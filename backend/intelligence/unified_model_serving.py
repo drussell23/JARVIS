@@ -952,7 +952,7 @@ class PrimeLocalClient(ModelClient):
 
             # v234.0: Run inference in single-worker executor (prevents concurrent OOM)
             loop = asyncio.get_event_loop()
-            result = await loop.run_in_executor(
+            _executor_coro = loop.run_in_executor(
                 self._inference_executor,
                 lambda: self._model(
                     prompt,
@@ -962,9 +962,28 @@ class PrimeLocalClient(ModelClient):
                 )
             )
 
+            # v280.6: Budget-aware inference timeout.
+            # Without this, local inference can block 15-60s on the single-
+            # worker executor, consuming the entire command budget before
+            # the fallback chain reaches faster providers (Claude API).
+            if request.deadline is not None:
+                _local_remaining = request.deadline - time.monotonic()
+                _local_timeout = max(3.0, _local_remaining - 1.0)
+                result = await asyncio.wait_for(_executor_coro, timeout=_local_timeout)
+            else:
+                result = await _executor_coro
+
             response.content = result["choices"][0]["text"].strip()
             response.tokens_used = result.get("usage", {}).get("total_tokens", 0)
             response.success = True
+
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "[v280.6] Local Prime inference deadline timeout (%.1fs remaining)",
+                (request.deadline - time.monotonic()) if request.deadline else 0,
+            )
+            response.success = False
+            response.error = "Local inference deadline timeout"
 
         except Exception as e:
             self.logger.error(f"Prime inference error: {e}")
@@ -1601,10 +1620,17 @@ class PrimeCloudRunClient(ModelClient):
                 "metadata": self._build_request_metadata(request),
             }
 
+            # v280.6: Budget-aware timeout. Cap to remaining deadline
+            # instead of fixed PRIME_TIMEOUT_SECONDS (60s).
+            _cr_timeout = PRIME_TIMEOUT_SECONDS
+            if request.deadline is not None:
+                _cr_remaining = request.deadline - time.monotonic()
+                _cr_timeout = min(PRIME_TIMEOUT_SECONDS, max(3.0, _cr_remaining - 1.0))
+
             async with session.post(
                 f"{self.url}/v1/chat/completions",
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=PRIME_TIMEOUT_SECONDS),
+                timeout=aiohttp.ClientTimeout(total=_cr_timeout),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -1743,13 +1769,21 @@ class ClaudeClient(ModelClient):
                     # System messages go in the system parameter
                     pass
 
-            # Make API call
-            result = await client.messages.create(
+            # v280.6: Budget-aware API call. Default SDK timeout is 120s;
+            # cap to remaining budget so the chain can fall through faster.
+            _claude_coro = client.messages.create(
                 model=CLAUDE_DEFAULT_MODEL,
                 max_tokens=request.max_tokens,
                 system=request.system_prompt or "",
                 messages=claude_messages,
             )
+
+            if request.deadline is not None:
+                _claude_remaining = request.deadline - time.monotonic()
+                _claude_timeout = max(3.0, _claude_remaining - 1.0)
+                result = await asyncio.wait_for(_claude_coro, timeout=_claude_timeout)
+            else:
+                result = await _claude_coro
 
             response.content = result.content[0].text if result.content else ""
             response.tokens_used = result.usage.input_tokens + result.usage.output_tokens
@@ -1760,6 +1794,14 @@ class ClaudeClient(ModelClient):
                 input_cost = (result.usage.input_tokens / 1_000_000) * self._cost_per_1m_input.get(CLAUDE_DEFAULT_MODEL, 3.0)
                 output_cost = (result.usage.output_tokens / 1_000_000) * self._cost_per_1m_output.get(CLAUDE_DEFAULT_MODEL, 15.0)
                 response.estimated_cost_usd = input_cost + output_cost
+
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                "[v280.6] Claude API deadline timeout (%.1fs remaining)",
+                (request.deadline - time.monotonic()) if request.deadline else 0,
+            )
+            response.success = False
+            response.error = "Claude API deadline timeout"
 
         except Exception as e:
             self.logger.error(f"Claude API error: {e}")
@@ -3503,7 +3545,21 @@ class UnifiedModelServing:
                 continue
 
             try:
-                response = await client.generate(request)
+                # v280.6: Deadline-aware per-provider timeout.
+                # Without this, each provider uses its own fixed timeout
+                # (Cloud Run 60s, Claude 120s) and the cumulative chain
+                # exceeds the command pipeline budget. The budget check at
+                # the TOP of the loop only fires between providers — it
+                # cannot interrupt a provider mid-execution.
+                if request.deadline is not None:
+                    _provider_remaining = request.deadline - time.monotonic()
+                    _provider_timeout = max(3.0, _provider_remaining - 1.0)
+                    response = await asyncio.wait_for(
+                        client.generate(request),
+                        timeout=_provider_timeout,
+                    )
+                else:
+                    response = await client.generate(request)
 
                 if response.success:
                     self._circuit_breaker.record_success(provider.value)
@@ -3521,6 +3577,17 @@ class UnifiedModelServing:
                     last_error = response.error
                     fallback_used = True
                     self._fallback_count += 1
+
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "[v280.6] Provider %s deadline-enforced timeout (%.1fs remaining)",
+                    provider.value,
+                    (request.deadline - time.monotonic()) if request.deadline else 0,
+                )
+                self._circuit_breaker.record_failure(provider.value)
+                last_error = f"{provider.value} deadline timeout"
+                fallback_used = True
+                self._fallback_count += 1
 
             except Exception as e:
                 self.logger.error(f"Provider {provider.value} error: {e}")

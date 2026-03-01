@@ -1202,7 +1202,18 @@ class JarvisPrimeClient:
                     deadline=deadline,  # v280.5: propagate budget to provider chain
                 )
 
-                response = await unified_serving.generate(request)
+                # v280.6: Budget-aware UMS call. The UMS router now enforces
+                # per-provider deadlines internally, but this outer guard
+                # prevents the entire UMS chain from exceeding the command budget.
+                if deadline is not None:
+                    _ums_remaining = deadline - time.monotonic()
+                    _ums_timeout = max(3.0, _ums_remaining - 2.0)
+                    response = await asyncio.wait_for(
+                        unified_serving.generate(request),
+                        timeout=_ums_timeout,
+                    )
+                else:
+                    response = await unified_serving.generate(request)
 
                 if response.success:
                     logger.info(
