@@ -1929,6 +1929,45 @@ class GoogleWorkspaceClient:
                         await circuit_breaker.record_failure(api_name)
                         raise retry_error
 
+            # v281.1: Transport error retry — stale httplib2 connections
+            # cause ssl.SSLError (WRONG_VERSION_NUMBER), ConnectionResetError,
+            # BrokenPipeError, etc. after network blips or sleep/wake.
+            # Rebuild services (fresh httplib2 Http objects) and retry once.
+            import ssl as _ssl
+            _is_transport_error = (
+                isinstance(e, (_ssl.SSLError, ConnectionError, BrokenPipeError))
+                or "ssl" in error_str
+                or "wrong version" in error_str
+                or "connection reset" in error_str
+                or "broken pipe" in error_str
+                or "servernotfounderror" in error_str
+            )
+            if _is_transport_error:
+                logger.warning(
+                    "[GoogleWorkspaceClient] Transport error (%s: %s), "
+                    "rebuilding services and retrying...",
+                    type(e).__name__, e,
+                )
+                try:
+                    await self._rebuild_services()
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(None, operation),
+                        timeout=operation_timeout,
+                    )
+                    await circuit_breaker.record_success(api_name)
+                    logger.info(
+                        "[GoogleWorkspaceClient] Transport retry succeeded for %s",
+                        api_name,
+                    )
+                    return result
+                except Exception as transport_retry_err:
+                    logger.warning(
+                        "[GoogleWorkspaceClient] Transport retry also failed: %s",
+                        transport_retry_err,
+                    )
+                    await circuit_breaker.record_failure(api_name)
+                    raise transport_retry_err
+
             # Record failure (transient)
             await circuit_breaker.record_failure(api_name)
             raise

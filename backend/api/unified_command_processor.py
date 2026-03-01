@@ -1851,12 +1851,25 @@ class UnifiedCommandProcessor:
                 action_required = result.get("action_required", "")
                 if action_required:
                     return f"Email check failed: {error_str}. Action: {action_required}"
-                # v281.1: User-friendly message for timeout errors
+                # v281.1: User-friendly messages for common transient errors
                 if error_str == "deadline_exceeded":
                     _timeout_s = result.get("timeout_s", "?")
                     return (
                         f"Email check timed out after {_timeout_s}s. "
                         "The system may be under heavy load. Please try again."
+                    )
+                _err_lower = error_str.lower()
+                if "ssl" in _err_lower or "wrong version" in _err_lower:
+                    return (
+                        "Email check failed due to a network connection issue. "
+                        "This usually resolves on retry. Please try again."
+                    )
+                if "connection" in _err_lower and (
+                    "reset" in _err_lower or "refused" in _err_lower or "broken" in _err_lower
+                ):
+                    return (
+                        "Email check failed due to a network connection issue. "
+                        "Please try again in a moment."
                     )
                 return f"Email check failed: {error_str}"
             count = result.get("count", 0)
