@@ -594,7 +594,18 @@ class DynamicConfigService {
       const { signal, clear } = createTimeoutController(2000);
       const response = await fetch(`${url}/health`, { signal, mode: 'cors' });
       clear();
-      return response.ok;
+      if (!response.ok) return false;
+
+      // v281.0: Validate this is the real backend, not the loading server.
+      // The loading server responds to /health but can't process commands.
+      try {
+        const data = await response.json();
+        if (data.service === 'loading_server') return false;
+      } catch {
+        // If we can't parse JSON, still consider it valid (some backends return plain text)
+      }
+
+      return true;
     } catch {
       return false;
     }
