@@ -314,6 +314,38 @@ class TestGoogleWorkspaceAgentExecution:
         mock_client.fetch_unread_emails.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_fetch_unread_emails_defaults_to_api_authority(self, agent_with_mock):
+        """Email reads should stay on the Gmail API path unless visual fallback is explicit."""
+        from backend.neural_mesh.agents.google_workspace_agent import (
+            ExecutionResult,
+            ExecutionTier,
+            UnifiedWorkspaceExecutor,
+        )
+
+        executor = UnifiedWorkspaceExecutor()
+        executor.execute_email_check = AsyncMock(
+            return_value=ExecutionResult(
+                success=False,
+                tier_used=ExecutionTier.GOOGLE_API,
+                data={
+                    "error": "Google Workspace email is not authenticated",
+                    "error_code": "auth_missing",
+                    "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+                },
+                error="Google Workspace email is not authenticated",
+            )
+        )
+        agent_with_mock._unified_executor = executor
+
+        result = await agent_with_mock.execute_task({
+            "action": "fetch_unread_emails",
+            "limit": 5,
+        })
+
+        assert result["error_code"] == "auth_missing"
+        assert executor.execute_email_check.await_args.kwargs["allow_visual_fallback"] is False
+
+    @pytest.mark.asyncio
     async def test_check_calendar_events(self, agent_with_mock, mock_client):
         """Should check calendar events."""
         result = await agent_with_mock.execute_task({
@@ -449,6 +481,68 @@ class TestGoogleWorkspaceAgentExecution:
         ok = await agent._ensure_client()
         assert ok is True
         agent._client.authenticate.assert_awaited_once_with(interactive=False)
+
+
+class TestGoogleWorkspaceReadinessPolicy:
+    """Test authoritative Gmail read-path behavior."""
+
+    @pytest.mark.asyncio
+    async def test_client_returns_structured_auth_missing_for_email_reads(self):
+        """Unauthenticated Gmail reads should return a structured setup error."""
+        from backend.neural_mesh.agents.google_workspace_agent import (
+            AuthState,
+            GoogleWorkspaceClient,
+            GoogleWorkspaceConfig,
+            TokenHealthStatus,
+        )
+
+        client = GoogleWorkspaceClient(
+            GoogleWorkspaceConfig(
+                credentials_path="/tmp/test.json",
+                token_path="/tmp/token.json",
+            )
+        )
+        client._ensure_authenticated = AsyncMock(return_value=False)
+        client._auth_state = AuthState.UNAUTHENTICATED
+        client._token_health = TokenHealthStatus.MISSING
+
+        result = await client.fetch_unread_emails(limit=3)
+
+        assert result["error_code"] == "auth_missing"
+        assert "connected" in result["error"].lower()
+        assert result["emails"] == []
+
+    @pytest.mark.asyncio
+    async def test_executor_stops_on_auth_missing_without_visual_fallback(self):
+        """Auth/capability failures should not cascade into browser automation."""
+        from backend.neural_mesh.agents.google_workspace_agent import (
+            AuthState,
+            ExecutionTier,
+            UnifiedWorkspaceExecutor,
+        )
+
+        executor = UnifiedWorkspaceExecutor()
+        executor._ensure_visual_tooling = AsyncMock(return_value=True)
+        google_client = MagicMock()
+        google_client.can_attempt_google_api = True
+        google_client.auth_state = AuthState.UNAUTHENTICATED
+        google_client.fetch_unread_emails = AsyncMock(return_value={
+            "error": "Google Workspace email is not authenticated",
+            "error_code": "auth_missing",
+            "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+            "emails": [],
+        })
+
+        result = await executor.execute_email_check(
+            google_client=google_client,
+            limit=2,
+            allow_visual_fallback=True,
+        )
+
+        assert result.success is False
+        assert result.tier_used == ExecutionTier.GOOGLE_API
+        assert result.data["error_code"] == "auth_missing"
+        executor._ensure_visual_tooling.assert_not_awaited()
 
 
 # =============================================================================

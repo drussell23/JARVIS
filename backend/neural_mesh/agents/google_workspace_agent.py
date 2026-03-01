@@ -458,6 +458,25 @@ def get_parallel_executor() -> ParallelTierExecutor:
 # Google API Availability Check
 # =============================================================================
 
+if os.sys.version_info < (3, 10):
+    try:
+        from importlib import metadata as _metadata
+
+        if not hasattr(_metadata, "packages_distributions"):
+            def _packages_distributions_fallback():
+                try:
+                    import importlib_metadata as _backport
+
+                    if hasattr(_backport, "packages_distributions"):
+                        return _backport.packages_distributions()
+                except ImportError:
+                    pass
+                return {}
+
+            _metadata.packages_distributions = _packages_distributions_fallback
+    except Exception:
+        pass
+
 try:
     from google.oauth2.credentials import Credentials
     from google.auth.transport.requests import Request
@@ -2204,12 +2223,7 @@ class GoogleWorkspaceClient:
             Dictionary with email list and metadata
         """
         if not await self._ensure_authenticated():
-            response: Dict[str, Any] = {"error": "Not authenticated", "emails": []}
-            if self._auth_state == AuthState.NEEDS_REAUTH:
-                response["error"] = f"Google auth permanently failed: {self._last_auth_failure_reason}"
-                response["error_code"] = "needs_reauth"
-                response["action_required"] = "Re-run: python3 backend/scripts/google_oauth_setup.py"
-            return response
+            return self._build_email_auth_error_response()
 
         cache_key = f"unread:{label}:{limit}"
         cached = self._get_cached(cache_key)
@@ -2886,6 +2900,17 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
             "initialized": client is not None,
             "auth_state": auth_state,
             "ready": auth_state == "authenticated",
+            "token_health": (
+                client._token_health.value
+                if client and hasattr(client, "_token_health") and hasattr(client._token_health, "value")
+                else "unknown"
+            ),
+            "action_required": (
+                "Run: python3 backend/scripts/google_oauth_setup.py"
+                if auth_state in {"unauthenticated", "needs_reauth"}
+                else None
+            ),
+            "email_visual_fallback_enabled": bool(self.config.email_visual_fallback_enabled),
             "capabilities": sorted(self.capabilities) if hasattr(self, "capabilities") else [],
         }
 
@@ -3315,7 +3340,12 @@ Return ONLY a JSON object with these keys (use null if not found):
         2. Computer Use (visual - open Gmail in browser)
         """
         limit = payload.get("limit", self.config.default_email_limit)
-        allow_visual_fallback = bool(payload.get("allow_visual_fallback", True))
+        allow_visual_fallback = bool(
+            payload.get(
+                "allow_visual_fallback",
+                self.config.email_visual_fallback_enabled,
+            )
+        )
         # v280.5: Propagate deadline so internal operations use budget-aware timeouts
         deadline = payload.get("deadline_monotonic")
 
@@ -3690,7 +3720,11 @@ EMAIL BODY:"""
         )
 
         # Ensure unified executor is available
-        if not self._unified_executor or not self._unified_executor._computer_use:
+        if not self._unified_executor:
+            logger.warning("Unified executor not available, falling back to API")
+            return await self._draft_email(payload)
+
+        if not await self._unified_executor._ensure_visual_tooling():
             logger.warning("Computer Use not available, falling back to API")
             return await self._draft_email(payload)
 
@@ -4409,7 +4443,7 @@ EMAIL BODY:"""
                 logger.warning(f"gspread read failed: {e}")
 
         # Fallback to Computer Use (Tier 3)
-        if self._unified_executor and self._unified_executor._computer_use:
+        if self._unified_executor and await self._unified_executor._ensure_visual_tooling():
             try:
                 await self._unified_executor._switch_to_app_with_spatial_awareness("Safari", narrate=True)
 
@@ -4536,7 +4570,7 @@ EMAIL BODY:"""
                 logger.warning(f"gspread write failed: {e}")
 
         # Fallback to Computer Use
-        if self._unified_executor and self._unified_executor._computer_use:
+        if self._unified_executor and await self._unified_executor._ensure_visual_tooling():
             try:
                 await self._unified_executor._switch_to_app_with_spatial_awareness("Safari", narrate=True)
 
