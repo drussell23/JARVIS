@@ -2234,6 +2234,22 @@ class UnifiedCommandProcessor:
                     "routing to workspace handler anyway", intent,
                 )
                 return await self._handle_workspace_action(command_text, response, deadline=deadline)
+            # v280.7: J-Prime (GCP golden image) doesn't emit x_jarvis_routing
+            # metadata, so classify_and_complete() defaults domain to "general".
+            # Run the local workspace detector as a safety net — it's sub-ms
+            # regex/keyword matching that catches email/calendar/docs commands
+            # that J-Prime generated a text answer for instead of routing.
+            if domain == "general":
+                _ws_result = await self._attempt_workspace_failover(
+                    command_text, deadline=deadline,
+                )
+                if _ws_result is not None:
+                    logger.info(
+                        "[v280.7] Workspace detector caught unclassified workspace "
+                        "command (J-Prime returned domain='general'), rerouted"
+                    )
+                    _ws_result.setdefault("source", "jprime_workspace_reroute")
+                    return _ws_result
             return {
                 "success": True,
                 "response": response.content,
