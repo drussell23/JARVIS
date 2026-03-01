@@ -638,6 +638,10 @@ class JARVISVoiceAPI:
         # Lazy initialization - don't create JARVIS yet
         self._jarvis = None
         self._jarvis_initialized = False
+        # v280.6: Retry-aware init tracking (replaces sticky latch)
+        self._jarvis_init_attempts = 0
+        self._jarvis_init_last_attempt = 0.0  # monotonic timestamp
+        self._jarvis_init_last_error: Optional[str] = None
 
         # Startup announcement guard - prevents multiple voices at startup
         self._startup_announced = False
@@ -704,45 +708,83 @@ class JARVISVoiceAPI:
 
     @property
     def jarvis(self):
-        """Get JARVIS instance, initializing if needed"""
+        """Get JARVIS instance, initializing if needed.
+
+        v280.6: Retry-aware initialization replaces sticky latch.
+        Failed init no longer permanently blocks recovery. Retries
+        are gated by cooldown + max attempts to prevent thrashing.
+        """
+        # Fast path: already initialized successfully
+        if self._jarvis_initialized:
+            return self._jarvis
+
+        if not self.jarvis_available:
+            return None
+
+        # v280.6: Retry gating — cooldown + max attempts
+        import time as _time
+
+        _RETRY_COOLDOWN = float(os.getenv("JARVIS_INIT_RETRY_COOLDOWN_S", "30"))
+        _MAX_RETRIES = int(os.getenv("JARVIS_INIT_MAX_RETRIES", "5"))
+
+        if self._jarvis_init_attempts > 0:
+            if self._jarvis_init_attempts >= _MAX_RETRIES:
+                # Exhausted retries — log once per 60s to avoid spam
+                return None
+            elapsed = _time.monotonic() - self._jarvis_init_last_attempt
+            if elapsed < _RETRY_COOLDOWN:
+                return None  # still in cooldown
+
+        self._jarvis_init_attempts += 1
+        self._jarvis_init_last_attempt = _time.monotonic()
+        attempt = self._jarvis_init_attempts
+
         logger.info(
-            f"[JARVIS API] JARVIS property getter called - initialized: {self._jarvis_initialized}, available: {self.jarvis_available}"
+            f"[JARVIS API] Init attempt {attempt}/{_MAX_RETRIES} "
+            f"(last_error={self._jarvis_init_last_error})"
         )
 
-        if not self._jarvis_initialized and self.jarvis_available:
+        try:
+            # Try to use factory for proper dependency injection
             try:
-                # Try to use factory for proper dependency injection
-                try:
-                    from api.jarvis_factory import create_jarvis_agent, get_vision_analyzer
+                from api.jarvis_factory import create_jarvis_agent, get_vision_analyzer
 
-                    # Check if vision analyzer is available before creating JARVIS
-                    vision_analyzer = get_vision_analyzer()
-                    logger.info(
-                        f"[JARVIS API] Vision analyzer available during JARVIS creation: {vision_analyzer is not None}"
-                    )
-
-                    self._jarvis = create_jarvis_agent()
-                    logger.info(
-                        "[JARVIS API] JARVIS Agent created using factory with shared vision analyzer"
-                    )
-                except ImportError:
-                    # Fallback to direct creation
-                    logger.warning(
-                        "[INIT ORDER] Factory not available, falling back to direct creation"
-                    )
-                    self._jarvis = JARVISAgentVoice()
-                    logger.info("JARVIS Agent created directly (no shared vision analyzer)")
-
-                self.system_control_enabled = (
-                    self._jarvis.system_control_enabled if self._jarvis else False
+                vision_analyzer = get_vision_analyzer()
+                logger.info(
+                    f"[JARVIS API] Vision analyzer available during JARVIS creation: {vision_analyzer is not None}"
                 )
-                logger.info("JARVIS Agent Voice System initialized with system control")
-            except Exception as e:
-                logger.error(f"[INIT ORDER] Failed to initialize JARVIS Agent: {e}")
-                self._jarvis = None
-                self.system_control_enabled = False
-            finally:
-                self._jarvis_initialized = True
+
+                self._jarvis = create_jarvis_agent()
+                logger.info(
+                    "[JARVIS API] JARVIS Agent created using factory with shared vision analyzer"
+                )
+            except ImportError:
+                # Fallback to direct creation
+                logger.warning(
+                    "[INIT ORDER] Factory not available, falling back to direct creation"
+                )
+                self._jarvis = JARVISAgentVoice()
+                logger.info("JARVIS Agent created directly (no shared vision analyzer)")
+
+            # SUCCESS — latch so we don't re-init
+            self._jarvis_initialized = True
+            self._jarvis_init_last_error = None
+            self.system_control_enabled = (
+                self._jarvis.system_control_enabled if self._jarvis else False
+            )
+            logger.info(
+                f"JARVIS Agent Voice System initialized with system control "
+                f"(attempt {attempt})"
+            )
+        except Exception as e:
+            logger.error(
+                f"[INIT ORDER] Failed to initialize JARVIS Agent "
+                f"(attempt {attempt}/{_MAX_RETRIES}): {e}"
+            )
+            self._jarvis = None
+            self._jarvis_init_last_error = str(e)
+            self.system_control_enabled = False
+            # v280.6: Do NOT set _jarvis_initialized — allows retry after cooldown
 
         logger.debug(f"[INIT ORDER] Returning JARVIS instance: {self._jarvis is not None}")
         return self._jarvis
@@ -1057,13 +1099,19 @@ class JARVISVoiceAPI:
                 "features": [],
             }
 
-        # If we have API key but imports failed, still show as ready with limited features
+        # v280.6: Accurate status when imports aren't available
         if self.api_key and not JARVIS_IMPORTS_AVAILABLE:
             return {
-                "status": "ready",
-                "message": "JARVIS ready with limited features",
+                "status": "degraded",
+                "message": "JARVIS voice agent unavailable — running in text-only mode",
                 "features": ["basic_conversation", "text_commands"],
-                "import_status": "limited",
+                "import_status": "unavailable",
+                "voice_agent": {
+                    "available": False,
+                    "reason": "JARVIS agent components not importable",
+                    "init_attempts": self._jarvis_init_attempts,
+                    "last_error": self._jarvis_init_last_error,
+                },
             }
 
         features = [
@@ -1159,10 +1207,21 @@ class JARVISVoiceAPI:
                             "[STARTUP VOICE] ⏭️  Status endpoint skipping - already announced (path 2)"
                         )
 
-            # Return status without triggering JARVIS initialization
+            # v280.6: Include voice agent init state for frontend diagnostics
+            _max_retries = int(os.getenv("JARVIS_INIT_MAX_RETRIES", "5"))
+            voice_agent_info = {
+                "available": False,
+                "init_attempts": self._jarvis_init_attempts,
+                "max_retries": _max_retries,
+                "last_error": self._jarvis_init_last_error,
+                "retrying": self._jarvis_init_attempts > 0 and self._jarvis_init_attempts < _max_retries,
+            }
+
             return {
                 "status": "standby",
-                "message": "JARVIS ready to initialize on first command",
+                "message": "JARVIS ready to initialize on first command"
+                    if self._jarvis_init_attempts == 0
+                    else f"JARVIS voice agent init failed ({self._jarvis_init_attempts}/{_max_retries} attempts)",
                 "user_name": "Sir",
                 "features": features,
                 "wake_words": {
@@ -1175,7 +1234,8 @@ class JARVISVoiceAPI:
                     "enabled": getattr(self, "system_control_enabled", False),
                     "mode": "conversation",
                 },
-                "startup_announced": self._startup_announced,  # Tell frontend if announcement was made
+                "voice_agent": voice_agent_info,
+                "startup_announced": self._startup_announced,
             }
 
     # ================================================================

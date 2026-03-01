@@ -671,7 +671,7 @@ const getConnectionMessage = (result) => {
       case 'temporarily_disconnected': {
         const secs = ctx.timeSinceLastOnline ? Math.round(ctx.timeSinceLastOnline / 1000) : null;
         const ago = secs != null ? (secs < 120 ? `${secs}s ago` : `${Math.round(secs / 60)}m ago`) : '';
-        return `Reconnecting to JARVIS${ago ? ` (last seen ${ago})` : ''} — command queued for retry`;
+        return `Reconnecting to JARVIS${ago ? ` (last seen ${ago})` : ''} — command queued, will auto-send on reconnect`;
       }
       case 'starting_up':
         return 'JARVIS is starting up — command queued, will send when ready';
@@ -2334,10 +2334,11 @@ const JarvisVoice = () => {
           console.log('%c═══════════════════════════════════════════════════════════════════════════════\n', 'color: #00ff88; font-weight: bold');
         }
 
-        // v238.0: requestId dedup — same pattern as 'response' handler.
-        // Backend now echoes requestId. Drop stale responses.
+        // v238.0 + v280.6: requestId dedup — only drop when a DIFFERENT request is active.
+        // When activeRequestIdRef is null (e.g., queued command flushed after reconnect),
+        // accept the response so queued command results are always surfaced.
         const cmdRequestId = data.requestId;
-        if (cmdRequestId && activeRequestIdRef.current !== cmdRequestId) {
+        if (cmdRequestId && activeRequestIdRef.current && activeRequestIdRef.current !== cmdRequestId) {
           console.debug(`[WS] Ignoring stale command_response (got ${cmdRequestId}, active ${activeRequestIdRef.current})`);
           break;
         }
@@ -2411,10 +2412,11 @@ const JarvisVoice = () => {
       case 'response':
         console.log('WebSocket response received:', data);
 
-        // Dedup: Only process if this response matches the active request.
-        // Prevents double-display and double-speech from WS+REST race.
+        // v280.6: Dedup — only drop when a DIFFERENT request is active.
+        // When activeRequestIdRef is null (queued command flushed after reconnect),
+        // accept the response so queued command results always surface to the user.
         const incomingRequestId = data.requestId || data.metadata?.requestId;
-        if (incomingRequestId && activeRequestIdRef.current !== incomingRequestId) {
+        if (incomingRequestId && activeRequestIdRef.current && activeRequestIdRef.current !== incomingRequestId) {
           console.debug(`[WS] Ignoring stale response (got ${incomingRequestId}, active ${activeRequestIdRef.current})`);
           return;
         }
@@ -3478,13 +3480,19 @@ const JarvisVoice = () => {
         try {
           queuedCmd.attempts++;
 
+          // v280.6: Generate requestId so response handler can track this queued command
+          const queuedRequestId = `q_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+          activeRequestIdRef.current = queuedRequestId;
+
           const message = {
             type: 'command',
+            command_id: queuedRequestId,
             text: queuedCmd.command,
             mode: autonomousMode ? 'autonomous' : 'manual',
             priority: queuedCmd.metadata.priority || 'normal',
             metadata: {
               ...queuedCmd.metadata,
+              requestId: queuedRequestId,
               queuedAt: queuedCmd.timestamp,
               processedAt: Date.now(),
               queueAttempt: queuedCmd.attempts
