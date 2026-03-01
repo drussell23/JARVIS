@@ -182,6 +182,31 @@ async def test_start_uses_output_stream_when_input_unavailable(monkeypatch):
     await device.stop()
 
 
+@pytest.mark.asyncio
+async def test_start_and_stop_use_dedicated_audio_executor(monkeypatch):
+    """Audio I/O should not compete with the generic executor during startup."""
+    fake_sd = _make_fake_sd()
+    monkeypatch.setattr(fd_mod, "sd", fake_sd)
+
+    captured_executors = []
+
+    class _FakeLoop:
+        async def run_in_executor(self, executor, func):
+            captured_executors.append(executor)
+            return func()
+
+    monkeypatch.setattr(fd_mod.asyncio, "get_running_loop", lambda: _FakeLoop())
+
+    device = FullDuplexDevice(DeviceConfig())
+    await device.start()
+    await device.stop()
+
+    assert captured_executors == [
+        fd_mod._AUDIO_IO_EXECUTOR,
+        fd_mod._AUDIO_IO_EXECUTOR,
+    ]
+
+
 def test_validate_device_selection_fails_when_no_output_device(monkeypatch):
     """Output device is mandatory; startup must fail if none is valid."""
     no_output_devices = [

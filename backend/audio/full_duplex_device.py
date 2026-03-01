@@ -18,10 +18,12 @@ Architecture:
 """
 
 import asyncio
+import atexit
 import logging
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
@@ -35,6 +37,21 @@ except ImportError:
 from backend.audio.playback_ring_buffer import PlaybackRingBuffer
 
 logger = logging.getLogger(__name__)
+
+
+_AUDIO_IO_EXECUTOR = ThreadPoolExecutor(
+    max_workers=1,
+    thread_name_prefix="jarvis-audio-io",
+)
+
+
+@atexit.register
+def _shutdown_audio_io_executor() -> None:
+    """Release the dedicated audio executor during interpreter shutdown."""
+    try:
+        _AUDIO_IO_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -177,7 +194,7 @@ class FullDuplexDevice:
 
         loop = asyncio.get_running_loop()
         await loop.run_in_executor(
-            None, lambda: self._open_stream_sync(progress_callback)
+            _AUDIO_IO_EXECUTOR, lambda: self._open_stream_sync(progress_callback)
         )
 
         # These touch asyncio primitives — must stay on event loop thread.
@@ -584,7 +601,7 @@ class FullDuplexDevice:
         self._cancel_requested.set()
         self._running = False
         loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, self._safe_close_stream)
+        await loop.run_in_executor(_AUDIO_IO_EXECUTOR, self._safe_close_stream)
         self._started_event.clear()
         self._startup_silence_frames = 0
         logger.info("[FullDuplexDevice] Stopped")

@@ -24,11 +24,14 @@ async def test_audio_bus_starts_in_output_only_mode_without_mic_registration(mon
         def sample_rate(self):
             return self.config.sample_rate
 
-        async def start(self):
+        async def start(self, progress_callback=None):
             self.is_running = True
 
         async def stop(self):
             self.is_running = False
+
+        def request_cancel(self):
+            pass
 
         def add_capture_callback(self, _cb):
             self._add_capture_calls += 1
@@ -64,4 +67,3 @@ async def test_audio_bus_starts_in_output_only_mode_without_mic_registration(mon
         await bus.stop()
     finally:
         AudioBus._instance = old_instance
-
