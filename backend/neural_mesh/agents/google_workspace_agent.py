@@ -56,6 +56,7 @@ Version: 3.0.0 (Trinity Integration + Sheets)
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 import logging
 import os
@@ -501,26 +502,49 @@ except ImportError:
 # Tier 3: Computer Use Availability Check (Visual Fallback)
 # =============================================================================
 
-try:
-    from backend.autonomy.computer_use_tool import (
-        ComputerUseTool,
-        get_computer_use_tool,
-        ComputerUseResult,
-    )
-    COMPUTER_USE_AVAILABLE = True
-except ImportError:
-    try:
-        from autonomy.computer_use_tool import (
-            ComputerUseTool,
-            get_computer_use_tool,
-            ComputerUseResult,
-        )
-        COMPUTER_USE_AVAILABLE = True
-    except ImportError:
-        COMPUTER_USE_AVAILABLE = False
-        ComputerUseTool = None
-        get_computer_use_tool = None
-        logger.info("ComputerUseTool not available - visual fallback disabled")
+COMPUTER_USE_AVAILABLE = False
+ComputerUseTool = None
+ComputerUseResult = None
+get_computer_use_tool = None
+_computer_use_import_attempted = False
+_computer_use_import_lock = threading.Lock()
+
+
+def _load_computer_use_components() -> bool:
+    """Load Computer Use lazily so API-first commands stay cheap to initialize."""
+    global COMPUTER_USE_AVAILABLE
+    global ComputerUseTool
+    global ComputerUseResult
+    global get_computer_use_tool
+    global _computer_use_import_attempted
+
+    if COMPUTER_USE_AVAILABLE and get_computer_use_tool is not None:
+        return True
+
+    with _computer_use_import_lock:
+        if COMPUTER_USE_AVAILABLE and get_computer_use_tool is not None:
+            return True
+        if _computer_use_import_attempted:
+            return False
+        _computer_use_import_attempted = True
+
+        last_error: Optional[Exception] = None
+        for module_name in (
+            "backend.autonomy.computer_use_tool",
+            "autonomy.computer_use_tool",
+        ):
+            try:
+                module = importlib.import_module(module_name)
+                ComputerUseTool = getattr(module, "ComputerUseTool")
+                ComputerUseResult = getattr(module, "ComputerUseResult")
+                get_computer_use_tool = getattr(module, "get_computer_use_tool")
+                COMPUTER_USE_AVAILABLE = True
+                return True
+            except Exception as exc:
+                last_error = exc
+
+        logger.info("ComputerUseTool not available - visual fallback disabled: %s", last_error)
+        return False
 
 
 # =============================================================================
@@ -666,6 +690,12 @@ class GoogleWorkspaceConfig:
             str(Path.home() / '.jarvis' / 'google_workspace_token.json')
         )
     )
+    # Gmail reads should use the authoritative API path unless visual mode is explicit.
+    email_visual_fallback_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_WORKSPACE_EMAIL_VISUAL_FALLBACK", "false"
+        ).lower() in {"1", "true", "yes"}
+    )
     # Email defaults
     default_email_limit: int = 10
     max_email_body_preview: int = 500
@@ -787,18 +817,21 @@ class UnifiedWorkspaceExecutor:
             self._available_tiers.append(ExecutionTier.MACOS_LOCAL)
             logger.info("Tier 2 (macOS Local) available")
 
-        # Tier 3: Computer Use
-        if COMPUTER_USE_AVAILABLE:
+        # Tier 3: Computer Use (loaded lazily on first visual request)
+        if COMPUTER_USE_AVAILABLE and get_computer_use_tool is not None:
             self._available_tiers.append(ExecutionTier.COMPUTER_USE)
             logger.info("Tier 3 (Computer Use) available")
 
         # Initialize stats
         for tier in ExecutionTier:
-            self._tier_stats[tier] = {
-                "attempts": 0,
-                "successes": 0,
-                "failures": 0,
-            }
+            self._tier_stats.setdefault(
+                tier,
+                {
+                    "attempts": 0,
+                    "successes": 0,
+                    "failures": 0,
+                },
+            )
 
         if not self._available_tiers:
             logger.warning(
@@ -808,7 +841,7 @@ class UnifiedWorkspaceExecutor:
             )
 
     async def initialize(self) -> bool:
-        """Initialize all available execution backends."""
+        """Initialize core execution backends without eager visual/browser imports."""
         async with self._lock:
             if self._initialized:
                 return True
@@ -819,28 +852,56 @@ class UnifiedWorkspaceExecutor:
                     self._calendar_bridge = CalendarBridge()
                     logger.info("CalendarBridge initialized")
 
-                # v6.2: Initialize Spatial Awareness (for smart app switching)
-                try:
-                    from core.computer_use_bridge import switch_to_app_smart, get_current_context
-                    self._spatial_awareness = {
-                        "switch_to_app": switch_to_app_smart,
-                        "get_context": get_current_context,
-                    }
-                    logger.info("Spatial Awareness (Proprioception) initialized")
-                except ImportError as e:
-                    logger.info(f"Spatial Awareness not available: {e}")
-                    self._spatial_awareness = None
-
-                # Initialize Tier 3: Computer Use
-                if COMPUTER_USE_AVAILABLE and get_computer_use_tool is not None:
-                    self._computer_use = get_computer_use_tool()
-                    logger.info("ComputerUseTool initialized")
-
                 self._initialized = True
                 return True
 
             except Exception as e:
                 logger.exception(f"Error initializing unified executor: {e}")
+                return False
+
+    async def _ensure_spatial_awareness(self) -> bool:
+        """Load spatial awareness only when a visual workflow actually needs it."""
+        if self._spatial_awareness is not None:
+            return True
+
+        async with self._lock:
+            if self._spatial_awareness is not None:
+                return True
+            try:
+                from core.computer_use_bridge import (
+                    switch_to_app_smart,
+                    get_current_context,
+                )
+                self._spatial_awareness = {
+                    "switch_to_app": switch_to_app_smart,
+                    "get_context": get_current_context,
+                }
+                logger.info("Spatial Awareness (Proprioception) initialized lazily")
+                return True
+            except ImportError as e:
+                logger.info(f"Spatial Awareness not available: {e}")
+                self._spatial_awareness = None
+                return False
+
+    async def _ensure_visual_tooling(self) -> bool:
+        """Load Computer Use only for commands that explicitly need a visual tier."""
+        if self._computer_use is not None:
+            return True
+
+        async with self._lock:
+            if self._computer_use is not None:
+                return True
+            if not _load_computer_use_components() or get_computer_use_tool is None:
+                self._check_tier_availability()
+                return False
+            try:
+                self._computer_use = get_computer_use_tool()
+                self._check_tier_availability()
+                logger.info("ComputerUseTool initialized lazily")
+                return self._computer_use is not None
+            except Exception as e:
+                logger.warning("ComputerUseTool initialization failed: %s", e)
+                self._check_tier_availability()
                 return False
 
     async def execute_calendar_check(
@@ -913,11 +974,7 @@ class UnifiedWorkspaceExecutor:
 
         # Tier 3: Computer Use (Visual)
         # v6.2: First switch to Calendar using Spatial Awareness, then take screenshot
-        if (
-            allow_visual_fallback
-            and ExecutionTier.COMPUTER_USE in self._available_tiers
-            and self._computer_use
-        ):
+        if allow_visual_fallback and await self._ensure_visual_tooling():
             self._tier_stats[ExecutionTier.COMPUTER_USE]["attempts"] += 1
             try:
                 # v6.2 Grand Unification: Switch to Calendar app first via Yabai
@@ -996,10 +1053,44 @@ class UnifiedWorkspaceExecutor:
                         data=result,
                         execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
                     )
+                if isinstance(result, dict):
+                    error_code = result.get("error_code")
+                    if result.get("error") == "Not authenticated" and not error_code:
+                        result["error_code"] = "auth_missing"
+                        result.setdefault(
+                            "action_required",
+                            "Run: python3 backend/scripts/google_oauth_setup.py",
+                        )
+                        error_code = "auth_missing"
+                    if error_code in {"needs_reauth", "auth_missing", "api_unavailable"}:
+                        self._tier_stats[ExecutionTier.GOOGLE_API]["failures"] += 1
+                        return ExecutionResult(
+                            success=False,
+                            tier_used=ExecutionTier.GOOGLE_API,
+                            data=result,
+                            error=result.get("error") or "Workspace email unavailable",
+                            execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                        )
                 self._tier_stats[ExecutionTier.GOOGLE_API]["failures"] += 1
+                if not allow_visual_fallback:
+                    return ExecutionResult(
+                        success=False,
+                        tier_used=ExecutionTier.GOOGLE_API,
+                        data=result if isinstance(result, dict) else {},
+                        error=result.get("error") if isinstance(result, dict) else "Gmail API failed",
+                        execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                    )
             except Exception as e:
                 logger.warning("Gmail API error: %s", e)
                 self._tier_stats[ExecutionTier.GOOGLE_API]["failures"] += 1
+                if not allow_visual_fallback:
+                    return ExecutionResult(
+                        success=False,
+                        tier_used=ExecutionTier.GOOGLE_API,
+                        data={"error": str(e)},
+                        error=str(e),
+                        execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                    )
 
         # Short-circuit: don't waste budget on Computer Use when auth is permanently dead
         if google_client and getattr(google_client, 'auth_state', None) == AuthState.NEEDS_REAUTH:
@@ -1014,14 +1105,35 @@ class UnifiedWorkspaceExecutor:
                 error=f"Google auth permanently failed: {reason}. Re-run google_oauth_setup.py",
                 execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
             )
+        if not _can_try_api and not allow_visual_fallback:
+            if not GOOGLE_API_AVAILABLE:
+                return ExecutionResult(
+                    success=False,
+                    tier_used=ExecutionTier.GOOGLE_API,
+                    data={
+                        "error_code": "api_unavailable",
+                        "action_required": (
+                            "Install: pip install google-auth google-auth-oauthlib "
+                            "google-auth-httplib2 google-api-python-client"
+                        ),
+                    },
+                    error="Google API libraries are not available",
+                    execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+                )
+            return ExecutionResult(
+                success=False,
+                tier_used=ExecutionTier.GOOGLE_API,
+                data={
+                    "error_code": "auth_missing",
+                    "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+                },
+                error="Google Workspace email is not authenticated",
+                execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
+            )
 
         # Tier 3: Computer Use (Visual) - Skip Tier 2 for email (no macOS email bridge)
         # v6.2: First switch to browser using Spatial Awareness, then navigate
-        if (
-            allow_visual_fallback
-            and ExecutionTier.COMPUTER_USE in self._available_tiers
-            and self._computer_use
-        ):
+        if allow_visual_fallback and await self._ensure_visual_tooling():
             self._tier_stats[ExecutionTier.COMPUTER_USE]["attempts"] += 1
             try:
                 # v6.2 Grand Unification: Switch to Safari first via Yabai
@@ -1102,7 +1214,7 @@ class UnifiedWorkspaceExecutor:
 
         # Tier 3: Computer Use (Visual)
         # v6.2: First switch to browser using Spatial Awareness
-        if ExecutionTier.COMPUTER_USE in self._available_tiers and self._computer_use:
+        if await self._ensure_visual_tooling():
             try:
                 # v6.2 Grand Unification: Switch to Safari first via Yabai
                 await self._switch_to_app_with_spatial_awareness("Safari", narrate=True)
@@ -1152,7 +1264,7 @@ class UnifiedWorkspaceExecutor:
         Returns:
             True if switch succeeded, False otherwise
         """
-        if not self._spatial_awareness:
+        if not await self._ensure_spatial_awareness():
             logger.debug("Spatial Awareness not available, skipping app switch")
             return False
 
@@ -2019,6 +2131,41 @@ class GoogleWorkspaceClient:
                 self._last_auth_failure_reason,
             )
             self._reauth_notice_cooldown = now
+
+    def _build_email_auth_error_response(self) -> Dict[str, Any]:
+        """Return structured auth diagnostics for Gmail read commands."""
+        if not GOOGLE_API_AVAILABLE:
+            return {
+                "error": "Google API libraries are not available",
+                "error_code": "api_unavailable",
+                "action_required": (
+                    "Install: pip install google-auth google-auth-oauthlib "
+                    "google-auth-httplib2 google-api-python-client"
+                ),
+                "emails": [],
+            }
+
+        if self._auth_state == AuthState.NEEDS_REAUTH:
+            return {
+                "error": f"Google auth permanently failed: {self._last_auth_failure_reason}",
+                "error_code": "needs_reauth",
+                "action_required": "Re-run: python3 backend/scripts/google_oauth_setup.py",
+                "emails": [],
+            }
+
+        if self._token_health == TokenHealthStatus.MISSING:
+            reason = "Google Workspace email is not connected"
+        elif self._token_health == TokenHealthStatus.CORRUPT:
+            reason = "Google Workspace token file is invalid"
+        else:
+            reason = self._last_auth_failure_reason or "Google Workspace email is not authenticated"
+
+        return {
+            "error": reason,
+            "error_code": "auth_missing",
+            "action_required": "Run: python3 backend/scripts/google_oauth_setup.py",
+            "emails": [],
+        }
 
     def _get_cached(self, key: str) -> Optional[Any]:
         """Get cached value if not expired."""
