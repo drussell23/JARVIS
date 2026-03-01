@@ -63330,6 +63330,9 @@ class JarvisSystemKernel:
         # v275.6: Oscillation prevention for AudioBus init/recovery cycles
         self._audio_init_consecutive_failures: int = 0
         self._audio_init_permanent_degraded: bool = False
+        self._audio_recovery_cooldown_until: float = 0.0
+        self._audio_last_init_outcome: str = AudioInitOutcome.SUCCESS
+        self._audio_last_init_error: str = ""
 
         # Unified Agent Runtime (initialized in _start_agent_runtime)
         self._agent_runtime = None
@@ -76773,6 +76776,47 @@ class JarvisSystemKernel:
                 bs_err,
             )
 
+    def _audio_failure_is_terminal(self, outcome: str, error: str = "") -> bool:
+        """Classify whether a failed audio init campaign is unrecoverable in-process."""
+        if outcome == AudioInitOutcome.IMPORT_ERROR:
+            return True
+
+        err = (error or "").lower()
+        if not err:
+            return False
+
+        terminal_markers = (
+            "sounddevice is not installed",
+            "no audio devices available",
+            "no valid output device available",
+            "no valid input device available (required)",
+            "permission denied",
+            "operation not permitted",
+            "microphone access",
+        )
+        transient_markers = (
+            "timed out",
+            "timeout",
+            "busy",
+            "temporarily unavailable",
+            "interrupted",
+            "cancelled",
+        )
+
+        if any(marker in err for marker in terminal_markers):
+            return True
+        if any(marker in err for marker in transient_markers):
+            return False
+        return False
+
+    def _audio_recovery_in_cooldown(self) -> bool:
+        """Return True when the current audio recovery campaign is cooling down."""
+        return self._audio_recovery_cooldown_until > time.time()
+
+    def _clear_audio_recovery_cooldown(self) -> None:
+        """Re-open audio recovery after a successful start or cooldown expiry."""
+        self._audio_recovery_cooldown_until = 0.0
+
     async def _attempt_audio_bus_start(
         self,
         *,
@@ -76849,9 +76893,13 @@ class JarvisSystemKernel:
 
                 self._audio_bus = AudioBus.get_instance()
                 await asyncio.wait_for(
-                    self._audio_bus.start(progress_callback=_progress_cb),
+                self._audio_bus.start(progress_callback=_progress_cb),
                     timeout=effective_timeout,
                 )
+                self._clear_audio_recovery_cooldown()
+                self._audio_init_permanent_degraded = False
+                self._audio_last_init_outcome = AudioInitOutcome.SUCCESS
+                self._audio_last_init_error = ""
                 return AudioInitAttemptResult(
                     success=True,
                     outcome=AudioInitOutcome.SUCCESS,
@@ -76867,6 +76915,8 @@ class JarvisSystemKernel:
                     is_timeout=True,
                 )
                 await self._stop_zombie_audio_bus()
+                self._audio_last_init_outcome = outcome
+                self._audio_last_init_error = ""
                 return AudioInitAttemptResult(
                     success=False,
                     outcome=outcome,
@@ -76884,6 +76934,8 @@ class JarvisSystemKernel:
                     error=err,
                 )
                 await self._stop_zombie_audio_bus()
+                self._audio_last_init_outcome = outcome
+                self._audio_last_init_error = str(err)
                 return AudioInitAttemptResult(
                     success=False,
                     outcome=outcome,
@@ -77070,10 +77122,22 @@ class JarvisSystemKernel:
         """Schedule bounded background recovery for AudioBus initialization failures."""
         if not self._audio_bus_enabled:
             return
+        if self._audio_recovery_cooldown_until > 0.0 and not self._audio_recovery_in_cooldown():
+            self._clear_audio_recovery_cooldown()
         if self._audio_init_permanent_degraded:
             self.logger.warning(
                 "[AudioRecovery] Permanently degraded — skipping recovery for '%s'",
                 reason,
+            )
+            return
+        if self._audio_recovery_in_cooldown():
+            remaining = max(0.0, self._audio_recovery_cooldown_until - time.time())
+            self.logger.warning(
+                "[AudioRecovery] Cooling down for %.1fs — skipping recovery for '%s' "
+                "(last_outcome=%s)",
+                remaining,
+                reason,
+                self._audio_last_init_outcome,
             )
             return
         if self._audio_recovery_task is not None and not self._audio_recovery_task.done():
@@ -77222,29 +77286,72 @@ class JarvisSystemKernel:
                 )
                 # v275.6: Oscillation check
                 if self._audio_init_consecutive_failures >= max_consecutive:
-                    self._audio_init_permanent_degraded = True
-                    self._component_status["audio_infrastructure"] = {
-                        "status": "degraded",
-                        "message": (
-                            f"AudioBus permanently degraded after "
-                            f"{self._audio_init_consecutive_failures} "
-                            f"consecutive failures"
-                        ),
-                    }
-                    self.logger.error(
-                        "[AudioRecovery] Oscillation limit reached (%d consecutive "
-                        "failures) — entering permanent degraded mode",
-                        self._audio_init_consecutive_failures,
+                    _is_terminal = self._audio_failure_is_terminal(
+                        _rc_outcome,
+                        str(recovery_err),
                     )
+                    if _is_terminal:
+                        self._audio_init_permanent_degraded = True
+                        self._component_status["audio_infrastructure"] = {
+                            "status": "degraded",
+                            "message": (
+                                f"AudioBus permanently degraded after "
+                                f"{self._audio_init_consecutive_failures} "
+                                f"consecutive failures"
+                            ),
+                        }
+                        self.logger.error(
+                            "[AudioRecovery] Oscillation limit reached (%d consecutive "
+                            "failures) — entering permanent degraded mode",
+                            self._audio_init_consecutive_failures,
+                        )
+                    else:
+                        _cooldown = _get_env_float(
+                            "JARVIS_AUDIO_RECOVERY_CAMPAIGN_COOLDOWN",
+                            45.0,
+                        )
+                        self._audio_recovery_cooldown_until = time.time() + max(1.0, _cooldown)
+                        self._component_status["audio_infrastructure"] = {
+                            "status": "degraded",
+                            "message": (
+                                f"AudioBus recovery cooling down for "
+                                f"{_cooldown:.0f}s after "
+                                f"{self._audio_init_consecutive_failures} "
+                                f"consecutive failures"
+                            ),
+                        }
+                        self.logger.warning(
+                            "[AudioRecovery] Oscillation limit reached (%d consecutive "
+                            "failures) — entering cooldown for %.1fs "
+                            "(outcome=%s)",
+                            self._audio_init_consecutive_failures,
+                            _cooldown,
+                            _rc_outcome,
+                        )
                     self._emit_event(
                         SupervisorEventType.COMPONENT_STATUS,
-                        "AudioBus oscillation limit — permanent degraded mode",
-                        severity=SupervisorEventSeverity.ERROR,
+                        (
+                            "AudioBus oscillation limit — permanent degraded mode"
+                            if _is_terminal
+                            else "AudioBus oscillation limit — cooldown"
+                        ),
+                        severity=(
+                            SupervisorEventSeverity.ERROR
+                            if _is_terminal
+                            else SupervisorEventSeverity.WARNING
+                        ),
                         component="audio_infrastructure",
                         metadata={
                             "outcome": AudioInitOutcome.OSCILLATION_LIMIT,
                             "consecutive_failures": self._audio_init_consecutive_failures,
                             "reason": initial_reason,
+                            "failure_outcome": _rc_outcome,
+                            "disposition": (
+                                AudioRecoveryDisposition.TERMINAL
+                                if _is_terminal
+                                else AudioRecoveryDisposition.COOLDOWN
+                            ),
+                            "cooldown_until": self._audio_recovery_cooldown_until,
                         },
                     )
                     return

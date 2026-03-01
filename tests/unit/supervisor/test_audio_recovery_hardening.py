@@ -41,6 +41,31 @@ async def test_schedule_audio_recovery_resets_failure_streak_for_new_campaign(mo
         _reset_kernel(us)
 
 
+def test_schedule_audio_recovery_skips_only_while_cooling_down(monkeypatch):
+    kernel, us = _make_kernel(monkeypatch)
+    scheduled = []
+
+    def _fake_create_safe_task(coro, name=None, log_exceptions=True, **kwargs):
+        scheduled.append(name)
+        coro.close()
+        return asyncio.Future()
+
+    monkeypatch.setattr(us, "create_safe_task", _fake_create_safe_task)
+    kernel._audio_recovery_cooldown_until = us.time.time() + 60.0
+
+    try:
+        kernel._schedule_audio_bus_recovery("phase4_audio_bus_missing")
+        assert scheduled == []
+
+        kernel._audio_recovery_cooldown_until = us.time.time() - 1.0
+        kernel._schedule_audio_bus_recovery("phase4_audio_bus_missing")
+
+        assert scheduled == ["audio-recovery"]
+        assert kernel._audio_recovery_cooldown_until == 0.0
+    finally:
+        _reset_kernel(us)
+
+
 @pytest.mark.asyncio
 async def test_attempt_audio_bus_start_serializes_concurrent_calls(monkeypatch):
     kernel, us = _make_kernel(monkeypatch)
@@ -106,6 +131,39 @@ async def test_attempt_audio_bus_start_serializes_concurrent_calls(monkeypatch):
         assert result1.success is True
         assert result2.success is True
         assert len(start_calls) == 1
+    finally:
+        _reset_kernel(us)
+
+
+@pytest.mark.asyncio
+async def test_audio_recovery_oscillation_uses_cooldown_for_transient_failures(monkeypatch):
+    kernel, us = _make_kernel(monkeypatch)
+
+    monkeypatch.setenv("JARVIS_AUDIO_RECOVERY_INITIAL_DELAY", "0")
+    monkeypatch.setenv("JARVIS_AUDIO_RECOVERY_RETRY_INTERVAL", "0")
+    monkeypatch.setenv("JARVIS_AUDIO_RECOVERY_MAX_ATTEMPTS", "1")
+    monkeypatch.setenv("JARVIS_AUDIO_INIT_MAX_CONSECUTIVE_FAILURES", "1")
+    monkeypatch.setenv("JARVIS_AUDIO_RECOVERY_CAMPAIGN_COOLDOWN", "30")
+
+    async def _fake_attempt_audio_bus_start(**_kwargs):
+        return us.AudioInitAttemptResult(
+            success=False,
+            outcome=us.AudioInitOutcome.TIMEOUT_HUNG,
+            timeout_seconds=12.0,
+            timeout_reason="base",
+            duration_ms=12000.0,
+            progress_steps=0,
+            last_phase="none",
+            timed_out=True,
+        )
+
+    monkeypatch.setattr(kernel, "_attempt_audio_bus_start", _fake_attempt_audio_bus_start)
+
+    try:
+        await kernel._audio_recovery_loop("phase4_audio_bus_missing")
+
+        assert kernel._audio_init_permanent_degraded is False
+        assert kernel._audio_recovery_cooldown_until > us.time.time()
     finally:
         _reset_kernel(us)
 
