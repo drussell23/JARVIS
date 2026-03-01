@@ -2683,21 +2683,34 @@ class UnifiedCommandProcessor:
         )
 
         # Guardrail 9: Execute with stage-level deadline partitioning
-        execute_cap = float(os.getenv("JARVIS_EXECUTE_CAP_SECONDS", "25.0"))
+        # v281.1: The execute_timeout covers the ENTIRE _handle_workspace_action()
+        # including both workspace execution (2-6s) AND J-Prime compose (5-15s).
+        # Previously used remaining * 0.6 which left 40% unused — compose runs
+        # INSIDE _handle_workspace_action(), not after it.  Now: remaining - margin.
+        execute_cap = float(os.getenv("JARVIS_EXECUTE_CAP_SECONDS", "40.0"))
+        delivery_margin = float(
+            os.getenv("JARVIS_DELIVERY_MARGIN_SECONDS", "3.0")
+        )
         if deadline is not None:
             remaining = deadline - time.monotonic()
-            delivery_margin = float(
-                os.getenv("JARVIS_DELIVERY_MARGIN_SECONDS", "3.0")
-            )
-            execute_timeout = min(remaining * 0.6, execute_cap)
+            execute_timeout = min(remaining - delivery_margin, execute_cap)
             # Ensure enough budget for at least execution + delivery
-            if execute_timeout < 2.0:
+            if execute_timeout < 5.0:
                 logger.info(
-                    "[v281] Fast-path budget too low for execution: %.1fs", remaining,
+                    "[v281] Fast-path budget too low for execution: %.1fs remaining, "
+                    "need at least %.1fs", remaining, 5.0 + delivery_margin,
                 )
                 return None
         else:
             execute_timeout = execute_cap
+
+        _fp_start = time.monotonic()
+        logger.info(
+            "[v281] Fast-path executing: timeout=%.1fs remaining=%.1fs action=%s",
+            execute_timeout,
+            (deadline - time.monotonic()) if deadline else execute_timeout,
+            suggested_action,
+        )
 
         try:
             result = await asyncio.wait_for(
@@ -2711,15 +2724,26 @@ class UnifiedCommandProcessor:
                 ),
                 timeout=execute_timeout,
             )
+            _fp_elapsed = time.monotonic() - _fp_start
+            logger.info(
+                "[v281] Fast-path completed in %.1fs (budget was %.1fs)",
+                _fp_elapsed, execute_timeout,
+            )
             if isinstance(result, dict):
                 result.setdefault("source", "workspace_fast_path")
                 result["command_id"] = command_id
                 result["fast_path"] = True
+                result["execution_time_s"] = round(_fp_elapsed, 2)
             return result
         except asyncio.TimeoutError:
+            _fp_elapsed = time.monotonic() - _fp_start
             logger.warning(
-                "[v281] Workspace fast-path execution timed out after %.1fs",
+                "[v281] Workspace fast-path execution timed out after %.1fs "
+                "(budget=%.1fs, remaining=%.1fs, action=%s)",
+                _fp_elapsed,
                 execute_timeout,
+                (deadline - time.monotonic()) if deadline else 0,
+                suggested_action,
             )
             return {
                 "success": False,
@@ -2728,6 +2752,8 @@ class UnifiedCommandProcessor:
                 "error": "deadline_exceeded",
                 "source": "workspace_fast_path",
                 "command_id": command_id,
+                "elapsed_s": round(_fp_elapsed, 2),
+                "budget_s": round(execute_timeout, 2),
             }
         except Exception as e:
             logger.warning("[v281] Workspace fast-path failed: %s", e)
@@ -3058,6 +3084,8 @@ class UnifiedCommandProcessor:
         """
         import time as _time
 
+        _ws_action_start = _time.monotonic()
+
         if deadline:
             _remaining = deadline - _time.monotonic()
             if _remaining <= 0:
@@ -3074,6 +3102,7 @@ class UnifiedCommandProcessor:
             if agent is None:
                 # Lazy singleton fallback with lock to prevent concurrent double-init.
                 if self._workspace_agent_singleton is None:
+                    _init_start = _time.monotonic()
                     async with self._workspace_agent_singleton_lock:
                         if self._workspace_agent_singleton is None:
                             try:
@@ -3081,9 +3110,15 @@ class UnifiedCommandProcessor:
                                 _agent = GoogleWorkspaceAgent()
                                 await _agent.on_initialize()
                                 self._workspace_agent_singleton = _agent
+                                logger.info(
+                                    "[v281] GoogleWorkspaceAgent initialized in %.1fs",
+                                    _time.monotonic() - _init_start,
+                                )
                             except Exception:
                                 logger.warning(
-                                    "[v266] GoogleWorkspaceAgent initialization failed",
+                                    "[v266] GoogleWorkspaceAgent initialization failed "
+                                    "(%.1fs elapsed)",
+                                    _time.monotonic() - _init_start,
                                     exc_info=True,
                                 )
                                 self._workspace_agent_singleton = None
@@ -3511,6 +3546,14 @@ class UnifiedCommandProcessor:
                     pending.clear()
                     break
 
+            _dag_elapsed = _time.monotonic() - _ws_action_start
+            logger.info(
+                "[v281] DAG execution completed in %.1fs (%d nodes, remaining=%.1fs)",
+                _dag_elapsed,
+                len(node_outcomes),
+                (deadline - _time.monotonic()) if deadline else -1,
+            )
+
             summaries: List[str] = []
             has_error = False
             last_error_dict: Optional[Dict[str, Any]] = None
@@ -3590,6 +3633,7 @@ class UnifiedCommandProcessor:
                     _r = _o.get("result", {}) or {}
                     _artifacts.update(_r)
 
+                _compose_start = _time.monotonic()
                 composed_response = await self._compose_workspace_response(
                     command_text=original_command or command_text,
                     artifacts=_artifacts,
@@ -3600,7 +3644,14 @@ class UnifiedCommandProcessor:
                     workspace_action=_ws_action,
                     confidence=getattr(response, "confidence", 0.0),
                 )
+                _compose_elapsed = _time.monotonic() - _compose_start
                 lifecycle_state = "completed" if composed_response else "fallback_completed"
+                logger.info(
+                    "[v281] Compose phase: %s in %.1fs (total elapsed=%.1fs)",
+                    "composed" if composed_response else "fallback",
+                    _compose_elapsed,
+                    _time.monotonic() - _ws_action_start,
+                )
 
             final_response = composed_response if composed_response else combined
 
