@@ -1847,10 +1847,18 @@ class UnifiedCommandProcessor:
         if intent in ("check_email", "fetch_unread_emails"):
             # Check for auth/API errors first — never mask as "no unread"
             if result.get("error"):
+                error_str = str(result["error"])
                 action_required = result.get("action_required", "")
                 if action_required:
-                    return f"Email check failed: {result['error']}. Action: {action_required}"
-                return f"Email check failed: {result['error']}"
+                    return f"Email check failed: {error_str}. Action: {action_required}"
+                # v281.1: User-friendly message for timeout errors
+                if error_str == "deadline_exceeded":
+                    _timeout_s = result.get("timeout_s", "?")
+                    return (
+                        f"Email check timed out after {_timeout_s}s. "
+                        "The system may be under heavy load. Please try again."
+                    )
+                return f"Email check failed: {error_str}"
             count = result.get("count", 0)
             total = result.get("total_unread", count)
             if count == 0:
@@ -3285,6 +3293,18 @@ class UnifiedCommandProcessor:
             def _node_status_satisfies_dependencies(status: str) -> bool:
                 return status in {"success", "duplicate"}
 
+            # v281.1: Pre-compute DAG context for adaptive timeout
+            _total_pending_nodes = len(plan_nodes)
+            # Reserve budget for post-DAG compose when requested.
+            # compose needs min 5s + 3s delivery margin = 8s.
+            # If compose is disabled or won't be attempted, reserve only 2s
+            # for summarization + response delivery.
+            _compose_min = float(os.getenv("JARVIS_COMPOSE_MIN_BUDGET_SECONDS", "5.0"))
+            _delivery_margin = float(os.getenv("JARVIS_DELIVERY_MARGIN_SECONDS", "3.0"))
+            _post_dag_reserve = (
+                (_compose_min + _delivery_margin) if compose_with_jprime else 2.0
+            )
+
             async def _execute_workspace_node(node: Dict[str, Any]) -> Dict[str, Any]:
                 node_id = node["node_id"]
                 action = node["action"]
@@ -3305,7 +3325,35 @@ class UnifiedCommandProcessor:
                 else:
                     remaining = default_timeout_s
 
-                per_node_timeout_s = max(1.0, min(node["timeout_ms"] / 1000.0, remaining))
+                # v281.1: Adaptive per-node timeout — scale with remaining budget.
+                # The old fixed `min(6.0, remaining)` was too tight under CPU
+                # pressure — a 2s Gmail API call takes 10-15s when the event loop
+                # is starved by model loading / startup work.
+                #
+                # New strategy: give the node the LARGER of its configured timeout
+                # and a proportional share of remaining budget.  For single-node
+                # DAGs (the common "check my email" case), this means the node
+                # gets nearly the full budget instead of an arbitrary 6s.
+                _configured_timeout = node["timeout_ms"] / 1000.0
+                _pending_count = max(1, _total_pending_nodes - len(node_outcomes))
+                # Each node gets a fair share of remaining budget minus
+                # the post-DAG reserve (compose + delivery or just delivery).
+                _dag_budget = max(1.0, remaining - _post_dag_reserve)
+                _per_node_share = max(1.0, _dag_budget / _pending_count)
+                per_node_timeout_s = max(
+                    1.0,
+                    min(
+                        max(_configured_timeout, _per_node_share),
+                        _dag_budget,  # Never exceed total DAG budget
+                    ),
+                )
+                logger.debug(
+                    "[v281] Node %s (%s): timeout=%.1fs (configured=%.1fs, "
+                    "share=%.1fs, remaining=%.1fs, pending=%d)",
+                    node_id, action, per_node_timeout_s,
+                    _configured_timeout, _per_node_share,
+                    remaining, _pending_count,
+                )
                 idempotency_key = f"{correlation_id}:{node_id}:{action}"
                 operation_token: Optional[str] = None
 
@@ -3412,11 +3460,13 @@ class UnifiedCommandProcessor:
                     "upstream_outputs": dict(artifacts),
                 }
 
+                _node_exec_start = _time.monotonic()
                 try:
                     raw_result = await asyncio.wait_for(
                         agent.execute_task(payload),
                         timeout=per_node_timeout_s,
                     )
+                    _node_elapsed = _time.monotonic() - _node_exec_start
                     result_dict = raw_result if isinstance(raw_result, dict) else {
                         "response": str(raw_result),
                         "workspace_action": action,
@@ -3426,6 +3476,10 @@ class UnifiedCommandProcessor:
                         complete_tracked_operation(operation_token)
 
                     status = "failed" if result_dict.get("error") else "success"
+                    logger.info(
+                        "[v281] Node %s (%s): %s in %.1fs",
+                        node_id, action, status, _node_elapsed,
+                    )
                     return {
                         "node_id": node_id,
                         "action": action,
@@ -3435,10 +3489,22 @@ class UnifiedCommandProcessor:
                         "result": result_dict,
                     }
                 except asyncio.TimeoutError:
+                    _node_elapsed = _time.monotonic() - _node_exec_start
                     if operation_token:
                         fail_tracked_operation(operation_token)
-                    result_dict = {"error": "deadline_exceeded", "skipped": True, "workspace_action": action}
-                    logger.warning(f"[workspace-dag] Action '{action}' timed out")
+                    result_dict = {
+                        "error": "deadline_exceeded",
+                        "skipped": True,
+                        "workspace_action": action,
+                        "timeout_s": round(per_node_timeout_s, 1),
+                        "elapsed_s": round(_node_elapsed, 1),
+                    }
+                    logger.warning(
+                        "[workspace-dag] Action '%s' timed out after %.1fs "
+                        "(budget=%.1fs, remaining=%.1fs)",
+                        action, _node_elapsed, per_node_timeout_s,
+                        (deadline - _time.monotonic()) if deadline else 0,
+                    )
                     return {
                         "node_id": node_id,
                         "action": action,
@@ -3448,9 +3514,13 @@ class UnifiedCommandProcessor:
                         "result": result_dict,
                     }
                 except Exception as exc:
+                    _node_elapsed = _time.monotonic() - _node_exec_start
                     if operation_token:
                         fail_tracked_operation(operation_token)
-                    logger.warning(f"[workspace-dag] Action '{action}' failed: {exc}")
+                    logger.warning(
+                        "[workspace-dag] Action '%s' failed after %.1fs: %s",
+                        action, _node_elapsed, exc,
+                    )
                     return {
                         "node_id": node_id,
                         "action": action,

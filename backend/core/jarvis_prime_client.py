@@ -1227,7 +1227,7 @@ class JarvisPrimeClient:
                         backend=f"unified:{response.provider.value}",
                         latency_ms=response.latency_ms,
                         tokens_used=response.tokens_used,
-                        cost_usd=response.estimated_cost_usd,
+                        cost_estimate=getattr(response, "estimated_cost_usd", 0.0),
                     )
 
                     if enrichment_metadata:
