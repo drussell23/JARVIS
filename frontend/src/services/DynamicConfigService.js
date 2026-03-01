@@ -195,7 +195,10 @@ class DynamicConfigService {
       // 8010 is the default BACKEND_PORT, followed by common alternatives
       ports: this._inferPorts(),
       // Ports to skip (system services, loading servers)
-      excludedPorts: new Set([5000, 5001, 3001, 8001]),
+      // v281.0: Added 8080-8089 — loading server port range (LOADING_SERVER_PORT_RANGE in supervisor).
+      // The loading server responds to /health with status fields that fool _isJarvisBackend().
+      // Commands sent to loading server WebSocket are silently ignored (it only streams progress).
+      excludedPorts: new Set([5000, 5001, 3001, 8001, 8080, 8081, 8082, 8083, 8084, 8085, 8086, 8087, 8088, 8089]),
       // Timeouts - increased for more reliable discovery
       portScanTimeout: 500,        // Increased from 300ms
       healthCheckTimeout: 5000,    // Increased from 2000ms for slow cold starts
@@ -267,7 +270,8 @@ class DynamicConfigService {
     const envPort = typeof process !== 'undefined' && process.env?.REACT_APP_BACKEND_PORT;
     
     // Priority-ordered list - most likely ports first
-    const priorityPorts = [8010, 8000, 8080, 8888, 9000, 9090];
+    // v281.0: Removed 8080 — that's the loading server, not the backend
+    const priorityPorts = [8010, 8000, 8888, 9000, 9090];
     
     if (envPort) {
       const port = parseInt(envPort, 10);
@@ -527,6 +531,11 @@ class DynamicConfigService {
 
   _isJarvisBackend(data) {
     if (!data) return false;
+
+    // v281.0: Reject loading server — it responds to /health but doesn't process commands.
+    // Its WebSocket handler only streams startup progress, silently ignoring command frames.
+    if (data.service === 'loading_server') return false;
+
     const dataStr = JSON.stringify(data).toLowerCase();
     return this.servicePatterns.backend.identifiers.some(id => dataStr.includes(id));
   }

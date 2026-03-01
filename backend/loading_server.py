@@ -1977,9 +1977,14 @@ class LoadingServer:
             return self._json_response({"error": "Not found"}, status=404)
 
     def _get_health_response(self) -> Dict[str, Any]:
-        """Generate health response."""
+        """Generate health response.
+
+        v281.0: Added 'service' field so frontend DynamicConfigService can
+        distinguish the loading server from the real JARVIS backend.
+        """
         state = self.get_supervisor_state()
         return {
+            "service": "loading_server",
             "status": "healthy" if state.get("pid") else "starting",
             "uptime": round(time.time() - self._startup_time, 2),
             "supervisor": {
