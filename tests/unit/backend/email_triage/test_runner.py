@@ -249,8 +249,8 @@ class TestTriageCache:
         await runner.run_cycle()
         assert runner._last_report is not None
 
-        # Artificially age the report
-        runner._last_report_at = time.monotonic() - 300.0
+        # Artificially age the committed snapshot
+        runner._committed_snapshot["committed_at"] = time.monotonic() - 300.0
         result = runner.get_fresh_results(staleness_window_s=120.0)
         assert result is None
 

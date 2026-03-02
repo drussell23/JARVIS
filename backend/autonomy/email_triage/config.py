@@ -84,6 +84,9 @@ class TriageConfig:
     # Staleness
     staleness_window_s: float = 120.0
 
+    # Commit policy
+    commit_error_threshold: float = 0.5
+
     # Notification delivery
     notification_budget_s: float = 10.0
     summary_budget_s: float = 5.0
@@ -113,6 +116,7 @@ class TriageConfig:
             dep_backoff_base_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_BASE_S", 5.0),
             dep_backoff_max_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_MAX_S", 300.0),
             staleness_window_s=_env_float("EMAIL_TRIAGE_STALENESS_WINDOW_S", 120.0),
+            commit_error_threshold=_env_float("EMAIL_TRIAGE_COMMIT_ERROR_THRESHOLD", 0.5),
             notification_budget_s=_env_float("EMAIL_TRIAGE_NOTIFICATION_BUDGET_S", 10.0),
             summary_budget_s=_env_float("EMAIL_TRIAGE_SUMMARY_BUDGET_S", 5.0),
             immediate_flush_threshold=_env_int("EMAIL_TRIAGE_IMMEDIATE_FLUSH_THRESHOLD", 10),

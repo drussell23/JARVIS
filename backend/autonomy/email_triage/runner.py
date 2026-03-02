@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from dataclasses import replace
 from typing import Any, ClassVar, Dict, List, Optional
 from uuid import uuid4
 
@@ -25,6 +26,7 @@ from autonomy.email_triage.events import (
     EVENT_EMAIL_TRIAGED,
     EVENT_CYCLE_COMPLETED,
     EVENT_TRIAGE_ERROR,
+    EVENT_SNAPSHOT_PRESERVED,
 )
 from autonomy.email_triage.extraction import extract_features
 from autonomy.email_triage.labels import apply_label, ensure_labels_exist
@@ -64,6 +66,7 @@ class EmailTriageRunner:
         self._triaged_emails: Dict[str, TriagedEmail] = {}
         self._report_lock = asyncio.Lock()
         self._triage_schema_version: str = "1.0"
+        self._committed_snapshot: Optional[Dict[str, Any]] = None
 
     @classmethod
     def get_instance(cls, **kwargs) -> EmailTriageRunner:
@@ -256,11 +259,41 @@ class EmailTriageRunner:
             errors=errors,
         )
 
-        # Commit triage snapshot atomically (partial-cycle semantics)
-        async with self._report_lock:
-            self._last_report = report
-            self._last_report_at = time.monotonic()
-            self._triaged_emails = new_triaged
+        # Commit policy gate — preserve prior snapshot on degraded cycles
+        should_commit, commit_reason = self._should_commit_snapshot(report, new_triaged)
+
+        if should_commit:
+            committed_at = time.monotonic()
+            async with self._report_lock:
+                self._last_report = report
+                self._last_report_at = committed_at
+                self._triaged_emails = new_triaged
+                # Pre-built snapshot for GIL-atomic reads (defensive copy)
+                self._committed_snapshot = {
+                    "report": report,
+                    "triaged_emails": dict(new_triaged),
+                    "schema_version": self._triage_schema_version,
+                    "committed_at": committed_at,
+                }
+            report = replace(report, snapshot_committed=True)
+        else:
+            report = replace(
+                report, degraded=True, degraded_reason=commit_reason,
+                snapshot_committed=False,
+            )
+            prior_id = self._last_report.cycle_id if self._last_report else None
+            emit_triage_event(EVENT_SNAPSHOT_PRESERVED, {
+                "cycle_id": cycle_id,
+                "reason": commit_reason,
+                "prior_cycle_id": prior_id,
+                "emails_fetched": emails_fetched,
+                "emails_processed": emails_processed,
+                "error_count": len(errors),
+            })
+            logger.info(
+                "Snapshot preserved (prior %s): reason=%s, fetched=%d, processed=%d, errors=%d",
+                prior_id or "none", commit_reason, emails_fetched, emails_processed, len(errors),
+            )
 
         return report
 
@@ -284,21 +317,71 @@ class EmailTriageRunner:
             if gmail_svc:
                 await apply_label(gmail_svc, message_id, label_name, self._label_map)
 
+    def _should_commit_snapshot(
+        self,
+        report: TriageCycleReport,
+        new_triaged: Dict[str, TriagedEmail],
+    ) -> tuple:
+        """Decide whether this cycle's results should replace the current snapshot.
+
+        Returns (should_commit: bool, reason: str).
+
+        Policy:
+        - Skipped cycles never commit.
+        - Cold-start with required dep unavailable: don't commit
+          (blocker #1: workspace_agent unresolved means we can't trust
+          the empty result — distinct from a legit empty inbox).
+        - No prior with actual data: always commit (partial beats nothing).
+        - Empty triaged when prior had data: regression, don't commit.
+        - Error ratio > threshold: degraded, don't commit.
+        """
+        if report.skipped:
+            return False, "skipped"
+
+        has_prior = self._committed_snapshot is not None and len(
+            self._committed_snapshot.get("triaged_emails", {})
+        ) > 0
+
+        # Cold-start false-truth prevention (blocker #1):
+        # Only block when required dependency (workspace_agent) was unavailable.
+        # A legit empty inbox (fetch succeeded, 0 emails) IS valid truth.
+        if not has_prior and self._resolver.get("workspace_agent") is None:
+            return False, "cold_start_dep_unavailable"
+
+        # No prior with actual data => always commit
+        if not has_prior:
+            return True, "no_prior_snapshot"
+
+        # Empty triaged when prior had data => regression
+        if len(new_triaged) == 0:
+            return False, "empty_triaged_regression"
+
+        # Error ratio: count processing errors vs fetched
+        if report.emails_fetched > 0:
+            process_errors = sum(1 for e in report.errors if e.startswith("process:"))
+            error_ratio = process_errors / report.emails_fetched
+            if error_ratio > self._config.commit_error_threshold:
+                return False, f"error_ratio:{error_ratio:.2f}"
+
+        return True, "healthy"
+
     def get_fresh_results(
         self, staleness_window_s: Optional[float] = None,
     ) -> Optional[TriageCycleReport]:
         """Return last report if within staleness window, else None."""
-        if self._last_report is None:
+        snapshot = self._committed_snapshot
+        if snapshot is None:
             return None
         window = (
             staleness_window_s
             if staleness_window_s is not None
             else self._config.staleness_window_s
         )
-        age = time.monotonic() - self._last_report_at
+        committed_at = snapshot.get("committed_at", 0.0)
+        age = time.monotonic() - committed_at
         if age > window:
             return None
-        return self._last_report
+        return snapshot.get("report")
 
     def get_triage_snapshot(
         self,
@@ -306,28 +389,35 @@ class EmailTriageRunner:
     ) -> Optional[Dict[str, Any]]:
         """Return an atomic snapshot of the last triage cycle.
 
-        All fields are read together to prevent tearing under concurrent
-        writes from ``run_cycle()``.  Returns None when stale or empty.
+        Reads a single pre-built dict reference (GIL-atomic) to prevent
+        tearing under concurrent writes from run_cycle().
+
+        Returns defensive copies so callers cannot mutate internal truth.
         """
-        report = self._last_report
-        report_at = self._last_report_at
-        if report is None or report_at == 0.0:
+        snapshot = self._committed_snapshot
+        if snapshot is None:
             return None
         window = (
             staleness_window_s
             if staleness_window_s is not None
             else self._config.staleness_window_s
         )
-        age = time.monotonic() - report_at
+        committed_at = snapshot.get("committed_at", 0.0)
+        age = time.monotonic() - committed_at
         if age > window:
             return None
+        # Defensive copy: shallow-copy triaged_emails so callers can't mutate
         return {
-            "report": report,
-            "triaged_emails": dict(self._triaged_emails),
-            "schema_version": self._triage_schema_version,
+            "report": snapshot["report"],
+            "triaged_emails": dict(snapshot["triaged_emails"]),
+            "schema_version": snapshot["schema_version"],
+            "committed_at": committed_at,
             "age_s": age,
         }
 
     def get_triaged_email(self, message_id: str) -> Optional[TriagedEmail]:
         """Return a single triaged email by message ID, or None."""
-        return self._triaged_emails.get(message_id)
+        snapshot = self._committed_snapshot
+        if snapshot is None:
+            return None
+        return snapshot.get("triaged_emails", {}).get(message_id)

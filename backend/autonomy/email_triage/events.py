@@ -24,6 +24,7 @@ EVENT_TRIAGE_ERROR = "triage_error"
 EVENT_DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
 EVENT_DEPENDENCY_DEGRADED = "dependency_degraded"
 EVENT_NOTIFICATION_DELIVERY_RESULT = "notification_delivery_result"
+EVENT_SNAPSHOT_PRESERVED = "snapshot_preserved"
 
 _ERROR_EVENTS = frozenset({EVENT_TRIAGE_ERROR, EVENT_DEPENDENCY_UNAVAILABLE})
 

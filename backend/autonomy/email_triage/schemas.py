@@ -63,7 +63,7 @@ class TriagedEmail:
     processed_at: float
 
 
-@dataclass
+@dataclass(frozen=True)
 class TriageCycleReport:
     """Summary of a single triage cycle."""
 
@@ -80,3 +80,7 @@ class TriageCycleReport:
     skip_reason: Optional[str] = None
     triage_schema_version: str = "1.0"
     policy_version: str = "v1"
+    # Commit policy metadata (v1.1.1)
+    degraded: bool = False
+    degraded_reason: Optional[str] = None
+    snapshot_committed: bool = True
