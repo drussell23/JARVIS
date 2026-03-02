@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 _neural_mesh_coordinator = None
 _crew_manager = None
 _initialized = False
+_production_agents_registered: Dict[str, frozenset] = {}
 
 
 @dataclass
@@ -277,8 +278,44 @@ async def shutdown_neural_mesh():
 
 
 def get_neural_mesh_coordinator():
-    """Get the global Neural Mesh coordinator instance."""
-    return _neural_mesh_coordinator
+    """Get the global coordinator — canonical accessor.
+    Checks integration module singleton first, falls back to coordinator module singleton."""
+    if _neural_mesh_coordinator is not None:
+        return _neural_mesh_coordinator
+    try:
+        from neural_mesh.neural_mesh_coordinator import _coordinator as _cm_coordinator
+        if _cm_coordinator is not None and getattr(_cm_coordinator, '_running', False):
+            return _cm_coordinator
+    except (ImportError, Exception):
+        pass
+    return None
+
+
+def set_neural_mesh_coordinator(coordinator) -> None:
+    """Set the canonical coordinator reference. Called by AGI OS after start_neural_mesh()."""
+    global _neural_mesh_coordinator
+    _neural_mesh_coordinator = coordinator
+    logger.info("[integration] Coordinator cross-registered: %s", type(coordinator).__name__ if coordinator else "None")
+
+
+def mark_neural_mesh_initialized(initialized: bool = True) -> None:
+    """Mark integration module's initialized flag."""
+    global _initialized
+    _initialized = initialized
+
+
+def _is_agent_set_registered(coordinator_id: str, agent_names: set) -> bool:
+    """Check if agent set was already registered for this coordinator instance."""
+    registered = _production_agents_registered.get(coordinator_id)
+    if registered is None:
+        return False
+    return agent_names.issubset(registered)
+
+
+def _mark_agent_set_registered(coordinator_id: str, agent_names: set) -> None:
+    """Record that agent set was registered for coordinator instance."""
+    existing = _production_agents_registered.get(coordinator_id, frozenset())
+    _production_agents_registered[coordinator_id] = existing | frozenset(agent_names)
 
 
 def get_crew_manager():
