@@ -2749,13 +2749,14 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
             if (
                 self.vision_manager
                 and hasattr(self.vision_manager, "vision_analyzer")
-                and self.vision_manager.vision_analyzer
+                and getattr(self.vision_manager, "get_vision_analyzer", None)
+                and self.vision_manager.get_vision_analyzer()
             ):
                 # Use enhanced capture with multi-space support WITH TIMEOUT
                 logger.info(f"[VISION-CAPTURE] Starting screen capture (multi_space={multi_space}, space_number={space_number})")
                 try:
                     screenshot = await asyncio.wait_for(
-                        self.vision_manager.vision_analyzer.capture_screen(
+                        self.vision_manager.capture_screen(
                             multi_space=multi_space, space_number=space_number
                         ),
                         timeout=15.0  # 15 second timeout for screen capture
@@ -2764,6 +2765,9 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
                     return screenshot
                 except asyncio.TimeoutError:
                     logger.error(f"[VISION-CAPTURE] ❌ Screen capture timed out after 15 seconds")
+                    return None
+                except Exception as e:
+                    logger.error(f"[VISION-CAPTURE] ❌ Vision manager capture failed: {e}")
                     return None
             else:
                 # Try to capture screen directly as fallback
@@ -2844,9 +2848,14 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
                 
                 # Check if vision_analyzer needs initialization
                 if hasattr(vision_manager, "vision_analyzer"):
-                    if vision_manager.vision_analyzer is None:
+                    current_analyzer = (
+                        vision_manager.get_vision_analyzer()
+                        if hasattr(vision_manager, "get_vision_analyzer")
+                        else getattr(vision_manager, "vision_analyzer", None)
+                    )
+                    if current_analyzer is None:
                         logger.info(
-                            "[VISION INIT] Vision analyzer is None, checking app state..."
+                            "[VISION INIT] Vision analyzer missing or invalid, checking app state..."
                         )
                         # Try to get from app state
                         try:
@@ -2861,7 +2870,7 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
                             from main import app
 
                             if hasattr(app.state, "vision_analyzer"):
-                                vision_manager.vision_analyzer = (
+                                vision_manager.set_vision_analyzer(
                                     app.state.vision_analyzer
                                 )
                                 logger.info(
@@ -2874,14 +2883,18 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
                         
                         # If still None and we have our own vision analyzer, use that
                         if (
-                            vision_manager.vision_analyzer is None
+                            (
+                                vision_manager.get_vision_analyzer()
+                                if hasattr(vision_manager, "get_vision_analyzer")
+                                else getattr(vision_manager, "vision_analyzer", None)
+                            ) is None
                             and hasattr(self, "vision_analyzer")
                             and self.vision_analyzer
                         ):
-                            vision_manager.vision_analyzer = self.vision_analyzer
-                            logger.info(
-                                "[VISION INIT] Set vision analyzer from handler"
-                            )
+                            if vision_manager.set_vision_analyzer(self.vision_analyzer):
+                                logger.info(
+                                    "[VISION INIT] Set vision analyzer from handler"
+                                )
                     else:
                         logger.info("[VISION INIT] Vision analyzer already set")
                         

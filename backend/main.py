@@ -7723,10 +7723,12 @@ def mount_routers():
         except Exception as e:
             logger.error(f"Error mounting notification router: {e}")
             
-        # Set vision analyzer if available
-        vision = components.get("vision", {})
-        if vision and vision.get("analyzer"):
-            set_vision_analyzer(vision["analyzer"])
+        # Publish the initialized analyzer instance, never the analyzer class.
+        analyzer_instance = getattr(app.state, "vision_analyzer", None)
+        if analyzer_instance is not None:
+            set_vision_analyzer(analyzer_instance)
+        else:
+            logger.info("Vision analyzer instance not initialized yet; websocket manager left unbound")
 
         logger.info("✅ Vision WebSocket endpoint mounted at /vision/ws/vision")
     except ImportError as e:

@@ -2248,10 +2248,32 @@ class GoogleWorkspaceClient:
             return False
 
     async def _ensure_authenticated(self) -> bool:
-        """Ensure client is authenticated."""
+        """Ensure client is authenticated AND token is valid/fresh.
+
+        The critical distinction: ``_authenticated`` is a cached flag set once
+        during initial credential load.  Tokens expire independently of that
+        flag (typically after 1 hour).  We must validate the token on every
+        call so that expired-but-refreshable tokens are transparently renewed
+        instead of hitting the API with stale credentials — which would
+        cascade into a permanent NEEDS_REAUTH state.
+        """
         if self._auth_state == AuthState.NEEDS_REAUTH:
             return False
         if not self._authenticated:
+            return await self.authenticate(interactive=False)
+        # Token was loaded at some point — verify it's still valid and
+        # proactively refresh if expired or nearing expiry.
+        if not await self._ensure_valid_token():
+            # _ensure_valid_token sets NEEDS_REAUTH on permanent failure.
+            # For transient failures (e.g. network blip during refresh),
+            # attempt a full re-authentication cycle once before giving up.
+            if self._auth_state == AuthState.NEEDS_REAUTH:
+                return False
+            logger.warning(
+                "[GoogleWorkspaceClient] Token validation failed but not permanent "
+                "— attempting full re-authentication",
+            )
+            self._authenticated = False
             return await self.authenticate(interactive=False)
         return True
 

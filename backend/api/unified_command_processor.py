@@ -2870,14 +2870,18 @@ class UnifiedCommandProcessor:
         intent_value = getattr(getattr(detection, "intent", None), "value", "unknown")
         action_map = {
             "check_email": "fetch_unread_emails",
+            "read_email": "fetch_unread_emails",
             "search_email": "search_email",
             "draft_email": "draft_email_reply",
             "send_email": "send_email",
             "check_calendar": "check_calendar_events",
             "create_event": "create_calendar_event",
+            "list_events": "check_calendar_events",
             "get_contacts": "get_contacts",
+            "search_contacts": "get_contacts",
             "create_document": "create_document",
             "workspace_summary": "workspace_summary",
+            "daily_briefing": "workspace_summary",
         }
         suggested_action = action_map.get(intent_value, "handle_workspace_query")
 
@@ -2947,19 +2951,30 @@ class UnifiedCommandProcessor:
             return None
 
         # Guardrail 15: Drift guard — validate allowlisted intents on first call
+        # by checking against the ACTUAL action_map used at runtime (lines 3020-3032),
+        # not a manually-maintained shadow set.
         if not self._fastpath_validated:
             self._fastpath_validated = True
-            # Reuse the same action_map from _attempt_workspace_failover
-            _known_actions = {
-                "check_email", "search_email", "draft_email", "send_email",
-                "check_calendar", "create_event", "get_contacts",
-                "create_document", "workspace_summary",
+            _runtime_action_map = {
+                "check_email": "fetch_unread_emails",
+                "read_email": "fetch_unread_emails",
+                "search_email": "search_email",
+                "draft_email": "draft_email_reply",
+                "send_email": "send_email",
+                "check_calendar": "check_calendar_events",
+                "create_event": "create_calendar_event",
+                "list_events": "check_calendar_events",
+                "get_contacts": "get_contacts",
+                "search_contacts": "get_contacts",
+                "create_document": "create_document",
+                "workspace_summary": "workspace_summary",
+                "daily_briefing": "workspace_summary",
             }
             for intent in self._FASTPATH_ALLOWED_INTENTS:
-                if intent not in _known_actions:
+                if intent not in _runtime_action_map:
                     logger.warning(
                         "[v281] Drift guard: intent '%s' in allowlist has no "
-                        "mapped action in _attempt_workspace_failover — disabling",
+                        "mapped action in runtime action_map — disabling",
                         intent,
                     )
                     self._fastpath_disabled_intents.add(intent)
