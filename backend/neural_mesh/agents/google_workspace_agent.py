@@ -64,6 +64,7 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections import namedtuple
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, date
 from enum import Enum
@@ -129,6 +130,26 @@ except ImportError:
 
 
 # =============================================================================
+# Degraded-State User Messages
+# =============================================================================
+
+_DEGRADED_MESSAGES: Dict[Tuple[str, str], str] = {
+    ("degraded_visual", "read"): (
+        "Using visual fallback \u2014 Google API auth is being refreshed. "
+        "Results may be slower than usual."
+    ),
+    ("needs_reauth_guided", "read"): (
+        "Your Google auth needs renewal. I fetched your email visually, but "
+        "say 'fix my Google auth' or re-run the setup script for full API access."
+    ),
+    ("needs_reauth_guided", "write"): (
+        "I can't send emails right now \u2014 Google auth needs renewal. "
+        "Say 'fix my Google auth' or re-run the setup script."
+    ),
+}
+
+
+# =============================================================================
 # v3.1: Per-API Circuit Breaker with Adaptive Recovery
 # =============================================================================
 
@@ -143,10 +164,40 @@ class CircuitState:
 
 
 class AuthState(str, Enum):
-    """Authentication state for Google Workspace client."""
+    """Authentication state for Google Workspace client.
+
+    5-state machine with visual fallback support:
+
+        UNAUTHENTICATED ──(credentials_loaded)──> AUTHENTICATED
+        AUTHENTICATED ──(token_expired)──> REFRESHING
+        REFRESHING ──(refresh_success)──> AUTHENTICATED
+        REFRESHING ──(permanent_failure)──> DEGRADED_VISUAL
+        DEGRADED_VISUAL ──(write_action)──> NEEDS_REAUTH_GUIDED
+        DEGRADED_VISUAL ──(api_probe_success)──> AUTHENTICATED
+        NEEDS_REAUTH_GUIDED ──(token_healed)──> UNAUTHENTICATED
+    """
     UNAUTHENTICATED = "unauthenticated"
     AUTHENTICATED = "authenticated"
-    NEEDS_REAUTH = "needs_reauth"  # Permanent failure — interactive OAuth required
+    REFRESHING = "refreshing"
+    DEGRADED_VISUAL = "degraded_visual"
+    NEEDS_REAUTH_GUIDED = "needs_reauth_guided"
+    # Legacy alias — existing code using AuthState.NEEDS_REAUTH continues to work
+    NEEDS_REAUTH = "needs_reauth_guided"
+
+
+AuthTransition = namedtuple(
+    "AuthTransition", ["from_state", "event", "to_state", "reason_code"]
+)
+
+_AUTH_TRANSITIONS = [
+    AuthTransition("authenticated", "token_expired", "refreshing", "auth_refreshing"),
+    AuthTransition("refreshing", "refresh_success", "authenticated", "auth_healthy"),
+    AuthTransition("refreshing", "transient_failure", "refreshing", "auth_refresh_transient_fail"),
+    AuthTransition("refreshing", "permanent_failure", "degraded_visual", "auth_refresh_permanent_fail"),
+    AuthTransition("degraded_visual", "write_action", "needs_reauth_guided", "auth_guided_recovery"),
+    AuthTransition("degraded_visual", "api_probe_success", "authenticated", "auth_auto_healed"),
+    AuthTransition("needs_reauth_guided", "token_healed", "unauthenticated", "auth_auto_healed"),
+]
 
 
 class TokenHealthStatus(str, Enum):
@@ -676,6 +727,33 @@ _AUTH_ERROR_MESSAGES = {
     "access_denied": "Access denied by Google",
 }
 
+# =============================================================================
+# Action Risk Classification
+# =============================================================================
+
+_ACTION_RISK: Dict[str, str] = {
+    "fetch_unread_emails": "read",
+    "check_calendar_events": "read",
+    "search_email": "read",
+    "get_contacts": "read",
+    "workspace_summary": "read",
+    "daily_briefing": "read",
+    "handle_workspace_query": "read",
+    "read_spreadsheet": "read",
+    "send_email": "write",
+    "draft_email_reply": "write",
+    "create_calendar_event": "write",
+    "create_document": "write",
+    "write_spreadsheet": "write",
+    "delete_email": "high_risk_write",
+    "delete_event": "high_risk_write",
+}
+
+
+def _classify_action_risk(action: str) -> str:
+    """Classify workspace action risk level. Unknown defaults to write."""
+    return _ACTION_RISK.get(action, "write")
+
 
 @dataclass
 class GoogleWorkspaceConfig:
@@ -709,10 +787,16 @@ class GoogleWorkspaceConfig:
             str(Path.home() / '.jarvis' / 'google_workspace_token.json')
         )
     )
-    # Gmail reads should use the authoritative API path unless visual mode is explicit.
+    # Gmail reads fall back to visual automation when API auth is degraded.
     email_visual_fallback_enabled: bool = field(
         default_factory=lambda: os.getenv(
-            "JARVIS_WORKSPACE_EMAIL_VISUAL_FALLBACK", "false"
+            "JARVIS_WORKSPACE_EMAIL_VISUAL_FALLBACK", "true"
+        ).lower() in {"1", "true", "yes"}
+    )
+    # Write operations via visual automation are high-risk — opt-in only.
+    write_visual_fallback_enabled: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_WORKSPACE_WRITE_VISUAL_FALLBACK", "false"
         ).lower() in {"1", "true", "yes"}
     )
     # Email defaults
@@ -2946,7 +3030,7 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
             ),
             "action_required": (
                 "Run: python3 backend/scripts/google_oauth_setup.py"
-                if auth_state in {"unauthenticated", "needs_reauth"}
+                if auth_state in {"unauthenticated", "needs_reauth", "needs_reauth_guided"}
                 else None
             ),
             "email_visual_fallback_enabled": bool(self.config.email_visual_fallback_enabled),
