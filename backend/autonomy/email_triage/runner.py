@@ -352,16 +352,18 @@ class EmailTriageRunner:
         if not has_prior:
             return True, "no_prior_snapshot"
 
-        # Empty triaged when prior had data => regression
-        if len(new_triaged) == 0:
-            return False, "empty_triaged_regression"
-
-        # Error ratio: count processing errors vs fetched
+        # Error ratio: count processing errors vs fetched.
+        # Check BEFORE empty-triaged so "all failed" reports as error_ratio,
+        # not as empty_triaged_regression.
         if report.emails_fetched > 0:
             process_errors = sum(1 for e in report.errors if e.startswith("process:"))
             error_ratio = process_errors / report.emails_fetched
             if error_ratio > self._config.commit_error_threshold:
                 return False, f"error_ratio:{error_ratio:.2f}"
+
+        # Empty triaged when prior had data => regression (filtering, not errors)
+        if len(new_triaged) == 0:
+            return False, "empty_triaged_regression"
 
         return True, "healthy"
 

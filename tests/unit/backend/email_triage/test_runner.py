@@ -350,3 +350,235 @@ class TestNotificationDelivery:
             report = await runner.run_cycle()
 
         assert report.notifications_sent == 1  # Only 1 of 2 succeeded
+
+
+class TestSnapshotCommitPolicy:
+    """v1.1.1: Last-good snapshot commit policy."""
+
+    def _make_runner(self, workspace_agent=None, **config_kwargs):
+        config = TriageConfig(enabled=True, extraction_enabled=False, **config_kwargs)
+        runner = EmailTriageRunner(config=config, workspace_agent=workspace_agent)
+        runner._label_map = {
+            "jarvis/tier4_noise": "L4", "jarvis/tier3_review": "L3",
+            "jarvis/tier2_high": "L2", "jarvis/tier1_critical": "L1",
+        }
+        runner._apply_label = AsyncMock()
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_healthy_cycle_commits_snapshot(self):
+        """Full successful cycle commits snapshot_committed=True."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(2)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        report = await runner.run_cycle()
+        assert report.snapshot_committed is True
+        assert report.degraded is False
+        assert runner._committed_snapshot is not None
+        assert runner._committed_snapshot["report"].cycle_id == report.cycle_id
+
+    @pytest.mark.asyncio
+    async def test_degraded_cycle_preserves_prior(self):
+        """When all extract_features fail, prior snapshot preserved."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(2)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        # First cycle succeeds
+        first_report = await runner.run_cycle()
+        assert first_report.snapshot_committed is True
+        first_snapshot = runner._committed_snapshot
+        first_cycle_id = first_snapshot["report"].cycle_id
+
+        # Second cycle: all processing errors
+        with patch(
+            "autonomy.email_triage.runner.extract_features",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("extraction boom"),
+        ):
+            second_report = await runner.run_cycle()
+
+        assert second_report.degraded is True
+        assert second_report.snapshot_committed is False
+        assert "error_ratio" in second_report.degraded_reason
+        # Prior snapshot preserved
+        assert runner._committed_snapshot["report"].cycle_id == first_cycle_id
+
+    @pytest.mark.asyncio
+    async def test_first_cycle_commits_with_actual_data(self):
+        """No prior snapshot, cycle with emails succeeds — commits."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(1)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+        assert runner._committed_snapshot is None
+
+        report = await runner.run_cycle()
+        assert report.snapshot_committed is True
+        assert runner._committed_snapshot is not None
+
+    @pytest.mark.asyncio
+    async def test_cold_start_dep_unavailable_does_not_commit(self):
+        """No prior + workspace_agent unresolved -> no commit (blocker #1)."""
+        runner = self._make_runner(workspace_agent=None)
+        # Prevent resolve_all from finding a real workspace_agent
+        runner._resolver.resolve_all = AsyncMock()
+        # Without workspace_agent, _fetch_unread returns []
+        report = await runner.run_cycle()
+        assert report.snapshot_committed is False
+        assert report.degraded is True
+        assert report.degraded_reason == "cold_start_dep_unavailable"
+        assert runner._committed_snapshot is None
+
+    @pytest.mark.asyncio
+    async def test_cold_start_legit_empty_inbox_commits(self):
+        """No prior + workspace_agent IS resolved but inbox empty -> commits."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": []}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        report = await runner.run_cycle()
+        # Legit empty inbox is valid truth — should commit
+        assert report.snapshot_committed is True
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_preserves_prior(self):
+        """Fetch failure early-returns before commit block, prior preserved."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(1)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        # First cycle succeeds
+        first_report = await runner.run_cycle()
+        first_cycle_id = runner._committed_snapshot["report"].cycle_id
+
+        # Second cycle: fetch fails
+        runner._fetch_unread = AsyncMock(side_effect=RuntimeError("API error"))
+        await runner.run_cycle()
+
+        # Prior snapshot preserved (fetch failure returns before commit block)
+        assert runner._committed_snapshot["report"].cycle_id == first_cycle_id
+
+    @pytest.mark.asyncio
+    async def test_healthy_after_degraded_advances(self):
+        """Degraded preserves prior, then healthy cycle advances snapshot."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(2)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        # First cycle succeeds
+        await runner.run_cycle()
+        first_cycle_id = runner._committed_snapshot["report"].cycle_id
+
+        # Second cycle: degraded (all errors)
+        with patch(
+            "autonomy.email_triage.runner.extract_features",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("extraction boom"),
+        ):
+            degraded_report = await runner.run_cycle()
+        assert degraded_report.degraded is True
+        assert runner._committed_snapshot["report"].cycle_id == first_cycle_id
+
+        # Third cycle: healthy again
+        third_report = await runner.run_cycle()
+        assert third_report.snapshot_committed is True
+        assert runner._committed_snapshot["report"].cycle_id != first_cycle_id
+
+    @pytest.mark.asyncio
+    async def test_snapshot_preserved_event_emitted(self):
+        """When degraded, emit_triage_event called with snapshot_preserved."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(2)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        # First cycle succeeds (establishes prior)
+        await runner.run_cycle()
+
+        # Second cycle: all errors -> degraded -> event emitted
+        with patch(
+            "autonomy.email_triage.runner.extract_features",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("extraction boom"),
+        ), patch(
+            "autonomy.email_triage.runner.emit_triage_event",
+        ) as mock_emit:
+            await runner.run_cycle()
+
+        # Find the snapshot_preserved event among all emitted events
+        preserved_calls = [
+            c for c in mock_emit.call_args_list
+            if c[0][0] == "snapshot_preserved"
+        ]
+        assert len(preserved_calls) == 1
+        payload = preserved_calls[0][0][1]
+        assert "reason" in payload
+        assert "prior_cycle_id" in payload
+
+    @pytest.mark.asyncio
+    async def test_empty_triaged_with_prior_is_regression(self):
+        """All emails filtered (new_triaged empty) but prior had data."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(2)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        # First cycle succeeds
+        await runner.run_cycle()
+
+        # Second cycle: fetch succeeds but 0 emails -> empty triaged
+        agent._fetch_unread_emails = AsyncMock(return_value={"emails": []})
+        second_report = await runner.run_cycle()
+        assert second_report.degraded is True
+        assert second_report.degraded_reason == "empty_triaged_regression"
+
+    @pytest.mark.asyncio
+    async def test_snapshot_read_returns_defensive_copy(self):
+        """Mutating returned triaged_emails does NOT affect internal snapshot."""
+        agent = AsyncMock()
+        agent._fetch_unread_emails = AsyncMock(
+            return_value={"emails": _sample_emails(1)}
+        )
+        runner = self._make_runner(workspace_agent=agent)
+
+        await runner.run_cycle()
+        snapshot = runner.get_triage_snapshot()
+        assert snapshot is not None
+
+        # Mutate the returned dict
+        snapshot["triaged_emails"]["injected"] = "evil"
+
+        # Internal snapshot should be unaffected
+        internal = runner._committed_snapshot
+        assert "injected" not in internal["triaged_emails"]
+
+    def test_frozen_report_rejects_mutation(self):
+        """TriageCycleReport is frozen — direct assignment raises."""
+        report = TriageCycleReport(
+            cycle_id="test",
+            started_at=0.0,
+            completed_at=0.0,
+            emails_fetched=0,
+            emails_processed=0,
+            tier_counts={},
+            notifications_sent=0,
+            notifications_suppressed=0,
+            errors=[],
+        )
+        with pytest.raises(AttributeError):
+            report.cycle_id = "mutated"

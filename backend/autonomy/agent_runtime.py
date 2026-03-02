@@ -2752,12 +2752,22 @@ class UnifiedAgentRuntime:
     # ─────────────────────────────────────────────────────────
 
     async def _maybe_run_email_triage(self) -> None:
-        """Run email triage cycle if enabled and cooldown elapsed.
+        """Run email triage cycle if enabled, cooldown elapsed, and leader lock acquired.
 
         Gated by:
         1. EMAIL_TRIAGE_ENABLED feature flag (default: False)
         2. Cooldown timer (EMAIL_TRIAGE_POLL_INTERVAL_S, default: 60s)
-        3. asyncio.wait_for timeout (EMAIL_TRIAGE_CYCLE_TIMEOUT_S, default: 30s)
+        3. DLM leader lock via acquire_unified() with fencing token
+        4. asyncio.wait_for timeout (EMAIL_TRIAGE_CYCLE_TIMEOUT_S, default: 30s)
+
+        Fail-closed by default: if DLM is unavailable, triage is skipped to
+        prevent duplicate writers. Override with EMAIL_TRIAGE_DLM_FAIL_OPEN=true
+        for availability-first mode (single-process deployments only).
+
+        Architecture note: Current deployment is strictly single-process
+        (one unified_supervisor). The DLM lock is a forward-compatible safety
+        net for multi-process deployments. Runner singleton is process-local;
+        the DLM provides cross-process mutual exclusion.
         """
         if not _env_bool("EMAIL_TRIAGE_ENABLED", False):
             return
@@ -2770,24 +2780,59 @@ class UnifiedAgentRuntime:
         self._last_email_triage_run = now
         try:
             from autonomy.email_triage.runner import EmailTriageRunner
+            from core.distributed_lock_manager import get_lock_manager
 
             runner = EmailTriageRunner.get_instance()
             timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
-            report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
-            if report and not report.skipped:
-                logger.info(
-                    "[AgentRuntime] Email triage: %d fetched, %d processed, "
-                    "tiers=%s, notifications=%d, errors=%d",
-                    report.emails_fetched,
-                    report.emails_processed,
-                    report.tier_counts,
-                    report.notifications_sent,
-                    len(report.errors),
+            lock_ttl = timeout + 10.0
+
+            lock_manager = await get_lock_manager()
+            async with lock_manager.acquire_unified(
+                "email_triage_cycle",
+                timeout=2.0,
+                ttl=lock_ttl,
+                enable_keepalive=False,
+            ) as (acquired, lock_meta):
+                if not acquired:
+                    logger.debug(
+                        "[AgentRuntime] Email triage lock held by another process, skipping"
+                    )
+                    return
+                fencing_token = lock_meta.fencing_token if lock_meta else 0
+                logger.debug(
+                    "[AgentRuntime] Email triage lock acquired (fencing_token=%d)",
+                    fencing_token,
                 )
+                report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+                if report and not report.skipped:
+                    logger.info(
+                        "[AgentRuntime] Email triage: %d fetched, %d processed, "
+                        "tiers=%s, notifications=%d, errors=%d, committed=%s, "
+                        "fencing_token=%d",
+                        report.emails_fetched,
+                        report.emails_processed,
+                        report.tier_counts,
+                        report.notifications_sent,
+                        len(report.errors),
+                        report.snapshot_committed,
+                        fencing_token,
+                    )
         except asyncio.TimeoutError:
             logger.warning("[AgentRuntime] Email triage cycle timed out")
         except Exception as e:
-            logger.warning("[AgentRuntime] Email triage cycle failed: %s", e)
+            # Fail-closed: DLM unavailable or any error -> skip triage, don't run unguarded
+            # Override with EMAIL_TRIAGE_DLM_FAIL_OPEN=true for availability-first mode
+            if _env_bool("EMAIL_TRIAGE_DLM_FAIL_OPEN", False):
+                logger.warning("[AgentRuntime] Email triage DLM failed, running unguarded: %s", e)
+                try:
+                    from autonomy.email_triage.runner import EmailTriageRunner
+                    runner = EmailTriageRunner.get_instance()
+                    timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
+                    report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+                except Exception as inner:
+                    logger.warning("[AgentRuntime] Email triage unguarded cycle also failed: %s", inner)
+            else:
+                logger.warning("[AgentRuntime] Email triage cycle failed (fail-closed): %s", e)
 
     # ─────────────────────────────────────────────────────────
     # v240.0: Heartbeat Context Gathering
