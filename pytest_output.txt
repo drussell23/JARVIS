@@ -1,0 +1,94 @@
+/Users/djrussell23/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+[1m============================= test session starts ==============================[0m
+platform darwin -- Python 3.9.6, pytest-8.4.2, pluggy-1.6.0 -- /Library/Developer/CommandLineTools/usr/bin/python3
+cachedir: .pytest_cache
+JARVIS AI Agent Test Suite
+Project Root: /Users/djrussell23/Documents/repos/JARVIS-AI-Agent
+rootdir: /Users/djrussell23/Documents/repos/JARVIS-AI-Agent
+configfile: pytest.ini
+plugins: asyncio-1.2.0, anyio-4.12.0, langsmith-0.4.37
+asyncio: mode=auto, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+[1mcollecting ... [0mcollected 77 items
+
+tests/unit/backend/email_triage/test_agent_runtime_integration.py::TestMaybeRunEmailTriage::test_disabled_by_default [32mPASSED[0m[33m [  1%][0m
+tests/unit/backend/email_triage/test_agent_runtime_integration.py::TestMaybeRunEmailTriage::test_cooldown_prevents_rapid_calls [32mPASSED[0m[33m [  2%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_disabled_by_default [32mPASSED[0m[33m [  3%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_tier_thresholds [32mPASSED[0m[33m [  5%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_quiet_hours [32mPASSED[0m[33m [  6%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_dedup_windows [32mPASSED[0m[33m [  7%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_interrupt_budget [32mPASSED[0m[33m [  9%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_summary_interval [32mPASSED[0m[33m [ 10%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_runner_settings [32mPASSED[0m[33m [ 11%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_gmail_labels [32mPASSED[0m[33m [ 12%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_notification_flags_default_true [32mPASSED[0m[33m [ 14%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigDefaults::test_quarantine_default_false [32mPASSED[0m[33m [ 15%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigFromEnv::test_enabled_from_env [32mPASSED[0m[33m [ 16%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigFromEnv::test_poll_interval_from_env [32mPASSED[0m[33m [ 18%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigFromEnv::test_quiet_hours_from_env [32mPASSED[0m[33m [ 19%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigFromEnv::test_budget_from_env [32mPASSED[0m[33m [ 20%][0m
+tests/unit/backend/email_triage/test_config.py::TestTriageConfigFromEnv::test_invalid_env_uses_default [32mPASSED[0m[33m [ 22%][0m
+tests/unit/backend/email_triage/test_config.py::TestGetTriageConfig::test_returns_config [32mPASSED[0m[33m [ 23%][0m
+tests/unit/backend/email_triage/test_config.py::TestGetTriageConfig::test_tier_label_for_score [32mPASSED[0m[33m [ 24%][0m
+tests/unit/backend/email_triage/test_config.py::TestGetTriageConfig::test_tier_for_score [32mPASSED[0m[33m [ 25%][0m
+tests/unit/backend/email_triage/test_events.py::TestEventConstants::test_all_event_types_defined [32mPASSED[0m[33m [ 27%][0m
+tests/unit/backend/email_triage/test_events.py::TestEmitTriageEvent::test_emits_to_logger [32mPASSED[0m[33m [ 28%][0m
+tests/unit/backend/email_triage/test_events.py::TestEmitTriageEvent::test_payload_in_log [32mPASSED[0m[33m [ 29%][0m
+tests/unit/backend/email_triage/test_events.py::TestEmitTriageEvent::test_error_event [32mPASSED[0m[33m [ 31%][0m
+tests/unit/backend/email_triage/test_events.py::TestEmitTriageEvent::test_event_includes_timestamp [32mPASSED[0m[33m [ 32%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestHeuristicFeatures::test_basic_extraction [32mPASSED[0m[33m [ 33%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestHeuristicFeatures::test_sender_domain_extraction [32mPASSED[0m[33m [ 35%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestHeuristicFeatures::test_empty_email_fields [32mPASSED[0m[33m [ 36%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestHeuristicFeatures::test_subject_urgency_keywords_detected [32mPASSED[0m[33m [ 37%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestBuildExtractionPrompt::test_prompt_contains_email_fields [32mPASSED[0m[33m [ 38%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestBuildExtractionPrompt::test_prompt_requests_json [32mPASSED[0m[33m [ 40%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestExtractFeatures::test_successful_extraction [32mPASSED[0m[33m [ 41%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestExtractFeatures::test_fallback_on_router_failure [32mPASSED[0m[33m [ 42%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestExtractFeatures::test_fallback_on_invalid_json [32mPASSED[0m[33m [ 44%][0m
+tests/unit/backend/email_triage/test_extraction.py::TestExtractFeatures::test_extraction_disabled_uses_heuristic [32mPASSED[0m[33m [ 45%][0m
+tests/unit/backend/email_triage/test_labels.py::TestEnsureLabelsExist::test_creates_missing_labels [32mPASSED[0m[33m [ 46%][0m
+tests/unit/backend/email_triage/test_labels.py::TestEnsureLabelsExist::test_skips_existing_labels [32mPASSED[0m[33m [ 48%][0m
+tests/unit/backend/email_triage/test_labels.py::TestApplyLabel::test_applies_label [32mPASSED[0m[33m [ 49%][0m
+tests/unit/backend/email_triage/test_labels.py::TestApplyLabel::test_missing_label_in_map_logs_warning [32mPASSED[0m[33m [ 50%][0m
+tests/unit/backend/email_triage/test_policy.py::TestNotificationActions::test_tier1_gets_immediate [32mPASSED[0m[33m [ 51%][0m
+tests/unit/backend/email_triage/test_policy.py::TestNotificationActions::test_tier2_gets_summary [32mPASSED[0m[33m [ 53%][0m
+tests/unit/backend/email_triage/test_policy.py::TestNotificationActions::test_tier3_gets_label_only [32mPASSED[0m[33m [ 54%][0m
+tests/unit/backend/email_triage/test_policy.py::TestNotificationActions::test_tier4_gets_quarantine_when_enabled [32mPASSED[0m[33m [ 55%][0m
+tests/unit/backend/email_triage/test_policy.py::TestNotificationActions::test_tier4_gets_label_only_when_quarantine_disabled [32mPASSED[0m[33m [ 57%][0m
+tests/unit/backend/email_triage/test_policy.py::TestNotificationActions::test_tier1_disabled_gets_label_only [32mPASSED[0m[33m [ 58%][0m
+tests/unit/backend/email_triage/test_policy.py::TestNotificationActions::test_tier2_disabled_gets_label_only [32mPASSED[0m[33m [ 59%][0m
+tests/unit/backend/email_triage/test_policy.py::TestQuietHours::test_tier2_suppressed_during_quiet [32mPASSED[0m[33m [ 61%][0m
+tests/unit/backend/email_triage/test_policy.py::TestQuietHours::test_tier1_still_notifies_during_quiet [32mPASSED[0m[33m [ 62%][0m
+tests/unit/backend/email_triage/test_policy.py::TestQuietHours::test_not_quiet_at_noon [32mPASSED[0m[33m [ 63%][0m
+tests/unit/backend/email_triage/test_policy.py::TestDedup::test_tier1_dedup_within_15min [32mPASSED[0m[33m [ 64%][0m
+tests/unit/backend/email_triage/test_policy.py::TestDedup::test_different_messages_not_deduped [32mPASSED[0m[33m [ 66%][0m
+tests/unit/backend/email_triage/test_policy.py::TestInterruptBudget::test_budget_exhaustion [32mPASSED[0m[33m [ 67%][0m
+tests/unit/backend/email_triage/test_policy.py::TestSummaryBuffer::test_tier2_added_to_summary_buffer [32mPASSED[0m[33m [ 68%][0m
+tests/unit/backend/email_triage/test_policy.py::TestSummaryBuffer::test_flush_clears_buffer [32mPASSED[0m[33m [ 70%][0m
+tests/unit/backend/email_triage/test_runner.py::TestRunCycle::test_disabled_returns_skipped [32mPASSED[0m[33m [ 71%][0m
+tests/unit/backend/email_triage/test_runner.py::TestRunCycle::test_processes_emails [32mPASSED[0m[33m [ 72%][0m
+tests/unit/backend/email_triage/test_runner.py::TestRunCycle::test_respects_max_per_cycle [32mPASSED[0m[33m [ 74%][0m
+tests/unit/backend/email_triage/test_runner.py::TestRunCycle::test_handles_fetch_failure [32mPASSED[0m[33m [ 75%][0m
+tests/unit/backend/email_triage/test_runner.py::TestRunCycle::test_single_email_error_does_not_abort_cycle [32mPASSED[0m[33m [ 76%][0m
+tests/unit/backend/email_triage/test_runner.py::TestRunnerSingleton::test_get_instance [32mPASSED[0m[33m [ 77%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestEmailFeatures::test_construction_with_all_fields [32mPASSED[0m[33m [ 79%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestEmailFeatures::test_frozen_immutability [32mPASSED[0m[33m [ 80%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestEmailFeatures::test_heuristic_only_features [32mPASSED[0m[33m [ 81%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestScoringResult::test_construction [32mPASSED[0m[33m [ 83%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestScoringResult::test_frozen [32mPASSED[0m[33m [ 84%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestTriagedEmail::test_construction [32mPASSED[0m[33m [ 85%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestTriageCycleReport::test_skipped_cycle [32mPASSED[0m[33m [ 87%][0m
+tests/unit/backend/email_triage/test_schemas.py::TestTriageCycleReport::test_normal_cycle [32mPASSED[0m[33m [ 88%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestScoreEmailDeterminism::test_same_inputs_same_score [32mPASSED[0m[33m [ 89%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestScoreEmailDeterminism::test_different_message_id_different_idempotency_key [32mPASSED[0m[33m [ 90%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestTierMapping::test_tier1_critical [32mPASSED[0m[33m [ 92%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestTierMapping::test_tier4_noise [32mPASSED[0m[33m [ 93%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestTierMapping::test_tier2_high [32mPASSED[0m[33m [ 94%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestTierMapping::test_tier3_review [32mPASSED[0m[33m [ 96%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestScoreBoundaries::test_score_range [32mPASSED[0m[33m [ 97%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestScoringBreakdown::test_breakdown_keys [32mPASSED[0m[33m [ 98%][0m
+tests/unit/backend/email_triage/test_scoring.py::TestScoringBreakdown::test_breakdown_values_in_range [32mPASSED[0m[33m [100%][0m
+
+[33m======================== [32m77 passed[0m, [33m[1m1 warning[0m[33m in 7.67s[0m[33m =========================[0m
+/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/backend/core/resilience/graceful_shutdown.py:2341: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  if isinstance(obj, ProcessPoolExecutor):
