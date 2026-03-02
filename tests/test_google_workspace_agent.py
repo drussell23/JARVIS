@@ -256,6 +256,8 @@ class TestGoogleWorkspaceAgentExecution:
 
         client = GoogleWorkspaceClient(GoogleWorkspaceConfig())
         client.authenticate = AsyncMock(return_value=True)
+        client._ensure_authenticated = AsyncMock(return_value=True)
+        client.can_attempt_google_api = True
         client.fetch_unread_emails = AsyncMock(return_value={
             "emails": [
                 {"id": "1", "from": "test@example.com", "subject": "Test", "snippet": "Hello"},
