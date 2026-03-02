@@ -4086,6 +4086,26 @@ class UnifiedCommandProcessor:
                     _r = _o.get("result", {}) or {}
                     _artifacts.update(_r)
 
+                # v281.1: Triage enrichment — merge triage metadata into emails
+                _triage_enriched = False
+                _triage_age_s = None
+                if _ws_action in ("fetch_unread_emails",) and "emails" in _artifacts:
+                    try:
+                        from autonomy.email_triage.runner import EmailTriageRunner
+                        from autonomy.email_triage.enrichment import enrich_with_triage
+                        _runner = EmailTriageRunner._instance  # Safe: None if not initialized
+                        _enriched, _triage_enriched, _triage_age_s = enrich_with_triage(
+                            _artifacts.get("emails", []),
+                            _runner,
+                            staleness_window_s=120.0,
+                        )
+                        if _triage_enriched:
+                            _artifacts["emails"] = _enriched
+                            _artifacts["triage_available"] = True
+                            _artifacts["triage_age_s"] = round(_triage_age_s, 1) if _triage_age_s else None
+                    except Exception as _te:
+                        logger.debug("[v281.1] Triage enrichment skipped: %s", _te)
+
                 _compose_start = _time.monotonic()
                 composed_response = await self._compose_workspace_response(
                     command_text=original_command or command_text,
