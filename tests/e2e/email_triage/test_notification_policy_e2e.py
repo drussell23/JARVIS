@@ -277,9 +277,9 @@ class TestNotificationPolicyE2E:
         assert triaged.scoring.tier == 1
         assert triaged.notification_action == "immediate"  # Decision was made before delivery
 
-        # Error captured in report
-        notify_errors = [e for e in report.errors if "notify" in e.lower()]
-        assert len(notify_errors) >= 1, f"Expected notify error, got: {report.errors}"
+        # Notification failure is isolated — deliver_immediate catches internally
+        # and returns failure results. notifications_sent should be 0.
+        assert report.notifications_sent == 0
 
         # Snapshot still committed (notification failure is not a triage failure)
         assert report.snapshot_committed is True

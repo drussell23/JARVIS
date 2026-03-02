@@ -347,6 +347,9 @@ class TimeController:
 def controlled_time(base_time: float = 1_000_000.0, hour: int = 10):
     """Context manager that patches time.time, time.monotonic, and _current_hour.
 
+    Patches time at the module level for email triage modules, NOT globally,
+    to avoid breaking asyncio event loop internals that rely on time.monotonic.
+
     Yields a TimeController for advancing time and setting hour.
     """
     ctrl = TimeController(
@@ -355,13 +358,16 @@ def controlled_time(base_time: float = 1_000_000.0, hour: int = 10):
         _hour=hour,
     )
 
-    with patch("time.time", side_effect=lambda: ctrl.now()):
-        with patch("time.monotonic", side_effect=lambda: ctrl.mono()):
-            with patch(
-                "autonomy.email_triage.policy._current_hour",
-                side_effect=lambda: ctrl.hour(),
-            ):
-                yield ctrl
+    # Patch time.time and time.monotonic at module import level for the
+    # specific email triage modules, NOT globally (global patch breaks asyncio).
+    with patch("autonomy.email_triage.runner.time.time", side_effect=lambda: ctrl.now()):
+        with patch("autonomy.email_triage.runner.time.monotonic", side_effect=lambda: ctrl.mono()):
+            with patch("autonomy.email_triage.policy.time.time", side_effect=lambda: ctrl.now()):
+                with patch(
+                    "autonomy.email_triage.policy._current_hour",
+                    side_effect=lambda: ctrl.hour(),
+                ):
+                    yield ctrl
 
 
 @pytest.fixture
