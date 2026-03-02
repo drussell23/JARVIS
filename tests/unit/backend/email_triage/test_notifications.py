@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -17,7 +17,6 @@ from autonomy.email_triage.notifications import (
 )
 from autonomy.email_triage.schemas import (
     EmailFeatures,
-    NotificationDeliveryResult,
     ScoringResult,
     TriagedEmail,
 )

@@ -186,7 +186,6 @@ async def deliver_immediate(
         )
     except asyncio.TimeoutError:
         # Entire batch timed out -- return failure for every email.
-        t_now = time.monotonic()
         results_list: List[NotificationDeliveryResult] = []
         for email in emails:
             failure = NotificationDeliveryResult(
@@ -246,6 +245,16 @@ async def deliver_immediate(
                 success=False,
                 latency_ms=0,
                 error=f"Unexpected result type: {type(result).__name__}",
+            )
+            emit_triage_event(
+                EVENT_NOTIFICATION_DELIVERY_RESULT,
+                {
+                    "message_id": failure.message_id,
+                    "channel": failure.channel,
+                    "success": failure.success,
+                    "latency_ms": failure.latency_ms,
+                    "error": failure.error,
+                },
             )
             final.append(failure)
 
