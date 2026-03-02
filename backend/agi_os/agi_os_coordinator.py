@@ -1632,6 +1632,20 @@ class AGIOSCoordinator:
                 timeout_seconds=mesh_timeout,
             )
 
+            # Cross-register with integration module so
+            # get_neural_mesh_coordinator() returns the correct instance
+            # regardless of which code path queries it.
+            try:
+                from neural_mesh.integration import (
+                    set_neural_mesh_coordinator,
+                    mark_neural_mesh_initialized,
+                )
+                set_neural_mesh_coordinator(self._neural_mesh)
+                mark_neural_mesh_initialized(True)
+                logger.info("[v_autonomy] Cross-registered coordinator with integration module")
+            except ImportError:
+                logger.debug("[v_autonomy] integration module not available for cross-registration")
+
             # Step 2: Register production agents (30% of budget, non-fatal)
             n_production = 0
             try:
