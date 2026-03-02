@@ -3,6 +3,7 @@ import asyncio
 import os
 import pytest
 import sys
+import threading
 import time
 from pathlib import Path
 from unittest.mock import MagicMock, AsyncMock, patch, PropertyMock
@@ -23,11 +24,14 @@ def _make_client():
         client = GoogleWorkspaceClient.__new__(GoogleWorkspaceClient)
         client.config = config
         client._auth_state = AuthState.AUTHENTICATED
+        client._authenticated = True
         client._creds = MagicMock()
         client._last_auth_failure_reason = None
         client._token_health = MagicMock()
         client._token_mtime = None
         client._auth_transition_lock = asyncio.Lock()
+        client._auth_transition_sync_lock = threading.RLock()
+        client._auth_transition_counts = {}
         client._refresh_attempts = 0
         client._max_refresh_attempts = 3
         client._auth_probe_count = 0
@@ -99,6 +103,35 @@ class TestNeedsReauthGuidedState:
         client._auth_state = AuthState.NEEDS_REAUTH_GUIDED
         await client._handle_auth_event("token_healed")
         assert client._auth_state == AuthState.UNAUTHENTICATED
+
+    def test_sync_permanent_failure_from_unauthenticated_transitions_to_guided(self):
+        client = _make_client()
+        from backend.neural_mesh.agents.google_workspace_agent import AuthState
+
+        client._auth_state = AuthState.UNAUTHENTICATED
+        transitioned = client._handle_auth_event_sync("permanent_failure")
+
+        assert transitioned is True
+        assert client._auth_state == AuthState.NEEDS_REAUTH_GUIDED
+
+
+class TestResetState:
+
+    def test_reset_auth_state_clears_to_unauthenticated(self):
+        client = _make_client()
+        from backend.neural_mesh.agents.google_workspace_agent import AuthState
+
+        client._auth_state = AuthState.DEGRADED_VISUAL
+        client._refresh_attempts = 2
+        client._auth_probe_count = 3
+        client._last_auth_failure_reason = "expired"
+
+        client.reset_auth_state()
+
+        assert client._auth_state == AuthState.UNAUTHENTICATED
+        assert client._refresh_attempts == 0
+        assert client._auth_probe_count == 0
+        assert client._last_auth_failure_reason is None
 
 
 class TestFeatureFlag:

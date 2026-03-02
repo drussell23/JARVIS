@@ -198,6 +198,7 @@ AuthTransition = namedtuple(
 
 _AUTH_TRANSITIONS = [
     AuthTransition("unauthenticated", "credentials_loaded", "authenticated", "auth_healthy"),
+    AuthTransition("unauthenticated", "permanent_failure", "needs_reauth_guided", "auth_guided_recovery"),
     AuthTransition("authenticated", "token_expired", "refreshing", "auth_refreshing"),
     AuthTransition("authenticated", "permanent_failure", "degraded_visual", "auth_refresh_permanent_fail"),
     AuthTransition("refreshing", "refresh_success", "authenticated", "auth_healthy"),
@@ -206,8 +207,10 @@ _AUTH_TRANSITIONS = [
     AuthTransition("degraded_visual", "write_action", "needs_reauth_guided", "auth_guided_recovery"),
     AuthTransition("degraded_visual", "api_probe_success", "authenticated", "auth_auto_healed"),
     AuthTransition("degraded_visual", "credentials_loaded", "authenticated", "auth_healthy"),
+    AuthTransition("degraded_visual", "permanent_failure", "needs_reauth_guided", "auth_guided_recovery"),
     AuthTransition("needs_reauth_guided", "token_healed", "unauthenticated", "auth_auto_healed"),
     AuthTransition("needs_reauth_guided", "credentials_loaded", "authenticated", "auth_healthy"),
+    AuthTransition("needs_reauth_guided", "permanent_failure", "needs_reauth_guided", "auth_guided_recovery"),
 ]
 
 
@@ -1717,6 +1720,8 @@ class GoogleWorkspaceClient:
 
         # v_autonomy: Auth state machine v2
         self._auth_transition_lock = asyncio.Lock()
+        self._auth_transition_sync_lock = threading.RLock()
+        self._auth_transition_counts: Dict[str, int] = {}
         self._refresh_attempts = 0
         self._max_refresh_attempts = int(os.getenv("JARVIS_AUTH_MAX_REFRESH_ATTEMPTS", "3"))
         self._auth_probe_count = 0
@@ -1966,10 +1971,7 @@ class GoogleWorkspaceClient:
         """Synchronous permanent failure helper for auth code running in threads."""
         if backup_stale_token:
             self._backup_stale_token()
-        if self._auth_state == AuthState.AUTHENTICATED:
-            self._auth_state = AuthState.DEGRADED_VISUAL
-        else:
-            self._auth_state = AuthState.NEEDS_REAUTH_GUIDED
+        self._handle_auth_event_sync("permanent_failure")
         self._last_auth_failure_reason = reason
         self._auth_permanent_fail_total += 1
         if clear_credentials:
@@ -2029,7 +2031,6 @@ class GoogleWorkspaceClient:
                 return False
             if not self._credentials_need_refresh():
                 await self._handle_auth_event("api_probe_success")
-                self._authenticated = True
                 self._auth_autoheal_total += 1
                 return True
 
@@ -2108,7 +2109,6 @@ class GoogleWorkspaceClient:
                             await self._handle_auth_event("api_probe_success")
                         else:
                             await self._handle_auth_event("refresh_success")
-                        self._authenticated = True
                         self._token_health = self._check_token_health()
                         return True
 
@@ -2591,7 +2591,7 @@ class GoogleWorkspaceClient:
                 )
                 return False
 
-            self._auth_state = AuthState.AUTHENTICATED
+            self._handle_auth_event_sync("credentials_loaded")
             # Record mtime for auto-heal detection
             try:
                 self._token_mtime = os.path.getmtime(self.config.token_path)
@@ -2692,7 +2692,7 @@ class GoogleWorkspaceClient:
 
     def reset_auth_state(self) -> None:
         """Clear NEEDS_REAUTH state after fresh token is available."""
-        self._auth_state = AuthState.UNAUTHENTICATED
+        self._handle_auth_event_sync("reset")
         self._last_auth_failure_reason = None
         self._token_health = TokenHealthStatus.MISSING
         self._creds = None
@@ -2703,38 +2703,80 @@ class GoogleWorkspaceClient:
     # v_autonomy: Auth State Machine v2 — Behavioral Wiring
     # =========================================================================
 
+    def _apply_auth_event_transition_locked(self, event: str) -> bool:
+        """Apply an auth event while holding the sync transition lock."""
+        current = self._auth_state.value
+
+        if event == "reset":
+            old_state = self._auth_state
+            self._auth_state = AuthState.UNAUTHENTICATED
+            self._authenticated = False
+            self._refresh_attempts = 0
+            self._auth_probe_count = 0
+            self._auth_transition_counts[event] = self._auth_transition_counts.get(event, 0) + 1
+            logger.info(
+                "[v_autonomy] Auth transition: %s -[%s]-> %s (reason: %s)",
+                old_state.value,
+                event,
+                self._auth_state.value,
+                "auth_reset",
+            )
+            return True
+
+        for t in _AUTH_TRANSITIONS:
+            if t.from_state != current or t.event != event:
+                continue
+
+            if event == "transient_failure":
+                self._refresh_attempts += 1
+                if self._refresh_attempts >= self._max_refresh_attempts:
+                    old_state = self._auth_state
+                    self._auth_state = AuthState.DEGRADED_VISUAL
+                    self._authenticated = False
+                    self._auth_transition_counts[event] = (
+                        self._auth_transition_counts.get(event, 0) + 1
+                    )
+                    logger.warning(
+                        "[v_autonomy] Auth transition: %s -[%s]-> %s (reason: %s)",
+                        old_state.value,
+                        event,
+                        self._auth_state.value,
+                        "auth_refresh_exhausted",
+                    )
+                    return True
+
+            new_state = AuthState(t.to_state)
+            old_state = self._auth_state
+            self._auth_state = new_state
+            self._auth_transition_counts[event] = self._auth_transition_counts.get(event, 0) + 1
+
+            if event in {"refresh_success", "api_probe_success", "credentials_loaded"}:
+                self._refresh_attempts = 0
+                self._last_auth_failure_reason = None
+                self._authenticated = True
+                self._auth_probe_count = 0
+            elif event in {"permanent_failure", "write_action"}:
+                self._authenticated = False
+
+            logger.info(
+                "[v_autonomy] Auth transition: %s -[%s]-> %s (reason: %s)",
+                old_state.value, event, new_state.value, t.reason_code,
+            )
+            return True
+
+        logger.debug("[v_autonomy] No transition for state=%s event=%s", current, event)
+        return False
+
+    def _handle_auth_event_sync(self, event: str) -> bool:
+        """Synchronous auth transition entrypoint for thread-executed auth paths."""
+        with self._auth_transition_sync_lock:
+            return self._apply_auth_event_transition_locked(event)
+
     async def _handle_auth_event(self, event: str) -> None:
         """Process auth state transition event using constant transition map."""
         async with self._auth_transition_lock:
-            current = self._auth_state.value
-            for t in _AUTH_TRANSITIONS:
-                if t.from_state == current and t.event == event:
-                    if event == "transient_failure":
-                        self._refresh_attempts += 1
-                        if self._refresh_attempts >= self._max_refresh_attempts:
-                            self._auth_state = AuthState.DEGRADED_VISUAL
-                            self._authenticated = False
-                            logger.warning(
-                                "[v_autonomy] Auth refresh exhausted (%d attempts) → DEGRADED_VISUAL",
-                                self._refresh_attempts,
-                            )
-                            return
-                    new_state = AuthState(t.to_state)
-                    old_state = self._auth_state
-                    self._auth_state = new_state
-                    if event in {"refresh_success", "api_probe_success", "credentials_loaded"}:
-                        self._refresh_attempts = 0
-                        self._last_auth_failure_reason = None
-                        self._authenticated = True
-                        self._auth_probe_count = 0
-                    elif event == "permanent_failure":
-                        self._authenticated = False
-                    logger.info(
-                        "[v_autonomy] Auth transition: %s -[%s]-> %s (reason: %s)",
-                        old_state.value, event, new_state.value, t.reason_code,
-                    )
-                    return
-            logger.debug("[v_autonomy] No transition for state=%s event=%s", current, event)
+            with self._auth_transition_sync_lock:
+                self._apply_auth_event_transition_locked(event)
 
     def _should_use_visual_fallback(self, action: str) -> bool:
         """Determine if visual fallback should be used for this action."""
@@ -5379,6 +5421,7 @@ EMAIL BODY:"""
                 "token_backup_failures": self._client._token_backup_fail_total if self._client else 0,
                 "refresh_attempts": self._client._refresh_attempts if self._client else 0,
                 "probe_attempts": self._client._auth_probe_count if self._client else 0,
+                "transition_counts": dict(self._client._auth_transition_counts) if self._client else {},
             },
         }
 
@@ -5393,6 +5436,36 @@ EMAIL BODY:"""
 # v237.0: Singleton getter for GoogleWorkspaceAgent
 # ---------------------------------------------------------------------------
 _workspace_agent_instance: Optional["GoogleWorkspaceAgent"] = None
+
+
+def _load_workspace_supervisor_readiness_state() -> Dict[str, Any]:
+    """Best-effort load of the supervisor readiness snapshot."""
+    state_file = Path.home() / ".jarvis" / "kernel" / "readiness_state.json"
+    try:
+        with open(state_file, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
+def _can_create_standalone_workspace_agent() -> Tuple[bool, str]:
+    """Gate standalone workspace agent creation behind supervisor authority."""
+    if os.getenv("JARVIS_WORKSPACE_ALLOW_STANDALONE", "").lower() in {"1", "true", "yes"}:
+        return True, "explicit_standalone_mode"
+
+    if os.getenv("JARVIS_SUPERVISED") != "1":
+        return False, "standalone_mode_disabled"
+
+    readiness = _load_workspace_supervisor_readiness_state()
+    tier = str(readiness.get("tier", "") or "").lower()
+    startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
+
+    if tier and tier not in {"interactive", "warmup", "fully_ready"}:
+        return False, f"supervisor_not_ready:{tier}"
+    if not tier and not startup_complete:
+        return False, "supervisor_startup_incomplete"
+    return True, "supervisor_ready"
 
 
 async def get_google_workspace_agent() -> Optional["GoogleWorkspaceAgent"]:
@@ -5423,6 +5496,14 @@ async def get_google_workspace_agent() -> Optional["GoogleWorkspaceAgent"]:
         pass
 
     # Tier 2: Create standalone instance
+    standalone_allowed, standalone_reason = _can_create_standalone_workspace_agent()
+    if not standalone_allowed:
+        logger.warning(
+            "Standalone GoogleWorkspaceAgent creation denied: %s",
+            standalone_reason,
+        )
+        return None
+
     try:
         instance = GoogleWorkspaceAgent()
         await instance.on_initialize()

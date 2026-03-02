@@ -250,6 +250,7 @@ class TestGoogleWorkspaceAgentExecution:
     def mock_client(self):
         """Create a mock Google Workspace client."""
         from backend.neural_mesh.agents.google_workspace_agent import (
+            AuthState,
             GoogleWorkspaceClient,
             GoogleWorkspaceConfig,
         )
@@ -257,7 +258,9 @@ class TestGoogleWorkspaceAgentExecution:
         client = GoogleWorkspaceClient(GoogleWorkspaceConfig())
         client.authenticate = AsyncMock(return_value=True)
         client._ensure_authenticated = AsyncMock(return_value=True)
-        client.can_attempt_google_api = True
+        client._auth_state = AuthState.AUTHENTICATED
+        client._authenticated = True
+        client._creds = object()
         client.fetch_unread_emails = AsyncMock(return_value={
             "emails": [
                 {"id": "1", "from": "test@example.com", "subject": "Test", "snippet": "Hello"},
@@ -788,6 +791,73 @@ class TestGoogleWorkspaceIntegration:
         # Test convenience method
         result = await agent.check_schedule("today")
         assert "events" in result or "error" in result
+
+
+class TestWorkspaceSingletonAuthority:
+    """Authority gating for shared workspace-agent singleton access."""
+
+    @pytest.mark.asyncio
+    async def test_get_google_workspace_agent_denies_standalone_before_supervisor_ready(
+        self,
+        monkeypatch,
+    ):
+        import backend.neural_mesh.agents.google_workspace_agent as workspace_module
+
+        original_instance = workspace_module._workspace_agent_instance
+        workspace_module._workspace_agent_instance = None
+        monkeypatch.setenv("JARVIS_SUPERVISED", "1")
+        monkeypatch.delenv("JARVIS_STARTUP_COMPLETE", raising=False)
+        monkeypatch.delenv("JARVIS_WORKSPACE_ALLOW_STANDALONE", raising=False)
+
+        try:
+            with patch.object(
+                workspace_module,
+                "_load_workspace_supervisor_readiness_state",
+                return_value={},
+            ), patch.object(
+                workspace_module,
+                "GoogleWorkspaceAgent",
+                side_effect=AssertionError("standalone creation should be denied"),
+            ) as agent_cls:
+                agent = await workspace_module.get_google_workspace_agent()
+
+            assert agent is None
+            agent_cls.assert_not_called()
+        finally:
+            workspace_module._workspace_agent_instance = original_instance
+
+    @pytest.mark.asyncio
+    async def test_get_google_workspace_agent_allows_explicit_standalone(
+        self,
+        monkeypatch,
+    ):
+        import backend.neural_mesh.agents.google_workspace_agent as workspace_module
+
+        original_instance = workspace_module._workspace_agent_instance
+        workspace_module._workspace_agent_instance = None
+        monkeypatch.setenv("JARVIS_WORKSPACE_ALLOW_STANDALONE", "true")
+        monkeypatch.delenv("JARVIS_SUPERVISED", raising=False)
+        monkeypatch.delenv("JARVIS_STARTUP_COMPLETE", raising=False)
+
+        try:
+            instance = MagicMock()
+            instance.on_initialize = AsyncMock(return_value=None)
+            instance._running = False
+
+            with patch.object(
+                workspace_module,
+                "GoogleWorkspaceAgent",
+                return_value=instance,
+            ) as agent_cls:
+                agent = await workspace_module.get_google_workspace_agent()
+
+            assert agent is instance
+            assert workspace_module._workspace_agent_instance is instance
+            assert instance._running is True
+            instance.on_initialize.assert_awaited_once()
+            agent_cls.assert_called_once()
+        finally:
+            workspace_module._workspace_agent_instance = original_instance
 
 
 # =============================================================================
