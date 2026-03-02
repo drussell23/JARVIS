@@ -227,6 +227,152 @@ def _verify_workspace_result(action, result):
     return "verify_passed", result
 
 
+# ─── Bounded Recovery + Runtime Escalation (v_autonomy) ──────────────
+_RUNTIME_ESCALATION_FLOOR = float(os.getenv("JARVIS_RUNTIME_ESCALATION_FLOOR", "5.0"))
+_MIN_ATTEMPT_BUDGET = 2.0
+
+
+def _classify_action_risk_ucp(action: str) -> str:
+    """Action risk classification for command processor context."""
+    _READ_ACTIONS = {
+        "fetch_unread_emails", "check_calendar_events", "search_email",
+        "get_contacts", "workspace_summary", "daily_briefing",
+        "handle_workspace_query", "read_spreadsheet",
+    }
+    if action in _READ_ACTIONS:
+        return "read"
+    return "write"
+
+
+async def _attempt_workspace_recovery(
+    action: str,
+    initial_result: dict,
+    initial_outcome: str,
+    agent,
+    payload: dict,
+    deadline: float,
+    command_text: str,
+) -> dict:
+    """Bounded workspace recovery: same-tier retry -> tier fallback -> runtime escalation."""
+    if initial_outcome in ("verify_passed", "verify_empty_valid"):
+        return initial_result
+
+    attempts = []
+    risk = _classify_action_risk_ucp(action)
+    has_idempotency_key = bool(payload.get("idempotency_key"))
+    remaining = deadline - time.monotonic()
+
+    if remaining <= 0:
+        initial_result["_attempts"] = attempts
+        initial_result["_recovery_reason"] = "recovery_deadline_exhausted"
+        return initial_result
+
+    retry_budget = remaining * 0.4
+    fallback_budget = remaining * 0.4
+
+    # Attempt 1: Same-tier retry (reads, or writes with idempotency key)
+    if risk == "read" or has_idempotency_key:
+        if retry_budget >= _MIN_ATTEMPT_BUDGET:
+            attempt_start = time.monotonic()
+            try:
+                retry_payload = dict(payload)
+                retry_payload["deadline_monotonic"] = time.monotonic() + retry_budget
+                retry_result = await asyncio.wait_for(
+                    agent.execute_task(retry_payload),
+                    timeout=retry_budget,
+                )
+                outcome, annotated = _verify_workspace_result(action, retry_result)
+                attempts.append({
+                    "strategy": "same_tier_retry",
+                    "tier": "api",
+                    "outcome": outcome,
+                    "duration_ms": (time.monotonic() - attempt_start) * 1000,
+                })
+                if outcome in ("verify_passed", "verify_empty_valid"):
+                    annotated["_attempts"] = attempts
+                    return annotated
+            except (asyncio.TimeoutError, Exception) as e:
+                attempts.append({
+                    "strategy": "same_tier_retry",
+                    "tier": "api",
+                    "outcome": "verify_transport_fail",
+                    "reason": str(e)[:100],
+                    "duration_ms": (time.monotonic() - attempt_start) * 1000,
+                })
+
+    # Attempt 2: Tier fallback (force visual) -- reads only
+    remaining = deadline - time.monotonic()
+    if remaining >= _MIN_ATTEMPT_BUDGET and risk == "read":
+        attempt_start = time.monotonic()
+        try:
+            fallback_payload = dict(payload)
+            fallback_payload["_force_visual_fallback"] = True
+            fallback_payload["deadline_monotonic"] = time.monotonic() + min(fallback_budget, remaining)
+            fallback_result = await asyncio.wait_for(
+                agent.execute_task(fallback_payload),
+                timeout=min(fallback_budget, remaining),
+            )
+            outcome, annotated = _verify_workspace_result(action, fallback_result)
+            attempts.append({
+                "strategy": "tier_fallback",
+                "tier": "visual",
+                "outcome": outcome,
+                "duration_ms": (time.monotonic() - attempt_start) * 1000,
+            })
+            if outcome in ("verify_passed", "verify_empty_valid"):
+                annotated["_attempts"] = attempts
+                return annotated
+        except (asyncio.TimeoutError, Exception) as e:
+            attempts.append({
+                "strategy": "tier_fallback",
+                "tier": "visual",
+                "outcome": "verify_transport_fail",
+                "reason": str(e)[:100],
+                "duration_ms": (time.monotonic() - attempt_start) * 1000,
+            })
+
+    # Attempt 3: Runtime escalation
+    remaining = deadline - time.monotonic()
+    if remaining >= _RUNTIME_ESCALATION_FLOOR:
+        attempt_start = time.monotonic()
+        try:
+            from autonomy.agent_runtime import get_agent_runtime
+            runtime = get_agent_runtime()
+            if runtime and getattr(runtime, '_running', False):
+                goal_id = await runtime.submit_goal(
+                    description=f"Complete workspace action: {command_text}",
+                    priority="normal",
+                    source="workspace_replan",
+                    context={"action": action, "attempt_history": attempts},
+                )
+                poll_deadline = time.monotonic() + remaining - 1.0
+                status = None
+                while time.monotonic() < poll_deadline:
+                    status = await runtime.get_goal_status(goal_id)
+                    if status and status.get("status") in ("completed", "failed"):
+                        break
+                    await asyncio.sleep(1.0)
+                attempts.append({
+                    "strategy": "runtime_escalation",
+                    "tier": "agent_runtime",
+                    "outcome": status.get("status", "timeout") if status else "timeout",
+                    "duration_ms": (time.monotonic() - attempt_start) * 1000,
+                })
+        except (ImportError, Exception) as e:
+            attempts.append({
+                "strategy": "runtime_escalation",
+                "tier": "agent_runtime",
+                "outcome": "unavailable",
+                "reason": str(e)[:100],
+                "duration_ms": (time.monotonic() - attempt_start) * 1000,
+            })
+
+    # All attempts exhausted
+    initial_result["_attempts"] = attempts
+    initial_result["_recovery_reason"] = "recovery_deadline_exhausted"
+    return initial_result
+
+
 class DynamicPatternLearner:
     """Learns command patterns from usage and system analysis"""
 
