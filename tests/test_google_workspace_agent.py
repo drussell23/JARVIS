@@ -13,9 +13,11 @@ Author: JARVIS AI System
 """
 
 import asyncio
+import json
 import pytest
 import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict
@@ -477,11 +479,12 @@ class TestGoogleWorkspaceAgentExecution:
             )
         )
         agent._client = MagicMock()
-        agent._client.authenticate = AsyncMock(return_value=True)
+        agent._client.can_attempt_google_api = True
+        agent._client._ensure_authenticated = AsyncMock(return_value=True)
 
         ok = await agent._ensure_client()
         assert ok is True
-        agent._client.authenticate.assert_awaited_once_with(interactive=False)
+        agent._client._ensure_authenticated.assert_awaited_once_with()
 
 
 class TestGoogleWorkspaceReadinessPolicy:
@@ -544,6 +547,85 @@ class TestGoogleWorkspaceReadinessPolicy:
         assert result.tier_used == ExecutionTier.GOOGLE_API
         assert result.data["error_code"] == "auth_missing"
         executor._ensure_visual_tooling.assert_not_awaited()
+
+    def test_check_token_health_rejects_missing_required_scopes(self, tmp_path):
+        """Token health must fail when required Workspace scopes are missing."""
+        from backend.neural_mesh.agents.google_workspace_agent import (
+            GoogleWorkspaceClient,
+            GoogleWorkspaceConfig,
+            TokenHealthStatus,
+        )
+
+        token_path = tmp_path / "token.json"
+        token_path.write_text(
+            json.dumps(
+                {
+                    "token": "token-value",
+                    "refresh_token": "refresh-value",
+                    "client_id": "client-id",
+                    "client_secret": "client-secret",
+                    "expiry": "2099-01-01T00:00:00Z",
+                    "scopes": [
+                        "https://www.googleapis.com/auth/gmail.readonly",
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        client = GoogleWorkspaceClient(
+            GoogleWorkspaceConfig(token_path=str(token_path))
+        )
+
+        assert client._check_token_health() == TokenHealthStatus.PERMANENTLY_INVALID
+
+    @pytest.mark.asyncio
+    async def test_refresh_token_singleflight_coalesces_concurrent_requests(self, tmp_path):
+        """Concurrent refresh callers for one account should produce one refresh."""
+        from backend.neural_mesh.agents.google_workspace_agent import (
+            AuthState,
+            GoogleWorkspaceClient,
+            GoogleWorkspaceConfig,
+            TokenHealthStatus,
+        )
+
+        client = GoogleWorkspaceClient(
+            GoogleWorkspaceConfig(token_path=str(tmp_path / "token.json"))
+        )
+        refresh_calls = {"count": 0}
+
+        class _FakeCreds:
+            refresh_token = "refresh-value"
+            expiry = None
+            expired = True
+
+            def refresh(self, _request):
+                refresh_calls["count"] += 1
+                time.sleep(0.05)
+
+        @contextmanager
+        def _no_lock(**_kwargs):
+            yield None
+
+        client._creds = _FakeCreds()
+        client._auth_state = AuthState.AUTHENTICATED
+        client._authenticated = True
+        client._acquire_token_file_lock_sync = _no_lock
+        client._load_credentials_from_disk_sync = MagicMock(return_value=False)
+        client._persist_credentials_sync = MagicMock(return_value=True)
+        client._validate_current_credentials_scopes = MagicMock(return_value=(True, None))
+        client._rebuild_services = AsyncMock(return_value=None)
+        client._handle_auth_event = AsyncMock(return_value=None)
+        client._check_token_health = MagicMock(return_value=TokenHealthStatus.HEALTHY)
+
+        results = await asyncio.gather(
+            client._refresh_token(),
+            client._refresh_token(),
+            client._refresh_token(),
+        )
+
+        assert results == [True, True, True]
+        assert refresh_calls["count"] == 1
 
 
 # =============================================================================
