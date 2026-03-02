@@ -2772,7 +2772,17 @@ class UnifiedAgentRuntime:
 
             runner = EmailTriageRunner.get_instance()
             timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
-            await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+            report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+            if report and not report.skipped:
+                logger.info(
+                    "[AgentRuntime] Email triage: %d fetched, %d processed, "
+                    "tiers=%s, notifications=%d, errors=%d",
+                    report.emails_fetched,
+                    report.emails_processed,
+                    report.tier_counts,
+                    report.notifications_sent,
+                    len(report.errors),
+                )
         except asyncio.TimeoutError:
             logger.warning("[AgentRuntime] Email triage cycle timed out")
         except Exception as e:
