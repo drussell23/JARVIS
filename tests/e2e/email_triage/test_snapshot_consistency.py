@@ -59,7 +59,7 @@ class TestSnapshotConsistencyE2E:
             swap_runner_dep(runner, "workspace_agent", agent2)
 
             with patch(
-                "autonomy.email_triage.extraction.extract_features",
+                "autonomy.email_triage.runner.extract_features",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("extraction exploded"),
             ):
@@ -93,7 +93,7 @@ class TestSnapshotConsistencyE2E:
             swap_runner_dep(runner, "workspace_agent", agent2)
 
             with patch(
-                "autonomy.email_triage.extraction.extract_features",
+                "autonomy.email_triage.runner.extract_features",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("extraction broken"),
             ):
@@ -120,7 +120,12 @@ class TestSnapshotConsistencyE2E:
         config = make_triage_config()
         runner = fresh_runner(config=config, workspace_agent=None)
 
-        report = await runner.run_cycle()
+        # Block the resolver from importing the real GoogleWorkspaceAgent singleton
+        with patch(
+            "autonomy.email_triage.dependencies._resolve_workspace_agent",
+            side_effect=RuntimeError("No agent in test"),
+        ):
+            report = await runner.run_cycle()
 
         # No workspace agent → fetch returns [] but commit gate blocks
         assert runner._committed_snapshot is None

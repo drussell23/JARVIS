@@ -66,7 +66,7 @@ class TestNotificationPolicyE2E:
         # Per-email extraction: first = tier1, second = tier2
         router = _make_per_email_router([
             {"keywords": ["urgent", "critical", "emergency"], "sender_frequency": "frequent", "urgency_signals": ["action_required", "escalation", "deadline"]},
-            {"keywords": ["deadline"], "sender_frequency": "occasional", "urgency_signals": ["deadline"]},
+            {"keywords": ["deadline", "urgent", "action_required"], "sender_frequency": "occasional", "urgency_signals": ["deadline", "action_required", "escalation"]},
         ])
 
         agent = make_mock_workspace_agent(emails)
@@ -230,7 +230,7 @@ class TestNotificationPolicyE2E:
         # Use tier2 emails (they go to summary buffer)
         emails = [high_priority_email("msg_sum_001")]
         router = _make_per_email_router([
-            {"keywords": ["deadline"], "sender_frequency": "occasional", "urgency_signals": ["deadline"]},
+            {"keywords": ["deadline", "urgent", "action_required"], "sender_frequency": "occasional", "urgency_signals": ["deadline", "action_required", "escalation"]},
         ])
         agent = make_mock_workspace_agent(emails)
         notifier = make_mock_notifier()
