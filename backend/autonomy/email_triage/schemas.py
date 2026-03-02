@@ -32,6 +32,17 @@ class EmailFeatures:
 
 
 @dataclass(frozen=True)
+class NotificationDeliveryResult:
+    """Outcome of a single notification delivery attempt."""
+
+    message_id: str
+    channel: str  # "voice" | "websocket" | "macos" | "bridge" | "summary"
+    success: bool
+    latency_ms: int
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ScoringResult:
     """Deterministic scoring output. Same inputs → same result."""
 
@@ -67,3 +78,5 @@ class TriageCycleReport:
     errors: List[str]
     skipped: bool = False
     skip_reason: Optional[str] = None
+    triage_schema_version: str = "1.0"
+    policy_version: str = "v1"
