@@ -2567,8 +2567,22 @@ class UnifiedCommandProcessor:
             os.getenv("JARVIS_DELIVERY_MARGIN_SECONDS", "3.0")
         )
         compose_max_timeout = float(
-            os.getenv("JARVIS_COMPOSE_MAX_TIMEOUT_SECONDS", "20.0")
+            os.getenv("JARVIS_COMPOSE_MAX_TIMEOUT_SECONDS", "10.0")
         )
+
+        # v282.0: Fast J-Prime readiness pre-check — avoid burning budget on
+        # backends that are known-unavailable.  decide_mode() is synchronous
+        # (reads cached routing state) so this adds <1ms.
+        try:
+            from core.jarvis_prime_client import get_jarvis_prime_client, RoutingMode
+            _pre_client = get_jarvis_prime_client()
+            _mode, _reason = _pre_client.decide_mode()
+            if _mode == RoutingMode.DISABLED:
+                logger.info("[v282] Compose skipped: J-Prime routing disabled (%s)", _reason)
+                self._track_compose_fallback("jprime_disabled")
+                return None
+        except Exception:
+            pass  # Fall through to normal compose attempt
 
         if deadline is not None:
             remaining = deadline - time.monotonic()

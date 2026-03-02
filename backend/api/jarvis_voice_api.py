@@ -2039,6 +2039,9 @@ class JARVISVoiceAPI:
             # Continue to normal processing if this fails
 
         # DYNAMIC COMPONENT LOADING - Load required components based on command intent
+        # v282.0: Budget-aware — cap total pre-pipeline time so the processing
+        # stage retains the majority of the deadline budget.
+        _dynamic_load_cap = float(os.getenv("JARVIS_DYNAMIC_LOAD_CAP_SECONDS", "8.0"))
         try:
             from api.jarvis_factory import get_app_state
 
@@ -2050,32 +2053,49 @@ class JARVISVoiceAPI:
                 and app_state.component_manager
             ):
                 manager = app_state.component_manager
-                logger.info(
-                    f"[DYNAMIC] Analyzing command for required components: '{command.text}'"
+                logger.debug(
+                    "[DYNAMIC] Analyzing command for required components: '%s'",
+                    command.text[:50],
                 )
 
-                # Analyze intent and load required components
-                required_components = await manager.intent_analyzer.analyze(command.text)
+                # Analyze intent and load required components — bounded by cap
+                required_components = await asyncio.wait_for(
+                    manager.intent_analyzer.analyze(command.text),
+                    timeout=min(3.0, _dynamic_load_cap),
+                )
 
                 if required_components:
                     logger.info(f"[DYNAMIC] Required components: {required_components}")
 
-                    # Load each required component
+                    _load_start = time.monotonic()
                     for comp_name in required_components:
+                        # Budget check: stop loading if cap exhausted
+                        if time.monotonic() - _load_start > _dynamic_load_cap - 3.0:
+                            logger.info("[DYNAMIC] Component loading cap reached, deferring rest")
+                            break
                         if comp_name in manager.components:
                             comp = manager.components[comp_name]
                             if comp.state.value != "loaded":
                                 logger.info(f"[DYNAMIC] Loading {comp_name}...")
-                                success = await manager.load_component(comp_name)
+                                try:
+                                    success = await asyncio.wait_for(
+                                        manager.load_component(comp_name),
+                                        timeout=5.0,
+                                    )
+                                except asyncio.TimeoutError:
+                                    logger.warning("[DYNAMIC] %s load timed out (5s cap)", comp_name)
+                                    success = False
                                 if success:
-                                    logger.info(f"[DYNAMIC] ✅ {comp_name} loaded successfully")
+                                    logger.info(f"[DYNAMIC] {comp_name} loaded successfully")
                                 else:
-                                    logger.warning(f"[DYNAMIC] ⚠️ {comp_name} failed to load")
+                                    logger.warning(f"[DYNAMIC] {comp_name} failed to load")
                             else:
                                 logger.debug(f"[DYNAMIC] {comp_name} already loaded")
                                 comp.last_used = asyncio.get_event_loop().time()
                 else:
                     logger.debug(f"[DYNAMIC] No specific components required for: '{command.text}'")
+        except asyncio.TimeoutError:
+            logger.info("[DYNAMIC] Component analysis timed out (%.0fs cap)", _dynamic_load_cap)
         except Exception as e:
             logger.debug(f"[DYNAMIC] Component loading skipped: {e}")
 
