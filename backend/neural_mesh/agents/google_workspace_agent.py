@@ -1236,15 +1236,31 @@ class UnifiedWorkspaceExecutor:
 
         # Tier 3: Computer Use (Visual) - Skip Tier 2 for email (no macOS email bridge)
         # v6.2: First switch to browser using Spatial Awareness, then navigate
+        # v282: Deadline-aware — never exceed pipeline budget
+        _VISUAL_MIN_BUDGET_S = 5.0
+        _VISUAL_HARD_CAP_S = 45.0
+        _visual_budget = None
+        if isinstance(deadline, (int, float)):
+            _visual_budget = deadline - time.monotonic()
+            if _visual_budget <= _VISUAL_MIN_BUDGET_S:
+                logger.info(
+                    "Skipping visual fallback: only %.1fs budget remaining (need %.1fs)",
+                    _visual_budget, _VISUAL_MIN_BUDGET_S,
+                )
+                allow_visual_fallback = False  # budget exhausted — skip visual tier
+
         if allow_visual_fallback and await self._ensure_visual_tooling():
             self._tier_stats[ExecutionTier.COMPUTER_USE]["attempts"] += 1
+            _cu_timeout = min(_visual_budget - 1.0, _VISUAL_HARD_CAP_S) if _visual_budget else _VISUAL_HARD_CAP_S
             try:
-                # v6.2 Grand Unification: Switch to Safari first via Yabai
-                await self._switch_to_app_with_spatial_awareness("Safari", narrate=True)
+                async def _visual_email_check():
+                    # v6.2 Grand Unification: Switch to Safari first via Yabai
+                    await self._switch_to_app_with_spatial_awareness("Safari", narrate=True)
+                    # Now run Computer Use - Safari should already be focused
+                    goal = f"Navigate to mail.google.com and read the {limit} most recent unread emails. List the sender and subject of each."
+                    return await self._computer_use.run(goal=goal)
 
-                # Now run Computer Use - Safari should already be focused
-                goal = f"Navigate to mail.google.com and read the {limit} most recent unread emails. List the sender and subject of each."
-                result = await self._computer_use.run(goal=goal)
+                result = await asyncio.wait_for(_visual_email_check(), timeout=_cu_timeout)
                 if result and result.success:
                     self._tier_stats[ExecutionTier.COMPUTER_USE]["successes"] += 1
                     return ExecutionResult(
@@ -1258,6 +1274,9 @@ class UnifiedWorkspaceExecutor:
                         fallback_attempted=True,
                         execution_time_ms=(asyncio.get_event_loop().time() - start_time) * 1000,
                     )
+                self._tier_stats[ExecutionTier.COMPUTER_USE]["failures"] += 1
+            except asyncio.TimeoutError:
+                logger.warning("Computer Use visual fallback timed out (budget: %.1fs)", _cu_timeout)
                 self._tier_stats[ExecutionTier.COMPUTER_USE]["failures"] += 1
             except Exception as e:
                 logger.warning(f"Computer Use error for email: {e}")

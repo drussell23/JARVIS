@@ -173,7 +173,7 @@ def _normalize_workspace_result(action, result):
 def _verify_workspace_result(action, result):
     """Verify workspace action result against contract.
     Returns (outcome_code, annotated_result).
-    outcome_code: verify_passed | verify_schema_fail | verify_semantic_fail | verify_empty_valid | verify_transport_fail
+    outcome_code: verify_passed | verify_visual_accepted | verify_schema_fail | verify_semantic_fail | verify_empty_valid | verify_transport_fail
     """
     if not isinstance(result, dict):
         result = {"_raw": result}
@@ -182,6 +182,13 @@ def _verify_workspace_result(action, result):
     if result.get("error") and not result.get("success", True):
         result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
         return "verify_transport_fail", result
+
+    # Visual-tier results are unstructured by design — accept without schema check.
+    # Computer Use returns {"raw_response": "...", "source": "computer_use_visual"}
+    # which will never match API-shaped contracts (missing "emails", "events", etc.).
+    if result.get("source") == "computer_use_visual" or result.get("tier_used") == "computer_use":
+        result["_verification"] = {"passed": True, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "tier": "visual"}
+        return "verify_visual_accepted", result
 
     result = _normalize_workspace_result(action, result)
     contract = _WORKSPACE_VERIFICATION_CONTRACTS.get(action)
@@ -288,7 +295,7 @@ async def _attempt_workspace_recovery(
                     "outcome": outcome,
                     "duration_ms": (time.monotonic() - attempt_start) * 1000,
                 })
-                if outcome in ("verify_passed", "verify_empty_valid"):
+                if outcome in ("verify_passed", "verify_empty_valid", "verify_visual_accepted"):
                     annotated["_attempts"] = attempts
                     return annotated
             except (asyncio.TimeoutError, Exception) as e:
@@ -319,7 +326,7 @@ async def _attempt_workspace_recovery(
                 "outcome": outcome,
                 "duration_ms": (time.monotonic() - attempt_start) * 1000,
             })
-            if outcome in ("verify_passed", "verify_empty_valid"):
+            if outcome in ("verify_passed", "verify_empty_valid", "verify_visual_accepted"):
                 annotated["_attempts"] = attempts
                 return annotated
         except (asyncio.TimeoutError, Exception) as e:
@@ -3832,7 +3839,7 @@ class UnifiedCommandProcessor:
 
                     # v_autonomy: Verify result against contract before accepting
                     outcome_code, result_dict = _verify_workspace_result(action, result_dict)
-                    if outcome_code not in ("verify_passed", "verify_empty_valid"):
+                    if outcome_code not in ("verify_passed", "verify_empty_valid", "verify_visual_accepted"):
                         _recovery_deadline = deadline if deadline else (_time.monotonic() + 15.0)
                         if (_recovery_deadline - _time.monotonic()) >= _MIN_ATTEMPT_BUDGET:
                             result_dict = await _attempt_workspace_recovery(
