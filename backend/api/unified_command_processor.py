@@ -100,6 +100,13 @@ except ImportError as e:
     INTELLIGENT_ROUTER_AVAILABLE = False
     logger.warning(f"[UNIFIED] Intelligent Vision Router not available: {e}")
 
+# v_autonomy: Neural Mesh coordinator factory (fail-open)
+try:
+    from neural_mesh.integration import get_neural_mesh_coordinator
+except ImportError:
+    get_neural_mesh_coordinator = lambda: None  # noqa: E731
+
+
 # ─── Workspace Result Verification Contract (v_autonomy) ───────────────
 WORKSPACE_RESULT_CONTRACT_VERSION = "v1"
 
@@ -473,11 +480,21 @@ class UnifiedCommandProcessor:
             "compose_attempts": 0,
             "compose_successes": 0,
             "compose_fallback_reason": {},  # reason_code -> count
+            # v_autonomy: Coordinator lookup retry state machine metrics
+            "coordinator_lookups": 0,
+            "coordinator_hits": 0,
+            "coordinator_misses": 0,
+            "coordinator_stale": 0,
         }
 
-        # v242.2: Neural Mesh coordinator reference (lazy-resolved)
+        # v_autonomy: Coordinator lookup retry state machine
         self._neural_mesh_coordinator = None
-        self._neural_mesh_lookup_attempted = False
+        self._coordinator_state = "UNRESOLVED"
+        self._coordinator_last_lookup: float = 0.0
+        self._coordinator_lookup_failures: int = 0
+        self._coordinator_max_retries = int(os.getenv("JARVIS_COORDINATOR_LOOKUP_MAX_RETRIES", "5"))
+        self._coordinator_cooldown_seconds = float(os.getenv("JARVIS_COORDINATOR_COOLDOWN_SECONDS", "300"))
+        self._coordinator_lock = asyncio.Lock()
         self._workspace_agent_singleton = None
         self._workspace_agent_singleton_lock = asyncio.Lock()
 
@@ -490,28 +507,88 @@ class UnifiedCommandProcessor:
         self._dedup_ttl = float(os.getenv("JARVIS_DEDUP_WINDOW_SECONDS", "60"))
         self._dedup_max = int(os.getenv("JARVIS_DEDUP_CACHE_MAX", "500"))
 
-    def _get_neural_mesh_coordinator(self):
-        """Lazily resolve the Neural Mesh coordinator singleton.
+    _COORDINATOR_BACKOFF_SCHEDULE = [5.0, 10.0, 20.0, 40.0, 60.0]
 
-        v242.2: Avoids circular imports by deferring lookup until first use.
-        Only attempts lookup once -- if coordinator isn't available at first
-        call, subsequent workspace requests use the lazy singleton fallback.
+    async def _get_neural_mesh_coordinator(self):
+        """Resolve the Neural Mesh coordinator with bounded retry state machine.
+
+        v_autonomy: Replaces one-shot boolean with state machine:
+        UNRESOLVED -> attempt -> RESOLVED | BACKING_OFF -> ... -> COOLDOWN
         """
-        if self._neural_mesh_coordinator is not None:
-            return self._neural_mesh_coordinator
-        if self._neural_mesh_lookup_attempted:
-            return None
-        self._neural_mesh_lookup_attempted = True
-        try:
-            from neural_mesh.integration import get_neural_mesh_coordinator
-            coordinator = get_neural_mesh_coordinator()
+        async with self._coordinator_lock:
+            self._v242_metrics["coordinator_lookups"] += 1
+
+            # RESOLVED: return cached, but check staleness
+            if self._coordinator_state == "RESOLVED":
+                if self._neural_mesh_coordinator is not None:
+                    if getattr(self._neural_mesh_coordinator, '_running', True):
+                        self._v242_metrics["coordinator_hits"] += 1
+                        return self._neural_mesh_coordinator
+                    logger.warning("[v_autonomy] Coordinator stale (_running=False) — invalidating")
+                    self._v242_metrics["coordinator_stale"] += 1
+                    self._neural_mesh_coordinator = None
+                    self._coordinator_state = "UNRESOLVED"
+                else:
+                    self._coordinator_state = "UNRESOLVED"
+
+            # COOLDOWN: check if cooldown expired
+            if self._coordinator_state == "COOLDOWN":
+                elapsed = time.monotonic() - self._coordinator_last_lookup
+                if elapsed < self._coordinator_cooldown_seconds:
+                    self._v242_metrics["coordinator_misses"] += 1
+                    return None
+                logger.info("[v_autonomy] Coordinator cooldown expired — retrying")
+                self._coordinator_state = "UNRESOLVED"
+                self._coordinator_lookup_failures = 0
+
+            # BACKING_OFF: check if backoff delay has passed
+            if self._coordinator_state == "BACKING_OFF":
+                idx = min(self._coordinator_lookup_failures - 1, len(self._COORDINATOR_BACKOFF_SCHEDULE) - 1)
+                backoff = self._COORDINATOR_BACKOFF_SCHEDULE[max(0, idx)]
+                elapsed = time.monotonic() - self._coordinator_last_lookup
+                if elapsed < backoff:
+                    self._v242_metrics["coordinator_misses"] += 1
+                    return None
+
+            # UNRESOLVED or backoff delay passed — attempt lookup
+            self._coordinator_last_lookup = time.monotonic()
+            try:
+                coordinator = get_neural_mesh_coordinator()
+            except Exception as e:
+                logger.debug("[v_autonomy] Coordinator lookup error: %s", e)
+                coordinator = None
+
             if coordinator is not None:
                 self._neural_mesh_coordinator = coordinator
-                logger.info("[v242.2] Neural Mesh coordinator resolved")
-            return coordinator
-        except (ImportError, Exception) as e:
-            logger.debug(f"[v242.2] Neural Mesh coordinator not available: {e}")
+                self._coordinator_state = "RESOLVED"
+                self._coordinator_lookup_failures = 0
+                self._v242_metrics["coordinator_hits"] += 1
+                logger.info("[v_autonomy] Coordinator resolved")
+                return coordinator
+
+            # Lookup failed
+            self._coordinator_lookup_failures += 1
+            self._v242_metrics["coordinator_misses"] += 1
+
+            if self._coordinator_lookup_failures >= self._coordinator_max_retries:
+                self._coordinator_state = "COOLDOWN"
+                logger.warning(
+                    "[v_autonomy] Coordinator max retries (%d) hit — entering cooldown (%.0fs)",
+                    self._coordinator_max_retries,
+                    self._coordinator_cooldown_seconds,
+                )
+            else:
+                self._coordinator_state = "BACKING_OFF"
             return None
+
+    async def notify_coordinator_ready(self):
+        """Called when mesh becomes ready. Clears BACKING_OFF or COOLDOWN."""
+        async with self._coordinator_lock:
+            if self._coordinator_state in ("BACKING_OFF", "COOLDOWN"):
+                logger.info("[v_autonomy] Coordinator readiness event — clearing %s state", self._coordinator_state)
+                self._coordinator_state = "UNRESOLVED"
+                self._coordinator_lookup_failures = 0
+                self._coordinator_last_lookup = 0.0
 
     async def _gather_sensory_context(self, command_text: str) -> Dict[str, Any]:
         """Gather context from sensory subsystems for J-Prime classification.
@@ -3235,7 +3312,7 @@ class UnifiedCommandProcessor:
         try:
             # Prefer existing agent instance from Neural Mesh coordinator
             agent = None
-            coordinator = self._get_neural_mesh_coordinator()
+            coordinator = await self._get_neural_mesh_coordinator()
             if coordinator:
                 agent = coordinator.get_agent("google_workspace_agent")
 
