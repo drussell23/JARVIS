@@ -37,12 +37,10 @@ def _make_triaged(message_id: str, tier: int, score: int) -> TriagedEmail:
 
 
 def _mock_runner(triaged_emails: dict, report_at=None, schema_version="1.0"):
-    """Build a mock runner with triage state for enrichment tests."""
+    """Build a mock runner with get_triage_snapshot() accessor."""
     runner = MagicMock()
-    runner._triaged_emails = triaged_emails
-    runner._last_report_at = report_at if report_at is not None else time.monotonic()
-    runner._triage_schema_version = schema_version
-    runner._last_report = TriageCycleReport(
+    _report_at = report_at if report_at is not None else time.monotonic()
+    _report = TriageCycleReport(
         cycle_id="test_cycle",
         started_at=time.time() - 5.0,
         completed_at=time.time(),
@@ -53,6 +51,20 @@ def _mock_runner(triaged_emails: dict, report_at=None, schema_version="1.0"):
         notifications_suppressed=0,
         errors=[],
     )
+
+    def get_triage_snapshot(staleness_window_s=None):
+        window = staleness_window_s if staleness_window_s is not None else 120.0
+        age = time.monotonic() - _report_at
+        if age > window:
+            return None
+        return {
+            "report": _report,
+            "triaged_emails": dict(triaged_emails),
+            "schema_version": schema_version,
+            "age_s": age,
+        }
+
+    runner.get_triage_snapshot = get_triage_snapshot
     return runner
 
 

@@ -7,7 +7,6 @@ no side effects, no network, no exceptions.
 
 from __future__ import annotations
 
-import time
 from typing import Any, Dict, List, Optional, Tuple
 
 _COMPATIBLE_SCHEMA_VERSIONS = {"1.0"}
@@ -16,7 +15,7 @@ _COMPATIBLE_SCHEMA_VERSIONS = {"1.0"}
 def enrich_with_triage(
     emails: List[Dict[str, Any]],
     runner: Any,
-    staleness_window_s: float,
+    staleness_window_s: Optional[float] = None,
 ) -> Tuple[List[Dict[str, Any]], bool, Optional[float]]:
     """Merge triage metadata into raw email dicts.
 
@@ -26,12 +25,12 @@ def enrich_with_triage(
         Raw email dicts from GoogleWorkspaceAgent.  Each must have an ``"id"``
         key for matching.
     runner:
-        An ``EmailTriageRunner`` instance (or None).  The function reads
-        ``_triaged_emails``, ``_last_report``, ``_last_report_at``, and
-        ``_triage_schema_version`` — all read-only.
+        An ``EmailTriageRunner`` instance (or None).  Uses the public
+        ``get_triage_snapshot()`` accessor to atomically read triage state.
     staleness_window_s:
         Maximum age (in seconds, monotonic clock) of the last triage report
-        before results are considered stale and skipped.
+        before results are considered stale and skipped.  When None, the
+        runner's configured staleness window is used.
 
     Returns
     -------
@@ -54,28 +53,22 @@ def enrich_with_triage(
     if runner is None:
         return (emails, False, None)
 
-    # Guard: no last report
-    last_report = getattr(runner, "_last_report", None)
-    if last_report is None:
+    # Use public accessor for atomic snapshot
+    snapshot_fn = getattr(runner, "get_triage_snapshot", None)
+    if snapshot_fn is None:
+        return (emails, False, None)
+
+    snapshot = snapshot_fn(staleness_window_s=staleness_window_s)
+    if snapshot is None:
         return (emails, False, None)
 
     # Guard: incompatible schema version
-    schema_version = getattr(runner, "_triage_schema_version", None)
+    schema_version = snapshot.get("schema_version")
     if schema_version not in _COMPATIBLE_SCHEMA_VERSIONS:
         return (emails, False, None)
 
-    # Guard: stale results
-    last_report_at = getattr(runner, "_last_report_at", None)
-    if last_report_at is None:
-        return (emails, False, None)
-
-    now = time.monotonic()
-    age = now - last_report_at
-    if age > staleness_window_s:
-        return (emails, False, None)
-
-    # Guard: empty triaged emails
-    triaged_emails = getattr(runner, "_triaged_emails", None) or {}
+    age = snapshot.get("age_s")
+    triaged_emails = snapshot.get("triaged_emails") or {}
     if not triaged_emails:
         return (emails, False, age)
 

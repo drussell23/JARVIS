@@ -4093,11 +4093,10 @@ class UnifiedCommandProcessor:
                     try:
                         from autonomy.email_triage.runner import EmailTriageRunner
                         from autonomy.email_triage.enrichment import enrich_with_triage
-                        _runner = EmailTriageRunner._instance  # Safe: None if not initialized
+                        _runner = EmailTriageRunner.get_instance_safe()
                         _enriched, _triage_enriched, _triage_age_s = enrich_with_triage(
                             _artifacts.get("emails", []),
                             _runner,
-                            staleness_window_s=120.0,
                         )
                         if _triage_enriched:
                             _artifacts["emails"] = _enriched

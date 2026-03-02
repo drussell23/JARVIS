@@ -71,6 +71,11 @@ class EmailTriageRunner:
             cls._instance = cls(**kwargs)
         return cls._instance
 
+    @classmethod
+    def get_instance_safe(cls) -> Optional[EmailTriageRunner]:
+        """Return the singleton if it exists, else None. Never creates."""
+        return cls._instance
+
     async def run_cycle(self) -> TriageCycleReport:
         """Execute a single triage cycle."""
         cycle_id = uuid4().hex[:12]
@@ -294,3 +299,35 @@ class EmailTriageRunner:
         if age > window:
             return None
         return self._last_report
+
+    def get_triage_snapshot(
+        self,
+        staleness_window_s: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return an atomic snapshot of the last triage cycle.
+
+        All fields are read together to prevent tearing under concurrent
+        writes from ``run_cycle()``.  Returns None when stale or empty.
+        """
+        report = self._last_report
+        report_at = self._last_report_at
+        if report is None or report_at == 0.0:
+            return None
+        window = (
+            staleness_window_s
+            if staleness_window_s is not None
+            else self._config.staleness_window_s
+        )
+        age = time.monotonic() - report_at
+        if age > window:
+            return None
+        return {
+            "report": report,
+            "triaged_emails": dict(self._triaged_emails),
+            "schema_version": self._triage_schema_version,
+            "age_s": age,
+        }
+
+    def get_triaged_email(self, message_id: str) -> Optional[TriagedEmail]:
+        """Return a single triaged email by message ID, or None."""
+        return self._triaged_emails.get(message_id)

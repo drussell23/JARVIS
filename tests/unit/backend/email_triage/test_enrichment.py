@@ -65,23 +65,41 @@ def _mock_runner(
     triaged_emails: dict,
     report_at=None,
     schema_version: str = "1.0",
+    has_report: bool = True,
 ) -> MagicMock:
-    """Build a mock runner with triage state attributes."""
+    """Build a mock runner with get_triage_snapshot() accessor."""
     runner = MagicMock()
-    runner._triaged_emails = triaged_emails
-    runner._last_report_at = report_at if report_at is not None else time.monotonic()
-    runner._triage_schema_version = schema_version
-    runner._last_report = TriageCycleReport(
-        cycle_id="test_cycle",
-        started_at=time.time() - 5.0,
-        completed_at=time.time(),
-        emails_fetched=len(triaged_emails),
-        emails_processed=len(triaged_emails),
-        tier_counts={},
-        notifications_sent=0,
-        notifications_suppressed=0,
-        errors=[],
-    )
+    _report_at = report_at if report_at is not None else time.monotonic()
+
+    _report = None
+    if has_report:
+        _report = TriageCycleReport(
+            cycle_id="test_cycle",
+            started_at=time.time() - 5.0,
+            completed_at=time.time(),
+            emails_fetched=len(triaged_emails),
+            emails_processed=len(triaged_emails),
+            tier_counts={},
+            notifications_sent=0,
+            notifications_suppressed=0,
+            errors=[],
+        )
+
+    def get_triage_snapshot(staleness_window_s=None):
+        if _report is None:
+            return None
+        window = staleness_window_s if staleness_window_s is not None else 120.0
+        age = time.monotonic() - _report_at
+        if age > window:
+            return None
+        return {
+            "report": _report,
+            "triaged_emails": dict(triaged_emails),
+            "schema_version": schema_version,
+            "age_s": age,
+        }
+
+    runner.get_triage_snapshot = get_triage_snapshot
     return runner
 
 
@@ -205,12 +223,11 @@ class TestEnrichWithTriage:
         assert age is None
 
     def test_no_last_report_returns_unenriched(self):
-        """_last_report = None -> (emails, False, None)."""
-        runner = MagicMock()
-        runner._triaged_emails = {"msg_a": _make_triaged("msg_a", 1, 90)}
-        runner._last_report_at = time.monotonic()
-        runner._triage_schema_version = "1.0"
-        runner._last_report = None
+        """No report -> get_triage_snapshot returns None -> (emails, False, None)."""
+        runner = _mock_runner(
+            {"msg_a": _make_triaged("msg_a", 1, 90)},
+            has_report=False,
+        )
 
         emails = [{"id": "msg_a", "subject": "No report"}]
         result, was_enriched, age = enrich_with_triage(emails, runner, staleness_window_s=120.0)
@@ -254,7 +271,7 @@ class TestEnrichWithTriage:
         assert "triage_tier" in result[0]
 
     def test_empty_triaged_emails_returns_with_age(self):
-        """Empty _triaged_emails returns (emails, False, age)."""
+        """Empty triaged_emails returns (emails, False, age)."""
         runner = _mock_runner({}, report_at=time.monotonic() - 5.0)
 
         emails = [{"id": "msg_a", "subject": "Test"}]
@@ -264,3 +281,25 @@ class TestEnrichWithTriage:
         assert was_enriched is False
         assert age is not None
         assert age >= 4.0
+
+    def test_staleness_defaults_to_runner_config(self):
+        """When staleness_window_s=None, runner's config window is used."""
+        t1 = _make_triaged("msg_a", tier=2, score=70)
+        runner = _mock_runner({"msg_a": t1})
+
+        emails = [{"id": "msg_a", "subject": "Default window"}]
+        result, was_enriched, age = enrich_with_triage(emails, runner)
+
+        assert was_enriched is True
+        assert age is not None
+
+    def test_no_snapshot_accessor_returns_unenriched(self):
+        """Runner without get_triage_snapshot returns unenriched."""
+        runner = MagicMock(spec=[])  # Empty spec = no attributes
+
+        emails = [{"id": "msg_a", "subject": "No accessor"}]
+        result, was_enriched, age = enrich_with_triage(emails, runner)
+
+        assert result is emails
+        assert was_enriched is False
+        assert age is None

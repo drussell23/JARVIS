@@ -2761,7 +2761,7 @@ class UnifiedAgentRuntime:
         if not _env_bool("EMAIL_TRIAGE_ENABLED", False):
             return
 
-        now = time.time()
+        now = time.monotonic()
         interval = _env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0)
         if now - self._last_email_triage_run < interval:
             return
