@@ -2625,6 +2625,14 @@ class GoogleWorkspaceClient:
     async def _ensure_authenticated(self) -> bool:
         """Ensure client is authenticated AND token is valid/fresh.
 
+        v283.0: Concurrency-safe.  All reads/writes of ``_authenticated``
+        and ``_auth_state`` are protected by ``self._lock`` to prevent
+        TOCTOU races when multiple concurrent commands call this method.
+        The lock is NOT held during the long-running ``_ensure_valid_token()``
+        call (which may take 10-30s for network token refresh) to avoid
+        blocking all other callers.  Instead we use a double-checked pattern:
+        acquire → read → release → long work → acquire → write → release.
+
         The critical distinction: ``_authenticated`` is a cached flag set once
         during initial credential load.  Tokens expire independently of that
         flag (typically after 1 hour).  We must validate the token on every
@@ -2632,29 +2640,45 @@ class GoogleWorkspaceClient:
         instead of hitting the API with stale credentials — which would
         cascade into a permanent NEEDS_REAUTH state.
         """
-        if self._auth_state in {AuthState.NEEDS_REAUTH, AuthState.NEEDS_REAUTH_GUIDED}:
-            return False
-        if not self._authenticated:
+        # Phase 1: Quick state check under lock — determine action
+        _do_initial_auth = False
+        async with self._lock:
+            if self._auth_state in {AuthState.NEEDS_REAUTH, AuthState.NEEDS_REAUTH_GUIDED}:
+                return False
+            if not self._authenticated:
+                _do_initial_auth = True
+
+        # Not yet authenticated — go through full auth flow.
+        # authenticate() acquires self._lock internally.
+        if _do_initial_auth:
             return await self.authenticate(interactive=False)
-        # Token was loaded at some point — verify it's still valid and
-        # proactively refresh if expired or nearing expiry.
-        if not await self._ensure_valid_token():
-            # _ensure_valid_token sets NEEDS_REAUTH on permanent failure.
-            # For transient failures (e.g. network blip during refresh),
-            # attempt a full re-authentication cycle once before giving up.
+
+        # Phase 2: Token was loaded at some point — verify it's still valid.
+        # This is a long-running operation (network refresh possible),
+        # so we do NOT hold the lock here.
+        if await self._ensure_valid_token():
+            return True
+
+        # Phase 3: Token validation failed — re-check state under lock
+        # before deciding next action (another task may have already
+        # recovered or marked permanent failure while we were refreshing).
+        async with self._lock:
             if self._auth_state in {
                 AuthState.NEEDS_REAUTH,
                 AuthState.NEEDS_REAUTH_GUIDED,
                 AuthState.DEGRADED_VISUAL,
             }:
                 return False
+            # Transient failure — reset flag so authenticate() does a
+            # full credential reload from disk + refresh.
             logger.warning(
                 "[GoogleWorkspaceClient] Token validation failed but not permanent "
                 "— attempting full re-authentication",
             )
             self._authenticated = False
-            return await self.authenticate(interactive=False)
-        return True
+
+        # authenticate() acquires self._lock internally
+        return await self.authenticate(interactive=False)
 
     # =========================================================================
     # Public Auth State API (Step 12, 17, 20)
