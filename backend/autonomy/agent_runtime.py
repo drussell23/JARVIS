@@ -453,7 +453,8 @@ class UnifiedAgentRuntime:
             "AGENT_RUNTIME_PROACTIVE_COOLDOWN", 1800.0
         )
 
-        # Email triage integration — last run timestamp for cooldown
+        # Email triage integration — last run timestamp (monotonic clock).
+        # Sentinel 0.0 means "never ran" — first call always passes cooldown.
         self._last_email_triage_run: float = 0.0
 
     # ─────────────────────────────────────────────────────────
@@ -2763,7 +2764,7 @@ class UnifiedAgentRuntime:
 
         now = time.monotonic()
         interval = _env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0)
-        if now - self._last_email_triage_run < interval:
+        if self._last_email_triage_run > 0.0 and now - self._last_email_triage_run < interval:
             return
 
         self._last_email_triage_run = now

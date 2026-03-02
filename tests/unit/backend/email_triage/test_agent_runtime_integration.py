@@ -137,7 +137,7 @@ class TestAgentRuntimeTriageWiring:
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
         runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = time.time()  # Just ran
+        runtime._last_email_triage_run = time.monotonic()  # Just ran
 
         with patch.dict(os.environ, {
             "EMAIL_TRIAGE_ENABLED": "true",
