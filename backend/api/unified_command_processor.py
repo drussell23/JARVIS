@@ -3830,6 +3830,27 @@ class UnifiedCommandProcessor:
                     if operation_token:
                         complete_tracked_operation(operation_token)
 
+                    # v_autonomy: Verify result against contract before accepting
+                    outcome_code, result_dict = _verify_workspace_result(action, result_dict)
+                    if outcome_code not in ("verify_passed", "verify_empty_valid"):
+                        _recovery_deadline = deadline if deadline else (_time.monotonic() + 15.0)
+                        if (_recovery_deadline - _time.monotonic()) >= _MIN_ATTEMPT_BUDGET:
+                            result_dict = await _attempt_workspace_recovery(
+                                action=action,
+                                initial_result=result_dict,
+                                initial_outcome=outcome_code,
+                                agent=agent,
+                                payload=payload,
+                                deadline=_recovery_deadline,
+                                command_text=command_text,
+                            )
+                            # Re-verify after recovery
+                            outcome_code, result_dict = _verify_workspace_result(action, result_dict)
+                        logger.info(
+                            "[v_autonomy] Node %s (%s): verification=%s",
+                            node_id, action, outcome_code,
+                        )
+
                     status = "failed" if result_dict.get("error") else "success"
                     logger.info(
                         "[v281] Node %s (%s): %s in %.1fs",

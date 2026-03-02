@@ -314,8 +314,8 @@ class TestGoogleWorkspaceAgentExecution:
         mock_client.fetch_unread_emails.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_fetch_unread_emails_defaults_to_api_authority(self, agent_with_mock):
-        """Email reads should stay on the Gmail API path unless visual fallback is explicit."""
+    async def test_fetch_unread_emails_defaults_to_visual_fallback_enabled(self, agent_with_mock):
+        """Email reads enable visual fallback by default (v_autonomy: design Section 2)."""
         from backend.neural_mesh.agents.google_workspace_agent import (
             ExecutionResult,
             ExecutionTier,
@@ -343,7 +343,8 @@ class TestGoogleWorkspaceAgentExecution:
         })
 
         assert result["error_code"] == "auth_missing"
-        assert executor.execute_email_check.await_args.kwargs["allow_visual_fallback"] is False
+        # v_autonomy: email_visual_fallback_enabled default changed to True (design Section 2)
+        assert executor.execute_email_check.await_args.kwargs["allow_visual_fallback"] is True
 
     @pytest.mark.asyncio
     async def test_check_calendar_events(self, agent_with_mock, mock_client):
