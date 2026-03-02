@@ -33,9 +33,11 @@ from autonomy.email_triage.extraction import extract_features
 from autonomy.email_triage.labels import apply_label, ensure_labels_exist
 from autonomy.email_triage.policy import NotificationPolicy
 from autonomy.email_triage.schemas import TriageCycleReport, TriagedEmail
-from autonomy.email_triage.notifications import deliver_immediate, deliver_summary
+from autonomy.email_triage.notifications import deliver_immediate, deliver_summary, replay_outbox
 from autonomy.email_triage.scoring import score_email
 from autonomy.email_triage.state_store import TriageStateStore
+from autonomy.email_triage.outcome_collector import OutcomeCollector
+from autonomy.email_triage.weight_adapter import WeightAdapter
 
 logger = logging.getLogger("jarvis.email_triage.runner")
 
@@ -77,6 +79,14 @@ class EmailTriageRunner:
         # Fencing (WS2)
         self._current_fencing_token: int = 0
         self._last_committed_fencing_token: int = 0
+        # Reactor-Core feedback loop (WS5)
+        self._outcome_collector: Optional[OutcomeCollector] = None
+        self._weight_adapter: Optional[WeightAdapter] = None
+        self._prior_triaged: Dict[str, TriagedEmail] = {}
+        if self._config.outcome_collection_enabled:
+            self._outcome_collector = OutcomeCollector(self._config, state_store)
+        if self._config.adaptive_scoring_enabled:
+            self._weight_adapter = WeightAdapter(self._config)
 
     @classmethod
     def get_instance(cls, **kwargs) -> EmailTriageRunner:
@@ -191,6 +201,26 @@ class EmailTriageRunner:
         await self._ensure_state_store()
         await self._cold_start_recovery()
 
+        # Replay undelivered outbox entries (WS6)
+        if (
+            self._state_store is not None
+            and self._config.outbox_replay_on_start
+            and not getattr(self, "_outbox_replayed", False)
+        ):
+            self._outbox_replayed = True
+            notifier_for_replay = self._resolver.get("notifier")
+            try:
+                replay_stats = await replay_outbox(
+                    self._state_store,
+                    notifier_for_replay,
+                    self._config,
+                    budget_s=self._config.notification_budget_s,
+                )
+                if any(v > 0 for v in replay_stats.values()):
+                    logger.info("Outbox replay: %s", replay_stats)
+            except Exception as e:
+                logger.warning("Outbox replay failed: %s", e)
+
         if not self._config.enabled:
             return TriageCycleReport(
                 cycle_id=cycle_id,
@@ -247,6 +277,33 @@ class EmailTriageRunner:
                 errors=errors,
             )
 
+        # Outcome collection for prior cycle (WS5)
+        if self._outcome_collector and self._prior_triaged:
+            try:
+                await self._outcome_collector.check_outcomes_for_cycle(
+                    workspace_agent, self._prior_triaged,
+                )
+            except Exception as e:
+                logger.debug("Outcome collection failed: %s", e)
+
+        # Compute adaptive weights for this cycle (WS5)
+        adaptive_weights = None
+        if self._weight_adapter:
+            # Feed adaptation-eligible outcomes from collector
+            if self._outcome_collector:
+                for rec in self._outcome_collector.get_adaptation_outcomes():
+                    self._weight_adapter.record_outcome(rec)
+                self._outcome_collector.clear()
+
+            try:
+                await self._weight_adapter.compute_adapted_weights(self._state_store)
+            except Exception as e:
+                logger.debug("Weight adaptation failed: %s", e)
+
+            # Advance shadow cycle and get weights
+            self._weight_adapter.advance_shadow_cycle()
+            adaptive_weights = self._weight_adapter.get_weights_for_scoring()
+
         # Process each email
         new_triaged: Dict[str, TriagedEmail] = {}
         immediate_emails: List[TriagedEmail] = []
@@ -257,8 +314,22 @@ class EmailTriageRunner:
                     email, self._resolver.get("router"), config=self._config,
                 )
 
-                # Score
-                scoring = score_email(features, self._config)
+                # Get sender reputation bonus (WS5)
+                rep_bonus = 0.0
+                if self._weight_adapter and self._state_store:
+                    try:
+                        rep_bonus = await self._weight_adapter.get_sender_reputation_bonus(
+                            features.sender_domain, self._state_store,
+                        )
+                    except Exception:
+                        pass
+
+                # Score (with optional adaptive weights)
+                scoring = score_email(
+                    features, self._config,
+                    adaptive_weights=adaptive_weights,
+                    sender_reputation_bonus=rep_bonus,
+                )
 
                 # Apply label
                 try:
@@ -314,11 +385,44 @@ class EmailTriageRunner:
         notifier = self._resolver.get("notifier")
         if notifier:
             if immediate_emails:
+                # Enqueue to outbox before delivery (WS6)
+                outbox_ids: Dict[str, int] = {}  # message_id -> outbox row id
+                if self._state_store is not None:
+                    for em in immediate_emails:
+                        try:
+                            oid = await self._state_store.enqueue_notification(
+                                message_id=em.features.message_id,
+                                action="immediate",
+                                tier=em.scoring.tier,
+                                sender_domain=em.features.sender_domain,
+                                expires_at=time.time() + 2 * self._config.summary_interval_s,
+                            )
+                            if oid is not None:
+                                outbox_ids[em.features.message_id] = oid
+                        except Exception as e:
+                            logger.debug("Outbox enqueue failed for %s: %s",
+                                         em.features.message_id, e)
+
                 try:
                     delivery_results = await deliver_immediate(
                         immediate_emails, notifier, self._config.notification_budget_s,
                     )
                     notifications_sent = sum(1 for r in delivery_results if r.success)
+
+                    # Mark delivered in outbox (WS6)
+                    if self._state_store is not None:
+                        for dr in delivery_results:
+                            oid = outbox_ids.get(dr.message_id)
+                            if oid is not None and dr.success:
+                                try:
+                                    await self._state_store.mark_delivered(oid)
+                                except Exception:
+                                    pass
+                            elif oid is not None and not dr.success:
+                                try:
+                                    await self._state_store.increment_outbox_attempts(oid)
+                                except Exception:
+                                    pass
                 except Exception as e:
                     logger.warning("Immediate notification delivery failed: %s", e)
                     errors.append(f"notify_immediate: {e}")

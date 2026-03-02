@@ -100,6 +100,15 @@ class TriageConfig:
     outbox_replay_on_start: bool = True
     snapshot_retention_count: int = 10
 
+    # Adaptive scoring / Reactor-Core (WS5)
+    adaptive_scoring_enabled: bool = False
+    outcome_collection_enabled: bool = False
+    min_outcomes_for_adaptation: int = 50  # high-confidence only
+    weight_bounds_pct: float = 20.0  # max ±20% drift from defaults
+    shadow_cycles: int = 5  # shadow before activating adapted weights
+    shadow_tier_drift_threshold: float = 0.10  # 10% tier disagreement → rollback
+    outcome_lookback_cycles: int = 2  # check N prior cycles for outcomes
+
     @classmethod
     def from_env(cls) -> TriageConfig:
         """Build config from environment variables."""
@@ -134,6 +143,14 @@ class TriageConfig:
             outbox_retry_limit=_env_int("EMAIL_TRIAGE_OUTBOX_RETRY_LIMIT", 3),
             outbox_replay_on_start=_env_bool("EMAIL_TRIAGE_OUTBOX_REPLAY", True),
             snapshot_retention_count=_env_int("EMAIL_TRIAGE_SNAPSHOT_RETENTION", 10),
+            # Adaptive scoring / Reactor-Core (WS5)
+            adaptive_scoring_enabled=_env_bool("EMAIL_TRIAGE_ADAPTIVE_SCORING", False),
+            outcome_collection_enabled=_env_bool("EMAIL_TRIAGE_OUTCOME_COLLECTION", False),
+            min_outcomes_for_adaptation=_env_int("EMAIL_TRIAGE_MIN_OUTCOMES", 50),
+            weight_bounds_pct=_env_float("EMAIL_TRIAGE_WEIGHT_BOUNDS_PCT", 20.0),
+            shadow_cycles=_env_int("EMAIL_TRIAGE_SHADOW_CYCLES", 5),
+            shadow_tier_drift_threshold=_env_float("EMAIL_TRIAGE_SHADOW_DRIFT_THRESHOLD", 0.10),
+            outcome_lookback_cycles=_env_int("EMAIL_TRIAGE_OUTCOME_LOOKBACK", 2),
         )
 
     def tier_for_score(self, score: int) -> int:

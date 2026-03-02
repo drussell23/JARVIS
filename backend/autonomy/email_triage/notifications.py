@@ -349,3 +349,128 @@ async def deliver_summary(
     )
 
     return delivery
+
+
+# ---------------------------------------------------------------------------
+# Outbox replay (WS6 — Gate #3)
+# ---------------------------------------------------------------------------
+
+
+async def replay_outbox(
+    state_store: Any,
+    notifier: Callable[..., Any],
+    config: TriageConfig,
+    budget_s: float = 10.0,
+) -> dict:
+    """Replay undelivered outbox entries with policy re-evaluation (Gate #3).
+
+    Each pending entry is checked for:
+    1. Expiry — entries past ``expires_at_epoch`` are discarded (never delivered).
+    2. Policy — quiet hours suppress tier >=2 entries.
+    3. Retry limit — entries past ``config.outbox_retry_limit`` are permanently failed.
+    4. Delivery — attempts actual notification delivery.
+
+    Args:
+        state_store: TriageStateStore instance (or None to no-op).
+        notifier: Callable (sync or async) that sends notifications.
+        config: TriageConfig for policy evaluation.
+        budget_s: Total wall-clock budget for all replays.
+
+    Returns:
+        Stats dict: ``{delivered, expired, suppressed, failed}``.
+    """
+    from autonomy.email_triage.policy import NotificationPolicy
+
+    stats = {"delivered": 0, "expired": 0, "suppressed": 0, "failed": 0}
+
+    if state_store is None or notifier is None:
+        return stats
+
+    try:
+        pending = await state_store.get_pending_notifications(limit=10)
+    except Exception as exc:
+        logger.warning("Outbox replay: failed to get pending: %s", exc)
+        return stats
+
+    if not pending:
+        return stats
+
+    now = time.time()
+    policy = NotificationPolicy(config)
+    per_entry_budget = budget_s / max(len(pending), 1)
+
+    for entry in pending:
+        entry_id = entry["id"]
+        msg_id = entry["message_id"]
+        tier = entry["tier"]
+        expires_at = entry.get("expires_at_epoch", now + 3600)
+        attempts = entry.get("attempts", 0)
+        sender_domain = entry.get("sender_domain", "unknown")
+
+        # 1. Expiry check — never deliver stale notifications
+        if now > expires_at:
+            emit_triage_event(
+                EVENT_OUTBOX_EXPIRED,
+                {
+                    "message_id": msg_id,
+                    "tier": tier,
+                    "age_s": now - entry.get("created_at_epoch", now),
+                },
+            )
+            try:
+                await state_store.mark_delivered(entry_id)
+            except Exception:
+                pass
+            stats["expired"] += 1
+            continue
+
+        # 2. Policy re-evaluation (Gate #3) — quiet hours suppress tier >=2
+        if tier >= 2 and policy._in_quiet_hours():
+            stats["suppressed"] += 1
+            continue
+
+        # 3. Retry limit
+        if attempts >= config.outbox_retry_limit:
+            stats["failed"] += 1
+            continue
+
+        # 4. Attempt delivery
+        urgency = tier_to_urgency(tier)
+        title = f"[Replay] Email notification (tier {tier})"
+        message = f"Queued notification for {sender_domain} (tier {tier})"
+
+        try:
+            result = await asyncio.wait_for(
+                _invoke_notifier(
+                    notifier,
+                    message=message,
+                    urgency=urgency,
+                    title=title,
+                ),
+                timeout=per_entry_budget,
+            )
+            if result:
+                await state_store.mark_delivered(entry_id)
+                stats["delivered"] += 1
+            else:
+                await state_store.increment_outbox_attempts(entry_id)
+                stats["failed"] += 1
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Outbox replay timed out for %s (attempt %d)", msg_id, attempts + 1
+            )
+            try:
+                await state_store.increment_outbox_attempts(entry_id)
+            except Exception:
+                pass
+            stats["failed"] += 1
+        except Exception as exc:
+            logger.warning("Outbox replay failed for %s: %s", msg_id, exc)
+            try:
+                await state_store.increment_outbox_attempts(entry_id)
+            except Exception:
+                pass
+            stats["failed"] += 1
+
+    emit_triage_event(EVENT_OUTBOX_REPLAYED, stats)
+    return stats

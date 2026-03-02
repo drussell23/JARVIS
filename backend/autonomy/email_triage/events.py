@@ -30,6 +30,9 @@ EVENT_OUTBOX_REPLAYED = "outbox_replayed"
 EVENT_OUTBOX_EXPIRED = "outbox_expired"
 EVENT_FENCING_REJECTED = "fencing_rejected"
 EVENT_EXTRACTION_DEGRADED = "extraction_degraded"
+EVENT_OUTCOME_CAPTURED = "outcome_captured"
+EVENT_WEIGHTS_ADAPTED = "weights_adapted"
+EVENT_WEIGHTS_SHADOW = "weights_shadow"
 
 _ERROR_EVENTS = frozenset({EVENT_TRIAGE_ERROR, EVENT_DEPENDENCY_UNAVAILABLE})
 

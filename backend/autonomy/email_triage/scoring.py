@@ -7,10 +7,18 @@ Same EmailFeatures + same TriageConfig -> identical ScoringResult every time.
 from __future__ import annotations
 
 import hashlib
-from typing import Set
+from typing import Dict, Optional, Set
 
 from autonomy.email_triage.config import TriageConfig
 from autonomy.email_triage.schemas import EmailFeatures, ScoringResult
+
+# Default factor weights
+DEFAULT_WEIGHTS: Dict[str, float] = {
+    "sender": 0.30,
+    "content": 0.35,
+    "urgency": 0.25,
+    "context": 0.10,
+}
 
 # Urgency keywords (normalized to lowercase)
 _URGENT_KEYWORDS: Set[str] = {
@@ -30,32 +38,49 @@ _PROMOTIONAL_LABELS: Set[str] = {
 }
 
 
-def score_email(features: EmailFeatures, config: TriageConfig) -> ScoringResult:
+def score_email(
+    features: EmailFeatures,
+    config: TriageConfig,
+    adaptive_weights: Optional[Dict[str, float]] = None,
+    sender_reputation_bonus: float = 0.0,
+) -> ScoringResult:
     """Score an email deterministically.
 
-    Factor weights:
+    Factor weights (defaults):
         sender   (30%) -- known contacts, frequency, domain
         content  (35%) -- urgency keywords in subject/snippet, attachment
         urgency  (25%) -- urgency signals from extraction, is_reply
         context  (10%) -- label context (INBOX vs CATEGORY_PROMOTIONS)
 
+    When ``adaptive_weights`` is provided, those weights are used instead of
+    the defaults. ``sender_reputation_bonus`` adjusts the sender sub-score
+    (clamped to 0.0-1.0).
+
     Args:
         features: Extracted email features.
         config: Triage configuration (thresholds, scoring version).
+        adaptive_weights: Optional weight overrides (WS5). Keys must match
+            DEFAULT_WEIGHTS.
+        sender_reputation_bonus: Adjustment to sender score (-0.1 to +0.1).
 
     Returns:
         ScoringResult with score (0-100), tier (1-4), breakdown, idempotency key.
     """
+    weights = adaptive_weights if adaptive_weights else DEFAULT_WEIGHTS
+
     sender_score = _score_sender(features)
+    # Apply sender reputation bonus (WS5)
+    if sender_reputation_bonus != 0.0:
+        sender_score = max(0.0, min(1.0, sender_score + sender_reputation_bonus))
     content_score = _score_content(features)
     urgency_score = _score_urgency(features)
     context_score = _score_context(features)
 
     raw = (
-        sender_score * 0.30
-        + content_score * 0.35
-        + urgency_score * 0.25
-        + context_score * 0.10
+        sender_score * weights.get("sender", 0.30)
+        + content_score * weights.get("content", 0.35)
+        + urgency_score * weights.get("urgency", 0.25)
+        + context_score * weights.get("context", 0.10)
     )
     score = max(0, min(100, int(round(raw * 100))))
     tier = config.tier_for_score(score)
@@ -79,6 +104,14 @@ def score_email(features: EmailFeatures, config: TriageConfig) -> ScoringResult:
         explanation_parts.append(f"important context ({context_score:.0%})")
     elif context_score <= 0.2:
         explanation_parts.append(f"promotional context ({context_score:.0%})")
+    # Note adaptive context in explanation
+    if adaptive_weights:
+        explanation_parts.append("adapted weights")
+    if sender_reputation_bonus > 0:
+        explanation_parts.append(f"sender reputation: +{sender_reputation_bonus:.0%}")
+    elif sender_reputation_bonus < 0:
+        explanation_parts.append(f"sender reputation: {sender_reputation_bonus:.0%}")
+
     scoring_explanation = (
         f"Tier {tier}: " + " + ".join(explanation_parts)
         if explanation_parts
