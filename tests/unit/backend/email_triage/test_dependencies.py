@@ -198,6 +198,38 @@ class TestDependencyResolver:
         assert resolver.get("notifier") is fake_notifier
 
     @pytest.mark.asyncio
+    async def test_resolve_all_handles_async_resolver(self):
+        """When a resolver returns a coroutine (e.g. get_prime_router is async),
+        resolve_all awaits it instead of storing the raw coroutine."""
+        fake_agent = MagicMock()
+        fake_router = MagicMock()
+        fake_notifier = MagicMock()
+
+        async def _async_router_resolver():
+            return fake_router
+
+        with (
+            patch(
+                "autonomy.email_triage.dependencies._resolve_workspace_agent",
+                return_value=fake_agent,
+            ),
+            patch(
+                "autonomy.email_triage.dependencies._resolve_router",
+                side_effect=_async_router_resolver,
+            ),
+            patch(
+                "autonomy.email_triage.dependencies._resolve_notifier",
+                return_value=fake_notifier,
+            ),
+        ):
+            resolver = self._make_resolver()
+            await resolver.resolve_all()
+
+        assert resolver.get("router") is fake_router
+        assert resolver.get("workspace_agent") is fake_agent
+        assert resolver.get("notifier") is fake_notifier
+
+    @pytest.mark.asyncio
     async def test_resolve_all_failure_emits_event(self):
         with (
             patch(

@@ -11,6 +11,7 @@ drives lazy resolution with configurable exponential backoff on failure.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import random
 import time
@@ -198,7 +199,12 @@ class DependencyResolver:
             _this_module = _sys.modules[__name__]
             resolver_fn: Callable[[], Any] = getattr(_this_module, fn_name)
             try:
-                instance = resolver_fn()
+                result = resolver_fn()
+                # Handle async resolver functions (e.g. get_prime_router)
+                if inspect.isawaitable(result):
+                    instance = await result
+                else:
+                    instance = result
                 dep.record_success(instance)
                 logger.info("Dependency %s resolved successfully", name)
             except Exception as exc:
