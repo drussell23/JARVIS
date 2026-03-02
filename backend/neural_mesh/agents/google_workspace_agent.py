@@ -1656,6 +1656,15 @@ class GoogleWorkspaceClient:
         self._auth_autoheal_total: int = 0
         self._token_backup_fail_total: int = 0
 
+        # v_autonomy: Auth state machine v2
+        self._auth_transition_lock = asyncio.Lock()
+        self._refresh_attempts = 0
+        self._max_refresh_attempts = int(os.getenv("JARVIS_AUTH_MAX_REFRESH_ATTEMPTS", "3"))
+        self._auth_probe_count = 0
+        self._auth_probe_max = int(os.getenv("JARVIS_AUTH_PROBE_MAX", "30"))
+        self._last_auth_probe: float = 0.0
+        self._v2_enabled = os.getenv("JARVIS_AUTH_STATE_MACHINE_V2", "true").lower() in {"1", "true", "yes"}
+
     async def _ensure_valid_token(self) -> bool:
         """
         Proactively check and refresh token before expiration.
@@ -2263,6 +2272,48 @@ class GoogleWorkspaceClient:
         self._token_health = TokenHealthStatus.MISSING
         self._creds = None
         logger.info("[GoogleWorkspaceClient] Auth state reset — will re-authenticate on next request")
+
+    # =========================================================================
+    # v_autonomy: Auth State Machine v2 — Behavioral Wiring
+    # =========================================================================
+
+    async def _handle_auth_event(self, event: str) -> None:
+        """Process auth state transition event using constant transition map."""
+        async with self._auth_transition_lock:
+            current = self._auth_state.value
+            for t in _AUTH_TRANSITIONS:
+                if t.from_state == current and t.event == event:
+                    if event == "transient_failure":
+                        self._refresh_attempts += 1
+                        if self._refresh_attempts >= self._max_refresh_attempts:
+                            self._auth_state = AuthState.DEGRADED_VISUAL
+                            logger.warning(
+                                "[v_autonomy] Auth refresh exhausted (%d attempts) → DEGRADED_VISUAL",
+                                self._refresh_attempts,
+                            )
+                            return
+                    new_state = AuthState(t.to_state)
+                    old_state = self._auth_state
+                    self._auth_state = new_state
+                    if event == "refresh_success":
+                        self._refresh_attempts = 0
+                    logger.info(
+                        "[v_autonomy] Auth transition: %s -[%s]-> %s (reason: %s)",
+                        old_state.value, event, new_state.value, t.reason_code,
+                    )
+                    return
+            logger.debug("[v_autonomy] No transition for state=%s event=%s", current, event)
+
+    def _should_use_visual_fallback(self, action: str) -> bool:
+        """Determine if visual fallback should be used for this action."""
+        if not self._v2_enabled:
+            return False
+        if not self.config.email_visual_fallback_enabled:
+            return False
+        risk = _classify_action_risk(action)
+        if risk in ("write", "high_risk_write"):
+            return self.config.write_visual_fallback_enabled
+        return True
 
     def _emit_reauth_notice(self) -> None:
         """Emit a NEEDS_REAUTH log warning with monotonic cooldown to avoid spam."""
