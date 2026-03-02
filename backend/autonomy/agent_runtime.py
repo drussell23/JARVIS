@@ -453,6 +453,9 @@ class UnifiedAgentRuntime:
             "AGENT_RUNTIME_PROACTIVE_COOLDOWN", 1800.0
         )
 
+        # Email triage integration — last run timestamp for cooldown
+        self._last_email_triage_run: float = 0.0
+
     # ─────────────────────────────────────────────────────────
     # Lifecycle
     # ─────────────────────────────────────────────────────────
@@ -1007,6 +1010,7 @@ class UnifiedAgentRuntime:
                 await self._promote_pending_goals()
                 await self._check_timeouts()
                 await self._cleanup_completed_runners()
+                await self._maybe_run_email_triage()
 
                 # Self-directed goal generation + sub-threshold interventions (less frequent)
                 now = time.time()
@@ -2741,6 +2745,38 @@ class UnifiedAgentRuntime:
             )
         except Exception as e:
             logger.debug("[AgentRuntime] Sub-threshold intervention failed: %s", e)
+
+    # ─────────────────────────────────────────────────────────
+    # Email Triage Integration
+    # ─────────────────────────────────────────────────────────
+
+    async def _maybe_run_email_triage(self) -> None:
+        """Run email triage cycle if enabled and cooldown elapsed.
+
+        Gated by:
+        1. EMAIL_TRIAGE_ENABLED feature flag (default: False)
+        2. Cooldown timer (EMAIL_TRIAGE_POLL_INTERVAL_S, default: 60s)
+        3. asyncio.wait_for timeout (EMAIL_TRIAGE_CYCLE_TIMEOUT_S, default: 30s)
+        """
+        if not _env_bool("EMAIL_TRIAGE_ENABLED", False):
+            return
+
+        now = time.time()
+        interval = _env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0)
+        if now - self._last_email_triage_run < interval:
+            return
+
+        self._last_email_triage_run = now
+        try:
+            from autonomy.email_triage.runner import EmailTriageRunner
+
+            runner = EmailTriageRunner.get_instance()
+            timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
+            await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+        except asyncio.TimeoutError:
+            logger.warning("[AgentRuntime] Email triage cycle timed out")
+        except Exception as e:
+            logger.warning("[AgentRuntime] Email triage cycle failed: %s", e)
 
     # ─────────────────────────────────────────────────────────
     # v240.0: Heartbeat Context Gathering
