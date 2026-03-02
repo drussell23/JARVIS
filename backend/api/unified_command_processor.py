@@ -100,6 +100,278 @@ except ImportError as e:
     INTELLIGENT_ROUTER_AVAILABLE = False
     logger.warning(f"[UNIFIED] Intelligent Vision Router not available: {e}")
 
+# v_autonomy: Neural Mesh coordinator factory (fail-open)
+try:
+    from neural_mesh.integration import get_neural_mesh_coordinator
+except ImportError:
+    get_neural_mesh_coordinator = lambda: None  # noqa: E731
+
+
+# ─── Workspace Result Verification Contract (v_autonomy) ───────────────
+WORKSPACE_RESULT_CONTRACT_VERSION = "v1"
+
+
+@dataclass
+class _VerificationContract:
+    required_keys: tuple
+    type_checks: dict
+    item_required_keys: tuple = ()
+    allow_empty: bool = False
+    semantic_check: object = None  # Optional callable
+
+
+_WORKSPACE_VERIFICATION_CONTRACTS = {
+    "fetch_unread_emails": _VerificationContract(
+        required_keys=("emails",),
+        type_checks={"emails": list},
+        item_required_keys=("subject", "from"),
+        allow_empty=True,
+    ),
+    "check_calendar_events": _VerificationContract(
+        required_keys=("events",),
+        type_checks={"events": list},
+        item_required_keys=("title", "start"),
+        allow_empty=True,
+    ),
+    "search_email": _VerificationContract(
+        required_keys=("emails",),
+        type_checks={"emails": list},
+        item_required_keys=("subject",),
+        allow_empty=True,
+    ),
+    "send_email": _VerificationContract(
+        required_keys=("message_id",),
+        type_checks={"message_id": str},
+        semantic_check=lambda v: bool(v.get("message_id")),
+    ),
+    "draft_email_reply": _VerificationContract(
+        required_keys=("draft_id",),
+        type_checks={"draft_id": str},
+        semantic_check=lambda v: bool(v.get("draft_id")),
+    ),
+    "create_calendar_event": _VerificationContract(
+        required_keys=("event_id",),
+        type_checks={"event_id": str},
+        semantic_check=lambda v: bool(v.get("event_id")),
+    ),
+}
+
+
+def _normalize_workspace_result(action, result):
+    """Normalize workspace result to canonical schema (contract v1)."""
+    if not isinstance(result, dict):
+        return result
+    if action in ("check_calendar_events", "list_events"):
+        events = result.get("events")
+        if isinstance(events, list):
+            for evt in events:
+                if isinstance(evt, dict) and "summary" in evt and "title" not in evt:
+                    evt["title"] = evt["summary"]
+    return result
+
+
+def _verify_workspace_result(action, result):
+    """Verify workspace action result against contract.
+    Returns (outcome_code, annotated_result).
+    outcome_code: verify_passed | verify_schema_fail | verify_semantic_fail | verify_empty_valid | verify_transport_fail
+    """
+    if not isinstance(result, dict):
+        result = {"_raw": result}
+
+    # Transport failure check — error key present with no success indicator
+    if result.get("error") and not result.get("success", True):
+        result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+        return "verify_transport_fail", result
+
+    result = _normalize_workspace_result(action, result)
+    contract = _WORKSPACE_VERIFICATION_CONTRACTS.get(action)
+    if contract is None:
+        result["_verification"] = {"passed": True, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+        return "verify_passed", result
+
+    # Schema checks
+    for key in contract.required_keys:
+        if key not in result:
+            result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": f"missing_key:{key}"}
+            return "verify_schema_fail", result
+    for key, expected_type in contract.type_checks.items():
+        if key in result and not isinstance(result[key], expected_type):
+            result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": f"type_mismatch:{key}"}
+            return "verify_schema_fail", result
+
+    # Empty check
+    for key in contract.required_keys:
+        val = result.get(key)
+        if isinstance(val, list) and len(val) == 0:
+            if contract.allow_empty:
+                result["_verification"] = {"passed": True, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+                return "verify_empty_valid", result
+
+    # Item-level checks
+    if contract.item_required_keys:
+        for key in contract.required_keys:
+            items = result.get(key, [])
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        if not all(k in item for k in contract.item_required_keys):
+                            result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": f"item_missing_keys:{contract.item_required_keys}"}
+                            return "verify_semantic_fail", result
+
+    # Semantic check
+    if contract.semantic_check and not contract.semantic_check(result):
+        result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": "semantic_check"}
+        return "verify_semantic_fail", result
+
+    result["_verification"] = {"passed": True, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+    return "verify_passed", result
+
+
+# ─── Bounded Recovery + Runtime Escalation (v_autonomy) ──────────────
+_RUNTIME_ESCALATION_FLOOR = float(os.getenv("JARVIS_RUNTIME_ESCALATION_FLOOR", "5.0"))
+_MIN_ATTEMPT_BUDGET = 2.0
+
+
+def _classify_action_risk_ucp(action: str) -> str:
+    """Action risk classification for command processor context."""
+    _READ_ACTIONS = {
+        "fetch_unread_emails", "check_calendar_events", "search_email",
+        "get_contacts", "workspace_summary", "daily_briefing",
+        "handle_workspace_query", "read_spreadsheet",
+    }
+    if action in _READ_ACTIONS:
+        return "read"
+    return "write"
+
+
+async def _attempt_workspace_recovery(
+    action: str,
+    initial_result: dict,
+    initial_outcome: str,
+    agent,
+    payload: dict,
+    deadline: float,
+    command_text: str,
+) -> dict:
+    """Bounded workspace recovery: same-tier retry -> tier fallback -> runtime escalation."""
+    if initial_outcome in ("verify_passed", "verify_empty_valid"):
+        return initial_result
+
+    attempts = []
+    risk = _classify_action_risk_ucp(action)
+    has_idempotency_key = bool(payload.get("idempotency_key"))
+    remaining = deadline - time.monotonic()
+
+    if remaining <= 0:
+        initial_result["_attempts"] = attempts
+        initial_result["_recovery_reason"] = "recovery_deadline_exhausted"
+        return initial_result
+
+    retry_budget = remaining * 0.4
+    fallback_budget = remaining * 0.4
+
+    # Attempt 1: Same-tier retry (reads, or writes with idempotency key)
+    if risk == "read" or has_idempotency_key:
+        if retry_budget >= _MIN_ATTEMPT_BUDGET:
+            attempt_start = time.monotonic()
+            try:
+                retry_payload = dict(payload)
+                retry_payload["deadline_monotonic"] = time.monotonic() + retry_budget
+                retry_result = await asyncio.wait_for(
+                    agent.execute_task(retry_payload),
+                    timeout=retry_budget,
+                )
+                outcome, annotated = _verify_workspace_result(action, retry_result)
+                attempts.append({
+                    "strategy": "same_tier_retry",
+                    "tier": "api",
+                    "outcome": outcome,
+                    "duration_ms": (time.monotonic() - attempt_start) * 1000,
+                })
+                if outcome in ("verify_passed", "verify_empty_valid"):
+                    annotated["_attempts"] = attempts
+                    return annotated
+            except (asyncio.TimeoutError, Exception) as e:
+                attempts.append({
+                    "strategy": "same_tier_retry",
+                    "tier": "api",
+                    "outcome": "verify_transport_fail",
+                    "reason": str(e)[:100],
+                    "duration_ms": (time.monotonic() - attempt_start) * 1000,
+                })
+
+    # Attempt 2: Tier fallback (force visual) -- reads only
+    remaining = deadline - time.monotonic()
+    if remaining >= _MIN_ATTEMPT_BUDGET and risk == "read":
+        attempt_start = time.monotonic()
+        try:
+            fallback_payload = dict(payload)
+            fallback_payload["_force_visual_fallback"] = True
+            fallback_payload["deadline_monotonic"] = time.monotonic() + min(fallback_budget, remaining)
+            fallback_result = await asyncio.wait_for(
+                agent.execute_task(fallback_payload),
+                timeout=min(fallback_budget, remaining),
+            )
+            outcome, annotated = _verify_workspace_result(action, fallback_result)
+            attempts.append({
+                "strategy": "tier_fallback",
+                "tier": "visual",
+                "outcome": outcome,
+                "duration_ms": (time.monotonic() - attempt_start) * 1000,
+            })
+            if outcome in ("verify_passed", "verify_empty_valid"):
+                annotated["_attempts"] = attempts
+                return annotated
+        except (asyncio.TimeoutError, Exception) as e:
+            attempts.append({
+                "strategy": "tier_fallback",
+                "tier": "visual",
+                "outcome": "verify_transport_fail",
+                "reason": str(e)[:100],
+                "duration_ms": (time.monotonic() - attempt_start) * 1000,
+            })
+
+    # Attempt 3: Runtime escalation
+    remaining = deadline - time.monotonic()
+    if remaining >= _RUNTIME_ESCALATION_FLOOR:
+        attempt_start = time.monotonic()
+        try:
+            from autonomy.agent_runtime import get_agent_runtime
+            runtime = get_agent_runtime()
+            if runtime and getattr(runtime, '_running', False):
+                goal_id = await runtime.submit_goal(
+                    description=f"Complete workspace action: {command_text}",
+                    priority="normal",
+                    source="workspace_replan",
+                    context={"action": action, "attempt_history": attempts},
+                )
+                poll_deadline = time.monotonic() + remaining - 1.0
+                status = None
+                while time.monotonic() < poll_deadline:
+                    status = await runtime.get_goal_status(goal_id)
+                    if status and status.get("status") in ("completed", "failed"):
+                        break
+                    await asyncio.sleep(1.0)
+                attempts.append({
+                    "strategy": "runtime_escalation",
+                    "tier": "agent_runtime",
+                    "outcome": status.get("status", "timeout") if status else "timeout",
+                    "duration_ms": (time.monotonic() - attempt_start) * 1000,
+                })
+        except (ImportError, Exception) as e:
+            attempts.append({
+                "strategy": "runtime_escalation",
+                "tier": "agent_runtime",
+                "outcome": "unavailable",
+                "reason": str(e)[:100],
+                "duration_ms": (time.monotonic() - attempt_start) * 1000,
+            })
+
+    # All attempts exhausted
+    initial_result["_attempts"] = attempts
+    initial_result["_recovery_reason"] = "recovery_deadline_exhausted"
+    return initial_result
+
 
 class DynamicPatternLearner:
     """Learns command patterns from usage and system analysis"""
@@ -354,11 +626,21 @@ class UnifiedCommandProcessor:
             "compose_attempts": 0,
             "compose_successes": 0,
             "compose_fallback_reason": {},  # reason_code -> count
+            # v_autonomy: Coordinator lookup retry state machine metrics
+            "coordinator_lookups": 0,
+            "coordinator_hits": 0,
+            "coordinator_misses": 0,
+            "coordinator_stale": 0,
         }
 
-        # v242.2: Neural Mesh coordinator reference (lazy-resolved)
+        # v_autonomy: Coordinator lookup retry state machine
         self._neural_mesh_coordinator = None
-        self._neural_mesh_lookup_attempted = False
+        self._coordinator_state = "UNRESOLVED"
+        self._coordinator_last_lookup: float = 0.0
+        self._coordinator_lookup_failures: int = 0
+        self._coordinator_max_retries = int(os.getenv("JARVIS_COORDINATOR_LOOKUP_MAX_RETRIES", "5"))
+        self._coordinator_cooldown_seconds = float(os.getenv("JARVIS_COORDINATOR_COOLDOWN_SECONDS", "300"))
+        self._coordinator_lock = asyncio.Lock()
         self._workspace_agent_singleton = None
         self._workspace_agent_singleton_lock = asyncio.Lock()
 
@@ -371,28 +653,88 @@ class UnifiedCommandProcessor:
         self._dedup_ttl = float(os.getenv("JARVIS_DEDUP_WINDOW_SECONDS", "60"))
         self._dedup_max = int(os.getenv("JARVIS_DEDUP_CACHE_MAX", "500"))
 
-    def _get_neural_mesh_coordinator(self):
-        """Lazily resolve the Neural Mesh coordinator singleton.
+    _COORDINATOR_BACKOFF_SCHEDULE = [5.0, 10.0, 20.0, 40.0, 60.0]
 
-        v242.2: Avoids circular imports by deferring lookup until first use.
-        Only attempts lookup once -- if coordinator isn't available at first
-        call, subsequent workspace requests use the lazy singleton fallback.
+    async def _get_neural_mesh_coordinator(self):
+        """Resolve the Neural Mesh coordinator with bounded retry state machine.
+
+        v_autonomy: Replaces one-shot boolean with state machine:
+        UNRESOLVED -> attempt -> RESOLVED | BACKING_OFF -> ... -> COOLDOWN
         """
-        if self._neural_mesh_coordinator is not None:
-            return self._neural_mesh_coordinator
-        if self._neural_mesh_lookup_attempted:
-            return None
-        self._neural_mesh_lookup_attempted = True
-        try:
-            from neural_mesh.integration import get_neural_mesh_coordinator
-            coordinator = get_neural_mesh_coordinator()
+        async with self._coordinator_lock:
+            self._v242_metrics["coordinator_lookups"] += 1
+
+            # RESOLVED: return cached, but check staleness
+            if self._coordinator_state == "RESOLVED":
+                if self._neural_mesh_coordinator is not None:
+                    if getattr(self._neural_mesh_coordinator, '_running', True):
+                        self._v242_metrics["coordinator_hits"] += 1
+                        return self._neural_mesh_coordinator
+                    logger.warning("[v_autonomy] Coordinator stale (_running=False) — invalidating")
+                    self._v242_metrics["coordinator_stale"] += 1
+                    self._neural_mesh_coordinator = None
+                    self._coordinator_state = "UNRESOLVED"
+                else:
+                    self._coordinator_state = "UNRESOLVED"
+
+            # COOLDOWN: check if cooldown expired
+            if self._coordinator_state == "COOLDOWN":
+                elapsed = time.monotonic() - self._coordinator_last_lookup
+                if elapsed < self._coordinator_cooldown_seconds:
+                    self._v242_metrics["coordinator_misses"] += 1
+                    return None
+                logger.info("[v_autonomy] Coordinator cooldown expired — retrying")
+                self._coordinator_state = "UNRESOLVED"
+                self._coordinator_lookup_failures = 0
+
+            # BACKING_OFF: check if backoff delay has passed
+            if self._coordinator_state == "BACKING_OFF":
+                idx = min(self._coordinator_lookup_failures - 1, len(self._COORDINATOR_BACKOFF_SCHEDULE) - 1)
+                backoff = self._COORDINATOR_BACKOFF_SCHEDULE[max(0, idx)]
+                elapsed = time.monotonic() - self._coordinator_last_lookup
+                if elapsed < backoff:
+                    self._v242_metrics["coordinator_misses"] += 1
+                    return None
+
+            # UNRESOLVED or backoff delay passed — attempt lookup
+            self._coordinator_last_lookup = time.monotonic()
+            try:
+                coordinator = get_neural_mesh_coordinator()
+            except Exception as e:
+                logger.debug("[v_autonomy] Coordinator lookup error: %s", e)
+                coordinator = None
+
             if coordinator is not None:
                 self._neural_mesh_coordinator = coordinator
-                logger.info("[v242.2] Neural Mesh coordinator resolved")
-            return coordinator
-        except (ImportError, Exception) as e:
-            logger.debug(f"[v242.2] Neural Mesh coordinator not available: {e}")
+                self._coordinator_state = "RESOLVED"
+                self._coordinator_lookup_failures = 0
+                self._v242_metrics["coordinator_hits"] += 1
+                logger.info("[v_autonomy] Coordinator resolved")
+                return coordinator
+
+            # Lookup failed
+            self._coordinator_lookup_failures += 1
+            self._v242_metrics["coordinator_misses"] += 1
+
+            if self._coordinator_lookup_failures >= self._coordinator_max_retries:
+                self._coordinator_state = "COOLDOWN"
+                logger.warning(
+                    "[v_autonomy] Coordinator max retries (%d) hit — entering cooldown (%.0fs)",
+                    self._coordinator_max_retries,
+                    self._coordinator_cooldown_seconds,
+                )
+            else:
+                self._coordinator_state = "BACKING_OFF"
             return None
+
+    async def notify_coordinator_ready(self):
+        """Called when mesh becomes ready. Clears BACKING_OFF or COOLDOWN."""
+        async with self._coordinator_lock:
+            if self._coordinator_state in ("BACKING_OFF", "COOLDOWN"):
+                logger.info("[v_autonomy] Coordinator readiness event — clearing %s state", self._coordinator_state)
+                self._coordinator_state = "UNRESOLVED"
+                self._coordinator_lookup_failures = 0
+                self._coordinator_last_lookup = 0.0
 
     async def _gather_sensory_context(self, command_text: str) -> Dict[str, Any]:
         """Gather context from sensory subsystems for J-Prime classification.
@@ -3116,7 +3458,7 @@ class UnifiedCommandProcessor:
         try:
             # Prefer existing agent instance from Neural Mesh coordinator
             agent = None
-            coordinator = self._get_neural_mesh_coordinator()
+            coordinator = await self._get_neural_mesh_coordinator()
             if coordinator:
                 agent = coordinator.get_agent("google_workspace_agent")
 
@@ -3487,6 +3829,27 @@ class UnifiedCommandProcessor:
 
                     if operation_token:
                         complete_tracked_operation(operation_token)
+
+                    # v_autonomy: Verify result against contract before accepting
+                    outcome_code, result_dict = _verify_workspace_result(action, result_dict)
+                    if outcome_code not in ("verify_passed", "verify_empty_valid"):
+                        _recovery_deadline = deadline if deadline else (_time.monotonic() + 15.0)
+                        if (_recovery_deadline - _time.monotonic()) >= _MIN_ATTEMPT_BUDGET:
+                            result_dict = await _attempt_workspace_recovery(
+                                action=action,
+                                initial_result=result_dict,
+                                initial_outcome=outcome_code,
+                                agent=agent,
+                                payload=payload,
+                                deadline=_recovery_deadline,
+                                command_text=command_text,
+                            )
+                            # Re-verify after recovery
+                            outcome_code, result_dict = _verify_workspace_result(action, result_dict)
+                        logger.info(
+                            "[v_autonomy] Node %s (%s): verification=%s",
+                            node_id, action, outcome_code,
+                        )
 
                     status = "failed" if result_dict.get("error") else "success"
                     logger.info(
