@@ -61,54 +61,123 @@ python3 unified_supervisor.py
 
 ---
 
-## ✅ Email Triage E2E Status (March 2026)
+## Reliable Autonomous Gmail Triage (v1.1)
 
-The email triage end-to-end test suite is complete and green for the
-mocked/runtime-safe path, with live Gmail tests intentionally opt-in.
+Email Triage is built to make JARVIS a **reliable autonomous Gmail triage
+operator**: it should consistently identify what matters, alert you
+appropriately, and avoid unsafe or surprising behavior.
 
-| Suite | Result |
-|---|---|
-| Total tests | 40 |
-| Passed | 35 |
-| Skipped (by design) | 5 |
-| Runtime | ~1s |
+### Product Goal and Safety Contract
 
-### Coverage Breakdown
+**Goal:** classify incoming unread email into actionable priority tiers and
+surface the right interruptions at the right time.
 
-| File | Count | Status |
-|---|---:|---|
-| `tests/e2e/email_triage/test_full_pipeline.py` | 9 | ✅ PASS |
-| `tests/e2e/email_triage/test_notification_policy_e2e.py` | 7 | ✅ PASS |
-| `tests/e2e/email_triage/test_snapshot_consistency.py` | 8 | ✅ PASS |
-| `tests/e2e/email_triage/test_error_resilience.py` | 6 | ✅ PASS |
-| `tests/e2e/email_triage/test_observability.py` | 5 | ✅ PASS |
-| `tests/e2e/email_triage/test_live_gmail_integration.py` | 5 | ⏭️ SKIP by default |
+**Safety contract (hard invariants):**
 
-### What This Proves
+- JARVIS can **label** and **notify**; it does **not** auto-delete, auto-send,
+  auto-reply, or auto-archive mail in this triage path.
+- Notification delivery failures never change scoring, tiering, or labeling
+  outcomes.
+- Degraded cycles preserve prior committed truth instead of replacing it with
+  low-confidence or partial state.
+- Dependency failures degrade predictably (with backoff), not noisily.
+- Cross-process duplicate-writer risk is controlled by a distributed lock.
 
-- Full cycle behavior is stable (`fetch -> extract -> score -> label -> notify -> snapshot`).
-- Notification policy behavior is enforced (quiet hours, interrupt budgets, dedup, quarantine, summaries).
-- Snapshot commit gate preserves prior-good state during degraded cycles.
-- Error handling is graceful and does not corrupt committed triage state.
-- Structured events provide observability for success and failure paths.
+### End-to-End Runtime Flow
 
-### Runtime Wiring (No Supervisor Changes Required)
+Each cycle executes the same pipeline:
 
-Email triage is already integrated in backend runtime paths:
+`fetch -> extract -> score -> label -> policy decision -> notify -> commit snapshot`
 
-- `backend/autonomy/agent_runtime.py`: periodic triage cycle execution (feature-gated).
-- `backend/api/unified_command_processor.py`: "check my email" style responses can include triage enrichment.
-- DLM lock key `email_triage_cycle`: avoids duplicate write behavior in multi-process setups.
+**Where this runs:**
 
-`unified_supervisor.py` does not require changes for this feature.
+- `backend/autonomy/agent_runtime.py`: calls triage in housekeeping.
+- `backend/autonomy/email_triage/runner.py`: orchestration and commit gate.
+- `backend/api/unified_command_processor.py`: enriches email responses with fresh triage metadata when available.
 
-### Enable in Runtime
+### Reliability by Design
+
+#### 1) Deterministic scoring (same input -> same outcome)
+
+- `backend/autonomy/email_triage/scoring.py` is pure and deterministic.
+- Score is weighted across sender/content/urgency/context, then mapped to tiers.
+- `idempotency_key` is derived from `message_id + scoring_version` to support stable dedup behavior.
+
+#### 2) Policy guardrails against noisy interruptions
+
+`backend/autonomy/email_triage/policy.py` enforces:
+
+- Quiet hours suppression (tier 2+), with tier 1 still allowed.
+- Dedup windows (tier-aware) keyed by idempotency.
+- Interrupt budgets (hour/day caps) with overflow routed to summary.
+- Tier behavior: immediate, summary, label-only, or quarantine (configurable).
+
+#### 3) Safe degradation and state integrity
+
+`backend/autonomy/email_triage/runner.py` commits snapshots only when healthy:
+
+- Skipped cycles do not commit.
+- Cold start with missing required dependency does not commit.
+- High process-error ratio does not commit.
+- Empty-regression cycles do not overwrite prior non-empty truth.
+
+When commit is denied, the previous snapshot is preserved and a degraded reason is recorded.
+
+#### 4) Dependency resilience with backoff
+
+`backend/autonomy/email_triage/dependencies.py` resolves:
+
+- required: `workspace_agent`
+- optional: `router`, `notifier`
+
+Failures use exponential backoff with jitter and emit dependency events. Optional
+dependencies can fail without collapsing core triage behavior.
+
+#### 5) Notification isolation
+
+`backend/autonomy/email_triage/notifications.py` runs bounded async delivery and always
+converts notifier exceptions/timeouts into delivery results (not pipeline crashes).
+
+### Multi-Process Safety and Supervisor Role
+
+Triage execution is gated by distributed lock acquisition (`email_triage_cycle`) in
+`agent_runtime`, with fail-closed default if lock infrastructure is unavailable.
+
+- Default: skip unguarded execution to avoid duplicate writers.
+- Optional availability-first override: `EMAIL_TRIAGE_DLM_FAIL_OPEN=true` (single-process deployments only).
+
+`unified_supervisor.py` does not need direct triage logic changes because triage is a
+runtime subsystem concern, not a supervisor bootstrap concern.
+
+### Operator-Facing Configuration
+
+Minimum activation:
 
 ```bash
 export EMAIL_TRIAGE_ENABLED=true
 ```
 
-For deeper test execution guidance and suite internals, see `tests/README.md`.
+Common tuning controls:
+
+- cadence/timeouts: `EMAIL_TRIAGE_POLL_INTERVAL_S`, `EMAIL_TRIAGE_CYCLE_TIMEOUT_S`
+- interruption policy: `EMAIL_TRIAGE_QUIET_START`, `EMAIL_TRIAGE_QUIET_END`,
+  `EMAIL_TRIAGE_MAX_INTERRUPTS_HOUR`, `EMAIL_TRIAGE_MAX_INTERRUPTS_DAY`
+- dedup policy: `EMAIL_TRIAGE_DEDUP_TIER1_S`, `EMAIL_TRIAGE_DEDUP_TIER2_S`
+- behavior flags: `EMAIL_TRIAGE_NOTIFY_TIER1`, `EMAIL_TRIAGE_NOTIFY_TIER2`,
+  `EMAIL_TRIAGE_QUARANTINE_TIER4`, `EMAIL_TRIAGE_SUMMARIES_ENABLED`
+
+### Verification Status (March 2026)
+
+| Suite | Result |
+|---|---|
+| Total e2e tests | 40 |
+| Passed | 35 |
+| Skipped by design | 5 (live Gmail opt-in) |
+| Runtime (mocked path) | ~1s |
+
+Coverage includes full pipeline, policy edge cases, snapshot consistency,
+error resilience, observability events, and optional live Gmail integration.
+See `tests/README.md` for the per-file matrix and commands.
 
 ---
 
