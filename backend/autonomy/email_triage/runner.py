@@ -11,12 +11,14 @@ Called by agent_runtime.py housekeeping loop. Coordinates:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any, ClassVar, Dict, List, Optional
 from uuid import uuid4
 
 from autonomy.email_triage.config import TriageConfig, get_triage_config
+from autonomy.email_triage.dependencies import DependencyResolver
 from autonomy.email_triage.events import (
     emit_triage_event,
     EVENT_CYCLE_STARTED,
@@ -43,13 +45,24 @@ class EmailTriageRunner:
         config: Optional[TriageConfig] = None,
         workspace_agent: Any = None,
         router: Any = None,
+        notifier: Any = None,
     ):
         self._config = config or get_triage_config()
-        self._workspace_agent = workspace_agent
-        self._router = router
+        self._resolver = DependencyResolver(
+            self._config,
+            workspace_agent=workspace_agent,
+            router=router,
+            notifier=notifier,
+        )
         self._policy = NotificationPolicy(self._config)
         self._label_map: Dict[str, str] = {}
         self._labels_initialized = False
+        # Triage cache (read by command processor enrichment)
+        self._last_report: Optional[TriageCycleReport] = None
+        self._last_report_at: float = 0.0  # monotonic
+        self._triaged_emails: Dict[str, TriagedEmail] = {}
+        self._report_lock = asyncio.Lock()
+        self._triage_schema_version: str = "1.0"
 
     @classmethod
     def get_instance(cls, **kwargs) -> EmailTriageRunner:
@@ -85,10 +98,14 @@ class EmailTriageRunner:
 
         emit_triage_event(EVENT_CYCLE_STARTED, {"cycle_id": cycle_id})
 
+        # Resolve dependencies (lazy, with backoff)
+        await self._resolver.resolve_all()
+
         # Ensure labels exist
-        if not self._labels_initialized and self._workspace_agent:
+        workspace_agent = self._resolver.get("workspace_agent")
+        if not self._labels_initialized and workspace_agent:
             try:
-                gmail_svc = getattr(self._workspace_agent, "_gmail_service", None)
+                gmail_svc = getattr(workspace_agent, "_gmail_service", None)
                 if gmail_svc:
                     self._label_map = await ensure_labels_exist(gmail_svc, self._config)
                     self._labels_initialized = True
@@ -121,11 +138,12 @@ class EmailTriageRunner:
             )
 
         # Process each email
+        new_triaged: Dict[str, TriagedEmail] = {}
         for email in emails[: self._config.max_emails_per_cycle]:
             try:
                 # Extract features
                 features = await extract_features(
-                    email, self._router, config=self._config,
+                    email, self._resolver.get("router"), config=self._config,
                 )
 
                 # Score
@@ -149,6 +167,7 @@ class EmailTriageRunner:
                 )
                 action = self._policy.decide_action(triaged)
                 triaged.notification_action = action
+                new_triaged[features.message_id] = triaged
 
                 # Track stats
                 tier_counts[scoring.tier] = tier_counts.get(scoring.tier, 0) + 1
@@ -194,7 +213,7 @@ class EmailTriageRunner:
             "errors": len(errors),
         })
 
-        return TriageCycleReport(
+        report = TriageCycleReport(
             cycle_id=cycle_id,
             started_at=started_at,
             completed_at=completed_at,
@@ -206,10 +225,19 @@ class EmailTriageRunner:
             errors=errors,
         )
 
+        # Commit triage snapshot atomically (partial-cycle semantics)
+        async with self._report_lock:
+            self._last_report = report
+            self._last_report_at = time.monotonic()
+            self._triaged_emails = new_triaged
+
+        return report
+
     async def _fetch_unread(self) -> List[Dict[str, Any]]:
         """Fetch unread emails via workspace agent."""
-        if self._workspace_agent:
-            result = await self._workspace_agent._fetch_unread_emails({
+        agent = self._resolver.get("workspace_agent")
+        if agent:
+            result = await agent._fetch_unread_emails({
                 "limit": self._config.max_emails_per_cycle,
             })
             return result.get("emails", [])
@@ -219,7 +247,24 @@ class EmailTriageRunner:
         self, message_id: str, label_name: str
     ) -> None:
         """Apply Gmail label to message."""
-        if self._workspace_agent and self._label_map:
-            gmail_svc = getattr(self._workspace_agent, "_gmail_service", None)
+        agent = self._resolver.get("workspace_agent")
+        if agent and self._label_map:
+            gmail_svc = getattr(agent, "_gmail_service", None)
             if gmail_svc:
                 await apply_label(gmail_svc, message_id, label_name, self._label_map)
+
+    def get_fresh_results(
+        self, staleness_window_s: Optional[float] = None,
+    ) -> Optional[TriageCycleReport]:
+        """Return last report if within staleness window, else None."""
+        if self._last_report is None:
+            return None
+        window = (
+            staleness_window_s
+            if staleness_window_s is not None
+            else self._config.staleness_window_s
+        )
+        age = time.monotonic() - self._last_report_at
+        if age > window:
+            return None
+        return self._last_report
