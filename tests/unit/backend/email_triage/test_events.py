@@ -16,6 +16,10 @@ from autonomy.email_triage.events import (
     EVENT_SUMMARY_FLUSHED,
     EVENT_CYCLE_COMPLETED,
     EVENT_TRIAGE_ERROR,
+    EVENT_DEPENDENCY_UNAVAILABLE,
+    EVENT_DEPENDENCY_DEGRADED,
+    EVENT_NOTIFICATION_DELIVERY_RESULT,
+    _ERROR_EVENTS,
 )
 
 
@@ -30,6 +34,82 @@ class TestEventConstants:
         assert EVENT_SUMMARY_FLUSHED == "summary_flushed"
         assert EVENT_CYCLE_COMPLETED == "triage_cycle_completed"
         assert EVENT_TRIAGE_ERROR == "triage_error"
+
+
+class TestNewEventConstants:
+    """Three new event constants are defined with correct values."""
+
+    def test_dependency_unavailable_constant(self):
+        assert EVENT_DEPENDENCY_UNAVAILABLE == "dependency_unavailable"
+
+    def test_dependency_degraded_constant(self):
+        assert EVENT_DEPENDENCY_DEGRADED == "dependency_degraded"
+
+    def test_notification_delivery_result_constant(self):
+        assert EVENT_NOTIFICATION_DELIVERY_RESULT == "notification_delivery_result"
+
+    def test_dependency_unavailable_in_error_events(self):
+        assert EVENT_DEPENDENCY_UNAVAILABLE in _ERROR_EVENTS
+
+    def test_dependency_degraded_not_in_error_events(self):
+        assert EVENT_DEPENDENCY_DEGRADED not in _ERROR_EVENTS
+
+    def test_notification_delivery_result_not_in_error_events(self):
+        assert EVENT_NOTIFICATION_DELIVERY_RESULT not in _ERROR_EVENTS
+
+    def test_error_events_contains_triage_error(self):
+        """Existing membership unchanged."""
+        assert EVENT_TRIAGE_ERROR in _ERROR_EVENTS
+
+    def test_error_events_is_frozenset(self):
+        assert isinstance(_ERROR_EVENTS, frozenset)
+
+
+class TestNewEventEmission:
+    """New events emit at the correct log level via emit_triage_event()."""
+
+    def test_dependency_unavailable_emits_warning(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="jarvis.email_triage"):
+            emit_triage_event(EVENT_DEPENDENCY_UNAVAILABLE, {
+                "service": "cloud_sql",
+                "reason": "connection_refused",
+            })
+        found = [r for r in caplog.records if "dependency_unavailable" in r.message]
+        assert len(found) == 1
+        assert found[0].levelno == logging.WARNING
+
+    def test_dependency_degraded_emits_info(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="jarvis.email_triage"):
+            emit_triage_event(EVENT_DEPENDENCY_DEGRADED, {
+                "service": "jprime",
+                "fallback": "claude_api",
+            })
+        found = [r for r in caplog.records if "dependency_degraded" in r.message]
+        assert len(found) == 1
+        assert found[0].levelno == logging.INFO
+
+    def test_notification_delivery_result_emits_info(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="jarvis.email_triage"):
+            emit_triage_event(EVENT_NOTIFICATION_DELIVERY_RESULT, {
+                "channel": "voice",
+                "success": True,
+            })
+        found = [r for r in caplog.records if "notification_delivery_result" in r.message]
+        assert len(found) == 1
+        assert found[0].levelno == logging.INFO
+
+    def test_dependency_unavailable_payload_preserved(self, caplog):
+        with caplog.at_level(logging.DEBUG, logger="jarvis.email_triage"):
+            emit_triage_event(EVENT_DEPENDENCY_UNAVAILABLE, {
+                "service": "cloud_sql",
+                "reason": "timeout",
+            })
+        found = [r for r in caplog.records if "dependency_unavailable" in r.message]
+        data = json.loads(found[0].message)
+        assert data["event"] == "dependency_unavailable"
+        assert data["service"] == "cloud_sql"
+        assert data["reason"] == "timeout"
+        assert "timestamp" in data
 
 
 class TestEmitTriageEvent:

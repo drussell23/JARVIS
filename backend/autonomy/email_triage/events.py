@@ -1,7 +1,7 @@
 """Structured observability events for the email triage system.
 
 All events are emitted as JSON to the ``jarvis.email_triage`` logger.
-7 event types cover the full triage lifecycle.
+10 event types cover the full triage lifecycle.
 """
 
 from __future__ import annotations
@@ -21,8 +21,11 @@ EVENT_NOTIFICATION_SUPPRESSED = "notification_suppressed"
 EVENT_SUMMARY_FLUSHED = "summary_flushed"
 EVENT_CYCLE_COMPLETED = "triage_cycle_completed"
 EVENT_TRIAGE_ERROR = "triage_error"
+EVENT_DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
+EVENT_DEPENDENCY_DEGRADED = "dependency_degraded"
+EVENT_NOTIFICATION_DELIVERY_RESULT = "notification_delivery_result"
 
-_ERROR_EVENTS = frozenset({EVENT_TRIAGE_ERROR})
+_ERROR_EVENTS = frozenset({EVENT_TRIAGE_ERROR, EVENT_DEPENDENCY_UNAVAILABLE})
 
 
 def emit_triage_event(event_type: str, payload: Dict[str, Any]) -> None:
