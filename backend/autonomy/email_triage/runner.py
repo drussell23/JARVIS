@@ -536,6 +536,10 @@ class EmailTriageRunner:
                 prior_id or "none", commit_reason, emails_fetched, emails_processed, len(errors),
             )
 
+        # Save triaged emails for next cycle's outcome collection (WS5)
+        if new_triaged:
+            self._prior_triaged = dict(new_triaged)
+
         return report
 
     async def _fetch_unread(self) -> List[Dict[str, Any]]:
