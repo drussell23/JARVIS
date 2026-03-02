@@ -79,8 +79,14 @@ class OCRResult:
         return matching_regions
 
 class OCRProcessor:
-    """Processes images to extract text using OCR"""
-    
+    """Processes images to extract text using OCR.
+
+    v283.0: Provider priority — GCP J-Prime (primary) → Apple Vision → Tesseract.
+    J-Prime LLaVA is a multimodal model that excels at OCR: handwriting,
+    complex layouts, multi-language, and semantic understanding. Processing
+    happens on GCP with zero local memory overhead beyond base64 encoding.
+    """
+
     def __init__(self, languages: List[str] = None):
         self.languages = languages or ['eng']
         if _HAS_MANAGED_EXECUTOR:
@@ -103,6 +109,20 @@ class OCRProcessor:
 
         # v243.0 (#8): Ghost display dark background detection
         self._dark_threshold = int(os.getenv('JARVIS_OCR_DARK_THRESHOLD', '80'))
+
+        # v283.0: J-Prime OCR backend — primary when GCP VM available
+        self._jprime_ocr_enabled = (
+            os.getenv('JARVIS_OCR_JPRIME_ENABLED', 'true').lower() == 'true'
+        )
+        self._jprime_ocr_timeout = float(
+            os.getenv('JARVIS_OCR_JPRIME_TIMEOUT', '30')
+        )
+        self._jprime_client = None  # Lazy-loaded PrimeClient
+        self._jprime_available: Optional[bool] = None  # Cached health
+        self._jprime_health_checked_at: float = 0.0
+        self._jprime_health_ttl = float(
+            os.getenv('JARVIS_OCR_JPRIME_HEALTH_TTL', '30')
+        )
 
         # v243.0 (#7): Apple Vision Framework via existing SwiftVisionProcessor
         # Reuses backend/swift_bridge/performance_bridge.py — no duplication
@@ -154,6 +174,126 @@ class OCRProcessor:
         Prevents CPU saturation from calling OCR faster than it can process."""
         return max(200.0, self._last_ocr_duration * 2000.0)
 
+    async def _get_jprime_client(self):
+        """v283.0: Lazy-load PrimeClient singleton for J-Prime OCR."""
+        if self._jprime_client is not None:
+            return self._jprime_client
+        try:
+            from core.prime_client import get_prime_client
+            self._jprime_client = await get_prime_client()
+            return self._jprime_client
+        except Exception as e:
+            logger.debug("[OCR v283.0] PrimeClient unavailable: %s", e)
+            return None
+
+    async def _is_jprime_ocr_available(self) -> bool:
+        """v283.0: Check if J-Prime vision server is healthy (cached TTL)."""
+        if not self._jprime_ocr_enabled:
+            return False
+        now = _time.monotonic()
+        if (
+            self._jprime_available is not None
+            and now - self._jprime_health_checked_at < self._jprime_health_ttl
+        ):
+            return self._jprime_available
+
+        try:
+            client = await self._get_jprime_client()
+            if client is None:
+                self._jprime_available = False
+            else:
+                self._jprime_available = await client._check_vision_health()
+        except Exception:
+            self._jprime_available = False
+        self._jprime_health_checked_at = now
+        return self._jprime_available
+
+    async def _perform_jprime_ocr(self, image: Image.Image) -> Optional[OCRResult]:
+        """v283.0: OCR via GCP J-Prime LLaVA multimodal model.
+
+        Sends image to J-Prime with an OCR-specific prompt. LLaVA performs
+        semantic text extraction — better than Tesseract for handwriting,
+        complex layouts, and multi-language content. Processing is on GCP
+        so local memory usage is only base64 encoding (~5MB for 1080p).
+        """
+        import io
+        import base64
+
+        start_time = datetime.now()
+        client = await self._get_jprime_client()
+        if client is None:
+            return None
+
+        # Encode image as JPEG base64
+        buf = io.BytesIO()
+        image.save(buf, format='JPEG', quality=85)
+        image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+        # OCR-specific prompt — concise for LLaVA's 4096 token context
+        ocr_prompt = (
+            "Extract ALL text visible in this image. Preserve the original "
+            "layout and line breaks. Include every label, button, menu item, "
+            "heading, body text, error message, URL, and number you can see. "
+            "Return ONLY the extracted text, no commentary."
+        )
+
+        try:
+            response = await client.send_vision_request(
+                image_base64=image_base64,
+                prompt=ocr_prompt,
+                max_tokens=1024,
+                temperature=0.0,
+                timeout=self._jprime_ocr_timeout,
+            )
+            full_text = response.content.strip()
+        except Exception as e:
+            logger.debug("[OCR v283.0] J-Prime OCR failed: %s", e)
+            return None
+
+        if not full_text:
+            return None
+
+        # Parse the flat text response into TextRegions.
+        # J-Prime returns raw text without bounding boxes — we create
+        # approximate regions from line-level text blocks.
+        regions = []
+        lines = full_text.split('\n')
+        y_offset = 0
+        line_height = max(1, image.size[1] // max(len(lines), 1))
+        for line in lines:
+            line = line.strip()
+            if not line:
+                y_offset += line_height
+                continue
+            # Approximate bounding box from line position
+            bbox = (0, y_offset, image.size[0], line_height)
+            center = (image.size[0] // 2, y_offset + line_height // 2)
+            area_type = self._classify_text_type(
+                line, bbox, image.size
+            ) if hasattr(self, '_classify_text_type') else 'body'
+            regions.append(TextRegion(
+                text=line,
+                confidence=0.9,  # LLaVA semantic extraction is high confidence
+                bounding_box=bbox,
+                center_point=center,
+                area_type=area_type,
+            ))
+            y_offset += line_height
+
+        processing_time = (datetime.now() - start_time).total_seconds()
+        logger.info(
+            "[OCR v283.0] J-Prime OCR: %d chars, %d regions in %.2fs",
+            len(full_text), len(regions), processing_time,
+        )
+        return OCRResult(
+            timestamp=start_time,
+            regions=regions,
+            full_text=full_text,
+            processing_time=processing_time,
+            image_size=image.size,
+            language='jprime_llava',
+        )
+
     async def process_image(
         self,
         image: Image.Image,
@@ -161,6 +301,11 @@ class OCRProcessor:
         source_context: Optional[str] = None,
     ) -> OCRResult:
         """Process an image to extract text.
+
+        v283.0: Provider priority — J-Prime (GCP) → Apple Vision → Tesseract.
+        J-Prime is tried first when available because it runs on GCP (zero
+        local memory overhead) and handles complex layouts better than local
+        engines. Falls back gracefully to local engines when GCP is unavailable.
 
         Args:
             image: PIL Image to process
@@ -171,6 +316,21 @@ class OCRProcessor:
         start_time = datetime.now()
         wall_start = _time.monotonic()
 
+        # Crop to region if specified
+        if region:
+            x, y, width, height = region
+            image = image.crop((x, y, x + width, y + height))
+
+        # v283.0: Try J-Prime first (GCP, zero local memory overhead)
+        if self._jprime_ocr_enabled and await self._is_jprime_ocr_available():
+            try:
+                jprime_result = await self._perform_jprime_ocr(image)
+                if jprime_result is not None and jprime_result.full_text:
+                    self._last_ocr_duration = _time.monotonic() - wall_start
+                    return jprime_result
+            except Exception as e:
+                logger.debug("[OCR v283.0] J-Prime OCR failed, trying local: %s", e)
+
         if not self.tesseract_available and self._vision_processor is None:
             return OCRResult(
                 timestamp=start_time,
@@ -180,15 +340,10 @@ class OCRProcessor:
                 image_size=image.size
             )
 
-        # Crop to region if specified
-        if region:
-            x, y, width, height = region
-            image = image.crop((x, y, x + width, y + height))
-
-        # v243.0 (#6): Downsample large images before OCR
+        # v243.0 (#6): Downsample large images before OCR (local engines only)
         image = self._downsample_if_needed(image)
 
-        # v243.0 (#7): Try Apple Vision Framework first (5-10x faster than pytesseract)
+        # v243.0 (#7): Try Apple Vision Framework (5-10x faster than pytesseract)
         if self._vision_processor is not None:
             try:
                 vision_result = await self._perform_vision_ocr(image)

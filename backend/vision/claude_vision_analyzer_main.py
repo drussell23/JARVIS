@@ -794,6 +794,10 @@ class MemorySafetyMonitor:
         self.warnings_issued = 0
         self._last_gc_time = time.time()
         self._emergency_mode = False
+        # v283.0: Set by ensure_memory_available when local memory is
+        # insufficient but GCP J-Prime is available for cloud offload.
+        # Read by provider dispatch to force J-Prime routing.
+        self.cloud_offload_required: bool = False
 
     def check_memory_safety(self) -> MemorySafetyStatus:
         """Check current memory status"""
@@ -947,7 +951,19 @@ class MemorySafetyMonitor:
         }
 
     async def ensure_memory_available(self, width: int, height: int) -> bool:
-        """Ensure enough memory is available for operation"""
+        """Ensure enough memory is available for operation.
+
+        v283.0: When local memory is insufficient, checks if GCP J-Prime is
+        available for cloud offload. Cloud offload requires only ~5MB local
+        memory (base64 encode + HTTP send) regardless of image size, so the
+        local memory projection is irrelevant when routing to GCP.
+
+        Sets ``self.cloud_offload_required = True`` when the request is only
+        being allowed because GCP can handle it. The provider dispatch logic
+        in ``analyze_screenshot`` reads this flag to force J-Prime routing.
+        """
+        self.cloud_offload_required = False
+
         if not self.config.enable_memory_safety:
             return True
 
@@ -960,33 +976,69 @@ class MemorySafetyMonitor:
                 logger.warning(warning)
                 self.warnings_issued += 1
 
-        # Reject if already unsafe
-        if not status.is_safe:
-            self.rejected_requests += 1
-            if self.config.reject_on_memory_pressure:
-                return False
-
-        # Estimate required memory
+        # Estimate required memory for LOCAL processing
         estimate = self.estimate_memory_usage(width, height)
         projected_memory = status.process_mb + estimate["total_estimate_mb"]
+        _local_memory_ok = (
+            status.is_safe
+            and projected_memory <= self.config.process_memory_limit_mb
+        )
 
-        # Check if operation would exceed limits
-        if projected_memory > self.config.process_memory_limit_mb:
-            self.rejected_requests += 1
+        if _local_memory_ok:
+            # Force GC if needed
+            if (
+                time.time() - self._last_gc_time > 30
+                and status.process_mb > self.config.memory_warning_threshold_mb
+            ):
+                gc.collect()
+                self._last_gc_time = time.time()
+            return True
+
+        # v283.0: Local memory insufficient — check if GCP J-Prime can handle
+        # this request remotely. Cloud offload only needs ~5MB local memory
+        # for base64 encoding + HTTP transport, NOT the full image pipeline.
+        _cloud_offload_enabled = (
+            os.getenv("VISION_CLOUD_OFFLOAD_ON_PRESSURE", "true").lower() == "true"
+        )
+        if _cloud_offload_enabled:
+            try:
+                _async_status = await self.check_memory_safety_async()
+                if _async_status.gcp_vm_ready and _async_status.gcp_vm_ip:
+                    self.cloud_offload_required = True
+                    logger.info(
+                        "[v283.0] Local memory insufficient "
+                        "(projected %dMB > %dMB limit) but GCP J-Prime "
+                        "available at %s — routing to cloud offload",
+                        int(projected_memory),
+                        self.config.process_memory_limit_mb,
+                        _async_status.gcp_vm_ip,
+                    )
+                    return True
+            except Exception as e:
+                logger.debug(
+                    "[v283.0] Cloud offload check failed: %s", e
+                )
+
+        # Neither local nor cloud can handle it — reject
+        self.rejected_requests += 1
+        if not status.is_safe:
             logger.warning(
-                f"Rejecting {estimate['category']} image ({estimate['megapixels']:.1f}MP). "
-                f"Would exceed memory limit: {projected_memory:.0f}MB > {self.config.process_memory_limit_mb}MB"
+                "Memory unsafe (process=%dMB, available=%.1fGB) "
+                "and no cloud offload available",
+                int(status.process_mb),
+                status.system_available_gb,
             )
-            if self.config.reject_on_memory_pressure:
-                return False
-
-        # Force GC if needed
-        if (
-            time.time() - self._last_gc_time > 30
-            and status.process_mb > self.config.memory_warning_threshold_mb
-        ):
-            gc.collect()
-            self._last_gc_time = time.time()
+        else:
+            logger.warning(
+                "Rejecting %s image (%.1fMP). Would exceed memory limit: "
+                "%dMB > %dMB and no cloud offload available",
+                estimate["category"],
+                estimate["megapixels"],
+                int(projected_memory),
+                self.config.process_memory_limit_mb,
+            )
+        if self.config.reject_on_memory_pressure:
+            return False
 
         return True
 
@@ -3077,15 +3129,28 @@ class ClaudeVisionAnalyzer:
                 #   2. CLAUDE_API provider override
                 #   3. J-Prime unhealthy (pre-flight check avoids 120s timeout)
                 #   4. J-Prime returns low-quality response (quality gate escalation)
+                #
+                # v283.0: cloud_offload_required overrides provider selection.
+                # When local memory is insufficient but GCP is available,
+                # the memory gate sets this flag to force J-Prime routing.
+                _cloud_offload = getattr(self.memory_monitor, "cloud_offload_required", False)
                 _force_claude = (
                     self._vision_provider == VisionProvider.CLAUDE_API
                     or priority == "high"
+                ) and not _cloud_offload
+                _force_jprime = (
+                    self._vision_provider == VisionProvider.JPRIME_LLAVA
+                    or _cloud_offload
                 )
-                _force_jprime = self._vision_provider == VisionProvider.JPRIME_LLAVA
                 _use_jprime = _force_jprime or (
                     self._vision_provider == VisionProvider.AUTO
                     and not _force_claude
                 )
+                if _cloud_offload:
+                    logger.info(
+                        "[v283.0] Cloud offload active — forcing J-Prime "
+                        "routing (local memory insufficient)"
+                    )
 
                 # v259.1: Pre-flight health check — if J-Prime is known-unhealthy
                 # (cached 30s), skip directly to Claude instead of waiting 120s timeout
