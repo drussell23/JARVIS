@@ -3,7 +3,7 @@
 import os
 import sys
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "backend"))
 
@@ -259,3 +259,94 @@ class TestTriageCache:
         config = TriageConfig(enabled=False)
         runner = EmailTriageRunner(config=config)
         assert runner.get_fresh_results() is None
+
+
+class TestNotificationDelivery:
+    """Runner wires notification delivery for immediate and summary actions."""
+
+    def _make_runner(self, notifier=None, **config_kwargs):
+        config = TriageConfig(enabled=True, extraction_enabled=False, **config_kwargs)
+        runner = EmailTriageRunner(config=config, notifier=notifier)
+        runner._fetch_unread = AsyncMock(return_value=_sample_emails(2))
+        runner._label_map = {
+            "jarvis/tier4_noise": "L4", "jarvis/tier3_review": "L3",
+            "jarvis/tier2_high": "L2", "jarvis/tier1_critical": "L1",
+        }
+        runner._apply_label = AsyncMock()
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_deliver_immediate_called_when_notifier_present(self):
+        """When notifier is resolved and policy returns 'immediate',
+        deliver_immediate is called with the immediate emails."""
+        notifier = AsyncMock(return_value=True)
+        runner = self._make_runner(notifier=notifier)
+        runner._policy.decide_action = MagicMock(return_value="immediate")
+
+        mock_result = MagicMock(success=True)
+        with patch(
+            "autonomy.email_triage.runner.deliver_immediate",
+            new_callable=AsyncMock,
+            return_value=[mock_result, mock_result],
+        ) as mock_deliver:
+            report = await runner.run_cycle()
+            mock_deliver.assert_called_once()
+            args = mock_deliver.call_args
+            assert len(args[0][0]) == 2  # 2 immediate emails
+            assert args[0][1] is notifier  # notifier passed through
+
+        assert report.notifications_sent == 2
+
+    @pytest.mark.asyncio
+    async def test_no_delivery_without_notifier(self):
+        """When notifier is not resolved, deliver_immediate is never called."""
+        runner = self._make_runner(notifier=None)
+        runner._policy.decide_action = MagicMock(return_value="immediate")
+        # Prevent lazy resolution from finding the real notifier
+        runner._resolver.resolve_all = AsyncMock()
+
+        with patch(
+            "autonomy.email_triage.runner.deliver_immediate",
+            new_callable=AsyncMock,
+        ) as mock_deliver:
+            report = await runner.run_cycle()
+            mock_deliver.assert_not_called()
+
+        assert report.notifications_sent == 0
+
+    @pytest.mark.asyncio
+    async def test_delivery_failure_does_not_affect_triage_outcome(self):
+        """Notification delivery exception is caught and logged as error,
+        but triage processing (tier counts, labels) is unaffected."""
+        notifier = AsyncMock(return_value=True)
+        runner = self._make_runner(notifier=notifier)
+        runner._policy.decide_action = MagicMock(return_value="immediate")
+
+        with patch(
+            "autonomy.email_triage.runner.deliver_immediate",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("notification bridge down"),
+        ):
+            report = await runner.run_cycle()
+
+        assert report.emails_processed == 2
+        assert report.notifications_sent == 0
+        assert any("notify_immediate" in e for e in report.errors)
+
+    @pytest.mark.asyncio
+    async def test_notifications_sent_reflects_actual_delivery(self):
+        """notifications_sent counts successful deliveries, not decisions."""
+        notifier = AsyncMock(return_value=True)
+        runner = self._make_runner(notifier=notifier)
+        runner._policy.decide_action = MagicMock(return_value="immediate")
+
+        success = MagicMock(success=True)
+        failure = MagicMock(success=False)
+        with patch(
+            "autonomy.email_triage.runner.deliver_immediate",
+            new_callable=AsyncMock,
+            return_value=[success, failure],
+        ):
+            report = await runner.run_cycle()
+
+        assert report.notifications_sent == 1  # Only 1 of 2 succeeded

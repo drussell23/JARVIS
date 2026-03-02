@@ -30,6 +30,7 @@ from autonomy.email_triage.extraction import extract_features
 from autonomy.email_triage.labels import apply_label, ensure_labels_exist
 from autonomy.email_triage.policy import NotificationPolicy
 from autonomy.email_triage.schemas import TriageCycleReport, TriagedEmail
+from autonomy.email_triage.notifications import deliver_immediate, deliver_summary
 from autonomy.email_triage.scoring import score_email
 
 logger = logging.getLogger("jarvis.email_triage.runner")
@@ -139,6 +140,7 @@ class EmailTriageRunner:
 
         # Process each email
         new_triaged: Dict[str, TriagedEmail] = {}
+        immediate_emails: List[TriagedEmail] = []
         for email in emails[: self._config.max_emails_per_cycle]:
             try:
                 # Extract features
@@ -172,7 +174,7 @@ class EmailTriageRunner:
                 # Track stats
                 tier_counts[scoring.tier] = tier_counts.get(scoring.tier, 0) + 1
                 if action == "immediate":
-                    notifications_sent += 1
+                    immediate_emails.append(triaged)
                 elif action in ("label_only", "quarantine"):
                     if scoring.tier <= 2:
                         notifications_suppressed += 1
@@ -198,9 +200,33 @@ class EmailTriageRunner:
                     "message": str(e),
                 })
 
-        # Flush summary if window elapsed
-        if self._policy.should_flush_summary():
-            self._policy.flush_summary()
+        # Deliver notifications (side-effect: failure never changes triage outcome)
+        notifier = self._resolver.get("notifier")
+        if notifier:
+            if immediate_emails:
+                try:
+                    delivery_results = await deliver_immediate(
+                        immediate_emails, notifier, self._config.notification_budget_s,
+                    )
+                    notifications_sent = sum(1 for r in delivery_results if r.success)
+                except Exception as e:
+                    logger.warning("Immediate notification delivery failed: %s", e)
+                    errors.append(f"notify_immediate: {e}")
+
+            if self._policy.should_flush_summary():
+                summary_emails = list(self._policy.summary_buffer)
+                self._policy.flush_summary()
+                try:
+                    await deliver_summary(
+                        summary_emails, notifier, self._config.summary_budget_s,
+                    )
+                except Exception as e:
+                    logger.warning("Summary notification delivery failed: %s", e)
+                    errors.append(f"notify_summary: {e}")
+        else:
+            # No notifier — flush summary to prevent unbounded buffer growth
+            if self._policy.should_flush_summary():
+                self._policy.flush_summary()
 
         completed_at = time.time()
         emit_triage_event(EVENT_CYCLE_COMPLETED, {
