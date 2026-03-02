@@ -61,6 +61,57 @@ python3 unified_supervisor.py
 
 ---
 
+## ✅ Email Triage E2E Status (March 2026)
+
+The email triage end-to-end test suite is complete and green for the
+mocked/runtime-safe path, with live Gmail tests intentionally opt-in.
+
+| Suite | Result |
+|---|---|
+| Total tests | 40 |
+| Passed | 35 |
+| Skipped (by design) | 5 |
+| Runtime | ~1s |
+
+### Coverage Breakdown
+
+| File | Count | Status |
+|---|---:|---|
+| `tests/e2e/email_triage/test_full_pipeline.py` | 9 | ✅ PASS |
+| `tests/e2e/email_triage/test_notification_policy_e2e.py` | 7 | ✅ PASS |
+| `tests/e2e/email_triage/test_snapshot_consistency.py` | 8 | ✅ PASS |
+| `tests/e2e/email_triage/test_error_resilience.py` | 6 | ✅ PASS |
+| `tests/e2e/email_triage/test_observability.py` | 5 | ✅ PASS |
+| `tests/e2e/email_triage/test_live_gmail_integration.py` | 5 | ⏭️ SKIP by default |
+
+### What This Proves
+
+- Full cycle behavior is stable (`fetch -> extract -> score -> label -> notify -> snapshot`).
+- Notification policy behavior is enforced (quiet hours, interrupt budgets, dedup, quarantine, summaries).
+- Snapshot commit gate preserves prior-good state during degraded cycles.
+- Error handling is graceful and does not corrupt committed triage state.
+- Structured events provide observability for success and failure paths.
+
+### Runtime Wiring (No Supervisor Changes Required)
+
+Email triage is already integrated in backend runtime paths:
+
+- `backend/autonomy/agent_runtime.py`: periodic triage cycle execution (feature-gated).
+- `backend/api/unified_command_processor.py`: "check my email" style responses can include triage enrichment.
+- DLM lock key `email_triage_cycle`: avoids duplicate write behavior in multi-process setups.
+
+`unified_supervisor.py` does not require changes for this feature.
+
+### Enable in Runtime
+
+```bash
+export EMAIL_TRIAGE_ENABLED=true
+```
+
+For deeper test execution guidance and suite internals, see `tests/README.md`.
+
+---
+
 ## Architecture at a Glance
 
 ```

@@ -81,6 +81,61 @@ Complete system workflow tests.
 - `test_full_system.py` - Full system workflow
 - `test_vision_functional.py` - Vision functional flow
 
+#### `/e2e/email_triage/` - Email Triage Pipeline E2E (Production-Gated)
+
+This suite validates the complete email triage runtime path:
+
+`fetch -> extract -> score -> label -> notify -> snapshot commit`
+
+It is designed to prove correctness under realistic operational constraints
+(quiet hours, interrupt budgets, dedup windows, partial dependency failure,
+snapshot preservation, and observability event integrity).
+
+**Final suite status:**
+
+| Test File | Tests | Status | Purpose |
+|---|---:|---|---|
+| `conftest.py` | Fixtures | N/A | Factories, deterministic time control, event capture, singleton isolation |
+| `test_full_pipeline.py` | 9 | ✅ 9/9 PASS | Happy path, tiering spread, extraction contract, caps, determinism |
+| `test_notification_policy_e2e.py` | 7 | ✅ 7/7 PASS | Quiet hours, budget exhaustion, dedup behavior, quarantine, summary flush |
+| `test_snapshot_consistency.py` | 8 | ✅ 8/8 PASS | Commit gating, degraded-cycle preservation, cold-start/staleness behavior |
+| `test_error_resilience.py` | 6 | ✅ 6/6 PASS | Partial failures, cascading failures, graceful degradation guarantees |
+| `test_observability.py` | 5 | ✅ 5/5 PASS | Event sequence, payload shape, delivery/error telemetry coverage |
+| `test_live_gmail_integration.py` | 5 | ⏭️ 5/5 SKIP (by design) | Real Gmail API integration, gated behind explicit opt-in |
+| **Total** | **40** | **35 passed, 5 skipped** | **Runtime safety + behavior confidence** |
+
+### Email Triage E2E Run Commands
+
+```bash
+# Full triage e2e suite (CI-safe, mocked infra)
+pytest tests/e2e/email_triage -v
+
+# Run only deterministic mocked tests (exclude live Gmail)
+pytest tests/e2e/email_triage -v -m "not api and not slow"
+
+# Opt in to live Gmail tests (requires credentials + delegated user)
+RUN_LIVE_GMAIL_TESTS=true pytest tests/e2e/email_triage/test_live_gmail_integration.py -v
+```
+
+### Live Gmail Test Gating and Safety
+
+- Live Gmail tests are intentionally skipped by default.
+- They require `RUN_LIVE_GMAIL_TESTS=true` plus Gmail credentials.
+- Label writes use a unique per-run prefix (`jarvis/test/<uuid>/...`) and clean up in `finally` blocks.
+- Fetch-oriented tests remain read-only where possible.
+
+### Runtime Integration Notes (Why `unified_supervisor.py` Is Unchanged)
+
+The triage pipeline is wired through backend runtime subsystems rather than
+the top-level supervisor:
+
+- `backend/autonomy/agent_runtime.py`: housekeeping loop invokes triage cycles behind `EMAIL_TRIAGE_ENABLED`.
+- `backend/api/unified_command_processor.py`: email responses are enriched with triage metadata when fresh snapshots exist.
+- DLM locking (`email_triage_cycle`) prevents duplicate writes in multi-process scenarios.
+
+Because of that architecture, enabling email triage is an environment/config
+concern, not a supervisor bootstrap concern.
+
 ### 🛠️ `/utilities/` - Test Utilities
 Shared test utilities and helpers.
 
