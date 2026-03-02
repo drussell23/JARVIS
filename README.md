@@ -36294,6 +36294,65 @@ Before testing JARVIS live, verify all of these:
 
 ---
 
+## Autonomous Gmail Triage (Cross-Repo v2)
+
+JARVIS now supports a durable, explainable, and adaptive Gmail triage loop designed to run autonomously while staying safe and predictable.
+
+### What "Fully Autonomous" Means Here
+
+- Triage runs continuously in the background via runtime housekeeping, not only on manual "check my email" requests.
+- Decisions are explainable per message (score factors + policy reason chain).
+- Durable state survives restarts (snapshot, dedup, interrupt budget, outbox).
+- Notification side effects are isolated (delivery failures do not change scoring/labeling truth).
+- Single-writer fencing prevents stale leaders from overwriting committed state.
+- Learning loop is bounded and safe (shadow adaptation + rollback thresholds).
+
+### Cross-Repo Responsibility Split
+
+| Layer | Repo | Responsibility |
+|------|------|----------------|
+| **Body** | **JARVIS (this repo)** | Runtime loop, Gmail action execution, policy enforcement, notification fanout, frontend delivery |
+| **Mind** | [JARVIS-Prime](https://github.com/drussell23/jarvis-prime) | Semantic extraction and model routing used by triage |
+| **Nerves** | [Reactor-Core](https://github.com/drussell23/JARVIS-Reactor) | Outcome ingestion, adaptive weight feedback, long-term model improvement |
+
+### End-to-End Flow
+
+```mermaid
+flowchart TD
+    A[AgentRuntime housekeeping loop] --> B[EmailTriageRunner.run_cycle]
+    B --> C[Durable restore + outbox replay]
+    C --> D[Fetch unread Gmail]
+    D --> E[Feature extraction]
+    E -->|valid contract| F[J-Prime semantic features]
+    E -->|invalid/unavailable| G[Heuristic fallback]
+    F --> H[Score + policy explanation]
+    G --> H
+    H --> I[Apply labels]
+    I --> J[Policy action decide]
+    J --> K[Outbox enqueue]
+    K --> L[Notify bridge]
+    L --> M[Voice + WebSocket + macOS]
+    J --> N[Fenced snapshot commit]
+    N --> O[check my email enrichment]
+```
+
+### What You Should Observe During Testing
+
+1. **Background autonomy**: triage cycles happen without prompting.
+2. **Safe restart**: after process restart, snapshot restore/outbox replay occurs before new cycle work.
+3. **Explainability**: each triaged email has score and policy explanation metadata.
+4. **Frontend communication**: proactive notifications arrive through WebSocket (`proactive_notification`) and appear in UI; voice/macOS fire based on urgency and policy.
+5. **Manual command quality**: "check my email" works even without fresh triage; when fresh, output includes tier/score/action enrichment.
+
+### Safety Invariants
+
+- No destructive triage actions (no auto-delete/archive/send in triage pipeline).
+- Quiet-hours, dedup windows, and interrupt budgets constrain alert noise.
+- Outbox replay respects expiration and retry limits.
+- Degraded cycles preserve last-good committed truth.
+
+---
+
 ## License
 
 MIT License - see LICENSE file for details
