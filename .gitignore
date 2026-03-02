@@ -354,3 +354,6 @@ terraform/.terraform/
 terraform/*.tfplan
 terraform/*.tfplan2
 terraform/terraform.tfvars
+
+# Claude Code working state
+.claude/worktrees/
