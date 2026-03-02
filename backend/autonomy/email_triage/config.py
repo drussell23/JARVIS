@@ -77,6 +77,19 @@ class TriageConfig:
     max_emails_per_cycle: int = 25
     cycle_timeout_s: float = 30.0
 
+    # Dependency resolution
+    dep_backoff_base_s: float = 5.0
+    dep_backoff_max_s: float = 300.0
+
+    # Staleness
+    staleness_window_s: float = 120.0
+
+    # Notification delivery
+    notification_budget_s: float = 10.0
+    summary_budget_s: float = 5.0
+    immediate_flush_threshold: int = 10
+    max_summary_items: int = 20
+
     @classmethod
     def from_env(cls) -> TriageConfig:
         """Build config from environment variables."""
@@ -97,6 +110,13 @@ class TriageConfig:
             poll_interval_s=_env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0),
             max_emails_per_cycle=_env_int("EMAIL_TRIAGE_MAX_PER_CYCLE", 25),
             cycle_timeout_s=_env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0),
+            dep_backoff_base_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_BASE_S", 5.0),
+            dep_backoff_max_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_MAX_S", 300.0),
+            staleness_window_s=_env_float("EMAIL_TRIAGE_STALENESS_WINDOW_S", 120.0),
+            notification_budget_s=_env_float("EMAIL_TRIAGE_NOTIFICATION_BUDGET_S", 10.0),
+            summary_budget_s=_env_float("EMAIL_TRIAGE_SUMMARY_BUDGET_S", 5.0),
+            immediate_flush_threshold=_env_int("EMAIL_TRIAGE_IMMEDIATE_FLUSH_THRESHOLD", 10),
+            max_summary_items=_env_int("EMAIL_TRIAGE_MAX_SUMMARY_ITEMS", 20),
         )
 
     def tier_for_score(self, score: int) -> int:

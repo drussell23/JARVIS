@@ -5,7 +5,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "backend"))
 
-from autonomy.email_triage.config import TriageConfig, get_triage_config
+from autonomy.email_triage.config import TriageConfig, get_triage_config, reset_triage_config
 
 
 class TestTriageConfigDefaults:
@@ -62,6 +62,28 @@ class TestTriageConfigDefaults:
         config = TriageConfig()
         assert config.quarantine_tier4 is False
 
+    def test_dep_backoff_defaults(self):
+        config = TriageConfig()
+        assert config.dep_backoff_base_s == 5.0
+        assert config.dep_backoff_max_s == 300.0
+
+    def test_staleness_window_default(self):
+        config = TriageConfig()
+        assert config.staleness_window_s == 120.0
+
+    def test_notification_budget_defaults(self):
+        config = TriageConfig()
+        assert config.notification_budget_s == 10.0
+        assert config.summary_budget_s == 5.0
+
+    def test_immediate_flush_threshold_default(self):
+        config = TriageConfig()
+        assert config.immediate_flush_threshold == 10
+
+    def test_max_summary_items_default(self):
+        config = TriageConfig()
+        assert config.max_summary_items == 20
+
 
 class TestTriageConfigFromEnv:
     """Config reads from environment variables."""
@@ -94,6 +116,45 @@ class TestTriageConfigFromEnv:
         monkeypatch.setenv("EMAIL_TRIAGE_POLL_INTERVAL_S", "not_a_number")
         config = TriageConfig.from_env()
         assert config.poll_interval_s == 60.0
+
+    def test_dep_backoff_from_env(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_DEP_BACKOFF_BASE_S", "2.5")
+        monkeypatch.setenv("EMAIL_TRIAGE_DEP_BACKOFF_MAX_S", "600.0")
+        config = TriageConfig.from_env()
+        assert config.dep_backoff_base_s == 2.5
+        assert config.dep_backoff_max_s == 600.0
+
+    def test_staleness_window_from_env(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_STALENESS_WINDOW_S", "60.0")
+        config = TriageConfig.from_env()
+        assert config.staleness_window_s == 60.0
+
+    def test_notification_budget_from_env(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_NOTIFICATION_BUDGET_S", "15.0")
+        monkeypatch.setenv("EMAIL_TRIAGE_SUMMARY_BUDGET_S", "8.0")
+        config = TriageConfig.from_env()
+        assert config.notification_budget_s == 15.0
+        assert config.summary_budget_s == 8.0
+
+    def test_immediate_flush_threshold_from_env(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_IMMEDIATE_FLUSH_THRESHOLD", "5")
+        config = TriageConfig.from_env()
+        assert config.immediate_flush_threshold == 5
+
+    def test_max_summary_items_from_env(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_MAX_SUMMARY_ITEMS", "50")
+        config = TriageConfig.from_env()
+        assert config.max_summary_items == 50
+
+    def test_invalid_int_env_uses_default(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_IMMEDIATE_FLUSH_THRESHOLD", "xyz")
+        config = TriageConfig.from_env()
+        assert config.immediate_flush_threshold == 10
+
+    def test_invalid_float_dep_backoff_uses_default(self, monkeypatch):
+        monkeypatch.setenv("EMAIL_TRIAGE_DEP_BACKOFF_BASE_S", "bad")
+        config = TriageConfig.from_env()
+        assert config.dep_backoff_base_s == 5.0
 
 
 class TestGetTriageConfig:
