@@ -93,6 +93,13 @@ class TriageConfig:
     immediate_flush_threshold: int = 10
     max_summary_items: int = 20
 
+    # State persistence (WS1)
+    state_persistence_enabled: bool = True
+    state_db_path: str = ""  # default: ~/.jarvis/email_triage_state.db
+    outbox_retry_limit: int = 3
+    outbox_replay_on_start: bool = True
+    snapshot_retention_count: int = 10
+
     @classmethod
     def from_env(cls) -> TriageConfig:
         """Build config from environment variables."""
@@ -121,6 +128,12 @@ class TriageConfig:
             summary_budget_s=_env_float("EMAIL_TRIAGE_SUMMARY_BUDGET_S", 5.0),
             immediate_flush_threshold=_env_int("EMAIL_TRIAGE_IMMEDIATE_FLUSH_THRESHOLD", 10),
             max_summary_items=_env_int("EMAIL_TRIAGE_MAX_SUMMARY_ITEMS", 20),
+            # State persistence (WS1)
+            state_persistence_enabled=_env_bool("EMAIL_TRIAGE_STATE_PERSISTENCE", True),
+            state_db_path=os.getenv("EMAIL_TRIAGE_STATE_DB", ""),
+            outbox_retry_limit=_env_int("EMAIL_TRIAGE_OUTBOX_RETRY_LIMIT", 3),
+            outbox_replay_on_start=_env_bool("EMAIL_TRIAGE_OUTBOX_REPLAY", True),
+            snapshot_retention_count=_env_int("EMAIL_TRIAGE_SNAPSHOT_RETENTION", 10),
         )
 
     def tier_for_score(self, score: int) -> int:

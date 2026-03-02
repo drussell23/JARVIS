@@ -29,6 +29,8 @@ class EmailFeatures:
     sender_frequency: str  # "first_time" | "occasional" | "frequent"
     urgency_signals: Tuple[str, ...]  # "deadline", "action_required", etc.
     extraction_confidence: float  # 0.0-1.0
+    extraction_source: str = "heuristic"  # "heuristic" | "jprime_v1" | "jprime_degraded_fallback"
+    extraction_contract_version: str = ""  # "" for heuristic, "1.0" for validated J-Prime
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,22 @@ class ScoringResult:
     tier_label: str  # "jarvis/tier1_critical", etc.
     breakdown: Dict[str, float]  # per-factor scores
     idempotency_key: str  # sha256(message_id + scoring_version)[:16]
+    scoring_explanation: str = ""  # Human-readable: "Tier 1: frequent sender (90%) + ..."
+
+
+@dataclass(frozen=True)
+class PolicyExplanation:
+    """Why a notification action was chosen (WS4 explainability)."""
+
+    action: str  # "immediate" | "summary" | "label_only" | "quarantine"
+    reasons: Tuple[str, ...]  # ("tier1_critical", "budget_available", "not_duplicate")
+    suppressed_by: Optional[str] = None  # "quiet_hours" | "dedup_window" | "budget_exhausted"
+    tier: int = 0
+    score: int = 0
+    quiet_hours_active: bool = False
+    budget_remaining_hour: int = 0
+    budget_remaining_day: int = 0
+    dedup_hit: bool = False
 
 
 @dataclass
@@ -61,6 +79,7 @@ class TriagedEmail:
     scoring: ScoringResult
     notification_action: str  # "immediate" | "summary" | "label_only" | "quarantine"
     processed_at: float
+    policy_explanation: Optional[PolicyExplanation] = None
 
 
 @dataclass(frozen=True)

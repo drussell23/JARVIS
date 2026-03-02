@@ -47,49 +47,49 @@ class TestNotificationActions:
         config = TriageConfig(notify_tier1=True)
         policy = NotificationPolicy(config)
         t = _make_triaged(tier=1, score=90)
-        action = policy.decide_action(t)
+        action, _expl = policy.decide_action(t)
         assert action == "immediate"
 
     def test_tier2_gets_summary(self):
         config = TriageConfig(notify_tier2=True)
         policy = NotificationPolicy(config)
         t = _make_triaged(tier=2, score=70)
-        action = policy.decide_action(t)
+        action, _expl = policy.decide_action(t)
         assert action == "summary"
 
     def test_tier3_gets_label_only(self):
         config = TriageConfig()
         policy = NotificationPolicy(config)
         t = _make_triaged(tier=3, score=50)
-        action = policy.decide_action(t)
+        action, _expl = policy.decide_action(t)
         assert action == "label_only"
 
     def test_tier4_gets_quarantine_when_enabled(self):
         config = TriageConfig(quarantine_tier4=True)
         policy = NotificationPolicy(config)
         t = _make_triaged(tier=4, score=10)
-        action = policy.decide_action(t)
+        action, _expl = policy.decide_action(t)
         assert action == "quarantine"
 
     def test_tier4_gets_label_only_when_quarantine_disabled(self):
         config = TriageConfig(quarantine_tier4=False)
         policy = NotificationPolicy(config)
         t = _make_triaged(tier=4, score=10)
-        action = policy.decide_action(t)
+        action, _expl = policy.decide_action(t)
         assert action == "label_only"
 
     def test_tier1_disabled_gets_label_only(self):
         config = TriageConfig(notify_tier1=False)
         policy = NotificationPolicy(config)
         t = _make_triaged(tier=1, score=95)
-        action = policy.decide_action(t)
+        action, _expl = policy.decide_action(t)
         assert action == "label_only"
 
     def test_tier2_disabled_gets_label_only(self):
         config = TriageConfig(notify_tier2=False)
         policy = NotificationPolicy(config)
         t = _make_triaged(tier=2, score=70)
-        action = policy.decide_action(t)
+        action, _expl = policy.decide_action(t)
         assert action == "label_only"
 
 
@@ -101,7 +101,7 @@ class TestQuietHours:
         policy = NotificationPolicy(config)
         with patch("autonomy.email_triage.policy._current_hour", return_value=2):
             t = _make_triaged(tier=2, score=70)
-            action = policy.decide_action(t)
+            action, _ = policy.decide_action(t)
             assert action == "label_only"
 
     def test_tier1_still_notifies_during_quiet(self):
@@ -109,7 +109,7 @@ class TestQuietHours:
         policy = NotificationPolicy(config)
         with patch("autonomy.email_triage.policy._current_hour", return_value=2):
             t = _make_triaged(tier=1, score=90)
-            action = policy.decide_action(t)
+            action, _ = policy.decide_action(t)
             assert action == "immediate"
 
     def test_not_quiet_at_noon(self):
@@ -117,7 +117,7 @@ class TestQuietHours:
         policy = NotificationPolicy(config)
         with patch("autonomy.email_triage.policy._current_hour", return_value=12):
             t = _make_triaged(tier=2, score=70)
-            action = policy.decide_action(t)
+            action, _ = policy.decide_action(t)
             assert action == "summary"
 
 
@@ -130,10 +130,10 @@ class TestDedup:
         t1 = _make_triaged(tier=1, score=90, msg_id="dup1")
         t2 = _make_triaged(tier=1, score=90, msg_id="dup1")
 
-        action1 = policy.decide_action(t1)
+        action1, _ = policy.decide_action(t1)
         assert action1 == "immediate"
 
-        action2 = policy.decide_action(t2)
+        action2, _ = policy.decide_action(t2)
         assert action2 == "label_only"
 
     def test_different_messages_not_deduped(self):
@@ -142,8 +142,8 @@ class TestDedup:
         t1 = _make_triaged(tier=1, score=90, msg_id="a")
         t2 = _make_triaged(tier=1, score=90, msg_id="b")
 
-        action1 = policy.decide_action(t1)
-        action2 = policy.decide_action(t2)
+        action1, _ = policy.decide_action(t1)
+        action2, _ = policy.decide_action(t2)
         assert action1 == "immediate"
         assert action2 == "immediate"
 
@@ -157,11 +157,11 @@ class TestInterruptBudget:
 
         for i in range(2):
             t = _make_triaged(tier=1, score=90, msg_id=f"msg_{i}")
-            action = policy.decide_action(t)
+            action, _ = policy.decide_action(t)
             assert action == "immediate", f"Message {i} should be immediate"
 
         t3 = _make_triaged(tier=1, score=90, msg_id="msg_overflow")
-        action3 = policy.decide_action(t3)
+        action3, _ = policy.decide_action(t3)
         assert action3 in ("summary", "label_only")
 
 

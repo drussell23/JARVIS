@@ -13,10 +13,13 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 from autonomy.email_triage.config import TriageConfig
-from autonomy.email_triage.schemas import TriagedEmail
+from autonomy.email_triage.schemas import PolicyExplanation, TriagedEmail
+
+if TYPE_CHECKING:
+    from autonomy.email_triage.state_store import TriageStateStore
 
 logger = logging.getLogger("jarvis.email_triage.policy")
 
@@ -27,10 +30,20 @@ def _current_hour() -> int:
 
 
 class NotificationPolicy:
-    """Stateful notification policy engine."""
+    """Stateful notification policy engine.
 
-    def __init__(self, config: TriageConfig):
+    Supports optional durable state via TriageStateStore. When a state_store
+    is provided, dedup and budget checks are backed by SQLite. The in-memory
+    caches remain as a fast path and fallback.
+    """
+
+    def __init__(
+        self,
+        config: TriageConfig,
+        state_store: Optional[TriageStateStore] = None,
+    ):
         self._config = config
+        self._state_store: Optional[TriageStateStore] = state_store
         self._dedup_cache: Dict[str, float] = {}
         self._interrupt_timestamps: List[float] = []
         self._summary_buffer: List[TriagedEmail] = []
@@ -40,56 +53,95 @@ class NotificationPolicy:
     def summary_buffer(self) -> List[TriagedEmail]:
         return self._summary_buffer
 
-    def decide_action(self, triaged: TriagedEmail) -> str:
+    def decide_action(self, triaged: TriagedEmail) -> Tuple[str, PolicyExplanation]:
         """Decide notification action for a triaged email.
 
-        Returns: "immediate" | "summary" | "label_only" | "quarantine"
+        Returns: (action, explanation) where action is one of:
+            "immediate" | "summary" | "label_only" | "quarantine"
         """
         tier = triaged.scoring.tier
+        score = triaged.scoring.score
         idem_key = triaged.scoring.idempotency_key
+        reasons: List[str] = []
+        suppressed_by: Optional[str] = None
+        quiet_active = self._in_quiet_hours()
+        budget_hour, budget_day = self._budget_remaining()
+        dedup_hit = self._is_duplicate(tier, idem_key)
+
+        def _explain(action: str) -> Tuple[str, PolicyExplanation]:
+            return action, PolicyExplanation(
+                action=action,
+                reasons=tuple(reasons),
+                suppressed_by=suppressed_by,
+                tier=tier,
+                score=score,
+                quiet_hours_active=quiet_active,
+                budget_remaining_hour=budget_hour,
+                budget_remaining_day=budget_day,
+                dedup_hit=dedup_hit,
+            )
 
         # Tier 3: always label only
         if tier == 3:
-            return "label_only"
+            reasons.append("tier3_review_only")
+            return _explain("label_only")
 
         # Tier 4: quarantine or label only
         if tier == 4:
-            return "quarantine" if self._config.quarantine_tier4 else "label_only"
+            if self._config.quarantine_tier4:
+                reasons.append("tier4_quarantine_enabled")
+                return _explain("quarantine")
+            reasons.append("tier4_noise")
+            return _explain("label_only")
 
         # Tier 1: check if notifications enabled
         if tier == 1 and not self._config.notify_tier1:
-            return "label_only"
+            reasons.append("tier1_notifications_disabled")
+            suppressed_by = "config_disabled"
+            return _explain("label_only")
 
         # Tier 2: check if notifications enabled
         if tier == 2 and not self._config.notify_tier2:
-            return "label_only"
+            reasons.append("tier2_notifications_disabled")
+            suppressed_by = "config_disabled"
+            return _explain("label_only")
 
         # Dedup check
-        if self._is_duplicate(tier, idem_key):
-            return "label_only"
+        if dedup_hit:
+            reasons.append("duplicate_within_window")
+            suppressed_by = "dedup_window"
+            return _explain("label_only")
 
         # Quiet hours: suppress tier2, allow tier1
-        if tier >= 2 and self._in_quiet_hours():
-            return "label_only"
+        if tier >= 2 and quiet_active:
+            reasons.append("quiet_hours_active")
+            suppressed_by = "quiet_hours"
+            return _explain("label_only")
 
         # Budget check: tier1 can exceed budget only by escalation
         if tier == 1:
+            reasons.append("tier1_critical")
             if self._budget_allows():
+                reasons.append("budget_available")
                 self._record_interrupt()
                 self._dedup_record(idem_key)
-                return "immediate"
+                return _explain("immediate")
             else:
+                reasons.append("budget_exhausted_to_summary")
+                suppressed_by = "budget_exhausted"
                 self._summary_buffer.append(triaged)
                 self._dedup_record(idem_key)
-                return "summary"
+                return _explain("summary")
 
         # Tier 2 -> summary
         if tier == 2:
+            reasons.append("tier2_to_summary")
             self._summary_buffer.append(triaged)
             self._dedup_record(idem_key)
-            return "summary"
+            return _explain("summary")
 
-        return "label_only"
+        reasons.append("fallback_label_only")
+        return _explain("label_only")
 
     def flush_summary(self) -> Optional[str]:
         """Flush the summary buffer. Returns formatted summary or None if empty."""
@@ -138,8 +190,8 @@ class NotificationPolicy:
         """Record notification for dedup."""
         self._dedup_cache[idem_key] = time.time()
 
-    def _budget_allows(self) -> bool:
-        """Check if interrupt budget allows another notification."""
+    def _budget_remaining(self) -> Tuple[int, int]:
+        """Return (remaining_hour, remaining_day) interrupt budget."""
         now = time.time()
         hour_ago = now - 3600
         day_ago = now - 86400
@@ -148,11 +200,15 @@ class NotificationPolicy:
         ]
         hour_count = sum(1 for t in self._interrupt_timestamps if t > hour_ago)
         day_count = len(self._interrupt_timestamps)
-
         return (
-            hour_count < self._config.max_interrupts_per_hour
-            and day_count < self._config.max_interrupts_per_day
+            max(0, self._config.max_interrupts_per_hour - hour_count),
+            max(0, self._config.max_interrupts_per_day - day_count),
         )
+
+    def _budget_allows(self) -> bool:
+        """Check if interrupt budget allows another notification."""
+        hour_remaining, day_remaining = self._budget_remaining()
+        return hour_remaining > 0 and day_remaining > 0
 
     def _record_interrupt(self) -> None:
         """Record an interrupt for budget tracking."""

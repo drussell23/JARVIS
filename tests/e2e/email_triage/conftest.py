@@ -248,6 +248,8 @@ def make_triage_config(**overrides) -> TriageConfig:
         dedup_tier2_s=3600,
         quiet_start_hour=23,
         quiet_end_hour=8,
+        # State persistence disabled by default in tests (in-memory only)
+        state_persistence_enabled=False,
     )
     defaults.update(overrides)
     return TriageConfig(**defaults)
@@ -306,6 +308,85 @@ def fresh_runner():
     yield _factory
 
     # Teardown: reset all singletons
+    EmailTriageRunner._instance = None
+    reset_triage_config()
+
+
+# ---------------------------------------------------------------------------
+# State store fixtures (WS7)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def state_store_factory(tmp_path):
+    """Factory that creates a TriageStateStore backed by a temp SQLite DB.
+
+    Automatically opens and closes the store.
+    """
+    from autonomy.email_triage.state_store import TriageStateStore
+
+    stores = []
+
+    async def _factory(db_name: str = "test_state.db") -> "TriageStateStore":
+        db_path = str(tmp_path / db_name)
+        store = TriageStateStore(db_path=db_path)
+        await store.open()
+        stores.append(store)
+        return store
+
+    yield _factory
+
+    # Cleanup
+    for s in stores:
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                pass  # Can't await in sync teardown
+            else:
+                loop.run_until_complete(s.close())
+        except Exception:
+            pass
+
+
+@pytest.fixture
+def fresh_runner_with_state(tmp_path):
+    """Factory that creates an EmailTriageRunner with a temp state store.
+
+    Resets singleton state before AND after each test.
+    """
+    from autonomy.email_triage.state_store import TriageStateStore
+
+    created_runners = []
+    stores = []
+
+    def _factory(
+        config: Optional[TriageConfig] = None,
+        workspace_agent: Any = None,
+        router: Any = None,
+        notifier: Any = None,
+        db_name: str = "runner_state.db",
+    ) -> Tuple[EmailTriageRunner, TriageStateStore]:
+        # Reset singletons before creating
+        EmailTriageRunner._instance = None
+        reset_triage_config()
+
+        cfg = config or make_triage_config(state_persistence_enabled=True)
+        db_path = str(tmp_path / db_name)
+        store = TriageStateStore(db_path=db_path)
+        runner = EmailTriageRunner(
+            config=cfg,
+            workspace_agent=workspace_agent,
+            router=router,
+            notifier=notifier,
+            state_store=store,
+        )
+        created_runners.append(runner)
+        stores.append(store)
+        return runner, store
+
+    yield _factory
+
+    # Teardown
     EmailTriageRunner._instance = None
     reset_triage_config()
 

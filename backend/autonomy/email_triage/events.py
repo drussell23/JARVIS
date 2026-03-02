@@ -25,6 +25,11 @@ EVENT_DEPENDENCY_UNAVAILABLE = "dependency_unavailable"
 EVENT_DEPENDENCY_DEGRADED = "dependency_degraded"
 EVENT_NOTIFICATION_DELIVERY_RESULT = "notification_delivery_result"
 EVENT_SNAPSHOT_PRESERVED = "snapshot_preserved"
+EVENT_SNAPSHOT_RESTORED = "snapshot_restored"
+EVENT_OUTBOX_REPLAYED = "outbox_replayed"
+EVENT_OUTBOX_EXPIRED = "outbox_expired"
+EVENT_FENCING_REJECTED = "fencing_rejected"
+EVENT_EXTRACTION_DEGRADED = "extraction_degraded"
 
 _ERROR_EVENTS = frozenset({EVENT_TRIAGE_ERROR, EVENT_DEPENDENCY_UNAVAILABLE})
 

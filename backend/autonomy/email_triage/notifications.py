@@ -16,8 +16,11 @@ import logging
 import time
 from typing import Any, Callable, List, Optional
 
+from autonomy.email_triage.config import TriageConfig
 from autonomy.email_triage.events import (
     EVENT_NOTIFICATION_DELIVERY_RESULT,
+    EVENT_OUTBOX_EXPIRED,
+    EVENT_OUTBOX_REPLAYED,
     emit_triage_event,
 )
 from autonomy.email_triage.schemas import (

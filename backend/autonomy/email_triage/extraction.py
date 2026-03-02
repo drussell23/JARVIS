@@ -15,6 +15,7 @@ import re
 from typing import Any, Dict, Optional, Tuple
 
 from autonomy.email_triage.config import TriageConfig, get_triage_config
+from autonomy.email_triage.events import EVENT_EXTRACTION_DEGRADED, emit_triage_event
 from autonomy.email_triage.schemas import EmailFeatures
 
 logger = logging.getLogger("jarvis.email_triage.extraction")
@@ -24,6 +25,55 @@ _HEURISTIC_URGENCY = {
     "urgent", "critical", "immediate", "asap", "emergency",
     "action required", "time-sensitive", "deadline", "due today",
 }
+
+# Contract validation constants (WS3)
+_EXTRACTION_CONTRACT_VERSION = "1.0"
+_REQUIRED_FIELDS = {"keywords", "sender_frequency", "urgency_signals"}
+_VALID_SENDER_FREQ = frozenset({"first_time", "occasional", "frequent"})
+_VALID_URGENCY_SIGNALS = frozenset({
+    "deadline", "action_required", "escalation", "time_sensitive", "follow_up",
+})
+_MAX_KEYWORDS = 10
+
+
+def _validate_extraction_contract(
+    data: Dict[str, Any],
+) -> Tuple[bool, list]:
+    """Validate a J-Prime extraction response against the v1.0 contract.
+
+    Returns (valid, warnings) where warnings are non-fatal issues.
+    """
+    warnings = []
+
+    # Required fields
+    for field in _REQUIRED_FIELDS:
+        if field not in data:
+            return False, [f"missing required field: {field}"]
+
+    # keywords: list of strings, max length
+    kw = data["keywords"]
+    if not isinstance(kw, list):
+        return False, ["keywords is not a list"]
+    if not all(isinstance(k, str) for k in kw):
+        return False, ["keywords contains non-string entries"]
+    if len(kw) > _MAX_KEYWORDS:
+        warnings.append(f"keywords truncated from {len(kw)} to {_MAX_KEYWORDS}")
+
+    # sender_frequency: must be in valid set
+    sf = data["sender_frequency"]
+    if sf not in _VALID_SENDER_FREQ:
+        return False, [f"invalid sender_frequency: {sf!r}"]
+
+    # urgency_signals: list of strings, warn on unknown
+    us = data["urgency_signals"]
+    if not isinstance(us, list):
+        return False, ["urgency_signals is not a list"]
+    unknown = [s for s in us if isinstance(s, str) and s not in _VALID_URGENCY_SIGNALS]
+    if unknown:
+        warnings.append(f"unknown urgency_signals: {unknown}")
+
+    return True, warnings
+
 
 _EXTRACTION_SYSTEM_PROMPT = (
     "You are an email classification assistant. Analyze the email and return "
@@ -101,13 +151,14 @@ def _build_extraction_prompt(email_dict: Dict[str, Any]) -> str:
 def _merge_features(
     heuristic: EmailFeatures,
     ai_data: Dict[str, Any],
+    extraction_source: str = "jprime_v1",
 ) -> EmailFeatures:
     """Merge AI extraction results into heuristic features."""
-    keywords = tuple(ai_data.get("keywords", [])) or heuristic.keywords
+    keywords = tuple(ai_data.get("keywords", []))[:_MAX_KEYWORDS] or heuristic.keywords
     sender_freq = ai_data.get("sender_frequency", heuristic.sender_frequency)
     urgency = tuple(ai_data.get("urgency_signals", [])) or heuristic.urgency_signals
 
-    if sender_freq not in ("first_time", "occasional", "frequent"):
+    if sender_freq not in _VALID_SENDER_FREQ:
         sender_freq = heuristic.sender_frequency
 
     return EmailFeatures(
@@ -123,6 +174,8 @@ def _merge_features(
         sender_frequency=sender_freq,
         urgency_signals=urgency,
         extraction_confidence=0.8,
+        extraction_source=extraction_source,
+        extraction_contract_version=_EXTRACTION_CONTRACT_VERSION if extraction_source == "jprime_v1" else "",
     )
 
 
@@ -159,10 +212,47 @@ async def extract_features(
             deadline=deadline,
         )
         parsed = json.loads(response.content)
-        return _merge_features(heuristic, parsed)
+
+        # Contract validation (WS3)
+        valid, warnings = _validate_extraction_contract(parsed)
+        if warnings:
+            logger.debug("Extraction contract warnings: %s", warnings)
+        if not valid:
+            emit_triage_event(EVENT_EXTRACTION_DEGRADED, {
+                "message_id": email_dict.get("id", ""),
+                "reason": "contract_validation_failed",
+                "details": warnings,
+            })
+            return EmailFeatures(
+                message_id=heuristic.message_id,
+                sender=heuristic.sender,
+                sender_domain=heuristic.sender_domain,
+                subject=heuristic.subject,
+                snippet=heuristic.snippet,
+                is_reply=heuristic.is_reply,
+                has_attachment=heuristic.has_attachment,
+                label_ids=heuristic.label_ids,
+                keywords=heuristic.keywords,
+                sender_frequency=heuristic.sender_frequency,
+                urgency_signals=heuristic.urgency_signals,
+                extraction_confidence=0.0,
+                extraction_source="jprime_degraded_fallback",
+            )
+
+        return _merge_features(heuristic, parsed, extraction_source="jprime_v1")
     except (json.JSONDecodeError, AttributeError) as e:
         logger.debug("Extraction JSON parse failed: %s", e)
+        emit_triage_event(EVENT_EXTRACTION_DEGRADED, {
+            "message_id": email_dict.get("id", ""),
+            "reason": "json_parse_failed",
+            "details": [str(e)],
+        })
         return heuristic
     except Exception as e:
         logger.warning("Extraction failed, using heuristic: %s", e)
+        emit_triage_event(EVENT_EXTRACTION_DEGRADED, {
+            "message_id": email_dict.get("id", ""),
+            "reason": "extraction_exception",
+            "details": [str(e)],
+        })
         return heuristic

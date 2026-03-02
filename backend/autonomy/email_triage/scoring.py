@@ -65,6 +65,26 @@ def score_email(features: EmailFeatures, config: TriageConfig) -> ScoringResult:
         f"{features.message_id}:{config.scoring_version}".encode()
     ).hexdigest()[:16]
 
+    # Build human-readable explanation (WS4)
+    explanation_parts = []
+    if sender_score >= 0.7:
+        explanation_parts.append(f"frequent sender ({sender_score:.0%})")
+    elif sender_score >= 0.4:
+        explanation_parts.append(f"occasional sender ({sender_score:.0%})")
+    if content_score >= 0.6:
+        explanation_parts.append(f"urgent content ({content_score:.0%})")
+    if urgency_score >= 0.5:
+        explanation_parts.append(f"urgency signals ({urgency_score:.0%})")
+    if context_score >= 0.8:
+        explanation_parts.append(f"important context ({context_score:.0%})")
+    elif context_score <= 0.2:
+        explanation_parts.append(f"promotional context ({context_score:.0%})")
+    scoring_explanation = (
+        f"Tier {tier}: " + " + ".join(explanation_parts)
+        if explanation_parts
+        else f"Tier {tier}: baseline scoring"
+    )
+
     return ScoringResult(
         score=score,
         tier=tier,
@@ -76,6 +96,7 @@ def score_email(features: EmailFeatures, config: TriageConfig) -> ScoringResult:
             "context": round(context_score, 4),
         },
         idempotency_key=idempotency_key,
+        scoring_explanation=scoring_explanation,
     )
 
 

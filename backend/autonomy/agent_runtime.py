@@ -2799,6 +2799,7 @@ class UnifiedAgentRuntime:
                     )
                     return
                 fencing_token = lock_meta.fencing_token if lock_meta else 0
+                runner.set_fencing_token(fencing_token)
                 logger.debug(
                     "[AgentRuntime] Email triage lock acquired (fencing_token=%d)",
                     fencing_token,

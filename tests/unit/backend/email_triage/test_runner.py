@@ -10,7 +10,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..
 import pytest
 from autonomy.email_triage.runner import EmailTriageRunner
 from autonomy.email_triage.config import TriageConfig
-from autonomy.email_triage.schemas import TriageCycleReport
+from autonomy.email_triage.schemas import PolicyExplanation, TriageCycleReport
+
+
+def _mock_policy_result(action: str):
+    """Build a (action, PolicyExplanation) tuple for mocking decide_action."""
+    return (action, PolicyExplanation(action=action, reasons=(action,)))
 
 
 def _sample_emails(count=3):
@@ -42,7 +47,7 @@ class TestRunCycle:
 
     @pytest.mark.asyncio
     async def test_processes_emails(self):
-        config = TriageConfig(enabled=True, extraction_enabled=False)
+        config = TriageConfig(enabled=True, extraction_enabled=False, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
 
         # Mock email fetching
@@ -59,7 +64,7 @@ class TestRunCycle:
 
     @pytest.mark.asyncio
     async def test_respects_max_per_cycle(self):
-        config = TriageConfig(enabled=True, extraction_enabled=False, max_emails_per_cycle=2)
+        config = TriageConfig(enabled=True, extraction_enabled=False, max_emails_per_cycle=2, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
 
         runner._fetch_unread = AsyncMock(return_value=_sample_emails(5))
@@ -73,7 +78,7 @@ class TestRunCycle:
 
     @pytest.mark.asyncio
     async def test_handles_fetch_failure(self):
-        config = TriageConfig(enabled=True)
+        config = TriageConfig(enabled=True, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
         runner._fetch_unread = AsyncMock(side_effect=RuntimeError("API error"))
 
@@ -83,7 +88,7 @@ class TestRunCycle:
 
     @pytest.mark.asyncio
     async def test_single_email_error_does_not_abort_cycle(self):
-        config = TriageConfig(enabled=True, extraction_enabled=False)
+        config = TriageConfig(enabled=True, extraction_enabled=False, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
 
         emails = _sample_emails(3)
@@ -128,7 +133,7 @@ class TestDependencyResolution:
         agent._fetch_unread_emails = AsyncMock(
             return_value={"emails": []}
         )
-        config = TriageConfig(enabled=True)
+        config = TriageConfig(enabled=True, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config, workspace_agent=agent)
 
         report = await runner.run_cycle()
@@ -139,7 +144,7 @@ class TestDependencyResolution:
     async def test_no_workspace_agent_returns_zero_fetched(self):
         """Without workspace_agent injection (and lazy resolution failing
         in test), fetch returns empty list and report shows 0 fetched."""
-        config = TriageConfig(enabled=True)
+        config = TriageConfig(enabled=True, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
 
         report = await runner.run_cycle()
@@ -163,7 +168,7 @@ class TestTriageCache:
     @pytest.mark.asyncio
     async def test_last_report_populated_after_cycle(self):
         """After a successful cycle, _last_report is populated."""
-        config = TriageConfig(enabled=True, extraction_enabled=False)
+        config = TriageConfig(enabled=True, extraction_enabled=False, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
         runner._fetch_unread = AsyncMock(return_value=_sample_emails(1))
         runner._label_map = {
@@ -180,7 +185,7 @@ class TestTriageCache:
     @pytest.mark.asyncio
     async def test_triaged_emails_populated(self):
         """After processing 2 emails, _triaged_emails has 2 entries."""
-        config = TriageConfig(enabled=True, extraction_enabled=False)
+        config = TriageConfig(enabled=True, extraction_enabled=False, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
         runner._fetch_unread = AsyncMock(return_value=_sample_emails(2))
         runner._label_map = {
@@ -195,7 +200,7 @@ class TestTriageCache:
     @pytest.mark.asyncio
     async def test_partial_cycle_preserves_previous_snapshot(self):
         """First cycle succeeds, second fails on fetch -- previous snapshot preserved."""
-        config = TriageConfig(enabled=True, extraction_enabled=False)
+        config = TriageConfig(enabled=True, extraction_enabled=False, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
 
         # First cycle succeeds
@@ -220,7 +225,7 @@ class TestTriageCache:
     @pytest.mark.asyncio
     async def test_get_fresh_results_returns_when_fresh(self):
         """After a cycle, get_fresh_results returns the report."""
-        config = TriageConfig(enabled=True, extraction_enabled=False, staleness_window_s=120.0)
+        config = TriageConfig(enabled=True, extraction_enabled=False, staleness_window_s=120.0, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
         runner._fetch_unread = AsyncMock(return_value=_sample_emails(1))
         runner._label_map = {
@@ -237,7 +242,7 @@ class TestTriageCache:
     @pytest.mark.asyncio
     async def test_get_fresh_results_returns_none_when_stale(self):
         """When _last_report_at is old enough, get_fresh_results returns None."""
-        config = TriageConfig(enabled=True, extraction_enabled=False, staleness_window_s=120.0)
+        config = TriageConfig(enabled=True, extraction_enabled=False, staleness_window_s=120.0, state_persistence_enabled=False)
         runner = EmailTriageRunner(config=config)
         runner._fetch_unread = AsyncMock(return_value=_sample_emails(1))
         runner._label_map = {
@@ -265,6 +270,7 @@ class TestNotificationDelivery:
     """Runner wires notification delivery for immediate and summary actions."""
 
     def _make_runner(self, notifier=None, **config_kwargs):
+        config_kwargs.setdefault("state_persistence_enabled", False)
         config = TriageConfig(enabled=True, extraction_enabled=False, **config_kwargs)
         runner = EmailTriageRunner(config=config, notifier=notifier)
         runner._fetch_unread = AsyncMock(return_value=_sample_emails(2))
@@ -281,7 +287,7 @@ class TestNotificationDelivery:
         deliver_immediate is called with the immediate emails."""
         notifier = AsyncMock(return_value=True)
         runner = self._make_runner(notifier=notifier)
-        runner._policy.decide_action = MagicMock(return_value="immediate")
+        runner._policy.decide_action = MagicMock(return_value=_mock_policy_result("immediate"))
 
         mock_result = MagicMock(success=True)
         with patch(
@@ -301,7 +307,7 @@ class TestNotificationDelivery:
     async def test_no_delivery_without_notifier(self):
         """When notifier is not resolved, deliver_immediate is never called."""
         runner = self._make_runner(notifier=None)
-        runner._policy.decide_action = MagicMock(return_value="immediate")
+        runner._policy.decide_action = MagicMock(return_value=_mock_policy_result("immediate"))
         # Prevent lazy resolution from finding the real notifier
         runner._resolver.resolve_all = AsyncMock()
 
@@ -320,7 +326,7 @@ class TestNotificationDelivery:
         but triage processing (tier counts, labels) is unaffected."""
         notifier = AsyncMock(return_value=True)
         runner = self._make_runner(notifier=notifier)
-        runner._policy.decide_action = MagicMock(return_value="immediate")
+        runner._policy.decide_action = MagicMock(return_value=_mock_policy_result("immediate"))
 
         with patch(
             "autonomy.email_triage.runner.deliver_immediate",
@@ -338,7 +344,7 @@ class TestNotificationDelivery:
         """notifications_sent counts successful deliveries, not decisions."""
         notifier = AsyncMock(return_value=True)
         runner = self._make_runner(notifier=notifier)
-        runner._policy.decide_action = MagicMock(return_value="immediate")
+        runner._policy.decide_action = MagicMock(return_value=_mock_policy_result("immediate"))
 
         success = MagicMock(success=True)
         failure = MagicMock(success=False)
@@ -356,6 +362,7 @@ class TestSnapshotCommitPolicy:
     """v1.1.1: Last-good snapshot commit policy."""
 
     def _make_runner(self, workspace_agent=None, **config_kwargs):
+        config_kwargs.setdefault("state_persistence_enabled", False)
         config = TriageConfig(enabled=True, extraction_enabled=False, **config_kwargs)
         runner = EmailTriageRunner(config=config, workspace_agent=workspace_agent)
         runner._label_map = {

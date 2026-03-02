@@ -27,6 +27,7 @@ from autonomy.email_triage.events import (
     EVENT_CYCLE_COMPLETED,
     EVENT_TRIAGE_ERROR,
     EVENT_SNAPSHOT_PRESERVED,
+    EVENT_SNAPSHOT_RESTORED,
 )
 from autonomy.email_triage.extraction import extract_features
 from autonomy.email_triage.labels import apply_label, ensure_labels_exist
@@ -34,6 +35,7 @@ from autonomy.email_triage.policy import NotificationPolicy
 from autonomy.email_triage.schemas import TriageCycleReport, TriagedEmail
 from autonomy.email_triage.notifications import deliver_immediate, deliver_summary
 from autonomy.email_triage.scoring import score_email
+from autonomy.email_triage.state_store import TriageStateStore
 
 logger = logging.getLogger("jarvis.email_triage.runner")
 
@@ -49,6 +51,7 @@ class EmailTriageRunner:
         workspace_agent: Any = None,
         router: Any = None,
         notifier: Any = None,
+        state_store: Optional[TriageStateStore] = None,
     ):
         self._config = config or get_triage_config()
         self._resolver = DependencyResolver(
@@ -67,6 +70,13 @@ class EmailTriageRunner:
         self._report_lock = asyncio.Lock()
         self._triage_schema_version: str = "1.0"
         self._committed_snapshot: Optional[Dict[str, Any]] = None
+        # Durable state (WS1)
+        self._state_store: Optional[TriageStateStore] = state_store
+        self._state_store_initialized = False
+        self._cold_start_recovered = False
+        # Fencing (WS2)
+        self._current_fencing_token: int = 0
+        self._last_committed_fencing_token: int = 0
 
     @classmethod
     def get_instance(cls, **kwargs) -> EmailTriageRunner:
@@ -79,6 +89,93 @@ class EmailTriageRunner:
         """Return the singleton if it exists, else None. Never creates."""
         return cls._instance
 
+    def set_fencing_token(self, token: int) -> None:
+        """Set the current fencing token from the DLM (WS2)."""
+        self._current_fencing_token = token
+
+    async def _ensure_state_store(self) -> None:
+        """Lazily initialize and open the state store if persistence is enabled."""
+        if self._state_store_initialized:
+            return
+        self._state_store_initialized = True
+
+        if not self._config.state_persistence_enabled:
+            self._state_store = None
+            return
+
+        if self._state_store is None:
+            try:
+                self._state_store = TriageStateStore(
+                    db_path=self._config.state_db_path,
+                )
+                await self._state_store.open()
+            except Exception as e:
+                logger.warning("State store init failed (falling back to in-memory): %s", e)
+                self._state_store = None
+                return
+
+        if not self._state_store.is_open:
+            try:
+                await self._state_store.open()
+            except Exception as e:
+                logger.warning("State store open failed: %s", e)
+                self._state_store = None
+
+    async def _cold_start_recovery(self) -> None:
+        """Recover state from the durable store on first cycle."""
+        if self._cold_start_recovered or self._state_store is None:
+            return
+        self._cold_start_recovered = True
+
+        try:
+            snapshot_data = await self._state_store.load_latest_snapshot()
+            if snapshot_data is None:
+                return
+
+            # Restore fencing token
+            stored_token = snapshot_data.get("fencing_token", 0)
+            self._last_committed_fencing_token = stored_token
+
+            # Check if this is a cross-session recovery
+            stored_session = snapshot_data.get("session_id", "")
+            current_session = self._state_store.session_id
+            is_cold_recovery = stored_session != current_session
+
+            committed_at_epoch = snapshot_data["committed_at_epoch"]
+
+            # Rebuild _committed_snapshot from stored data (minimal form)
+            # We can't fully restore TriagedEmail objects, but we can restore
+            # the snapshot dict that consumers read.
+            triaged_min = snapshot_data.get("triaged_emails_min", {})
+            report_summary = snapshot_data.get("report_summary", {})
+
+            self._committed_snapshot = {
+                "report": None,  # Full report not persisted
+                "triaged_emails": {},  # Will be repopulated on next healthy cycle
+                "schema_version": self._triage_schema_version,
+                "committed_at": committed_at_epoch,
+                "restored_from_db": True,
+                "cold_recovery": is_cold_recovery,
+                "stored_triaged_min": triaged_min,
+            }
+
+            emit_triage_event(EVENT_SNAPSHOT_RESTORED, {
+                "stored_cycle_id": snapshot_data.get("cycle_id", ""),
+                "stored_session_id": stored_session,
+                "current_session_id": current_session,
+                "cold_recovery": is_cold_recovery,
+                "age_s": time.time() - committed_at_epoch,
+                "restored_fencing_token": stored_token,
+            })
+            logger.info(
+                "Restored snapshot from DB: cycle=%s, cold=%s, age=%.1fs",
+                snapshot_data.get("cycle_id", "?"),
+                is_cold_recovery,
+                time.time() - committed_at_epoch,
+            )
+        except Exception as e:
+            logger.warning("Cold-start recovery failed: %s", e)
+
     async def run_cycle(self) -> TriageCycleReport:
         """Execute a single triage cycle."""
         cycle_id = uuid4().hex[:12]
@@ -89,6 +186,10 @@ class EmailTriageRunner:
         notifications_suppressed = 0
         emails_fetched = 0
         emails_processed = 0
+
+        # Initialize state store + cold-start recovery (first cycle only)
+        await self._ensure_state_store()
+        await self._cold_start_recovery()
 
         if not self._config.enabled:
             return TriageCycleReport(
@@ -175,8 +276,9 @@ class EmailTriageRunner:
                     notification_action="",
                     processed_at=time.time(),
                 )
-                action = self._policy.decide_action(triaged)
+                action, explanation = self._policy.decide_action(triaged)
                 triaged.notification_action = action
+                triaged.policy_explanation = explanation
                 new_triaged[features.message_id] = triaged
 
                 # Track stats
@@ -276,6 +378,41 @@ class EmailTriageRunner:
                     "committed_at": committed_at,
                 }
             report = replace(report, snapshot_committed=True)
+
+            # Persist to durable state store (best-effort)
+            if self._state_store is not None:
+                try:
+                    db_committed, db_reason = await self._state_store.save_snapshot(
+                        cycle_id=cycle_id,
+                        report=report,
+                        triaged_emails=new_triaged,
+                        fencing_token=self._current_fencing_token,
+                    )
+                    if db_committed:
+                        self._last_committed_fencing_token = self._current_fencing_token
+                    else:
+                        logger.warning("State store rejected snapshot: %s", db_reason)
+                except Exception as e:
+                    logger.warning("State store save failed (in-memory still committed): %s", e)
+
+                # Update sender reputation
+                try:
+                    for triaged in new_triaged.values():
+                        await self._state_store.update_sender_reputation(
+                            triaged.features.sender_domain,
+                            triaged.scoring.tier,
+                            triaged.scoring.score,
+                        )
+                except Exception as e:
+                    logger.debug("Sender reputation update failed: %s", e)
+
+                # Run GC
+                try:
+                    await self._state_store.run_gc(
+                        snapshot_retention=self._config.snapshot_retention_count,
+                    )
+                except Exception as e:
+                    logger.debug("State store GC failed: %s", e)
         else:
             report = replace(
                 report, degraded=True, degraded_reason=commit_reason,
