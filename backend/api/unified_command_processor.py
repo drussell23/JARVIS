@@ -157,6 +157,45 @@ _WORKSPACE_VERIFICATION_CONTRACTS = {
 }
 
 
+# Canonical workspace intent routing registry.
+# All failover, fast-path, and drift checks must derive from this map.
+_WORKSPACE_INTENT_ACTION_MAP: Dict[str, str] = {
+    "check_email": "fetch_unread_emails",
+    "read_email": "fetch_unread_emails",
+    "search_email": "search_email",
+    "draft_email": "draft_email_reply",
+    "send_email": "send_email",
+    "check_calendar": "check_calendar_events",
+    "create_event": "create_calendar_event",
+    "list_events": "check_calendar_events",
+    "get_contacts": "get_contacts",
+    "search_contacts": "get_contacts",
+    "create_document": "create_document",
+    "workspace_summary": "workspace_summary",
+    "daily_briefing": "workspace_summary",
+}
+
+_WORKSPACE_FASTPATH_INTENTS: frozenset = frozenset({
+    "check_email",
+    "read_email",
+    "search_email",
+    "send_email",
+    "check_calendar",
+    "create_event",
+    "list_events",
+    "get_contacts",
+    "search_contacts",
+    "create_document",
+    "workspace_summary",
+    "daily_briefing",
+})
+
+
+def _map_workspace_intent_to_action(intent_value: str) -> str:
+    """Map detector/J-Prime workspace intent to canonical action."""
+    return _WORKSPACE_INTENT_ACTION_MAP.get(intent_value, "handle_workspace_query")
+
+
 def _normalize_workspace_result(action, result):
     """Normalize workspace result to canonical schema (contract v1)."""
     if not isinstance(result, dict):
@@ -638,6 +677,8 @@ class UnifiedCommandProcessor:
             "coordinator_hits": 0,
             "coordinator_misses": 0,
             "coordinator_stale": 0,
+            "workspace_action_map_misses": 0,
+            "workspace_standalone_denials": 0,
         }
 
         # v_autonomy: Coordinator lookup retry state machine
@@ -2868,22 +2909,9 @@ class UnifiedCommandProcessor:
             return None
 
         intent_value = getattr(getattr(detection, "intent", None), "value", "unknown")
-        action_map = {
-            "check_email": "fetch_unread_emails",
-            "read_email": "fetch_unread_emails",
-            "search_email": "search_email",
-            "draft_email": "draft_email_reply",
-            "send_email": "send_email",
-            "check_calendar": "check_calendar_events",
-            "create_event": "create_calendar_event",
-            "list_events": "check_calendar_events",
-            "get_contacts": "get_contacts",
-            "search_contacts": "get_contacts",
-            "create_document": "create_document",
-            "workspace_summary": "workspace_summary",
-            "daily_briefing": "workspace_summary",
-        }
-        suggested_action = action_map.get(intent_value, "handle_workspace_query")
+        suggested_action = _map_workspace_intent_to_action(intent_value)
+        if suggested_action == "handle_workspace_query":
+            self._v242_metrics["workspace_action_map_misses"] += 1
 
         response_stub = SimpleNamespace(
             intent="action",
@@ -2914,14 +2942,38 @@ class UnifiedCommandProcessor:
     # =========================================================================
 
     # Guardrail 1: Strict allowlist of intents eligible for fast-path
-    _FASTPATH_ALLOWED_INTENTS: frozenset = frozenset({
-        "check_email", "read_email", "search_email", "send_email",
-        "check_calendar", "create_event", "list_events",
-        "get_contacts", "search_contacts",
-        "create_document", "workspace_summary", "daily_briefing",
-    })
+    _FASTPATH_ALLOWED_INTENTS: frozenset = _WORKSPACE_FASTPATH_INTENTS
     _fastpath_validated: bool = False
     _fastpath_disabled_intents: set = set()
+
+    @staticmethod
+    def _load_supervisor_readiness_state() -> Dict[str, Any]:
+        """Best-effort load of the kernel readiness snapshot."""
+        state_file = Path.home() / ".jarvis" / "kernel" / "readiness_state.json"
+        try:
+            with open(state_file, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def _can_use_standalone_workspace_agent(self) -> Tuple[bool, str]:
+        """Gate standalone workspace agent creation behind supervisor authority."""
+        if os.getenv("JARVIS_WORKSPACE_ALLOW_STANDALONE", "").lower() in {"1", "true", "yes"}:
+            return True, "explicit_standalone_mode"
+
+        if os.getenv("JARVIS_SUPERVISED") != "1":
+            return False, "standalone_mode_disabled"
+
+        readiness = self._load_supervisor_readiness_state()
+        tier = str(readiness.get("tier", "") or "").lower()
+        startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
+
+        if tier and tier not in {"interactive", "warmup", "fully_ready"}:
+            return False, f"supervisor_not_ready:{tier}"
+        if not tier and not startup_complete:
+            return False, "supervisor_startup_incomplete"
+        return True, "supervisor_ready"
 
     async def _try_workspace_fast_path(
         self,
@@ -2955,23 +3007,8 @@ class UnifiedCommandProcessor:
         # not a manually-maintained shadow set.
         if not self._fastpath_validated:
             self._fastpath_validated = True
-            _runtime_action_map = {
-                "check_email": "fetch_unread_emails",
-                "read_email": "fetch_unread_emails",
-                "search_email": "search_email",
-                "draft_email": "draft_email_reply",
-                "send_email": "send_email",
-                "check_calendar": "check_calendar_events",
-                "create_event": "create_calendar_event",
-                "list_events": "check_calendar_events",
-                "get_contacts": "get_contacts",
-                "search_contacts": "get_contacts",
-                "create_document": "create_document",
-                "workspace_summary": "workspace_summary",
-                "daily_briefing": "workspace_summary",
-            }
             for intent in self._FASTPATH_ALLOWED_INTENTS:
-                if intent not in _runtime_action_map:
+                if intent not in _WORKSPACE_INTENT_ACTION_MAP:
                     logger.warning(
                         "[v281] Drift guard: intent '%s' in allowlist has no "
                         "mapped action in runtime action_map — disabling",
@@ -3032,21 +3069,9 @@ class UnifiedCommandProcessor:
             return None
 
         # Map intent to action (reuse failover mapping)
-        action_map = {
-            "check_email": "fetch_unread_emails",
-            "read_email": "fetch_unread_emails",
-            "search_email": "search_email",
-            "send_email": "send_email",
-            "check_calendar": "check_calendar_events",
-            "create_event": "create_calendar_event",
-            "list_events": "check_calendar_events",
-            "get_contacts": "get_contacts",
-            "search_contacts": "get_contacts",
-            "create_document": "create_document",
-            "workspace_summary": "workspace_summary",
-            "daily_briefing": "workspace_summary",
-        }
-        suggested_action = action_map.get(intent_value, "handle_workspace_query")
+        suggested_action = _map_workspace_intent_to_action(intent_value)
+        if suggested_action == "handle_workspace_query":
+            self._v242_metrics["workspace_action_map_misses"] += 1
 
         self._v242_metrics["workspace_fast_path_hits"] += 1
         logger.info(
@@ -3485,6 +3510,29 @@ class UnifiedCommandProcessor:
                 agent = coordinator.get_agent("google_workspace_agent")
 
             if agent is None:
+                standalone_allowed, standalone_reason = self._can_use_standalone_workspace_agent()
+                if not standalone_allowed:
+                    self._v242_metrics["workspace_standalone_denials"] += 1
+                    logger.warning(
+                        "[workspace-authority] Standalone workspace agent blocked: %s",
+                        standalone_reason,
+                    )
+                    return {
+                        "success": False,
+                        "response": (
+                            "Workspace commands are unavailable until supervisor readiness "
+                            "is established."
+                        ),
+                        "command_type": "WORKSPACE",
+                        "source": getattr(response, "source", "unknown"),
+                        "error": "workspace_authority_unavailable",
+                        "error_code": "workspace_authority_unavailable",
+                        "action_required": (
+                            "Start the unified supervisor or enable "
+                            "JARVIS_WORKSPACE_ALLOW_STANDALONE=true explicitly."
+                        ),
+                        "authority_reason": standalone_reason,
+                    }
                 # Lazy singleton fallback with lock to prevent concurrent double-init.
                 if self._workspace_agent_singleton is None:
                     _init_start = _time.monotonic()
