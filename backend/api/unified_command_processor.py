@@ -100,6 +100,125 @@ except ImportError as e:
     INTELLIGENT_ROUTER_AVAILABLE = False
     logger.warning(f"[UNIFIED] Intelligent Vision Router not available: {e}")
 
+# ─── Workspace Result Verification Contract (v_autonomy) ───────────────
+WORKSPACE_RESULT_CONTRACT_VERSION = "v1"
+
+
+@dataclass
+class _VerificationContract:
+    required_keys: tuple
+    type_checks: dict
+    item_required_keys: tuple = ()
+    allow_empty: bool = False
+    semantic_check: object = None  # Optional callable
+
+
+_WORKSPACE_VERIFICATION_CONTRACTS = {
+    "fetch_unread_emails": _VerificationContract(
+        required_keys=("emails",),
+        type_checks={"emails": list},
+        item_required_keys=("subject", "from"),
+        allow_empty=True,
+    ),
+    "check_calendar_events": _VerificationContract(
+        required_keys=("events",),
+        type_checks={"events": list},
+        item_required_keys=("title", "start"),
+        allow_empty=True,
+    ),
+    "search_email": _VerificationContract(
+        required_keys=("emails",),
+        type_checks={"emails": list},
+        item_required_keys=("subject",),
+        allow_empty=True,
+    ),
+    "send_email": _VerificationContract(
+        required_keys=("message_id",),
+        type_checks={"message_id": str},
+        semantic_check=lambda v: bool(v.get("message_id")),
+    ),
+    "draft_email_reply": _VerificationContract(
+        required_keys=("draft_id",),
+        type_checks={"draft_id": str},
+        semantic_check=lambda v: bool(v.get("draft_id")),
+    ),
+    "create_calendar_event": _VerificationContract(
+        required_keys=("event_id",),
+        type_checks={"event_id": str},
+        semantic_check=lambda v: bool(v.get("event_id")),
+    ),
+}
+
+
+def _normalize_workspace_result(action, result):
+    """Normalize workspace result to canonical schema (contract v1)."""
+    if not isinstance(result, dict):
+        return result
+    if action in ("check_calendar_events", "list_events"):
+        events = result.get("events")
+        if isinstance(events, list):
+            for evt in events:
+                if isinstance(evt, dict) and "summary" in evt and "title" not in evt:
+                    evt["title"] = evt["summary"]
+    return result
+
+
+def _verify_workspace_result(action, result):
+    """Verify workspace action result against contract.
+    Returns (outcome_code, annotated_result).
+    outcome_code: verify_passed | verify_schema_fail | verify_semantic_fail | verify_empty_valid | verify_transport_fail
+    """
+    if not isinstance(result, dict):
+        result = {"_raw": result}
+
+    # Transport failure check — error key present with no success indicator
+    if result.get("error") and not result.get("success", True):
+        result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+        return "verify_transport_fail", result
+
+    result = _normalize_workspace_result(action, result)
+    contract = _WORKSPACE_VERIFICATION_CONTRACTS.get(action)
+    if contract is None:
+        result["_verification"] = {"passed": True, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+        return "verify_passed", result
+
+    # Schema checks
+    for key in contract.required_keys:
+        if key not in result:
+            result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": f"missing_key:{key}"}
+            return "verify_schema_fail", result
+    for key, expected_type in contract.type_checks.items():
+        if key in result and not isinstance(result[key], expected_type):
+            result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": f"type_mismatch:{key}"}
+            return "verify_schema_fail", result
+
+    # Empty check
+    for key in contract.required_keys:
+        val = result.get(key)
+        if isinstance(val, list) and len(val) == 0:
+            if contract.allow_empty:
+                result["_verification"] = {"passed": True, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+                return "verify_empty_valid", result
+
+    # Item-level checks
+    if contract.item_required_keys:
+        for key in contract.required_keys:
+            items = result.get(key, [])
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        if not all(k in item for k in contract.item_required_keys):
+                            result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": f"item_missing_keys:{contract.item_required_keys}"}
+                            return "verify_semantic_fail", result
+
+    # Semantic check
+    if contract.semantic_check and not contract.semantic_check(result):
+        result["_verification"] = {"passed": False, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION, "failed_check": "semantic_check"}
+        return "verify_semantic_fail", result
+
+    result["_verification"] = {"passed": True, "contract_version": WORKSPACE_RESULT_CONTRACT_VERSION}
+    return "verify_passed", result
+
 
 class DynamicPatternLearner:
     """Learns command patterns from usage and system analysis"""
