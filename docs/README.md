@@ -44,6 +44,7 @@ Detailed documentation for all JARVIS features:
 - Task automation
 
 #### ⚙️ [System Features](./features/system/)
+- [Ghost Display System](./features/system/ghost-display/GHOST_DISPLAY_SYSTEM.md) - Software-defined virtual display for background window management and vision
 - Weather system
 - Environmental adaptation
 - Self-healing capabilities
@@ -102,5 +103,5 @@ If you have questions or need clarification on any documentation, please:
 
 ---
 
-**Last Updated**: 2025-10-08
-**JARVIS Version**: 13.10.0+
+**Last Updated**: 2026-03-03
+**JARVIS Version**: v283.1+
