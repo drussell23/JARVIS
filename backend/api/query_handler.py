@@ -33,6 +33,11 @@ import re
 from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 
+try:
+    from backend.core.runtime_module_resolver import get_main_app
+except ImportError:
+    from core.runtime_module_resolver import get_main_app
+
 logger = logging.getLogger(__name__)
 
 
@@ -420,7 +425,7 @@ async def handle_query(
         # Try to get UAE context for enhanced understanding
         uae_context = None
         try:
-            from main import app
+            app = get_main_app(strict=False)
             uae_engine = getattr(app.state, 'uae_engine', None)
             if uae_engine:
                 # Get contextual information from UAE
@@ -557,7 +562,7 @@ async def _fallback_to_uae(command: str, context: Optional[Dict[str, Any]] = Non
     When it falls through to _fallback_to_cloud, generous defaults (4096/0.7) apply.
     """
     try:
-        from main import app
+        app = get_main_app(strict=False)
         uae_engine = getattr(app.state, 'uae_engine', None)
 
         if uae_engine:

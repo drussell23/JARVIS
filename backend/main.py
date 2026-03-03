@@ -232,6 +232,21 @@ import multiprocessing
 import os
 import sys
 
+# Canonicalize the backend entrypoint so legacy ``main`` imports and
+# package-qualified ``backend.main`` imports share one module instance.
+def _register_main_module_aliases() -> None:
+    current_module = sys.modules.get(__name__)
+    if current_module is None:
+        return
+    if __name__ in {"backend.main", "main", "__main__"}:
+        module_file = os.path.abspath(getattr(current_module, "__file__", "") or "")
+        if module_file.endswith(os.path.join("backend", "main.py")):
+            sys.modules.setdefault("backend.main", current_module)
+            sys.modules.setdefault("main", current_module)
+
+
+_register_main_module_aliases()
+
 # Ensure both package-style (backend.*) and legacy top-level (api.*, core.*)
 # imports resolve regardless of launch context (repo root, backend dir, uvicorn).
 def _bootstrap_import_paths() -> None:

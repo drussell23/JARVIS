@@ -48,6 +48,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
+from .runtime_module_resolver import get_main_module
+
 # Trinity Unified Event Loop Manager - shared infrastructure across repos
 try:
     # Add cross_repo to path for shared modules
@@ -3591,13 +3593,14 @@ class ParallelInitializer:
             if not existing:
                 self.app.include_router(voice_unlock_router, tags=["voice_unlock"])
 
-            # Populate global components dict for voice_unlock
-            import main
-            main.components["voice_unlock"] = {
-                "router": voice_unlock_router,
-                "available": True,
-                "initialized": True
-            }
+            # Populate the canonical global components dict without re-importing main.py.
+            main_module = get_main_module(strict=False)
+            if main_module is not None and hasattr(main_module, "components"):
+                main_module.components["voice_unlock"] = {
+                    "router": voice_unlock_router,
+                    "available": True,
+                    "initialized": True,
+                }
 
             # Also set app.state for health check
             self.app.state.voice_unlock = {
@@ -3613,8 +3616,7 @@ class ParallelInitializer:
     async def _init_jarvis_voice_api(self):
         """Initialize JARVIS voice API and populate global components dict"""
         try:
-            # Import the global components dict from main
-            import main
+            main_module = get_main_module(strict=False)
 
             # Import voice system components
             voice = {}
@@ -3662,8 +3664,9 @@ class ParallelInitializer:
                 voice["jarvis_available"] = False
                 logger.debug(f"JARVIS voice API import failed: {e}")
 
-            # Populate the global components dict
-            main.components["voice"] = voice
+            # Populate the canonical global components dict when available.
+            if main_module is not None and hasattr(main_module, "components"):
+                main_module.components["voice"] = voice
 
             if voice.get("jarvis_available"):
                 logger.info("   JARVIS voice API ready (jarvis_available=True)")

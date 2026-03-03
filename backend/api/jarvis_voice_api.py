@@ -72,6 +72,11 @@ from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+try:
+    from backend.core.runtime_module_resolver import get_main_attr
+except ImportError:
+    from core.runtime_module_resolver import get_main_attr
+
 # Import response cleaner
 from .clean_vision_response import clean_vision_response
 
@@ -1956,9 +1961,10 @@ class JARVISVoiceAPI:
         # =====================================================================
         _context_handler_active = True  # Default: context handler supersedes CAI
         try:
-            from main import USE_ENHANCED_CONTEXT
-            _context_handler_active = USE_ENHANCED_CONTEXT
-        except ImportError:
+            _context_handler_active = bool(
+                get_main_attr("USE_ENHANCED_CONTEXT", default=True, strict=False)
+            )
+        except Exception:
             pass  # Default True — context handler assumed active
 
         if (
@@ -3054,17 +3060,13 @@ class JARVISVoiceAPI:
                             pass
 
                     # Check if context awareness is enabled
-                    # Import the setting from main.py
+                    # Read the setting from the canonical backend main module.
                     try:
-                        import sys
-
-                        sys.path.insert(
-                            0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-                        )
-                        from main import USE_ENHANCED_CONTEXT
-
                         USE_CONTEXT_HANDLER = True
-                    except ImportError:
+                        USE_ENHANCED_CONTEXT = bool(
+                            get_main_attr("USE_ENHANCED_CONTEXT", default=True, strict=False)
+                        )
+                    except Exception:
                         # Default to using context handler
                         USE_CONTEXT_HANDLER = True
                         USE_ENHANCED_CONTEXT = True

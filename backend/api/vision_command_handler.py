@@ -30,6 +30,11 @@ from .pure_vision_intelligence import (
 from .proactive_monitoring_handler import get_monitoring_handler
 from .activity_reporting_commands import is_activity_reporting_command
 
+try:
+    from backend.core.runtime_module_resolver import get_main_app
+except ImportError:
+    from core.runtime_module_resolver import get_main_app
+
 logger = logging.getLogger(__name__)
 
 # Canonicalize module identity so both import styles share one singleton
@@ -2859,17 +2864,9 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
                         )
                         # Try to get from app state
                         try:
-                            import sys
-                            import os
+                            app = get_main_app(strict=False)
 
-                            sys.path.append(
-                                os.path.dirname(
-                                    os.path.dirname(os.path.abspath(__file__))
-                                )
-                            )
-                            from main import app
-
-                            if hasattr(app.state, "vision_analyzer"):
+                            if app is not None and hasattr(app.state, "vision_analyzer"):
                                 vision_manager.set_vision_analyzer(
                                     app.state.vision_analyzer
                                 )

@@ -34,6 +34,8 @@ from pathlib import Path
 import importlib
 import sys
 
+from .runtime_module_resolver import get_main_module
+
 # Phase 5A: Bounded queue backpressure
 try:
     from backend.core.bounded_queue import BoundedAsyncQueue, OverflowPolicy
@@ -1760,16 +1762,14 @@ class DynamicComponentManager:
                 result = import_func()
                 return result
 
-            # Strategy 2: Try importing from main.py directly
-            try:
-                import main as main_module
-                if hasattr(main_module, import_func_name):
-                    import_func = getattr(main_module, import_func_name)
-                    logger.debug(f"Calling {import_func_name}() from main.py")
-                    result = import_func()
-                    return result
-            except ImportError:
-                pass
+            # Strategy 2: Resolve the canonical backend main module without
+            # triggering a second app import under the legacy ``main`` name.
+            main_module = get_main_module(strict=False)
+            if main_module and hasattr(main_module, import_func_name):
+                import_func = getattr(main_module, import_func_name)
+                logger.debug(f"Calling {import_func_name}() from canonical main module")
+                result = import_func()
+                return result
 
             # Strategy 3: Fallback - direct module import
             logger.warning(f"Could not find {import_func_name}, trying direct import of {config.import_path}")
