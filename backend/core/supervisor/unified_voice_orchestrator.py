@@ -873,14 +873,11 @@ class UnifiedVoiceOrchestrator:
 
             # Speak
             if self._is_macos and self.config.enabled:
-                # v279.0: Startup-phase speech bypasses AudioBus entirely.
-                # The PortAudio callback thread needs the Python GIL every
-                # 20ms to read from the ring buffer. During startup, the GIL
-                # is saturated by concurrent heavy imports/init, starving
-                # the callback and causing output buffer underflows = static.
-                # afplay runs as a native macOS process with no GIL dependency,
-                # so it produces clean audio regardless of Python thread load.
-                # CoreAudio's HAL mixer handles coexistence with PortAudio.
+                # v279.0: STARTUP speech always bypasses AudioBus (fast path).
+                # v283.0: _execute_say() now also bypasses AudioBus when
+                # device is held (cures live-operation static at source).
+                # The STARTUP fast-path is retained as defense-in-depth —
+                # it avoids the AudioBus probe overhead during startup.
                 if message.topic == SpeechTopic.STARTUP:
                     await self._execute_say_via_afplay(message.text)
                 else:
@@ -936,11 +933,37 @@ class UnifiedVoiceOrchestrator:
             "JARVIS_VOICE_ALLOW_DIRECT_SAY_FALLBACK", "false"
         )
 
-        # v266.0: Prefer UnifiedTTSEngine for both held and free device states.
+        # v283.0: When AudioBus/FullDuplexDevice holds the audio device, the
+        # PortAudio output callback needs the Python GIL every ~20ms to read
+        # from the PlaybackRingBuffer. ANY GIL-heavy operation — ML inference,
+        # vision processing, heavy imports, garbage collection — starves the
+        # callback → output buffer underflows → audible static/crackle.
+        # This was the root cause of persistent audio static during BOTH
+        # startup AND live operation.
+        #
+        # afplay is a native macOS process with its own audio pipeline — no
+        # GIL, no Python callback, no xruns. CoreAudio's HAL mixer handles
+        # coexistence with the PortAudio stream (multiple CoreAudio clients
+        # can output simultaneously — this is how system sounds play alongside
+        # music apps). FullDuplexDevice's output callback safely outputs
+        # silence (outdata[:] = 0.0) when the PlaybackRingBuffer is empty.
+        #
+        # v279.0 applied this fix for STARTUP speech only. v283.0 extends it
+        # to ALL speech when the device is held — curing the disease at the
+        # architectural level rather than treating the startup symptom.
+        if _device_held:
+            logger.debug(
+                "[UnifiedVoice v283.0] Device held — routing through afplay "
+                "(bypassing AudioBus/PortAudio GIL-dependent callback)"
+            )
+            await self._execute_say_via_afplay(text)
+            return
+
+        # v266.0: Prefer UnifiedTTSEngine when device is FREE.
         # This centralizes playback through one engine path and works with
         # UnifiedTTSEngine's global playback mutex to prevent cross-subsystem
         # overlap/static. Direct `say` remains a controlled fallback.
-        if _device_held or prefer_unified_tts:
+        if prefer_unified_tts:
             try:
                 from backend.voice.engines.unified_tts_engine import get_tts_engine
                 tts = await get_tts_engine()
@@ -948,16 +971,10 @@ class UnifiedVoiceOrchestrator:
                 logger.debug("[UnifiedVoice v266.0] Spoke via UnifiedTTSEngine")
                 return
             except Exception as e:
-                if _device_held:
-                    logger.warning(
-                        f"[UnifiedVoice] AudioBus TTS failed while device held: {e} "
-                        f"— skipping speech to prevent static"
-                    )
-                    return
-                if prefer_unified_tts and not allow_direct_say_fallback:
+                if not allow_direct_say_fallback:
                     logger.warning(
                         f"[UnifiedVoice] UnifiedTTSEngine failed: {e} "
-                        f"— skipping direct say fallback to keep startup audio deterministic"
+                        f"— skipping direct say fallback to keep audio deterministic"
                     )
                     return
                 logger.warning(
@@ -991,30 +1008,17 @@ class UnifiedVoiceOrchestrator:
                 await self._current_process.wait()
                 self._current_process = None
 
-                # Play through AudioBus if running, else afplay
-                _played = False
-                try:
-                    from backend.audio.audio_bus import AudioBus as _ABPlay
-                    _ab = _ABPlay.get_instance_safe()
-                    if _ab is not None and _ab.is_running:
-                        import soundfile as _sf
-                        import numpy as _np
-                        _data, _sr = _sf.read(_temp_path, dtype="float32")
-                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                        await _ab.play_audio(_data, _sr)
-                        _played = True
-                except Exception as _ab_err:
-                    logger.debug(f"[UnifiedVoice] AudioBus play failed: {_ab_err}")
-
-                if not _played:
-                    _play_proc = await asyncio.create_subprocess_exec(
-                        "afplay", _temp_path,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await _play_proc.wait()
+                # v283.0: Always use afplay (native macOS, no GIL dependency).
+                # Previously tried AudioBus.play_audio() when bus running,
+                # which routes through PortAudio callback (GIL-dependent →
+                # static during GIL-heavy operations). afplay is safe
+                # alongside FullDuplexDevice (CoreAudio HAL mixer).
+                _play_proc = await asyncio.create_subprocess_exec(
+                    "afplay", _temp_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await _play_proc.wait()
                 return
             except FileNotFoundError:
                 logger.error("[UnifiedVoice] macOS 'say' command not found")
@@ -1078,15 +1082,18 @@ class UnifiedVoiceOrchestrator:
     async def _execute_say_via_afplay(self, text: str) -> None:
         """Synthesize with `say -o` and play with `afplay` — no Python audio callback.
 
-        v279.0: Dedicated startup playback path that bypasses AudioBus/PortAudio
-        entirely. During startup the GIL is saturated by concurrent init tasks,
-        starving the PortAudio callback thread and causing output buffer underflows
-        (= audible static). afplay is a native macOS process with its own audio
-        pipeline — no GIL, no Python callback, no xruns.
+        v279.0: Originally a startup-only path to bypass AudioBus/PortAudio.
+        v283.0: Now the PRIMARY playback path whenever FullDuplexDevice holds the
+        audio device. The PortAudio output callback needs the GIL every ~20ms to
+        read from PlaybackRingBuffer. ANY GIL-heavy operation (ML inference, vision,
+        heavy imports, GC) starves it → buffer underflows → audible static.
 
-        CoreAudio's HAL mixer handles coexistence with the PortAudio stream that
-        AudioBus may have already opened (multiple CoreAudio clients can output
-        simultaneously — this is how system sounds play alongside music apps).
+        afplay is a native macOS process with its own audio pipeline — no GIL,
+        no Python callback, no xruns. CoreAudio's HAL mixer handles coexistence
+        with the PortAudio stream that AudioBus may have already opened (multiple
+        CoreAudio clients can output simultaneously — this is how system sounds
+        play alongside music apps). FullDuplexDevice's output callback safely
+        outputs silence (outdata[:] = 0.0) when the PlaybackRingBuffer is empty.
         """
         import tempfile as _tmpmod
 
@@ -1350,25 +1357,20 @@ async def safe_say(
                 logger.warning("[safe_say:%s] say exited %d", source, proc.returncode)
                 return False
 
-            # 3. Route playback: AudioBus (if running) → afplay (fallback)
-            _played = False
-            try:
-                from backend.audio.audio_bus import AudioBus as _ABCls
-                _ab = _ABCls.get_instance_safe()
-                if _ab is not None and _ab.is_running:
-                    import soundfile as _sf
-                    import numpy as _np
-                    _data, _sr = _sf.read(_temp_path, dtype="float32")
-                    if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                        _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                    _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                    await _ab.play_audio(_data, _sr, wait_for_drain=True)
-                    _played = True
-            except Exception as _bus_err:
-                logger.debug("[safe_say:%s] AudioBus path failed: %s", source, _bus_err)
-
-            if not _played:
-                # afplay is safe when AudioBus isn't holding the device
+            # 3. Route playback via afplay (native macOS, no GIL dependency).
+            #
+            # v283.0: ALWAYS use afplay regardless of AudioBus state.
+            # Previously this tried AudioBus.play_audio() when the bus was
+            # running, which routes through PlaybackRingBuffer → PortAudio
+            # output callback. That callback needs the Python GIL every ~20ms.
+            # ANY GIL-heavy operation (ML inference, vision, GC) starves it
+            # → buffer underflows → audible static/crackle.
+            #
+            # afplay is a native macOS process — no GIL, no callback, clean
+            # audio. CoreAudio's HAL mixer handles coexistence with
+            # FullDuplexDevice's PortAudio stream (the output callback safely
+            # outputs silence when PlaybackRingBuffer is empty).
+            if True:  # v283.0: Always afplay — no AudioBus routing
                 _afplay = await asyncio.create_subprocess_exec(
                     "afplay", _temp_path,
                     stdout=asyncio.subprocess.DEVNULL,

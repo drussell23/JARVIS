@@ -1186,12 +1186,15 @@ class MacOSSayEngine(TTSEngine):
         rate: int,
         timeout: float,
     ) -> bool:
-        """Speak using say -o tempfile + AudioBus playback (device-safe).
+        """Speak using say -o tempfile + afplay (device-safe, GIL-free).
 
         v270.1: `say -o file` writes audio to a file WITHOUT opening the
-        audio device. The file is then loaded and fed to AudioBus.play_audio()
-        which routes through the PlaybackRingBuffer of the existing
-        FullDuplexDevice stream — no device contention, no static.
+        audio device.
+        v283.0: Playback via afplay (native macOS process) instead of
+        AudioBus.play_audio(). The PortAudio output callback needs the GIL
+        every ~20ms — any GIL-heavy op starves it → static. afplay has no
+        GIL dependency. CoreAudio HAL mixer handles coexistence with
+        FullDuplexDevice.
         """
         import tempfile
 
@@ -1216,29 +1219,20 @@ class MacOSSayEngine(TTSEngine):
                 self.last_error = f"say -o failed: {stderr.decode().strip()}"
                 return False
 
-            # Read audio file and play through AudioBus
-            import soundfile as sf
-            import numpy as np
-
-            audio_data, sample_rate = sf.read(tmp, dtype="float32")
-            if audio_data.ndim == 2:
-                audio_data = np.mean(audio_data, axis=1)  # Mono mixdown
-
-            from backend.audio.audio_bus import AudioBus
-
-            bus = AudioBus.get_instance_safe()
-            if bus is None or not bus.is_running:
-                self.last_error = "AudioBus not available for playback"
-                return False
-
-            await bus.play_audio(audio_data, sample_rate, wait_for_drain=True)
+            # v283.0: Play via afplay (native, no GIL, no PortAudio callback)
+            _play_proc = await asyncio.create_subprocess_exec(
+                "afplay", tmp,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(_play_proc.wait(), timeout=timeout)
             return True
 
         except asyncio.TimeoutError:
-            self.last_error = f"AudioBus TTS timeout after {timeout}s"
+            self.last_error = f"TTS timeout after {timeout}s"
             return False
         except Exception as e:
-            self.last_error = f"AudioBus TTS error: {e}"
+            self.last_error = f"TTS error: {e}"
             return False
         finally:
             if tmp:
@@ -1447,12 +1441,11 @@ class Pyttsx3Engine(TTSEngine):
         rate: int,
         timeout: float,
     ) -> bool:
-        """Speak using say -o tempfile + AudioBus playback (device-safe).
+        """Speak using say -o tempfile + afplay (device-safe, GIL-free).
 
-        v270.1: Identical to MacOSSayEngine._speak_via_audiobus(). When
-        FullDuplexDevice holds the audio device, pyttsx3.runAndWait() would
-        open a conflicting audio stream. Instead we use macOS `say -o file`
-        (no device) then route through AudioBus PlaybackRingBuffer.
+        v270.1: `say -o file` writes audio WITHOUT opening audio device.
+        v283.0: Playback via afplay instead of AudioBus.play_audio().
+        PortAudio callback is GIL-dependent → static. afplay is native.
         """
         import tempfile
 
@@ -1479,28 +1472,20 @@ class Pyttsx3Engine(TTSEngine):
                 self.last_error = f"say -o failed: {stderr.decode().strip()}"
                 return False
 
-            import soundfile as sf
-            import numpy as np
-
-            audio_data, sample_rate = sf.read(tmp, dtype="float32")
-            if audio_data.ndim == 2:
-                audio_data = np.mean(audio_data, axis=1)
-
-            from backend.audio.audio_bus import AudioBus
-
-            bus = AudioBus.get_instance_safe()
-            if bus is None or not bus.is_running:
-                self.last_error = "AudioBus not available for playback"
-                return False
-
-            await bus.play_audio(audio_data, sample_rate, wait_for_drain=True)
+            # v283.0: Play via afplay (native, no GIL, no PortAudio callback)
+            _play_proc = await asyncio.create_subprocess_exec(
+                "afplay", tmp,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(_play_proc.wait(), timeout=timeout)
             return True
 
         except asyncio.TimeoutError:
-            self.last_error = f"AudioBus TTS timeout after {timeout}s"
+            self.last_error = f"TTS timeout after {timeout}s"
             return False
         except Exception as e:
-            self.last_error = f"AudioBus TTS error: {e}"
+            self.last_error = f"TTS error: {e}"
             return False
         finally:
             if tmp:
@@ -1571,28 +1556,10 @@ class EdgeTTSEngine(TTSEngine):
                     timeout=timeout
                 )
 
-                if device_held:
-                    # v270.1: Route through AudioBus (no device contention)
-                    import soundfile as sf
-                    import numpy as np
-
-                    audio_data, sample_rate = sf.read(temp_path, dtype="float32")
-                    if audio_data.ndim == 2:
-                        audio_data = np.mean(audio_data, axis=1)
-
-                    from backend.audio.audio_bus import AudioBus
-
-                    bus = AudioBus.get_instance_safe()
-                    if bus is None or not bus.is_running:
-                        self.last_error = "AudioBus not available for playback"
-                        return False
-
-                    await bus.play_audio(
-                        audio_data, sample_rate, wait_for_drain=True
-                    )
-                    return True
-
-                # Normal path: play using afplay (macOS) or mpg123 (Linux)
+                # v283.0: Always use native playback (afplay/mpg123) instead
+                # of AudioBus.play_audio(). PortAudio callback is GIL-dependent
+                # → static during GIL-heavy ops. afplay is native, no GIL.
+                # (device_held branch previously routed through AudioBus)
                 if os.path.exists("/usr/bin/afplay"):
                     play_cmd = ["afplay", temp_path]
                 else:

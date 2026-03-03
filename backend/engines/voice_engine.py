@@ -851,29 +851,42 @@ class VoiceAssistant:
             self._play_feedback("success")
             
     def _play_feedback(self, feedback_type: str):
-        """Play audio feedback — AudioBus or pyaudio fallback."""
+        """Play audio feedback — afplay (native, GIL-free) or pyaudio fallback."""
         feedback_audio = self.audio_feedback.get_feedback(feedback_type)
         if feedback_audio is not None:
-            # Try AudioBus first
-            _bus_enabled = os.getenv(
-                "JARVIS_AUDIO_BUS_ENABLED", "false"
-            ).lower() in ("true", "1", "yes")
-            if _bus_enabled:
+            # v283.0: Prefer afplay (native macOS, no GIL dependency).
+            # AudioBus.play_audio() routes through PortAudio callback
+            # (GIL-dependent → static during GIL-heavy ops).
+            import platform
+            if platform.system() == "Darwin":
                 try:
-                    from backend.audio.audio_bus import get_audio_bus_safe
-                    bus = get_audio_bus_safe()
-                    if bus is not None and bus.is_running:
-                        import asyncio
-                        audio_f32 = feedback_audio.astype(np.float32)
-                        loop = asyncio.get_event_loop()
-                        loop.run_until_complete(
-                            bus.play_audio(audio_f32, self.config.sample_rate)
+                    import tempfile
+                    import soundfile as sf
+                    audio_f32 = feedback_audio.astype(np.float32)
+                    _fd, _path = tempfile.mkstemp(
+                        suffix=".wav", prefix="jarvis_feedback_"
+                    )
+                    os.close(_fd)
+                    try:
+                        sf.write(_path, audio_f32, self.config.sample_rate)
+                        import subprocess
+                        subprocess.run(
+                            ["afplay", _path],
+                            check=False,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
                         )
-                        return
-                except (ImportError, RuntimeError):
-                    pass
+                    finally:
+                        try:
+                            os.unlink(_path)
+                        except OSError:
+                            pass
+                    return
+                except Exception:
+                    pass  # Fall through to PyAudio
 
-            # Legacy: PyAudio playback
+            # Legacy: PyAudio playback (non-macOS or afplay failed)
             audio_int16 = (feedback_audio * 32767).astype(np.int16)
             p = pyaudio.PyAudio()
             stream = p.open(

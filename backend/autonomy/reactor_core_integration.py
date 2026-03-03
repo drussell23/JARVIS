@@ -295,6 +295,28 @@ class ReactorCoreIntegration:
 
         self._initialized = True
         logger.info("[ReactorCore] Initialization complete")
+
+        # v283.0: Publish state so cross-repo health probe can find us.
+        # In standalone mode, no external Reactor Core process writes these
+        # files — doing it here bridges the in-process and file-based probes.
+        try:
+            import json
+            state_dir = Path.home() / ".jarvis" / "trinity" / "state"
+            state_dir.mkdir(parents=True, exist_ok=True)
+            state_file = state_dir / "reactor_state.json"
+            _existing = {}
+            if state_file.exists():
+                try:
+                    _existing = json.loads(state_file.read_text())
+                except Exception:
+                    pass
+            _existing["status"] = "ready"
+            _existing["last_update"] = datetime.now().isoformat()
+            _existing["source"] = "in_process"
+            state_file.write_text(json.dumps(_existing, indent=2))
+        except Exception as _e:
+            logger.debug(f"[ReactorCore] Could not write state file: {_e}")
+
         return True
 
     def _prime_port_candidates(self) -> List[int]:

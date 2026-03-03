@@ -1905,36 +1905,13 @@ class EnhancedVoiceEngine:
             try:
                 self.tts_engine.save_to_file(text, _temp_path)
                 self.tts_engine.runAndWait()
-                # Play the generated file safely
-                _device_held = False
-                try:
-                    from backend.audio.audio_bus import AudioBus as _ABCls
-                    _bus = _ABCls.get_instance_safe()
-                    _device_held = _bus is not None and _bus.is_running
-                except ImportError:
-                    pass
-                if _device_held:
-                    try:
-                        import soundfile as _sf
-                        import numpy as _np
-                        _data, _sr = _sf.read(_temp_path, dtype="float32")
-                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                        import asyncio
-                        _loop = asyncio.get_event_loop()
-                        if _loop.is_running():
-                            asyncio.run_coroutine_threadsafe(
-                                _bus.play_audio(_data, _sr), _loop
-                            ).result(timeout=30)
-                        else:
-                            _loop.run_until_complete(_bus.play_audio(_data, _sr))
-                    except Exception:
-                        import subprocess as _sp
-                        _sp.run(["afplay", _temp_path], check=False)
-                else:
-                    import subprocess as _sp
-                    _sp.run(["afplay", _temp_path], check=False)
+                # v283.0: Always use afplay (native, no GIL dependency).
+                # AudioBus.play_audio() routes through PortAudio callback
+                # (GIL-dependent → static during GIL-heavy ops). afplay is
+                # a native macOS process — no GIL, no callback, clean audio.
+                # CoreAudio HAL mixer handles coexistence with FullDuplexDevice.
+                import subprocess as _sp
+                _sp.run(["afplay", _temp_path], check=False)
             finally:
                 try:
                     os.unlink(_temp_path)

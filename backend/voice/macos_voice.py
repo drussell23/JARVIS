@@ -208,28 +208,10 @@ class MacOSVoice:
                 if self._current_say_process is proc:
                     self._current_say_process = None
 
-            # Play through AudioBus if running, else afplay
-            if _device_held:
-                try:
-                    import soundfile as _sf
-                    import numpy as _np
-                    _data, _sr = _sf.read(_temp_path, dtype="float32")
-                    if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                        _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                    _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                    # Sync context — use run_coroutine_threadsafe
-                    import asyncio
-                    _loop = self._event_loop
-                    if _loop is not None and _loop.is_running():
-                        _fut = asyncio.run_coroutine_threadsafe(
-                            _bus.play_audio(_data, _sr), _loop
-                        )
-                        _fut.result(timeout=30)
-                        return
-                except Exception:
-                    pass  # Fall through to afplay
-
-            # afplay fallback (file-based, safe — no device contention)
+            # v283.0: Always use afplay (native, no GIL dependency).
+            # AudioBus.play_audio() routes through PortAudio callback
+            # (GIL-dependent → static during GIL-heavy ops). afplay is
+            # native macOS — no GIL, no callback, clean audio.
             _play_proc = subprocess.Popen(
                 ["afplay", _temp_path],
                 start_new_session=True,

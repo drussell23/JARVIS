@@ -477,30 +477,15 @@ class VoiceUnlockIntegration:
                 )
                 await asyncio.wait_for(proc.wait(), timeout=30.0)
 
-                # Play safely
-                _played = False
-                try:
-                    from backend.audio.audio_bus import AudioBus as _ABCls
-                    _ab = _ABCls.get_instance_safe()
-                    if _ab is not None and _ab.is_running:
-                        import soundfile as _sf
-                        import numpy as _np
-                        _data, _sr = _sf.read(_temp_path, dtype="float32")
-                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                        await _ab.play_audio(_data, _sr)
-                        _played = True
-                except Exception:
-                    pass
-
-                if not _played:
-                    _play_proc = await asyncio.create_subprocess_exec(
-                        "afplay", _temp_path,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await _play_proc.wait()
+                # v283.0: Always use afplay (native, no GIL dependency).
+                # AudioBus.play_audio() routes through PortAudio callback
+                # (GIL-dependent → static during GIL-heavy ops).
+                _play_proc = await asyncio.create_subprocess_exec(
+                    "afplay", _temp_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await _play_proc.wait()
             finally:
                 try:
                     os.unlink(_temp_path)

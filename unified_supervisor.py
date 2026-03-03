@@ -75678,10 +75678,15 @@ class JarvisSystemKernel:
 
         if not success:
             # Optional dependency failures are "skipped", not hard errors.
+            # v283.0: Added "CLI integration is disabled" — BetterDisplay is
+            # installed but the user hasn't enabled CLI integration in its
+            # Settings > Integration panel.  This is a configuration issue,
+            # not a hard failure — treat identically to "not installed".
             _not_installed_signals = (
                 "BetterDisplay CLI not found",
                 "not running and could not be launched",
                 "not installed",
+                "CLI integration is disabled",
             )
             is_missing_dependency = error and any(
                 sig in error for sig in _not_installed_signals

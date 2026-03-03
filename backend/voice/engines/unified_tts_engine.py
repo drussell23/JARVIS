@@ -904,22 +904,19 @@ class UnifiedTTSEngine:
             raise
 
     async def _play_audio(self, audio_data: bytes, sample_rate: int):
-        """Play audio — routes through AudioBus when device is held, else sounddevice.
+        """Play audio via native OS player (GIL-free) or sounddevice fallback.
 
-        v236.5: Probe actual AudioBus singleton state (not env-var intent).
+        v283.0 decision matrix:
+          bus.is_running + macOS   →  afplay (native, no GIL, no PortAudio callback)
+          bus.is_running + Linux   →  paplay/aplay/pw-play → AudioBus last resort
+          bus not running + macOS  →  afplay → sounddevice fallback
+          bus not running + Linux  →  sounddevice
 
-        The ONLY dangerous case is when FullDuplexDevice **actively holds** the
-        audio device (``bus.is_running == True``).  Opening a second output
-        stream via ``sd.play()`` then triggers PortAudio -9986.
-
-        If AudioBus was enabled but failed to start (or hasn't started yet),
-        the device is FREE — ``sd.play()`` / raw ``say`` work fine.
-
-        Decision matrix:
-          bus.is_running  →  use bus.play_audio() (single stream, no contention)
-          bus.play_audio() FAILS while bus.is_running  →  RAISE (sd.play would -9986)
-          bus not running / not imported  →  native playback (afplay on macOS),
-                                             else sounddevice fallback
+        v283.0: AudioBus.play_audio() routes through PortAudio output callback
+        which needs the GIL every ~20ms. GIL-heavy ops (ML, vision, GC) starve
+        it → buffer underflows → static. Native OS players (afplay, aplay, paplay)
+        are separate processes — no GIL, no callback, clean audio. CoreAudio/ALSA/
+        PulseAudio handle coexistence with FullDuplexDevice.
         """
         try:
             if self._is_audio_output_in_cooldown():
@@ -959,20 +956,41 @@ class UnifiedTTSEngine:
                 pass  # AudioBus module not installed
 
             if _bus_running:
-                # FullDuplexDevice holds device — route through its stream.
-                # v237.0: wait_for_drain=True ensures we block until the
-                # ring buffer is fully consumed by the audio callback.
-                # Without this, _play_audio() returned immediately after
-                # *queueing* data, causing:
-                #   1. Speech-state manager to deactivate mic gate too early
-                #   2. Consecutive utterances to overflow the ring buffer
-                #      (silent data drops → truncated / garbled audio)
-                audio_np = np.asarray(data, dtype=np.float32)
-                await _bus.play_audio(audio_np, sample_rate, wait_for_drain=True)
-                self._clear_audio_output_cooldown()
-                return
-                # If play_audio() raises, exception propagates — we do NOT
-                # fall through to sd.play() (would always fail with -9986).
+                # v283.0: FullDuplexDevice holds device — use afplay (native
+                # macOS) instead of AudioBus.play_audio(). The PortAudio output
+                # callback needs the GIL every ~20ms to read from
+                # PlaybackRingBuffer. ANY GIL-heavy operation (ML inference,
+                # vision, GC) starves it → buffer underflows → static.
+                # afplay is a native process — no GIL, no callback, clean audio.
+                # CoreAudio's HAL mixer handles coexistence with FullDuplexDevice.
+                # FullDuplexDevice's output callback safely outputs silence when
+                # PlaybackRingBuffer is empty (outdata[:] = 0.0).
+                if self._is_macos:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, lambda: self._play_with_afplay(audio_data)
+                    )
+                    self._clear_audio_output_cooldown()
+                    return
+                # Non-macOS: try native Linux player (aplay/paplay/pw-play).
+                # Same GIL-free principle as afplay — native process, no callback.
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(
+                        None, lambda: self._play_with_native_linux_player(audio_data)
+                    )
+                    self._clear_audio_output_cooldown()
+                    return
+                except (FileNotFoundError, Exception) as _linux_err:
+                    logger.debug(
+                        "[UnifiedTTS v283.0] Native Linux player failed: %s "
+                        "— falling back to AudioBus", _linux_err
+                    )
+                    # Last resort: AudioBus (GIL-dependent but better than silence)
+                    audio_np = np.asarray(data, dtype=np.float32)
+                    await _bus.play_audio(audio_np, sample_rate, wait_for_drain=True)
+                    self._clear_audio_output_cooldown()
+                    return
 
             # Device is free (AudioBus not running / not started / failed).
             # Prefer native macOS playback to avoid PortAudio startup artifacts.
@@ -1037,6 +1055,43 @@ class UnifiedTTSEngine:
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
+        finally:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _play_with_native_linux_player(audio_data: bytes) -> None:
+        """Play WAV bytes via native Linux audio player (aplay/paplay).
+
+        v283.0: Same GIL-free principle as afplay on macOS. Both aplay
+        (ALSA) and paplay (PulseAudio) are native processes with their
+        own audio pipelines — no GIL, no PortAudio callback, clean audio.
+        """
+        temp_fd, temp_path = tempfile.mkstemp(suffix=".wav", prefix="jarvis_tts_play_")
+        os.close(temp_fd)
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(audio_data)
+            # Try native players in order of commonality
+            for player_cmd in (
+                ["paplay", temp_path],    # PulseAudio (most desktop Linux)
+                ["aplay", temp_path],     # ALSA (fallback)
+                ["pw-play", temp_path],   # PipeWire
+            ):
+                try:
+                    subprocess.run(
+                        player_cmd,
+                        check=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                    return
+                except FileNotFoundError:
+                    continue
+            raise FileNotFoundError("No native Linux audio player found (paplay/aplay/pw-play)")
         finally:
             try:
                 os.unlink(temp_path)

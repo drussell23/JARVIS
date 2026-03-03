@@ -1680,12 +1680,30 @@ class CrossRepoStateInitializer:
         """
         Probe Reactor Core health.
 
-        Checks:
+        Checks (v283.0 order):
+        0. In-process integration singleton (standalone mode)
         1. Reactor state file exists and has recent heartbeat
         2. (Optional) HTTP health check if endpoint configured
         """
         # v211.0: Use asyncio.wait_for for Python 3.9 compatibility
         async def _do_health_probe() -> bool:
+            # Method 0 (v283.0): Check in-process integration singleton.
+            # In standalone mode, ReactorCoreIntegration initializes in-process
+            # but never writes heartbeat/state files.  Checking the singleton
+            # bridges the two initialization paths.
+            try:
+                from backend.autonomy.reactor_core_integration import (
+                    get_reactor_core_integration,
+                )
+                _rc = get_reactor_core_integration()
+                if getattr(_rc, "_initialized", False):
+                    logger.debug(
+                        "[CrossRepoState] Reactor Core in-process integration active"
+                    )
+                    return True
+            except (ImportError, AttributeError, Exception):
+                pass
+
             # Method 1: Check heartbeat file
             heartbeat_data = await self._read_json_file(self._state_files["heartbeat"], default={})
             reactor_heartbeat = heartbeat_data.get("reactor_core", {})

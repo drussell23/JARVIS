@@ -759,28 +759,15 @@ class RealTimeVoiceCommunicator:
                 )
                 await process.wait()
 
-                # Play through AudioBus if available, else afplay
-                _played = False
-                try:
-                    if _ab is not None and _ab.is_running:
-                        import soundfile as _sf
-                        import numpy as _np
-                        _data, _sr = _sf.read(_temp_path, dtype="float32")
-                        if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                            _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                        _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                        await _ab.play_audio(_data, _sr)
-                        _played = True
-                except Exception:
-                    pass
-
-                if not _played:
-                    _play_proc = await asyncio.create_subprocess_exec(
-                        "afplay", _temp_path,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL,
-                    )
-                    await _play_proc.wait()
+                # v283.0: Always use afplay (native, no GIL dependency).
+                # AudioBus.play_audio() routes through PortAudio callback
+                # (GIL-dependent → static during GIL-heavy ops).
+                _play_proc = await asyncio.create_subprocess_exec(
+                    "afplay", _temp_path,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await _play_proc.wait()
             finally:
                 try:
                     os.unlink(_temp_path)
@@ -1531,40 +1518,13 @@ class RealTimeVoiceCommunicator:
                         # Fall through to legacy path
                         _bus_enabled = False
 
-                _bus_fallback_succeeded = False
                 if not _bus_enabled:
-                    # Try AudioBus path first (provides AEC reference signal)
-                    try:
-                        from backend.audio.audio_bus import get_audio_bus_safe
-                        _bus = get_audio_bus_safe()
-                        if _bus is not None and getattr(_bus, 'is_running', False):
-                            from backend.voice.engines.unified_tts_engine import get_tts_engine
-                            _tts = await get_tts_engine()
-                            if hasattr(_tts, 'synthesize'):
-                                _tts_result = await _tts.synthesize(text)
-                                if _tts_result is not None:
-                                    _audio_bytes = getattr(_tts_result, 'audio_data', None)
-                                    _sr = getattr(_tts_result, 'sample_rate', 22050)
-                                    if _audio_bytes is not None:
-                                        import io
-                                        import numpy as np
-                                        try:
-                                            import soundfile as sf
-                                            _audio_np, _file_sr = sf.read(
-                                                io.BytesIO(_audio_bytes), dtype='float32',
-                                            )
-                                            _sr = _file_sr
-                                        except Exception:
-                                            _audio_np = np.frombuffer(
-                                                _audio_bytes, dtype=np.int16,
-                                            ).astype(np.float32) / 32767.0
-                                        await _bus.play_audio(_audio_np, _sr)
-                                        self._is_speaking = False
-                                        _bus_fallback_succeeded = True
-                    except Exception as bus_err:
-                        logger.debug(f"[SpeakImmediate] AudioBus path failed, falling back: {bus_err}")
-
-                    if not _bus_fallback_succeeded:
+                    # v283.0: Skip AudioBus synthesis+play path entirely.
+                    # AudioBus.play_audio() routes through PortAudio callback
+                    # (GIL-dependent → static during GIL-heavy ops). The AEC
+                    # reference signal it provided is secondary to clean audio,
+                    # and the say-o+afplay fallback never had AEC either.
+                    if True:
                         # v275.2: SAFE fallback — always use say -o tempfile
                         # to avoid opening audio device (causes static when
                         # FullDuplexDevice holds the device).
@@ -1592,30 +1552,13 @@ class RealTimeVoiceCommunicator:
                             await asyncio.wait_for(process.wait(), timeout=timeout)
                             self._current_speech_process = None
 
-                            # Play through AudioBus if running, else afplay
-                            _played = False
-                            try:
-                                from backend.audio.audio_bus import AudioBus as _ABCls
-                                _ab = _ABCls.get_instance_safe()
-                                if _ab is not None and _ab.is_running:
-                                    import soundfile as _sf
-                                    import numpy as _np
-                                    _data, _sr = _sf.read(_temp_path, dtype="float32")
-                                    if isinstance(_data, _np.ndarray) and _data.ndim > 1:
-                                        _data = _np.mean(_data, axis=1, dtype=_np.float32)
-                                    _data = _np.asarray(_data, dtype=_np.float32).reshape(-1)
-                                    await _ab.play_audio(_data, _sr)
-                                    _played = True
-                            except Exception as _ab_err:
-                                logger.debug(f"[SpeakImmediate] AudioBus play failed: {_ab_err}")
-
-                            if not _played:
-                                _play_proc = await asyncio.create_subprocess_exec(
-                                    "afplay", _temp_path,
-                                    stdout=asyncio.subprocess.DEVNULL,
-                                    stderr=asyncio.subprocess.DEVNULL,
-                                )
-                                await asyncio.wait_for(_play_proc.wait(), timeout=30.0)
+                            # v283.0: Always use afplay (native, no GIL dependency).
+                            _play_proc = await asyncio.create_subprocess_exec(
+                                "afplay", _temp_path,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await asyncio.wait_for(_play_proc.wait(), timeout=30.0)
                         finally:
                             try:
                                 os.unlink(_temp_path)
@@ -1640,7 +1583,7 @@ class RealTimeVoiceCommunicator:
                     except Exception:
                         pass
 
-                if not _in_conversation_mode and not _bus_enabled and not _bus_fallback_succeeded:
+                if not _in_conversation_mode and not _bus_enabled:
                     await asyncio.sleep(
                         float(os.getenv("JARVIS_POST_SPEECH_BUFFER_S", "0.3"))
                     )
