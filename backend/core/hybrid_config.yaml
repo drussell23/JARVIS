@@ -80,12 +80,35 @@ hybrid:
         - code_explanation
         - text_summarization
         - question_answering
+        # v290.0: Vision analysis via J-Prime LLaVA
+        - vision_analysis
+
+      # v290.0: Model definitions loaded dynamically by ModelRegistry
+      models:
+        jprime_llava:
+          display_name: "J-Prime LLaVA Vision"
+          type: vision
+          capabilities:
+            required: [vision, multimodal, vision_analyze_heavy, screen_analysis]
+            optional: [object_detection, ui_detection]
+          deployment: gcp_only
+          port: 8001
+          priority: 100
+          performance:
+            latency_ms: 500
+            quality_score: 0.90
+          resources:
+            ram_gb: 4.0
+            disk_gb: 8.0
+            min_ram_backend_gb: 16
+
       components:
         - CHATBOTS
         - ML_MODELS
         - MEMORY
         - MONITORING
         - LOCAL_LLM  # Phase 3.1: LLaMA 3.1 70B
+        - VISION_LLAVA  # v290.0: J-Prime LLaVA vision
       discovery:
         method: dns
         hostname: jarvis-backend.gcp.internal

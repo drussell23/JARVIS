@@ -304,6 +304,48 @@ class ModelRegistry:
                 priority=60,  # Lower priority than YOLOv8m
             )
 
+        # v290.0: Load additional models from config (dynamic, no hardcoding)
+        _deployment_map = {
+            "local_only": ModelDeployment.LOCAL_ONLY,
+            "gcp_only": ModelDeployment.GCP_ONLY,
+            "api": ModelDeployment.API,
+            "both": ModelDeployment.BOTH,
+        }
+        models_config = gcp_config.get("models", {})
+        for model_name, model_spec in models_config.items():
+            if model_name in self.models:
+                continue  # Don't override programmatic definitions
+            caps_cfg = model_spec.get("capabilities", {})
+            required_caps = set(caps_cfg.get("required", []) if isinstance(caps_cfg, dict) else caps_cfg)
+            optional_caps = set(caps_cfg.get("optional", []) if isinstance(caps_cfg, dict) else [])
+            all_caps = required_caps | optional_caps
+            res_cfg = model_spec.get("resources", {})
+            perf_cfg = model_spec.get("performance", {})
+            self.models[model_name] = ModelDefinition(
+                name=model_name,
+                display_name=model_spec.get("display_name", model_name),
+                model_type=model_spec.get("type", "vision"),
+                capabilities=all_caps,
+                deployment=_deployment_map.get(
+                    model_spec.get("deployment", "gcp_only"), ModelDeployment.GCP_ONLY,
+                ),
+                resources=ResourceProfile(
+                    ram_gb=res_cfg.get("ram_gb", 2.0),
+                    disk_gb=res_cfg.get("disk_gb", 4.0),
+                    min_ram_backend_gb=res_cfg.get("min_ram_backend_gb", 16),
+                ),
+                performance=PerformanceProfile(
+                    latency_ms=perf_cfg.get("latency_ms", 500),
+                    quality_score=perf_cfg.get("quality_score", 0.85),
+                ),
+                backend_preference="gcp",
+                lazy_load=True,
+                priority=model_spec.get("priority", 50),
+            )
+            logger.info(f"Loaded model from config: {model_name} (caps: {all_caps})")
+
+        if ("llm_inference" in capabilities or "ml_processing" in capabilities) \
+                and "semantic_search" not in self.models:
             # Semantic Search
             self.models["semantic_search"] = ModelDefinition(
                 name="semantic_search",

@@ -126,8 +126,9 @@ class SceneNode:
     timestamp: datetime = field(default_factory=datetime.now)
     
     def get_property(self, key: str, default: Any = None) -> Any:
-        """Get a property value"""
-        return self.properties.get(key, default)
+        """Get a property value, returning default when value is None"""
+        value = self.properties.get(key, default)
+        return value if value is not None else default
     
     def set_property(self, key: str, value: Any):
         """Set a property value"""
@@ -172,7 +173,7 @@ class ContentNode(SceneNode):
         super().__init__(node_type=NodeType.CONTENT, bounds=bounds)
         self.properties.update({
             'content_type': content_type,
-            'value': kwargs.get('value'),
+            'value': kwargs.get('value') or '',
             'state': kwargs.get('state', 'idle'),
             'is_modified': kwargs.get('is_modified', False),
             'metadata': kwargs.get('metadata', {})
@@ -188,10 +189,10 @@ class UIElementNode(SceneNode):
             'element_type': element_type,
             'is_interactive': kwargs.get('is_interactive', True),
             'is_enabled': kwargs.get('is_enabled', True),
-            'value': kwargs.get('value'),
-            'label': kwargs.get('label'),
-            'tooltip': kwargs.get('tooltip'),
-            'keyboard_shortcut': kwargs.get('keyboard_shortcut')
+            'value': kwargs.get('value') or '',
+            'label': kwargs.get('label') or '',
+            'tooltip': kwargs.get('tooltip') or '',
+            'keyboard_shortcut': kwargs.get('keyboard_shortcut') or ''
         })
 
 
@@ -201,7 +202,7 @@ class InformationNode(SceneNode):
     def __init__(self, text: str, bounds: Optional[Bounds] = None, **kwargs):
         super().__init__(node_type=NodeType.INFORMATION, bounds=bounds)
         self.properties.update({
-            'text': text,
+            'text': text or '',
             'format': kwargs.get('format', 'plain'),
             'language': kwargs.get('language', 'en'),
             'is_editable': kwargs.get('is_editable', False),
@@ -323,9 +324,13 @@ class SceneGraphBuilder:
             )
         
         else:
-            # Generic scene node
+            # Generic scene node — normalize None values to empty string
             node = SceneNode(node_type=NodeType.UNKNOWN, bounds=bounds)
-            node.properties.update(element)
+            node.properties.update({
+                k: (v if v is not None else '')
+                for k, v in element.items()
+                if k not in ('bounds', 'type')
+            })
             return node
     
     async def _discover_relationships(self):

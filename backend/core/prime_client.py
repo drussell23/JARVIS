@@ -600,6 +600,14 @@ class PrimeClient:
             self._vision_session = aiohttp.ClientSession()
         return self._vision_session
 
+    async def get_vision_health(self) -> bool:
+        """Public API: Check vision server health (cached 30s).
+
+        v290.0: Promoted from private ``_check_vision_health`` so that
+        ``VisionRoutingPolicy`` can call it without reaching into internals.
+        """
+        return await self._check_vision_health()
+
     async def _check_vision_health(self) -> bool:
         """Check vision server health (cached 30s). Uses dedicated session (F8)."""
         now = time.time()

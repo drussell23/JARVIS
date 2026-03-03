@@ -1203,6 +1203,13 @@ class ClaudeVisionAnalyzer:
         # F9: Backoff when both providers fail
         self._vision_both_failed_until: float = 0.0
 
+        # v290.0: Centralized routing policy (single source of truth)
+        try:
+            from .vision_routing_policy import get_vision_routing_policy
+            self._routing_policy = get_vision_routing_policy()
+        except Exception:
+            self._routing_policy = None
+
         logger.info(
             f"Initialized ClaudeVisionAnalyzer with config: {self.config.to_dict()}"
         )
@@ -3115,93 +3122,40 @@ class ClaudeVisionAnalyzer:
                         region_info = ""
                     enhanced_prompt = prompt + region_info
 
-                # v259.1: Provider dispatch — J-Prime LLaVA as DEFAULT, Claude for escalation
-                # F9: Check dual-fail cooldown
-                if time.time() < self._vision_both_failed_until:
-                    raise RuntimeError(
-                        f"Vision temporarily unavailable (both providers failed, "
-                        f"retry in {self._vision_both_failed_until - time.time():.0f}s)"
-                    )
-
-                # v259.1: Routing decision — J-Prime is the default for ALL vision
-                # requests in AUTO mode. Claude is reserved for:
-                #   1. priority="high" (explicit escalation for complex queries)
-                #   2. CLAUDE_API provider override
-                #   3. J-Prime unhealthy (pre-flight check avoids 120s timeout)
-                #   4. J-Prime returns low-quality response (quality gate escalation)
-                #
-                # v283.0: cloud_offload_required overrides provider selection.
-                # When local memory is insufficient but GCP is available,
-                # the memory gate sets this flag to force J-Prime routing.
+                # v290.0: Centralized provider dispatch via VisionRoutingPolicy
                 _cloud_offload = getattr(self.memory_monitor, "cloud_offload_required", False)
-                _force_claude = (
-                    self._vision_provider == VisionProvider.CLAUDE_API
-                    or priority == "high"
-                ) and not _cloud_offload
-                _force_jprime = (
-                    self._vision_provider == VisionProvider.JPRIME_LLAVA
-                    or _cloud_offload
-                )
-                _use_jprime = _force_jprime or (
-                    self._vision_provider == VisionProvider.AUTO
-                    and not _force_claude
-                )
-                if _cloud_offload:
-                    logger.info(
-                        "[v283.0] Cloud offload active — forcing J-Prime "
-                        "routing (local memory insufficient)"
+
+                if self._routing_policy is not None:
+                    from .vision_routing_policy import VisionRequest as _VisionReq
+
+                    _vreq = _VisionReq(
+                        image_base64=image_base64,
+                        prompt=enhanced_prompt,
+                        priority=priority,
+                        cloud_offload_required=_cloud_offload,
+                        max_tokens=self.config.max_tokens,
+                        temperature=0.1,
+                        timeout=self.config.jprime_vision_timeout,
                     )
 
-                # v259.1: Pre-flight health check — if J-Prime is known-unhealthy
-                # (cached 30s), skip directly to Claude instead of waiting 120s timeout
-                if _use_jprime and not _force_jprime:
-                    _jprime_healthy = await self._is_jprime_healthy()
-                    if not _jprime_healthy:
-                        logger.info(
-                            "[VisionProvider] J-Prime unhealthy (pre-flight), "
-                            "routing to Claude"
-                        )
-                        _use_jprime = False
+                    async def _jprime_caller(img_b64, prompt_str, timeout_val):
+                        return await self._call_jprime_vision(img_b64, prompt_str, timeout=timeout_val)
 
-                if _use_jprime:
-                    try:
-                        result = await self._call_jprime_vision(image_base64, enhanced_prompt)
-                        # v259.1: Quality gate — if J-Prime returns a very short
-                        # or empty response, escalate to Claude for a better answer
-                        _min_len = int(os.getenv(
-                            "VISION_JPRIME_MIN_RESPONSE_LENGTH", "20"
-                        ))
-                        if (
-                            not _force_jprime
-                            and self.config.jprime_fallback_to_claude
-                            and len(result.strip()) < _min_len
-                        ):
-                            logger.info(
-                                "[VisionProvider] J-Prime response too short "
-                                "(%d chars < %d), escalating to Claude",
-                                len(result.strip()), _min_len,
-                            )
-                            result = await self._call_claude_api(
-                                image_base64, enhanced_prompt
-                            )
-                    except Exception as e:
-                        logger.warning(f"[VisionProvider] LLaVA failed ({e}), falling back to Claude")
-                        if self.config.jprime_fallback_to_claude:
-                            try:
-                                result = await self._call_claude_api(image_base64, enhanced_prompt)
-                            except Exception as e2:
-                                # F9: Both failed — set cooldown
-                                self._vision_both_failed_until = (
-                                    time.time() + self.config.vision_dual_fail_cooldown
-                                )
-                                logger.error(
-                                    f"[VisionProvider] Both LLaVA and Claude failed. "
-                                    f"Cooling down {self.config.vision_dual_fail_cooldown}s"
-                                )
-                                raise
-                        else:
-                            raise
+                    async def _claude_caller(img_b64, prompt_str):
+                        return await self._call_claude_api(img_b64, prompt_str)
+
+                    _resp = await self._routing_policy.execute(
+                        _vreq,
+                        jprime_caller=_jprime_caller,
+                        claude_caller=_claude_caller,
+                    )
+
+                    if _resp.error and _resp.provider_used == "none":
+                        raise RuntimeError(_resp.error)
+
+                    result = _resp.content
                 else:
+                    # Legacy fallback if routing policy failed to init
                     result = await self._call_claude_api(image_base64, enhanced_prompt)
             metrics.api_call_time = time.time() - api_start
 
@@ -4800,7 +4754,12 @@ class ClaudeVisionAnalyzer:
         except Exception:
             return False
 
-    async def _call_jprime_vision(self, image_base64: str, prompt: str) -> str:
+    async def _call_jprime_vision(
+        self,
+        image_base64: str,
+        prompt: str,
+        timeout: Optional[float] = None,
+    ) -> str:
         """Call J-Prime LLaVA vision server (port 8001). CPU inference ~30-60s.
 
         Note: Does NOT re-apply _enhance_prompt_for_ui_elements() because:
@@ -4818,7 +4777,7 @@ class ClaudeVisionAnalyzer:
             prompt=prompt,
             max_tokens=self.config.max_tokens,
             temperature=0.1,
-            timeout=self.config.jprime_vision_timeout,
+            timeout=timeout if timeout is not None else self.config.jprime_vision_timeout,
         )
         return response.content
 

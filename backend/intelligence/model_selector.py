@@ -36,7 +36,8 @@ class QueryContext:
 
     query: str
     intent: Optional[str] = None  # CAI classification
-    required_capabilities: Set[str] = None  # What capabilities needed
+    required_capabilities: Set[str] = None  # Must have ALL of these
+    preferred_capabilities: Set[str] = None  # Score bonus, not mandatory
     complexity: str = "medium"  # simple, medium, complex
     quality_requirement: str = "balanced"  # quick, balanced, best
     user_focus_level: str = "casual"  # deep_work, focused, casual, idle
@@ -46,6 +47,8 @@ class QueryContext:
     def __post_init__(self):
         if self.required_capabilities is None:
             self.required_capabilities = set()
+        if self.preferred_capabilities is None:
+            self.preferred_capabilities = set()
 
 
 @dataclass
@@ -185,8 +188,11 @@ class IntelligentModelSelector:
             intent = await self._classify_intent(query)
 
         # Infer capabilities from intent
+        preferred_capabilities: Set[str] = set()
         if not required_capabilities:
-            required_capabilities = self._intent_to_capabilities(intent)
+            required_capabilities, preferred_capabilities = (
+                self._intent_to_required_and_preferred(intent)
+            )
 
         # Determine complexity
         complexity = self._estimate_complexity(query, intent)
@@ -210,6 +216,7 @@ class IntelligentModelSelector:
             query=query,
             intent=intent,
             required_capabilities=required_capabilities,
+            preferred_capabilities=preferred_capabilities,
             complexity=complexity,
             quality_requirement=quality_requirement,
             user_focus_level=user_focus_level,
@@ -248,19 +255,38 @@ class IntelligentModelSelector:
         return "nlp_analysis"
 
     def _intent_to_capabilities(self, intent: str) -> Set[str]:
-        """Map intent to required capabilities"""
-        intent_capability_map = {
-            "vision_analysis": {"vision", "object_detection", "vision_analyze_heavy"},
-            "code_explanation": {"code_explanation", "nlp_analysis"},
-            "conversational_ai": {"conversational_ai", "chatbot_inference"},
-            "semantic_search": {"semantic_search", "embedding", "similarity_search"},
-            "nlp_analysis": {"nlp_analysis", "response_generation"},
+        """Map intent to required capabilities (backward compat)."""
+        required, _ = self._intent_to_required_and_preferred(intent)
+        return required
+
+    def _intent_to_required_and_preferred(
+        self, intent: str
+    ) -> Tuple[Set[str], Set[str]]:
+        """Map intent to (required, preferred) capability sets.
+
+        Required: model MUST have ALL of these.
+        Preferred: bonus score for having these, not mandatory.
+        """
+        _required_map = {
+            "vision_analysis": {"vision"},
+            "code_explanation": {"nlp_analysis"},
+            "conversational_ai": {"conversational_ai"},
+            "semantic_search": {"semantic_search", "embedding"},
+            "nlp_analysis": {"nlp_analysis"},
             "intent_classification": {"intent_classification"},
             "text_summarization": {"text_summarization"},
             "query_expansion": {"query_expansion"},
         }
-
-        return set(intent_capability_map.get(intent, {"nlp_analysis"}))
+        _preferred_map = {
+            "vision_analysis": {"object_detection", "vision_analyze_heavy", "screen_analysis"},
+            "code_explanation": {"code_explanation", "response_generation"},
+            "conversational_ai": {"chatbot_inference", "response_generation"},
+            "semantic_search": {"similarity_search"},
+            "nlp_analysis": {"response_generation"},
+        }
+        required = set(_required_map.get(intent, {"nlp_analysis"}))
+        preferred = set(_preferred_map.get(intent, set()))
+        return required, preferred
 
     def _estimate_complexity(self, query: str, intent: str) -> str:
         """Estimate query complexity"""
@@ -276,31 +302,48 @@ class IntelligentModelSelector:
     # ============== Model Finding ==============
 
     async def _find_capable_models(self, query_context: QueryContext) -> List[ModelDefinition]:
-        """Find all models capable of handling the query"""
-        # Use a dict keyed by model name for deduplication instead of a set,
-        # which avoids relying on ModelDefinition.__hash__ (unhashable in some
-        # runtime configurations where @dataclass sets __hash__ = None).
+        """Find models using required + preferred capability matching.
+
+        v290.0: Models must have ALL required capabilities (hard filter).
+        Preferred capabilities provide a score bonus for ranking but are
+        not mandatory — a model missing preferred caps is still viable.
+        """
         capable_models: Dict[str, ModelDefinition] = {}
 
-        # Find models for each required capability
-        for capability in query_context.required_capabilities:
+        # Gather candidate models from both required and preferred capabilities
+        all_caps = query_context.required_capabilities | query_context.preferred_capabilities
+        for capability in all_caps:
             models = self.registry.get_models_for_capability(capability)
             for model in models:
                 capable_models[model.name] = model
 
-        # Filter out models that can't be deployed
-        viable_models = []
+        # Filter: must have ALL required capabilities
+        viable: list = []
         for model in capable_models.values():
-            # Check if model supports ALL required capabilities
             if not all(
-                model.supports_capability(cap) for cap in query_context.required_capabilities
+                model.supports_capability(cap)
+                for cap in query_context.required_capabilities
             ):
                 continue
 
-            viable_models.append(model)
+            # Score preferred capability coverage
+            pref_score = sum(
+                1 for cap in query_context.preferred_capabilities
+                if model.supports_capability(cap)
+            )
+            viable.append((model, pref_score))
 
-        logger.debug(f"Found {len(viable_models)} capable models for {query_context.intent}")
-        return viable_models
+        # Sort by preferred coverage + priority (higher = better)
+        viable.sort(key=lambda x: (x[1], x[0].priority), reverse=True)
+        result = [model for model, _ in viable]
+
+        logger.debug(
+            "Found %d capable models for %s (required=%s, preferred=%s)",
+            len(result), query_context.intent,
+            query_context.required_capabilities,
+            query_context.preferred_capabilities,
+        )
+        return result
 
     # ============== Model Scoring ==============
 

@@ -650,6 +650,25 @@ class MultiSpaceCaptureEngine:
         """Capture a single space using best available method"""
         capture_start = time.time()
 
+        # v290.0: Pre-check — skip empty spaces (with freshness guard)
+        try:
+            from .multi_space_window_detector import MultiSpaceWindowDetector
+            _detector = MultiSpaceWindowDetector()
+            _window_info = _detector.get_all_windows_across_spaces()
+            _spaces = _window_info.get("spaces", {})
+            _space_data = _spaces.get(space_id, {})
+            _win_count = len(_space_data.get("windows", []))
+            _freshness = time.time() - _space_data.get("timestamp", 0)
+            if _win_count == 0 and _freshness < 5.0:
+                logger.info(
+                    f"[CAPTURE] Skipping space {space_id} "
+                    f"(empty, fresh check {_freshness:.1f}s ago)"
+                )
+                return (False, None, None,
+                        f"Space {space_id} is empty (0 windows)")
+        except Exception:
+            pass  # Detector unavailable — continue with capture
+
         # Adapt quality based on memory pressure
         effective_quality = self.get_quality_for_pressure(request.quality)
 
@@ -1104,11 +1123,20 @@ class MultiSpaceCaptureEngine:
             # Use regular screencapture when on the space
             return await self._capture_with_screencapture(space_id, request.quality)
 
-        # Quick switch and capture
-        logger.info(f"[SPACE_SWITCH] Calling quick_capture_and_return for space {space_id}")
+        # v290.0: Per-space timeout — never exceed parent budget
+        _per_space_timeout = float(os.environ.get(
+            "JARVIS_PER_SPACE_CAPTURE_TIMEOUT", "10"
+        ))
+        logger.info(
+            f"[SPACE_SWITCH] Calling quick_capture_and_return for space "
+            f"{space_id} (timeout={_per_space_timeout}s)"
+        )
         try:
-            screenshot = await self.space_switcher.quick_capture_and_return(
-                space_id, capture_callback
+            screenshot = await asyncio.wait_for(
+                self.space_switcher.quick_capture_and_return(
+                    space_id, capture_callback
+                ),
+                timeout=_per_space_timeout,
             )
             if screenshot is not None:
                 logger.info(f"[SPACE_SWITCH] Successfully captured space {space_id} via switching")
@@ -1116,6 +1144,12 @@ class MultiSpaceCaptureEngine:
                 logger.warning(
                     f"[SPACE_SWITCH] Failed to capture space {space_id} - screenshot is None"
                 )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[SPACE_SWITCH] Space switch budget exhausted for space "
+                f"{space_id} after {_per_space_timeout}s"
+            )
+            screenshot = None
         except Exception as e:
             logger.error(f"[SPACE_SWITCH] Error during space switch capture: {e}", exc_info=True)
             screenshot = None

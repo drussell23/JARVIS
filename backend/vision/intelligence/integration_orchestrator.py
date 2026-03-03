@@ -32,6 +32,22 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 
+def _dict_to_state_vector(state_dict: Dict[str, Any]) -> 'StateVector':
+    """Canonical adapter: dict -> StateVector with bounded dimensions.
+
+    Canonicalizes state to prevent cardinality explosion in Markov matrix.
+    Only app_id, app_state, and user_action are used as state dimensions.
+    Additional context goes in metadata (not used for state indexing).
+    """
+    from .predictive_precomputation_engine import StateVector
+    return StateVector(
+        app_id=str(state_dict.get('app_id', 'unknown'))[:64],
+        app_state=str(state_dict.get('state', 'unknown'))[:64],
+        user_action='vision_pipeline',
+        metadata={'confidence': state_dict.get('confidence', 0.0)},
+    )
+
+
 class SystemMode(Enum):
     """Operating modes based on memory pressure"""
     NORMAL = "normal"          # < 60% memory usage
@@ -675,9 +691,20 @@ class IntegrationOrchestrator:
                 return None
 
         try:
-            prediction = await self.components['predictive_engine'].predict(state, intelligence)
-            return prediction
-        except Exception:
+            state_vector = _dict_to_state_vector(state)
+            predictions = self.components['predictive_engine'].transition_matrix.get_predictions(
+                state_vector, top_k=3
+            )
+            if predictions:
+                return {
+                    'predictions': [
+                        {'state': str(s), 'probability': p, 'confidence': c}
+                        for s, p, c in predictions
+                    ]
+                }
+            return None
+        except Exception as e:
+            logger.debug(f"Predictive engine error: {type(e).__name__}: {e}")
             return None
     
     async def _make_api_decision(self, frame: np.ndarray, spatial: Dict[str, Any],
@@ -707,7 +734,11 @@ class IntegrationOrchestrator:
         
         # Update predictive engine
         if self.components['predictive_engine']:
-            await self.components['predictive_engine'].update_state(state)
+            try:
+                state_vector = _dict_to_state_vector(state)
+                await self.components['predictive_engine'].update_state(state_vector)
+            except Exception as e:
+                logger.debug(f"Predictive state update failed: {type(e).__name__}: {e}")
         
         return integrated
     

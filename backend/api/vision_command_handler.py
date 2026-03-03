@@ -2758,18 +2758,30 @@ Provide a comprehensive analysis of what you see in Space {space_id}."""
                 and self.vision_manager.get_vision_analyzer()
             ):
                 # Use enhanced capture with multi-space support WITH TIMEOUT
-                logger.info(f"[VISION-CAPTURE] Starting screen capture (multi_space={multi_space}, space_number={space_number})")
+                # v290.0: Dynamic capture timeout — multi-space needs more budget
+                _base_timeout = float(os.environ.get(
+                    "JARVIS_VISION_CAPTURE_TIMEOUT", "30"
+                ))
+                _capture_timeout = (
+                    _base_timeout if multi_space
+                    else min(_base_timeout, 15.0)
+                )
+                logger.info(
+                    f"[VISION-CAPTURE] Starting screen capture "
+                    f"(multi_space={multi_space}, space_number={space_number}, "
+                    f"timeout={_capture_timeout}s)"
+                )
                 try:
                     screenshot = await asyncio.wait_for(
                         self.vision_manager.capture_screen(
                             multi_space=multi_space, space_number=space_number
                         ),
-                        timeout=15.0  # 15 second timeout for screen capture
+                        timeout=_capture_timeout
                     )
                     logger.info(f"[VISION-CAPTURE] ✅ Screen capture completed successfully")
                     return screenshot
                 except asyncio.TimeoutError:
-                    logger.error(f"[VISION-CAPTURE] ❌ Screen capture timed out after 15 seconds")
+                    logger.error(f"[VISION-CAPTURE] ❌ Screen capture timed out after {_capture_timeout}s")
                     return None
                 except Exception as e:
                     logger.error(f"[VISION-CAPTURE] ❌ Vision manager capture failed: {e}")
