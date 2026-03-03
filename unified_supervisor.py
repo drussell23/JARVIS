@@ -63300,7 +63300,7 @@ class JarvisSystemKernel:
         self._ghost_display_recovery_task: Optional[asyncio.Task] = None
         self._ghost_display_health_task: Optional[asyncio.Task] = None
         self._visual_pipeline_health_task: Optional[asyncio.Task] = None
-        self._visual_pipeline_deferred_task: Optional[asyncio.Task] = None
+        self._visual_pipeline_deferred_task: Optional[asyncio.Task] = None  # Tracks the single in-flight init task
         self._visual_pipeline_initialized: bool = False
 
         # v264.0: Screen Recording Permission + Real-Time Observation (Phase 6.4)
@@ -70498,36 +70498,52 @@ class JarvisSystemKernel:
                 )
 
             # v262.0: Outer timeout for Visual Pipeline (derived from internal timeout + grace)
-            _vp_inner_timeout = visual_pipeline_timeout
-            _vp_outer_timeout = _get_env_float(
-                "JARVIS_VISUAL_PIPELINE_OUTER_TIMEOUT",
-                _vp_inner_timeout + 15.0,
+            _vp_outer_timeout = self._get_visual_pipeline_outer_timeout()
+            _vp_startup_budget = self._get_visual_pipeline_startup_budget(
+                outer_timeout=_vp_outer_timeout,
             )
             if _ssm: await _ssm.start_component("visual_pipeline")
+            _vp_task = self._ensure_visual_pipeline_init_task(
+                outer_timeout=_vp_outer_timeout,
+            )
+            _vp_ok = False
+            _vp_deferred = False
             try:
-                _vp_ok = await asyncio.wait_for(
-                    self._initialize_visual_pipeline(), timeout=_vp_outer_timeout
+                _vp_ok = bool(
+                    await shielded_wait_for(
+                        _vp_task,
+                        timeout=_vp_startup_budget,
+                        name="visual_pipeline_startup_budget",
+                    )
                 )
             except asyncio.TimeoutError:
-                self.logger.error(
-                    f"[Kernel] v262.0: _initialize_visual_pipeline() OUTER timeout "
-                    f"after {_vp_outer_timeout:.0f}s"
+                _vp_deferred = True
+                self.logger.info(
+                    "[VisualPipeline] Initialization exceeded %.0fs startup budget "
+                    "— continuing in background",
+                    _vp_startup_budget,
                 )
-                _vp_ok = False
                 self._update_component_status(
-                    "visual_pipeline", "error",
-                    f"Outer timeout ({_vp_outer_timeout:.0f}s)",
+                    "visual_pipeline",
+                    "running",
+                    f"Initialization continuing in background ({_vp_startup_budget:.0f}s startup budget)",
                 )
             except asyncio.CancelledError:
-                self.logger.error("[Kernel] v262.0: _initialize_visual_pipeline() cancelled")
-                _vp_ok = False
                 raise
+            except Exception as _vp_wait_err:
+                self.logger.warning(f"[VisualPipeline] Startup wait failed: {_vp_wait_err}")
+                _vp_ok = False
             if _ssm:
-                if _vp_ok:
+                if _vp_deferred:
+                    await _ssm.skip_component(
+                        "visual_pipeline",
+                        "Initialization continuing in background",
+                    )
+                elif _vp_ok:
                     await _ssm.complete_component("visual_pipeline")
                 else:
                     await _ssm.complete_component("visual_pipeline", error="Init failed or timed out")
-            if not _vp_ok:
+            if not _vp_ok and not _vp_deferred:
                 # Non-fatal — continue without Visual Pipeline
                 issue_collector.add_warning(
                     "Visual Pipeline failed to initialize — continuing without visual processing",
@@ -70535,9 +70551,23 @@ class JarvisSystemKernel:
                     suggestion="Check Ghost Hands Orchestrator and N-Optic Nerve availability"
                 )
 
+            _vp_status = self._component_status.get(
+                "visual_pipeline", {}
+            ).get("status", "pending")
+            if _vp_deferred:
+                _vp_message = (
+                    "Visual Pipeline initializing in background — launching frontend..."
+                )
+            elif _vp_status == "complete":
+                _vp_message = "Visual Pipeline ready — launching frontend..."
+            elif _vp_status == "skipped":
+                _vp_message = "Visual Pipeline skipped — launching frontend..."
+            else:
+                _vp_message = "Visual Pipeline unavailable — launching frontend..."
+
             await self._safe_broadcast(
                 stage="visual_pipeline",
-                message="Visual Pipeline ready — launching frontend...",
+                message=_vp_message,
                 progress=93,
                 metadata={
                     "icon": "eye",
@@ -70771,6 +70801,27 @@ class JarvisSystemKernel:
                     }
                 }
             )
+
+            _cid_fn = f"phase-finalizing-{uuid.uuid4().hex[:8]}"
+            _t0_fn = time.time()
+            self.logger.info(
+                "[Kernel] Finalizing startup: verifying services, readiness, and completion hooks..."
+            )
+            self._emit_event(
+                SupervisorEventType.PHASE_START,
+                "Phase: Finalization",
+                phase="finalizing",
+                correlation_id=_cid_fn,
+            )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_enter:
+                try:
+                    _trace_phase_enter(
+                        "finalizing",
+                        progress=99,
+                        metadata={"correlation_id": _cid_fn},
+                    )
+                except Exception:
+                    pass
 
             # Start background pre-warming task (non-blocking)
             issue_collector.set_current_phase("Background Tasks")
@@ -71114,6 +71165,25 @@ class JarvisSystemKernel:
                 "startup_complete",
                 phase="complete",
             )
+
+            self._emit_event(
+                SupervisorEventType.PHASE_END,
+                "Phase: Finalization complete",
+                severity=SupervisorEventSeverity.SUCCESS,
+                phase="finalizing",
+                duration_ms=(time.time() - _t0_fn) * 1000,
+                correlation_id=_cid_fn,
+            )
+            if _TRACE_HOOKS_AVAILABLE and _trace_phase_exit:
+                try:
+                    _trace_phase_exit(
+                        "finalizing",
+                        progress=100,
+                        success=True,
+                        duration_s=time.time() - _t0_fn,
+                    )
+                except Exception:
+                    pass
 
             return 0
 
@@ -75697,14 +75767,99 @@ class JarvisSystemKernel:
             self._start_deferred_visual_pipeline_initialization()
 
     def _start_deferred_visual_pipeline_initialization(self) -> None:
-        """Start deferred Visual Pipeline initialization if no retry is active."""
-        if self._visual_pipeline_deferred_task and not self._visual_pipeline_deferred_task.done():
-            return
-        self._visual_pipeline_deferred_task = create_safe_task(
-            self._initialize_visual_pipeline(),
-            name="visual-pipeline-deferred-init",
+        """Start or reuse deferred Visual Pipeline initialization."""
+        self._ensure_visual_pipeline_init_task()
+
+    def _get_visual_pipeline_outer_timeout(self) -> float:
+        """Return the guarded outer timeout for Visual Pipeline initialization."""
+        inner_timeout = _get_env_float("JARVIS_VISUAL_PIPELINE_TIMEOUT", 45.0)
+        return _get_env_float(
+            "JARVIS_VISUAL_PIPELINE_OUTER_TIMEOUT",
+            inner_timeout + 15.0,
         )
-        self._background_tasks.append(self._visual_pipeline_deferred_task)
+
+    def _get_visual_pipeline_startup_budget(self, *, outer_timeout: float) -> float:
+        """Return the startup-lane budget before Visual Pipeline is handed off."""
+        default_budget = min(15.0, max(5.0, outer_timeout * 0.25))
+        configured_budget = _get_env_float(
+            "JARVIS_VISUAL_PIPELINE_STARTUP_BUDGET",
+            default_budget,
+        )
+        return max(5.0, min(configured_budget, outer_timeout))
+
+    def _ensure_visual_pipeline_init_task(
+        self,
+        *,
+        outer_timeout: Optional[float] = None,
+    ) -> asyncio.Task:
+        """Create or reuse the single Visual Pipeline initialization task."""
+        task = self._visual_pipeline_deferred_task
+        if task is None or task.done():
+            task = create_safe_task(
+                self._run_visual_pipeline_initialization_with_timeout(
+                    outer_timeout=(
+                        outer_timeout
+                        if outer_timeout is not None
+                        else self._get_visual_pipeline_outer_timeout()
+                    ),
+                ),
+                name="visual-pipeline-init",
+            )
+            self._visual_pipeline_deferred_task = task
+            self._background_tasks.append(task)
+            task.add_done_callback(self._on_visual_pipeline_init_done)
+        return task
+
+    async def _run_visual_pipeline_initialization_with_timeout(
+        self,
+        *,
+        outer_timeout: float,
+    ) -> bool:
+        """Run Visual Pipeline initialization with an outer timeout guard."""
+        try:
+            return await asyncio.wait_for(
+                self._initialize_visual_pipeline(),
+                timeout=outer_timeout,
+            )
+        except asyncio.TimeoutError:
+            self.logger.error(
+                "[Kernel] Visual Pipeline init exceeded outer timeout %.0fs",
+                outer_timeout,
+            )
+            self._update_component_status(
+                "visual_pipeline",
+                "error",
+                f"Outer timeout ({outer_timeout:.0f}s)",
+            )
+            return False
+        except asyncio.CancelledError:
+            self.logger.error("[Kernel] Visual Pipeline init cancelled")
+            raise
+
+    def _on_visual_pipeline_init_done(self, task: asyncio.Task) -> None:
+        """Finalize the tracked Visual Pipeline init task lifecycle."""
+        if task is self._visual_pipeline_deferred_task:
+            self._visual_pipeline_deferred_task = None
+
+        if task.cancelled():
+            return
+
+        try:
+            success = bool(task.result())
+        except Exception as e:
+            self.logger.debug(f"[VisualPipeline] Deferred init task failed: {e}")
+            return
+
+        if success:
+            status = self._component_status.get("visual_pipeline", {}).get("status", "unknown")
+            self.logger.info(
+                "[VisualPipeline] Deferred initialization completed (status=%s)",
+                status,
+            )
+        else:
+            self.logger.warning(
+                "[VisualPipeline] Deferred initialization completed without activation"
+            )
 
     async def _ghost_display_crash_recovery(self) -> None:
         """

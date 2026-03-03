@@ -2972,22 +2972,52 @@ class UnifiedCommandProcessor:
             return {}
 
     def _can_use_standalone_workspace_agent(self) -> Tuple[bool, str]:
-        """Gate standalone workspace agent creation behind supervisor authority."""
+        """Gate standalone workspace agent creation on CAPABILITY, not process state.
+
+        v283.0: The original gate checked ``JARVIS_SUPERVISED == "1"`` which is
+        only set when the unified supervisor spawns the backend.  In standalone
+        mode (direct ``python main.py``), the env var is empty → the gate always
+        returned ``(False, "standalone_mode_disabled")`` → workspace commands
+        were permanently blocked → "check my email" fell through to J-Prime →
+        Safari opened.
+
+        The real question is not "is the supervisor running?" but "can the
+        workspace agent authenticate with Google?".  We check for credential
+        files on disk.  If running under the supervisor, we still honour the
+        readiness tier to prevent commands during early startup.
+        """
+        # 1. Explicit override — always honoured
         if os.getenv("JARVIS_WORKSPACE_ALLOW_STANDALONE", "").lower() in {"1", "true", "yes"}:
             return True, "explicit_standalone_mode"
 
-        if os.getenv("JARVIS_SUPERVISED") != "1":
-            return False, "standalone_mode_disabled"
+        # 2. Credential-based capability check (v283.0)
+        from pathlib import Path as _Path
 
-        readiness = self._load_supervisor_readiness_state()
-        tier = str(readiness.get("tier", "") or "").lower()
-        startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
+        _creds_path = os.getenv(
+            "GOOGLE_CREDENTIALS_PATH",
+            str(_Path.home() / ".jarvis" / "google_credentials.json"),
+        )
+        _token_path = os.getenv(
+            "GOOGLE_TOKEN_PATH",
+            str(_Path.home() / ".jarvis" / "google_workspace_token.json"),
+        )
+        if os.path.isfile(_creds_path) and os.path.isfile(_token_path):
+            return True, "credentials_available"
 
-        if tier and tier not in {"interactive", "warmup", "fully_ready"}:
-            return False, f"supervisor_not_ready:{tier}"
-        if not tier and not startup_complete:
-            return False, "supervisor_startup_incomplete"
-        return True, "supervisor_ready"
+        # 3. Supervised mode — check readiness tier
+        if os.getenv("JARVIS_SUPERVISED") == "1":
+            readiness = self._load_supervisor_readiness_state()
+            tier = str(readiness.get("tier", "") or "").lower()
+            startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
+
+            if tier and tier not in {"interactive", "warmup", "fully_ready"}:
+                return False, f"supervisor_not_ready:{tier}"
+            if not tier and not startup_complete:
+                return False, "supervisor_startup_incomplete"
+            return True, "supervisor_ready"
+
+        # 4. No credentials and not supervised
+        return False, "no_workspace_credentials"
 
     async def _try_workspace_fast_path(
         self,
@@ -3239,6 +3269,21 @@ class UnifiedCommandProcessor:
             if domain == "surveillance":
                 return await self._handle_surveillance_action(command_text, websocket, deadline=deadline)
             elif domain == "system":
+                # v283.0: Safari guard — J-Prime sometimes misclassifies workspace
+                # commands (e.g. "check my email") as domain="system" with a
+                # suggested action that opens Safari.  Run the sub-ms workspace
+                # detector as a safety net BEFORE executing system actions.
+                _ws_rescue = await self._attempt_workspace_failover(
+                    command_text, deadline=deadline,
+                )
+                if _ws_rescue is not None:
+                    logger.info(
+                        "[v283.0] Workspace detector rescued misclassified "
+                        "system action: '%s' → workspace handler",
+                        command_text[:60],
+                    )
+                    _ws_rescue.setdefault("source", "system_to_workspace_rescue")
+                    return _ws_rescue
                 return await self._handle_system_action_via_jprime(
                     command_text, response.suggested_actions, deadline=deadline,
                 )

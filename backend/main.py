@@ -3067,7 +3067,21 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         logger.warning(f"⚠️ Could not initialize Rust acceleration: {e}")
         app.state.rust_acceleration = {"available": False}
 
-    # Connect vision analyzer to other components (analyzer already initialized earlier)
+    # v283.0: ALWAYS set app state in JARVIS factory, regardless of vision
+    # health.  The factory provides dependency injection for ALL subsystems
+    # (workspace agent, email, calendar, etc.), not just vision.  Gating it
+    # behind the vision analyzer caused catastrophic over-coupling: if vision
+    # failed (common under memory pressure), workspace/email commands also
+    # broke — falling through to J-Prime which opened Safari instead.
+    try:
+        from api.jarvis_factory import set_app_state
+
+        set_app_state(app.state)
+        logger.info("✅ App state set in JARVIS factory (unconditional)")
+    except ImportError:
+        logger.warning("⚠️ JARVIS factory not available for dependency injection")
+
+    # Connect vision analyzer to vision-specific components (optional)
     if hasattr(app.state, "vision_analyzer") and app.state.vision_analyzer:
         logger.info("🔗 Connecting vision analyzer to other JARVIS components...")
 
@@ -3090,15 +3104,6 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             logger.info("✅ Vision analyzer set in vision websocket manager")
         except ImportError as e:
             logger.warning(f"⚠️ Could not set vision analyzer in websocket: {e}")
-
-        # Set app state in JARVIS factory for dependency injection
-        try:
-            from api.jarvis_factory import set_app_state
-
-            set_app_state(app.state)
-            logger.info("✅ App state set in JARVIS factory")
-        except ImportError:
-            logger.warning("⚠️ JARVIS factory not available for dependency injection")
     else:
         logger.warning("⚠️ Vision analyzer not available - vision features disabled")
 

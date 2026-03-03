@@ -5474,22 +5474,41 @@ def _load_workspace_supervisor_readiness_state() -> Dict[str, Any]:
 
 
 def _can_create_standalone_workspace_agent() -> Tuple[bool, str]:
-    """Gate standalone workspace agent creation behind supervisor authority."""
+    """Gate standalone workspace agent creation on CAPABILITY, not process state.
+
+    v283.0: Mirrors ``UnifiedCommandProcessor._can_use_standalone_workspace_agent``.
+    Checks for Google workspace credential files instead of supervisor process state.
+    """
+    # 1. Explicit override
     if os.getenv("JARVIS_WORKSPACE_ALLOW_STANDALONE", "").lower() in {"1", "true", "yes"}:
         return True, "explicit_standalone_mode"
 
-    if os.getenv("JARVIS_SUPERVISED") != "1":
-        return False, "standalone_mode_disabled"
+    # 2. Credential-based capability check (v283.0)
+    _creds_path = os.getenv(
+        "GOOGLE_CREDENTIALS_PATH",
+        str(Path.home() / ".jarvis" / "google_credentials.json"),
+    )
+    _token_path = os.getenv(
+        "GOOGLE_TOKEN_PATH",
+        str(Path.home() / ".jarvis" / "google_workspace_token.json"),
+    )
+    if os.path.isfile(_creds_path) and os.path.isfile(_token_path):
+        return True, "credentials_available"
 
-    readiness = _load_workspace_supervisor_readiness_state()
-    tier = str(readiness.get("tier", "") or "").lower()
-    startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
+    # 3. Supervised mode — check readiness tier
+    if os.getenv("JARVIS_SUPERVISED") == "1":
+        readiness = _load_workspace_supervisor_readiness_state()
+        tier = str(readiness.get("tier", "") or "").lower()
+        startup_complete = os.getenv("JARVIS_STARTUP_COMPLETE", "").lower() == "true"
 
-    if tier and tier not in {"interactive", "warmup", "fully_ready"}:
-        return False, f"supervisor_not_ready:{tier}"
-    if not tier and not startup_complete:
-        return False, "supervisor_startup_incomplete"
-    return True, "supervisor_ready"
+        if tier and tier not in {"interactive", "warmup", "fully_ready"}:
+            return False, f"supervisor_not_ready:{tier}"
+        if not tier and not startup_complete:
+            return False, "supervisor_startup_incomplete"
+        return True, "supervisor_ready"
+
+    # 4. No credentials and not supervised
+    return False, "no_workspace_credentials"
 
 
 async def get_google_workspace_agent() -> Optional["GoogleWorkspaceAgent"]:
