@@ -5,7 +5,7 @@ This module provides the communication bridge between JARVIS (Body) and the
 Trinity architecture (J-Prime Mind + Reactor Core Nerves).
 
 ARCHITECTURE:
-┌────────────┐    JSON Commands    ┌──────────────┐    Triggers    ┌────────────┐
+┌────────────┐    JSON Commands    ┌──────────────┐    Triggers   ┌────────────┐
 │  J-PRIME   │ ────────────────────│ REACTOR CORE │ ──────────────│   JARVIS   │
 │   (Mind)   │                     │   (Nerves)   │               │   (Body)   │
 └────────────┘    Status Updates   └──────────────┘    Heartbeat  └────────────┘

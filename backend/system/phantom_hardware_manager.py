@@ -712,6 +712,13 @@ class PhantomHardwareManager:
                         created_at=datetime.now()
                     )
                     logger.info("[v68.0] Virtual display created successfully")
+
+                    # v283.1: Activate the display. BetterDisplay `create`
+                    # only defines the virtual screen in config — it does NOT
+                    # connect it to the GPU framebuffer.  Without this step
+                    # the display never appears in system_profiler or yabai.
+                    await self._connect_virtual_display_async(cli_path)
+
                     return True, None
 
                 # "already exists" is success
@@ -722,6 +729,10 @@ class PhantomHardwareManager:
                         is_active=True,
                         is_jarvis_ghost=True,
                     )
+
+                    # v283.1: Ensure existing display is connected too.
+                    await self._connect_virtual_display_async(cli_path)
+
                     return True, None
 
                 # "Failed." typically means CLI integration is disabled
@@ -740,6 +751,49 @@ class PhantomHardwareManager:
             error_msg = f"Display creation error: {e}"
             logger.error(f"[v68.0] {error_msg}")
             return False, error_msg
+
+    async def _connect_virtual_display_async(
+        self,
+        cli_path: str,
+    ) -> bool:
+        """
+        v283.1: Activate a virtual screen so it appears as a real display.
+
+        BetterDisplay ``create`` only defines the virtual screen in config.
+        ``set -connected=on`` connects it to the GPU framebuffer, making it
+        visible to system_profiler, yabai, and all downstream consumers.
+        """
+        display_name = self.ghost_display_name.replace("_", " ")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                cli_path, "set",
+                f"-virtualScreenName={display_name}",
+                "-connected=on",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=10.0
+            )
+            combined = (stdout.decode() + stderr.decode()).strip()
+
+            if proc.returncode == 0 and "failed" not in combined.lower():
+                logger.info("[v283.1] Ghost display connected to GPU framebuffer")
+                return True
+
+            logger.warning(
+                "[v283.1] Ghost display connect returned: %s (rc=%s)",
+                combined or "(empty)",
+                proc.returncode,
+            )
+            return False
+
+        except asyncio.TimeoutError:
+            logger.warning("[v283.1] Ghost display connect timed out")
+            return False
+        except Exception as e:
+            logger.warning("[v283.1] Ghost display connect error: %s", e)
+            return False
 
     async def _wait_for_display_registration_async(
         self,
