@@ -2783,6 +2783,16 @@ class UnifiedAgentRuntime:
             from core.distributed_lock_manager import get_lock_manager
 
             runner = EmailTriageRunner.get_instance()
+
+            # v283.0: Pre-warm one-time dependencies (workspace agent creation,
+            # OAuth, state store, cold-start recovery) OUTSIDE the per-cycle
+            # timeout.  These cold-start costs are 5-15s under event loop
+            # contention — consuming half the 30s budget and causing first-cycle
+            # timeouts.  warm_up() is idempotent; subsequent calls are no-ops.
+            if not runner.is_warmed_up:
+                warmup_budget = _env_float("EMAIL_TRIAGE_WARMUP_TIMEOUT_S", 45.0)
+                await asyncio.wait_for(runner.warm_up(), timeout=warmup_budget)
+
             timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
             lock_ttl = timeout + 10.0
 

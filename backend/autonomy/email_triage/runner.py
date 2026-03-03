@@ -83,6 +83,8 @@ class EmailTriageRunner:
         self._outcome_collector: Optional[OutcomeCollector] = None
         self._weight_adapter: Optional[WeightAdapter] = None
         self._prior_triaged: Dict[str, TriagedEmail] = {}
+        # v283.0: Warm-up tracking
+        self._warmed_up = False
         if self._config.outcome_collection_enabled:
             self._outcome_collector = OutcomeCollector(self._config, state_store)
         if self._config.adaptive_scoring_enabled:
@@ -98,6 +100,30 @@ class EmailTriageRunner:
     def get_instance_safe(cls) -> Optional[EmailTriageRunner]:
         """Return the singleton if it exists, else None. Never creates."""
         return cls._instance
+
+    @property
+    def is_warmed_up(self) -> bool:
+        """True after warm_up() has completed at least once."""
+        return self._warmed_up
+
+    async def warm_up(self) -> None:
+        """Pre-warm one-time dependencies outside the per-cycle timeout.
+
+        v283.0: Cold-start init (dependency resolution, state store, recovery)
+        is a one-time cost that should NOT eat into the recurring 30s per-cycle
+        budget.  Callers should ``await runner.warm_up()`` once before the first
+        ``run_cycle()`` invocation.
+
+        Idempotent — subsequent calls are no-ops.
+        """
+        if self._warmed_up:
+            return
+        self._warmed_up = True
+
+        await self._resolver.resolve_all()
+        await self._ensure_state_store()
+        await self._cold_start_recovery()
+        logger.info("[EmailTriageRunner] Warm-up complete")
 
     def set_fencing_token(self, token: int) -> None:
         """Set the current fencing token from the DLM (WS2)."""

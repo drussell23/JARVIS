@@ -58,6 +58,7 @@ from datetime import datetime
 from enum import Enum, auto
 from typing import (
     Any,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -379,6 +380,7 @@ class GhostHandsOrchestrator:
         # State
         self._is_running = False
         self._shutdown_event = asyncio.Event()
+        self._optional_init_tasks: Dict[str, asyncio.Task] = {}
 
         # Statistics
         self._stats = {
@@ -412,20 +414,33 @@ class GhostHandsOrchestrator:
         if self.config.actuator_enabled:
             await self._init_actuator()
 
-        if self.config.narration_enabled:
-            await self._init_narration()
-
-        if self.config.yabai_enabled:
-            await self._init_yabai()
-
         self._is_running = True
         self._stats["start_time"] = datetime.now()
 
-        # Narrate startup
-        if self._narration:
-            await self._narration.narrate_greeting()
+        optional_components: List[str] = []
+        if self.config.narration_enabled:
+            optional_components.append("narration")
+            self._ensure_optional_init_task(
+                "narration",
+                self._initialize_narration_startup,
+                timeout=float(os.getenv("JARVIS_GHOST_NARRATION_INIT_TIMEOUT", "20.0")),
+            )
 
-        logger.info("[GHOST-HANDS] System started")
+        if self.config.yabai_enabled:
+            optional_components.append("yabai")
+            self._ensure_optional_init_task(
+                "yabai",
+                self._init_yabai,
+                timeout=float(os.getenv("JARVIS_GHOST_YABAI_INIT_TIMEOUT", "15.0")),
+            )
+
+        if optional_components:
+            logger.info(
+                "[GHOST-HANDS] System started (%s continuing in background)",
+                ", ".join(optional_components),
+            )
+        else:
+            logger.info("[GHOST-HANDS] System started")
         return True
 
     async def stop(self) -> None:
@@ -433,6 +448,18 @@ class GhostHandsOrchestrator:
         logger.info("[GHOST-HANDS] Stopping Ghost Hands system...")
 
         self._shutdown_event.set()
+
+        for name, task in list(self._optional_init_tasks.items()):
+            if task.done():
+                continue
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, timeout=1.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            except Exception as e:
+                logger.debug(f"[GHOST-HANDS] Optional init '{name}' stop warning: {e}")
+        self._optional_init_tasks.clear()
 
         # Cancel all tasks
         for task in self._tasks.values():
@@ -450,6 +477,59 @@ class GhostHandsOrchestrator:
 
         self._is_running = False
         logger.info("[GHOST-HANDS] System stopped")
+
+    def _ensure_optional_init_task(
+        self,
+        name: str,
+        initializer: Callable[[], Awaitable[Any]],
+        *,
+        timeout: float,
+    ) -> asyncio.Task:
+        """Start or reuse an optional component initializer in the background."""
+        task = self._optional_init_tasks.get(name)
+        if task is not None and not task.done():
+            return task
+
+        async def _runner() -> None:
+            try:
+                await asyncio.wait_for(initializer(), timeout=timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[GHOST-HANDS] Optional component '%s' init timed out after %.1fs",
+                    name,
+                    timeout,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "[GHOST-HANDS] Optional component '%s' init failed: %s",
+                    name,
+                    e,
+                )
+
+        task = asyncio.create_task(
+            _runner(),
+            name=f"ghost-hands-{name}-init",
+        )
+        self._optional_init_tasks[name] = task
+        task.add_done_callback(
+            lambda finished, component=name: (
+                self._optional_init_tasks.pop(component, None)
+                if self._optional_init_tasks.get(component) is finished
+                else None
+            )
+        )
+        return task
+
+    async def _initialize_narration_startup(self) -> None:
+        """Initialize narration and queue the startup greeting off the critical path."""
+        await self._init_narration()
+        if self._narration:
+            try:
+                await self._narration.narrate_greeting()
+            except Exception as e:
+                logger.debug(f"[GHOST-HANDS] Narration greeting skipped: {e}")
 
     # =========================================================================
     # Component Initialization
