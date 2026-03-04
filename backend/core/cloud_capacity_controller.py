@@ -22,10 +22,11 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration (all env-var-driven, no hardcoding) ---
 _SPOT_CREATE_COOLDOWN_S = float(os.getenv("JARVIS_SPOT_CREATE_COOLDOWN_S", "120"))
-_SPOT_DESTROY_COOLDOWN_S = float(os.getenv("JARVIS_SPOT_DESTROY_COOLDOWN_S", "300"))
 _CRITICAL_SUSTAIN_S = float(os.getenv("JARVIS_CRITICAL_SUSTAIN_THRESHOLD_S", "30"))
-_QUEUE_DEPTH_HIGH = int(os.getenv("JARVIS_QUEUE_DEPTH_HIGH", "10"))
 _QUEUE_DEPTH_OFFLOAD = int(os.getenv("JARVIS_QUEUE_DEPTH_OFFLOAD", "8"))
+
+# Module-level singleton for cross-module access
+_instance: Optional["CloudCapacityController"] = None
 
 
 class CloudCapacityController:
@@ -42,12 +43,12 @@ class CloudCapacityController:
     """
 
     def __init__(self, broker: Any) -> None:
+        global _instance
         self._broker = broker
         self._current_tier: PressureTier = PressureTier.OPTIMAL
 
         # Cooldown tracking (monotonic timestamps; -inf means "never")
         self._last_spot_create: float = float("-inf")
-        self._last_spot_destroy: float = float("-inf")
 
         # Sustained-critical tracking
         self._first_critical_at: Optional[float] = None
@@ -61,6 +62,7 @@ class CloudCapacityController:
 
         # Register with broker
         broker.register_pressure_observer(self._on_pressure_change)
+        _instance = self
         logger.info("[CloudCapacity] Registered with MCP broker")
 
     async def _on_pressure_change(
@@ -158,10 +160,6 @@ class CloudCapacityController:
         """Record that a Spot VM was just created (starts cooldown)."""
         self._last_spot_create = time.monotonic()
 
-    def record_spot_destroyed(self) -> None:
-        """Record that a Spot VM was just destroyed (starts cooldown)."""
-        self._last_spot_destroy = time.monotonic()
-
     def mark_spot_unavailable(self) -> None:
         """Mark Spot VMs as unavailable (preempted/quota exhausted)."""
         self._spot_available = False
@@ -185,3 +183,8 @@ class CloudCapacityController:
                 else 0.0
             ),
         }
+
+
+def get_cloud_capacity_controller() -> Optional[CloudCapacityController]:
+    """Return the singleton CloudCapacityController, or None if not yet initialized."""
+    return _instance
