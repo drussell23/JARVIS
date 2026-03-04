@@ -2407,6 +2407,22 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             logger.error(f"Dynamic loading failed, falling back to legacy mode: {e}")
             DYNAMIC_LOADING_ENABLED = False
 
+    # Memory Control Plane: Initialize broker before component loading
+    try:
+        from core.memory_quantizer import get_memory_quantizer
+        from core.memory_budget_broker import init_memory_budget_broker
+        from core.memory_types import StartupPhase
+
+        _mq = await get_memory_quantizer()
+        if _mq:
+            import time as _time_mcp
+            _epoch = int(_time_mcp.time())  # Supervisor epoch = boot timestamp
+            _broker = await init_memory_budget_broker(_mq, epoch=_epoch)
+            _broker.set_phase(StartupPhase.BOOT_OPTIONAL)
+            logger.info(f"[MCP] MemoryBudgetBroker initialized (epoch={_epoch})")
+    except Exception as e:
+        logger.debug(f"[MCP] Broker init skipped: {e}")
+
     if not DYNAMIC_LOADING_ENABLED:
         # Legacy mode - load all components at startup
         if OPTIMIZE_STARTUP and PARALLEL_IMPORTS:
@@ -2457,6 +2473,18 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
         except Exception as e:
             logger.error(f"❌ Component warmup error: {e}", exc_info=True)
             logger.warning("⚠️ Falling back to lazy initialization")
+
+    # Memory Control Plane: Transition to runtime phase
+    try:
+        from core.memory_budget_broker import get_memory_budget_broker
+        from core.memory_types import StartupPhase
+
+        _broker = get_memory_budget_broker()
+        if _broker:
+            _broker.set_phase(StartupPhase.RUNTIME_INTERACTIVE)
+            logger.info("[MCP] Phase transition: RUNTIME_INTERACTIVE")
+    except Exception as e:
+        logger.debug(f"[MCP] Phase transition skipped: {e}")
 
     # Initialize memory manager (NON-BLOCKING - spawns monitoring as background task)
     memory_class = components.get("memory", {}).get("manager_class")
@@ -6592,10 +6620,21 @@ async def system_status():
         logger.warning("[SystemStatus] Workspace agent health read failed: %s", exc)
         agents["google_workspace"] = {"initialized": False, "error": str(exc)}
 
+    # Memory Control Plane status
+    mcp_status = None
+    try:
+        from core.memory_budget_broker import get_memory_budget_broker
+        _broker = get_memory_budget_broker()
+        if _broker:
+            mcp_status = _broker.get_status()
+    except Exception:
+        pass
+
     return {
         "system": system,
         "components": components,
         "agents": agents,
+        "memory_control_plane": mcp_status,
         "ts": _time.time(),
     }
 
@@ -9362,10 +9401,10 @@ async def ensure_uae_loaded(app_state):
     # MEMORY QUANTIZER INTEGRATION - Intelligent Load Prevention
     # ============================================================
     try:
-        from core.memory_quantizer import MemoryQuantizer, MemoryTier
+        from core.memory_quantizer import MemoryQuantizer, MemoryTier, get_memory_quantizer_instance
 
-        # Get memory quantizer instance
-        quantizer = MemoryQuantizer()
+        # Use singleton if available, else create fresh instance
+        quantizer = get_memory_quantizer_instance() or MemoryQuantizer()
         metrics = quantizer.get_current_metrics()  # Synchronous call
 
         # Log current memory state
