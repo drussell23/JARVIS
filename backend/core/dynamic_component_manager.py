@@ -26,7 +26,7 @@ import platform
 import psutil
 import random
 import time
-from typing import Dict, List, Optional, Any, Callable, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Set, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 from collections import defaultdict, deque, Counter
@@ -35,6 +35,10 @@ import importlib
 import sys
 
 from .runtime_module_resolver import get_main_module
+from backend.core.memory_types import PressureTier
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 # Phase 5A: Bounded queue backpressure
 try:
@@ -924,26 +928,71 @@ class MemoryPressureMonitor:
         self.callbacks: List[Callable] = []
         self.monitoring = False
 
+        # MCP broker integration
+        self._mcp_active: bool = False
+        self._broker: Optional["MemoryBudgetBroker"] = None
+
+    # ------------------------------------------------------------------
+    # MCP broker integration
+    # ------------------------------------------------------------------
+
+    # Map PressureTier -> MemoryPressure for decision-making
+    _TIER_TO_PRESSURE = {
+        PressureTier.ABUNDANT: MemoryPressure.LOW,
+        PressureTier.OPTIMAL: MemoryPressure.LOW,
+        PressureTier.ELEVATED: MemoryPressure.MEDIUM,
+        PressureTier.CONSTRAINED: MemoryPressure.HIGH,
+        PressureTier.CRITICAL: MemoryPressure.CRITICAL,
+        PressureTier.EMERGENCY: MemoryPressure.EMERGENCY,
+    }
+
+    def register_with_broker(self, broker: "MemoryBudgetBroker") -> None:
+        """Register with the MCP MemoryBudgetBroker.
+
+        Once registered, psutil call sites that read memory state for
+        decision-making or enrichment will prefer ``broker.latest_snapshot``
+        over raw psutil, falling back to psutil when no snapshot is available.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "MemoryPressureMonitor registered with MCP broker (epoch=%d)",
+            broker.current_epoch,
+        )
+
     def current_pressure(self) -> MemoryPressure:
         """
         Get current memory pressure level.
-        
+
+        When MCP broker is active and has a snapshot, maps the broker's
+        ``PressureTier`` to the local ``MemoryPressure`` enum.  Falls back
+        to raw psutil when the broker is inactive or has no snapshot.
+
         IMPORTANT: macOS memory management is different from Linux!
         macOS will typically show 70-90% memory usage under normal conditions
         because it caches aggressively. We need to look at AVAILABLE memory,
         not just percentage used.
-        
+
         Thresholds based on available memory (not percent used):
         - LOW: >4GB available
-        - MEDIUM: 2-4GB available  
+        - MEDIUM: 2-4GB available
         - HIGH: 1-2GB available
         - CRITICAL: 500MB-1GB available
         - EMERGENCY: <500MB available
         """
+        # MCP broker path — use cached PressureTier when available
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                return self._TIER_TO_PRESSURE.get(
+                    snap.pressure_tier, MemoryPressure.MEDIUM
+                )
+
+        # Legacy psutil fallback
         try:
             memory = psutil.virtual_memory()
             available_gb = memory.available / (1024 ** 3)
-            
+
             # Use available memory (more accurate for macOS)
             if available_gb > 4.0:
                 return MemoryPressure.LOW
@@ -960,7 +1009,17 @@ class MemoryPressureMonitor:
             return MemoryPressure.MEDIUM
 
     def memory_available_mb(self) -> int:
-        """Get available memory in MB"""
+        """Get available memory in MB.
+
+        Uses broker snapshot when MCP is active, falls back to psutil.
+        """
+        # MCP broker path
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                return int(snap.physical_free // (1024 * 1024))
+
+        # Legacy psutil fallback
         try:
             return psutil.virtual_memory().available // (1024 * 1024)
         except Exception:
@@ -1950,12 +2009,29 @@ class DynamicComponentManager:
         
         if should_log:
             # v137.2: Add context about available memory
+            # Prefer MCP broker snapshot when active for consistency
             try:
-                import psutil
-                mem = psutil.virtual_memory()
-                available_gb = mem.available / (1024 ** 3)
-                used_percent = mem.percent
-                context = f" (available: {available_gb:.1f}GB, used: {used_percent:.0f}%)"
+                monitor = self.memory_monitor
+                if monitor._mcp_active and monitor._broker is not None:
+                    snap = monitor._broker.latest_snapshot
+                    if snap is not None:
+                        available_gb = snap.physical_free / (1024 ** 3)
+                        used_percent = (
+                            (snap.physical_total - snap.physical_free)
+                            / snap.physical_total * 100.0
+                        ) if snap.physical_total > 0 else 0.0
+                        context = f" (available: {available_gb:.1f}GB, used: {used_percent:.0f}%)"
+                    else:
+                        # Broker active but no snapshot yet — fall back
+                        mem = psutil.virtual_memory()
+                        available_gb = mem.available / (1024 ** 3)
+                        used_percent = mem.percent
+                        context = f" (available: {available_gb:.1f}GB, used: {used_percent:.0f}%)"
+                else:
+                    mem = psutil.virtual_memory()
+                    available_gb = mem.available / (1024 ** 3)
+                    used_percent = mem.percent
+                    context = f" (available: {available_gb:.1f}GB, used: {used_percent:.0f}%)"
             except Exception:
                 context = ""
             
