@@ -3,6 +3,7 @@ JARVIS Workflow Parser - Multi-Command Decomposition Engine
 Parses complex natural language commands into executable workflow steps
 """
 
+import os
 import re
 from typing import List, Dict, Any, Tuple, Optional
 from dataclasses import dataclass, field
@@ -115,10 +116,12 @@ class WorkflowParser:
     ]
     
     # App name mappings
+    # v283.3: Default browser is config-driven (was hardcoded "Safari")
+    _DEFAULT_BROWSER = os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
     APP_MAPPINGS = {
-        "browser": "Safari",
-        "web browser": "Safari", 
-        "internet": "Safari",
+        "browser": _DEFAULT_BROWSER,
+        "web browser": _DEFAULT_BROWSER,
+        "internet": _DEFAULT_BROWSER,
         "mail": "Mail",
         "email": "Mail",
         "calendar": "Calendar",

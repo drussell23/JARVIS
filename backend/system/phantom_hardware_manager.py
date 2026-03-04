@@ -295,20 +295,13 @@ class PhantomHardwareManager:
             return True, None
 
         # =================================================================
-        # STEP 1: Discover BetterDisplay CLI
-        # =================================================================
-        cli_path = await self._discover_cli_path_async()
-
-        if not cli_path:
-            error_msg = (
-                "BetterDisplay CLI not found. Please install BetterDisplay from "
-                "https://betterdisplay.pro/ or use a physical HDMI dummy plug."
-            )
-            logger.info(f"[v68.0] {error_msg}")
-            return False, error_msg
-
-        # =================================================================
-        # STEP 2: Verify BetterDisplay.app is Running
+        # STEP 1: Ensure BetterDisplay.app is Running
+        # v283.2: Moved BEFORE CLI discovery. The CLI communicates with the
+        # running app via Apple notifications — ``betterdisplaycli help``
+        # returns "Failed. Request timed out." when the host app isn't
+        # running, causing _verify_cli_works_async() to reject the path
+        # and _discover_cli_path_async() to return None. Previously STEP 2,
+        # but STEP 1 (CLI discovery) could never succeed without the app.
         # =================================================================
         app_running = await self._check_app_running_async()
 
@@ -320,11 +313,26 @@ class PhantomHardwareManager:
                     "BetterDisplay.app is not running and could not be launched. "
                     "Please start BetterDisplay manually."
                 )
-                logger.warning(f"[v68.0] {error_msg}")
+                logger.warning(f"[v283.2] {error_msg}")
                 return False, error_msg
 
-            # Wait for app to initialize
-            await asyncio.sleep(2.0)
+            # Wait for app to initialize before CLI verification
+            await asyncio.sleep(3.0)
+
+        # =================================================================
+        # STEP 2: Discover BetterDisplay CLI
+        # v283.2: Now runs after app is confirmed running, so CLI
+        # verification (``betterdisplaycli help``) will succeed.
+        # =================================================================
+        cli_path = await self._discover_cli_path_async()
+
+        if not cli_path:
+            error_msg = (
+                "BetterDisplay CLI not found. Please install BetterDisplay from "
+                "https://betterdisplay.pro/ or use a physical HDMI dummy plug."
+            )
+            logger.info(f"[v68.0] {error_msg}")
+            return False, error_msg
 
         # =================================================================
         # STEP 3: Check if Ghost Display Already Exists (via CLI)

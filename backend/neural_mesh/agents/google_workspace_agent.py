@@ -866,6 +866,15 @@ class GoogleWorkspaceConfig:
             "JARVIS_GOOGLE_INTERACTIVE_AUTH", "false"
         ).lower() in {"1", "true", "yes"}
     )
+    # v283.3: Browser preference for Computer Use visual fallback.
+    # Previously hardcoded to "Safari" in 5 places.  Now config-driven.
+    # Precedence: JARVIS_WORKSPACE_BROWSER → JARVIS_DEFAULT_BROWSER → "Google Chrome"
+    preferred_browser: str = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_WORKSPACE_BROWSER",
+            os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome"),
+        )
+    )
 
 
 # =============================================================================
@@ -936,8 +945,9 @@ class UnifiedWorkspaceExecutor:
     - v6.2 Grand Unification: Spatial Awareness integration
     """
 
-    def __init__(self) -> None:
+    def __init__(self, config: Optional[GoogleWorkspaceConfig] = None) -> None:
         """Initialize the unified executor with all available tiers."""
+        self._config = config or GoogleWorkspaceConfig()
         self._available_tiers: List[ExecutionTier] = []
         self._tier_stats: Dict[ExecutionTier, Dict[str, int]] = {}
         self._calendar_bridge: Optional[CalendarBridge] = None
@@ -1297,9 +1307,12 @@ class UnifiedWorkspaceExecutor:
             _cu_timeout = min(_visual_budget - 1.0, _VISUAL_HARD_CAP_S) if _visual_budget else _VISUAL_HARD_CAP_S
             try:
                 async def _visual_email_check():
-                    # v6.2 Grand Unification: Switch to Safari first via Yabai
-                    await self._switch_to_app_with_spatial_awareness("Safari", narrate=True)
-                    # Now run Computer Use - Safari should already be focused
+                    # v6.2 Grand Unification: Switch to browser via Yabai
+                    # v283.3: Config-driven browser (was hardcoded "Safari")
+                    await self._switch_to_app_with_spatial_awareness(
+                        self._config.preferred_browser, narrate=True,
+                    )
+                    # Now run Computer Use - browser should already be focused
                     goal = f"Navigate to mail.google.com and read the {limit} most recent unread emails. List the sender and subject of each."
                     return await self._computer_use.run(goal=goal)
 
@@ -1381,8 +1394,11 @@ class UnifiedWorkspaceExecutor:
         # v6.2: First switch to browser using Spatial Awareness
         if await self._ensure_visual_tooling():
             try:
-                # v6.2 Grand Unification: Switch to Safari first via Yabai
-                await self._switch_to_app_with_spatial_awareness("Safari", narrate=True)
+                # v6.2 Grand Unification: Switch to browser via Yabai
+                # v283.3: Config-driven browser (was hardcoded "Safari")
+                await self._switch_to_app_with_spatial_awareness(
+                    self._config.preferred_browser, narrate=True,
+                )
 
                 goal = (
                     f"Navigate to docs.google.com, create a new blank document, "
@@ -3515,7 +3531,7 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
         self._client = GoogleWorkspaceClient(self.config)
 
         # Initialize Unified Executor for waterfall fallbacks
-        self._unified_executor = UnifiedWorkspaceExecutor()
+        self._unified_executor = UnifiedWorkspaceExecutor(config=self.config)
         await self._unified_executor.initialize()
         logger.info(
             f"Unified Executor ready: {self._unified_executor.get_stats()['available_tiers']}"
@@ -3529,7 +3545,21 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
                 self._handle_workspace_message,
             )
 
-        # Proactive token health check (file-parse only, no network)
+        # Proactive token health check AND eager credential loading.
+        # v283.3: The previous code only did file-parse health check (no network)
+        # but NEVER loaded credentials into _creds.  This meant
+        # can_attempt_google_api always returned False at startup, causing
+        # email triage to skip the Google API tier entirely and fall through
+        # to Computer Use (which then launched Safari).
+        #
+        # Root cause: lazy auth was architecturally intentional for interactive
+        # flows, but autonomous flows (email triage) run before any interactive
+        # API call ever triggers credential loading.
+        #
+        # Fix: When token health is VALID or NEEDS_REFRESH, eagerly load
+        # credentials from disk + attempt non-interactive authenticate().
+        # This populates _creds so the Google API tier is available when
+        # email triage runs.
         if self._client and GOOGLE_API_AVAILABLE:
             health = self._client._check_token_health()
             self._client._token_health = health
@@ -3562,6 +3592,43 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
                 )
             else:
                 logger.info("[GoogleWorkspaceAgent] Token health: %s", health.value)
+
+                # v283.3: Eager credential loading for autonomous flows.
+                # Token file exists and is parseable — load credentials so
+                # can_attempt_google_api returns True immediately.
+                _eager_timeout = float(os.getenv(
+                    "JARVIS_GOOGLE_EAGER_AUTH_TIMEOUT", "10.0"
+                ))
+                try:
+                    auth_ok = await asyncio.wait_for(
+                        self._client.authenticate(interactive=False),
+                        timeout=_eager_timeout,
+                    )
+                    if auth_ok:
+                        logger.info(
+                            "[GoogleWorkspaceAgent] v283.3: Eager auth succeeded — "
+                            "Google API tier available (auth_state=%s)",
+                            self._client.auth_state.value,
+                        )
+                    else:
+                        logger.warning(
+                            "[GoogleWorkspaceAgent] v283.3: Eager auth returned False "
+                            "(auth_state=%s) — Google API tier unavailable at startup, "
+                            "will retry on first API call",
+                            self._client.auth_state.value,
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[GoogleWorkspaceAgent] v283.3: Eager auth timed out after %.1fs "
+                        "— will retry lazily on first API call",
+                        _eager_timeout,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[GoogleWorkspaceAgent] v283.3: Eager auth failed (%s: %s) "
+                        "— will retry lazily on first API call",
+                        type(e).__name__, e,
+                    )
 
         logger.info("GoogleWorkspaceAgent initialized with Never-Fail fallbacks")
 
@@ -4460,8 +4527,9 @@ EMAIL BODY:"""
         try:
             # Step 1: Switch to Gmail using spatial awareness
             logger.info("[GoogleWorkspaceAgent] 🎯 Switching to Gmail via spatial awareness...")
+            # v283.3: Config-driven browser (was hardcoded "Safari")
             spatial_success = await self._unified_executor._switch_to_app_with_spatial_awareness(
-                app_name="Safari",  # Assuming Gmail in browser
+                app_name=self.config.preferred_browser,
                 narrate=True,
             )
 
@@ -5174,7 +5242,10 @@ EMAIL BODY:"""
         # Fallback to Computer Use (Tier 3)
         if self._unified_executor and await self._unified_executor._ensure_visual_tooling():
             try:
-                await self._unified_executor._switch_to_app_with_spatial_awareness("Safari", narrate=True)
+                # v283.3: Config-driven browser (was hardcoded "Safari")
+                await self._unified_executor._switch_to_app_with_spatial_awareness(
+                    self.config.preferred_browser, narrate=True,
+                )
 
                 goal = (
                     f"Navigate to Google Sheets (docs.google.com/spreadsheets/d/{spreadsheet_id}), "
@@ -5301,7 +5372,10 @@ EMAIL BODY:"""
         # Fallback to Computer Use
         if self._unified_executor and await self._unified_executor._ensure_visual_tooling():
             try:
-                await self._unified_executor._switch_to_app_with_spatial_awareness("Safari", narrate=True)
+                # v283.3: Config-driven browser (was hardcoded "Safari")
+                await self._unified_executor._switch_to_app_with_spatial_awareness(
+                    self.config.preferred_browser, narrate=True,
+                )
 
                 # Flatten values for Computer Use instruction
                 values_str = str(values[:5])  # Limit for prompt size

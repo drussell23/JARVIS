@@ -1379,7 +1379,10 @@ async def get_database_adapter() -> CloudDatabaseAdapter:
     if _adapter is not None:
         return _adapter
 
-    # ── v265.1: Gate-aware fast path ──────────────────────────────────
+    # ── v265.1→v283.3: Gate-aware fast path ──────────────────────────
+    # v283.3: Treat ANY non-READY state as "Cloud SQL not available".
+    # Previously only UNAVAILABLE/DEGRADED_SQLITE triggered SQLite fallback.
+    # UNKNOWN (Phase 4, before proxy init) and CHECKING caused 30-58s hangs.
     _force_sqlite = False
     try:
         try:
@@ -1395,15 +1398,21 @@ async def get_database_adapter() -> CloudDatabaseAdapter:
 
         _gate = _get_gate()
         _gs = _gate.state
-        if _gs in (_RS.UNAVAILABLE, _RS.DEGRADED_SQLITE):
+        if _gs != _RS.READY:
             logger.info(
-                "[DatabaseAdapter v265.1] ReadinessGate=%s — skipping Cloud SQL, "
-                "instant SQLite fallback for all consumers",
+                "[DatabaseAdapter v283.3] ReadinessGate=%s (not READY) — "
+                "skipping Cloud SQL, instant SQLite fallback",
                 _gs.value,
             )
             _force_sqlite = True
     except Exception:
-        pass  # Gate not available — proceed with normal init
+        # Gate not importable or not initialized — Cloud SQL status unknown.
+        # SQLite fallback is always safe.
+        logger.debug(
+            "[DatabaseAdapter v283.3] ReadinessGate unavailable — "
+            "instant SQLite fallback"
+        )
+        _force_sqlite = True
 
     # ── Initialise adapter (with timeout safety net) ──────────────────
     _init_timeout = float(os.getenv("JARVIS_DB_ADAPTER_INIT_TIMEOUT", "15.0"))

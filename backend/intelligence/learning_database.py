@@ -9271,7 +9271,19 @@ async def get_learning_database(
     """
     global _db_instance
 
-    # ── v265.1: Gate-aware fast_mode promotion ────────────────────────
+    # ── v265.1→v283.3: Gate-aware fast_mode promotion ─────────────────
+    # v283.3: Added UNKNOWN and CHECKING to the promotion set.
+    #
+    # Root cause: Memory agent boots in Phase 4 (Intelligence) but Cloud SQL
+    # proxy doesn't initialize until Phase 6 (Enterprise Services).  At Phase 4
+    # the gate state is still UNKNOWN — the v265.1 check only caught UNAVAILABLE
+    # and DEGRADED_SQLITE, so the code attempted standard Cloud SQL init, hung
+    # waiting for a proxy that doesn't exist yet, and timed out every time.
+    #
+    # Fix: If Cloud SQL readiness is anything other than READY, use SQLite-first.
+    # The background upgrade task in fast_mode will retry Cloud SQL later when
+    # the proxy becomes available.  This eliminates the lifecycle ordering
+    # violation without reordering startup phases.
     if not fast_mode:
         try:
             try:
@@ -9286,15 +9298,21 @@ async def get_learning_database(
                 )
 
             _gs = _get_gate().state
-            if _gs in (_RS.UNAVAILABLE, _RS.DEGRADED_SQLITE):
+            if _gs != _RS.READY:
                 logger.info(
-                    "[LearningDB v265.1] ReadinessGate=%s — promoting to fast_mode "
-                    "(SQLite-first, no Cloud SQL blocking)",
+                    "[LearningDB v283.3] ReadinessGate=%s (not READY) — promoting "
+                    "to fast_mode (SQLite-first, Cloud SQL deferred to background)",
                     _gs.value,
                 )
                 fast_mode = True
         except Exception:
-            pass  # Gate not available — use caller's fast_mode preference
+            # Gate not importable or not initialized — assume Cloud SQL
+            # is not ready.  SQLite-first is always safe.
+            logger.debug(
+                "[LearningDB v283.3] ReadinessGate unavailable — "
+                "promoting to fast_mode (SQLite-first)"
+            )
+            fast_mode = True
 
     # ── v265.1: Configurable init timeout safety net ──────────────────
     _init_timeout = float(os.environ.get("JARVIS_LEARNING_DB_INIT_TIMEOUT", "15.0"))

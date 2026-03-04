@@ -313,7 +313,8 @@ class NavigationExecutor(BaseActionExecutor):
         return f"https://{stripped}"
 
     async def _open_url(self, url: str, context: ExecutionContext) -> Dict[str, Any]:
-        browser = context.get_variable("preferred_browser", os.getenv("JARVIS_DEFAULT_BROWSER", "Safari"))
+        # v283.3: Default to Chrome (was Safari). JARVIS uses Chrome for its UI.
+        browser = context.get_variable("preferred_browser", os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome"))
 
         try:
             subprocess.run(["open", "-a", browser, url], check=True)

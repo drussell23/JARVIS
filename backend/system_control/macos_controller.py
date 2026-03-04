@@ -1055,7 +1055,8 @@ class MacOSController:
                 return False, message
 
         if not browser:
-            browser = "Safari"  # Default browser
+            # v283.3: Config-driven default (was hardcoded "Safari")
+            browser = os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
         browser = self.app_aliases.get(browser.lower(), browser)
 
         script = f"""
@@ -1091,7 +1092,8 @@ class MacOSController:
     ) -> Tuple[bool, str]:
         """Type text in the active browser element (like search bar)"""
         if not browser:
-            browser = "Safari"
+            # v283.3: Config-driven default (was hardcoded "Safari")
+            browser = os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
         browser = self.app_aliases.get(browser.lower(), browser)
 
         # First ensure browser is active
@@ -1138,7 +1140,8 @@ class MacOSController:
                 return False, message
 
         if not browser:
-            browser = "Safari"
+            # v283.3: Config-driven default (was hardcoded "Safari")
+            browser = os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
         browser = self.app_aliases.get(browser.lower(), browser)
 
         # Use keyboard shortcut to focus address bar (Cmd+L works in most browsers)
@@ -1168,7 +1171,8 @@ class MacOSController:
                 return False, message
 
         if not browser:
-            browser = "Safari"
+            # v283.3: Config-driven default (was hardcoded "Safari")
+            browser = os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
         browser = self.app_aliases.get(browser.lower(), browser)
 
         # Use keyboard shortcut to focus address bar (Cmd+L works in most browsers)
