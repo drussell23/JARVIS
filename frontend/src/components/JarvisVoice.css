@@ -15,9 +15,20 @@
   --bg-pure-black: #000000;
   --bg-transparent: rgba(0, 0, 0, 0.4);
 
-  /* Text */
+  /* Text — WCAG AA compliant on black background */
   --text-white: #FFFFFF;
   --text-cyan: #00FFFF;
+  --text-primary: #E8E8E8;
+  /* 13.3:1 contrast ratio on #000 — exceeds AA */
+  --text-secondary: #A0A0A0;
+  /* 6.3:1 contrast ratio on #000 — meets AA */
+
+  /* Semantic color aliases for message labels */
+  --color-electric-cyan: #00FFFF;
+  --color-matrix-green: #00FF41;
+
+  /* Transcript adaptive height — computed by ResizeObserver, fallback to clamp */
+  --transcript-max-h: 45vh;
 
   /* Reactor States */
   --reactor-idle: radial-gradient(circle, #00FFFF 0%, #00D9FF 50%, #0EA5E9 100%);
@@ -39,13 +50,14 @@
   flex-direction: column;
   align-items: center;
   justify-content: flex-start;
-  gap: 2rem;
-  /* Consistent spacing between all sections */
+  gap: 1.5rem;
   height: 100vh;
+  height: 100dvh;
+  /* Dynamic viewport height — respects mobile keyboard / notch */
   width: 100%;
-  padding: 2rem;
-  padding-bottom: 140px;
-  /* Extra space for fixed input at bottom */
+  padding: 1.5rem 2rem;
+  padding-bottom: calc(100px + env(safe-area-inset-bottom, 0px));
+  /* Safe-area aware: reserves space for fixed input dock + notch */
   box-sizing: border-box;
   background: none;
   position: relative;
@@ -435,43 +447,123 @@
 }
 
 /* ==================== TRANSCRIPT DISPLAY ==================== */
-.jarvis-transcript {
+/* Container uses ResizeObserver-set --transcript-max-h CSS var for adaptive height.
+   Fallback: clamp(180px, 32vh, 45vh) if JS hasn't computed yet. */
+.jarvis-transcript-wrapper {
+  position: relative;
   width: 100%;
   max-width: 1000px;
-  min-height: 120px;
-  max-height: 60vh;
-  /* Viewport-relative: adapts to screen size, shows much more content */
-  margin: 0;
-  padding: 1.5rem 2rem;
-  box-sizing: border-box;
-  z-index: 10;
   flex-shrink: 1;
-  /* Allow transcript to shrink if needed but prefer growing */
   flex-grow: 1;
-  /* Take available vertical space */
+  z-index: 10;
+}
+
+.jarvis-transcript {
+  width: 100%;
+  min-height: 140px;
+  height: clamp(180px, 32vh, var(--transcript-max-h, 45vh));
+  max-height: var(--transcript-max-h, 45vh);
+  padding: 1.25rem 1.75rem;
+  box-sizing: border-box;
   overflow-y: auto;
-  /* Scrollable when content exceeds max-height */
+  overflow-x: hidden;
+  overscroll-behavior-y: contain;
+  /* Prevent scroll chaining to parent */
   scroll-behavior: smooth;
-  background: rgba(0, 0, 0, 0.3);
-  /* Subtle background to delineate transcript area */
-  border: 1px solid rgba(0, 255, 255, 0.08);
+  background: rgba(0, 0, 0, 0.35);
+  border: 1px solid rgba(0, 255, 255, 0.1);
   border-radius: 12px;
   display: flex;
   flex-direction: column;
   justify-content: flex-start;
-  /* Content flows from top — no more clipping */
-  box-shadow: inset 0 0 30px rgba(0, 0, 0, 0.5);
+  gap: 0.75rem;
+  box-shadow:
+    inset 0 0 40px rgba(0, 0, 0, 0.6),
+    0 0 12px rgba(0, 255, 255, 0.03);
 }
 
+/* "Jump to latest" pill — shown when user scrolls up */
+.transcript-jump-pill {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  padding: 6px 18px;
+  border-radius: 20px;
+  background: rgba(0, 255, 65, 0.15);
+  border: 1px solid rgba(0, 255, 65, 0.4);
+  color: var(--color-matrix-green);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  cursor: pointer;
+  z-index: 20;
+  backdrop-filter: blur(8px);
+  transition: all 0.2s ease;
+  animation: jumpPillFadeIn 0.25s ease-out;
+}
+
+.transcript-jump-pill:hover {
+  background: rgba(0, 255, 65, 0.25);
+  box-shadow: 0 0 16px rgba(0, 255, 65, 0.3);
+}
+
+@keyframes jumpPillFadeIn {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Status row — sits ABOVE transcript, never overlaps */
+.transcript-status-row {
+  width: 100%;
+  max-width: 1000px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 24px;
+  z-index: 10;
+  flex-shrink: 0;
+}
+
+.transcript-status-text {
+  font-size: 0.8rem;
+  font-weight: 500;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-secondary, #A0A0A0);
+}
+
+.transcript-status-text.listening {
+  color: #FFD700;
+}
+
+.transcript-status-text.processing {
+  color: #A855F7;
+  animation: processingPulse 1.5s ease-in-out infinite;
+}
+
+.transcript-status-text.speaking {
+  color: var(--glow-cyan);
+}
+
+/* ==================== MESSAGE BLOCKS ==================== */
 .user-message,
 .jarvis-message {
-  margin: 0 0 1.5rem 0;
-  /* Spacing between messages */
-  padding: 0.5rem 0;
+  margin: 0;
+  padding: 0.6rem 0;
   border-radius: 0;
   background: none;
-  border-left: none;
-  animation: messageFadeIn 0.5s ease-out;
+  border-left: 3px solid transparent;
+  padding-left: 12px;
+  animation: messageFadeIn 0.4s ease-out;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -480,13 +572,12 @@
 .user-message:last-child,
 .jarvis-message:last-child {
   margin-bottom: 0;
-  /* No margin on last message */
 }
 
 @keyframes messageFadeIn {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(6px);
   }
 
   to {
@@ -505,13 +596,13 @@
 
 .message-label {
   display: block;
-  font-size: 0.85rem;
+  font-size: 0.8rem;
   font-weight: 700;
   letter-spacing: 0.15em;
   text-transform: uppercase;
-  margin-bottom: 0.5rem;
-  /* Spacing between label and text */
-  opacity: 0.8;
+  margin-bottom: 0.35rem;
+  opacity: 0.85;
+  /* WCAG: label contrast handled by color value, not opacity */
 }
 
 .user-message .message-label {
@@ -523,18 +614,23 @@
 }
 
 .message-text {
-  color: var(--text-primary);
-  font-size: 1.1rem;
-  line-height: 1.7;
+  color: var(--text-primary, #E8E8E8);
+  font-size: 0.95rem;
+  /* Accessibility floor: ~15.2px at default zoom >= 14px */
+  line-height: 1.55;
+  /* Accessibility floor: >= 1.45 */
   width: 100%;
-  word-wrap: break-word;
-  overflow-wrap: break-word;
+  overflow-wrap: anywhere;
+  /* Stronger than break-word — breaks mid-URL/mid-hash */
+  word-break: break-word;
   white-space: pre-wrap;
-  /* Preserve line breaks from backend responses */
+  /* Preserves \n from backend (email lists, multi-line responses) */
+  font-family: 'SF Pro Text', -apple-system, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
 }
 
 .processing-indicator {
-  color: #A855F7;
+  color: #C084FC;
   font-style: italic;
   animation: processingPulse 1.5s ease-in-out infinite;
 }
@@ -569,15 +665,15 @@
   }
 }
 
-/* ==================== TEXT COMMAND INPUT ==================== */
+/* ==================== TEXT COMMAND INPUT (bottom-docked) ==================== */
 .text-command-container {
   width: 100%;
   max-width: 800px;
   position: fixed;
-  bottom: 2rem;
+  bottom: calc(12px + env(safe-area-inset-bottom, 0px));
   left: 50%;
   transform: translateX(-50%);
-  z-index: 10;
+  z-index: 100;
   padding: 0 20px;
 }
 
@@ -809,15 +905,21 @@ AudioQualityStatsDisplay {
   }
 
   .jarvis-transcript {
-    max-height: 50vh;
-    padding: 1rem 1.2rem;
+    --transcript-max-h: 40vh;
+    min-height: 120px;
+    padding: 1rem 1rem;
+  }
+
+  .message-text {
+    font-size: 0.9rem;
+    /* Still >= 14px at default mobile zoom */
   }
 }
 
 @media (max-width: 480px) {
   .jarvis-voice-container {
-    gap: 30px;
-    padding: 30px 15px;
+    gap: 20px;
+    padding: 20px 12px;
   }
 
   .jarvis-logo {
@@ -833,6 +935,33 @@ AudioQualityStatsDisplay {
   .arc-reactor .core {
     width: 70px;
     height: 70px;
+  }
+
+  .jarvis-transcript {
+    --transcript-max-h: 35vh;
+    padding: 0.75rem 0.75rem;
+  }
+}
+
+/* Small-height stress (1280x600, laptop lid mode, 125% zoom) */
+@media (max-height: 650px) {
+  .jarvis-voice-container {
+    gap: 0.75rem;
+    padding-top: 0.5rem;
+  }
+
+  .jarvis-transcript {
+    --transcript-max-h: 30vh;
+    min-height: 100px;
+  }
+
+  .arc-reactor {
+    width: 160px;
+    height: 160px;
+  }
+
+  .jarvis-logo {
+    font-size: 2rem;
   }
 }
 

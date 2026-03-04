@@ -777,7 +777,10 @@ const JarvisVoice = () => {
 
   const typingTimeoutRef = useRef(null);
 
-  const transcriptRef = useRef(null); // Auto-scroll transcript container
+  const transcriptRef = useRef(null); // Transcript scroll container
+  const transcriptWrapperRef = useRef(null); // Wrapper for ResizeObserver
+  const [userScrolledUp, setUserScrolledUp] = useState(false); // Smart auto-scroll pause
+  const userScrolledUpRef = useRef(false); // Ref mirror for scroll handler (avoids stale closure)
   const wsRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
@@ -1159,11 +1162,65 @@ const JarvisVoice = () => {
     console.log('🎨 [Favicon] Dynamic favicon system initialized');
   }, []);
 
-  // Auto-scroll transcript to bottom when content changes
+  // ── ResizeObserver: compute available vertical space for transcript ──
+  // Sets CSS variable --transcript-max-h on the wrapper element so the
+  // transcript height adapts dynamically to the viewport without hardcoded px.
   useEffect(() => {
-    if (transcriptRef.current) {
+    const container = document.querySelector('.jarvis-voice-container');
+    if (!container || typeof ResizeObserver === 'undefined') return;
+
+    const computeTranscriptHeight = () => {
+      const containerRect = container.getBoundingClientRect();
+      const containerH = containerRect.height;
+      // Reserve space for: header (~120px) + reactor (~300px) + status row (~30px) + input dock (~80px) + gaps
+      // Use ratio-based approach: transcript gets remaining after fixed elements
+      const headerEl = container.querySelector('.jarvis-header');
+      const reactorEl = container.querySelector('.arc-reactor-container') || container.querySelector('.arc-reactor');
+      const headerH = headerEl ? headerEl.getBoundingClientRect().height : 0;
+      const reactorH = reactorEl ? reactorEl.getBoundingClientRect().height : 0;
+      const fixedDockH = 80; // Input bar (fixed positioned, not in flow)
+      const gapAndPadding = 100; // Accumulated gaps + padding
+      const available = containerH - headerH - reactorH - fixedDockH - gapAndPadding;
+      const maxH = Math.max(160, Math.min(available, containerH * 0.55));
+      container.style.setProperty('--transcript-max-h', `${Math.round(maxH)}px`);
+    };
+
+    const ro = new ResizeObserver(computeTranscriptHeight);
+    ro.observe(container);
+    computeTranscriptHeight(); // Initial compute
+
+    return () => ro.disconnect();
+  }, []);
+
+  // ── Smart auto-scroll: follow latest unless user scrolled up ──
+  useEffect(() => {
+    const el = transcriptRef.current;
+    if (!el) return;
+
+    const handleScroll = () => {
+      // If user is within 60px of bottom, consider them "following"
+      const isNearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+      const wasScrolledUp = userScrolledUpRef.current;
+      if (isNearBottom && wasScrolledUp) {
+        userScrolledUpRef.current = false;
+        setUserScrolledUp(false);
+      } else if (!isNearBottom && !wasScrolledUp) {
+        userScrolledUpRef.current = true;
+        setUserScrolledUp(true);
+      }
+    };
+
+    el.addEventListener('scroll', handleScroll, { passive: true });
+    return () => el.removeEventListener('scroll', handleScroll);
+  }, [transcript, response]); // Re-attach when transcript mounts/unmounts
+
+  // ── Auto-scroll to bottom when new content arrives (unless user scrolled up) ──
+  useEffect(() => {
+    if (transcriptRef.current && !userScrolledUpRef.current) {
       requestAnimationFrame(() => {
-        transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+        if (transcriptRef.current) {
+          transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+        }
       });
     }
   }, [response, transcript, isProcessing, isJarvisSpeaking]);
@@ -6939,36 +6996,78 @@ const JarvisVoice = () => {
         }
       `}</style>
 
-      {/* Transcript Display - Always visible when there's activity */}
-      {(transcript || response || isProcessing || isJarvisSpeaking) && (
-        <div className="jarvis-transcript" ref={transcriptRef}>
-          {/* User Message */}
-          {transcript && (
-            <div className="user-message">
-              <span className="message-label">You:</span>
-              <span className="message-text">{transcript}</span>
-            </div>
-          )}
+      {/* Status Row — sits ABOVE transcript, never overlaps */}
+      {(isProcessing || isJarvisSpeaking || isListening || isWaitingForCommand) && (
+        <div className="transcript-status-row">
+          <span className={`transcript-status-text ${
+            isProcessing ? 'processing' :
+            isJarvisSpeaking ? 'speaking' :
+            (isListening || isWaitingForCommand) ? 'listening' : ''
+          }`}>
+            {isProcessing ? 'Analyzing...' :
+             isJarvisSpeaking ? 'Speaking...' :
+             (isListening || isWaitingForCommand) ? 'Listening...' : ''}
+          </span>
+        </div>
+      )}
 
-          {/* JARVIS Response - Always show when processing, speaking, or has response */}
-          {(isProcessing || isJarvisSpeaking || response) && (
-            <div className="jarvis-message">
-              <span className="message-label">JARVIS:</span>
-              <span className="message-text" style={{ whiteSpace: 'pre-wrap' }}>
-                {/* Priority 1: Processing state (no response yet) */}
-                {isProcessing && !response ? (
-                  <span className="processing-indicator">⚙️ Processing your request...</span>
-                ) : isJarvisSpeaking && response ? (
-                  /* Priority 2: Speaking with response */
-                  <>
-                    {response}
-                    <span className="speaking-indicator"> 🎤</span>
-                  </>
-                ) : (
-                  /* Priority 3: Just the response */
-                  response || ''
-                )}
-              </span>
+      {/* Transcript Display — adaptive height via ResizeObserver */}
+      {(transcript || response || isProcessing || isJarvisSpeaking) && (
+        <div className="jarvis-transcript-wrapper" ref={transcriptWrapperRef}>
+          <div className="jarvis-transcript" ref={transcriptRef}>
+            {/* User Message */}
+            {transcript && (
+              <div className="user-message">
+                <span className="message-label">You:</span>
+                <span className="message-text">{transcript}</span>
+              </div>
+            )}
+
+            {/* JARVIS Response */}
+            {(isProcessing || isJarvisSpeaking || response) && (
+              <div className="jarvis-message">
+                <span className="message-label">JARVIS:</span>
+                <span className="message-text">
+                  {isProcessing && !response ? (
+                    <span className="processing-indicator">Processing your request...</span>
+                  ) : isJarvisSpeaking && response ? (
+                    <>
+                      {response}
+                      <span className="speaking-indicator"> 🎤</span>
+                    </>
+                  ) : (
+                    response || ''
+                  )}
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Jump to latest pill — shown when user scrolled up */}
+          {userScrolledUp && (
+            <div
+              className="transcript-jump-pill"
+              onClick={() => {
+                if (transcriptRef.current) {
+                  transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+                  userScrolledUpRef.current = false;
+                  setUserScrolledUp(false);
+                }
+              }}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault();
+                  if (transcriptRef.current) {
+                    transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+                    userScrolledUpRef.current = false;
+                    setUserScrolledUp(false);
+                  }
+                }
+              }}
+            >
+              Jump to latest
             </div>
           )}
         </div>

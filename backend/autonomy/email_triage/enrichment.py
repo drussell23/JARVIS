@@ -87,6 +87,26 @@ def enrich_with_triage(
             enriched_email["triage_score"] = triaged.scoring.score
             enriched_email["triage_tier_label"] = triaged.scoring.tier_label
             enriched_email["triage_action"] = triaged.notification_action
+
+            # Extraction confidence + confirmation flag
+            confidence = getattr(triaged.features, "extraction_confidence", 0.0)
+            enriched_email["triage_confidence"] = confidence
+            enriched_email["triage_extraction_source"] = getattr(
+                triaged.features, "extraction_source", "heuristic"
+            )
+            # Ambiguous classification: low confidence + not extreme tier
+            _CONFIDENCE_THRESHOLD = 0.6
+            enriched_email["triage_needs_confirmation"] = (
+                confidence < _CONFIDENCE_THRESHOLD
+                and triaged.scoring.tier in (2, 3)
+            )
+
+            # Policy explanation for transparency
+            if triaged.policy_explanation is not None:
+                pe = triaged.policy_explanation
+                enriched_email["triage_suppressed_by"] = pe.suppressed_by
+                enriched_email["triage_dedup_hit"] = pe.dedup_hit
+
             enriched.append(enriched_email)
             any_matched = True
         else:
