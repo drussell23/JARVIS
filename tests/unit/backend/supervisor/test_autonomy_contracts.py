@@ -30,8 +30,22 @@ def test_version_gte_three_segments():
 
 
 def test_version_gte_unequal_length():
-    """Versions with different segment counts."""
+    """Versions with different segment counts.
+
+    Note: "1.0" is treated as < "1.0.1" because Python tuple comparison
+    treats shorter tuples as lesser when prefixes match.
+    """
     from backend.supervisor.cross_repo_startup_orchestrator import _version_gte
 
     assert _version_gte("1.0.0", "1.0") is True
     assert _version_gte("1.0", "1.0.1") is False
+
+
+def test_version_gte_malformed_inputs():
+    """Malformed version strings should return False, not raise."""
+    from backend.supervisor.cross_repo_startup_orchestrator import _version_gte
+
+    assert _version_gte("1.0-beta", "1.0") is False
+    assert _version_gte("v1.0", "1.0") is False
+    assert _version_gte("", "1.0") is False
+    assert _version_gte("1.0", "abc") is False

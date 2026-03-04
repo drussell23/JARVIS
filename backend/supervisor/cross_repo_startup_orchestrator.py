@@ -24772,10 +24772,21 @@ def get_orchestrator_shutdown_state() -> dict:
 # =============================================================================
 
 def _version_gte(a: str, b: str) -> bool:
-    """True if semantic version *a* >= *b* (numeric tuple compare)."""
-    def _parse(v: str) -> Tuple[int, ...]:
-        return tuple(int(x) for x in v.split("."))
-    return _parse(a) >= _parse(b)
+    """True if semantic version *a* >= *b* (numeric tuple compare).
+
+    Returns False for malformed inputs (non-numeric segments, empty strings).
+    Note: ``"1.0"`` is treated as strictly less than ``"1.0.1"`` — Python
+    tuple comparison treats shorter tuples as lesser when prefixes match.
+    """
+    def _parse(v: str) -> Optional[Tuple[int, ...]]:
+        try:
+            return tuple(int(x) for x in v.split("."))
+        except (ValueError, TypeError):
+            return None
+    pa, pb = _parse(a), _parse(b)
+    if pa is None or pb is None:
+        return False
+    return pa >= pb
 
 
 AUTONOMY_SCHEMA_COMPATIBILITY: Dict[str, Dict[str, str]] = {
