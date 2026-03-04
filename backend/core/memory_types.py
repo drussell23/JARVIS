@@ -19,7 +19,7 @@ Public API
 Enums:
     PressureTier, KernelPressure, ThrashState, SignalQuality,
     PressureTrend, BudgetPriority, StartupPhase, LeaseState,
-    MemoryBudgetEventType
+    MemoryBudgetEventType, DisplayState, DisplayFailureCode
 
 Dataclasses:
     MemorySnapshot, DegradationOption, ConfigProof, LoadResult
@@ -50,6 +50,81 @@ class PressureTier(IntEnum):
     CONSTRAINED = 3
     CRITICAL = 4
     EMERGENCY = 5
+
+
+class DisplayState(str, Enum):
+    """Ghost display lifecycle state.
+
+    Transitional states (DEGRADING, RECOVERING, DISCONNECTING) prevent
+    overlapping commands and enable deterministic crash recovery.
+    """
+    INACTIVE = "inactive"
+    ACTIVE = "active"
+    DEGRADING = "degrading"
+    DEGRADED_1 = "degraded_1"
+    DEGRADED_2 = "degraded_2"
+    MINIMUM = "minimum"
+    RECOVERING = "recovering"
+    DISCONNECTING = "disconnecting"
+    DISCONNECTED = "disconnected"
+
+    @property
+    def is_transitional(self) -> bool:
+        return self in _TRANSITIONAL_DISPLAY_STATES
+
+    @property
+    def is_display_connected(self) -> bool:
+        return self in _CONNECTED_DISPLAY_STATES
+
+
+_TRANSITIONAL_DISPLAY_STATES = frozenset({
+    DisplayState.DEGRADING, DisplayState.RECOVERING, DisplayState.DISCONNECTING,
+})
+
+_CONNECTED_DISPLAY_STATES = frozenset({
+    DisplayState.ACTIVE, DisplayState.DEGRADED_1, DisplayState.DEGRADED_2,
+    DisplayState.MINIMUM, DisplayState.DEGRADING, DisplayState.RECOVERING,
+})
+
+
+class DisplayFailureCode(str, Enum):
+    """Failure codes for display state transitions."""
+    COMMAND_TIMEOUT = "command_timeout"
+    VERIFY_MISMATCH = "verify_mismatch"
+    DEPENDENCY_BLOCKED = "dependency_blocked"
+    PREEMPTED = "preempted"
+    QUARANTINED = "quarantined"
+    CLI_ERROR = "cli_error"
+    COMPOSITOR_MISMATCH = "compositor_mismatch"
+
+    @property
+    def failure_class(self) -> str:
+        return _FAILURE_CLASSES.get(self, "unknown")
+
+    @property
+    def retryable(self) -> bool:
+        return _FAILURE_RETRYABLE.get(self, False)
+
+
+_FAILURE_CLASSES: Dict[DisplayFailureCode, str] = {
+    DisplayFailureCode.COMMAND_TIMEOUT: "transient",
+    DisplayFailureCode.VERIFY_MISMATCH: "structural",
+    DisplayFailureCode.DEPENDENCY_BLOCKED: "operator",
+    DisplayFailureCode.PREEMPTED: "transient",
+    DisplayFailureCode.QUARANTINED: "structural",
+    DisplayFailureCode.CLI_ERROR: "transient",
+    DisplayFailureCode.COMPOSITOR_MISMATCH: "structural",
+}
+
+_FAILURE_RETRYABLE: Dict[DisplayFailureCode, bool] = {
+    DisplayFailureCode.COMMAND_TIMEOUT: True,
+    DisplayFailureCode.VERIFY_MISMATCH: False,
+    DisplayFailureCode.DEPENDENCY_BLOCKED: False,
+    DisplayFailureCode.PREEMPTED: True,
+    DisplayFailureCode.QUARANTINED: False,
+    DisplayFailureCode.CLI_ERROR: True,
+    DisplayFailureCode.COMPOSITOR_MISMATCH: False,
+}
 
 
 class KernelPressure(str, Enum):
@@ -138,8 +213,8 @@ _TERMINAL_LEASE_STATES = frozenset({
 class MemoryBudgetEventType(str, Enum):
     """Structured event types emitted by the Memory Control Plane.
 
-    24 distinct events covering the full grant / release / preempt
-    lifecycle plus observability signals.
+    32 distinct events covering the full grant / release / preempt
+    lifecycle, display lifecycle, plus observability signals.
     """
     GRANT_REQUESTED = "grant_requested"
     GRANT_ISSUED = "grant_issued"
@@ -165,6 +240,16 @@ class MemoryBudgetEventType(str, Enum):
     LOADER_UNQUARANTINED = "loader_unquarantined"
     ESTIMATE_CALIBRATION = "estimate_calibration"
     SNAPSHOT_STALE_REJECTED = "snapshot_stale_rejected"
+
+    # --- Display lifecycle ---
+    DISPLAY_DEGRADE_REQUESTED    = "display_degrade_requested"
+    DISPLAY_DEGRADED             = "display_degraded"
+    DISPLAY_DISCONNECT_REQUESTED = "display_disconnect_requested"
+    DISPLAY_DISCONNECTED         = "display_disconnected"
+    DISPLAY_RECOVERY_REQUESTED   = "display_recovery_requested"
+    DISPLAY_RECOVERED            = "display_recovered"
+    DISPLAY_ACTION_FAILED        = "display_action_failed"
+    DISPLAY_ACTION_PHASE         = "display_action_phase"
 
 
 # ===================================================================

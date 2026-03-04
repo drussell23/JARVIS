@@ -249,7 +249,7 @@ class TestAuxiliaryEnums:
 # ===================================================================
 
 class TestMemoryBudgetEventType:
-    """All 24 event types must be present."""
+    """All 32 event types must be present (24 core + 8 display lifecycle)."""
 
     EXPECTED_EVENTS = {
         "grant_requested",
@@ -276,12 +276,21 @@ class TestMemoryBudgetEventType:
         "loader_unquarantined",
         "estimate_calibration",
         "snapshot_stale_rejected",
+        # Display lifecycle events
+        "display_degrade_requested",
+        "display_degraded",
+        "display_disconnect_requested",
+        "display_disconnected",
+        "display_recovery_requested",
+        "display_recovered",
+        "display_action_failed",
+        "display_action_phase",
     }
 
-    def test_count_is_24(self):
+    def test_count_is_32(self):
         from backend.core.memory_types import MemoryBudgetEventType
 
-        assert len(MemoryBudgetEventType) == 24
+        assert len(MemoryBudgetEventType) == 32
 
     def test_all_values_present(self):
         from backend.core.memory_types import MemoryBudgetEventType
