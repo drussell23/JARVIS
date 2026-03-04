@@ -182,6 +182,9 @@ _PRESSURE_FACTORS: Dict[PressureTier, float] = {
 
 _SWAP_HYSTERESIS_THRESHOLD_BPS: int = 50 * 1024 * 1024  # 50 MB/s
 
+assert set(_PRESSURE_FACTORS.keys()) == set(PressureTier), \
+    "_PRESSURE_FACTORS must cover all PressureTier values"
+
 
 # ===================================================================
 # Dataclasses
@@ -194,7 +197,7 @@ class MemorySnapshot:
     Created by the broker's sampler and passed to all decision logic.
     Replaces raw ``psutil`` calls throughout the codebase.
 
-    All 28 fields are required and represent a complete picture of system
+    All 27 fields are required and represent a complete picture of system
     memory at a single point in time.
 
     Computed properties
