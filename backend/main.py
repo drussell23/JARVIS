@@ -6630,11 +6630,59 @@ async def system_status():
     except Exception:
         pass
 
+    # v300.0: Phase 2 — Autonomy health surface
+    autonomy_status: dict = {
+        "mode": "read_only",
+        "contract_status": "unknown",
+        "pending_reconciliation": 0,
+        "body_ready": False,
+        "prime_compatible": False,
+        "reactor_ingesting": False,
+    }
+    try:
+        # Body readiness: check if workspace agent has autonomy policy
+        if gws and hasattr(gws, "get_autonomy_doctor_report"):
+            doc = gws.get_autonomy_doctor_report()
+            autonomy_status["body_ready"] = doc.get("overall") in ("pass", "degraded")
+            autonomy_status["pending_reconciliation"] = doc.get("pending_reconciliation", 0)
+
+        # Contract status from cached orchestrator check (non-blocking)
+        try:
+            from backend.supervisor.cross_repo_startup_orchestrator import (
+                check_autonomy_contracts,
+            )
+            # Use cached result if available to avoid network calls on every status request
+            _cached = getattr(system_status, "_autonomy_contract_cache", None)
+            if _cached and (_time.time() - _cached.get("ts", 0)) < 60:
+                autonomy_status["contract_status"] = _cached.get("status", "unknown")
+                autonomy_status["prime_compatible"] = _cached.get("prime_compatible", False)
+                autonomy_status["reactor_ingesting"] = _cached.get("reactor_compatible", False)
+            else:
+                # Perform check (will be fast if services are local)
+                all_pass, status_str, checks = await check_autonomy_contracts()
+                autonomy_status["contract_status"] = status_str
+                autonomy_status["prime_compatible"] = checks.get("prime_compatible", False)
+                autonomy_status["reactor_ingesting"] = checks.get("reactor_compatible", False)
+                if all_pass:
+                    autonomy_status["mode"] = "active"
+                # Cache for 60s
+                system_status._autonomy_contract_cache = {  # type: ignore[attr-defined]
+                    "ts": _time.time(),
+                    "status": status_str,
+                    "prime_compatible": checks.get("prime_compatible", False),
+                    "reactor_compatible": checks.get("reactor_compatible", False),
+                }
+        except ImportError:
+            pass
+    except Exception as exc:
+        logger.debug("[SystemStatus] Autonomy health check failed: %s", exc)
+
     return {
         "system": system,
         "components": components,
         "agents": agents,
         "memory_control_plane": mcp_status,
+        "autonomy": autonomy_status,
         "ts": _time.time(),
     }
 

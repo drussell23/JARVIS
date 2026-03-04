@@ -24768,6 +24768,130 @@ def get_orchestrator_shutdown_state() -> dict:
 
 
 # =============================================================================
+# v300.0: Phase 2 — Autonomy Contract Compatibility Check
+# =============================================================================
+
+AUTONOMY_SCHEMA_COMPATIBILITY: Dict[str, Dict[str, str]] = {
+    "1.0": {"min_prime": "1.0", "min_reactor": "1.0"},
+}
+
+
+async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
+    """Check cross-repo autonomy contract compatibility at boot.
+
+    Probes Body, Prime, and Reactor for schema version compatibility.
+    If any component is unreachable or incompatible, returns failure
+    with detailed diagnostics.
+
+    Returns
+    -------
+    (all_pass, status_str, checks_dict)
+        ``all_pass``: True if all contracts compatible.
+        ``status_str``: ``"autonomy_ready"`` or ``"contract_mismatch"``.
+        ``checks_dict``: Per-component compatibility details.
+    """
+    config = OrchestratorConfig()
+    checks: Dict[str, Any] = {}
+
+    # Body checks (local — no network)
+    body_schema = "1.0"
+    checks["body_schema"] = body_schema
+    try:
+        from backend.neural_mesh.agents.google_workspace_agent import (
+            AUTONOMY_SCHEMA_VERSION,
+        )
+        body_schema = AUTONOMY_SCHEMA_VERSION
+        checks["body_schema"] = body_schema
+    except ImportError:
+        pass
+
+    body_has_policy = False
+    body_has_journal = False
+    try:
+        from backend.neural_mesh.agents.google_workspace_agent import (
+            WorkspaceAutonomyPolicy,
+        )
+        body_has_policy = True
+    except ImportError:
+        pass
+    try:
+        from backend.core.orchestration_journal import OrchestrationJournal
+        j = OrchestrationJournal.get_instance()
+        body_has_journal = j is not None and getattr(j, "has_lease", False)
+    except Exception:
+        pass
+
+    checks["body_policy"] = body_has_policy
+    checks["body_journal"] = body_has_journal
+
+    # Prime health probe
+    prime_schema = None
+    checks["prime_reachable"] = False
+    try:
+        url = f"http://localhost:{config.jarvis_prime_default_port}/health"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    checks["prime_reachable"] = True
+                    prime_schema = data.get("autonomy_schema_version")
+    except Exception:
+        pass
+    checks["prime_schema"] = prime_schema
+
+    # Reactor health probe
+    reactor_schema = None
+    checks["reactor_reachable"] = False
+    try:
+        url = f"http://localhost:{config.reactor_core_default_port}/health"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5.0)
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    checks["reactor_reachable"] = True
+                    reactor_schema = data.get("autonomy_schema_version")
+    except Exception:
+        pass
+    checks["reactor_schema"] = reactor_schema
+
+    # Compatibility matrix evaluation
+    compat = AUTONOMY_SCHEMA_COMPATIBILITY.get(body_schema, {})
+    min_prime = compat.get("min_prime", "999")
+    min_reactor = compat.get("min_reactor", "999")
+
+    checks["prime_compatible"] = (
+        prime_schema is not None and prime_schema >= min_prime
+    )
+    checks["reactor_compatible"] = (
+        reactor_schema is not None and reactor_schema >= min_reactor
+    )
+
+    all_pass = (
+        checks.get("prime_compatible", False)
+        and checks.get("reactor_compatible", False)
+        and checks.get("prime_reachable", False)
+        and checks.get("reactor_reachable", False)
+    )
+
+    status = "autonomy_ready" if all_pass else "contract_mismatch"
+
+    if not all_pass:
+        logger.warning(
+            "[v300.0] Autonomy contract mismatch — degraded read-only mode. "
+            "Checks: %s",
+            checks,
+        )
+    else:
+        logger.info("[v300.0] Autonomy contracts validated — all compatible")
+
+    return all_pass, status, checks
+
+
+# =============================================================================
 # Module Exports
 # =============================================================================
 
@@ -24789,4 +24913,7 @@ __all__ = [
     "is_orchestrator_shutdown_in_progress",
     "is_orchestrator_shutdown_completed",
     "get_orchestrator_shutdown_state",
+    # v300.0: Phase 2 autonomy contracts
+    "check_autonomy_contracts",
+    "AUTONOMY_SCHEMA_COMPATIBILITY",
 ]
