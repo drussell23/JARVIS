@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.core.memory_types import ActuatorAction, DecisionEnvelope
 
@@ -52,7 +52,7 @@ class MemoryActuatorCoordinator:
         quarantine_seconds: float = 300.0,
         shadow_mode: bool = False,
     ) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._pending: List[PendingAction] = []
         self._failure_budget = failure_budget
         self._quarantine_seconds = quarantine_seconds
@@ -153,26 +153,29 @@ class MemoryActuatorCoordinator:
 
     def is_quarantined(self, action: ActuatorAction) -> bool:
         """Check if an action type is currently quarantined."""
-        deadline = self._quarantine_until.get(action)
-        if deadline is None:
-            return False
-        if time.monotonic() >= deadline:
-            # Quarantine expired — clear it
-            self._quarantine_until.pop(action, None)
-            self._failure_counts[action] = 0
-            return False
-        return True
+        with self._lock:
+            deadline = self._quarantine_until.get(action)
+            if deadline is None:
+                return False
+            if time.monotonic() >= deadline:
+                # Quarantine expired — clear it
+                self._quarantine_until.pop(action, None)
+                self._failure_counts[action] = 0
+                return False
+            return True
 
-    def get_stats(self) -> Dict[str, int]:
+    def get_stats(self) -> Dict[str, Any]:
         """Return coordinator statistics."""
         with self._lock:
+            # Snapshot keys before iterating to avoid mutation during iteration
+            quarantine_keys = list(self._quarantine_until)
             return {
                 "total_submitted": self._total_submitted,
                 "total_rejected_stale": self._total_rejected_stale,
                 "total_rejected_quarantined": self._total_rejected_quarantined,
                 "pending_count": len(self._pending),
                 "quarantined_actions": [
-                    a.value for a in self._quarantine_until
+                    a.value for a in quarantine_keys
                     if self.is_quarantined(a)
                 ],
                 "shadow_mode": self._shadow_mode,
