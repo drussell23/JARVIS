@@ -222,3 +222,49 @@ async def test_controller_pressure_callback(mock_broker):
 
     await controller._on_pressure_change(PressureTier.ELEVATED, None)
     assert controller._first_critical_at is None
+
+
+# ===================================================================
+# Broker observer backpressure tests
+# ===================================================================
+
+import logging
+
+
+@pytest.mark.asyncio
+async def test_broker_observer_backpressure_timeout():
+    """Slow observer should be skipped after timeout, not block others."""
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
+    from backend.core.memory_types import PressureTier
+
+    import threading
+    broker = MemoryBudgetBroker.__new__(MemoryBudgetBroker)
+    # Minimal init for observer notification
+    broker._pressure_observers = []
+    broker._latest_snapshot = None
+    broker._current_sequence = 0
+    broker._sequence = 0
+    broker._epoch = 1
+    broker._seq_lock = threading.Lock()
+    broker._coordinator = MagicMock()
+    broker.logger = logging.getLogger("test")
+
+    results = []
+
+    async def slow_observer(tier, snapshot):
+        await asyncio.sleep(10)  # Will be timed out
+        results.append("slow")
+
+    async def fast_observer(tier, snapshot):
+        results.append("fast")
+
+    broker.register_pressure_observer(slow_observer)
+    broker.register_pressure_observer(fast_observer)
+
+    start = time.monotonic()
+    await broker.notify_pressure_observers(PressureTier.CRITICAL, None)
+    elapsed = time.monotonic() - start
+
+    assert "fast" in results, "Fast observer must still run"
+    assert "slow" not in results, "Slow observer should be timed out"
+    assert elapsed < 5.0, f"Should not block for slow observer ({elapsed:.1f}s)"

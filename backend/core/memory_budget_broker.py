@@ -910,17 +910,31 @@ class MemoryBudgetBroker:
     ) -> None:
         """Notify all registered observers of a pressure tier change.
 
-        Observer exceptions are caught and logged -- one bad observer
-        must never block others.
+        Each observer gets a configurable timeout (default 2s) — slow
+        subscribers are skipped to prevent blocking the notification bus.
+        Observer exceptions are caught and logged.
         """
+        _OBSERVER_TIMEOUT_S = float(
+            os.environ.get("JARVIS_OBSERVER_TIMEOUT_S", "2.0")
+        )
         self._advance_sequence()
         self._latest_snapshot = snapshot
         for obs in self._pressure_observers:
             try:
-                await obs(tier, snapshot)
+                await asyncio.wait_for(
+                    obs(tier, snapshot), timeout=_OBSERVER_TIMEOUT_S,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Pressure observer %s timed out (>%.1fs), skipped",
+                    getattr(obs, "__qualname__", repr(obs)),
+                    _OBSERVER_TIMEOUT_S,
+                )
             except Exception:
                 logger.warning(
-                    "Pressure observer %s raised exception", obs, exc_info=True,
+                    "Pressure observer %s raised exception",
+                    getattr(obs, "__qualname__", repr(obs)),
+                    exc_info=True,
                 )
 
     # --- Lease amendment ---
