@@ -442,6 +442,7 @@ async def _run_preflight_checks(log) -> bool:
     try:
         from .diagnostics import (
             run_preflight_checks,
+            CheckCategory,
             CheckStatus,
             AutoRecovery,
         )
@@ -482,7 +483,13 @@ async def _run_preflight_checks(log) -> bool:
                 if check.fix_command:
                     log.error(f"      Manual fix: {check.fix_command}")
             elif check.status == CheckStatus.WARN:
-                log.warning(f"    ⚠ {check.name}: {check.message}")
+                if (
+                    check.category == CheckCategory.CONNECTIVITY
+                    and "local models available" in check.message
+                ):
+                    log.info(f"    ℹ {check.name}: {check.message}")
+                else:
+                    log.warning(f"    ⚠ {check.name}: {check.message}")
 
         log.info(f"  Pre-flight duration: {report.duration_ms:.1f}ms")
 

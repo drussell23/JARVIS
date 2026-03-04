@@ -3333,6 +3333,8 @@ class ServiceReadinessChecker:
         self._lock = asyncio.Lock()
         self._consecutive_failures = 0
         self._total_checks = 0
+        self._quiet_timeout_count: int = 0
+        _QUIET_ESCALATION_THRESHOLD = 3
 
         logger.debug(f"[v16.0] ServiceReadinessChecker initialized for {service_name} at {base_url}")
 
@@ -3438,6 +3440,7 @@ class ServiceReadinessChecker:
         self,
         timeout: float = 30.0,
         min_level: ServiceReadinessLevel = ServiceReadinessLevel.DEGRADED,
+        quiet: bool = False,
     ) -> bool:
         """
         Wait for service to become ready with exponential backoff.
@@ -3445,6 +3448,7 @@ class ServiceReadinessChecker:
         Args:
             timeout: Maximum time to wait in seconds
             min_level: Minimum readiness level to accept as "ready"
+            quiet: If True, log timeouts at DEBUG instead of WARNING (for quick probes)
 
         Returns:
             True if service became ready within timeout, False otherwise
@@ -3453,7 +3457,8 @@ class ServiceReadinessChecker:
         backoff_ms = self.INITIAL_BACKOFF_MS
         attempt = 0
 
-        logger.info(f"[v16.0] Waiting for {self._service_name} to become ready (timeout: {timeout}s)...")
+        _log_fn = logger.debug if quiet else logger.info
+        _log_fn(f"[v16.0] Waiting for {self._service_name} to become ready (timeout: {timeout}s)...")
 
         while (time.time() - start_time) < timeout:
             attempt += 1
@@ -3497,10 +3502,22 @@ class ServiceReadinessChecker:
             backoff_ms = min(backoff_ms * self.BACKOFF_MULTIPLIER, self.MAX_BACKOFF_MS)
 
         # Timeout reached
-        logger.warning(
-            f"[v16.0] {self._service_name} not ready after {timeout}s "
-            f"({attempt} attempts, last: {self._last_snapshot.level.value if self._last_snapshot else 'unknown'})"
-        )
+        if quiet:
+            self._quiet_timeout_count += 1
+            logger.debug(
+                f"[v16.0] {self._service_name} not ready after {timeout}s "
+                f"({attempt} attempts, last: {self._last_snapshot.level.value if self._last_snapshot else 'unknown'})"
+            )
+            if self._quiet_timeout_count >= 3:
+                logger.warning(
+                    f"[v16.0] {self._service_name} quiet probe failed {self._quiet_timeout_count} times "
+                    f"(last: {self._last_snapshot.level.value if self._last_snapshot else 'unreachable'})"
+                )
+        else:
+            logger.warning(
+                f"[v16.0] {self._service_name} not ready after {timeout}s "
+                f"({attempt} attempts, last: {self._last_snapshot.level.value if self._last_snapshot else 'unknown'})"
+            )
         return False
 
     def get_stats(self) -> Dict[str, Any]:
@@ -3512,6 +3529,7 @@ class ServiceReadinessChecker:
             "total_checks": self._total_checks,
             "consecutive_failures": self._consecutive_failures,
             "circuit_breaker": self._circuit_breaker.get_status(),
+            "quiet_timeouts": self._quiet_timeout_count,
             "last_snapshot": {
                 "level": self._last_snapshot.level.value if self._last_snapshot else None,
                 "latency_ms": self._last_snapshot.latency_ms if self._last_snapshot else None,

@@ -230,7 +230,10 @@ class TriageStateStore:
         self._writer_task: Optional[asyncio.Task] = None
         self._closed = False
         self._read_only = False  # Set True if DB version > expected
-        self._executor = None  # Uses default ThreadPoolExecutor
+        import concurrent.futures
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="triage_db",
+        )
 
     async def open(self) -> None:
         """Open the database, create tables, enable WAL, start writer."""
@@ -248,10 +251,15 @@ class TriageStateStore:
         if db_dir:
             os.makedirs(db_dir, exist_ok=True)
 
+        # INVARIANT: All DB operations (reads AND writes) MUST use self._executor
+        # (dedicated single-thread pool). Never call self._conn.execute() directly
+        # from the event loop or default executor. WAL mode allows the single-writer
+        # queue to coexist with reads on the same thread without blocking.
         self._conn = sqlite3.connect(
             self._db_path,
             timeout=10.0,
             isolation_level=None,  # autocommit by default, manual txn control
+            check_same_thread=False,  # Safe: dedicated single-thread executor + WAL + single-writer queue
         )
         self._conn.row_factory = sqlite3.Row
 
@@ -414,6 +422,9 @@ class TriageStateStore:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(self._executor, self._conn.close)
             self._conn = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=False)
+            self._executor = None
 
     # ------------------------------------------------------------------
     # Writer loop (Gate #6: single-writer serialization)

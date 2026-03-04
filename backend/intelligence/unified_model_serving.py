@@ -1456,12 +1456,15 @@ class PrimeAPIClient(ModelClient):
             await self._session.close()
             self._session = None
 
-    async def wait_for_ready(self) -> bool:
+    async def wait_for_ready(self, quiet: bool = False) -> bool:
         """
         Wait for J-Prime server to be ready.
 
         Uses ServiceReadinessChecker for intelligent waiting with
         exponential backoff.
+
+        Args:
+            quiet: If True, log timeouts at DEBUG instead of WARNING (for quick probes)
 
         Returns:
             True if server is ready, False if timeout
@@ -1481,6 +1484,7 @@ class PrimeAPIClient(ModelClient):
             is_ready = await checker.wait_for_ready(
                 timeout=self.wait_timeout,
                 min_level=ServiceReadinessLevel.DEGRADED,
+                quiet=quiet,
             )
 
             if is_ready:
@@ -1495,9 +1499,8 @@ class PrimeAPIClient(ModelClient):
                     self.logger.info("[v17.0] J-Prime API ready")
                 return True
             else:
-                self.logger.warning(
-                    f"[v17.0] J-Prime API not ready after {self.wait_timeout}s"
-                )
+                _log = self.logger.debug if quiet else self.logger.warning
+                _log(f"[v17.0] J-Prime API not ready after {self.wait_timeout}s")
                 return False
 
         except ImportError:
@@ -2581,7 +2584,7 @@ class UnifiedModelServing:
             self.logger.info("  🔄 Checking J-Prime API availability...")
             _quick_timeout = float(os.getenv("JARVIS_PRIME_API_QUICK_TIMEOUT", "2.0"))
             probe_client = PrimeAPIClient(wait_timeout=_quick_timeout)
-            if await probe_client.wait_for_ready():
+            if await probe_client.wait_for_ready(quiet=True):
                 # J-Prime already available — register immediately
                 self._clients[ModelProvider.PRIME_API] = probe_client
                 self._prime_api_source = "local_jprime"
@@ -3481,7 +3484,7 @@ class UnifiedModelServing:
             return
 
         if not _local._current_model_entry:
-            self.logger.warning("[ThrashCascade] No current model entry — cannot downgrade")
+            self.logger.debug("[ThrashCascade] No model loaded yet — skipping downgrade")
             return
 
         current_rank = _local._current_model_entry.get("quality_rank", 0)

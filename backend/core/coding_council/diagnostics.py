@@ -782,7 +782,7 @@ class RuntimeChecker:
                         name="Anthropic API",
                         category=CheckCategory.CONNECTIVITY,
                         status=CheckStatus.WARN,
-                        message="Invalid API key (AI features disabled)",
+                        message="Anthropic API auth failed (auth_failed, local models available)",
                         details="The provided ANTHROPIC_API_KEY is not valid",
                         fix_command="export ANTHROPIC_API_KEY=<valid_key>",
                         duration_ms=(time.time() - start) * 1000,
@@ -807,21 +807,26 @@ class RuntimeChecker:
             # v109.1: Provide specific error details based on exception type
             error_str = str(e)
             if "timeout" in error_str.lower() or "timed out" in error_str.lower():
+                reason = "timeout"
                 details = "Connection timed out - network may be slow or API endpoint unreachable"
             elif "connection refused" in error_str.lower():
+                reason = "connection_refused"
                 details = "Connection refused - check network/firewall settings"
             elif "name resolution" in error_str.lower() or "dns" in error_str.lower():
+                reason = "dns_failed"
                 details = "DNS resolution failed - check network connectivity"
             elif "ssl" in error_str.lower() or "certificate" in error_str.lower():
+                reason = "tls_error"
                 details = "SSL/TLS error - check system certificates"
             else:
+                reason = "unknown"
                 details = error_str
 
             return CheckResult(
                 name="Anthropic API",
                 category=CheckCategory.CONNECTIVITY,
                 status=CheckStatus.WARN,
-                message="Cannot reach Anthropic API",
+                message=f"Cannot reach Anthropic API ({reason}, local models available)",
                 details=details,
                 duration_ms=(time.time() - start) * 1000,
             )
