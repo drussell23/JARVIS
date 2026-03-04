@@ -19,13 +19,16 @@ Public API
 Enums:
     PressureTier, KernelPressure, ThrashState, SignalQuality,
     PressureTrend, BudgetPriority, StartupPhase, LeaseState,
-    MemoryBudgetEventType, DisplayState, DisplayFailureCode
+    MemoryBudgetEventType, DisplayState, DisplayFailureCode,
+    ActuatorAction
 
 Dataclasses:
-    MemorySnapshot, DegradationOption, ConfigProof, LoadResult
+    MemorySnapshot, DegradationOption, ConfigProof, LoadResult,
+    PressurePolicy, DecisionEnvelope
 
 Constants:
-    _PRESSURE_FACTORS, _SWAP_HYSTERESIS_THRESHOLD_BPS
+    _PRESSURE_FACTORS, _SWAP_HYSTERESIS_THRESHOLD_BPS,
+    _ACTUATOR_PRIORITY
 """
 
 from __future__ import annotations
@@ -398,3 +401,207 @@ class LoadResult:
     model_handle: Optional[Any]
     load_duration_ms: float
     error: Optional[str]
+
+
+# ===================================================================
+# Actuator Action Enum
+# ===================================================================
+
+class ActuatorAction(str, Enum):
+    """Priority-ordered actions that memory actuators can request.
+
+    Lower priority number = less disruptive, preferred first.
+    Use the ``priority`` property to compare action severity.
+    """
+    DISPLAY_SHED = "display_shed"
+    DEFCON_ESCALATE = "defcon_escalate"
+    MODEL_EVICT = "model_evict"
+    CLOUD_OFFLOAD = "cloud_offload"
+    CLOUD_SCALE = "cloud_scale"
+    CLEANUP = "cleanup"
+
+    @property
+    def priority(self) -> int:
+        """Return numeric priority (0 = least disruptive)."""
+        return _ACTUATOR_PRIORITY[self]
+
+
+_ACTUATOR_PRIORITY: Dict[ActuatorAction, int] = {
+    ActuatorAction.DISPLAY_SHED: 0,
+    ActuatorAction.DEFCON_ESCALATE: 1,
+    ActuatorAction.MODEL_EVICT: 2,
+    ActuatorAction.CLOUD_OFFLOAD: 3,
+    ActuatorAction.CLOUD_SCALE: 4,
+    ActuatorAction.CLEANUP: 5,
+}
+
+assert set(_ACTUATOR_PRIORITY.keys()) == set(ActuatorAction), \
+    "_ACTUATOR_PRIORITY must cover all ActuatorAction values"
+
+
+# ===================================================================
+# PressurePolicy (versioned threshold rules with hysteresis)
+# ===================================================================
+
+@dataclasses.dataclass(frozen=True)
+class PressurePolicy:
+    """Versioned threshold rules with hysteresis deadbands.
+
+    Replaces all hardcoded memory-pressure thresholds.  Each actionable
+    ``PressureTier`` (ELEVATED through EMERGENCY) has an *enter* threshold
+    and a strictly-lower *exit* threshold, creating a deadband that
+    prevents tier flapping.
+
+    Use the ``for_ram_gb`` class method to obtain hardware-appropriate
+    defaults.
+    """
+
+    version: str = "v1.0"
+
+    enter_thresholds: Dict[PressureTier, float] = dataclasses.field(
+        default_factory=lambda: {
+            PressureTier.ELEVATED: 70.0,
+            PressureTier.CONSTRAINED: 80.0,
+            PressureTier.CRITICAL: 90.0,
+            PressureTier.EMERGENCY: 95.0,
+        },
+    )
+
+    exit_thresholds: Dict[PressureTier, float] = dataclasses.field(
+        default_factory=lambda: {
+            PressureTier.ELEVATED: 65.0,
+            PressureTier.CONSTRAINED: 75.0,
+            PressureTier.CRITICAL: 85.0,
+            PressureTier.EMERGENCY: 90.0,
+        },
+    )
+
+    min_dwell_seconds: float = 5.0
+    cooldown_seconds: float = 30.0
+    max_actions_per_hour: int = 12
+
+    def __post_init__(self) -> None:
+        _actionable = {
+            PressureTier.ELEVATED,
+            PressureTier.CONSTRAINED,
+            PressureTier.CRITICAL,
+            PressureTier.EMERGENCY,
+        }
+        assert set(self.enter_thresholds.keys()) >= _actionable, \
+            "enter_thresholds must cover all actionable PressureTiers"
+        assert set(self.exit_thresholds.keys()) >= _actionable, \
+            "exit_thresholds must cover all actionable PressureTiers"
+        for tier in _actionable:
+            assert self.exit_thresholds[tier] < self.enter_thresholds[tier], (
+                f"Hysteresis violated for {tier}: "
+                f"exit={self.exit_thresholds[tier]} >= enter={self.enter_thresholds[tier]}"
+            )
+        assert self.min_dwell_seconds > 0.0, "min_dwell_seconds must be positive"
+        assert self.cooldown_seconds > 0.0, "cooldown_seconds must be positive"
+        assert self.max_actions_per_hour > 0, "max_actions_per_hour must be positive"
+        assert self.version.startswith("v"), "version must start with 'v'"
+
+    @classmethod
+    def for_ram_gb(cls, total_gb: float) -> PressurePolicy:
+        """Factory that returns hardware-appropriate thresholds.
+
+        Profiles
+        --------
+        * ``< 12 GB`` -- *constrained* (aggressive thresholds)
+        * ``< 20 GB`` -- *consumer* (16 GB Mac default)
+        * ``< 48 GB`` -- *prosumer* (32 GB workstation)
+        * ``>= 48 GB`` -- *server* (64 GB+ headroom)
+        """
+        if total_gb < 12.0:
+            enter = {
+                PressureTier.ELEVATED: 85.0,
+                PressureTier.CONSTRAINED: 90.0,
+                PressureTier.CRITICAL: 95.0,
+                PressureTier.EMERGENCY: 97.0,
+            }
+            exit_ = {
+                PressureTier.ELEVATED: 80.0,
+                PressureTier.CONSTRAINED: 87.0,
+                PressureTier.CRITICAL: 92.0,
+                PressureTier.EMERGENCY: 95.0,
+            }
+        elif total_gb < 20.0:
+            enter = {
+                PressureTier.ELEVATED: 80.0,
+                PressureTier.CONSTRAINED: 88.0,
+                PressureTier.CRITICAL: 93.0,
+                PressureTier.EMERGENCY: 96.0,
+            }
+            exit_ = {
+                PressureTier.ELEVATED: 75.0,
+                PressureTier.CONSTRAINED: 84.0,
+                PressureTier.CRITICAL: 90.0,
+                PressureTier.EMERGENCY: 93.0,
+            }
+        elif total_gb < 48.0:
+            enter = {
+                PressureTier.ELEVATED: 65.0,
+                PressureTier.CONSTRAINED: 75.0,
+                PressureTier.CRITICAL: 85.0,
+                PressureTier.EMERGENCY: 93.0,
+            }
+            exit_ = {
+                PressureTier.ELEVATED: 60.0,
+                PressureTier.CONSTRAINED: 70.0,
+                PressureTier.CRITICAL: 80.0,
+                PressureTier.EMERGENCY: 90.0,
+            }
+        else:
+            enter = {
+                PressureTier.ELEVATED: 55.0,
+                PressureTier.CONSTRAINED: 65.0,
+                PressureTier.CRITICAL: 80.0,
+                PressureTier.EMERGENCY: 90.0,
+            }
+            exit_ = {
+                PressureTier.ELEVATED: 50.0,
+                PressureTier.CONSTRAINED: 60.0,
+                PressureTier.CRITICAL: 75.0,
+                PressureTier.EMERGENCY: 85.0,
+            }
+
+        return cls(
+            enter_thresholds=enter,
+            exit_thresholds=exit_,
+        )
+
+
+# ===================================================================
+# DecisionEnvelope (provenance wrapper for actuator decisions)
+# ===================================================================
+
+@dataclasses.dataclass(frozen=True)
+class DecisionEnvelope:
+    """Provenance wrapper for every actuator decision.
+
+    Every action submitted by an actuator must be wrapped in a
+    ``DecisionEnvelope`` that records the snapshot, epoch, sequence, and
+    policy version that produced the decision.  The coordinator uses
+    ``is_stale`` to reject decisions that were computed against an
+    outdated snapshot.
+    """
+
+    snapshot_id: str
+    epoch: int
+    sequence: int
+    policy_version: str
+    pressure_tier: PressureTier
+    timestamp: float
+
+    def is_stale(self, *, current_epoch: int, current_sequence: int) -> bool:
+        """Return ``True`` if this envelope is outdated.
+
+        An envelope is stale when:
+        * Its epoch is behind the current epoch, **or**
+        * Its epoch matches but its sequence is behind the current sequence.
+        """
+        if self.epoch < current_epoch:
+            return True
+        if self.epoch == current_epoch and self.sequence < current_sequence:
+            return True
+        return False
