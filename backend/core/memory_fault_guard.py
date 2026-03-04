@@ -59,9 +59,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple
 
 import psutil
+
+from backend.core.memory_types import PressureTier
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 logger = logging.getLogger(__name__)
 
@@ -215,7 +220,11 @@ class MemoryFaultGuard:
         # Platform detection
         self._is_macos = platform.system().lower() == "darwin"
         self._is_arm64 = platform.machine().lower() in ("arm64", "aarch64")
-        
+
+        # MCP broker integration
+        self._mcp_active: bool = False
+        self._broker: Optional["MemoryBudgetBroker"] = None
+
         self._initialized = True
         logger.info("🛡️ MemoryFaultGuard initialized")
     
@@ -252,6 +261,50 @@ class MemoryFaultGuard:
             logger.error(f"❌ MemoryFaultGuard initialization failed: {e}")
             return False
     
+    def register_with_broker(self, broker: "MemoryBudgetBroker") -> None:
+        """Register with the MCP MemoryBudgetBroker.
+
+        Once registered, psutil call sites that read memory state for
+        decision-making or enrichment will prefer ``broker.latest_snapshot``
+        over raw psutil, falling back to psutil when no snapshot is available.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "MemoryFaultGuard registered with MCP broker (epoch=%d)",
+            broker.current_epoch,
+        )
+
+    # =========================================================================
+    # Broker snapshot helpers
+    # =========================================================================
+
+    def _get_snapshot_available_mb(self) -> Optional[float]:
+        """Return available MB from broker snapshot, or None if unavailable."""
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                return snap.physical_free / (1024 * 1024)
+        return None
+
+    def _get_snapshot_usage_percent(self) -> Optional[float]:
+        """Return memory usage percent from broker snapshot, or None."""
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                if snap.physical_total > 0:
+                    return (snap.physical_total - snap.physical_free) / snap.physical_total * 100.0
+                return 0.0
+        return None
+
+    def _get_snapshot_total_gb(self) -> Optional[float]:
+        """Return total RAM in GB from broker snapshot, or None."""
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                return snap.physical_total / (1024 ** 3)
+        return None
+
     def _allocate_emergency_reserve(self) -> None:
         """Allocate emergency memory reserve."""
         if self._emergency_reserve is not None:
@@ -389,13 +442,19 @@ class MemoryFaultGuard:
         )
         
         try:
-            # Get current memory state
-            mem = psutil.virtual_memory()
-            event.available_mb = mem.available / (1024 * 1024)
-            event.vm_usage_percent = mem.percent
+            # Get current memory state — prefer broker snapshot for consistency
+            snap_avail = self._get_snapshot_available_mb()
+            snap_pct = self._get_snapshot_usage_percent()
+            if snap_avail is not None and snap_pct is not None:
+                event.available_mb = snap_avail
+                event.vm_usage_percent = snap_pct
+            else:
+                mem = psutil.virtual_memory()
+                event.available_mb = mem.available / (1024 * 1024)
+                event.vm_usage_percent = mem.percent
         except Exception:
             pass
-        
+
         logger.critical(f"🚨 {message}")
         logger.critical(f"   Signal: {signum}")
         logger.critical(f"   Available: {event.available_mb:.0f}MB" if event.available_mb else "   Available: Unknown")
@@ -451,10 +510,14 @@ class MemoryFaultGuard:
             logger.info("   📝 Writing cross-repo signal...")
             self._write_signal_file(event)
             
-            # Check if we recovered enough memory
-            mem = psutil.virtual_memory()
-            available_mb = mem.available / (1024 * 1024)
-            
+            # Check if we recovered enough memory — broker snapshot or psutil
+            snap_avail = self._get_snapshot_available_mb()
+            if snap_avail is not None:
+                available_mb = snap_avail
+            else:
+                mem = psutil.virtual_memory()
+                available_mb = mem.available / (1024 * 1024)
+
             if available_mb > self.config.min_available_mb:
                 logger.info(f"   ✅ Recovered to {available_mb:.0f}MB available")
                 return True
@@ -519,12 +582,18 @@ class MemoryFaultGuard:
             cloud_lock_file = Path.home() / ".jarvis" / "trinity" / "cloud_lock.json"
             cloud_lock_file.parent.mkdir(parents=True, exist_ok=True)
             
-            mem = psutil.virtual_memory()
+            snap_total_gb = self._get_snapshot_total_gb()
+            if snap_total_gb is not None:
+                hw_ram_gb = snap_total_gb
+            else:
+                mem = psutil.virtual_memory()
+                hw_ram_gb = mem.total / (1024 ** 3)
+
             lock_data = {
                 "locked": True,
                 "reason": "SIGBUS_MEMORY_FAULT",
                 "timestamp": time.time(),
-                "hardware_ram_gb": mem.total / (1024 ** 3),
+                "hardware_ram_gb": hw_ram_gb,
                 "version": "v149.0",
             }
             
@@ -557,51 +626,62 @@ class MemoryFaultGuard:
     def check_memory_available(self, required_mb: int) -> Tuple[bool, str]:
         """
         Check if required memory is available before allocation.
-        
+
         Args:
             required_mb: Memory required in MB
-            
+
         Returns:
             (is_available, reason)
         """
         try:
-            mem = psutil.virtual_memory()
-            available_mb = mem.available / (1024 * 1024)
-            
+            snap_avail = self._get_snapshot_available_mb()
+            if snap_avail is not None:
+                available_mb = snap_avail
+            else:
+                mem = psutil.virtual_memory()
+                available_mb = mem.available / (1024 * 1024)
+
             # Account for emergency reserve
             effective_available = available_mb - self.config.min_available_mb
-            
+
             if effective_available >= required_mb:
                 return True, f"Available: {available_mb:.0f}MB (need {required_mb}MB)"
             else:
                 return False, f"Insufficient: {available_mb:.0f}MB available, need {required_mb}MB + {self.config.min_available_mb}MB buffer"
-                
+
         except Exception as e:
             return False, f"Cannot check memory: {e}"
     
     def check_vm_region_availability(self) -> Tuple[bool, str]:
         """
         Check if VM regions are healthy (not approaching exhaustion).
-        
+
         Returns:
             (is_healthy, reason)
         """
         try:
-            mem = psutil.virtual_memory()
-            usage_percent = mem.percent
-            
+            snap_pct = self._get_snapshot_usage_percent()
+            if snap_pct is not None:
+                usage_percent = snap_pct
+            else:
+                mem = psutil.virtual_memory()
+                usage_percent = mem.percent
+
             if usage_percent < self.config.vm_region_threshold_percent:
                 return True, f"VM usage: {usage_percent:.1f}% (threshold: {self.config.vm_region_threshold_percent}%)"
             else:
                 return False, f"VM usage too high: {usage_percent:.1f}% >= {self.config.vm_region_threshold_percent}%"
-                
+
         except Exception as e:
             return False, f"Cannot check VM regions: {e}"
     
     def should_offload_to_cloud(self) -> Tuple[bool, str]:
         """
         Determine if operations should be offloaded to cloud.
-        
+
+        When MCP broker is active, the primary decision uses
+        ``PressureTier >= CONSTRAINED`` instead of raw psutil thresholds.
+
         Returns:
             (should_offload, reason)
         """
@@ -610,23 +690,37 @@ class MemoryFaultGuard:
             e for e in self._fault_history
             if (datetime.now() - e.timestamp).total_seconds() < 300  # Last 5 minutes
         ]
-        
+
         if recent_faults:
             return True, f"Recent memory faults: {len(recent_faults)} in last 5 minutes"
-        
+
         # Check if reserve was released (indicates previous fault)
         if self._reserve_released:
             return True, "Emergency reserve was released - memory critically low"
-        
-        # Check current memory state
+
+        # MCP broker path: use PressureTier for the offload decision
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                if snap.pressure_tier >= PressureTier.CONSTRAINED:
+                    return True, (
+                        f"MCP pressure tier {snap.pressure_tier.name} "
+                        f">= CONSTRAINED — offload recommended"
+                    )
+                return False, (
+                    f"MCP pressure tier {snap.pressure_tier.name} "
+                    f"— memory healthy, local operation OK"
+                )
+
+        # Legacy fallback: check current memory state via psutil
         available_ok, reason = self.check_memory_available(500)  # Need 500MB buffer
         if not available_ok:
             return True, reason
-        
+
         vm_ok, reason = self.check_vm_region_availability()
         if not vm_ok:
             return True, reason
-        
+
         return False, "Memory healthy - local operation OK"
     
     def register_fault_callback(self, callback: Callable[[FaultEvent], None]) -> None:
@@ -651,8 +745,17 @@ class MemoryFaultGuard:
     
     def get_status(self) -> Dict[str, Any]:
         """Get current guard status."""
-        mem = psutil.virtual_memory()
-        
+        snap_avail = self._get_snapshot_available_mb()
+        snap_pct = self._get_snapshot_usage_percent()
+
+        if snap_avail is not None and snap_pct is not None:
+            memory_available_mb = snap_avail
+            memory_percent = snap_pct
+        else:
+            mem = psutil.virtual_memory()
+            memory_available_mb = mem.available / (1024 * 1024)
+            memory_percent = mem.percent
+
         return {
             "initialized": self._initialized,
             "handlers_installed": self._handlers_installed,
@@ -664,9 +767,10 @@ class MemoryFaultGuard:
                 e for e in self._fault_history
                 if (datetime.now() - e.timestamp).total_seconds() < 300
             ]),
-            "memory_available_mb": mem.available / (1024 * 1024),
-            "memory_percent": mem.percent,
+            "memory_available_mb": memory_available_mb,
+            "memory_percent": memory_percent,
             "is_recovering": self._is_recovering,
+            "mcp_active": self._mcp_active,
             "platform": "macos_arm64" if self._is_macos and self._is_arm64 else platform.system(),
         }
     
