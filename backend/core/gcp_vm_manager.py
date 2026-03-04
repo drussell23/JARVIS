@@ -64,10 +64,13 @@ if TYPE_CHECKING:
     InstancesClientType = compute_v1_types.InstancesClient
     ZonesClientType = compute_v1_types.ZonesClient
     InstanceType = compute_v1_types.Instance
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 else:
     InstancesClientType = Any
     ZonesClientType = Any
     InstanceType = Any
+
+from backend.core.memory_types import PressureTier, MemorySnapshot
 
 # Import with fallback for different import contexts
 try:
@@ -2645,6 +2648,32 @@ class GCPVMManager:
         self._golden_image_cache: Optional[GoldenImageInfo] = None
         self._golden_image_cache_time: float = 0
         self._golden_image_cache_ttl: float = 300  # 5 minutes
+
+        # MCP broker integration — when registered, VM lifecycle decisions
+        # use the broker's cached pressure tier instead of raw psutil calls.
+        self._mcp_active: bool = False
+        self._broker: Optional[MemoryBudgetBroker] = None
+
+    # -----------------------------------------------------------------
+    # MCP broker integration
+    # -----------------------------------------------------------------
+
+    def register_with_broker(self, broker: MemoryBudgetBroker) -> None:
+        """Register this VM manager as a broker-aware component.
+
+        Once registered, VM lifecycle decisions (e.g. whether local memory
+        pressure has normalized) use the broker's cached ``PressureTier``
+        instead of calling ``psutil.virtual_memory()`` directly.  The
+        legacy psutil fallback remains for when ``_mcp_active`` is False.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "[GCPVMManager] Registered with MCP broker (mcp_active=True)"
+        )
 
     # =========================================================================
     # v86.0: Property accessors for clean interface
@@ -7392,25 +7421,46 @@ class GCPVMManager:
 
                     # 4d. Check if local memory pressure normalized (VM no longer needed)
                     try:
-                        import psutil
-                        local_mem_percent = psutil.virtual_memory().percent
+                        _pressure_normalized = False
+                        _pressure_detail = ""
 
-                        if local_mem_percent < 70:
-                            logger.info(
-                                f"📉 Local RAM normalized ({local_mem_percent:.1f}%) - "
-                                f"VM {vm_name} no longer needed"
-                            )
-                            _notify_lifecycle("notify_pressure_cooled", local_mem_percent=local_mem_percent, vm_name=vm_name)
+                        if self._mcp_active and self._broker is not None:
+                            # MCP path: use broker's cached pressure tier
+                            _snap = self._broker.latest_snapshot
+                            if _snap is not None and _snap.pressure_tier <= PressureTier.OPTIMAL:
+                                _pressure_normalized = True
+                                _pressure_detail = (
+                                    f"pressure_tier={_snap.pressure_tier.name}, "
+                                    f"snapshot={_snap.snapshot_id}"
+                                )
+                                logger.info(
+                                    f"📉 Local pressure normalized ({_pressure_detail}) - "
+                                    f"VM {vm_name} no longer needed (MCP)"
+                                )
+                        if not _pressure_normalized and not self._mcp_active:
+                            # Legacy path: raw psutil
+                            import psutil
+                            local_mem_percent = psutil.virtual_memory().percent
+                            if local_mem_percent < 70:
+                                _pressure_normalized = True
+                                _pressure_detail = f"local RAM: {local_mem_percent:.1f}%"
+                                logger.info(
+                                    f"📉 Local RAM normalized ({local_mem_percent:.1f}%) - "
+                                    f"VM {vm_name} no longer needed"
+                                )
+
+                        if _pressure_normalized:
+                            _notify_lifecycle("notify_pressure_cooled", pressure_detail=_pressure_detail, vm_name=vm_name)
                             # v271.0: Log memory-pressure termination decision
                             try:
                                 from backend.core.decision_log import record_decision, DECISION_VM_TERMINATION
                                 record_decision(
                                     decision_type=DECISION_VM_TERMINATION,
-                                    reason=f"Memory pressure resolved (local RAM: {local_mem_percent:.1f}%)",
+                                    reason=f"Memory pressure resolved ({_pressure_detail})",
                                     inputs={
                                         "vm_name": vm_name,
-                                        "local_mem_percent": round(local_mem_percent, 1),
-                                        "threshold_percent": 70,
+                                        "pressure_detail": _pressure_detail,
+                                        "mcp_active": self._mcp_active,
                                     },
                                     outcome="terminated",
                                     component="gcp_vm_manager",
@@ -7419,7 +7469,7 @@ class GCPVMManager:
                                 pass
                             await self.terminate_vm(
                                 vm_name,
-                                reason=f"Memory pressure resolved (local RAM: {local_mem_percent:.1f}%)"
+                                reason=f"Memory pressure resolved ({_pressure_detail})"
                             )
                             continue
                     except Exception as mem_check_error:
@@ -10019,6 +10069,7 @@ async def cleanup_vm_manager():
 async def proactive_vm_manager_init(
     memory_threshold: float = 70.0,
     force: bool = False,
+    broker: Optional[MemoryBudgetBroker] = None,
 ) -> Optional[GCPVMManager]:
     """
     v95.0: Proactively initialize VM manager based on memory pressure.
@@ -10026,28 +10077,63 @@ async def proactive_vm_manager_init(
     This function checks memory usage and initializes the VM manager
     if memory is above the threshold, preparing for potential offloading.
 
+    When a ``broker`` is provided, the function uses the broker's cached
+    pressure tier instead of calling ``psutil.virtual_memory()`` directly.
+    Pressure at or below ``OPTIMAL`` is treated as "below threshold".
+
     Args:
         memory_threshold: Memory percentage threshold to trigger init (default 70%)
         force: If True, initialize regardless of memory pressure
+        broker: Optional ``MemoryBudgetBroker`` — when provided, uses cached
+                pressure tier instead of raw psutil.
 
     Returns:
         GCPVMManager instance if initialized, None if not needed or unavailable
     """
     try:
-        import psutil
-        mem_percent = psutil.virtual_memory().percent
+        _needs_init = force
 
-        if not force and mem_percent < memory_threshold:
-            logger.debug(
-                f"[v95.0] Memory ({mem_percent:.1f}%) below threshold ({memory_threshold}%) - "
-                f"VM manager init deferred"
+        if not _needs_init and broker is not None:
+            # MCP path: use broker's cached pressure tier
+            _snap = broker.latest_snapshot
+            if _snap is not None:
+                if _snap.pressure_tier > PressureTier.OPTIMAL:
+                    _needs_init = True
+                    logger.info(
+                        f"[v95.0] Pressure elevated ({_snap.pressure_tier.name}) - "
+                        f"proactively initializing VM manager (MCP)"
+                    )
+                else:
+                    logger.debug(
+                        f"[v95.0] Pressure normal ({_snap.pressure_tier.name}) - "
+                        f"VM manager init deferred (MCP)"
+                    )
+            else:
+                # No snapshot yet — fall through to legacy psutil
+                logger.debug(
+                    "[v95.0] Broker has no snapshot yet — falling back to psutil"
+                )
+
+        if not _needs_init and broker is None:
+            # Legacy path: raw psutil
+            import psutil
+            mem_percent = psutil.virtual_memory().percent
+
+            if mem_percent < memory_threshold:
+                logger.debug(
+                    f"[v95.0] Memory ({mem_percent:.1f}%) below threshold ({memory_threshold}%) - "
+                    f"VM manager init deferred"
+                )
+                return None
+
+            _needs_init = True
+            logger.info(
+                f"[v95.0] Memory pressure detected ({mem_percent:.1f}%) - "
+                f"proactively initializing VM manager"
             )
-            return None
 
-        logger.info(
-            f"[v95.0] Memory pressure detected ({mem_percent:.1f}%) - "
-            f"proactively initializing VM manager"
-        )
+        if not _needs_init:
+            return None
 
         manager = await get_gcp_vm_manager_safe()
 
@@ -10094,6 +10180,29 @@ class LocalMemoryFallback:
         self._last_gc_time = 0.0
         self._cache_clear_callbacks: List[Callable] = []
 
+        # MCP broker integration — when active, uses broker snapshot
+        # for the initial memory reading in attempt_local_relief().
+        self._mcp_active: bool = False
+        self._broker: Optional[MemoryBudgetBroker] = None
+
+    def register_with_broker(self, broker: MemoryBudgetBroker) -> None:
+        """Register this fallback handler with the MCP broker.
+
+        When registered, ``attempt_local_relief()`` reads the initial
+        memory percentage from the broker's cached snapshot instead of
+        calling ``psutil.virtual_memory()`` for that reading.  The final
+        measurement always uses raw psutil to capture actual post-relief
+        state.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        self.logger.info(
+            "[LocalMemoryFallback] Registered with MCP broker (mcp_active=True)"
+        )
+
     def register_cache_clear_callback(self, callback: Callable) -> None:
         """Register a callback to be invoked when clearing caches."""
         if callback not in self._cache_clear_callbacks:
@@ -10109,10 +10218,25 @@ class LocalMemoryFallback:
         import gc
         import psutil
 
+        # Initial memory reading: prefer broker snapshot if available
+        if self._mcp_active and self._broker is not None:
+            _snap = self._broker.latest_snapshot
+            if _snap is not None:
+                _used = _snap.physical_total - _snap.physical_free
+                _initial_percent = (
+                    _used / _snap.physical_total * 100.0
+                    if _snap.physical_total > 0
+                    else psutil.virtual_memory().percent
+                )
+            else:
+                _initial_percent = psutil.virtual_memory().percent
+        else:
+            _initial_percent = psutil.virtual_memory().percent
+
         result = {
             "freed_mb": 0.0,
             "strategies_used": [],
-            "initial_memory_percent": psutil.virtual_memory().percent,
+            "initial_memory_percent": _initial_percent,
             "final_memory_percent": 0.0,
         }
 
