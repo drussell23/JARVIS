@@ -1,0 +1,490 @@
+"""BudgetedLoader protocol and concrete loader adapters.
+
+Every component that needs memory from the Memory Control Plane must
+implement the ``BudgetedLoader`` protocol.  This module provides the
+abstract protocol plus four concrete adapters -- LLM, Whisper, ECAPA,
+and Embedding -- each with calibrated ``estimate_bytes`` calculations
+and degradation options.
+
+The ``load_with_grant()`` method is intentionally stubbed (raises
+``NotImplementedError``) and will be wired to real model-loading code
+in Task 7.
+
+Public API
+----------
+Protocols:
+    BudgetedLoader
+
+Concrete loaders:
+    LLMBudgetedLoader, WhisperBudgetedLoader,
+    EcapaBudgetedLoader, EmbeddingBudgetedLoader
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, runtime_checkable
+
+from typing_extensions import Protocol
+
+from backend.core.memory_types import (
+    BudgetPriority,
+    ConfigProof,
+    DegradationOption,
+    LoadResult,
+    StartupPhase,
+)
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import BudgetGrant
+
+logger = logging.getLogger(__name__)
+
+
+# ===================================================================
+# Protocol
+# ===================================================================
+
+
+@runtime_checkable
+class BudgetedLoader(Protocol):
+    """Protocol that every memory-managed model loader must satisfy.
+
+    The broker discovers loaders via this interface and calls
+    ``estimate_bytes`` / ``load_with_grant`` / ``prove_config``
+    during the grant lifecycle.
+    """
+
+    @property
+    def component_id(self) -> str:
+        """Versioned component identifier, e.g. ``"llm:mistral-7b-q4@v1"``."""
+        ...
+
+    @property
+    def phase(self) -> StartupPhase:
+        """Startup phase during which this loader should be funded."""
+        ...
+
+    @property
+    def priority(self) -> BudgetPriority:
+        """Budget priority class for grant ordering."""
+        ...
+
+    def estimate_bytes(self, config: Dict[str, Any]) -> int:
+        """Return estimated peak memory consumption in bytes."""
+        ...
+
+    async def load_with_grant(self, grant: BudgetGrant) -> LoadResult:
+        """Load the component using the resources described in *grant*."""
+        ...
+
+    def prove_config(self, constraints: Dict[str, Any]) -> ConfigProof:
+        """Return evidence that the loader applied *constraints*."""
+        ...
+
+    def measure_actual_bytes(self) -> int:
+        """Measure current resident memory (bytes) after loading."""
+        ...
+
+    async def release_handle(self, reason: str) -> None:
+        """Release the loaded model / resource."""
+        ...
+
+
+# ===================================================================
+# Boot profile helpers
+# ===================================================================
+
+_BOOT_PROFILE_PHASE_MAP: Dict[str, StartupPhase] = {
+    "interactive": StartupPhase.BOOT_OPTIONAL,
+    "headless": StartupPhase.BACKGROUND,
+    "server": StartupPhase.BACKGROUND,
+    "minimal": StartupPhase.BACKGROUND,
+}
+
+_BOOT_PROFILE_PRIORITY_MAP: Dict[str, BudgetPriority] = {
+    "interactive": BudgetPriority.BOOT_OPTIONAL,
+    "headless": BudgetPriority.BACKGROUND,
+    "server": BudgetPriority.BACKGROUND,
+    "minimal": BudgetPriority.BACKGROUND,
+}
+
+
+def _resolve_boot_profile() -> str:
+    """Read ``JARVIS_BOOT_PROFILE`` env var, default to ``"interactive"``."""
+    return os.environ.get("JARVIS_BOOT_PROFILE", "interactive").lower()
+
+
+# ===================================================================
+# LLMBudgetedLoader
+# ===================================================================
+
+
+class LLMBudgetedLoader:
+    """Budgeted loader adapter for local LLM inference (llama.cpp, etc.).
+
+    The estimate accounts for raw model weights, KV-cache proportional
+    to context length, and a fixed runtime overhead.
+
+    Parameters
+    ----------
+    model_name:
+        Human-readable model identifier (used in ``component_id``).
+    size_mb:
+        Model file size on disk in megabytes (approximate VRAM need).
+    context_length:
+        Maximum context window in tokens.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "unknown",
+        size_mb: int = 0,
+        context_length: int = 2048,
+    ) -> None:
+        self._model_name = model_name
+        self._size_mb = size_mb
+        self._context_length = context_length
+        self._model_handle: Optional[Any] = None
+
+    # --- Protocol properties ---
+
+    @property
+    def component_id(self) -> str:
+        return f"llm:{self._model_name}@v1"
+
+    @property
+    def phase(self) -> StartupPhase:
+        profile = _resolve_boot_profile()
+        return _BOOT_PROFILE_PHASE_MAP.get(profile, StartupPhase.BOOT_OPTIONAL)
+
+    @property
+    def priority(self) -> BudgetPriority:
+        profile = _resolve_boot_profile()
+        return _BOOT_PROFILE_PRIORITY_MAP.get(profile, BudgetPriority.BOOT_OPTIONAL)
+
+    # --- Estimation ---
+
+    def estimate_bytes(self, config: Dict[str, Any]) -> int:
+        """Estimate peak memory including model weights, KV-cache, and overhead.
+
+        KV-cache scaling logic:
+            ``size_scale = min(2.0, size_mb / 4000)``
+            ``kv_cache_mb = (context / 1024) * 64 * size_scale``
+
+        A fixed 512 MB overhead covers runtime allocations (scratch buffers,
+        thread stacks, Metal command buffers, etc.).
+        """
+        size_mb: int = config.get("size_mb", self._size_mb)
+        ctx: int = config.get("context_length", self._context_length)
+
+        size_scale = min(2.0, size_mb / 4000) if size_mb > 0 else 0.0
+        kv_cache_mb = (ctx / 1024) * 64 * size_scale
+        overhead_mb = 512
+
+        return int((size_mb + kv_cache_mb + overhead_mb) * 1024 * 1024)
+
+    # --- Degradation ---
+
+    @property
+    def degradation_options(self) -> List[DegradationOption]:
+        """Return available degradation options based on current config."""
+        options: List[DegradationOption] = []
+
+        if self._context_length > 2048:
+            reduced_estimate = self.estimate_bytes(
+                {"size_mb": self._size_mb, "context_length": 2048}
+            )
+            options.append(
+                DegradationOption(
+                    name="reduce_context_2048",
+                    bytes_required=reduced_estimate,
+                    quality_impact=0.2,
+                    constraints={"context_length": 2048},
+                )
+            )
+
+        if self._context_length > 1024:
+            reduced_estimate = self.estimate_bytes(
+                {"size_mb": self._size_mb, "context_length": 1024}
+            )
+            options.append(
+                DegradationOption(
+                    name="reduce_context_1024",
+                    bytes_required=reduced_estimate,
+                    quality_impact=0.4,
+                    constraints={"context_length": 1024},
+                )
+            )
+
+        # CPU-only fallback: zero GPU layers, context capped at 2048
+        cpu_ctx = min(self._context_length, 2048)
+        cpu_estimate = self.estimate_bytes(
+            {"size_mb": self._size_mb, "context_length": cpu_ctx}
+        )
+        options.append(
+            DegradationOption(
+                name="cpu_only",
+                bytes_required=cpu_estimate,
+                quality_impact=0.6,
+                constraints={"n_gpu_layers": 0, "context_length": cpu_ctx},
+            )
+        )
+
+        return options
+
+    # --- Stubs (wired in Task 7) ---
+
+    async def load_with_grant(self, grant: BudgetGrant) -> LoadResult:
+        raise NotImplementedError("Wired in Task 7")
+
+    def prove_config(self, constraints: Dict[str, Any]) -> ConfigProof:
+        return ConfigProof(
+            component_id=self.component_id,
+            requested_constraints=constraints,
+            applied_config=constraints,
+            compliant=True,
+            evidence="stub -- compliance proven after wiring in Task 7",
+        )
+
+    def measure_actual_bytes(self) -> int:
+        """Return 0 when no model is loaded."""
+        return 0
+
+    async def release_handle(self, reason: str) -> None:
+        logger.info(
+            "Releasing LLM handle for %s: %s", self.component_id, reason,
+        )
+        self._model_handle = None
+
+
+# ===================================================================
+# WhisperBudgetedLoader
+# ===================================================================
+
+
+class WhisperBudgetedLoader:
+    """Budgeted loader adapter for Whisper speech-to-text models.
+
+    Parameters
+    ----------
+    model_size:
+        Whisper model variant (``"tiny"``, ``"base"``, ``"small"``,
+        ``"medium"``, ``"large"``).
+    """
+
+    MODEL_SIZES_MB: Dict[str, int] = {
+        "tiny": 75,
+        "base": 150,
+        "small": 500,
+        "medium": 1500,
+        "large": 3000,
+    }
+    OVERHEAD_MB: int = 200
+
+    def __init__(self, model_size: str = "base") -> None:
+        if model_size not in self.MODEL_SIZES_MB:
+            raise ValueError(
+                f"Unknown Whisper model size {model_size!r}; "
+                f"expected one of {sorted(self.MODEL_SIZES_MB)}"
+            )
+        self._model_size = model_size
+        self._model_handle: Optional[Any] = None
+
+    # --- Protocol properties ---
+
+    @property
+    def component_id(self) -> str:
+        return f"whisper:{self._model_size}@v1"
+
+    @property
+    def phase(self) -> StartupPhase:
+        return StartupPhase.BOOT_OPTIONAL
+
+    @property
+    def priority(self) -> BudgetPriority:
+        return BudgetPriority.BOOT_OPTIONAL
+
+    # --- Estimation ---
+
+    def estimate_bytes(self, config: Dict[str, Any]) -> int:
+        size_key = config.get("model_size", self._model_size)
+        model_mb = self.MODEL_SIZES_MB.get(size_key, self.MODEL_SIZES_MB[self._model_size])
+        return int((model_mb + self.OVERHEAD_MB) * 1024 * 1024)
+
+    # --- Degradation ---
+
+    @property
+    def degradation_options(self) -> List[DegradationOption]:
+        if self._model_size == "tiny":
+            return []
+        tiny_estimate = self.estimate_bytes({"model_size": "tiny"})
+        return [
+            DegradationOption(
+                name="whisper_tiny",
+                bytes_required=tiny_estimate,
+                quality_impact=0.5,
+                constraints={"model_size": "tiny"},
+            )
+        ]
+
+    # --- Stubs ---
+
+    async def load_with_grant(self, grant: BudgetGrant) -> LoadResult:
+        raise NotImplementedError("Wired in Task 7")
+
+    def prove_config(self, constraints: Dict[str, Any]) -> ConfigProof:
+        return ConfigProof(
+            component_id=self.component_id,
+            requested_constraints=constraints,
+            applied_config=constraints,
+            compliant=True,
+            evidence="stub -- compliance proven after wiring in Task 7",
+        )
+
+    def measure_actual_bytes(self) -> int:
+        return 0
+
+    async def release_handle(self, reason: str) -> None:
+        logger.info(
+            "Releasing Whisper handle for %s: %s", self.component_id, reason,
+        )
+        self._model_handle = None
+
+
+# ===================================================================
+# EcapaBudgetedLoader
+# ===================================================================
+
+
+class EcapaBudgetedLoader:
+    """Budgeted loader adapter for ECAPA-TDNN speaker verification.
+
+    The ECAPA-TDNN model is relatively small (~150 MB weights) but
+    requires runtime buffers.  Estimated at 350 MB total.
+    """
+
+    _ESTIMATE_MB: int = 350
+
+    def __init__(self) -> None:
+        self._model_handle: Optional[Any] = None
+
+    # --- Protocol properties ---
+
+    @property
+    def component_id(self) -> str:
+        return "ecapa_tdnn@v1"
+
+    @property
+    def phase(self) -> StartupPhase:
+        return StartupPhase.BOOT_OPTIONAL
+
+    @property
+    def priority(self) -> BudgetPriority:
+        return BudgetPriority.BOOT_OPTIONAL
+
+    # --- Estimation ---
+
+    def estimate_bytes(self, config: Dict[str, Any]) -> int:
+        return int(self._ESTIMATE_MB * 1024 * 1024)
+
+    # --- Degradation ---
+
+    @property
+    def degradation_options(self) -> List[DegradationOption]:
+        # ECAPA-TDNN is already small; no meaningful degradation path.
+        return []
+
+    # --- Stubs ---
+
+    async def load_with_grant(self, grant: BudgetGrant) -> LoadResult:
+        raise NotImplementedError("Wired in Task 7")
+
+    def prove_config(self, constraints: Dict[str, Any]) -> ConfigProof:
+        return ConfigProof(
+            component_id=self.component_id,
+            requested_constraints=constraints,
+            applied_config=constraints,
+            compliant=True,
+            evidence="stub -- compliance proven after wiring in Task 7",
+        )
+
+    def measure_actual_bytes(self) -> int:
+        return 0
+
+    async def release_handle(self, reason: str) -> None:
+        logger.info(
+            "Releasing ECAPA handle for %s: %s", self.component_id, reason,
+        )
+        self._model_handle = None
+
+
+# ===================================================================
+# EmbeddingBudgetedLoader
+# ===================================================================
+
+
+class EmbeddingBudgetedLoader:
+    """Budgeted loader adapter for sentence-transformer embeddings.
+
+    Default model is ``all-MiniLM-L6-v2`` (~80 MB weights) with
+    tokenizer and runtime overhead estimated at 400 MB total.
+    """
+
+    _MODEL_NAME: str = "all-MiniLM-L6-v2"
+    _ESTIMATE_MB: int = 400
+
+    def __init__(self) -> None:
+        self._model_handle: Optional[Any] = None
+
+    # --- Protocol properties ---
+
+    @property
+    def component_id(self) -> str:
+        return f"embedding:{self._MODEL_NAME}@v1"
+
+    @property
+    def phase(self) -> StartupPhase:
+        return StartupPhase.BOOT_OPTIONAL
+
+    @property
+    def priority(self) -> BudgetPriority:
+        return BudgetPriority.BOOT_OPTIONAL
+
+    # --- Estimation ---
+
+    def estimate_bytes(self, config: Dict[str, Any]) -> int:
+        return int(self._ESTIMATE_MB * 1024 * 1024)
+
+    # --- Degradation ---
+
+    @property
+    def degradation_options(self) -> List[DegradationOption]:
+        # Fixed model, no degradation path.
+        return []
+
+    # --- Stubs ---
+
+    async def load_with_grant(self, grant: BudgetGrant) -> LoadResult:
+        raise NotImplementedError("Wired in Task 7")
+
+    def prove_config(self, constraints: Dict[str, Any]) -> ConfigProof:
+        return ConfigProof(
+            component_id=self.component_id,
+            requested_constraints=constraints,
+            applied_config=constraints,
+            compliant=True,
+            evidence="stub -- compliance proven after wiring in Task 7",
+        )
+
+    def measure_actual_bytes(self) -> int:
+        return 0
+
+    async def release_handle(self, reason: str) -> None:
+        logger.info(
+            "Releasing embedding handle for %s: %s",
+            self.component_id,
+            reason,
+        )
+        self._model_handle = None
