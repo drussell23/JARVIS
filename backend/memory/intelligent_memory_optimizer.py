@@ -28,16 +28,21 @@ import logging
 import subprocess
 import gc
 import ctypes
-from typing import List, Dict, Tuple, Optional, Any
+from typing import List, Dict, Tuple, Optional, Any, TYPE_CHECKING
 from datetime import datetime
 import json
 from pathlib import Path
+
+from backend.core.memory_types import PressureTier
 
 # Import optimization config
 try:
     from .optimization_config import optimization_config, AppProfile
 except ImportError:
     from optimization_config import optimization_config, AppProfile
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +230,75 @@ class IntelligentMemoryOptimizer:
         self.target_memory_percent = 45  # Target for LangChain mode
         self.optimization_history = []
 
+        # MCP broker integration -- when registered, decision-making
+        # psutil calls are replaced with broker snapshots for consistency.
+        self._mcp_active: bool = False
+        self._broker: Optional["MemoryBudgetBroker"] = None
+
+    # -----------------------------------------------------------------
+    # MCP broker integration
+    # -----------------------------------------------------------------
+
+    def register_with_broker(self, broker: "MemoryBudgetBroker") -> None:
+        """Register with the MCP memory budget broker.
+
+        Once registered, decision-making memory reads (optimization loop
+        checks, target comparisons, status reporting) use the broker's
+        cached snapshot instead of raw ``psutil``.  Effectiveness
+        measurements (before/after deltas around cache clears, purges)
+        intentionally remain on raw ``psutil`` for accurate hardware
+        readings.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "[IntelligentMemoryOptimizer] Registered with MCP broker "
+            "(mcp_active=True)"
+        )
+
+    def _get_memory_percent_from_broker(self) -> Optional[float]:
+        """Return memory usage percent from broker snapshot, or None.
+
+        Returns ``None`` when MCP is not active or no snapshot is
+        available yet, signalling the caller to fall back to psutil.
+        """
+        if not self._mcp_active or self._broker is None:
+            return None
+        snap = self._broker.latest_snapshot
+        if snap is None:
+            return None
+        try:
+            used = snap.physical_total - snap.physical_free
+            return (used / snap.physical_total) * 100.0
+        except (AttributeError, ZeroDivisionError):
+            return None
+
+    def _get_memory_snapshot_from_broker(self) -> Optional[Any]:
+        """Return a dict-like memory snapshot from the broker.
+
+        Returns a dict with ``percent``, ``used``, ``total`` keys
+        matching the fields callers expect from ``psutil.virtual_memory()``.
+        Returns ``None`` when the broker path is unavailable.
+        """
+        if not self._mcp_active or self._broker is None:
+            return None
+        snap = self._broker.latest_snapshot
+        if snap is None:
+            return None
+        try:
+            used = snap.physical_total - snap.physical_free
+            pct = (used / snap.physical_total) * 100.0
+            return {
+                "percent": pct,
+                "used": used,
+                "total": snap.physical_total,
+            }
+        except (AttributeError, ZeroDivisionError):
+            return None
+
     async def optimize_for_langchain(
         self, aggressive: bool = False
     ) -> Tuple[bool, Dict[str, Any]]:
@@ -251,9 +325,15 @@ class IntelligentMemoryOptimizer:
             f"Starting {'aggressive' if aggressive else 'intelligent'} memory optimization for LangChain"
         )
 
-        initial_memory = psutil.virtual_memory()
+        # Site 1: initial memory snapshot -- use broker when active
+        broker_pct = self._get_memory_percent_from_broker()
+        if broker_pct is not None:
+            initial_percent = broker_pct
+        else:
+            initial_percent = psutil.virtual_memory().percent
+
         report = {
-            "initial_percent": initial_memory.percent,
+            "initial_percent": initial_percent,
             "target_percent": self.target_memory_percent,
             "actions_taken": [],
             "memory_freed_mb": 0,
@@ -263,9 +343,9 @@ class IntelligentMemoryOptimizer:
         }
 
         # If already below target, we're good
-        if initial_memory.percent <= self.target_memory_percent:
+        if initial_percent <= self.target_memory_percent:
             report["success"] = True
-            report["final_percent"] = initial_memory.percent
+            report["final_percent"] = initial_percent
             return True, report
 
         # Calculate how much memory we need to free
@@ -288,7 +368,11 @@ class IntelligentMemoryOptimizer:
         ]
 
         for strategy_name, strategy_func in strategies:
-            if psutil.virtual_memory().percent <= self.target_memory_percent:
+            # Site 2: loop check -- use broker when active
+            loop_pct = self._get_memory_percent_from_broker()
+            if loop_pct is None:
+                loop_pct = psutil.virtual_memory().percent
+            if loop_pct <= self.target_memory_percent:
                 break
 
             try:
@@ -306,10 +390,12 @@ class IntelligentMemoryOptimizer:
             except Exception as e:
                 logger.warning(f"Strategy {strategy_name} failed: {e}")
 
-        # Final check
-        final_memory = psutil.virtual_memory()
-        report["final_percent"] = final_memory.percent
-        report["success"] = final_memory.percent <= self.target_memory_percent
+        # Site 3: final memory check -- use broker when active
+        final_pct = self._get_memory_percent_from_broker()
+        if final_pct is None:
+            final_pct = psutil.virtual_memory().percent
+        report["final_percent"] = final_pct
+        report["success"] = final_pct <= self.target_memory_percent
 
         # Save optimization history
         self._save_optimization_report(report)
@@ -318,13 +404,19 @@ class IntelligentMemoryOptimizer:
 
     def _calculate_memory_to_free(self) -> float:
         """Calculate how much memory needs to be freed to reach target.
-        
+
         Returns:
             Amount of memory in MB that needs to be freed
         """
-        mem = psutil.virtual_memory()
-        current_used_mb = mem.used / (1024 * 1024)
-        target_used_mb = (mem.total * self.target_memory_percent / 100) / (1024 * 1024)
+        # Site 4: use broker snapshot when active
+        broker_snap = self._get_memory_snapshot_from_broker()
+        if broker_snap is not None:
+            current_used_mb = broker_snap["used"] / (1024 * 1024)
+            target_used_mb = (broker_snap["total"] * self.target_memory_percent / 100) / (1024 * 1024)
+        else:
+            mem = psutil.virtual_memory()
+            current_used_mb = mem.used / (1024 * 1024)
+            target_used_mb = (mem.total * self.target_memory_percent / 100) / (1024 * 1024)
         return max(0, current_used_mb - target_used_mb)
 
     async def _optimize_python_memory(self) -> float:
@@ -590,9 +682,11 @@ class IntelligentMemoryOptimizer:
                     except Exception:
                         pass
 
-            # Check if we've freed enough memory
-            current_mem = psutil.virtual_memory().percent
-            if current_mem <= self.target_memory_percent:
+            # Site 6: check if we've freed enough -- use broker when active
+            current_mem_pct = self._get_memory_percent_from_broker()
+            if current_mem_pct is None:
+                current_mem_pct = psutil.virtual_memory().percent
+            if current_mem_pct <= self.target_memory_percent:
                 logger.info(
                     f"Target memory reached after closing {len(closed_apps)} apps"
                 )
@@ -866,9 +960,15 @@ class MemoryOptimizationAPI:
             ...     print(f"- {suggestion}")
         """
         suggestions = await self.optimizer.get_optimization_suggestions()
+        # Site 8: status reporting -- use broker when active
+        broker_pct = self.optimizer._get_memory_percent_from_broker()
+        if broker_pct is not None:
+            current_pct = broker_pct
+        else:
+            current_pct = psutil.virtual_memory().percent
         return {
             "suggestions": suggestions,
-            "current_memory_percent": psutil.virtual_memory().percent,
+            "current_memory_percent": current_pct,
         }
 
 if __name__ == "__main__":
