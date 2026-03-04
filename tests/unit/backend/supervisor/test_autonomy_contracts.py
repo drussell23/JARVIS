@@ -206,3 +206,115 @@ def test_autonomy_reason_to_mode_mapping():
     assert _REASON_TO_MODE["schema_mismatch"] == "read_only"
     assert _REASON_TO_MODE["timeout"] == "read_only"
     assert _REASON_TO_MODE["active"] == "active"
+
+
+import asyncio
+
+
+@pytest.mark.asyncio
+async def test_await_autonomy_dependencies_early_exit():
+    """Should exit early when all dependencies are met."""
+    from backend.supervisor.cross_repo_startup_orchestrator import (
+        await_autonomy_dependencies,
+    )
+
+    call_count = 0
+
+    async def mock_check():
+        nonlocal call_count
+        call_count += 1
+        return True, "autonomy_ready", {
+            "reason": "active",
+            "pending": [],
+            "prime_reachable": True,
+            "reactor_reachable": True,
+            "body_journal": True,
+        }
+
+    result = await await_autonomy_dependencies(
+        check_fn=mock_check, timeout=15.0, poll_interval=0.1,
+    )
+    assert result["all_ready"] is True
+    assert call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_await_autonomy_dependencies_timeout():
+    """Should return partial results on timeout."""
+    from backend.supervisor.cross_repo_startup_orchestrator import (
+        await_autonomy_dependencies,
+    )
+
+    async def mock_check():
+        return False, "contract_mismatch", {
+            "reason": "pending_services",
+            "pending": ["prime"],
+            "prime_reachable": False,
+            "reactor_reachable": True,
+            "body_journal": True,
+        }
+
+    result = await await_autonomy_dependencies(
+        check_fn=mock_check, timeout=0.3, poll_interval=0.1,
+    )
+    assert result["all_ready"] is False
+    assert result["reason"] == "pending_services"
+
+
+@pytest.mark.asyncio
+async def test_await_autonomy_dependencies_gradual_readiness():
+    """Should keep polling until all dependencies are ready."""
+    from backend.supervisor.cross_repo_startup_orchestrator import (
+        await_autonomy_dependencies,
+    )
+
+    poll_count = 0
+
+    async def mock_check():
+        nonlocal poll_count
+        poll_count += 1
+        if poll_count < 3:
+            return False, "contract_mismatch", {
+                "reason": "pending_services",
+                "pending": ["prime"],
+                "prime_reachable": False,
+                "reactor_reachable": True,
+                "body_journal": True,
+            }
+        return True, "autonomy_ready", {
+            "reason": "active",
+            "pending": [],
+            "prime_reachable": True,
+            "reactor_reachable": True,
+            "body_journal": True,
+        }
+
+    result = await await_autonomy_dependencies(
+        check_fn=mock_check, timeout=5.0, poll_interval=0.1,
+    )
+    assert result["all_ready"] is True
+    assert poll_count == 3
+
+
+@pytest.mark.asyncio
+async def test_await_autonomy_dependencies_shutdown():
+    """Should abort on shutdown signal."""
+    from backend.supervisor.cross_repo_startup_orchestrator import (
+        await_autonomy_dependencies,
+    )
+
+    shutdown = asyncio.Event()
+    shutdown.set()  # Already shutting down
+
+    async def mock_check():
+        return False, "contract_mismatch", {
+            "reason": "pending_services",
+            "pending": ["prime", "reactor"],
+        }
+
+    result = await await_autonomy_dependencies(
+        check_fn=mock_check, timeout=10.0, poll_interval=0.1,
+        shutdown_event=shutdown,
+    )
+    assert result["all_ready"] is False
+    assert result["reason"] == "shutdown"

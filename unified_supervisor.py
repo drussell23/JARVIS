@@ -81401,20 +81401,42 @@ class JarvisSystemKernel:
                         raise
 
                 # v300.0: Phase 2 — Autonomy contract gate (boot-time)
-                # Checks schema version compatibility across Body, Prime, and
-                # Reactor.  Uses reason codes to distinguish "still starting"
-                # (pending) from "hard failure" (read_only).
+                # Bounded readiness wait + contract check. Polls every 2s
+                # for up to JARVIS_AUTONOMY_READINESS_WAIT_S (default 15s),
+                # then uses the result to set autonomy mode.
                 try:
                     self._update_component_status(
                         "autonomy_contracts", "running",
-                        "Checking autonomy schema compatibility...",
+                        "Waiting for autonomy dependencies...",
+                    )
+                    _readiness_timeout = max(
+                        1.0,
+                        float(os.environ.get("JARVIS_AUTONOMY_READINESS_WAIT_S", "15.0")),
                     )
                     from backend.supervisor.cross_repo_startup_orchestrator import (
-                        check_autonomy_contracts,
+                        await_autonomy_dependencies,
                     )
-                    _auto_pass, _auto_status, _auto_checks = await check_autonomy_contracts()
+                    _wait_result = await await_autonomy_dependencies(
+                        timeout=_readiness_timeout,
+                        poll_interval=2.0,
+                        shutdown_event=getattr(self, "_shutdown_event", None),
+                    )
+                    self.logger.info(
+                        "[Kernel] Autonomy readiness wait: ready=%s, reason=%s, "
+                        "elapsed=%.1fs, polls=%d",
+                        _wait_result["all_ready"],
+                        _wait_result["reason"],
+                        _wait_result["elapsed"],
+                        _wait_result["polls"],
+                    )
+
+                    _auto_pass = _wait_result["all_ready"]
+                    _auto_checks = _wait_result.get("checks", {})
                     self._autonomy_checks = _auto_checks
-                    _reason = _auto_checks.get("reason", "active" if _auto_pass else "schema_mismatch")
+                    _reason = _auto_checks.get(
+                        "reason",
+                        "active" if _auto_pass else _wait_result.get("reason", "timeout"),
+                    )
 
                     if _auto_pass:
                         self._autonomy_mode = "active"
@@ -81435,8 +81457,9 @@ class JarvisSystemKernel:
                             f"pending={_auto_checks.get('pending', [])})",
                         )
                         self.logger.info(
-                            "[Kernel] Autonomy contracts pending — mode=pending, "
-                            "reason=%s, pending=%s. Will re-check shortly.",
+                            "[Kernel] Autonomy contracts pending after %.1fs wait — "
+                            "mode=pending, reason=%s, pending=%s. Runtime monitor will re-check.",
+                            _wait_result["elapsed"],
                             _reason, _auto_checks.get("pending", []),
                         )
                     else:

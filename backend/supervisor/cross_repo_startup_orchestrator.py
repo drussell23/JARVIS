@@ -24932,6 +24932,97 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
     return all_pass, status, checks
 
 
+async def await_autonomy_dependencies(
+    *,
+    check_fn=None,
+    timeout: float = 15.0,
+    poll_interval: float = 2.0,
+    shutdown_event: Optional[asyncio.Event] = None,
+) -> Dict[str, Any]:
+    """Bounded wait for autonomy dependencies to become ready.
+
+    Polls ``check_fn`` (defaults to ``check_autonomy_contracts``) every
+    ``poll_interval`` seconds until all dependencies are met or ``timeout``
+    is exceeded.
+
+    Returns dict with keys:
+        all_ready (bool): True if all dependencies met within timeout.
+        reason (str): Reason code from last check.
+        checks (dict): Full checks dict from last check.
+        elapsed (float): Seconds spent waiting.
+        polls (int): Number of poll iterations.
+    """
+    if check_fn is None:
+        check_fn = check_autonomy_contracts
+
+    timeout = max(1.0, timeout)
+    start = asyncio.get_event_loop().time()
+    polls = 0
+
+    while True:
+        polls += 1
+        passed, _status, checks = await check_fn()
+        reason = checks.get("reason", "active" if passed else "pending_services")
+        elapsed = asyncio.get_event_loop().time() - start
+
+        if passed:
+            return {
+                "all_ready": True,
+                "reason": reason,
+                "checks": checks,
+                "elapsed": elapsed,
+                "polls": polls,
+            }
+
+        if elapsed >= timeout:
+            return {
+                "all_ready": False,
+                "reason": reason,
+                "checks": checks,
+                "elapsed": elapsed,
+                "polls": polls,
+            }
+
+        if shutdown_event and shutdown_event.is_set():
+            return {
+                "all_ready": False,
+                "reason": "shutdown",
+                "checks": checks,
+                "elapsed": elapsed,
+                "polls": polls,
+            }
+
+        remaining = timeout - elapsed
+        wait_time = min(poll_interval, remaining)
+        if wait_time <= 0:
+            break
+
+        if shutdown_event:
+            try:
+                await asyncio.wait_for(
+                    shutdown_event.wait(), timeout=wait_time,
+                )
+                return {
+                    "all_ready": False,
+                    "reason": "shutdown",
+                    "checks": checks,
+                    "elapsed": asyncio.get_event_loop().time() - start,
+                    "polls": polls,
+                }
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(wait_time)
+
+    return {
+        "all_ready": False,
+        "reason": reason,
+        "checks": checks,
+        "elapsed": asyncio.get_event_loop().time() - start,
+        "polls": polls,
+    }
+
+
 # =============================================================================
 # Module Exports
 # =============================================================================
@@ -24956,5 +25047,6 @@ __all__ = [
     "get_orchestrator_shutdown_state",
     # v300.0: Phase 2 autonomy contracts
     "check_autonomy_contracts",
+    "await_autonomy_dependencies",
     "AUTONOMY_SCHEMA_COMPATIBILITY",
 ]
