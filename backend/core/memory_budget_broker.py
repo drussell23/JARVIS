@@ -445,6 +445,11 @@ class MemoryBudgetBroker:
         return self._coordinator
 
     @property
+    def current_epoch(self) -> int:
+        """Current supervisor run epoch."""
+        return self._epoch
+
+    @property
     def current_sequence(self) -> int:
         """Current monotonic sequence number."""
         return self._sequence

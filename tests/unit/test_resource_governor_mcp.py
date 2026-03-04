@@ -44,7 +44,7 @@ def _mock_broker(epoch: int = 1) -> MagicMock:
     """Create a mock broker with the attributes the governor accesses."""
     broker = MagicMock()
     broker.register_pressure_observer = MagicMock()
-    broker._epoch = epoch
+    broker.current_epoch = epoch
     broker.current_sequence = 5
     broker.policy = PressurePolicy()
     broker.coordinator = MagicMock()
@@ -53,7 +53,7 @@ def _mock_broker(epoch: int = 1) -> MagicMock:
 
 
 def _mock_snapshot(
-    tier: PressureTier = PressureTier.NOMINAL if hasattr(PressureTier, "NOMINAL") else PressureTier.OPTIMAL,
+    tier: PressureTier = PressureTier.OPTIMAL,
     snapshot_id: str = "snap-test-001",
 ) -> MagicMock:
     """Create a mock MemorySnapshot with the fields the governor reads."""

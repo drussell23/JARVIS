@@ -71,9 +71,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 # Mapping table used by _on_pressure_change to convert broker PressureTiers
-# into the governor's DefconLevel state machine.  NOMINAL/ELEVATED map to
-# GREEN because they represent normal or mildly elevated memory usage that
-# does not require throttling.
+# into the governor's DefconLevel state machine.  ABUNDANT/OPTIMAL/ELEVATED
+# map to GREEN because they represent normal or mildly elevated memory usage
+# that does not require throttling.
 _TIER_TO_DEFCON: dict[PressureTier, "DefconLevel"] = {}  # populated after DefconLevel definition
 
 # =============================================================================
@@ -430,7 +430,7 @@ class AdaptiveResourceGovernor:
                 coordinator = self._broker.coordinator
                 envelope = DecisionEnvelope(
                     snapshot_id=snapshot.snapshot_id if hasattr(snapshot, "snapshot_id") else "unknown",
-                    epoch=self._broker._epoch,
+                    epoch=self._broker.current_epoch,
                     sequence=self._broker.current_sequence,
                     policy_version=self._broker.policy.version,
                     pressure_tier=tier,
