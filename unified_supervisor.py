@@ -86316,13 +86316,18 @@ class JarvisSystemKernel:
                             self._contract_runtime_last_check = _now
 
                 # v300.0: Phase 2 — Runtime autonomy contract monitor.
-                # Re-checks autonomy schema compatibility every 60s.  Detects
-                # when a component restarts with an incompatible schema version
-                # and transitions autonomy mode accordingly.
+                # Re-checks autonomy schema compatibility periodically.
+                # Uses adaptive interval: 5s when pending, base interval when active/read_only.
                 if _get_env_bool("JARVIS_AUTONOMY_MONITOR_ENABLED", True):
-                    _auto_interval = max(
+                    _auto_base_interval = max(
                         10.0,
                         _get_env_float("JARVIS_AUTONOMY_MONITOR_INTERVAL_S", 60.0),
+                    )
+                    # Adaptive: 5s polling when pending, base interval otherwise
+                    _auto_interval = (
+                        min(5.0, _auto_base_interval)
+                        if self._autonomy_mode == "pending"
+                        else _auto_base_interval
                     )
                     _auto_now = time.time()
                     _auto_last = float(
@@ -86335,27 +86340,54 @@ class JarvisSystemKernel:
                             )
                             _a_pass, _a_status, _a_checks = await check_autonomy_contracts()
                             _prev_mode = self._autonomy_mode
+                            _prev_reason = getattr(self, "_autonomy_reason", "unknown")
                             self._autonomy_checks = _a_checks
+                            _new_reason = _a_checks.get(
+                                "reason", "active" if _a_pass else "schema_mismatch"
+                            )
 
                             if _a_pass and _prev_mode != "active":
                                 self._autonomy_mode = "active"
+                                self._autonomy_reason = "active"
+                                _boot_time = getattr(self, "_boot_timestamp", None)
+                                _elapsed = (
+                                    f", {time.time() - _boot_time:.1f}s after boot"
+                                    if _boot_time else ""
+                                )
                                 self._update_component_status(
                                     "autonomy_contracts", "complete",
                                     "Autonomy contracts recovered — full autonomy mode",
                                 )
                                 self.logger.info(
-                                    "[Autonomy] Contracts recovered: read_only → active"
+                                    "[Autonomy] %s → active (reason=%s%s)",
+                                    _prev_mode, _new_reason, _elapsed,
                                 )
                             elif not _a_pass and _prev_mode == "active":
                                 self._autonomy_mode = "read_only"
+                                self._autonomy_reason = _new_reason
                                 self._update_component_status(
                                     "autonomy_contracts", "degraded",
-                                    f"Contract drift detected — read-only ({_a_status})",
+                                    f"Contract drift detected — read-only ({_new_reason})",
                                 )
                                 self.logger.warning(
-                                    "[Autonomy] Contract drift: active → read_only. "
-                                    "Checks: %s", _a_checks,
+                                    "[Autonomy] active → read_only (reason=%s). "
+                                    "Checks: %s", _new_reason, _a_checks,
                                 )
+                            elif not _a_pass and _prev_mode == "pending":
+                                # Still pending — update reason but stay pending
+                                self._autonomy_reason = _new_reason
+                                if _new_reason.startswith("pending"):
+                                    self.logger.debug(
+                                        "[Autonomy] Still pending: %s, pending=%s",
+                                        _new_reason, _a_checks.get("pending", []),
+                                    )
+                                else:
+                                    # Hard failure while pending → promote to read_only
+                                    self._autonomy_mode = "read_only"
+                                    self.logger.warning(
+                                        "[Autonomy] pending → read_only (reason=%s). "
+                                        "Checks: %s", _new_reason, _a_checks,
+                                    )
                         except Exception as _auto_err:
                             self.logger.debug(
                                 "[Autonomy] Runtime monitor error: %s", _auto_err,

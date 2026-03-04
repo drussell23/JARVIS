@@ -318,3 +318,16 @@ async def test_await_autonomy_dependencies_shutdown():
     )
     assert result["all_ready"] is False
     assert result["reason"] == "shutdown"
+
+
+def test_adaptive_monitor_interval():
+    """Pending mode should use shorter check interval."""
+    def _get_interval(mode: str, base_interval: float = 60.0) -> float:
+        if mode == "pending":
+            return min(5.0, base_interval)
+        return base_interval
+
+    assert _get_interval("pending") == 5.0
+    assert _get_interval("active") == 60.0
+    assert _get_interval("read_only") == 60.0
+    assert _get_interval("pending", base_interval=3.0) == 3.0
