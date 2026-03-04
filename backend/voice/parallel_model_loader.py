@@ -553,9 +553,22 @@ async def load_all_voice_models() -> ParallelLoadResult:
     """
     Load all voice models in parallel.
 
-    This is the optimized entry point for system startup - loads
-    Whisper and ECAPA-TDNN simultaneously for minimum startup time.
+    Memory Control Plane: If a broker is available, acquires grants
+    before loading.  Falls back to direct loading if broker is unavailable.
     """
+    # Try broker-mediated loading first
+    try:
+        from backend.core.memory_budget_broker import get_memory_budget_broker
+
+        _broker = get_memory_budget_broker()
+        if _broker is not None:
+            return await _load_voice_models_via_broker(_broker)
+    except ImportError:
+        pass
+    except Exception as e:
+        logger.debug("[MCP] Broker-mediated voice load unavailable: %s", e)
+
+    # Legacy path (no broker)
     from voice.whisper_audio_fix import _whisper_handler
     # v271.3: Route through centralized safe loader (meta tensor protection)
     try:
@@ -584,3 +597,65 @@ async def load_all_voice_models() -> ParallelLoadResult:
         ("whisper", load_whisper),
         ("ecapa_encoder", load_ecapa),
     ])
+
+
+async def _load_voice_models_via_broker(broker) -> ParallelLoadResult:
+    """Load voice models with broker grants for memory admission control."""
+    import time as _time
+    from backend.core.budgeted_loaders import WhisperBudgetedLoader, EcapaBudgetedLoader
+
+    start = _time.monotonic()
+    results = {}
+
+    whisper_loader = WhisperBudgetedLoader(
+        model_size=os.environ.get("JARVIS_WHISPER_MODEL", "base"),
+    )
+    ecapa_loader = EcapaBudgetedLoader()
+
+    # Sequential grants, parallel loading within grants
+    for name, loader in [("whisper", whisper_loader), ("ecapa_encoder", ecapa_loader)]:
+        model_start = _time.monotonic()
+        try:
+            grant = await broker.request(
+                component=loader.component_id,
+                bytes_requested=loader.estimate_bytes({}),
+                priority=loader.priority,
+                phase=loader.phase,
+                can_degrade=True,
+                degradation_options=loader.degradation_options,
+            )
+
+            result = await loader.load_with_grant(grant)
+
+            if result.success:
+                await grant.commit(result.actual_bytes, result.config_proof)
+                results[name] = ModelLoadResult(
+                    name=name,
+                    state=ModelState.LOADED,
+                    model=result.model_handle,
+                    load_time_ms=result.load_duration_ms,
+                )
+            else:
+                await grant.rollback(result.error or "load failed")
+                results[name] = ModelLoadResult(
+                    name=name,
+                    state=ModelState.FAILED,
+                    error=result.error,
+                    load_time_ms=result.load_duration_ms,
+                )
+        except Exception as e:
+            elapsed = (_time.monotonic() - model_start) * 1000
+            logger.error("[MCP] Failed to load %s: %s", name, e)
+            results[name] = ModelLoadResult(
+                name=name,
+                state=ModelState.FAILED,
+                error=str(e),
+                load_time_ms=elapsed,
+            )
+
+    total_ms = (_time.monotonic() - start) * 1000
+    return ParallelLoadResult(
+        results=results,
+        total_time_ms=total_ms,
+        parallel_speedup=1.0,  # Sequential via broker
+    )
