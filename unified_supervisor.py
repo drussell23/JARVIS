@@ -63299,6 +63299,7 @@ class JarvisSystemKernel:
         self._ghost_display_init_task: Optional[asyncio.Task] = None
         self._ghost_display_recovery_task: Optional[asyncio.Task] = None
         self._ghost_display_health_task: Optional[asyncio.Task] = None
+        self._display_pressure_controller = None  # v68.1: DisplayPressureController (set in Phase 6.5)
         self._visual_pipeline_health_task: Optional[asyncio.Task] = None
         self._visual_pipeline_deferred_task: Optional[asyncio.Task] = None  # Tracks the single in-flight init task
         self._visual_pipeline_initialized: bool = False
@@ -75703,6 +75704,36 @@ class JarvisSystemKernel:
             return False
 
         self.logger.info("[GhostDisplay] Virtual display ready")
+
+        # --- Wire display lease into Memory Control Plane ---
+        try:
+            from backend.core.memory_budget_broker import get_memory_budget_broker
+            from backend.core.memory_types import BudgetPriority, StartupPhase
+            from backend.system.phantom_hardware_manager import DisplayPressureController
+
+            _broker = get_memory_budget_broker()
+            if _broker is not None:
+                _display_res = getattr(phantom_mgr, "preferred_resolution", "1920x1080")
+                _ctrl = DisplayPressureController(phantom_mgr, _broker)
+                _est_bytes = _ctrl.estimate_bytes(_display_res)
+
+                _grant = await _broker.request(
+                    component="display:ghost@v1",
+                    bytes_requested=_est_bytes,
+                    priority=BudgetPriority.BOOT_OPTIONAL,
+                    phase=StartupPhase.BOOT_OPTIONAL,
+                )
+                await _grant.commit(_est_bytes)
+                await _ctrl.activate(_grant.lease_id, _display_res)
+                self._display_pressure_controller = _ctrl
+                self.logger.info(
+                    "Display lease granted: %s (%d bytes, %s)",
+                    _grant.lease_id, _est_bytes, _display_res,
+                )
+            else:
+                self.logger.debug("No broker available — display runs without lease")
+        except Exception as _lease_err:
+            self.logger.warning("Display lease request failed (non-fatal): %s", _lease_err)
 
         # Publish state file for cross-repo exchange
         await self._publish_ghost_display_state(phantom_mgr)
