@@ -7250,11 +7250,20 @@ async def autonomous_status():
                 "status": "disabled" if _disabled else "not_yet_run",
             }
 
+    # Notification bridge telemetry
+    notif_telemetry = None
+    try:
+        from agi_os.notification_bridge import get_notification_telemetry
+        notif_telemetry = get_notification_telemetry()
+    except Exception:
+        pass
+
     return {
         "autonomous_enabled": orchestrator_status is not None or mesh_status is not None,
         "orchestrator": orchestrator_status,
         "mesh": mesh_status,
         "agent_runtime": runtime_status,
+        "notification_telemetry": notif_telemetry,
     }
 
 

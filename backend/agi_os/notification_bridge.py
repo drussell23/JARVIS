@@ -3,19 +3,19 @@ JARVIS Notification Bridge
 ===========================
 
 Unified multi-channel notification delivery for proactive JARVIS output.
-Channels: Voice (RealTimeVoiceCommunicator), WebSocket (broadcast_router),
-          macOS native (osascript).
+Channels: Voice (RealTimeVoiceCommunicator), WebSocket (broadcast_router +
+          unified WS manager), macOS native (osascript).
 
 All channels are best-effort and delivered in **parallel** — a slow or
 failing channel never blocks delivery on the others.
 
-Version: 1.1.0 (v252.1)
+Version: 1.2.0 (v284.0)
 
-Fixes over v1.0.0:
-- [Bug 1] Parallel channel delivery via asyncio.gather()
-- [Bug 2] Per-channel timeout on voice speak() (not just acquire)
-- [Bug 6] shutdown_notifications() is now reversible for warm restarts
-- [Bug 7] hashlib.md5(usedforsecurity=False) for FIPS compat
+Fixes over v1.1.0:
+- [Fix 1] Dual WebSocket delivery: broadcast_router + unified WS manager
+- [Fix 2] notification_id on every payload for frontend dedup
+- [Fix 3] voice_spoken flag in payload prevents double-voice at frontend
+- [Fix 4] Telemetry counters: emitted / ws_sent / voice_spoken
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import hashlib
 import logging
 import os
 import time
+import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -103,6 +104,17 @@ _MACOS_MIN_URGENCY: int = _env_int(
 )
 _OSASCRIPT_TIMEOUT: float = _env_float("JARVIS_NOTIFY_OSASCRIPT_TIMEOUT", 5.0)
 
+# ── Telemetry counters (read via get_notification_telemetry()) ──
+_telemetry: Dict[str, int] = {
+    "emitted": 0,           # notify_user() called (after dedup)
+    "dedup_suppressed": 0,  # suppressed by cross-path dedup
+    "voice_spoken": 0,      # voice channel delivered
+    "ws_broadcast_sent": 0, # broadcast_router delivered
+    "ws_unified_sent": 0,   # unified WS manager delivered
+    "macos_sent": 0,        # macOS notification delivered
+    "all_channels_failed": 0,
+}
+
 
 # ─────────────────────────────────────────────────────────
 # Core: notify_user()
@@ -147,8 +159,15 @@ async def notify_user(
         dedup_key = hashlib.md5(dedup_payload).hexdigest()  # noqa: S324
     if dedup_key in _recent_notifications:
         logger.debug("[NotifyBridge] Dedup hit — skipping duplicate notification")
+        _telemetry["dedup_suppressed"] += 1
         return False
     _recent_notifications[dedup_key] = now
+
+    # ── Generate notification_id for end-to-end tracing + frontend dedup ──
+    notification_id = f"notif-{uuid.uuid4().hex[:12]}"
+    ctx["notification_id"] = notification_id
+
+    _telemetry["emitted"] += 1
 
     # ── Record to history ──
     record = NotificationRecord(
@@ -160,34 +179,49 @@ async def notify_user(
     )
     _notification_history.append(record)
 
-    # ── Deliver across ALL channels in parallel (best-effort) ──
-    voice_coro = _deliver_voice(message, urgency)
-    ws_coro = _deliver_websocket(message, urgency, title, ctx)
+    # ── Phase 1: Voice (must resolve BEFORE websocket so we can set flag) ──
+    voice_ok = False
+    try:
+        voice_ok = await _deliver_voice(message, urgency)
+    except Exception as e:
+        logger.debug("[NotifyBridge] voice channel raised: %s", e)
+    if voice_ok:
+        record.channels_delivered.append("voice")
+        _telemetry["voice_spoken"] += 1
+
+    # ── Phase 2: WebSocket + macOS in parallel ──
+    # Pass voice_spoken flag so frontend knows NOT to double-speak
+    ws_coro = _deliver_websocket(
+        message, urgency, title, ctx, voice_spoken=voice_ok,
+    )
     macos_coro = _deliver_macos(message, urgency, title)
 
-    results = await asyncio.gather(
-        voice_coro, ws_coro, macos_coro,
+    ws_macos_results = await asyncio.gather(
+        ws_coro, macos_coro,
         return_exceptions=True,
     )
 
-    channel_names = ("voice", "websocket", "macos")
-    delivered_any = False
-    for name, result in zip(channel_names, results):
+    ws_channel_names = ("websocket", "macos")
+    for name, result in zip(ws_channel_names, ws_macos_results):
         if isinstance(result, BaseException):
             logger.debug("[NotifyBridge] %s channel raised: %s", name, result)
         elif result is True:
             record.channels_delivered.append(name)
-            delivered_any = True
+
+    delivered_any = len(record.channels_delivered) > 0
 
     if delivered_any:
         logger.info(
-            "[NotifyBridge] Delivered '%s' [%s] via %s",
-            title, urgency.name, ", ".join(record.channels_delivered),
+            "[NotifyBridge] [%s] Delivered '%s' [%s] via %s",
+            notification_id, title, urgency.name,
+            ", ".join(record.channels_delivered),
         )
     else:
         logger.warning(
-            "[NotifyBridge] All channels failed for: %s", message[:80],
+            "[NotifyBridge] [%s] All channels failed for: %s",
+            notification_id, message[:80],
         )
+        _telemetry["all_channels_failed"] += 1
 
     return delivered_any
 
@@ -260,43 +294,60 @@ async def _deliver_websocket(
     urgency: NotificationUrgency,
     title: str,
     context: Dict[str, Any],
+    voice_spoken: bool = False,
 ) -> bool:
     """Broadcast via both broadcast_router AND unified WebSocket manager.
 
     The broadcast_router reaches ``/api/broadcast/ws`` clients.
     The unified WS manager reaches ``/ws`` clients (JarvisVoice frontend).
-    Both are best-effort — failure of one does not block the other.
+    Both are dispatched in parallel — failure of one does not block the other.
+
+    ``voice_spoken`` tells the frontend whether the backend already spoke
+    the message aloud, preventing double-voice.
     """
     payload = {
         "type": "proactive_notification",
+        "notification_id": context.get("notification_id", ""),
         "title": title,
         "message": message,
         "urgency": urgency.name.lower(),
         "urgency_level": int(urgency),
+        "voice_spoken": voice_spoken,
         "context": context,
         "timestamp": time.time(),
     }
 
-    delivered = False
-
-    # Channel A: broadcast_router (/api/broadcast/ws clients)
-    try:
+    async def _channel_broadcast() -> bool:
+        """broadcast_router channel."""
         from api.broadcast_router import manager
         count = await manager.broadcast(payload)
-        if count > 0:
-            delivered = True
-    except Exception as e:
-        logger.debug("[NotifyBridge] broadcast_router delivery failed: %s", e)
+        return count > 0
 
-    # Channel B: unified WebSocket manager (/ws clients — JarvisVoice frontend)
-    try:
+    async def _channel_unified_ws() -> bool:
+        """Unified WS manager channel."""
         from api.unified_websocket import get_ws_manager_if_initialized
         ws_mgr = get_ws_manager_if_initialized()
-        if ws_mgr is not None:
-            await ws_mgr.broadcast(payload)
+        if ws_mgr is None:
+            return False
+        await ws_mgr.broadcast(payload)
+        # unified WS broadcast is fire-and-forget; count connections as proxy
+        return len(getattr(ws_mgr, "connections", {})) > 0
+
+    results = await asyncio.gather(
+        _channel_broadcast(),
+        _channel_unified_ws(),
+        return_exceptions=True,
+    )
+
+    delivered = False
+    for i, result in enumerate(results):
+        if isinstance(result, BaseException):
+            ch = "broadcast_router" if i == 0 else "unified_ws"
+            logger.debug("[NotifyBridge] %s delivery failed: %s", ch, result)
+        elif result is True:
+            counter_key = "ws_broadcast_sent" if i == 0 else "ws_unified_sent"
+            _telemetry[counter_key] += 1
             delivered = True
-    except Exception as e:
-        logger.debug("[NotifyBridge] unified WS delivery failed: %s", e)
 
     return delivered
 
@@ -352,7 +403,10 @@ async def _deliver_macos(
             logger.debug("[NotifyBridge] osascript timed out — killed")
             return False
 
-        return process.returncode == 0
+        success = process.returncode == 0
+        if success:
+            _telemetry["macos_sent"] += 1
+        return success
     except Exception as e:
         logger.debug("[NotifyBridge] macOS notification failed: %s", e)
         return False
@@ -380,6 +434,15 @@ def get_notification_history(limit: int = 50) -> List[NotificationRecord]:
     items = list(_notification_history)
     items.reverse()
     return items[:limit]
+
+
+def get_notification_telemetry() -> Dict[str, int]:
+    """Return a snapshot of delivery telemetry counters.
+
+    Keys: emitted, dedup_suppressed, voice_spoken, ws_broadcast_sent,
+          ws_unified_sent, macos_sent, all_channels_failed.
+    """
+    return dict(_telemetry)
 
 
 def set_notifications_enabled(enabled: bool) -> None:

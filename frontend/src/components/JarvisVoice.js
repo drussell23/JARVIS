@@ -734,6 +734,10 @@ const JarvisVoice = () => {
   const backendListenWindowTimeoutRef = useRef(null);
   const backendListenWindowIdRef = useRef(null);
 
+  // Proactive notification dedup: tracks recent notification_ids to prevent
+  // duplicate display from reconnect/replay or dual-channel fanout.
+  const seenNotificationIdsRef = useRef(new Set());
+
   // ═══════════════════════════════════════════════════════════════════
   // v32.0: SURVEILLANCE PROGRESS STATE - Real-time God Mode tracking
   // ═══════════════════════════════════════════════════════════════════
@@ -3375,29 +3379,52 @@ const JarvisVoice = () => {
         // AUTONOMOUS NOTIFICATION — Email triage, system alerts, proactive
         // messages from the agent runtime. Delivered via notification_bridge
         // through the unified WebSocket manager.
+        //
+        // Correctness invariants:
+        // - Dedup by notification_id (reconnect/replay/dual-channel safe)
+        // - No transcript clobbering (only set response, never clear user)
+        // - No double-voice (backend voice_spoken flag gates frontend TTS)
         // ═══════════════════════════════════════════════════════════════════
+        const notifId = data.notification_id || '';
         const notifTitle = data.title || 'JARVIS';
         const notifMessage = data.message || '';
         const notifUrgency = data.urgency || 'normal';
         const notifUrgencyLevel = data.urgency_level || 2;
-        const notifContext = data.context || {};
+        const voiceSpoken = data.voice_spoken === true;
+
+        // ── Dedup: skip if we already rendered this notification_id ──
+        if (notifId && seenNotificationIdsRef.current.has(notifId)) {
+          console.debug('[PROACTIVE] Dedup hit — skipping', notifId);
+          break;
+        }
+        if (notifId) {
+          seenNotificationIdsRef.current.add(notifId);
+          // Cap set size to prevent unbounded growth
+          if (seenNotificationIdsRef.current.size > 200) {
+            const iter = seenNotificationIdsRef.current.values();
+            seenNotificationIdsRef.current.delete(iter.next().value);
+          }
+        }
 
         console.log(
           '%c[PROACTIVE]',
           'color: #00bfff; font-weight: bold',
-          `[${notifUrgency.toUpperCase()}] ${notifTitle}: ${notifMessage}`
+          `[${notifUrgency.toUpperCase()}] ${notifTitle}: ${notifMessage}`,
+          notifId ? `(${notifId})` : ''
         );
 
-        // Show in transcript — autonomous message (no "You:" line)
+        // ── Show in transcript — append to response, never clobber user ──
         if (notifMessage) {
-          // Clear user transcript for autonomous messages (JARVIS initiated)
-          setTranscript('');
-          setResponse(`${notifTitle}: ${notifMessage}`);
+          setResponse(prev => {
+            // If response is empty or stale, replace. Otherwise append.
+            if (!prev) return `${notifTitle}: ${notifMessage}`;
+            return `${prev}\n${notifTitle}: ${notifMessage}`;
+          });
           setIsProcessing(false);
         }
 
-        // Speak urgent/high notifications aloud
-        if (notifUrgencyLevel >= 3 && notifMessage) {
+        // ── Voice: only speak if backend did NOT already speak ──
+        if (!voiceSpoken && notifUrgencyLevel >= 3 && notifMessage) {
           speakResponse(notifMessage, notifUrgencyLevel >= 4);
         }
 
