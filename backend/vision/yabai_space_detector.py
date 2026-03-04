@@ -13513,13 +13513,26 @@ def _is_startup_phase_for_workspace_query() -> bool:
 
 
 def _current_thrash_state() -> str:
-    """Get current memory thrash state when quantizer is available."""
-    try:
-        import backend.core.memory_quantizer as _mq_mod
+    """Get current memory thrash state via typed snapshot API.
 
-        _mq = getattr(_mq_mod, "_memory_quantizer_instance", None)
+    Uses get_memory_quantizer_instance() (public singleton accessor)
+    rather than reaching into private attributes.
+    Falls back to 'unknown' if quantizer is unavailable.
+    """
+    try:
+        from backend.core.memory_quantizer import get_memory_quantizer_instance
+
+        _mq = get_memory_quantizer_instance()
         if _mq is not None:
-            return str(getattr(_mq, "_thrash_state", "unknown") or "unknown").lower()
+            # Try synchronous snapshot access first (non-async context)
+            if hasattr(_mq, "snapshot_sync"):
+                snap = _mq.snapshot_sync()
+                if snap is not None:
+                    return str(snap.thrash_state.value).lower()
+            # Fallback: read public thrash_state property if exposed
+            _ts = getattr(_mq, "thrash_state", None)
+            if _ts is not None:
+                return str(_ts.value if hasattr(_ts, "value") else _ts).lower()
     except Exception:
         pass
     return "unknown"
