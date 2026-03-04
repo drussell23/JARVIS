@@ -440,6 +440,20 @@ assert set(_ACTUATOR_PRIORITY.keys()) == set(ActuatorAction), \
 
 
 # ===================================================================
+# Cloud Capacity Action Enum
+# ===================================================================
+
+class CloudCapacityAction(str, Enum):
+    """Cloud capacity decisions made by CloudCapacityController."""
+
+    STAY_LOCAL = "stay_local"
+    DEGRADE_LOCAL = "degrade_local"
+    OFFLOAD_PARTIAL = "offload_partial"
+    SPIN_SPOT = "spin_spot"
+    FALLBACK_ONDEMAND = "fallback_ondemand"
+
+
+# ===================================================================
 # PressurePolicy (versioned threshold rules with hysteresis)
 # ===================================================================
 
