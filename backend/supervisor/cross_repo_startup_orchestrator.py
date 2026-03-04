@@ -24895,13 +24895,36 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
         and checks.get("reactor_reachable", False)
     )
 
+    # Determine reason code
+    _unreachable = []
+    if not checks.get("prime_reachable", False):
+        _unreachable.append("prime")
+    if not checks.get("reactor_reachable", False):
+        _unreachable.append("reactor")
+
+    if all_pass:
+        checks["reason"] = "active"
+        checks["pending"] = []
+    elif _unreachable:
+        # Services not yet responding — likely still starting
+        checks["reason"] = "pending_services"
+        checks["pending"] = _unreachable
+    elif not checks.get("body_journal", False):
+        checks["reason"] = "pending_lease"
+        checks["pending"] = ["journal"]
+    else:
+        # Services reachable but schema incompatible
+        checks["reason"] = "schema_mismatch"
+        checks["pending"] = []
+
     status = "autonomy_ready" if all_pass else "contract_mismatch"
 
     if not all_pass:
-        logger.warning(
-            "[v300.0] Autonomy contract mismatch — degraded read-only mode. "
+        _log_fn = logger.info if checks["reason"].startswith("pending") else logger.warning
+        _log_fn(
+            "[v300.0] Autonomy contract check — reason=%s, pending=%s. "
             "Checks: %s",
-            checks,
+            checks["reason"], checks["pending"], checks,
         )
     else:
         logger.info("[v300.0] Autonomy contracts validated — all compatible")
