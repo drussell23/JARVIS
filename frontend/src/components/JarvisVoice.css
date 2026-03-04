@@ -438,26 +438,29 @@
 .jarvis-transcript {
   width: 100%;
   max-width: 1000px;
-  min-height: 200px;
-  max-height: 400px;
-  /* Allow flexible height up to max */
-  margin: auto 0;
-  /* Center vertically in available space */
-  padding: 2rem 2.5rem;
+  min-height: 120px;
+  max-height: 60vh;
+  /* Viewport-relative: adapts to screen size, shows much more content */
+  margin: 0;
+  padding: 1.5rem 2rem;
   box-sizing: border-box;
   z-index: 10;
-  flex-shrink: 0;
-  /* Prevent transcript from shrinking */
+  flex-shrink: 1;
+  /* Allow transcript to shrink if needed but prefer growing */
+  flex-grow: 1;
+  /* Take available vertical space */
   overflow-y: auto;
-  /* Allow internal scrolling */
-  background: none;
-  border: none;
+  /* Scrollable when content exceeds max-height */
+  scroll-behavior: smooth;
+  background: rgba(0, 0, 0, 0.3);
+  /* Subtle background to delineate transcript area */
+  border: 1px solid rgba(0, 255, 255, 0.08);
+  border-radius: 12px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  /* Center content vertically */
-  border-radius: 0;
-  box-shadow: none;
+  justify-content: flex-start;
+  /* Content flows from top — no more clipping */
+  box-shadow: inset 0 0 30px rgba(0, 0, 0, 0.5);
 }
 
 .user-message,
@@ -521,9 +524,13 @@
 
 .message-text {
   color: var(--text-primary);
-  font-size: 1.2rem;
-  line-height: 1.6;
+  font-size: 1.1rem;
+  line-height: 1.7;
   width: 100%;
+  word-wrap: break-word;
+  overflow-wrap: break-word;
+  white-space: pre-wrap;
+  /* Preserve line breaks from backend responses */
 }
 
 .processing-indicator {
@@ -802,7 +809,8 @@ AudioQualityStatsDisplay {
   }
 
   .jarvis-transcript {
-    max-height: 150px;
+    max-height: 50vh;
+    padding: 1rem 1.2rem;
   }
 }
 

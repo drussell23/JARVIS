@@ -777,6 +777,7 @@ const JarvisVoice = () => {
 
   const typingTimeoutRef = useRef(null);
 
+  const transcriptRef = useRef(null); // Auto-scroll transcript container
   const wsRef = useRef(null);
   const mediaRecorderRef = useRef(null);
   const audioChunksRef = useRef([]);
@@ -1157,6 +1158,15 @@ const JarvisVoice = () => {
     initDynamicFavicon();
     console.log('🎨 [Favicon] Dynamic favicon system initialized');
   }, []);
+
+  // Auto-scroll transcript to bottom when content changes
+  useEffect(() => {
+    if (transcriptRef.current) {
+      requestAnimationFrame(() => {
+        transcriptRef.current.scrollTop = transcriptRef.current.scrollHeight;
+      });
+    }
+  }, [response, transcript, isProcessing, isJarvisSpeaking]);
 
   // Update favicon based on processing/listening state
   useEffect(() => {
@@ -6931,7 +6941,7 @@ const JarvisVoice = () => {
 
       {/* Transcript Display - Always visible when there's activity */}
       {(transcript || response || isProcessing || isJarvisSpeaking) && (
-        <div className="jarvis-transcript">
+        <div className="jarvis-transcript" ref={transcriptRef}>
           {/* User Message */}
           {transcript && (
             <div className="user-message">
