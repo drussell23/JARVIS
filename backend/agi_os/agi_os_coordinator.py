@@ -1764,58 +1764,72 @@ class AGIOSCoordinator:
 
             # Startup pressure guard: avoid initializing heavy continuous vision
             # when system resources are already under stress.
+            # v254: MCP-aware — prefer MemoryQuantizer.snapshot() for typed
+            # PressureTier decisions; fall back to raw psutil when the
+            # quantizer has not been instantiated yet.
             degraded_mode = False
             try:
-                import psutil
+                # --- MCP-aware pressure guard (replaces raw psutil.virtual_memory) ---
+                _snap = None
+                try:
+                    from backend.core.memory_quantizer import get_memory_quantizer_instance
+                    _mq = get_memory_quantizer_instance()
+                    if _mq is not None:
+                        _snap = await _mq.snapshot()
+                except Exception:
+                    pass
 
-                vm = psutil.virtual_memory()
-                process_mb = psutil.Process().memory_info().rss / (1024 * 1024)
-                available_mb = vm.available / (1024 * 1024)
-                cpu_percent = psutil.cpu_percent(interval=0.0)
+                if _snap is not None:
+                    from backend.core.memory_types import PressureTier
+                    available_mb = _snap.available_budget_bytes / (1024 * 1024)
+                    _tier = _snap.pressure_tier
 
-                min_available_mb = _env_float(
-                    "JARVIS_AGI_OS_SCREEN_GUARD_MIN_AVAILABLE_MB", 2200.0
-                )
-                critical_available_mb = _env_float(
-                    "JARVIS_AGI_OS_SCREEN_GUARD_CRITICAL_AVAILABLE_MB", 1400.0
-                )
-                max_process_mb = _env_float(
-                    "JARVIS_AGI_OS_SCREEN_GUARD_MAX_PROCESS_MB", 1600.0
-                )
-                max_cpu_percent = _env_float(
-                    "JARVIS_AGI_OS_SCREEN_GUARD_MAX_CPU_PERCENT", 92.0
-                )
-
-                if available_mb <= critical_available_mb:
-                    logger.warning(
-                        "Screen analyzer deferred due to critical startup pressure "
-                        "(available=%.0fMB <= %.0fMB)",
-                        available_mb,
-                        critical_available_mb,
+                    critical_available_mb = _env_float(
+                        "JARVIS_AGI_OS_SCREEN_GUARD_CRITICAL_AVAILABLE_MB", 1400.0
                     )
-                    self._component_status['screen_analyzer'] = ComponentStatus(
-                        name='screen_analyzer',
-                        available=False,
-                        error=(
-                            "Deferred: critical startup memory pressure "
-                            f"({available_mb:.0f}MB available)"
-                        ),
+                    min_available_mb = _env_float(
+                        "JARVIS_AGI_OS_SCREEN_GUARD_MIN_AVAILABLE_MB", 2200.0
                     )
-                    return
 
-                degraded_mode = (
-                    available_mb < min_available_mb
-                    or process_mb > max_process_mb
-                    or cpu_percent > max_cpu_percent
-                )
-                if degraded_mode:
-                    logger.warning(
-                        "Screen analyzer startup in degraded mode "
-                        "(available=%.0fMB, process=%.0fMB, cpu=%.1f%%)",
-                        available_mb,
-                        process_mb,
-                        cpu_percent,
+                    if _tier >= PressureTier.EMERGENCY or available_mb <= critical_available_mb:
+                        self._component_status['screen_analyzer'] = ComponentStatus(
+                            name='screen_analyzer',
+                            available=False,
+                            error=(
+                                f"Deferred: memory pressure tier {_tier.name} "
+                                f"({available_mb:.0f}MB available)"
+                            ),
+                        )
+                        return
+
+                    degraded_mode = _tier >= PressureTier.CONSTRAINED or available_mb < min_available_mb
+                    if degraded_mode:
+                        logger.warning(
+                            "Screen analyzer starting in degraded mode: tier=%s available=%.0fMB",
+                            _tier.name, available_mb,
+                        )
+                else:
+                    # Fallback: quantizer not available yet — use psutil
+                    import psutil
+                    vm = psutil.virtual_memory()
+                    available_mb = vm.available / (1024 * 1024)
+                    critical_available_mb = _env_float(
+                        "JARVIS_AGI_OS_SCREEN_GUARD_CRITICAL_AVAILABLE_MB", 1400.0
                     )
+                    if available_mb <= critical_available_mb:
+                        self._component_status['screen_analyzer'] = ComponentStatus(
+                            name='screen_analyzer',
+                            available=False,
+                            error=(
+                                f"Deferred: critical startup memory pressure "
+                                f"({available_mb:.0f}MB available)"
+                            ),
+                        )
+                        return
+                    min_available_mb = _env_float(
+                        "JARVIS_AGI_OS_SCREEN_GUARD_MIN_AVAILABLE_MB", 2200.0
+                    )
+                    degraded_mode = available_mb < min_available_mb
             except Exception as pressure_err:
                 logger.debug("Screen analyzer pressure preflight unavailable: %s", pressure_err)
 
