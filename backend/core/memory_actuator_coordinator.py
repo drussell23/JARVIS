@@ -125,11 +125,28 @@ class MemoryActuatorCoordinator:
             return decision_id
 
     def drain_pending(self) -> List[PendingAction]:
-        """Return all pending actions sorted by priority, clearing the queue."""
+        """Return fresh pending actions sorted by priority, clearing the queue.
+
+        Re-checks staleness at drain time — an action accepted at submit
+        may have become stale if a new epoch/sequence arrived since then.
+        """
         with self._lock:
-            actions = sorted(self._pending, key=lambda a: a.action.priority)
+            fresh = [
+                a for a in self._pending
+                if not a.envelope.is_stale(
+                    current_epoch=self._current_epoch,
+                    current_sequence=self._current_sequence,
+                )
+            ]
+            stale_count = len(self._pending) - len(fresh)
+            if stale_count:
+                self._total_rejected_stale += stale_count
+                logger.debug(
+                    "[ActuatorCoord] drain_pending: rejected %d stale actions",
+                    stale_count,
+                )
             self._pending = []
-            return actions
+            return sorted(fresh, key=lambda a: a.action.priority)
 
     def report_failure(self, action: ActuatorAction, reason: str) -> None:
         """Report a failed actuator action.  Quarantines after failure_budget."""
