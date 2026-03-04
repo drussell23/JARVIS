@@ -378,6 +378,8 @@ class MemoryBudgetBroker:
             else Path("~/.jarvis/memory/leases.json").expanduser()
         )
 
+        self._pressure_observers: List[Any] = []  # async callables (tier, snapshot)
+
         # Wire the quantizer to read committed_bytes from us
         if hasattr(quantizer, "set_broker_ref"):
             quantizer.set_broker_ref(self)
@@ -785,6 +787,68 @@ class MemoryBudgetBroker:
                 for g in self._leases.values()
             ],
         }
+
+    # --- Pressure observer pattern ---
+
+    def register_pressure_observer(self, callback: Any) -> None:
+        """Register an async callback for pressure tier changes.
+
+        Callback signature: async def callback(tier: PressureTier, snapshot: MemorySnapshot)
+        """
+        if callback not in self._pressure_observers:
+            self._pressure_observers.append(callback)
+
+    def unregister_pressure_observer(self, callback: Any) -> None:
+        """Remove a previously registered pressure observer."""
+        try:
+            self._pressure_observers.remove(callback)
+        except ValueError:
+            pass
+
+    async def notify_pressure_observers(
+        self, tier: "PressureTier", snapshot: Any,
+    ) -> None:
+        """Notify all registered observers of a pressure tier change.
+
+        Observer exceptions are caught and logged -- one bad observer
+        must never block others.
+        """
+        for obs in self._pressure_observers:
+            try:
+                await obs(tier, snapshot)
+            except Exception:
+                logger.warning(
+                    "Pressure observer %s raised exception", obs, exc_info=True,
+                )
+
+    # --- Lease amendment ---
+
+    async def amend_lease_bytes(
+        self, lease_id: str, new_bytes: int,
+    ) -> None:
+        """Atomically swap the granted_bytes of an active lease.
+
+        Used for display resolution changes -- the lease stays ACTIVE,
+        only the byte reservation changes.  No temporary release window.
+
+        Raises KeyError if lease not found.
+        Raises ValueError if the lease is in a terminal state.
+        """
+        grant = self._leases.get(lease_id)
+        if grant is None:
+            raise KeyError(f"Unknown lease: {lease_id}")
+        if grant.state.is_terminal:
+            raise ValueError(f"Cannot amend lease in terminal state: {grant.state.value}")
+        old_bytes = grant.granted_bytes
+        grant.granted_bytes = new_bytes
+        grant.actual_bytes = new_bytes
+        self._emit_event(MemoryBudgetEventType.GRANT_DEGRADED, {
+            "lease_id": lease_id,
+            "component": grant.component_id,
+            "old_bytes": old_bytes,
+            "new_bytes": new_bytes,
+        })
+        self._persist_leases()
 
     # --- Event emission ---
 
