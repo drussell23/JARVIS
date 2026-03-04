@@ -305,10 +305,13 @@ class ProactiveResourceGuard:
     ) -> bool:
         """
         Request a memory budget allocation before loading a component.
-        
+
         This is the main entry point. Call this BEFORE loading any heavy
         component (ML models, large data structures, etc.).
-        
+
+        .. deprecated::
+            Use :func:`MemoryBudgetBroker.request` instead.
+
         Args:
             component: Unique identifier for the component
             estimated_mb: Estimated memory usage (uses lookup if not provided)
@@ -316,10 +319,36 @@ class ProactiveResourceGuard:
             timeout: Max seconds to wait for memory to become available
             can_unload: Whether this component can be force-unloaded
             unload_callback: Function to call to unload this component
-            
+
         Returns:
             True if budget allocated (safe to load), False if denied
         """
+        # Memory Control Plane: delegate to broker if available
+        try:
+            import warnings
+            warnings.warn(
+                "ProactiveResourceGuard.request_memory_budget() is deprecated. "
+                "Use MemoryBudgetBroker.request() instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            from backend.core.memory_budget_broker import get_memory_budget_broker
+            broker = get_memory_budget_broker()
+            if broker is not None:
+                from backend.core.memory_types import BudgetPriority, StartupPhase
+                try:
+                    grant = await broker.try_request(
+                        component=f"legacy:{component}@v1",
+                        bytes_requested=int((estimated_mb if estimated_mb is not None else self.get_estimated_memory(component)) * 1024 * 1024),
+                        priority=BudgetPriority.RUNTIME_INTERACTIVE,
+                        phase=broker.current_phase,
+                    )
+                    return grant is not None
+                except Exception:
+                    pass  # Fall through to legacy logic
+        except ImportError:
+            pass
+
         if estimated_mb is None:
             estimated_mb = self.get_estimated_memory(component)
         

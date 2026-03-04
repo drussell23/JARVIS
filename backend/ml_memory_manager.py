@@ -390,7 +390,22 @@ class IntelligentMLMemoryManager:
                 asyncio.create_task(self.load_model(model_name))
                 
     def _can_load_model(self, config: ModelConfig) -> bool:
-        """Check if model can be loaded within memory budget"""
+        """Check if model can be loaded within memory budget.
+
+        .. deprecated::
+            Use :func:`MemoryBudgetBroker.try_request` instead.
+        """
+        # Memory Control Plane: delegate to broker if available
+        try:
+            import warnings
+            warnings.warn(
+                "IntelligentMLMemoryManager._can_load_model() is deprecated. "
+                "Use MemoryBudgetBroker.try_request() instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        except Exception:
+            pass
         current_usage = self.get_memory_usage()
         available_mb = min(
             current_usage["available_mb"],

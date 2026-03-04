@@ -1418,6 +1418,9 @@ class MemoryQuantizer:
         """
         Reserve memory in accounting. Returns reservation ID.
 
+        .. deprecated::
+            Memory is now managed by :class:`MemoryBudgetBroker`.
+
         Components call this BEFORE allocating large blocks (e.g., model loading).
         The reservation is factored into pressure calculations so other components
         see accurate available headroom. Call release_reservation() after the
@@ -1430,6 +1433,13 @@ class MemoryQuantizer:
         Returns:
             Reservation ID string to pass to release_reservation().
         """
+        import warnings
+        warnings.warn(
+            "MemoryQuantizer.reserve_memory() is deprecated. "
+            "Memory is now managed by MemoryBudgetBroker.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         import uuid
         reservation_id = f"res_{component}_{uuid.uuid4().hex[:8]}"
         self._memory_reservations[reservation_id] = (gb, component)
@@ -1442,12 +1452,22 @@ class MemoryQuantizer:
         """
         Release a memory reservation.
 
+        .. deprecated::
+            Memory is now managed by :class:`MemoryBudgetBroker`.
+
         Call this after the reserved memory has been physically allocated
         (the OS now tracks it in wired/active) or if the allocation failed.
 
         Args:
             reservation_id: The ID returned by reserve_memory().
         """
+        import warnings
+        warnings.warn(
+            "MemoryQuantizer.release_reservation() is deprecated. "
+            "Memory is now managed by MemoryBudgetBroker.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if reservation_id in self._memory_reservations:
             gb, component = self._memory_reservations.pop(reservation_id)
             logger.info(
