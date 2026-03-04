@@ -3875,39 +3875,52 @@ class GCPVMManager:
             f"endpoint {url} to routing layer"
         )
 
-        # Notify PrimeRouter (routes inference traffic)
-        _router_ok = False
-        try:
-            from backend.core.prime_router import notify_gcp_vm_ready
-            _router_success = await notify_gcp_vm_ready(vm.ip_address, port)
-            if _router_success:
-                _router_ok = True
-                logger.info(
-                    f"[EndpointPropagation] PrimeRouter promoted GCP endpoint: "
-                    f"{vm.ip_address}:{port}"
-                )
-            else:
-                logger.warning(
-                    f"[EndpointPropagation] PrimeRouter promotion failed "
-                    f"for {vm.ip_address}:{port}"
-                )
-        except ImportError:
-            logger.debug("[EndpointPropagation] PrimeRouter not available")
-        except Exception as e:
-            logger.warning(f"[EndpointPropagation] PrimeRouter notification error: {e}")
+        # --- Per-sink propagation tracking ---
+        # Track each sink independently so partial failures are retried correctly.
+        # The composite `endpoint_propagated` is True only when all required sinks succeed.
+        _router_ok = vm.metadata.get("router_propagated", False)
+        _model_ok = vm.metadata.get("model_serving_propagated", False)
 
-        # Notify UnifiedModelServing (hot-swaps inference client)
-        try:
-            from backend.intelligence.unified_model_serving import notify_gcp_endpoint_ready
-            _model_success = await notify_gcp_endpoint_ready(url)
-            if _model_success:
-                logger.info(
-                    f"[EndpointPropagation] UnifiedModelServing hot-swapped to {url}"
-                )
-        except ImportError:
-            logger.debug("[EndpointPropagation] UnifiedModelServing not available")
-        except Exception as e:
-            logger.warning(f"[EndpointPropagation] ModelServing notification error: {e}")
+        # Notify PrimeRouter (routes inference traffic) — skip if already propagated
+        if not _router_ok:
+            try:
+                from backend.core.prime_router import notify_gcp_vm_ready
+                _router_success = await notify_gcp_vm_ready(vm.ip_address, port)
+                if _router_success:
+                    _router_ok = True
+                    vm.metadata["router_propagated"] = True
+                    logger.info(
+                        f"[EndpointPropagation] PrimeRouter promoted GCP endpoint: "
+                        f"{vm.ip_address}:{port}"
+                    )
+                else:
+                    logger.warning(
+                        f"[EndpointPropagation] PrimeRouter promotion failed "
+                        f"for {vm.ip_address}:{port}"
+                    )
+            except ImportError:
+                logger.debug("[EndpointPropagation] PrimeRouter not available")
+            except Exception as e:
+                logger.warning(f"[EndpointPropagation] PrimeRouter notification error: {e}")
+
+        # Notify UnifiedModelServing (hot-swaps inference client) — skip if already propagated
+        if not _model_ok:
+            try:
+                from backend.intelligence.unified_model_serving import notify_gcp_endpoint_ready
+                _model_success = await notify_gcp_endpoint_ready(url)
+                if _model_success:
+                    _model_ok = True
+                    vm.metadata["model_serving_propagated"] = True
+                    logger.info(
+                        f"[EndpointPropagation] UnifiedModelServing hot-swapped to {url}"
+                    )
+            except ImportError:
+                # Model serving unavailable — treat as non-blocking (router is critical path)
+                _model_ok = True
+                vm.metadata["model_serving_propagated"] = True
+                logger.debug("[EndpointPropagation] UnifiedModelServing not available")
+            except Exception as e:
+                logger.warning(f"[EndpointPropagation] ModelServing notification error: {e}")
 
         # Notify orchestrator's Trinity GCP ready event (prevents duplicate VM provisioning)
         try:
@@ -3922,10 +3935,11 @@ class GCPVMManager:
         except Exception:
             pass
 
-        # Track propagation state — only mark propagated if PrimeRouter accepted the endpoint.
-        # Without this guard, a failed promotion sets endpoint_propagated=True, causing the
-        # guard at the top of this method to skip retries on subsequent calls.
-        if _router_ok:
+        # Composite propagation state — only fully propagated when all required sinks succeed.
+        # The top guard checks this flag; if any sink failed, subsequent calls will retry
+        # only the failed sinks (per-sink guards above).
+        _fully_propagated = _router_ok and _model_ok
+        if _fully_propagated:
             vm.metadata["endpoint_propagated"] = True
             vm.metadata["endpoint_propagated_at"] = time.time()
             vm.metadata["endpoint_url"] = url
@@ -3936,17 +3950,22 @@ class GCPVMManager:
         # propagation is an infrastructure event, not real application traffic.
         vm.last_activity_time = time.time()
 
-        if _router_ok:
+        if _fully_propagated:
             logger.info(
                 f"[EndpointPropagation] v236.3: VM '{vm.name}' fully integrated "
                 f"into routing layer at {url}"
             )
         else:
+            _failed = []
+            if not _router_ok:
+                _failed.append("PrimeRouter")
+            if not _model_ok:
+                _failed.append("ModelServing")
             logger.warning(
-                f"[EndpointPropagation] VM '{vm.name}' env vars set but PrimeRouter "
-                f"promotion failed — will retry on next call"
+                f"[EndpointPropagation] VM '{vm.name}' partially propagated — "
+                f"failed sinks: {', '.join(_failed)} — will retry on next call"
             )
-        return _router_ok
+        return _fully_propagated
 
     async def _ensure_endpoint_depropagated(self, vm: VMInstance) -> bool:
         """v236.3: Demote a VM's endpoint from the routing layer when health fails.
@@ -4014,6 +4033,8 @@ class GCPVMManager:
 
         # Clear propagation metadata — allows re-propagation if VM recovers
         vm.metadata["endpoint_propagated"] = False
+        vm.metadata["router_propagated"] = False
+        vm.metadata["model_serving_propagated"] = False
         vm.metadata["endpoint_demoted_at"] = time.time()
         vm.metadata["endpoint_demoted_reason"] = "health_check_failed"
 

@@ -301,6 +301,9 @@ class PrimeRouter:
         self._transition_cooldown_s: float = float(
             os.environ.get("JARVIS_ROUTING_TRANSITION_COOLDOWN_S", "30.0")
         )
+        # In-flight flag: prevents concurrent promote/demote while network I/O
+        # is in progress outside the lock
+        self._transition_in_flight: bool = False
 
     async def initialize(self) -> None:
         """Initialize the router and its clients."""
@@ -460,7 +463,12 @@ class PrimeRouter:
 
         Returns True if promotion succeeded (GCP endpoint is healthy).
         """
+        # Phase 1: Acquire lock, check state, claim transition
         async with self._lock:
+            if self._transition_in_flight:
+                logger.info("[PrimeRouter] Transition already in flight, skipping promote")
+                return self._gcp_promoted
+
             if not self._initialized:
                 await self.initialize()
 
@@ -469,8 +477,6 @@ class PrimeRouter:
                 return False
 
             # v273.0: Idempotent steady-state promotion should bypass cooldown checks.
-            # When the router is already promoted to this endpoint, return success
-            # instead of treating repeated notifications as flapping.
             if (
                 self._gcp_promoted
                 and self._gcp_host == host
@@ -497,8 +503,6 @@ class PrimeRouter:
             except ImportError:
                 pass
 
-            logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
-
             # v276.0 Phase 12: Partition-aware promotion gate
             try:
                 from backend.core.partition_aware_health import is_partition_detected as _is_part
@@ -511,43 +515,57 @@ class PrimeRouter:
             except ImportError:
                 pass
 
+            # Claim this transition — prevents concurrent promote/demote
+            # while we perform the network call outside the lock.
+            self._transition_in_flight = True
+
+        # Phase 2: Network call outside lock — avoids holding lock during I/O
+        logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
+        try:
             success = await self._prime_client.update_endpoint(host, port)
+        except Exception as e:
+            logger.warning(f"[PrimeRouter] update_endpoint failed: {e}")
+            success = False
+        finally:
+            # Phase 3: Re-acquire lock, commit state
+            async with self._lock:
+                self._transition_in_flight = False
 
-            if success:
-                self._gcp_promoted = True
-                self._gcp_host = host
-                self._gcp_port = port
-                self._last_transition_time = time.monotonic()
-                # v242.0: Reset circuit for health-checked GCP endpoint (skips cold probe)
-                self._local_circuit.reset_for_endpoint(
-                    endpoint_id=f"gcp:{host}:{port}", health_checked=True
-                )
-                # v242.0 Gap K: Cancel orphaned prime_router task from old endpoint
-                # (targeted — voice/reactor tasks are unrelated to endpoint swap)
-                try:
-                    _uc = await _get_ultra_coordinator()
-                    if _uc and _uc.cancel_shielded_task("prime_router"):
-                        logger.info("[PrimeRouter] v242.0 Cancelled orphan prime_router task on GCP promotion")
-                except Exception:
-                    pass  # Never break promotion for cleanup
-                # v271.0: Log promotion decision
-                try:
-                    from backend.core.decision_log import record_decision, DECISION_ROUTING_PROMOTE
-                    record_decision(
-                        decision_type=DECISION_ROUTING_PROMOTE,
-                        reason=f"GCP VM endpoint promoted: {host}:{port}",
-                        inputs={"host": host, "port": port},
-                        outcome="promoted",
-                        component="prime_router",
+                if success:
+                    self._gcp_promoted = True
+                    self._gcp_host = host
+                    self._gcp_port = port
+                    self._last_transition_time = time.monotonic()
+                    self._local_circuit.reset_for_endpoint(
+                        endpoint_id=f"gcp:{host}:{port}", health_checked=True
                     )
-                except ImportError:
-                    pass
-                logger.info("[PrimeRouter] v232.0: GCP VM promotion successful, routing updated")
-            else:
-                self._gcp_promoted = False
-                logger.warning("[PrimeRouter] v232.0: GCP VM promotion failed, keeping current routing")
+                else:
+                    self._gcp_promoted = False
 
-            return success
+        # Phase 4: Post-commit side effects (no lock needed, no state mutation)
+        if success:
+            try:
+                _uc = await _get_ultra_coordinator()
+                if _uc and _uc.cancel_shielded_task("prime_router"):
+                    logger.info("[PrimeRouter] v242.0 Cancelled orphan prime_router task on GCP promotion")
+            except Exception:
+                pass
+            try:
+                from backend.core.decision_log import record_decision, DECISION_ROUTING_PROMOTE
+                record_decision(
+                    decision_type=DECISION_ROUTING_PROMOTE,
+                    reason=f"GCP VM endpoint promoted: {host}:{port}",
+                    inputs={"host": host, "port": port},
+                    outcome="promoted",
+                    component="prime_router",
+                )
+            except ImportError:
+                pass
+            logger.info("[PrimeRouter] v232.0: GCP VM promotion successful, routing updated")
+        else:
+            logger.warning("[PrimeRouter] v232.0: GCP VM promotion failed, keeping current routing")
+
+        return success
 
     async def demote_gcp_endpoint(self) -> bool:
         """
@@ -556,8 +574,13 @@ class PrimeRouter:
         Called when the GCP VM becomes unhealthy or is terminated.
         Returns True if demotion succeeded.
         """
+        # Phase 1: Acquire lock, check state, claim transition
         async with self._lock:
             if self._prime_client is None:
+                return False
+
+            if self._transition_in_flight:
+                logger.info("[PrimeRouter] Transition already in flight, skipping demote")
                 return False
 
             # v271.0: Flapping protection
@@ -566,30 +589,43 @@ class PrimeRouter:
 
             _prev_host = self._gcp_host
             _prev_port = self._gcp_port
+            self._transition_in_flight = True
+
+        # Phase 2: Network call outside lock
+        try:
             success = await self._prime_client.demote_to_fallback()
-            if success:
-                self._gcp_promoted = False
-                self._gcp_host = None
-                self._gcp_port = None
-                self._last_transition_time = time.monotonic()
-                # v242.0: Reset circuit for local endpoint (cold probe for unverified local)
-                self._local_circuit.reset_for_endpoint(
-                    endpoint_id="local", health_checked=False
-                )
-                # v271.0: Log demotion decision
-                try:
-                    from backend.core.decision_log import record_decision, DECISION_ROUTING_DEMOTE
-                    record_decision(
-                        decision_type=DECISION_ROUTING_DEMOTE,
-                        reason="GCP VM endpoint demoted back to local",
-                        inputs={"previous_host": _prev_host, "previous_port": _prev_port},
-                        outcome="demoted",
-                        component="prime_router",
+        except Exception as e:
+            logger.warning(f"[PrimeRouter] demote_to_fallback failed: {e}")
+            success = False
+        finally:
+            # Phase 3: Re-acquire lock, commit state
+            async with self._lock:
+                self._transition_in_flight = False
+
+                if success:
+                    self._gcp_promoted = False
+                    self._gcp_host = None
+                    self._gcp_port = None
+                    self._last_transition_time = time.monotonic()
+                    self._local_circuit.reset_for_endpoint(
+                        endpoint_id="local", health_checked=False
                     )
-                except ImportError:
-                    pass
-                logger.info("[PrimeRouter] v232.0: Demoted from GCP VM to local Prime")
-            return success
+
+        # Phase 4: Post-commit side effects
+        if success:
+            try:
+                from backend.core.decision_log import record_decision, DECISION_ROUTING_DEMOTE
+                record_decision(
+                    decision_type=DECISION_ROUTING_DEMOTE,
+                    reason="GCP VM endpoint demoted back to local",
+                    inputs={"previous_host": _prev_host, "previous_port": _prev_port},
+                    outcome="demoted",
+                    component="prime_router",
+                )
+            except ImportError:
+                pass
+            logger.info("[PrimeRouter] v232.0: Demoted from GCP VM to local Prime")
+        return success
 
     async def generate(
         self,

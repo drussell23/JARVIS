@@ -293,45 +293,51 @@ def test_connectivity_warn_downgraded_only_with_fallback():
 # ---------------------------------------------------------------------------
 
 def test_supervisor_and_vm_manager_port_defaults_match():
-    """Supervisor and GCP VM manager must agree on default inference port.
+    """All JARVIS_PRIME_PORT consumers must agree on default = 8000.
 
-    Both unified_supervisor.py (invincible_node_port) and gcp_vm_manager.py
-    read JARVIS_PRIME_PORT with a fallback default. If they disagree, the
-    supervisor promotes on one port while the VM manager promotes on another,
-    causing the idempotent check in PrimeRouter to fail and triggering
-    false flapping protection.
-
-    We verify via source inspection to avoid heavy module-level side effects
-    from importing the full SystemKernelConfig.
+    Verifies:
+    1. DEFAULT_PRIME_INFERENCE_PORT constant exists and equals 8000
+    2. invincible_node_port references the constant (not a hardcoded literal)
+    3. prime_api_port references the constant (not a hardcoded literal)
+    4. gcp_vm_manager uses "8000" as its fallback default
+    5. No stale hardcoded 8001 remains in JARVIS_PRIME_PORT patterns
     """
     import re
     import pathlib
 
     project = pathlib.Path(__file__).resolve().parents[4]
-
-    # --- Supervisor: invincible_node_port default ---
-    # Pattern: invincible_node_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_PORT", XXXX))
     sup_src = (project / "unified_supervisor.py").read_text()
-    sup_match = re.search(
-        r'invincible_node_port.*_get_env_int\(\s*"JARVIS_PRIME_PORT"\s*,\s*(\d+)\s*\)',
-        sup_src,
-    )
-    assert sup_match, "Could not find invincible_node_port default in unified_supervisor.py"
-    sup_default = int(sup_match.group(1))
-
-    # --- GCP VM manager: JARVIS_PRIME_PORT default in _ensure_endpoint_propagated ---
-    # Pattern: os.getenv("JARVIS_PRIME_PORT" if is_invincible else "GCP_BACKEND_PORT", "8000")
     vm_src = (project / "backend" / "core" / "gcp_vm_manager.py").read_text()
+
+    # 1. Canonical constant exists and equals 8000
+    const_match = re.search(r'DEFAULT_PRIME_INFERENCE_PORT\s*=\s*(\d+)', sup_src)
+    assert const_match, "DEFAULT_PRIME_INFERENCE_PORT constant not found"
+    assert int(const_match.group(1)) == 8000, (
+        f"DEFAULT_PRIME_INFERENCE_PORT = {const_match.group(1)}, expected 8000"
+    )
+
+    # 2. invincible_node_port uses the constant
+    assert re.search(
+        r'invincible_node_port.*DEFAULT_PRIME_INFERENCE_PORT', sup_src
+    ), "invincible_node_port should reference DEFAULT_PRIME_INFERENCE_PORT"
+
+    # 3. prime_api_port uses the constant
+    assert re.search(
+        r'prime_api_port.*DEFAULT_PRIME_INFERENCE_PORT', sup_src
+    ), "prime_api_port should reference DEFAULT_PRIME_INFERENCE_PORT"
+
+    # 4. gcp_vm_manager default matches
     vm_match = re.search(
-        r'os\.getenv\(\s*"JARVIS_PRIME_PORT".*?,\s*"(\d+)"\s*,?\s*\)',
-        vm_src,
+        r'os\.getenv\(\s*"JARVIS_PRIME_PORT".*?,\s*"(\d+)"\s*,?\s*\)', vm_src,
     )
     assert vm_match, "Could not find JARVIS_PRIME_PORT default in gcp_vm_manager.py"
-    vm_default = int(vm_match.group(1))
-
-    assert sup_default == vm_default == 8000, (
-        f"Port default mismatch: supervisor={sup_default}, vm_manager={vm_default}, expected=8000"
+    assert int(vm_match.group(1)) == 8000, (
+        f"gcp_vm_manager default = {vm_match.group(1)}, expected 8000"
     )
+
+    # 5. No stale hardcoded 8001 in JARVIS_PRIME_PORT patterns
+    stale = re.findall(r'JARVIS_PRIME_PORT.*?8001', sup_src)
+    assert not stale, f"Stale 8001 default found in unified_supervisor.py: {stale}"
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +384,6 @@ async def test_endpoint_propagated_only_on_router_success():
 
     manager = GCPVMManager.__new__(GCPVMManager)
 
-    # Create a minimal VM
     vm = VMInstance(
         instance_id="test-123",
         name="jarvis-prime-node-1",
@@ -390,12 +395,10 @@ async def test_endpoint_propagated_only_on_router_success():
         metadata={},
     )
 
-    # Mock the health ping to succeed
     manager._ping_health_endpoint = AsyncMock(return_value=(True, {"status": "ok"}))
 
-    # Mock notify_gcp_vm_ready to FAIL (patched at source — lazy imported inside method)
+    # Router FAILS, model serving succeeds
     with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=False):
-        # Also mock the model serving notification to avoid import errors
         with patch("backend.intelligence.unified_model_serving.notify_gcp_endpoint_ready", new_callable=AsyncMock, return_value=True):
             result = await manager._ensure_endpoint_propagated(vm)
 
@@ -403,6 +406,53 @@ async def test_endpoint_propagated_only_on_router_success():
     assert vm.metadata.get("endpoint_propagated") is not True, (
         "endpoint_propagated must not be True when router promotion failed"
     )
+    assert vm.metadata.get("router_propagated") is not True, (
+        "router_propagated must not be True when router failed"
+    )
+    assert vm.metadata.get("model_serving_propagated") is True, (
+        "model_serving_propagated should be True since it succeeded"
+    )
+
+
+@pytest.mark.asyncio
+async def test_partial_propagation_retries_only_failed_sink():
+    """On retry, only the failed sink should be re-attempted."""
+    from backend.core.gcp_vm_manager import GCPVMManager, VMInstance, VMState
+
+    manager = GCPVMManager.__new__(GCPVMManager)
+
+    vm = VMInstance(
+        instance_id="test-789",
+        name="jarvis-prime-node-3",
+        zone="us-central1-a",
+        state=VMState.RUNNING,
+        created_at=0,
+        ip_address="10.0.0.3",
+        health_status="unknown",
+        metadata={},
+    )
+
+    manager._ping_health_endpoint = AsyncMock(return_value=(True, {"status": "ok"}))
+
+    # First call: router fails, model serving succeeds
+    with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=False) as mock_router:
+        with patch("backend.intelligence.unified_model_serving.notify_gcp_endpoint_ready", new_callable=AsyncMock, return_value=True) as mock_model:
+            result = await manager._ensure_endpoint_propagated(vm)
+            assert result is False
+            assert mock_router.call_count == 1
+            assert mock_model.call_count == 1
+
+    # Second call: router now succeeds — model serving should NOT be re-called
+    with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=True) as mock_router2:
+        with patch("backend.intelligence.unified_model_serving.notify_gcp_endpoint_ready", new_callable=AsyncMock, return_value=True) as mock_model2:
+            result = await manager._ensure_endpoint_propagated(vm)
+            assert result is True
+            assert mock_router2.call_count == 1  # Router retried
+            assert mock_model2.call_count == 0   # Model serving skipped (already propagated)
+
+    assert vm.metadata.get("endpoint_propagated") is True
+    assert vm.metadata.get("router_propagated") is True
+    assert vm.metadata.get("model_serving_propagated") is True
 
 
 # ---------------------------------------------------------------------------
