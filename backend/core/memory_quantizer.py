@@ -456,6 +456,10 @@ class MemoryQuantizer:
         self._unload_callbacks: List[Callable] = []
         self._recovery_callbacks: List[Callable] = []
 
+        # v267.0: Epoch fencing and broker back-reference for MemorySnapshot
+        self._supervisor_epoch: int = 0
+        self._broker_ref = None  # Set by MemoryBudgetBroker after init
+
         logger.info("Advanced Memory Quantizer initialized")
         logger.info(f"  Config: {self.config}")
         logger.info(f"  UAE: {'✅' if uae_engine else '❌'}")
@@ -1462,6 +1466,176 @@ class MemoryQuantizer:
             Dict mapping reservation_id -> (gb, component).
         """
         return dict(self._memory_reservations)
+
+    # ========================================================================
+    # v267.0: Epoch & Broker Setters + Canonical Snapshot
+    # ========================================================================
+
+    def set_supervisor_epoch(self, epoch: int) -> None:
+        """Set the supervisor epoch for snapshot fencing."""
+        self._supervisor_epoch = epoch
+
+    def set_broker_ref(self, broker) -> None:
+        """Set the MemoryBudgetBroker back-reference (called after broker init)."""
+        self._broker_ref = broker
+
+    async def snapshot(self, max_age_ms: int = 0) -> "MemorySnapshot":
+        """Create a canonical ``MemorySnapshot`` from live system signals.
+
+        This is the **single call-site** for ``psutil.virtual_memory()`` and
+        ``psutil.swap_memory()`` in the entire Memory Control Plane.  All
+        other code receives the resulting frozen dataclass.
+
+        Args:
+            max_age_ms: Staleness budget passed through to the snapshot.
+                        0 means "just sampled, no caching".
+
+        Returns:
+            A fully-populated, frozen ``MemorySnapshot``.
+        """
+        from backend.core.memory_types import (
+            MemorySnapshot as MTSnapshot,
+            PressureTier,
+            KernelPressure,
+            ThrashState,
+            SignalQuality,
+            PressureTrend,
+        )
+        import uuid
+
+        # ---- raw system signals (psutil) --------------------------------
+        mem = psutil.virtual_memory()
+        swap = psutil.swap_memory()
+
+        physical_total = mem.total
+        physical_wired = getattr(mem, 'wired', 0)
+        physical_active = getattr(mem, 'active', 0)
+        physical_inactive = getattr(mem, 'inactive', 0)
+        physical_compressed = (
+            getattr(mem, 'compressed', 0) if hasattr(mem, 'compressed') else 0
+        )
+        physical_free = mem.free
+
+        # ---- kernel pressure (async, may fail) --------------------------
+        signal_quality = SignalQuality.GOOD
+        try:
+            kernel_mp = await self._get_memory_pressure_async()
+            # Map MemoryPressure enum to KernelPressure enum
+            _kp_map = {
+                MemoryPressure.NORMAL: KernelPressure.NORMAL,
+                MemoryPressure.WARN: KernelPressure.WARN,
+                MemoryPressure.CRITICAL: KernelPressure.CRITICAL,
+            }
+            kernel_pressure = _kp_map.get(kernel_mp, KernelPressure.NORMAL)
+        except Exception:
+            kernel_pressure = KernelPressure.NORMAL
+            signal_quality = SignalQuality.DEGRADED
+
+        # ---- pageins (async, may fail) ----------------------------------
+        try:
+            pageins_per_sec = await self._get_pagein_rate_async()
+        except Exception:
+            pageins_per_sec = 0.0
+            if signal_quality == SignalQuality.GOOD:
+                signal_quality = SignalQuality.DEGRADED
+
+        # ---- map current_tier (MemoryTier) -> PressureTier --------------
+        _tier_map = {
+            MemoryTier.ABUNDANT: PressureTier.ABUNDANT,
+            MemoryTier.OPTIMAL: PressureTier.OPTIMAL,
+            MemoryTier.ELEVATED: PressureTier.ELEVATED,
+            MemoryTier.CONSTRAINED: PressureTier.CONSTRAINED,
+            MemoryTier.CRITICAL: PressureTier.CRITICAL,
+            MemoryTier.EMERGENCY: PressureTier.EMERGENCY,
+        }
+        pressure_tier = _tier_map.get(self.current_tier, PressureTier.OPTIMAL)
+
+        # ---- map _thrash_state string -> ThrashState enum ---------------
+        _thrash_map = {
+            "healthy": ThrashState.HEALTHY,
+            "thrashing": ThrashState.THRASHING,
+            "emergency": ThrashState.EMERGENCY,
+        }
+        thrash_state = _thrash_map.get(
+            self._thrash_state, ThrashState.HEALTHY
+        )
+
+        # ---- safety floor (tier-adaptive) -------------------------------
+        _floor_multipliers = {
+            PressureTier.ABUNDANT: 1.0,
+            PressureTier.OPTIMAL: 1.0,
+            PressureTier.ELEVATED: 1.25,
+            PressureTier.CONSTRAINED: 1.5,
+            PressureTier.CRITICAL: 2.0,
+            PressureTier.EMERGENCY: 2.5,
+        }
+        tier_multiplier = _floor_multipliers.get(pressure_tier, 1.0)
+        safety_floor_bytes = int(physical_total * 0.10 * tier_multiplier)
+
+        # ---- compressed trend (from pagein EMA as proxy) ----------------
+        compressed_trend_bytes = physical_compressed
+
+        # ---- usable_bytes = total - wired - compressed_trend ------------
+        usable_bytes = max(
+            0, physical_total - physical_wired - compressed_trend_bytes
+        )
+
+        # ---- committed bytes from broker --------------------------------
+        committed_bytes = 0
+        if self._broker_ref is not None:
+            try:
+                committed_bytes = self._broker_ref.get_committed_bytes()
+            except Exception:
+                pass
+
+        available_budget_bytes = max(0, usable_bytes - committed_bytes)
+
+        # ---- swap signals -----------------------------------------------
+        swap_growth_rate_bps = 0.0  # Will be populated by broker sampler
+        swap_slope_bps = 0.0
+
+        # ---- RSS slopes (not tracked here yet; broker fills later) ------
+        host_rss_slope_bps = 0.0
+        jarvis_tree_rss_slope_bps = 0.0
+
+        # ---- pressure trend (simple heuristic from pagein EMA) ----------
+        if self._pagein_rate_ema > THRASH_PAGEIN_WARNING:
+            pressure_trend = PressureTrend.RISING
+        elif self._pagein_rate_ema < THRASH_PAGEIN_HEALTHY:
+            pressure_trend = PressureTrend.FALLING
+        else:
+            pressure_trend = PressureTrend.STABLE
+
+        # ---- build the frozen snapshot ----------------------------------
+        return MTSnapshot(
+            physical_total=physical_total,
+            physical_wired=physical_wired,
+            physical_active=physical_active,
+            physical_inactive=physical_inactive,
+            physical_compressed=physical_compressed,
+            physical_free=physical_free,
+            swap_total=swap.total,
+            swap_used=swap.used,
+            swap_growth_rate_bps=swap_growth_rate_bps,
+            usable_bytes=usable_bytes,
+            committed_bytes=committed_bytes,
+            available_budget_bytes=available_budget_bytes,
+            kernel_pressure=kernel_pressure,
+            pressure_tier=pressure_tier,
+            thrash_state=thrash_state,
+            pageins_per_sec=pageins_per_sec,
+            host_rss_slope_bps=host_rss_slope_bps,
+            jarvis_tree_rss_slope_bps=jarvis_tree_rss_slope_bps,
+            swap_slope_bps=swap_slope_bps,
+            pressure_trend=pressure_trend,
+            safety_floor_bytes=safety_floor_bytes,
+            compressed_trend_bytes=compressed_trend_bytes,
+            signal_quality=signal_quality,
+            timestamp=time.time(),
+            max_age_ms=max_age_ms,
+            epoch=self._supervisor_epoch,
+            snapshot_id=f"snap_{uuid.uuid4().hex[:12]}",
+        )
 
     # ========================================================================
     # UAE/SAI Integration
