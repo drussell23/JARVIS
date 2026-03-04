@@ -233,6 +233,97 @@ JARVIS is the **orchestrator** for the three repos:
 body:HEAL | prime:STAR | reactorc:STAR | gcpvm:STAR | trinity:STAR
 ```
 
+### Phase 2: Trinity Autonomy Wiring
+
+Phase 2 adds **autonomy lifecycle events** to the Trinity loop. The Body emits structured events for every autonomous action (Google Workspace agent), which flow through the existing cross-repo transport to Reactor-Core for ingestion and classification, while JARVIS-Prime provides policy constraints and structured action plans.
+
+**Autonomy Event Pipeline:**
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                   PHASE 2: AUTONOMY EVENT FLOW                             │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  ┌──────────────────────────────────────────────────┐                      │
+│  │         JARVIS BODY (this repo)                   │                      │
+│  │                                                   │                      │
+│  │  GoogleWorkspaceAgent.execute_task()              │                      │
+│  │    ├─ policy_denied ──┐                           │                      │
+│  │    ├─ deduplicated ───┤                           │                      │
+│  │    ├─ no_journal_lease┤  _emit_autonomy_event()   │                      │
+│  │    ├─ intent_written ─┤         │                 │                      │
+│  │    ├─ committed ──────┤         │                 │                      │
+│  │    ├─ failed ─────────┤         ▼                 │                      │
+│  │    └─ superseded ─────┤  CrossRepoExperience      │                      │
+│  │                       │  Forwarder                │                      │
+│  │                       │    │ token-bucket rate     │                      │
+│  │                       │    │ limiter (50 evt/s)    │                      │
+│  └───────────────────────┼────┼──────────────────────┘                      │
+│                          │    │                                              │
+│                          │    ▼                                              │
+│  ┌───────────────────────┼─────────────────────────┐                       │
+│  │  REACTOR-CORE         │                          │                       │
+│  │                       ▼                          │                       │
+│  │  AutonomyEventIngestor                           │                       │
+│  │    ├─ validate (7 required keys)                 │                       │
+│  │    ├─ dedup (composite key, 50K window)          │                       │
+│  │    ├─ quarantine (malformed → disk)              │                       │
+│  │    └─ classify ──► AutonomyEventClassifier       │                       │
+│  │                       │                          │                       │
+│  │         ┌─────────────┼───────────────┐          │                       │
+│  │         │ TRAINABLE   │ INFRASTRUCTURE│          │                       │
+│  │         │ committed   │ policy_denied │          │                       │
+│  │         │ failed      │ no_journal_   │          │                       │
+│  │         │             │   lease       │          │                       │
+│  │         ▼             ▼               │          │                       │
+│  │    UnifiedPipeline   (excluded from   │          │                       │
+│  │    (DPO/LoRA)        training)        │          │                       │
+│  └───────────────────────────────────────┘          │                       │
+│                                                      │                      │
+│  ┌───────────────────────────────────────┐          │                       │
+│  │  JARVIS-PRIME                          │          │                       │
+│  │                                        │          │                       │
+│  │  JARVISCommand.autonomy_policy ────►  │          │                       │
+│  │  PrimeResponse.action_plan      ◄──── │          │                       │
+│  │  Health: autonomy_schema_version=1.0  │          │                       │
+│  └───────────────────────────────────────┘          │                       │
+│                                                      │                      │
+│  ┌───────────────────────────────────────┐          │                       │
+│  │  SUPERVISOR (boot contract check)     │          │                       │
+│  │                                        │          │                       │
+│  │  check_autonomy_contracts()           │          │                       │
+│  │    ├─ Body schema_version ✓           │          │                       │
+│  │    ├─ Prime contract_version ✓        │          │                       │
+│  │    ├─ Reactor schema support ✓        │          │                       │
+│  │    └─ Mismatch → read-only mode      │          │                       │
+│  └───────────────────────────────────────┘          │                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**7 canonical event types** emitted by the Body:
+
+| Event Type | Training Label | Description |
+|---|---|---|
+| `intent_written` | Excluded | Journal fence acquired, action about to execute |
+| `committed` | Trainable | Action completed successfully |
+| `failed` | Trainable | Action execution failed |
+| `policy_denied` | Infrastructure | Autonomy policy blocked the action |
+| `deduplicated` | Excluded | Idempotency check suppressed duplicate |
+| `superseded` | Reconcile-only | Stale intent replaced by newer one |
+| `no_journal_lease` | Infrastructure | Journal fence unavailable, fail-closed |
+
+**Key design decisions:**
+- **Strict metadata schema** — 7 required keys per event (`autonomy_event_type`, `autonomy_schema_version`, `idempotency_key`, `trace_id`, `correlation_id`, `action`, `request_kind`). Malformed events are quarantined, never silently coerced.
+- **Effectively-once semantics** — Deduplication by composite key `(idempotency_key, autonomy_event_type, trace_id)`.
+- **Boot contract validation** — Supervisor checks schema version compatibility matrix across Body, Prime, and Reactor at startup. Mismatch degrades to read-only autonomy mode.
+- **Guarded event-first** — Default mode is read-only autonomy. No autonomous writes until the contract gate passes.
+
+**Files modified (Body):**
+- `backend/neural_mesh/agents/google_workspace_agent.py` — Constants, `_emit_autonomy_event()`, 7 emission points
+- `backend/intelligence/cross_repo_experience_forwarder.py` — `forward_autonomy_event()` with rate limiting
+- `backend/supervisor/cross_repo_startup_orchestrator.py` — `check_autonomy_contracts()`
+- `backend/main.py` — `/api/system/status` autonomy block
+
 ---
 
 ## GCP Golden Image — Cloud Inference Architecture (v224.0+, v235.4, v236.0, v238.0, v241.1, v259.1)
