@@ -40,6 +40,7 @@ import dataclasses
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 import warnings
@@ -406,6 +407,7 @@ class MemoryBudgetBroker:
 
         self._coordinator = MemoryActuatorCoordinator()
         self._sequence: int = 0
+        self._seq_lock = threading.Lock()
         self._policy = PressurePolicy.for_ram_gb(self._detect_total_ram_gb())
 
         # Wire the quantizer to read committed_bytes from us
@@ -454,9 +456,10 @@ class MemoryBudgetBroker:
 
     def _advance_sequence(self) -> int:
         """Advance the sequence counter and sync with coordinator."""
-        self._sequence += 1
-        self._coordinator.advance_epoch(self._epoch, self._sequence)
-        return self._sequence
+        with self._seq_lock:
+            self._sequence += 1
+            self._coordinator.advance_epoch(self._epoch, self._sequence)
+            return self._sequence
 
     @staticmethod
     def _detect_total_ram_gb() -> float:
@@ -465,6 +468,10 @@ class MemoryBudgetBroker:
             import psutil
             return psutil.virtual_memory().total / (1024 ** 3)
         except Exception:
+            logger.warning(
+                "Could not detect system RAM via psutil; defaulting to 16 GB",
+                exc_info=True,
+            )
             return 16.0
 
     # --- Committed bytes ---
