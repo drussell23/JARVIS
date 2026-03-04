@@ -2420,6 +2420,14 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             _broker = await init_memory_budget_broker(_mq, epoch=_epoch)
             _broker.set_phase(StartupPhase.BOOT_OPTIONAL)
             logger.info(f"[MCP] MemoryBudgetBroker initialized (epoch={_epoch})")
+
+            # Wire CloudCapacityController as broker pressure observer
+            try:
+                from core.cloud_capacity_controller import CloudCapacityController
+                _cloud_capacity_controller = CloudCapacityController(broker=_broker)
+                logger.info("[MCP] CloudCapacityController registered with broker")
+            except Exception as _cc_err:
+                logger.debug(f"[MCP] CloudCapacityController init skipped: {_cc_err}")
     except Exception as e:
         logger.debug(f"[MCP] Broker init skipped: {e}")
 
