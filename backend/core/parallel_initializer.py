@@ -46,9 +46,14 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set
 
 from .runtime_module_resolver import get_main_module
+
+from backend.core.memory_types import PressureTier
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 # Trinity Unified Event Loop Manager - shared infrastructure across repos
 try:
@@ -503,6 +508,10 @@ class ParallelInitializer:
         self._interactive_announced = False
         self._force_sequential: bool = False  # v266.3: Set when bridge unavailable + low RAM
 
+        # MCP Memory Budget Broker integration
+        self._mcp_active: bool = False
+        self._broker: Optional["MemoryBudgetBroker"] = None
+
         # Store references for cleanup
         self._tasks: List[asyncio.Task] = []
 
@@ -527,6 +536,151 @@ class ParallelInitializer:
 
         # Register standard components
         self._register_components()
+
+    # ------------------------------------------------------------------
+    # MCP Memory Budget Broker integration
+    # ------------------------------------------------------------------
+
+    def register_with_broker(self, broker: "MemoryBudgetBroker") -> None:
+        """Register this initializer with the MCP memory budget broker.
+
+        Once registered, pressure-aware decisions use the broker's cached
+        ``MemorySnapshot`` instead of raw ``psutil`` calls:
+
+        * **Site 1** (admission gate ``available_gb``):
+          ``snapshot.physical_free / (1024**3)`` replaces
+          ``psutil.virtual_memory().available / (1024**3)``.
+        * **Site 2** (force sequential on bridge unavailable):
+          ``pressure_tier >= PressureTier.CONSTRAINED`` replaces
+          ``available < 4 GB``.
+        * **Site 3** (RAM check between sequential components):
+          ``pressure_tier >= PressureTier.CRITICAL`` replaces
+          ``available < 2 GB``.
+
+        The legacy psutil fallback chain remains intact for when
+        ``_mcp_active`` is ``False`` or when the broker has no
+        snapshot yet.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "[ParallelInitializer] Registered with MCP broker (epoch=%s)",
+            getattr(broker, "current_epoch", "?"),
+        )
+
+    def _get_broker_available_gb(self) -> Optional[float]:
+        """Return available GB from broker snapshot, or None if unavailable.
+
+        Used by Site 1 (admission gate) to replace the raw psutil call.
+        When this returns None, the caller falls through to the legacy
+        psutil path.
+        """
+        if not self._mcp_active or self._broker is None:
+            return None
+        snap = self._broker.latest_snapshot
+        if snap is None:
+            return None
+        return snap.physical_free / (1024 ** 3)
+
+    def _handle_bridge_unavailable_ram_check(self, reason: str) -> None:
+        """Check RAM when OOM bridge is unavailable and decide sequencing.
+
+        This is the extracted logic from the nested
+        ``_force_sequential_on_bridge_unavailable`` function inside
+        ``minimal_setup``.
+
+        **MCP path (Site 2):** When the broker is active and has a
+        snapshot, uses ``pressure_tier >= PressureTier.CONSTRAINED``
+        which accounts for UMA GPU claims that raw psutil misses.
+
+        **Legacy path:** Falls back to ``psutil.virtual_memory().available
+        < 4 GB`` when the broker is inactive or has no snapshot.
+
+        Args:
+            reason: Human-readable reason the bridge is unavailable.
+        """
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                if snap.pressure_tier >= PressureTier.CONSTRAINED:
+                    self._force_sequential = True
+                    logger.warning(
+                        "[OOM Prevention] Bridge unavailable (%s) + pressure %s "
+                        "— forcing sequential init (MCP)",
+                        reason,
+                        snap.pressure_tier.name,
+                    )
+                else:
+                    logger.warning(
+                        "[OOM Prevention] Bridge unavailable (%s) but pressure %s "
+                        "— parallel init allowed (MCP)",
+                        reason,
+                        snap.pressure_tier.name,
+                    )
+                return
+
+        # Legacy psutil fallback
+        try:
+            import psutil
+
+            _avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+            if _avail_gb < 4.0:
+                self._force_sequential = True
+                logger.warning(
+                    "[OOM Prevention] Bridge unavailable (%s) + %.1fGB available "
+                    "— forcing sequential init",
+                    reason,
+                    _avail_gb,
+                )
+            else:
+                logger.warning(
+                    "[OOM Prevention] Bridge unavailable (%s) but %.1fGB available "
+                    "— parallel init allowed",
+                    reason,
+                    _avail_gb,
+                )
+        except Exception:
+            # psutil unavailable too -> default to strict fail-closed mode.
+            self._force_sequential = True
+            logger.warning(
+                "[OOM Prevention] Bridge unavailable (%s) and RAM telemetry unavailable "
+                "— forcing sequential init",
+                reason,
+            )
+
+    def _should_abort_sequential(self) -> bool:
+        """Check whether to abort remaining sequential components.
+
+        **MCP path (Site 3):** When the broker is active and has a
+        snapshot, uses ``pressure_tier >= PressureTier.CRITICAL``
+        (2 GB available is the CRITICAL boundary).
+
+        **Legacy path:** Falls back to
+        ``psutil.virtual_memory().available < 2 GB``.
+
+        Returns:
+            True if RAM is critically low and remaining components
+            should be skipped.
+        """
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                return snap.pressure_tier >= PressureTier.CRITICAL
+
+        # Legacy psutil fallback
+        try:
+            import psutil
+            _post_avail_gb = psutil.virtual_memory().available / (1024 ** 3)
+            if _post_avail_gb < 2.0:
+                return True
+        except Exception:
+            pass
+        return False
+
+    # ------------------------------------------------------------------
 
     def _get_ready_event(self) -> asyncio.Event:
         """Lazily create the ready event (Python 3.9 safe)."""
@@ -615,6 +769,10 @@ class ParallelInitializer:
                             pass
             except Exception as gate_err:
                 logger.debug("[AdmissionGate] shared gate unavailable (%s)", gate_err)
+
+        if available_gb is None:
+            # MCP broker path: read from cached snapshot (Site 1)
+            available_gb = self._get_broker_available_gb()
 
         if available_gb is None:
             try:
@@ -894,32 +1052,8 @@ class ParallelInitializer:
             self.app.state.oom_bridge_available = False
             self.app.state.oom_bridge_reason = reason
             try:
-                import psutil
-
-                _avail_gb = psutil.virtual_memory().available / (1024**3)
-                if _avail_gb < 4.0:
-                    self._force_sequential = True
-                    logger.warning(
-                        "[OOM Prevention] Bridge unavailable (%s) + %.1fGB available "
-                        "— forcing sequential init",
-                        reason,
-                        _avail_gb,
-                    )
-                else:
-                    logger.warning(
-                        "[OOM Prevention] Bridge unavailable (%s) but %.1fGB available "
-                        "— parallel init allowed",
-                        reason,
-                        _avail_gb,
-                    )
-            except Exception:
-                # psutil unavailable too → default to strict fail-closed mode.
-                self._force_sequential = True
-                logger.warning(
-                    "[OOM Prevention] Bridge unavailable (%s) and RAM telemetry unavailable "
-                    "— forcing sequential init",
-                    reason,
-                )
+                # MCP broker path (Site 2): use PressureTier instead of raw psutil
+                self._handle_bridge_unavailable_ram_check(reason)
             finally:
                 self._sync_startup_admission_gate(
                     f"parallel_initializer:oom_bridge_unavailable:{reason}"
@@ -1095,20 +1229,14 @@ class ParallelInitializer:
                                 logger.warning(
                                     "[Sequential Init] Component failed: %s", _seq_err
                                 )
-                            # Check RAM between components
-                            try:
-                                import psutil
-                                _post_avail_gb = psutil.virtual_memory().available / (1024**3)
-                                if _post_avail_gb < 2.0:
-                                    logger.warning(
-                                        "[Sequential Init] RAM critical (%.1fGB) "
-                                        "— skipping remaining components in group",
-                                        _post_avail_gb,
-                                    )
-                                    _seq_completed_idx = _seq_idx
-                                    break
-                            except Exception:
-                                pass
+                            # Check RAM between components (Site 3: MCP pressure-aware)
+                            if self._should_abort_sequential():
+                                logger.warning(
+                                    "[Sequential Init] RAM critical "
+                                    "— skipping remaining components in group",
+                                )
+                                _seq_completed_idx = _seq_idx
+                                break
                         # v266.3: Mark unawaited components as skipped so watchdog
                         # and dependency checker don't wait for them indefinitely
                         for _skip_name in _task_comp_names[_seq_completed_idx + 1:]:
