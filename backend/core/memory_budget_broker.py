@@ -37,11 +37,13 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import logging
 import os
 import time
 import uuid
 import warnings
+from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Set
 
 from backend.core.memory_types import (
@@ -264,6 +266,7 @@ class BudgetGrant:
             "Committed lease %s (component=%s, actual=%d bytes)",
             self.lease_id, self.component_id, actual_bytes,
         )
+        self.broker._persist_leases()
 
     async def rollback(self, reason: str = "") -> None:
         """Transition GRANTED -> ROLLED_BACK.  Idempotent on terminal."""
@@ -276,6 +279,7 @@ class BudgetGrant:
             "Rolled back lease %s (component=%s, reason=%s)",
             self.lease_id, self.component_id, reason,
         )
+        self.broker._persist_leases()
 
     async def release(self) -> None:
         """Transition ACTIVE -> RELEASED.  Idempotent on terminal."""
@@ -294,6 +298,7 @@ class BudgetGrant:
             "Released lease %s (component=%s)",
             self.lease_id, self.component_id,
         )
+        self.broker._persist_leases()
 
     # --- Context manager ---
 
@@ -361,13 +366,17 @@ class MemoryBudgetBroker:
     All public methods are either sync (for reads) or async (for mutations).
     """
 
-    def __init__(self, quantizer: Any, epoch: int) -> None:
+    def __init__(self, quantizer: Any, epoch: int, *, lease_file: Optional[Path] = None) -> None:
         self._quantizer = quantizer
         self._epoch = epoch
         self._phase = StartupPhase.BOOT_CRITICAL
         self._phase_policies = _build_phase_policies()
         self._leases: Dict[str, BudgetGrant] = {}
         self._event_log: List[Dict[str, Any]] = []
+        self._lease_file: Path = (
+            lease_file if lease_file is not None
+            else Path("~/.jarvis/memory/leases.json").expanduser()
+        )
 
         # Wire the quantizer to read committed_bytes from us
         if hasattr(quantizer, "set_broker_ref"):
@@ -418,6 +427,92 @@ class MemoryBudgetBroker:
             1 for g in self._leases.values()
             if not g.state.is_terminal
         )
+
+    # --- Lease persistence ---
+
+    def _persist_leases(self) -> None:
+        """Persist current lease state to disk atomically."""
+        data = {
+            "schema_version": "1.0",
+            "broker_epoch": self._epoch,
+            "leases": [
+                {
+                    "lease_id": g.lease_id,
+                    "component_id": g.component_id,
+                    "granted_bytes": g.granted_bytes,
+                    "actual_bytes": g.actual_bytes,
+                    "state": g.state.value,
+                    "priority": g.priority.name,
+                    "phase": g.phase.name,
+                    "epoch": g.epoch,
+                    "pid": os.getpid(),
+                }
+                for g in self._leases.values()
+                if not g.state.is_terminal
+            ],
+        }
+        try:
+            self._lease_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._lease_file.with_suffix(".tmp")
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(str(tmp), str(self._lease_file))
+        except Exception:
+            logger.warning("Failed to persist leases", exc_info=True)
+
+    async def reconcile_stale_leases(self) -> Dict[str, Any]:
+        """Reconcile stale leases from a prior crash or epoch.
+
+        Reads the lease file, identifies leases from a different epoch
+        or with dead PIDs, and reclaims their committed bytes.
+        """
+        report: Dict[str, Any] = {"stale": 0, "reclaimed_bytes": 0, "corrupted": False}
+
+        if not self._lease_file.exists():
+            return report
+
+        try:
+            raw = self._lease_file.read_text()
+            data = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning("Corrupted lease file, resetting")
+            report["corrupted"] = True
+            self._persist_leases()  # overwrite with clean state
+            return report
+
+        if not isinstance(data, dict):
+            report["corrupted"] = True
+            self._persist_leases()
+            return report
+
+        file_epoch = data.get("broker_epoch", 0)
+        leases = data.get("leases", [])
+
+        for lease_data in leases:
+            state = lease_data.get("state", "")
+            lease_epoch = lease_data.get("epoch", 0)
+            pid = lease_data.get("pid", 0)
+            actual = lease_data.get("actual_bytes") or lease_data.get("granted_bytes", 0)
+
+            is_stale = False
+            if lease_epoch != self._epoch:
+                is_stale = True
+            elif state in ("granted", "active"):
+                # Check if the PID is still alive
+                try:
+                    os.kill(pid, 0)
+                except (OSError, ProcessLookupError):
+                    is_stale = True
+
+            if is_stale:
+                report["stale"] += 1
+                report["reclaimed_bytes"] += actual
+
+        # Overwrite with current clean state
+        self._persist_leases()
+        return report
 
     # --- Grant evaluation ---
 
@@ -572,6 +667,7 @@ class MemoryBudgetBroker:
             "Grant issued: lease=%s component=%s bytes=%d priority=%s degraded=%s",
             lease_id, component, granted_bytes, priority.name, degraded,
         )
+        self._persist_leases()
         return grant
 
     # --- Public API ---
@@ -720,13 +816,13 @@ def get_memory_budget_broker() -> Optional[MemoryBudgetBroker]:
 
 
 async def init_memory_budget_broker(
-    quantizer: Any, epoch: int,
+    quantizer: Any, epoch: int, *, lease_file: Optional[Path] = None,
 ) -> MemoryBudgetBroker:
     """Initialize the global MemoryBudgetBroker singleton.
 
     Returns the newly created broker instance.
     """
     global _broker_instance
-    _broker_instance = MemoryBudgetBroker(quantizer, epoch)
+    _broker_instance = MemoryBudgetBroker(quantizer, epoch, lease_file=lease_file)
     logger.info("Global MemoryBudgetBroker initialized (epoch=%d)", epoch)
     return _broker_instance
