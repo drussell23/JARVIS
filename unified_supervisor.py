@@ -63405,8 +63405,9 @@ class JarvisSystemKernel:
         }
 
         # v300.0: Phase 2 — Autonomy mode flag.
-        # "disabled" until contracts checked, "active" on pass, "read_only" on mismatch.
-        self._autonomy_mode: str = "disabled"
+        # "pending" until contracts checked, "active" on pass, "read_only" on hard failure.
+        self._autonomy_mode: str = "pending"
+        self._autonomy_reason: str = "pending_services"
         self._autonomy_checks: Dict[str, Any] = {}
 
         # Background tasks
@@ -81401,8 +81402,8 @@ class JarvisSystemKernel:
 
                 # v300.0: Phase 2 — Autonomy contract gate (boot-time)
                 # Checks schema version compatibility across Body, Prime, and
-                # Reactor.  Mismatch degrades to read-only autonomy mode rather
-                # than fail-closed (autonomy is non-critical at boot).
+                # Reactor.  Uses reason codes to distinguish "still starting"
+                # (pending) from "hard failure" (read_only).
                 try:
                     self._update_component_status(
                         "autonomy_contracts", "running",
@@ -81413,9 +81414,11 @@ class JarvisSystemKernel:
                     )
                     _auto_pass, _auto_status, _auto_checks = await check_autonomy_contracts()
                     self._autonomy_checks = _auto_checks
+                    _reason = _auto_checks.get("reason", "active" if _auto_pass else "schema_mismatch")
 
                     if _auto_pass:
                         self._autonomy_mode = "active"
+                        self._autonomy_reason = "active"
                         self._update_component_status(
                             "autonomy_contracts", "complete",
                             "All autonomy contracts compatible — full autonomy mode",
@@ -81423,24 +81426,39 @@ class JarvisSystemKernel:
                         self.logger.info(
                             "[Kernel] Phase 2 autonomy contracts validated — mode=active"
                         )
-                    else:
-                        self._autonomy_mode = "read_only"
+                    elif _reason.startswith("pending"):
+                        self._autonomy_mode = "pending"
+                        self._autonomy_reason = _reason
                         self._update_component_status(
                             "autonomy_contracts", "degraded",
-                            f"Contract mismatch — read-only autonomy ({_auto_status})",
+                            f"Services still starting — pending autonomy ({_reason}, "
+                            f"pending={_auto_checks.get('pending', [])})",
+                        )
+                        self.logger.info(
+                            "[Kernel] Autonomy contracts pending — mode=pending, "
+                            "reason=%s, pending=%s. Will re-check shortly.",
+                            _reason, _auto_checks.get("pending", []),
+                        )
+                    else:
+                        self._autonomy_mode = "read_only"
+                        self._autonomy_reason = _reason
+                        self._update_component_status(
+                            "autonomy_contracts", "degraded",
+                            f"Contract mismatch — read-only autonomy ({_reason})",
                         )
                         self.logger.warning(
                             "[Kernel] Autonomy contract mismatch — degraded to read_only. "
-                            "Checks: %s", _auto_checks,
+                            "reason=%s, checks=%s", _reason, _auto_checks,
                         )
                 except Exception as _auto_err:
-                    self._autonomy_mode = "disabled"
+                    self._autonomy_mode = "pending"
+                    self._autonomy_reason = "pending_services"
                     self._update_component_status(
                         "autonomy_contracts", "error",
-                        f"Contract check failed: {_auto_err}",
+                        f"Contract check failed (will retry): {_auto_err}",
                     )
                     self.logger.warning(
-                        "[Kernel] Autonomy contract check error (non-fatal): %s",
+                        "[Kernel] Autonomy contract check error (will retry): %s",
                         _auto_err,
                     )
 

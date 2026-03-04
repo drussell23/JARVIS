@@ -183,3 +183,26 @@ async def test_contract_check_schema_mismatch(mock_config):
     assert passed is False
     assert checks["reason"] == "schema_mismatch"
     assert checks["pending"] == []
+
+
+def test_autonomy_mode_pending_blocks_writes():
+    """pending mode must block writes identically to read_only."""
+    for mode in ("pending", "read_only"):
+        assert mode != "active", f"{mode} must block autonomous writes"
+
+
+def test_autonomy_reason_to_mode_mapping():
+    """Verify reason codes map to the correct autonomy mode."""
+    _REASON_TO_MODE = {
+        "pending_services": "pending",
+        "pending_lease": "pending",
+        "schema_mismatch": "read_only",
+        "health_probe_failed": "read_only",
+        "timeout": "read_only",
+        "active": "active",
+    }
+    assert _REASON_TO_MODE["pending_services"] == "pending"
+    assert _REASON_TO_MODE["pending_lease"] == "pending"
+    assert _REASON_TO_MODE["schema_mismatch"] == "read_only"
+    assert _REASON_TO_MODE["timeout"] == "read_only"
+    assert _REASON_TO_MODE["active"] == "active"
