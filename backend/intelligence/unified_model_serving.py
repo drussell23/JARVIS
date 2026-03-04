@@ -436,6 +436,9 @@ class PrimeLocalClient(ModelClient):
         self._current_model_entry: Optional[Dict[str, Any]] = None  # Current QUANT_CATALOG entry
         self._thrash_downgrade_attempted: bool = False
 
+        # Memory Control Plane: active grant from broker (if loaded via broker)
+        self._active_grant = None
+
     def _discover_model(self, model_name: str) -> Optional[Path]:
         """
         Discover a model file by searching multiple directories.
@@ -639,6 +642,137 @@ class PrimeLocalClient(ModelClient):
 
         return None
 
+    async def _load_model_via_broker(
+        self, broker: Any, model_name: Optional[str] = None,
+    ) -> bool:
+        """Load model via Memory Control Plane broker.
+
+        This replaces the legacy headroom/tier checking and direct
+        MemoryQuantizer.reserve_memory() path with transactional broker grants.
+        """
+        from backend.core.budgeted_loaders import LLMBudgetedLoader
+        from backend.core.memory_types import ConfigProof
+
+        # Step 1: Discover model and determine size
+        selected_entry = None
+        model_path = None
+
+        if model_name is not None:
+            model_path = self._discover_model(model_name)
+            if model_path is None and not self._discovery_attempted:
+                self._discovery_attempted = True
+                model_path = await self._auto_download_model(model_name)
+            for _cat_entry in self.QUANT_CATALOG:
+                if _cat_entry["filename"] == model_name:
+                    selected_entry = _cat_entry
+                    break
+        else:
+            # Dynamic selection - get available RAM for catalog selection
+            available_gb = None
+            try:
+                from backend.core.memory_quantizer import get_memory_quantizer
+                _mq = await get_memory_quantizer()
+                _metrics = _mq.get_current_metrics()
+                available_gb = _metrics.system_memory_available_gb
+            except Exception:
+                pass
+
+            if available_gb is not None:
+                result = await self._select_best_model(available_gb)
+                if result is not None:
+                    selected_entry, model_path = result
+            else:
+                model_path = self._discover_model(PRIME_DEFAULT_MODEL)
+
+        if model_path is None:
+            self.logger.warning("[MCP] No suitable model found")
+            return False
+
+        # Step 2: Create loader with model details
+        size_mb = selected_entry.get("size_mb", 4000) if selected_entry else 4000
+        ctx = selected_entry.get("context_length", 2048) if selected_entry else 2048
+        _name = selected_entry.get("name", model_path.stem) if selected_entry else model_path.stem
+
+        loader = LLMBudgetedLoader(
+            model_name=_name,
+            size_mb=size_mb,
+            context_length=ctx,
+        )
+
+        # Step 3: Request grant from broker
+        estimate = loader.estimate_bytes({})
+
+        try:
+            grant = await broker.request(
+                component=loader.component_id,
+                bytes_requested=estimate,
+                priority=loader.priority,
+                phase=loader.phase,
+                can_degrade=True,
+                degradation_options=loader.degradation_options,
+            )
+        except Exception as e:
+            self.logger.warning(f"[MCP] Broker denied LLM grant: {e}")
+            return False
+
+        # Step 4: Load using grant (with auto-rollback on failure)
+        async with grant:
+            from llama_cpp import Llama
+
+            # Apply constraints from grant
+            effective_ctx = ctx
+            n_gpu = int(os.getenv("JARVIS_N_GPU_LAYERS", "-1"))
+            import platform
+            if platform.machine() != "arm64":
+                n_gpu = 0
+            use_mmap = os.getenv(
+                "JARVIS_USE_MMAP", "true",
+            ).lower() in ("true", "1", "yes")
+
+            if grant.degradation_applied:
+                _constraints = grant.degradation_applied.constraints
+                effective_ctx = _constraints.get("context_length", effective_ctx)
+                n_gpu = _constraints.get("n_gpu_layers", n_gpu)
+
+            await grant.heartbeat()
+
+            self._model = Llama(
+                model_path=str(model_path),
+                n_ctx=effective_ctx,
+                n_threads=os.cpu_count() or 4,
+                n_gpu_layers=n_gpu,
+                use_mmap=use_mmap,
+                verbose=False,
+            )
+
+            # Commit the grant
+            proof = ConfigProof(
+                component_id=loader.component_id,
+                requested_constraints={
+                    "context_length": effective_ctx,
+                    "n_gpu_layers": n_gpu,
+                },
+                applied_config={
+                    "context_length": effective_ctx,
+                    "n_gpu_layers": n_gpu,
+                },
+                compliant=True,
+                evidence=f"Llama loaded from {model_path.name}",
+            )
+            await grant.commit(grant.granted_bytes, proof)
+
+        # Step 5: Store state
+        self._model_path = model_path
+        self._loaded = True
+        self._current_model_entry = selected_entry
+        self._active_grant = grant  # Keep reference for release
+
+        self.logger.info(
+            f"[MCP] Loaded {_name} via broker grant "
+            f"(bytes={grant.granted_bytes}, degraded={grant.degraded})"
+        )
+        return True
+
     async def load_model(self, model_name: Optional[str] = None) -> bool:
         """
         Load a Prime model with intelligent, memory-aware discovery.
@@ -658,6 +792,21 @@ class PrimeLocalClient(ModelClient):
             # If already loaded, skip
             if self._loaded and self._model is not None:
                 return True
+
+            # Memory Control Plane: Try broker-mediated loading first
+            try:
+                from backend.core.memory_budget_broker import get_memory_budget_broker
+                from backend.core.budgeted_loaders import LLMBudgetedLoader
+
+                _broker = get_memory_budget_broker()
+                if _broker is not None:
+                    return await self._load_model_via_broker(_broker, model_name)
+            except ImportError:
+                pass
+            except Exception as e:
+                self.logger.debug(
+                    f"[MCP] Broker-mediated load unavailable, falling back: {e}"
+                )
 
             try:
                 # Step 1: Get available RAM
