@@ -15,8 +15,6 @@ import time
 import threading
 from unittest.mock import patch
 
-import pytest
-
 from backend.core.memory_types import (
     ActuatorAction,
     DecisionEnvelope,
@@ -24,7 +22,6 @@ from backend.core.memory_types import (
 )
 from backend.core.memory_actuator_coordinator import (
     MemoryActuatorCoordinator,
-    PendingAction,
 )
 
 
