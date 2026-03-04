@@ -5066,9 +5066,19 @@ class GCPVMManager:
             except Exception as e:
                 logger.debug(f"Rate limit check failed (proceeding): {e}")
 
+        # Resolve zone via fallback policy (prefers config zone, falls back on capacity errors)
+        _creation_zone = self.config.zone
+        if hasattr(self, '_zone_fallback'):
+            _fb_zone = self._zone_fallback.get_next_zone()
+            if _fb_zone:
+                _creation_zone = _fb_zone
+            else:
+                logger.warning("[ZoneFallback] All zones blacklisted — using config default")
+
         logger.info(f"🚀 Creating GCP Spot VM...")
         logger.info(f"   Components: {', '.join(components)}")
         logger.info(f"   Trigger: {trigger_reason}")
+        logger.info(f"   Zone: {_creation_zone}")
         logger.info(f"   Quota check: {quota_check.message}")
 
         # ═══════════════════════════════════════════════════════════════════════════
@@ -5226,23 +5236,26 @@ class GCPVMManager:
                                 attempt -= 1
                             continue
 
-                    # Build VM configuration
+                    # Build VM configuration (uses _creation_zone for machine type URL)
+                    _saved_zone = self.config.zone
+                    self.config.zone = _creation_zone
                     instance_config = self._build_instance_config(
                         vm_name=vm_name,
                         components=components,
                         trigger_reason=trigger_reason,
                         metadata=metadata or {},
                     )
+                    self.config.zone = _saved_zone
 
-                    # Create the VM (async operation)
+                    # Create the VM (async operation) — uses zone from fallback policy
                     operation = await asyncio.to_thread(
                         self.instances_client.insert,
                         project=self.config.project_id,
-                        zone=self.config.zone,
+                        zone=_creation_zone,
                         instance_resource=instance_config,
                     )
 
-                    logger.info(f"⏳ VM creation operation started: {operation.name}")
+                    logger.info(f"⏳ VM creation operation started: {operation.name} (zone={_creation_zone})")
 
                     # Wait for operation to complete
                     await self._wait_for_operation(operation)
@@ -5252,7 +5265,7 @@ class GCPVMManager:
                     instance = await asyncio.to_thread(
                         self.instances_client.get,
                         project=self.config.project_id,
-                        zone=self.config.zone,
+                        zone=_creation_zone,
                         instance=vm_name,
                     )
 
@@ -5268,7 +5281,7 @@ class GCPVMManager:
                     vm_instance = VMInstance(
                         instance_id=str(instance.id),
                         name=vm_name,
-                        zone=self.config.zone,
+                        zone=_creation_zone,
                         state=VMState.RUNNING,
                         created_at=time.time(),
                         ip_address=ip_address,
@@ -5391,8 +5404,34 @@ class GCPVMManager:
                             await asyncio.sleep(delay)
                         continue
 
-                    # v9.0: Detect quota exceeded errors and stop retrying immediately
+                    # v9.0: Detect quota exceeded errors
                     is_quota_error, quota_name = self._is_quota_exceeded_error(e)
+
+                    # Zone capacity exhaustion — blacklist zone and try fallback
+                    _is_zone_capacity = (
+                        is_quota_error
+                        or "zone_resource_pool_exhausted" in _err_str
+                        or "stockout" in _err_str
+                        or "does not have enough resources" in _err_str
+                        or "insufficient" in _err_str
+                    )
+                    if _is_zone_capacity and hasattr(self, '_zone_fallback'):
+                        self._zone_fallback.blacklist_zone(
+                            _creation_zone,
+                            f"Capacity error: {quota_name or _err_str[:80]}"
+                        )
+                        _next_zone = self._zone_fallback.get_next_zone()
+                        if _next_zone and _next_zone != _creation_zone:
+                            logger.info(
+                                f"[ZoneFallback] Zone '{_creation_zone}' exhausted — "
+                                f"retrying in '{_next_zone}'"
+                            )
+                            _creation_zone = _next_zone
+                            # Don't count this as a full attempt — zone switch gets a fresh try
+                            attempt -= 1
+                            await asyncio.sleep(2)
+                            continue
+
                     if is_quota_error:
                         logger.error(f"🚫 QUOTA EXCEEDED ({quota_name}) - stopping retries immediately")
 

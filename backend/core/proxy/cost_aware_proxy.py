@@ -56,7 +56,12 @@ class CostAwareProxyLifecycle:
             if self._proxy_running:
                 return True
 
-            # Budget check before starting
+            # Budget check before starting (fail-closed by default)
+            #
+            # Policy: JARVIS_PROXY_BUDGET_BYPASS=true is the explicit break-glass
+            # override. Without it, if the cost tracker is unavailable or errors,
+            # proxy start is BLOCKED to enforce single budget authority.
+            _budget_bypass = os.getenv("JARVIS_PROXY_BUDGET_BYPASS", "false").lower() == "true"
             try:
                 from backend.core.cost_tracker import get_cost_tracker
                 ct = get_cost_tracker()
@@ -66,8 +71,20 @@ class CostAwareProxyLifecycle:
                 if not allowed:
                     logger.warning("[CostAwareProxy] Budget gate blocked proxy start: %s", reason)
                     return False
-            except Exception:
-                pass  # Fail open — allow proxy start even if cost tracker unavailable
+            except Exception as budget_err:
+                if _budget_bypass:
+                    logger.warning(
+                        "[CostAwareProxy] Budget check failed (%s) — "
+                        "JARVIS_PROXY_BUDGET_BYPASS=true, allowing start",
+                        budget_err,
+                    )
+                else:
+                    logger.error(
+                        "[CostAwareProxy] Budget check failed (%s) — "
+                        "proxy start BLOCKED (set JARVIS_PROXY_BUDGET_BYPASS=true to override)",
+                        budget_err,
+                    )
+                    return False
 
             controller = self._get_inner()
             success = await controller.start()
