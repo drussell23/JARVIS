@@ -798,6 +798,74 @@ def _classify_action_risk(action: str) -> str:
     return _ACTION_RISK.get(action, "write")
 
 
+# ---------------------------------------------------------------------------
+# Workspace Autonomy Policy (v284.0)
+# Central decision point for autonomous workspace action gating.
+# Follows NotificationPolicy pattern from email_triage/policy.py.
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class AutonomyPolicyDecision:
+    """Result of an autonomy policy check."""
+    allowed: bool
+    reason: str           # "allowed", "write_not_enabled", "high_risk_blocked", etc.
+    escalation: str       # EscalationLevel name
+    remediation: Optional[str] = None
+
+
+class WorkspaceAutonomyPolicy:
+    """Central decision point for autonomous workspace action gating.
+
+    Non-autonomous callers (interactive, startup, etc.) always pass — backward
+    compatible.  Autonomous callers are subject to read/write/high-risk gates
+    controlled by environment variables.
+
+    Allowlist precedence: when ``autonomous_write_allowlist`` is non-empty it
+    takes full control — the boolean flags (``allow_autonomous_writes``,
+    ``allow_autonomous_high_risk_writes``) are only consulted when the
+    allowlist is empty (default).
+    """
+
+    def __init__(self, config: "GoogleWorkspaceConfig"):
+        self._config = config
+
+    def check(self, action: str, request_kind: Optional[str] = None) -> AutonomyPolicyDecision:
+        """Evaluate whether *action* is allowed under the current policy."""
+        risk = _classify_action_risk(action)
+
+        # Non-autonomous callers always pass (backward compat)
+        if request_kind != "autonomous":
+            return AutonomyPolicyDecision(True, "interactive_caller", "AUTO_EXECUTE")
+
+        # Reads always allowed
+        if risk == "read":
+            return AutonomyPolicyDecision(True, "read_allowed", "AUTO_EXECUTE")
+
+        # High-risk writes ALWAYS require explicit flag, even if allowlisted
+        if risk == "high_risk_write" and not self._config.allow_autonomous_high_risk_writes:
+            return AutonomyPolicyDecision(
+                False, "high_risk_blocked", "REFUSE",
+                "Set JARVIS_WORKSPACE_ALLOW_AUTONOMOUS_HIGH_RISK_WRITES=true",
+            )
+
+        # Per-action allowlist (when non-empty, overrides boolean write flag)
+        if self._config.autonomous_write_allowlist:
+            if action not in self._config.autonomous_write_allowlist:
+                return AutonomyPolicyDecision(
+                    False, "action_not_in_allowlist", "REFUSE",
+                    f"Add '{action}' to JARVIS_WORKSPACE_AUTONOMOUS_WRITE_ALLOWLIST",
+                )
+            return AutonomyPolicyDecision(True, "allowlisted", "NOTIFY_AFTER")
+
+        # Standard writes (boolean flag path — only reached when allowlist is empty)
+        if not self._config.allow_autonomous_writes:
+            return AutonomyPolicyDecision(
+                False, "write_not_enabled", "BLOCK_UNTIL_APPROVED",
+                "Set JARVIS_WORKSPACE_ALLOW_AUTONOMOUS_WRITES=true",
+            )
+        return AutonomyPolicyDecision(True, "write_enabled", "NOTIFY_AFTER")
+
+
 @dataclass
 class GoogleWorkspaceConfig:
     """
@@ -873,6 +941,28 @@ class GoogleWorkspaceConfig:
         default_factory=lambda: os.getenv(
             "JARVIS_WORKSPACE_BROWSER",
             os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome"),
+        )
+    )
+    # v284.0: Autonomous write policy — default safe (read-only).
+    # When autonomous_write_allowlist is non-empty, it overrides the boolean
+    # flags below.  When empty (default), the boolean flags govern.
+    allow_autonomous_writes: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_WORKSPACE_ALLOW_AUTONOMOUS_WRITES", "false"
+        ).lower() in {"1", "true", "yes"}
+    )
+    allow_autonomous_high_risk_writes: bool = field(
+        default_factory=lambda: os.getenv(
+            "JARVIS_WORKSPACE_ALLOW_AUTONOMOUS_HIGH_RISK_WRITES", "false"
+        ).lower() in {"1", "true", "yes"}
+    )
+    # Per-action allowlist (comma-separated). Overrides the boolean flags above.
+    # Example: "send_email,create_calendar_event"
+    autonomous_write_allowlist: frozenset = field(
+        default_factory=lambda: frozenset(
+            a.strip() for a in os.getenv(
+                "JARVIS_WORKSPACE_AUTONOMOUS_WRITE_ALLOWLIST", ""
+            ).split(",") if a.strip()
         )
     )
 
@@ -3630,7 +3720,43 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
                         type(e).__name__, e,
                     )
 
-        logger.info("GoogleWorkspaceAgent initialized with Never-Fail fallbacks")
+        # v284.0: Reconcile stale pending workspace write intents from prior crash.
+        # "superseded" preserves the idempotency key barrier (no re-execution)
+        # while signaling that the remote outcome is unknown.
+        try:
+            from core.orchestration_journal import OrchestrationJournal
+            _journal = OrchestrationJournal.get_instance()
+            if _journal:
+                _pending = _journal.replay_from(0, action_filter="workspace:")
+                _stale = [e for e in _pending if e.get("result") == "pending"]
+                if _stale:
+                    logger.warning(
+                        "[GWS] %d stale workspace write intents from prior crash. "
+                        "Marking 'superseded' (idempotency keys prevent re-execution; "
+                        "outcome unknown — manual verification may be needed).",
+                        len(_stale),
+                    )
+                    for _entry in _stale:
+                        try:
+                            _journal.mark_result(_entry["seq"], "superseded")
+                        except Exception:
+                            pass
+        except Exception:
+            pass  # Journal not available — non-fatal at startup
+
+        # v284.0: Bootstrap summary log
+        _token_health = "unknown"
+        _auth_state = "unknown"
+        if self._client:
+            if hasattr(self._client, "_token_health") and hasattr(self._client._token_health, "value"):
+                _token_health = self._client._token_health.value
+            if hasattr(self._client, "auth_state") and hasattr(self._client.auth_state, "value"):
+                _auth_state = self._client.auth_state.value
+        logger.info(
+            "GoogleWorkspaceAgent initialized with Never-Fail fallbacks "
+            "(token_health=%s, auth_state=%s, creds=%s)",
+            _token_health, _auth_state, self.config.credentials_path,
+        )
 
     def get_capability_health(self) -> dict:
         """Formal capability health contract for /api/system/status.
@@ -3647,10 +3773,41 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
             raw = client.auth_state
             auth_state = raw.value if hasattr(raw, "value") else str(raw)
 
+        # v284.0: Readiness level — finer than binary "ready"
+        if auth_state == "authenticated":
+            readiness_level = "ready"
+        elif auth_state == "degraded_visual":
+            readiness_level = "degraded_read_only"
+        elif auth_state in {"needs_reauth", "needs_reauth_guided"}:
+            readiness_level = "blocked_needs_reauth"
+        elif auth_state == "unauthenticated":
+            th = (
+                client._token_health.value
+                if client and hasattr(client, "_token_health") and hasattr(client._token_health, "value")
+                else "unknown"
+            )
+            readiness_level = "blocked_no_credentials" if th == "missing" else "blocked_needs_reauth"
+        else:
+            readiness_level = "blocked_no_agent"
+
+        # v284.0: Scope drift detection
+        scope_valid = True
+        scope_issue = None
+        if client and hasattr(client, "_validate_current_credentials_scopes"):
+            try:
+                scope_valid, scope_issue = client._validate_current_credentials_scopes()
+            except Exception:
+                scope_valid = False
+                scope_issue = "scope_check_failed"
+
         return {
             "initialized": client is not None,
             "auth_state": auth_state,
             "ready": auth_state == "authenticated",
+            "readiness_level": readiness_level,
+            "standalone_mode": self.message_bus is None,
+            "scope_valid": scope_valid,
+            "scope_issue": scope_issue,
             "token_health": (
                 client._token_health.value
                 if client and hasattr(client, "_token_health") and hasattr(client._token_health, "value")
@@ -3668,6 +3825,116 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
             ),
             "email_visual_fallback_enabled": bool(self.config.email_visual_fallback_enabled),
             "capabilities": sorted(self.capabilities) if hasattr(self, "capabilities") else [],
+        }
+
+    def get_autonomy_doctor_report(self) -> dict:
+        """Structured diagnostic report for workspace autonomy readiness.
+
+        All checks are synchronous, no network calls. Returns:
+        ``{"overall": "pass"|"fail"|"degraded", "blocking_issues": int,
+           "checks": [...], "action_required": str|None, "ts": float}``
+        """
+        import time as _time
+
+        checks = []
+        blocking = 0
+
+        def _check(name: str, passed: bool, required: bool, detail: str = ""):
+            nonlocal blocking
+            if required and not passed:
+                blocking += 1
+            checks.append({
+                "name": name, "passed": passed,
+                "required": required, "detail": detail,
+            })
+
+        # Credential files
+        _check(
+            "credentials_file",
+            os.path.isfile(self.config.credentials_path),
+            True,
+            self.config.credentials_path,
+        )
+        _check(
+            "token_file",
+            os.path.isfile(self.config.token_path),
+            True,
+            self.config.token_path,
+        )
+
+        # Token health
+        client = getattr(self, "_client", None)
+        th = (
+            client._token_health.value
+            if client and hasattr(client, "_token_health") and hasattr(client._token_health, "value")
+            else "unknown"
+        )
+        _check("token_health", th not in {"missing", "corrupt", "permanently_invalid"}, True, th)
+
+        # Auth state
+        auth_st = "unavailable"
+        if client and hasattr(client, "auth_state"):
+            raw = client.auth_state
+            auth_st = raw.value if hasattr(raw, "value") else str(raw)
+        _check("auth_state", auth_st in {"authenticated", "refreshing"}, True, auth_st)
+
+        # Google API libs
+        _check("google_api_libs", GOOGLE_API_AVAILABLE, True)
+
+        # Can attempt API
+        can_api = bool(client and hasattr(client, "can_attempt_google_api") and client.can_attempt_google_api)
+        _check("can_attempt_api", can_api, True)
+
+        # Scope drift
+        scope_ok = True
+        scope_detail = ""
+        if client and hasattr(client, "_validate_current_credentials_scopes"):
+            try:
+                scope_ok, scope_detail = client._validate_current_credentials_scopes()
+                scope_detail = scope_detail or ""
+            except Exception as e:
+                scope_ok = False
+                scope_detail = str(e)
+        _check("scope_valid", scope_ok, True, scope_detail)
+
+        # Informational checks
+        _check(
+            "email_visual_fallback",
+            bool(self.config.email_visual_fallback_enabled),
+            False,
+        )
+        _check(
+            "write_visual_fallback",
+            bool(self.config.write_visual_fallback_enabled),
+            False,
+        )
+        _check(
+            "autonomous_writes",
+            bool(self.config.allow_autonomous_writes),
+            False,
+        )
+        standalone_ok, standalone_reason = _can_create_standalone_workspace_agent()
+        _check("standalone_gate", standalone_ok, False, standalone_reason)
+
+        # Overall
+        if blocking > 0:
+            overall = "fail"
+        elif any(not c["passed"] for c in checks):
+            overall = "degraded"
+        else:
+            overall = "pass"
+
+        action_required = None
+        if blocking > 0:
+            first_fail = next(c for c in checks if c["required"] and not c["passed"])
+            action_required = f"Fix: {first_fail['name']} ({first_fail['detail']})"
+
+        return {
+            "overall": overall,
+            "blocking_issues": blocking,
+            "checks": checks,
+            "action_required": action_required,
+            "ts": _time.time(),
         }
 
     async def on_start(self) -> None:
@@ -3981,6 +4248,114 @@ Return ONLY a JSON object with these keys (use null if not found):
 
         logger.debug(f"GoogleWorkspaceAgent executing: {action}")
 
+        # -------------------------------------------------------------------
+        # v284.0: Trusted provenance via ExecutionContext (not payload flag)
+        # -------------------------------------------------------------------
+        request_kind_val = None
+        try:
+            from core.execution_context import current_context
+            ctx = current_context()
+            if ctx and hasattr(ctx, "request_kind"):
+                request_kind_val = ctx.request_kind.value
+        except Exception:
+            pass
+
+        # Fallback: only trust _request_kind from validated internal callers.
+        _TRUSTED_SOURCES = frozenset({
+            "autonomy.agent_runtime",
+            "autonomy.email_triage.runner",
+        })
+        if request_kind_val is None:
+            fallback_source = payload.get("_request_kind_source", "")
+            if fallback_source in _TRUSTED_SOURCES:
+                request_kind_val = payload.get("_request_kind")
+
+        # -------------------------------------------------------------------
+        # v284.0: Autonomy policy gate
+        # -------------------------------------------------------------------
+        action_risk = _classify_action_risk(action)
+        if not hasattr(self, "_autonomy_policy"):
+            self._autonomy_policy = WorkspaceAutonomyPolicy(self.config)
+        decision = self._autonomy_policy.check(action, request_kind_val)
+        if not decision.allowed:
+            logger.warning(
+                "[GWS] Autonomy policy denied: action=%s reason=%s remediation=%s",
+                action, decision.reason, decision.remediation,
+            )
+            return {
+                "success": False,
+                "error": f"Autonomy policy: {decision.reason}",
+                "error_code": "autonomy_policy_denied",
+                "action_required": decision.remediation,
+                "escalation": decision.escalation,
+                "workspace_action": action or "unknown",
+                "request_id": request_id,
+                "correlation_id": correlation_id,
+                "node_id": node_id,
+                "idempotency_key": idempotency_key,
+            }
+
+        # -------------------------------------------------------------------
+        # v284.0: Canonical idempotency key for autonomous callers
+        # -------------------------------------------------------------------
+        if not idempotency_key and request_kind_val == "autonomous":
+            import hashlib
+            goal_id = payload.get("goal_id", "unknown")
+            step_id = payload.get("step_id", "0")
+            target_parts = []
+            for _k in ("to", "recipient", "email", "date", "title", "spreadsheet_id"):
+                _v = payload.get(_k)
+                if _v:
+                    target_parts.append(f"{_k}={_v}")
+            target_hash = (
+                hashlib.sha256("|".join(target_parts).encode()).hexdigest()[:12]
+                if target_parts else "no_target"
+            )
+            idempotency_key = f"{goal_id}:{step_id}:{action}:{target_hash}"
+
+        # -------------------------------------------------------------------
+        # v284.0: Durable intent+commit ledger for autonomous writes
+        # -------------------------------------------------------------------
+        _journal_seq = None
+        if request_kind_val == "autonomous" and action_risk in {"write", "high_risk_write"} and idempotency_key:
+            # Fast-path in-memory dedup
+            try:
+                from core.idempotency_registry import check_idempotent
+                if not check_idempotent("workspace_write", f"{action}:{idempotency_key}"):
+                    logger.info(
+                        "[GWS] Duplicate autonomous write suppressed: %s key=%s",
+                        action, idempotency_key,
+                    )
+                    return {"success": True, "deduplicated": True, "idempotency_key": idempotency_key}
+            except Exception:
+                pass
+
+            # Durable intent record (pre-write) — survives crash
+            try:
+                from core.orchestration_journal import OrchestrationJournal
+                journal = OrchestrationJournal.get_instance()
+                if journal is None or not journal.has_lease:
+                    logger.warning(
+                        "[GWS] Autonomous write rejected: no journal lease for durable intent tracking"
+                    )
+                    return {
+                        "success": False,
+                        "error": "No durable intent journal available for autonomous write",
+                        "error_code": "no_journal_lease",
+                        "action_required": "Ensure OrchestrationJournal has an active lease",
+                        "workspace_action": action or "unknown",
+                        "request_id": request_id,
+                        "idempotency_key": idempotency_key,
+                    }
+                _journal_seq = journal.fenced_write(
+                    action=f"workspace:{action}",
+                    target=idempotency_key,
+                    idempotency_key=f"ws:{action}:{idempotency_key}",
+                    payload={"action": action, "request_kind": request_kind_val},
+                )
+            except Exception as exc:
+                logger.debug("[GWS] Journal write skipped (no lease or unavailable): %s", exc)
+
         # Respect upstream deadline budgets to avoid doing work that cannot finish.
         # v280.5: Use time.monotonic() to match the clock used by the upstream
         # pipeline (jarvis_voice_api deadline_monotonic).
@@ -4016,7 +4391,7 @@ Return ONLY a JSON object with these keys (use null if not found):
             "workspace_summary",
             "daily_briefing",
         }
-        action_risk = _classify_action_risk(action)
+        # action_risk already computed above (v284.0 autonomy policy gate)
 
         if self._client:
             auth_state = self._client.auth_state
@@ -4119,6 +4494,17 @@ Return ONLY a JSON object with these keys (use null if not found):
             result = await self._write_spreadsheet(payload)
         else:
             raise ValueError(f"Unknown workspace action: {action}")
+
+        # v284.0: Commit durable intent result
+        if _journal_seq is not None:
+            try:
+                from core.orchestration_journal import OrchestrationJournal
+                _j = OrchestrationJournal.get_instance()
+                if _j:
+                    _success = isinstance(result, dict) and result.get("success")
+                    _j.mark_result(_journal_seq, "committed" if _success else "failed")
+            except Exception:
+                pass  # Best-effort commit — idempotency key prevents re-execution
 
         if isinstance(result, dict):
             result.setdefault("request_id", request_id)
@@ -5536,6 +5922,18 @@ EMAIL BODY:"""
 _workspace_agent_instance: Optional["GoogleWorkspaceAgent"] = None
 
 
+def get_workspace_agent_cached() -> Optional["GoogleWorkspaceAgent"]:
+    """Return the cached workspace agent singleton (no creation, no async).
+
+    Safe to call from sync contexts.  Returns None if no instance exists
+    or if the instance is stopped.
+    """
+    inst = _workspace_agent_instance
+    if inst is not None and hasattr(inst, "_running") and not inst._running:
+        return None
+    return inst
+
+
 def _load_workspace_supervisor_readiness_state() -> Dict[str, Any]:
     """Best-effort load of the supervisor readiness snapshot."""
     state_file = Path.home() / ".jarvis" / "kernel" / "readiness_state.json"
@@ -5615,21 +6013,38 @@ async def get_google_workspace_agent() -> Optional["GoogleWorkspaceAgent"]:
     # Tier 2: Create standalone instance
     standalone_allowed, standalone_reason = _can_create_standalone_workspace_agent()
     if not standalone_allowed:
+        # v284.0: Per-reason remediation in denial log
+        _STANDALONE_REMEDIATION = {
+            "no_workspace_credentials": (
+                "Google credentials not found.\n"
+                "  Run: python3 backend/scripts/google_oauth_setup.py\n"
+                "  Expected: {creds} and {token}"
+            ),
+            "supervisor_startup_incomplete": "Waiting for JARVIS_STARTUP_COMPLETE=true",
+        }
+        _cfg = GoogleWorkspaceConfig()
+        _remediation = _STANDALONE_REMEDIATION.get(
+            standalone_reason.split(":")[0],
+            f"Standalone creation blocked: {standalone_reason}",
+        ).format(creds=_cfg.credentials_path, token=_cfg.token_path)
         logger.warning(
-            "Standalone GoogleWorkspaceAgent creation denied: %s",
-            standalone_reason,
+            "Standalone GoogleWorkspaceAgent creation denied: reason=%s remediation=%s",
+            standalone_reason, _remediation,
         )
         return None
 
     try:
         instance = GoogleWorkspaceAgent()
         await instance.on_initialize()
-        # Mark as running so the staleness check (line 3795) doesn't
-        # destroy the singleton on the next call.  Standalone agents
-        # skip .start() (no message bus / coordinator) but are fully
-        # functional for direct execute_task() invocations.
+        # Mark as running so the staleness check doesn't destroy the
+        # singleton on the next call.  Standalone agents skip .start()
+        # (no message bus / coordinator) but are fully functional for
+        # direct execute_task() invocations.
         instance._running = True
         _workspace_agent_instance = instance
+        logger.info(
+            "Standalone GoogleWorkspaceAgent created: reason=%s", standalone_reason,
+        )
         return _workspace_agent_instance
     except Exception as exc:
         logger.error("Failed to create standalone GoogleWorkspaceAgent: %s", exc)

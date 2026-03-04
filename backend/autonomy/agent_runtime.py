@@ -456,6 +456,8 @@ class UnifiedAgentRuntime:
         # Email triage integration — last run timestamp (monotonic clock).
         # Sentinel 0.0 means "never ran" — first call always passes cooldown.
         self._last_email_triage_run: float = 0.0
+        # v284.0: Log triage-disabled once, not every cycle
+        self._triage_disabled_logged: bool = False
 
     # ─────────────────────────────────────────────────────────
     # Lifecycle
@@ -2770,6 +2772,9 @@ class UnifiedAgentRuntime:
         the DLM provides cross-process mutual exclusion.
         """
         if not _env_bool("EMAIL_TRIAGE_ENABLED", False):
+            if not self._triage_disabled_logged:
+                logger.info("[AgentRuntime] Email triage disabled (EMAIL_TRIAGE_ENABLED=false)")
+                self._triage_disabled_logged = True
             return
 
         now = time.monotonic()
@@ -2814,7 +2819,24 @@ class UnifiedAgentRuntime:
                     "[AgentRuntime] Email triage lock acquired (fencing_token=%d)",
                     fencing_token,
                 )
-                report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+
+                # v284.0: Thread autonomous execution context so
+                # downstream workspace writes use trusted provenance.
+                try:
+                    from core.execution_context import (
+                        execution_budget,
+                        RequestKind,
+                        RootReason,
+                    )
+                    async with execution_budget(
+                        owner="email_triage",
+                        timeout=timeout,
+                        request_kind=RequestKind.AUTONOMOUS,
+                        root_reason=RootReason.USER_JOB,
+                    ):
+                        report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+                except ImportError:
+                    report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
                 if report and not report.skipped:
                     logger.info(
                         "[AgentRuntime] Email triage: %d fetched, %d processed, "

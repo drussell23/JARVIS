@@ -6567,15 +6567,30 @@ async def system_status():
             components[name] = comp.to_dict()
 
     # Agent capability readiness (via formal contract methods, NOT private attr probing)
+    # v284.0: Use public getter, show readiness_level, handle missing agent
     agents = {}
     try:
         coordinator = getattr(app.state, "neural_mesh_coordinator", None)
+        gws = None
         if coordinator:
             gws = coordinator.get_agent("google_workspace_agent")
-            if gws and hasattr(gws, "get_capability_health"):
-                agents["google_workspace"] = gws.get_capability_health()
-    except Exception:
-        pass
+        if gws is None:
+            try:
+                from neural_mesh.agents.google_workspace_agent import get_workspace_agent_cached
+                gws = get_workspace_agent_cached()
+            except Exception:
+                pass
+        if gws and hasattr(gws, "get_capability_health"):
+            agents["google_workspace"] = gws.get_capability_health()
+        else:
+            agents["google_workspace"] = {
+                "initialized": False,
+                "readiness_level": "blocked_no_agent",
+                "action_required": "GoogleWorkspaceAgent not initialized. Check startup logs.",
+            }
+    except Exception as exc:
+        logger.warning("[SystemStatus] Workspace agent health read failed: %s", exc)
+        agents["google_workspace"] = {"initialized": False, "error": str(exc)}
 
     return {
         "system": system,

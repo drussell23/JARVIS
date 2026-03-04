@@ -120,6 +120,7 @@ class RequestKind(enum.Enum):
     RUNTIME = "runtime"
     RECOVERY = "recovery"
     BACKGROUND = "background"
+    AUTONOMOUS = "autonomous"
 
 
 class Criticality(enum.Enum):

@@ -576,6 +576,12 @@ class EmailTriageRunner:
                 "limit": self._config.max_emails_per_cycle,
             })
             return result.get("emails", [])
+        # v284.0: Log when workspace agent is not resolved with dep health
+        logger.warning(
+            "[EmailTriage] workspace_agent not resolved — cannot fetch unread emails. "
+            "dep_health=%s",
+            self._resolver.health_summary() if hasattr(self._resolver, "health_summary") else "N/A",
+        )
         return []
 
     async def _apply_label(

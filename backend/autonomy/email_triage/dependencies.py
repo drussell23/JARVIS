@@ -266,3 +266,19 @@ class DependencyResolver:
                 "reason": reason,
             },
         )
+
+    def health_summary(self) -> dict:
+        """Return a snapshot of all dependency health states."""
+        import time as _time
+        return {
+            name: {
+                "resolved": dep.resolved,
+                "required": dep.required,
+                "consecutive_failures": dep.consecutive_failures,
+                "last_error": dep.last_resolve_error,
+                "backoff_remaining_s": round(
+                    max(0.0, dep.next_attempt_at - _time.monotonic()), 2
+                ) if not dep.resolved else 0.0,
+            }
+            for name, dep in self._deps.items()
+        }
