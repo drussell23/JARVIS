@@ -513,6 +513,7 @@ class PressurePolicy:
         * ``>= 48 GB`` -- *server* (64 GB+ headroom)
         """
         if total_gb < 12.0:
+            version = "v1.0-constrained"
             enter = {
                 PressureTier.ELEVATED: 85.0,
                 PressureTier.CONSTRAINED: 90.0,
@@ -526,6 +527,7 @@ class PressurePolicy:
                 PressureTier.EMERGENCY: 95.0,
             }
         elif total_gb < 20.0:
+            version = "v1.0-consumer"
             enter = {
                 PressureTier.ELEVATED: 80.0,
                 PressureTier.CONSTRAINED: 88.0,
@@ -539,6 +541,7 @@ class PressurePolicy:
                 PressureTier.EMERGENCY: 93.0,
             }
         elif total_gb < 48.0:
+            version = "v1.0-prosumer"
             enter = {
                 PressureTier.ELEVATED: 65.0,
                 PressureTier.CONSTRAINED: 75.0,
@@ -552,6 +555,7 @@ class PressurePolicy:
                 PressureTier.EMERGENCY: 90.0,
             }
         else:
+            version = "v1.0-server"
             enter = {
                 PressureTier.ELEVATED: 55.0,
                 PressureTier.CONSTRAINED: 65.0,
@@ -566,6 +570,7 @@ class PressurePolicy:
             }
 
         return cls(
+            version=version,
             enter_thresholds=enter,
             exit_thresholds=exit_,
         )

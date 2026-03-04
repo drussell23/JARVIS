@@ -123,6 +123,7 @@ class TestPressurePolicy:
     def test_for_ram_gb_consumer_16(self) -> None:
         """16 GB Mac should get consumer thresholds."""
         policy = PressurePolicy.for_ram_gb(16.0)
+        assert policy.version == "v1.0-consumer"
         # Consumer enter thresholds: 80/88/93/96
         assert policy.enter_thresholds[PressureTier.ELEVATED] == 80.0
         assert policy.enter_thresholds[PressureTier.CONSTRAINED] == 88.0
@@ -137,6 +138,7 @@ class TestPressurePolicy:
     def test_for_ram_gb_server_64(self) -> None:
         """64 GB+ should get server thresholds."""
         policy = PressurePolicy.for_ram_gb(64.0)
+        assert policy.version == "v1.0-server"
         # Server enter thresholds: 55/65/80/90
         assert policy.enter_thresholds[PressureTier.ELEVATED] == 55.0
         assert policy.enter_thresholds[PressureTier.CONSTRAINED] == 65.0
@@ -151,12 +153,14 @@ class TestPressurePolicy:
     def test_for_ram_gb_constrained_8(self) -> None:
         """8 GB (< 12 GB) should get constrained thresholds."""
         policy = PressurePolicy.for_ram_gb(8.0)
+        assert policy.version == "v1.0-constrained"
         assert policy.enter_thresholds[PressureTier.ELEVATED] == 85.0
         assert policy.enter_thresholds[PressureTier.EMERGENCY] == 97.0
 
     def test_for_ram_gb_prosumer_32(self) -> None:
         """32 GB (< 48 GB) should get prosumer thresholds."""
         policy = PressurePolicy.for_ram_gb(32.0)
+        assert policy.version == "v1.0-prosumer"
         assert policy.enter_thresholds[PressureTier.ELEVATED] == 65.0
         assert policy.enter_thresholds[PressureTier.EMERGENCY] == 93.0
 
