@@ -49,11 +49,32 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 from backend.core.async_safety import LazyAsyncLock
+from backend.core.memory_types import (
+    ActuatorAction,
+    DecisionEnvelope,
+    MemorySnapshot,
+    PressureTier,
+)
+
+if TYPE_CHECKING:
+    from backend.core.memory_actuator_coordinator import MemoryActuatorCoordinator
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# PressureTier -> DefconLevel mapping
+# =============================================================================
+
+# Mapping table used by _on_pressure_change to convert broker PressureTiers
+# into the governor's DefconLevel state machine.  NOMINAL/ELEVATED map to
+# GREEN because they represent normal or mildly elevated memory usage that
+# does not require throttling.
+_TIER_TO_DEFCON: dict[PressureTier, "DefconLevel"] = {}  # populated after DefconLevel definition
 
 # =============================================================================
 # Defcon Level System
@@ -84,6 +105,17 @@ class DefconLevel(Enum):
             DefconLevel.YELLOW: "Elevated memory pressure - throttling active",
             DefconLevel.RED: "Critical memory pressure - emergency mode"
         }[self]
+
+
+# Now that DefconLevel is defined, populate the forward-declared mapping.
+_TIER_TO_DEFCON.update({
+    PressureTier.ABUNDANT: DefconLevel.GREEN,
+    PressureTier.OPTIMAL: DefconLevel.GREEN,
+    PressureTier.ELEVATED: DefconLevel.GREEN,
+    PressureTier.CONSTRAINED: DefconLevel.YELLOW,
+    PressureTier.CRITICAL: DefconLevel.RED,
+    PressureTier.EMERGENCY: DefconLevel.RED,
+})
 
 
 @dataclass
@@ -291,6 +323,11 @@ class AdaptiveResourceGovernor:
         # Lazy import psutil
         self._psutil = None
 
+        # MCP broker integration (when registered, the governor receives
+        # pressure tier changes from the broker instead of polling psutil).
+        self._mcp_active: bool = False
+        self._broker: Optional[MemoryBudgetBroker] = None
+
         logger.info(
             f"[ResourceGovernor] Initialized "
             f"(thresholds: G→Y={self.thresholds.green_to_yellow}%, "
@@ -324,6 +361,96 @@ class AdaptiveResourceGovernor:
     ) -> None:
         """Register callback for level changes. Called with (old_level, new_level)."""
         self._level_change_callbacks.append(callback)
+
+    # -----------------------------------------------------------------
+    # MCP broker integration
+    # -----------------------------------------------------------------
+
+    def register_with_broker(self, broker: MemoryBudgetBroker) -> None:
+        """Register this governor as a pressure observer on the broker.
+
+        Once registered, the governor receives ``PressureTier`` changes
+        from the broker instead of polling ``psutil`` directly.  The
+        legacy ``_update_memory_state`` loop remains active but skips
+        the psutil call (shadow mode fallback).
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        broker.register_pressure_observer(self._on_pressure_change)
+        self._mcp_active = True
+        logger.info(
+            "[ResourceGovernor] Registered as broker pressure observer "
+            "(mcp_active=True)"
+        )
+
+    async def _on_pressure_change(
+        self,
+        tier: PressureTier,
+        snapshot: MemorySnapshot,
+    ) -> None:
+        """Broker pressure-observer callback.
+
+        Maps the incoming ``PressureTier`` to a ``DefconLevel`` using the
+        module-level ``_TIER_TO_DEFCON`` table, then drives the existing
+        state-machine transition logic.
+
+        If the transition direction is *up* (i.e. escalation towards RED),
+        a ``DEFCON_ESCALATE`` action is submitted to the coordinator.
+
+        Args:
+            tier: Current pressure tier from the broker.
+            snapshot: The ``MemorySnapshot`` that triggered this notification.
+        """
+        new_level = _TIER_TO_DEFCON.get(tier, DefconLevel.GREEN)
+
+        if new_level == self._current_level:
+            return
+
+        # Apply stabilization timer (reuse existing logic -- skip only
+        # when NOT transitioning to RED, matching _transition_level).
+        time_in_current = time.time() - self._level_start_time
+        if new_level != DefconLevel.RED:
+            if time_in_current < self.thresholds.stabilization_seconds:
+                return
+
+        old_level = self._current_level
+        is_escalation = (
+            (old_level == DefconLevel.GREEN and new_level in (DefconLevel.YELLOW, DefconLevel.RED))
+            or (old_level == DefconLevel.YELLOW and new_level == DefconLevel.RED)
+        )
+
+        # Perform transition via the existing _transition_level path
+        await self._transition_level(new_level)
+
+        # Submit DEFCON_ESCALATE to coordinator if escalating
+        if is_escalation and self._broker is not None:
+            try:
+                coordinator = self._broker.coordinator
+                envelope = DecisionEnvelope(
+                    snapshot_id=snapshot.snapshot_id if hasattr(snapshot, "snapshot_id") else "unknown",
+                    epoch=self._broker._epoch,
+                    sequence=self._broker.current_sequence,
+                    policy_version=self._broker.policy.version,
+                    pressure_tier=tier,
+                    timestamp=time.time(),
+                )
+                coordinator.submit(
+                    ActuatorAction.DEFCON_ESCALATE,
+                    envelope,
+                    source="resource_governor",
+                )
+                logger.info(
+                    "[ResourceGovernor] Submitted DEFCON_ESCALATE: "
+                    "%s -> %s (tier=%s)",
+                    old_level.name, new_level.name, tier.name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[ResourceGovernor] Failed to submit DEFCON_ESCALATE: %s",
+                    exc,
+                )
 
     async def start(self) -> None:
         """Start background memory monitoring."""
@@ -367,7 +494,19 @@ class AdaptiveResourceGovernor:
                 await asyncio.sleep(self.monitoring_interval)
 
     async def _update_memory_state(self) -> None:
-        """Update memory state and potentially transition Defcon level."""
+        """Update memory state and potentially transition Defcon level.
+
+        When ``_mcp_active`` is True the broker's pressure observer drives
+        Defcon transitions, so this method skips the psutil call entirely.
+        The monitoring loop still runs (heartbeat / metrics refresh), but
+        memory polling is deferred to the broker.
+        """
+        if self._mcp_active:
+            # Observer-driven mode: broker pushes tier changes via
+            # _on_pressure_change; nothing to poll here.
+            return
+
+        # --- Legacy psutil path (shadow mode fallback) ---
         psutil = self._ensure_psutil()
 
         # Get memory info
@@ -463,10 +602,11 @@ class AdaptiveResourceGovernor:
         self._transitions_count += 1
         self._last_transition_time = datetime.now()
 
+        mem_pct = (self._last_memory_check or {}).get("memory_percent", 0)
         logger.warning(
             f"[ResourceGovernor] {new_level.emoji} DEFCON LEVEL CHANGE: "
             f"{old_level.name} → {new_level.name} "
-            f"({self._last_memory_check.get('memory_percent', 0):.1f}% memory used)"
+            f"({mem_pct:.1f}% memory used)"
         )
 
         # Notify callbacks
