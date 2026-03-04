@@ -1401,7 +1401,8 @@ async def safe_say(
         if wait:
             return await _do_say()
         else:
-            asyncio.ensure_future(_do_say())
+            task = asyncio.ensure_future(_do_say())
+            task.set_name("safe_say_fire_and_forget")
             return True
 
     gate = get_global_speech_gate()
@@ -1412,7 +1413,8 @@ async def safe_say(
         async def _gated_fire_and_forget():
             async with gate:
                 await _do_say()
-        asyncio.ensure_future(_gated_fire_and_forget())
+        task = asyncio.ensure_future(_gated_fire_and_forget())
+        task.set_name("safe_say_gated_fire_and_forget")
         return True
 
 

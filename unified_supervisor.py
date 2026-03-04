@@ -81729,7 +81729,10 @@ class JarvisSystemKernel:
 
             try:
                 loop = asyncio.get_running_loop()
-                loop.create_task(_finalize())
+                loop.create_task(
+                    _finalize(),
+                    name=f"zone6_{service_key}_bg_finalize",
+                )
             except RuntimeError:
                 # Event loop already closed during shutdown.
                 pass
@@ -95420,7 +95423,23 @@ async def async_main(args: argparse.Namespace) -> int:
             # It's not a real error — just normal shutdown/timeout cleanup.
             # v266.5: InvalidStateError from asyncpg TLS state machine during
             # CloudSQL reconnection — internal asyncpg tasks we don't control.
-            _is_transient = isinstance(exception, (
+            # v300.1: aiohttp.ServerDisconnectedError / ClientError from Cloud
+            # Run cold starts and idle connection pool resets.  These inherit
+            # from aiohttp.ClientError (NOT ConnectionError), so isinstance
+            # misses them.  Match by class-name hierarchy to avoid a top-level
+            # aiohttp import that would add startup latency.
+            _exc_class_names = {
+                cls.__name__ for cls in type(exception).__mro__
+            }
+            _is_aiohttp_transient = bool(
+                _exc_class_names & {
+                    "ServerDisconnectedError",
+                    "ClientOSError",
+                    "ClientConnectorError",
+                    "ClientResponseError",
+                }
+            )
+            _is_transient = _is_aiohttp_transient or isinstance(exception, (
                 ConnectionError,       # Includes ConnectionResetError, BrokenPipeError
                 asyncio.TimeoutError,  # Background health checks, keepalive extensions
                 asyncio.CancelledError,  # Task cancellation (timeout, shutdown, GC)

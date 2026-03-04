@@ -290,10 +290,12 @@ class CloudECAPAClientConfig:
     ECAPA_READY_TIMEOUT = float(os.getenv("CLOUD_ECAPA_READY_TIMEOUT", "30.0"))  # Reduced from 120s
     ECAPA_READY_POLL_INTERVAL = float(os.getenv("CLOUD_ECAPA_READY_POLL", "3.0"))  # Reduced from 5s
 
-    # Retries - v2.1: Reduced to allow faster fallback
-    MAX_RETRIES = int(os.getenv("CLOUD_ECAPA_MAX_RETRIES", "1"))  # Reduced from 3
-    RETRY_BACKOFF_BASE = float(os.getenv("CLOUD_ECAPA_BACKOFF_BASE", "0.5"))  # Reduced from 1.0
-    RETRY_BACKOFF_MAX = float(os.getenv("CLOUD_ECAPA_BACKOFF_MAX", "2.0"))  # Reduced from 10.0
+    # Retries - v2.2: Restored to 3 for Cloud Run cold-start resilience.
+    # v2.1 reduction to 1 caused ServerDisconnectedError to escape to the
+    # event loop before the connection pool could recover.
+    MAX_RETRIES = int(os.getenv("CLOUD_ECAPA_MAX_RETRIES", "3"))
+    RETRY_BACKOFF_BASE = float(os.getenv("CLOUD_ECAPA_BACKOFF_BASE", "1.0"))
+    RETRY_BACKOFF_MAX = float(os.getenv("CLOUD_ECAPA_BACKOFF_MAX", "4.0"))
 
     # Circuit breaker
     CB_FAILURE_THRESHOLD = int(os.getenv("CLOUD_ECAPA_CB_FAILURES", "5"))
@@ -1293,6 +1295,7 @@ class CloudECAPAClient:
         self._endpoints: List[str] = []
         self._circuit_breakers: Dict[str, EndpointCircuitBreaker] = {}
         self._session = None
+        self._session_lock = asyncio.Lock()  # v19.2.1: Serialize session recreation
         self._initialized = False
         self._healthy_endpoint: Optional[str] = None
         self._active_backend: BackendType = BackendType.CLOUD_RUN
@@ -2430,50 +2433,56 @@ class CloudECAPAClient:
                 await self._recreate_session()
 
     async def _recreate_session(self):
-        """Recreate the aiohttp session (fixes connection pool issues)."""
+        """Recreate the aiohttp session (fixes connection pool issues).
+
+        v19.2.1: Serialized via _session_lock to prevent concurrent
+        recreations from clobbering each other when multiple requests
+        hit ServerDisconnectedError simultaneously.
+        """
         import aiohttp
         import ssl
 
-        # Close old session if it exists
-        if self._session:
-            try:
-                await self._session.close()
-            except Exception:
-                pass
+        async with self._session_lock:
+            # Close old session if it exists
+            if self._session:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
 
-        timeout = aiohttp.ClientTimeout(
-            total=CloudECAPAClientConfig.REQUEST_TIMEOUT,
-            connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
-            sock_read=CloudECAPAClientConfig.REQUEST_TIMEOUT,
-            sock_connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
-        )
+            timeout = aiohttp.ClientTimeout(
+                total=CloudECAPAClientConfig.REQUEST_TIMEOUT,
+                connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
+                sock_read=CloudECAPAClientConfig.REQUEST_TIMEOUT,
+                sock_connect=CloudECAPAClientConfig.CONNECT_TIMEOUT,
+            )
 
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = True
-        ssl_context.verify_mode = ssl.CERT_REQUIRED
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = True
+            ssl_context.verify_mode = ssl.CERT_REQUIRED
 
-        connector = aiohttp.TCPConnector(
-            limit=30,
-            limit_per_host=10,
-            ttl_dns_cache=300,
-            ssl=ssl_context,
-            keepalive_timeout=30,
-            enable_cleanup_closed=True,
-            force_close=False,
-        )
+            connector = aiohttp.TCPConnector(
+                limit=30,
+                limit_per_host=10,
+                ttl_dns_cache=300,
+                ssl=ssl_context,
+                keepalive_timeout=30,
+                enable_cleanup_closed=True,
+                force_close=False,
+            )
 
-        self._session = aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector,
-            headers={
-                "User-Agent": f"JARVIS-CloudECAPA/{self.VERSION}",
-                "Accept": "application/json",
-                "Connection": "keep-alive",
-            },
-        )
+            self._session = aiohttp.ClientSession(
+                timeout=timeout,
+                connector=connector,
+                headers={
+                    "User-Agent": f"JARVIS-CloudECAPA/{self.VERSION}",
+                    "Accept": "application/json",
+                    "Connection": "keep-alive",
+                },
+            )
 
-        self._session_created_at = time.time()
-        logger.info("✅ HTTP session recreated successfully")
+            self._session_created_at = time.time()
+            logger.info("✅ HTTP session recreated successfully")
 
     async def _extract_from_endpoint(
         self,

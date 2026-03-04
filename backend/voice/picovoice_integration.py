@@ -371,7 +371,8 @@ class PicovoiceWakeWordDetector:
                         asyncio.create_task(
                             self.detection_callback(result)
                             if asyncio.iscoroutinefunction(self.detection_callback)
-                            else asyncio.to_thread(self.detection_callback, result)
+                            else asyncio.to_thread(self.detection_callback, result),
+                            name="picovoice_detection_callback",
                         )
 
                     break  # Return on first detection

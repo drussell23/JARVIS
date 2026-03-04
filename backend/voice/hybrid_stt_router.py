@@ -735,7 +735,7 @@ class HybridSTTRouter:
                     await _whisper_handler.load_model_async(timeout=timeout)
                     return _whisper_handler
 
-                prewarm_task = asyncio.create_task(_do_prewarm())
+                prewarm_task = asyncio.create_task(_do_prewarm(), name="whisper_prewarm")
 
                 # Wait with strict timeout - shield prevents cancellation propagation
                 self._whisper_handler = await asyncio.wait_for(
