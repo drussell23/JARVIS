@@ -3370,6 +3370,40 @@ const JarvisVoice = () => {
         break;
       }
 
+      case 'proactive_notification': {
+        // ═══════════════════════════════════════════════════════════════════
+        // AUTONOMOUS NOTIFICATION — Email triage, system alerts, proactive
+        // messages from the agent runtime. Delivered via notification_bridge
+        // through the unified WebSocket manager.
+        // ═══════════════════════════════════════════════════════════════════
+        const notifTitle = data.title || 'JARVIS';
+        const notifMessage = data.message || '';
+        const notifUrgency = data.urgency || 'normal';
+        const notifUrgencyLevel = data.urgency_level || 2;
+        const notifContext = data.context || {};
+
+        console.log(
+          '%c[PROACTIVE]',
+          'color: #00bfff; font-weight: bold',
+          `[${notifUrgency.toUpperCase()}] ${notifTitle}: ${notifMessage}`
+        );
+
+        // Show in transcript — autonomous message (no "You:" line)
+        if (notifMessage) {
+          // Clear user transcript for autonomous messages (JARVIS initiated)
+          setTranscript('');
+          setResponse(`${notifTitle}: ${notifMessage}`);
+          setIsProcessing(false);
+        }
+
+        // Speak urgent/high notifications aloud
+        if (notifUrgencyLevel >= 3 && notifMessage) {
+          speakResponse(notifMessage, notifUrgencyLevel >= 4);
+        }
+
+        break;
+      }
+
       default:
         break;
     }

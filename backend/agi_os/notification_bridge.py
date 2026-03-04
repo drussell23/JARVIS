@@ -261,23 +261,44 @@ async def _deliver_websocket(
     title: str,
     context: Dict[str, Any],
 ) -> bool:
-    """Broadcast via the broadcast_router WebSocket manager."""
+    """Broadcast via both broadcast_router AND unified WebSocket manager.
+
+    The broadcast_router reaches ``/api/broadcast/ws`` clients.
+    The unified WS manager reaches ``/ws`` clients (JarvisVoice frontend).
+    Both are best-effort — failure of one does not block the other.
+    """
+    payload = {
+        "type": "proactive_notification",
+        "title": title,
+        "message": message,
+        "urgency": urgency.name.lower(),
+        "urgency_level": int(urgency),
+        "context": context,
+        "timestamp": time.time(),
+    }
+
+    delivered = False
+
+    # Channel A: broadcast_router (/api/broadcast/ws clients)
     try:
         from api.broadcast_router import manager
-
-        count = await manager.broadcast({
-            "type": "proactive_notification",
-            "title": title,
-            "message": message,
-            "urgency": urgency.name.lower(),
-            "urgency_level": int(urgency),
-            "context": context,
-            "timestamp": time.time(),
-        })
-        return count > 0
+        count = await manager.broadcast(payload)
+        if count > 0:
+            delivered = True
     except Exception as e:
-        logger.debug("[NotifyBridge] WebSocket delivery failed: %s", e)
-        return False
+        logger.debug("[NotifyBridge] broadcast_router delivery failed: %s", e)
+
+    # Channel B: unified WebSocket manager (/ws clients — JarvisVoice frontend)
+    try:
+        from api.unified_websocket import get_ws_manager_if_initialized
+        ws_mgr = get_ws_manager_if_initialized()
+        if ws_mgr is not None:
+            await ws_mgr.broadcast(payload)
+            delivered = True
+    except Exception as e:
+        logger.debug("[NotifyBridge] unified WS delivery failed: %s", e)
+
+    return delivered
 
 
 # ─────────────────────────────────────────────────────────
