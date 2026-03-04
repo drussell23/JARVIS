@@ -286,3 +286,156 @@ def test_connectivity_warn_downgraded_only_with_fallback():
         message="Something about local models available",
     )
     assert get_log_level(check_non_connectivity) == "WARNING"
+
+
+# ---------------------------------------------------------------------------
+# Test 6: Port default consistency (supervisor vs gcp_vm_manager)
+# ---------------------------------------------------------------------------
+
+def test_supervisor_and_vm_manager_port_defaults_match():
+    """Supervisor and GCP VM manager must agree on default inference port.
+
+    Both unified_supervisor.py (invincible_node_port) and gcp_vm_manager.py
+    read JARVIS_PRIME_PORT with a fallback default. If they disagree, the
+    supervisor promotes on one port while the VM manager promotes on another,
+    causing the idempotent check in PrimeRouter to fail and triggering
+    false flapping protection.
+
+    We verify via source inspection to avoid heavy module-level side effects
+    from importing the full SystemKernelConfig.
+    """
+    import re
+    import pathlib
+
+    project = pathlib.Path(__file__).resolve().parents[4]
+
+    # --- Supervisor: invincible_node_port default ---
+    # Pattern: invincible_node_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_PORT", XXXX))
+    sup_src = (project / "unified_supervisor.py").read_text()
+    sup_match = re.search(
+        r'invincible_node_port.*_get_env_int\(\s*"JARVIS_PRIME_PORT"\s*,\s*(\d+)\s*\)',
+        sup_src,
+    )
+    assert sup_match, "Could not find invincible_node_port default in unified_supervisor.py"
+    sup_default = int(sup_match.group(1))
+
+    # --- GCP VM manager: JARVIS_PRIME_PORT default in _ensure_endpoint_propagated ---
+    # Pattern: os.getenv("JARVIS_PRIME_PORT" if is_invincible else "GCP_BACKEND_PORT", "8000")
+    vm_src = (project / "backend" / "core" / "gcp_vm_manager.py").read_text()
+    vm_match = re.search(
+        r'os\.getenv\(\s*"JARVIS_PRIME_PORT".*?,\s*"(\d+)"\s*,?\s*\)',
+        vm_src,
+    )
+    assert vm_match, "Could not find JARVIS_PRIME_PORT default in gcp_vm_manager.py"
+    vm_default = int(vm_match.group(1))
+
+    assert sup_default == vm_default == 8000, (
+        f"Port default mismatch: supervisor={sup_default}, vm_manager={vm_default}, expected=8000"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 7: Concurrent promote_gcp_endpoint serialization via lock
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_promote_gcp_endpoint_serialized():
+    """Two concurrent promote calls must not corrupt state."""
+    from backend.core.prime_router import PrimeRouter
+
+    router = PrimeRouter()
+    router._initialized = True
+    router._prime_client = AsyncMock()
+    router._prime_client.update_endpoint = AsyncMock(return_value=True)
+    # Stub out circuit breaker and ultra coordinator
+    router._local_circuit = MagicMock()
+    router._local_circuit.reset_for_endpoint = MagicMock()
+
+    with patch("backend.core.prime_router._get_ultra_coordinator", new_callable=AsyncMock, return_value=None):
+        # Fire two concurrent promotions to the same endpoint
+        results = await asyncio.gather(
+            router.promote_gcp_endpoint("10.0.0.1", 8000),
+            router.promote_gcp_endpoint("10.0.0.1", 8000),
+        )
+
+    # Both should succeed — first does the work, second hits idempotent check
+    assert all(results), f"Expected both True, got {results}"
+    assert router._gcp_promoted is True
+    assert router._gcp_host == "10.0.0.1"
+    assert router._gcp_port == 8000
+    # update_endpoint called exactly once (second call hits idempotent path)
+    assert router._prime_client.update_endpoint.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Test 8: endpoint_propagated conditional on PrimeRouter success
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_endpoint_propagated_only_on_router_success():
+    """endpoint_propagated must not be set when PrimeRouter promotion fails."""
+    from backend.core.gcp_vm_manager import GCPVMManager, VMInstance, VMState
+
+    manager = GCPVMManager.__new__(GCPVMManager)
+
+    # Create a minimal VM
+    vm = VMInstance(
+        instance_id="test-123",
+        name="jarvis-prime-node-1",
+        zone="us-central1-a",
+        state=VMState.RUNNING,
+        created_at=0,
+        ip_address="10.0.0.1",
+        health_status="unknown",
+        metadata={},
+    )
+
+    # Mock the health ping to succeed
+    manager._ping_health_endpoint = AsyncMock(return_value=(True, {"status": "ok"}))
+
+    # Mock notify_gcp_vm_ready to FAIL (patched at source — lazy imported inside method)
+    with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=False):
+        # Also mock the model serving notification to avoid import errors
+        with patch("backend.intelligence.unified_model_serving.notify_gcp_endpoint_ready", new_callable=AsyncMock, return_value=True):
+            result = await manager._ensure_endpoint_propagated(vm)
+
+    assert result is False, "Should return False when router promotion fails"
+    assert vm.metadata.get("endpoint_propagated") is not True, (
+        "endpoint_propagated must not be True when router promotion failed"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Test 9: Health status updated after successful ping
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_health_status_updated_after_successful_ping():
+    """_ensure_endpoint_propagated must set health_status='healthy' after ping succeeds."""
+    from backend.core.gcp_vm_manager import GCPVMManager, VMInstance, VMState
+
+    manager = GCPVMManager.__new__(GCPVMManager)
+
+    vm = VMInstance(
+        instance_id="test-456",
+        name="jarvis-prime-node-2",
+        zone="us-central1-a",
+        state=VMState.RUNNING,
+        created_at=0,
+        ip_address="10.0.0.2",
+        health_status="unknown",
+        metadata={},
+    )
+
+    # Mock health ping to succeed
+    manager._ping_health_endpoint = AsyncMock(return_value=(True, {"status": "ok"}))
+
+    # Mock PrimeRouter promotion to succeed (patched at source — lazy imported inside method)
+    with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=True):
+        with patch("backend.intelligence.unified_model_serving.notify_gcp_endpoint_ready", new_callable=AsyncMock, return_value=True):
+            result = await manager._ensure_endpoint_propagated(vm)
+
+    assert result is True
+    assert vm.health_status == "healthy", (
+        f"Expected health_status='healthy', got '{vm.health_status}'"
+    )

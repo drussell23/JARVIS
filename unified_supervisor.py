@@ -4597,7 +4597,7 @@ class SystemKernelConfig:
     # v210.0: Added default names for auto-creation - no manual setup required
     invincible_node_static_ip_name: str = field(default_factory=lambda: os.environ.get("GCP_VM_STATIC_IP_NAME", "jarvis-prime-ip"))
     invincible_node_instance_name: str = field(default_factory=lambda: os.environ.get("GCP_VM_INSTANCE_NAME", "jarvis-prime-node"))
-    invincible_node_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_PORT", 8001))
+    invincible_node_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_PORT", 8000))
     invincible_node_health_timeout: float = field(default_factory=lambda: _get_env_float("GCP_STATIC_VM_HEALTH_TIMEOUT", 300.0))
 
     # ═══════════════════════════════════════════════════════════════════════════

@@ -3847,6 +3847,11 @@ class GCPVMManager:
         if not is_ready:
             return False
 
+        # Update health status so the guard at the top of this method
+        # correctly returns True on subsequent calls (consistent with monitoring loop).
+        vm.health_status = "healthy"
+        vm.last_health_check = time.time()
+
         # === Propagate to routing layer ===
         url = f"http://{vm.ip_address}:{port}"
 
@@ -3871,10 +3876,12 @@ class GCPVMManager:
         )
 
         # Notify PrimeRouter (routes inference traffic)
+        _router_ok = False
         try:
             from backend.core.prime_router import notify_gcp_vm_ready
-            success = await notify_gcp_vm_ready(vm.ip_address, port)
-            if success:
+            _router_success = await notify_gcp_vm_ready(vm.ip_address, port)
+            if _router_success:
+                _router_ok = True
                 logger.info(
                     f"[EndpointPropagation] PrimeRouter promoted GCP endpoint: "
                     f"{vm.ip_address}:{port}"
@@ -3892,8 +3899,8 @@ class GCPVMManager:
         # Notify UnifiedModelServing (hot-swaps inference client)
         try:
             from backend.intelligence.unified_model_serving import notify_gcp_endpoint_ready
-            success = await notify_gcp_endpoint_ready(url)
-            if success:
+            _model_success = await notify_gcp_endpoint_ready(url)
+            if _model_success:
                 logger.info(
                     f"[EndpointPropagation] UnifiedModelServing hot-swapped to {url}"
                 )
@@ -3915,10 +3922,13 @@ class GCPVMManager:
         except Exception:
             pass
 
-        # Track propagation state
-        vm.metadata["endpoint_propagated"] = True
-        vm.metadata["endpoint_propagated_at"] = time.time()
-        vm.metadata["endpoint_url"] = url
+        # Track propagation state — only mark propagated if PrimeRouter accepted the endpoint.
+        # Without this guard, a failed promotion sets endpoint_propagated=True, causing the
+        # guard at the top of this method to skip retries on subsequent calls.
+        if _router_ok:
+            vm.metadata["endpoint_propagated"] = True
+            vm.metadata["endpoint_propagated_at"] = time.time()
+            vm.metadata["endpoint_url"] = url
 
         # v236.3 (C3 fix): Only update last_activity_time, NOT component_usage_count.
         # record_activity() increments usage count, which inflates efficiency score
@@ -3926,11 +3936,17 @@ class GCPVMManager:
         # propagation is an infrastructure event, not real application traffic.
         vm.last_activity_time = time.time()
 
-        logger.info(
-            f"[EndpointPropagation] v236.3: VM '{vm.name}' fully integrated "
-            f"into routing layer at {url}"
-        )
-        return True
+        if _router_ok:
+            logger.info(
+                f"[EndpointPropagation] v236.3: VM '{vm.name}' fully integrated "
+                f"into routing layer at {url}"
+            )
+        else:
+            logger.warning(
+                f"[EndpointPropagation] VM '{vm.name}' env vars set but PrimeRouter "
+                f"promotion failed — will retry on next call"
+            )
+        return _router_ok
 
     async def _ensure_endpoint_depropagated(self, vm: VMInstance) -> bool:
         """v236.3: Demote a VM's endpoint from the routing layer when health fails.

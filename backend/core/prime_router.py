@@ -460,93 +460,94 @@ class PrimeRouter:
 
         Returns True if promotion succeeded (GCP endpoint is healthy).
         """
-        if not self._initialized:
-            await self.initialize()
+        async with self._lock:
+            if not self._initialized:
+                await self.initialize()
 
-        if self._prime_client is None:
-            logger.warning("[PrimeRouter] Cannot promote GCP endpoint: no prime client")
-            return False
-
-        # v273.0: Idempotent steady-state promotion should bypass cooldown checks.
-        # When the router is already promoted to this endpoint, return success
-        # instead of treating repeated notifications as flapping.
-        if (
-            self._gcp_promoted
-            and self._gcp_host == host
-            and self._gcp_port == port
-        ):
-            logger.info(
-                "[PrimeRouter] v273.0: GCP endpoint already active (%s:%s) — "
-                "promotion treated as successful",
-                host,
-                port,
-            )
-            return True
-
-        # v271.0: Flapping protection
-        if not self._check_transition_cooldown("promote_gcp_endpoint"):
-            return False
-
-        # v272.x Phase 10: Prevent duplicate concurrent promotions
-        try:
-            from backend.core.idempotency_registry import check_idempotent
-            if not check_idempotent("promote_gcp_endpoint", f"{host}:{port}"):
-                logger.info("[PrimeRouter] v272.x: Duplicate promotion suppressed for %s:%s", host, port)
-                return self._gcp_promoted
-        except ImportError:
-            pass
-
-        logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
-
-        # v276.0 Phase 12: Partition-aware promotion gate
-        try:
-            from backend.core.partition_aware_health import is_partition_detected as _is_part
-            _partitioned, _part_reason = _is_part()
-            if _partitioned:
-                logger.warning(
-                    "[PrimeRouter] v276.0: Promotion blocked — %s", _part_reason
-                )
+            if self._prime_client is None:
+                logger.warning("[PrimeRouter] Cannot promote GCP endpoint: no prime client")
                 return False
-        except ImportError:
-            pass
 
-        success = await self._prime_client.update_endpoint(host, port)
-
-        if success:
-            self._gcp_promoted = True
-            self._gcp_host = host
-            self._gcp_port = port
-            self._last_transition_time = time.monotonic()
-            # v242.0: Reset circuit for health-checked GCP endpoint (skips cold probe)
-            self._local_circuit.reset_for_endpoint(
-                endpoint_id=f"gcp:{host}:{port}", health_checked=True
-            )
-            # v242.0 Gap K: Cancel orphaned prime_router task from old endpoint
-            # (targeted — voice/reactor tasks are unrelated to endpoint swap)
-            try:
-                _uc = await _get_ultra_coordinator()
-                if _uc and _uc.cancel_shielded_task("prime_router"):
-                    logger.info("[PrimeRouter] v242.0 Cancelled orphan prime_router task on GCP promotion")
-            except Exception:
-                pass  # Never break promotion for cleanup
-            # v271.0: Log promotion decision
-            try:
-                from backend.core.decision_log import record_decision, DECISION_ROUTING_PROMOTE
-                record_decision(
-                    decision_type=DECISION_ROUTING_PROMOTE,
-                    reason=f"GCP VM endpoint promoted: {host}:{port}",
-                    inputs={"host": host, "port": port},
-                    outcome="promoted",
-                    component="prime_router",
+            # v273.0: Idempotent steady-state promotion should bypass cooldown checks.
+            # When the router is already promoted to this endpoint, return success
+            # instead of treating repeated notifications as flapping.
+            if (
+                self._gcp_promoted
+                and self._gcp_host == host
+                and self._gcp_port == port
+            ):
+                logger.info(
+                    "[PrimeRouter] v273.0: GCP endpoint already active (%s:%s) — "
+                    "promotion treated as successful",
+                    host,
+                    port,
                 )
+                return True
+
+            # v271.0: Flapping protection
+            if not self._check_transition_cooldown("promote_gcp_endpoint"):
+                return False
+
+            # v272.x Phase 10: Prevent duplicate concurrent promotions
+            try:
+                from backend.core.idempotency_registry import check_idempotent
+                if not check_idempotent("promote_gcp_endpoint", f"{host}:{port}"):
+                    logger.info("[PrimeRouter] v272.x: Duplicate promotion suppressed for %s:%s", host, port)
+                    return self._gcp_promoted
             except ImportError:
                 pass
-            logger.info("[PrimeRouter] v232.0: GCP VM promotion successful, routing updated")
-        else:
-            self._gcp_promoted = False
-            logger.warning("[PrimeRouter] v232.0: GCP VM promotion failed, keeping current routing")
 
-        return success
+            logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
+
+            # v276.0 Phase 12: Partition-aware promotion gate
+            try:
+                from backend.core.partition_aware_health import is_partition_detected as _is_part
+                _partitioned, _part_reason = _is_part()
+                if _partitioned:
+                    logger.warning(
+                        "[PrimeRouter] v276.0: Promotion blocked — %s", _part_reason
+                    )
+                    return False
+            except ImportError:
+                pass
+
+            success = await self._prime_client.update_endpoint(host, port)
+
+            if success:
+                self._gcp_promoted = True
+                self._gcp_host = host
+                self._gcp_port = port
+                self._last_transition_time = time.monotonic()
+                # v242.0: Reset circuit for health-checked GCP endpoint (skips cold probe)
+                self._local_circuit.reset_for_endpoint(
+                    endpoint_id=f"gcp:{host}:{port}", health_checked=True
+                )
+                # v242.0 Gap K: Cancel orphaned prime_router task from old endpoint
+                # (targeted — voice/reactor tasks are unrelated to endpoint swap)
+                try:
+                    _uc = await _get_ultra_coordinator()
+                    if _uc and _uc.cancel_shielded_task("prime_router"):
+                        logger.info("[PrimeRouter] v242.0 Cancelled orphan prime_router task on GCP promotion")
+                except Exception:
+                    pass  # Never break promotion for cleanup
+                # v271.0: Log promotion decision
+                try:
+                    from backend.core.decision_log import record_decision, DECISION_ROUTING_PROMOTE
+                    record_decision(
+                        decision_type=DECISION_ROUTING_PROMOTE,
+                        reason=f"GCP VM endpoint promoted: {host}:{port}",
+                        inputs={"host": host, "port": port},
+                        outcome="promoted",
+                        component="prime_router",
+                    )
+                except ImportError:
+                    pass
+                logger.info("[PrimeRouter] v232.0: GCP VM promotion successful, routing updated")
+            else:
+                self._gcp_promoted = False
+                logger.warning("[PrimeRouter] v232.0: GCP VM promotion failed, keeping current routing")
+
+            return success
 
     async def demote_gcp_endpoint(self) -> bool:
         """
@@ -555,39 +556,40 @@ class PrimeRouter:
         Called when the GCP VM becomes unhealthy or is terminated.
         Returns True if demotion succeeded.
         """
-        if self._prime_client is None:
-            return False
+        async with self._lock:
+            if self._prime_client is None:
+                return False
 
-        # v271.0: Flapping protection
-        if not self._check_transition_cooldown("demote_gcp_endpoint"):
-            return False
+            # v271.0: Flapping protection
+            if not self._check_transition_cooldown("demote_gcp_endpoint"):
+                return False
 
-        _prev_host = self._gcp_host
-        _prev_port = self._gcp_port
-        success = await self._prime_client.demote_to_fallback()
-        if success:
-            self._gcp_promoted = False
-            self._gcp_host = None
-            self._gcp_port = None
-            self._last_transition_time = time.monotonic()
-            # v242.0: Reset circuit for local endpoint (cold probe for unverified local)
-            self._local_circuit.reset_for_endpoint(
-                endpoint_id="local", health_checked=False
-            )
-            # v271.0: Log demotion decision
-            try:
-                from backend.core.decision_log import record_decision, DECISION_ROUTING_DEMOTE
-                record_decision(
-                    decision_type=DECISION_ROUTING_DEMOTE,
-                    reason="GCP VM endpoint demoted back to local",
-                    inputs={"previous_host": _prev_host, "previous_port": _prev_port},
-                    outcome="demoted",
-                    component="prime_router",
+            _prev_host = self._gcp_host
+            _prev_port = self._gcp_port
+            success = await self._prime_client.demote_to_fallback()
+            if success:
+                self._gcp_promoted = False
+                self._gcp_host = None
+                self._gcp_port = None
+                self._last_transition_time = time.monotonic()
+                # v242.0: Reset circuit for local endpoint (cold probe for unverified local)
+                self._local_circuit.reset_for_endpoint(
+                    endpoint_id="local", health_checked=False
                 )
-            except ImportError:
-                pass
-            logger.info("[PrimeRouter] v232.0: Demoted from GCP VM to local Prime")
-        return success
+                # v271.0: Log demotion decision
+                try:
+                    from backend.core.decision_log import record_decision, DECISION_ROUTING_DEMOTE
+                    record_decision(
+                        decision_type=DECISION_ROUTING_DEMOTE,
+                        reason="GCP VM endpoint demoted back to local",
+                        inputs={"previous_host": _prev_host, "previous_port": _prev_port},
+                        outcome="demoted",
+                        component="prime_router",
+                    )
+                except ImportError:
+                    pass
+                logger.info("[PrimeRouter] v232.0: Demoted from GCP VM to local Prime")
+            return success
 
     async def generate(
         self,
