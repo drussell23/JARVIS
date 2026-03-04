@@ -2,7 +2,7 @@
 
 **The Body of the AGI OS — macOS integration, computer use, action execution, and unified orchestration**
 
-JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v244.0**, JARVIS features command lifecycle event infrastructure with explicit bus management (v243.0/v243.1), zero startup warnings with 858 lines of dead code removed and Cloud SQL proxy startup reduced from ~47s to ~3-5s (v244.0), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
+JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v260.0**, JARVIS features a **Memory Control Plane** with lease-based memory governance and pressure-driven ghost display resolution shedding (v260.0), command lifecycle event infrastructure (v243.0/v243.1), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
 
 ---
 
@@ -208,6 +208,9 @@ See `tests/README.md` for the per-file matrix and commands.
 | `unified_supervisor.py` | Monolithic kernel: startup, Trinity, GCP, dashboard, shutdown |
 | `backend/main.py` | FastAPI backend (Body) — REST + WebSocket |
 | `backend/core/` | GCP VM manager, Trinity integrator, dynamic components, resilience |
+| `backend/core/memory_budget_broker.py` | Memory Control Plane: lease-based memory governance for all components |
+| `backend/core/memory_types.py` | MCP type system: PressureTier, DisplayState, MemorySnapshot, events |
+| `backend/system/phantom_hardware_manager.py` | Ghost display lifecycle + DisplayPressureController state machine |
 | `backend/supervisor/` | Cross-repo startup orchestrator, Trinity coordination |
 | `loading_server.py` | Loading-page server and progress broadcaster |
 
@@ -1780,6 +1783,79 @@ Removed the `_is_continuous` gate so J-Prime LLaVA handles **all** vision reques
 
 Introduced `_ghost_display_init_task` and `_ghost_display_health_task` for concurrent lifecycle management. `PhantomHardwareManager` uses a single-flight mechanism to prevent concurrent calls to `ensure_ghost_display_exists_async` — only one initialization task runs at a time. Robust error handling for optional dependency failures.
 
+**v260.0 — Memory Control Plane: Ghost Display Integration (March 2026):**
+
+The ghost display is now a **first-class citizen** of the Memory Control Plane (MCP). On Apple Silicon M1/M2, GPU framebuffers consume the same 16GB unified memory pool as CPU — the compositor is invisible to `psutil` process RSS but very real to the system. This integration makes display memory visible, governed, and pressure-responsive.
+
+```
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                 MEMORY CONTROL PLANE — GHOST DISPLAY INTEGRATION             │
+├──────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  MemoryBudgetBroker (singleton)                                             │
+│    ├── Pressure Observer Pattern ──────────────────────────────────────┐     │
+│    │   register_pressure_observer() / notify_pressure_observers()      │     │
+│    │   One bad observer never blocks others (exception isolation)      │     │
+│    │                                                                    │     │
+│    ├── Display Lease: "display:ghost@v1"                               │     │
+│    │   Priority: BOOT_OPTIONAL                                         │     │
+│    │   Initial: 32MB (1920x1080 triple-buffer + compositor overhead)   │     │
+│    │   amend_lease_bytes() — atomic swap on resolution change           │     │
+│    │                                                                    │     │
+│    └── Crash Recovery                                                  │     │
+│        reconcile_stale_leases() queries BetterDisplay CLI               │     │
+│        Connected → restore lease | Disconnected → reclaim bytes         │     │
+│                                                                         │     │
+│  DisplayPressureController (state machine)  ◄───────────────────────────┘     │
+│    │                                                                         │
+│    ├── Shedding Ladder (pressure-driven downgrade):                          │
+│    │   ACTIVE ──► DEGRADED_1 ──► DEGRADED_2 ──► MINIMUM ──► DISCONNECTED   │
+│    │   1920x1080   1600x900     1280x720      1024x576     (released)       │
+│    │   ~32MB       ~22MB        ~14MB          ~9MB         0MB             │
+│    │                                                                         │
+│    │   Triggers:  CONSTRAINED    CRITICAL      CRITICAL+     EMERGENCY      │
+│    │                                           thrash                        │
+│    │                                                                         │
+│    ├── Recovery Ladder (reverse, one step at a time):                        │
+│    │   DISCONNECTED → MINIMUM → DEGRADED_2 → DEGRADED_1 → ACTIVE           │
+│    │   Requires: pressure ≤ clear tier + swap clear + trend not rising      │
+│    │                                                                         │
+│    ├── Invariants:                                                           │
+│    │   • One step per evaluation (EMERGENCY from ACTIVE → DEGRADED_1 only)  │
+│    │   • Two-phase protocol: PREPARE → APPLY → VERIFY → COMMIT/ROLLBACK    │
+│    │   • Flap guards: 30s degrade dwell, 60s recovery dwell, 20s cooldown  │
+│    │   • Rate limit: max 6 transitions/hour, 10min lockout after cap        │
+│    │   • Failure budget: quarantine transition after 3 failures (5min)       │
+│    │   • Dependency-aware disconnect: checks requires_display leases        │
+│    │                                                                         │
+│    ├── Calibration:                                                          │
+│    │   Before/after MemorySnapshot deltas, per-resolution EMA tracking      │
+│    │   Replaces static estimates with observed compositor memory cost        │
+│    │                                                                         │
+│    └── Telemetry: 8 DISPLAY_* events with structured metadata               │
+│        DEGRADE_REQUESTED, DEGRADED, DISCONNECT_REQUESTED, DISCONNECTED,     │
+│        RECOVERY_REQUESTED, RECOVERED, ACTION_FAILED, ACTION_PHASE           │
+│                                                                              │
+│  Also replaced in this release:                                              │
+│    • agi_os_coordinator.py: raw psutil → broker PressureTier snapshot        │
+│    • yabai_space_detector.py: private _thrash_state → typed snapshot API     │
+│                                                                              │
+│  13 env-configurable knobs, 0 hardcoded magic numbers                       │
+│  72 new tests (unit + integration), 196 total MCP tests passing             │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Files Modified (v260.0):**
+
+| Area | Files | Changes |
+|------|-------|---------|
+| MCP types | `backend/core/memory_types.py` | `DisplayState` (9 states), `DisplayFailureCode` (7 codes), 8 `DISPLAY_*` event types |
+| Broker | `backend/core/memory_budget_broker.py` | Pressure observer pattern, `amend_lease_bytes()`, display crash recovery |
+| State machine | `backend/system/phantom_hardware_manager.py` | `DisplayPressureController`, `set_resolution_async()`, `disconnect_async()`, `reconnect_async()`, `get_current_mode_async()` |
+| AGI OS | `backend/agi_os/agi_os_coordinator.py` | Replace raw `psutil.virtual_memory()` with broker snapshot |
+| Vision | `backend/vision/yabai_space_detector.py` | Replace private `_thrash_state` with typed `get_memory_quantizer_instance()` API |
+| Supervisor | `unified_supervisor.py` | Wire display lease in Phase 6.5, `DisplayPressureController` lifecycle |
+
 **Files Modified (v259.0/v259.1):**
 
 | Area | Files | Changes |
@@ -2307,10 +2383,10 @@ The system reacts to individual commands but cannot autonomously decompose, chai
 
 #### Ghost Display ↔ Computer Use Disconnection
 
-The Ghost Display (`GhostDisplayManager` in `yabai_space_detector.py`) creates a virtual macOS display for background autonomous work, but:
+The Ghost Display (`GhostDisplayManager` in `yabai_space_detector.py`) creates a virtual macOS display for background autonomous work. **As of v260.0**, the display lease mechanism is implemented via the Memory Control Plane (`display:ghost@v1`), but two gaps remain:
 
 - **Computer Use targets the main display** — `ClaudeComputerUseConnector` uses `pyautogui.screenshot()` which captures the primary display, not a specific `CGDirectDisplayID`
-- **No screen lease mechanism** — Nothing prevents Computer Use from operating on the main display (disrupting the user) when the Ghost Display is available
+- ~~**No screen lease mechanism**~~ — **Resolved (v260.0):** `DisplayPressureController` manages the display lifecycle with a broker lease, pressure-driven shedding ladder, dependency-aware disconnect, and crash recovery
 - **Ghost Hands Orchestrator is standalone** — Not integrated with the `GoogleWorkspaceAgent` or Autonomy System's tool registry
 
 #### Neural Mesh ↔ Autonomy System Gap
@@ -2510,16 +2586,16 @@ Build the missing **outer agent loop** — a persistent sense-think-act-verify-r
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-#### v248.0 — Ghost Display Integration (Planned)
+#### v248.0 — Ghost Display Integration (Partially Complete)
 
 Connect the Ghost Display to Computer Use and the Agent Runtime for non-intrusive background automation:
 
 - [ ] **Display-aware Computer Use** — Replace `pyautogui.screenshot()` in `ClaudeComputerUseConnector` with `CGDirectDisplayID`-targeted capture using `GhostDisplayManager.ghost_display_id`
-- [ ] **Screen lease mechanism** — Agent Runtime acquires a "screen lease" (Ghost Display preferred, main display with user permission) before any Computer Use action
+- [x] **Screen lease mechanism (v260.0)** — Ghost display registers as `display:ghost@v1` with the Memory Control Plane broker. `DisplayPressureController` manages the full lifecycle: pressure-driven resolution shedding (1920x1080 → 1024x576 → disconnect), two-phase action protocol, flap guards, dependency-aware disconnect, calibrated UMA memory accounting, and crash recovery
 - [ ] **Ghost Hands ↔ Agent Runtime bridge** — `GhostHandsOrchestrator` becomes a tool in the Agent Runtime's registry, enabling autonomous visual workflows on the Ghost Display
 - [ ] **Coordinate offset translation** — Click coordinates from Computer Use screenshots are translated to the Ghost Display's virtual coordinate space
 - [ ] **MosaicWatcher display targeting** — Fix `VisualMonitorAgent` to pass correct `CGDirectDisplayID` (from `GhostDisplayManager`) instead of yabai display index
-- [ ] **Ghost Display auto-provisioning** — Agent Runtime automatically creates/discovers Ghost Display on startup if autonomous visual tasks are queued
+- [x] **Ghost Display auto-provisioning** — Supervisor Phase 6.5 creates the ghost display and wires the `DisplayPressureController` with a broker lease automatically at startup
 - [ ] **Fallback to main display** — If Ghost Display is unavailable, prompt user before using main display for visual automation
 
 **Goal:** JARVIS can autonomously draft emails, manage calendar, and perform visual tasks on the Ghost Display without stealing the user's focus or requiring their active screen.
@@ -2541,6 +2617,8 @@ Unify the Neural Mesh multi-agent system with the Autonomy System's tool registr
 
 | Area | Location | Description |
 |------|----------|-------------|
+| **Memory Control Plane** | `backend/core/memory_budget_broker.py`, `memory_types.py`, `memory_quantizer.py` | Lease-based memory governance, pressure tiers, snapshot API, crash recovery |
+| **Ghost Display** | `backend/system/phantom_hardware_manager.py` | Virtual display lifecycle, pressure-driven resolution shedding, BetterDisplay CLI |
 | **Trinity** | `backend/core/trinity_integrator.py`, `backend/supervisor/cross_repo_startup_orchestrator.py` | Start Prime/Reactor, adopt early Prime, health checks |
 | **GCP** | `backend/core/gcp_vm_manager.py`, `dynamic_component_manager.py` | Golden image VMs, Spot VMs, auto offload, cost tracking |
 | **Loading progress** | `unified_supervisor.py` (LiveDashboard, `update_model_loading`), `backend/loading_server/` | Model load progress, handoff-safe (no 18%→0% regression) |
