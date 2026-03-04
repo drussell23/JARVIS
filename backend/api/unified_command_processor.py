@@ -679,6 +679,12 @@ class UnifiedCommandProcessor:
             "coordinator_stale": 0,
             "workspace_action_map_misses": 0,
             "workspace_standalone_denials": 0,
+            # Email autonomy observability
+            "email_announce_dedup_hits": 0,
+            "email_triage_enrichments": 0,
+            "email_needs_confirmation_count": 0,
+            "email_low_confidence_skips": 0,
+            "email_category_breakdown": {},  # category -> count
         }
 
         # v_autonomy: Coordinator lookup retry state machine
@@ -704,7 +710,9 @@ class UnifiedCommandProcessor:
         # Email announcement dedup — prevents duplicate email summaries from
         # rapid retries, reconnects, or repeated "check my email" commands.
         # Keyed by a hash of message IDs; stores (response_hash, timestamp).
+        # Lock-protected: concurrent command + autonomous triage loop can race.
         self._email_announce_cache: Dict[str, float] = {}
+        self._email_announce_lock = asyncio.Lock()
         self._email_announce_cooldown_s = float(
             os.getenv("JARVIS_EMAIL_ANNOUNCE_COOLDOWN_S", "30")
         )
@@ -712,31 +720,47 @@ class UnifiedCommandProcessor:
 
     _COORDINATOR_BACKOFF_SCHEDULE = [5.0, 10.0, 20.0, 40.0, 60.0]
 
-    def _email_announce_fingerprint(self, emails: list) -> str:
-        """Compute a stable fingerprint from email message IDs for dedup."""
+    @staticmethod
+    def _email_announce_fingerprint(emails: list) -> str:
+        """Compute a stable fingerprint from email message IDs for dedup.
+
+        Normalizes IDs to handle alias/forwarding variants. Sorted for
+        order-independence across retries.
+        """
         import hashlib
-        ids = sorted(e.get("id", "") for e in emails if e.get("id"))
+        ids = sorted(
+            str(e.get("id", "")).strip().lower()
+            for e in emails if e.get("id")
+        )
         return hashlib.sha256("|".join(ids).encode()).hexdigest()[:16]
 
-    def _email_announce_is_duplicate(self, fingerprint: str) -> bool:
-        """Check if this email set was recently announced."""
-        import time as _t
-        now = _t.monotonic()
-        # Evict expired entries (bounded cache)
-        expired = [k for k, v in self._email_announce_cache.items()
-                   if now - v > self._email_announce_cooldown_s]
-        for k in expired:
-            del self._email_announce_cache[k]
-        return fingerprint in self._email_announce_cache
+    async def _email_announce_check_and_record(self, fingerprint: str) -> bool:
+        """Atomically check + record. Returns True if duplicate (suppress).
 
-    def _email_announce_record(self, fingerprint: str) -> None:
-        """Record this email set as announced."""
+        Lock-protected to prevent races between concurrent command processing
+        and autonomous triage announcement loops.
+        """
         import time as _t
-        self._email_announce_cache[fingerprint] = _t.monotonic()
-        # Bounded eviction: remove oldest if over max
-        while len(self._email_announce_cache) > self._email_announce_max:
-            oldest_key = min(self._email_announce_cache, key=self._email_announce_cache.get)  # type: ignore[arg-type]
-            del self._email_announce_cache[oldest_key]
+        async with self._email_announce_lock:
+            now = _t.monotonic()
+            # Evict expired entries (bounded cache)
+            expired = [k for k, v in self._email_announce_cache.items()
+                       if now - v > self._email_announce_cooldown_s]
+            for k in expired:
+                del self._email_announce_cache[k]
+
+            if fingerprint in self._email_announce_cache:
+                return True  # Duplicate — suppress
+
+            # Record and enforce size bound
+            self._email_announce_cache[fingerprint] = now
+            while len(self._email_announce_cache) > self._email_announce_max:
+                oldest_key = min(
+                    self._email_announce_cache,
+                    key=self._email_announce_cache.get,  # type: ignore[arg-type]
+                )
+                del self._email_announce_cache[oldest_key]
+            return False  # Not a duplicate — announce
 
     async def _get_neural_mesh_coordinator(self):
         """Resolve the Neural Mesh coordinator with bounded retry state machine.
@@ -2306,18 +2330,8 @@ class UnifiedCommandProcessor:
 
             # ── Classify mailbox category from Gmail label_ids ──
             def _get_mailbox_tab(em: dict) -> str:
-                labels = set(em.get("labels", []))
-                if "CATEGORY_PROMOTIONS" in labels:
-                    return "promotions"
-                if "CATEGORY_SOCIAL" in labels:
-                    return "social"
-                if "CATEGORY_UPDATES" in labels:
-                    return "updates"
-                if "CATEGORY_FORUMS" in labels:
-                    return "forums"
-                if "SPAM" in labels:
-                    return "spam"
-                return "primary"
+                cat, _ = UnifiedCommandProcessor._classify_mailbox_tab(em)
+                return cat
 
             # ── Sort: urgent first, then by tier, then primary before promotions ──
             _tab_priority = {"primary": 0, "updates": 1, "social": 2, "forums": 3, "promotions": 4, "spam": 5}
@@ -2503,20 +2517,66 @@ class UnifiedCommandProcessor:
         r"|(?:you\s+are\s+now\s+(?:a|an|in))"
         r"|(?:new\s+instructions?:)"
         r"|(?:override\s+(?:all\s+)?(?:previous|above))"
+        # Sentinel tag escape: email content must never break XML boundaries
+        r"|(?:</?\s*workspace_data\s*/?\s*>)"
+        r"|(?:</?\s*system\s*>)"
+        # Role injection via email content
+        r"|(?:(?:human|assistant|user)\s*:)"
     )
 
     @staticmethod
     def _sanitize_for_compose(text: str) -> str:
-        """Guardrail 8: Strip control chars, tags, and injection patterns."""
+        """Guardrail 8: Strip control chars, tags, and injection patterns.
+
+        Treats all input as untrusted (email body, subject, snippet can contain
+        adversarial content). Defense-in-depth:
+        1. Control character removal (keeps \\n, \\t)
+        2. XML/HTML tag stripping (max 200 char tags)
+        3. Known injection pattern removal
+        4. Unicode normalization (NFKC) to collapse homoglyph evasion
+        """
         if not text or not isinstance(text, str):
             return ""
+        # Normalize unicode to prevent homoglyph evasion (e.g., fullwidth chars)
+        import unicodedata
+        cleaned = unicodedata.normalize("NFKC", text)
         # Strip control chars (keep newlines and tabs)
-        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
+        cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", cleaned)
         # Strip XML/HTML tags
         cleaned = re.sub(r"<[^>]{1,200}>", "", cleaned)
         # Strip prompt-injection patterns
         cleaned = UnifiedCommandProcessor._INJECTION_PATTERNS.sub("", cleaned)
         return cleaned.strip()
+
+    # Gmail category label → mailbox tab mapping.
+    # Priority order matters: first match wins. User-specific filters can cause
+    # multiple CATEGORY_* labels on a single message — we flag as ambiguous.
+    _CATEGORY_LABEL_MAP = {
+        "CATEGORY_PROMOTIONS": "promotions",
+        "CATEGORY_SOCIAL": "social",
+        "CATEGORY_UPDATES": "updates",
+        "CATEGORY_FORUMS": "forums",
+        "SPAM": "spam",
+    }
+
+    @staticmethod
+    def _classify_mailbox_tab(em: dict) -> tuple:
+        """Classify email into mailbox tab from Gmail label_ids.
+
+        Returns (category: str, ambiguous: bool).
+        Ambiguous=True when multiple CATEGORY_* labels coexist (user filter overlap).
+        """
+        labels = set(em.get("labels", []))
+        matched = [
+            cat for lbl, cat in UnifiedCommandProcessor._CATEGORY_LABEL_MAP.items()
+            if lbl in labels
+        ]
+        if not matched:
+            return ("primary", False)
+        if len(matched) == 1:
+            return (matched[0], False)
+        # Multiple category labels — pick first by priority but flag ambiguity
+        return (matched[0], True)
 
     def _build_compose_payload(
         self,
@@ -2557,19 +2617,11 @@ class UnifiedCommandProcessor:
                         )[:200],
                         "date": str(em.get("date", ""))[:30],
                     }
-                    # Mailbox category from Gmail label_ids
-                    _labels = set(em.get("labels", []))
-                    if "CATEGORY_PROMOTIONS" in _labels:
-                        _email_entry["category"] = "promotions"
-                    elif "CATEGORY_SOCIAL" in _labels:
-                        _email_entry["category"] = "social"
-                    elif "CATEGORY_UPDATES" in _labels:
-                        _email_entry["category"] = "updates"
-                    elif "CATEGORY_FORUMS" in _labels:
-                        _email_entry["category"] = "forums"
-                    else:
-                        _email_entry["category"] = "primary"
-                    _cat = _email_entry["category"]
+                    # Mailbox category from Gmail label_ids (shared logic)
+                    _cat, _cat_ambiguous = self._classify_mailbox_tab(em)
+                    _email_entry["category"] = _cat
+                    if _cat_ambiguous:
+                        _email_entry["category_ambiguous"] = True
                     _category_counts[_cat] = _category_counts.get(_cat, 0) + 1
 
                     # Triage intelligence when available
@@ -4331,6 +4383,7 @@ class UnifiedCommandProcessor:
                             result_dict["emails"] = _enriched
                             result_dict["triage_available"] = True
                             result_dict["triage_age_s"] = round(_age, 1) if _age else None
+                            self._v242_metrics["email_triage_enrichments"] += 1
                     except Exception as _te:
                         logger.debug("[v281.1] Early triage enrichment skipped: %s", _te)
 
@@ -4446,17 +4499,20 @@ class UnifiedCommandProcessor:
                     _all_emails.extend((_o.get("result", {}) or {}).get("emails", []))
                 if _all_emails:
                     _fp = self._email_announce_fingerprint(_all_emails)
-                    if self._email_announce_is_duplicate(_fp):
+                    _is_dup = await self._email_announce_check_and_record(_fp)
+                    if _is_dup:
                         _email_dedup_hit = True
+                        self._v242_metrics["email_announce_dedup_hits"] = (
+                            self._v242_metrics.get("email_announce_dedup_hits", 0) + 1
+                        )
                         final_response = (
                             "No new emails since I last checked."
                             if not composed_response
                             else final_response
                         )
-                    else:
-                        self._email_announce_record(_fp)
 
             # Surface confirmation needs for ambiguous classifications
+            # + track observability metrics for categories and confidence
             _needs_confirmation = []
             for _o in ordered_outcomes:
                 for _em in (_o.get("result", {}) or {}).get("emails", []):
@@ -4466,6 +4522,10 @@ class UnifiedCommandProcessor:
                             "confidence": _em.get("triage_confidence", 0.0),
                             "tier": _em.get("triage_tier", 0),
                         })
+                        self._v242_metrics["email_needs_confirmation_count"] += 1
+                    _conf = _em.get("triage_confidence")
+                    if _conf is not None and _conf < 0.5 and _em.get("triage_tier", 0) not in (1, 2):
+                        self._v242_metrics["email_low_confidence_skips"] += 1
 
             return {
                 "success": True,

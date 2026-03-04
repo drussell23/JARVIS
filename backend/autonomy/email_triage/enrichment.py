@@ -10,6 +10,9 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 
 _COMPATIBLE_SCHEMA_VERSIONS = {"1.0"}
+# Extraction contract versions whose confidence values we trust.
+# Unknown/missing contract versions default to heuristic confidence only.
+_TRUSTED_EXTRACTION_CONTRACTS = {"1.0", ""}
 
 
 def enrich_with_triage(
@@ -89,11 +92,25 @@ def enrich_with_triage(
             enriched_email["triage_action"] = triaged.notification_action
 
             # Extraction confidence + confirmation flag
-            confidence = getattr(triaged.features, "extraction_confidence", 0.0)
-            enriched_email["triage_confidence"] = confidence
-            enriched_email["triage_extraction_source"] = getattr(
-                triaged.features, "extraction_source", "heuristic"
+            # Only trust confidence from known extraction contract versions.
+            # Unknown contracts get demoted to heuristic-level confidence.
+            _extraction_contract = getattr(
+                triaged.features, "extraction_contract_version", ""
             )
+            _source = getattr(triaged.features, "extraction_source", "heuristic")
+            _raw_confidence = getattr(triaged.features, "extraction_confidence", 0.0)
+
+            if _extraction_contract in _TRUSTED_EXTRACTION_CONTRACTS:
+                confidence = _raw_confidence
+            else:
+                # Untrusted contract — demote confidence to prevent drift
+                confidence = min(_raw_confidence, 0.5)
+                _source = f"{_source}:untrusted_contract"
+
+            enriched_email["triage_confidence"] = confidence
+            enriched_email["triage_extraction_source"] = _source
+            enriched_email["triage_extraction_contract"] = _extraction_contract
+
             # Ambiguous classification: low confidence + not extreme tier
             _CONFIDENCE_THRESHOLD = 0.6
             enriched_email["triage_needs_confirmation"] = (
