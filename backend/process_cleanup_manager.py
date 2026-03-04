@@ -34,6 +34,7 @@ v4.0.0 NEW - Zero-Touch & Supervisor Integration:
 - Pre-update resource validation
 - Post-rollback cleanup coordination
 """
+from __future__ import annotations
 
 import asyncio
 import fcntl
@@ -55,11 +56,22 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import psutil
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from backend.core.memory_types import (
+    ActuatorAction,
+    DecisionEnvelope,
+    MemorySnapshot as BrokerMemorySnapshot,
+    PressurePolicy,
+    PressureTier,
+)
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 # Check for Swift availability
 try:
@@ -156,7 +168,12 @@ class IntelligentMemoryController:
         self._baseline_samples: deque = deque(maxlen=60)  # 5 minutes of samples
         self._baseline_established = False
         self._fast_baseline_threshold = 10  # v210.0: Establish baseline after 10 samples (vs 30)
-        
+
+        # MCP broker integration (Task 5) -- must be set BEFORE _detect_total_ram
+        # so that _detect_total_ram can check self._mcp_active safely.
+        self._mcp_active: bool = False
+        self._broker: Optional[MemoryBudgetBroker] = None
+
         # v210.0: Hardware-aware initial thresholds
         # Detect total system RAM and set appropriate thresholds
         self._total_ram_gb = self._detect_total_ram()
@@ -188,15 +205,59 @@ class IntelligentMemoryController:
         self._total_events_emitted = 0
         self._total_events_suppressed = 0
         self._total_relief_attempts = 0
-        
+
         logger.info(
             f"🧠 Intelligent Memory Controller initialized "
             f"(RAM: {self._total_ram_gb:.0f}GB, profile: {self._hardware_profile}, "
             f"thresholds: {self._moderate_threshold:.0f}/{self._high_threshold:.0f}/{self._critical_threshold:.0f}%)"
         )
-    
+
+    # -----------------------------------------------------------------
+    # MCP broker integration
+    # -----------------------------------------------------------------
+
+    def register_with_broker(self, broker: MemoryBudgetBroker) -> None:
+        """Register this controller with the MCP broker.
+
+        When registered, ``_detect_total_ram`` and ``_get_hardware_aware_thresholds``
+        use the broker's static RAM detection and ``PressurePolicy`` instead
+        of raw psutil calls.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+
+        # Re-derive RAM and thresholds from broker data
+        from backend.core.memory_budget_broker import MemoryBudgetBroker as _Broker
+        self._total_ram_gb = _Broker._detect_total_ram_gb()
+        self._hardware_profile = self._detect_hardware_profile()
+
+        thresholds = self._get_hardware_aware_thresholds()
+        self._base_moderate_threshold = thresholds["moderate"]
+        self._base_high_threshold = thresholds["high"]
+        self._base_critical_threshold = thresholds["critical"]
+        self._moderate_threshold = self._base_moderate_threshold
+        self._high_threshold = self._base_high_threshold
+        self._critical_threshold = self._base_critical_threshold
+
+        logger.info(
+            "[IntelligentMemoryController] Registered with broker "
+            "(mcp_active=True, thresholds=%.0f/%.0f/%.0f%%)",
+            self._moderate_threshold, self._high_threshold, self._critical_threshold,
+        )
+
     def _detect_total_ram(self) -> float:
-        """Detect total system RAM in GB."""
+        """Detect total system RAM in GB.
+
+        When the broker is active, delegates to
+        ``MemoryBudgetBroker._detect_total_ram_gb()`` to avoid a
+        redundant raw psutil call.
+        """
+        if self._mcp_active:
+            from backend.core.memory_budget_broker import MemoryBudgetBroker as _Broker
+            return _Broker._detect_total_ram_gb()
         try:
             import psutil
             mem = psutil.virtual_memory()
@@ -224,25 +285,39 @@ class IntelligentMemoryController:
     def _get_hardware_aware_thresholds(self) -> Dict[str, float]:
         """
         Get memory thresholds appropriate for the hardware profile.
-        
+
         v210.0 ROOT CAUSE FIX:
         The disease was using the same thresholds for all hardware.
         80% on 16GB (13GB used, 3GB free) is very different from
         80% on 64GB (51GB used, 13GB free).
-        
+
         The cure: hardware-aware thresholds that expect higher baseline
         usage on constrained systems.
+
+        When the MCP broker is active, thresholds are derived from the
+        broker's ``PressurePolicy`` instead of hardcoded per-profile
+        values.  The policy's CONSTRAINED enter threshold maps to
+        "moderate", CRITICAL to "high", and EMERGENCY to "critical".
         """
-        # Allow environment variable overrides
+        # Allow environment variable overrides (always honoured, even with broker)
         env_moderate = os.getenv("JARVIS_MEMORY_MODERATE_THRESHOLD")
         env_high = os.getenv("JARVIS_MEMORY_HIGH_THRESHOLD")
         env_critical = os.getenv("JARVIS_MEMORY_CRITICAL_THRESHOLD")
-        
+
         if env_moderate and env_high and env_critical:
             return {
                 "moderate": float(env_moderate),
                 "high": float(env_high),
                 "critical": float(env_critical),
+            }
+
+        # MCP broker path: derive from PressurePolicy
+        if self._mcp_active and self._broker is not None:
+            policy = self._broker.policy
+            return {
+                "moderate": policy.enter_thresholds[PressureTier.CONSTRAINED],
+                "high": policy.enter_thresholds[PressureTier.CRITICAL],
+                "critical": policy.enter_thresholds[PressureTier.EMERGENCY],
             }
         
         # Hardware-aware defaults
@@ -1242,6 +1317,10 @@ class EventDrivenCleanupTrigger:
         )
         self.check_interval = 5.0  # seconds
 
+        # MCP broker integration (Task 5)
+        self._mcp_active: bool = False
+        self._broker: Optional[MemoryBudgetBroker] = None
+
         # v259.0: CPU pressure hysteresis/state (prevents spike-driven thrash).
         self._cpu_pressure_min_samples = max(
             1, int(os.getenv("JARVIS_CPU_PRESSURE_MIN_SAMPLES", "2"))
@@ -1259,6 +1338,21 @@ class EventDrivenCleanupTrigger:
         self._cpu_recovery_consecutive = 0
         self._cpu_pressure_active = False
         self._last_cpu_pressure_emit_ts = 0.0
+
+    def register_with_broker(self, broker: MemoryBudgetBroker) -> None:
+        """Register this trigger with the MCP broker.
+
+        When active, ``_check_memory_pressure`` reads memory percent
+        from the broker's cached snapshot instead of raw psutil.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "[EventDrivenCleanupTrigger] Registered with broker (mcp_active=True)"
+        )
 
     def register_handler(
         self,
@@ -1375,17 +1469,32 @@ class EventDrivenCleanupTrigger:
     def _check_memory_pressure(self) -> None:
         """
         Check for memory pressure using intelligent controller.
-        
+
         The IntelligentMemoryController decides whether to emit an event
         based on:
         - Cooldown periods (don't spam cleanup)
         - Effectiveness tracking (backoff if cleanup isn't working)
         - Adaptive thresholds (based on system baseline)
         - State machine (prevent overlapping cleanups)
+
+        When the MCP broker is active and has a cached snapshot, the
+        memory percent is read from the broker instead of raw psutil.
         """
         try:
-            mem = psutil.virtual_memory()
-            memory_percent = mem.percent
+            # MCP broker path: read from cached snapshot
+            if self._mcp_active and self._broker is not None:
+                snap = self._broker.latest_snapshot
+                if snap is not None:
+                    # Derive percent from broker snapshot
+                    used = snap.physical_total - snap.physical_free
+                    memory_percent = (used / snap.physical_total * 100.0) if snap.physical_total > 0 else 0.0
+                else:
+                    # Broker hasn't captured first snapshot yet -- fall back
+                    mem = psutil.virtual_memory()
+                    memory_percent = mem.percent
+            else:
+                mem = psutil.virtual_memory()
+                memory_percent = mem.percent
             
             # Use intelligent controller to decide
             controller = get_memory_controller()
@@ -2741,6 +2850,10 @@ class ProcessCleanupManager:
         self._cpu_offload_thread: Optional[threading.Thread] = None
         self._last_cpu_offload_ts = 0.0
 
+        # MCP broker integration (Task 5)
+        self._mcp_active: bool = False
+        self._broker: Optional[MemoryBudgetBroker] = None
+
         # Register event handlers
         self._register_event_handlers()
 
@@ -2934,6 +3047,66 @@ class ProcessCleanupManager:
 
         logger.info("✅ ProcessCleanupManager v2.0.0 initialized with robust infrastructure")
 
+    # -----------------------------------------------------------------
+    # MCP broker integration
+    # -----------------------------------------------------------------
+
+    def register_with_broker(self, broker: MemoryBudgetBroker) -> None:
+        """Register this cleanup manager with the MCP broker.
+
+        Propagates broker registration to the owned
+        ``IntelligentMemoryController`` and ``EventDrivenCleanupTrigger``
+        so that decision-making memory reads come from the broker's
+        cached snapshot instead of raw psutil.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+
+        # Propagate to sub-components
+        controller = get_memory_controller()
+        controller.register_with_broker(broker)
+
+        if hasattr(self.event_trigger, "register_with_broker"):
+            self.event_trigger.register_with_broker(broker)
+
+        logger.info(
+            "[ProcessCleanupManager] Registered with broker (mcp_active=True)"
+        )
+
+    def _get_memory_percent_from_broker(self) -> Optional[float]:
+        """Read memory percent from broker snapshot, or None if unavailable.
+
+        Returns None when the broker hasn't captured its first snapshot
+        yet, signalling the caller to fall back to raw psutil.
+        """
+        if not self._mcp_active or self._broker is None:
+            return None
+        snap = self._broker.latest_snapshot
+        if snap is None:
+            return None
+        used = snap.physical_total - snap.physical_free
+        return (used / snap.physical_total * 100.0) if snap.physical_total > 0 else 0.0
+
+    def _build_decision_envelope(self, tier: PressureTier) -> Optional[DecisionEnvelope]:
+        """Build a DecisionEnvelope from current broker state.
+
+        Returns None if the broker is not active.
+        """
+        if not self._mcp_active or self._broker is None:
+            return None
+        snap = self._broker.latest_snapshot
+        return DecisionEnvelope(
+            snapshot_id=snap.snapshot_id if snap is not None else "unknown",
+            epoch=self._broker.current_epoch,
+            sequence=self._broker.current_sequence,
+            policy_version=self._broker.policy.version,
+            pressure_tier=tier,
+            timestamp=time.time(),
+        )
+
     def _register_event_handlers(self) -> None:
         """Register handlers for cleanup events."""
         # Memory pressure handler
@@ -2988,13 +3161,35 @@ class ProcessCleanupManager:
         
         logger.warning(f"🔥 Memory pressure: {memory_percent:.1f}% - {relief_level} relief ({reason})")
 
+        # Route through coordinator if broker is active
+        if self._mcp_active and self._broker is not None:
+            tier_map = {
+                "MODERATE": PressureTier.CONSTRAINED,
+                "HIGH": PressureTier.CRITICAL,
+                "CRITICAL": PressureTier.EMERGENCY,
+            }
+            tier = tier_map.get(relief_level, PressureTier.CONSTRAINED)
+            envelope = self._build_decision_envelope(tier)
+            if envelope is not None:
+                decision_id = self._broker.coordinator.submit(
+                    ActuatorAction.CLEANUP,
+                    envelope,
+                    source="process_cleanup_manager",
+                )
+                if decision_id is None:
+                    logger.debug(
+                        "[ProcessCleanupManager] CLEANUP action rejected "
+                        "(stale or quarantined) -- skipping relief"
+                    )
+                    return
+
         # Record metric
         self.health_monitor.metrics.current_memory_usage_percent = memory_percent / 100
 
         # Get memory controller for tracking
         controller = get_memory_controller()
         controller.relief_started(relief_level, memory_percent)
-        
+
         # Track actions taken for effectiveness reporting
         actions_taken = []
 
@@ -3044,11 +3239,15 @@ class ProcessCleanupManager:
 
         # Check for compound CPU+memory pressure
         _memory_percent = 0.0
-        try:
-            import psutil
-            _memory_percent = psutil.virtual_memory().percent
-        except Exception:
-            pass
+        _broker_pct = self._get_memory_percent_from_broker()
+        if _broker_pct is not None:
+            _memory_percent = _broker_pct
+        else:
+            try:
+                import psutil
+                _memory_percent = psutil.virtual_memory().percent
+            except Exception:
+                pass
 
         _compound = _memory_percent >= _compound_threshold
 
@@ -3646,7 +3845,8 @@ class ProcessCleanupManager:
 
             controller = get_supervisor_gcp_controller()
             if memory_percent is None:
-                memory_percent = psutil.virtual_memory().percent
+                _broker_pct = self._get_memory_percent_from_broker()
+                memory_percent = _broker_pct if _broker_pct is not None else psutil.virtual_memory().percent
             cpu_percent = 0.0 if cpu_percent is None else float(cpu_percent)
 
             if trigger_reason == "cpu_pressure":
@@ -4041,7 +4241,7 @@ class ProcessCleanupManager:
                 "JARVIS_CLOUD_ML_ENDPOINT",
                 ""
             ),
-            "memory_percent": psutil.virtual_memory().percent,
+            "memory_percent": self._get_memory_percent_from_broker() or psutil.virtual_memory().percent,
             "cloud_first_mode": os.getenv("JARVIS_CLOUD_FIRST_MODE", "false").lower() == "true",
             "ml_offload_recommended": False,
         }
@@ -5499,18 +5699,36 @@ class ProcessCleanupManager:
         """
 
     def get_system_snapshot(self) -> Dict[str, Any]:
-        """Get a snapshot of the system state using Swift if available"""
+        """Get a snapshot of the system state using Swift if available.
+
+        When the MCP broker is active and has a cached snapshot, memory
+        fields are read from it instead of raw psutil.
+        """
         monitor = self._get_swift_monitor()
         if monitor:
             return monitor.get_system_snapshot()
-        else:
-            # Fallback to psutil
-            return {
-                "cpu_percent": psutil.cpu_percent(interval=0.1),
-                "memory_percent": psutil.virtual_memory().percent,
-                "memory_available_mb": psutil.virtual_memory().available // (1024 * 1024),
-                "timestamp": datetime.now(),
-            }
+
+        # Try broker snapshot first
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                used = snap.physical_total - snap.physical_free
+                pct = (used / snap.physical_total * 100.0) if snap.physical_total > 0 else 0.0
+                avail_mb = snap.physical_free // (1024 * 1024) if snap.physical_free > 0 else 0
+                return {
+                    "cpu_percent": psutil.cpu_percent(interval=0.1),
+                    "memory_percent": pct,
+                    "memory_available_mb": avail_mb,
+                    "timestamp": datetime.now(),
+                }
+
+        # Legacy psutil fallback
+        return {
+            "cpu_percent": psutil.cpu_percent(interval=0.1),
+            "memory_percent": psutil.virtual_memory().percent,
+            "memory_available_mb": psutil.virtual_memory().available // (1024 * 1024),
+            "timestamp": datetime.now(),
+        }
 
     def analyze_system_state(self) -> Dict[str, Any]:
         """Analyze system state for cleanup"""

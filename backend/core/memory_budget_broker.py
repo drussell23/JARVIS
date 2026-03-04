@@ -404,6 +404,7 @@ class MemoryBudgetBroker:
         )
 
         self._pressure_observers: List[Any] = []  # async callables (tier, snapshot)
+        self._latest_snapshot: Optional[MemorySnapshot] = None
 
         self._coordinator = MemoryActuatorCoordinator()
         self._sequence: int = 0
@@ -458,6 +459,11 @@ class MemoryBudgetBroker:
     def policy(self) -> PressurePolicy:
         """The active pressure policy."""
         return self._policy
+
+    @property
+    def latest_snapshot(self) -> Optional[MemorySnapshot]:
+        """The most recent snapshot passed to pressure observers, or None."""
+        return self._latest_snapshot
 
     def _advance_sequence(self) -> int:
         """Advance the sequence counter and sync with coordinator."""
@@ -908,6 +914,7 @@ class MemoryBudgetBroker:
         must never block others.
         """
         self._advance_sequence()
+        self._latest_snapshot = snapshot
         for obs in self._pressure_observers:
             try:
                 await obs(tier, snapshot)
