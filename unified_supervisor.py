@@ -2985,11 +2985,15 @@ def _safe_read_json(path: Path, default: dict = None) -> dict:
         return default
 
 def _calculate_memory_budget() -> float:
-    """Calculate memory budget based on system RAM."""
-    if not PSUTIL_AVAILABLE:
-        return DEFAULT_MAX_MEMORY_GB
+    """Calculate memory budget based on system RAM.
 
-    total_gb = psutil.virtual_memory().total / (1024 ** 3)
+    v260.1: Prefers MCP broker snapshot for total RAM when available.
+    """
+    total_gb = _mcp_total_gb()
+    if total_gb <= 0.0:
+        if not PSUTIL_AVAILABLE:
+            return DEFAULT_MAX_MEMORY_GB
+        total_gb = psutil.virtual_memory().total / (1024 ** 3)
     target_percent = float(os.environ.get("JARVIS_MEMORY_TARGET", DEFAULT_MEMORY_TARGET_PERCENT))
 
     return round(total_gb * (target_percent / 100), 1)
@@ -3268,6 +3272,95 @@ def _read_startup_memory_snapshot_sync(
         )
 
     return _psutil_memory_snapshot()
+
+
+# ---------------------------------------------------------------------------
+# v260.1: MCP-aware memory accessors (broker-first, psutil-fallback)
+# ---------------------------------------------------------------------------
+# These thin helpers provide the same data as raw psutil.virtual_memory()
+# but prefer the MCP broker's latest snapshot when available.  All callers
+# that gate decisions on memory pressure should migrate to these.
+
+def _mcp_memory_percent() -> float:
+    """Return current memory usage percent (0-100), broker-first.
+
+    Falls back to psutil.virtual_memory().percent if broker is unavailable.
+    Safe to call from any thread or early bootstrap.
+    """
+    try:
+        from backend.core.memory_budget_broker import get_memory_budget_broker
+        _b = get_memory_budget_broker()
+        if _b is not None:
+            _snap = _b.latest_snapshot
+            if _snap is not None:
+                # Derive percent from snapshot physical fields
+                _total = _snap.physical_total
+                if _total > 0:
+                    _used = _total - _snap.physical_free - _snap.physical_inactive
+                    return round(max(0.0, min(100.0, (_used / _total) * 100)), 1)
+    except Exception:
+        pass
+    if PSUTIL_AVAILABLE:
+        try:
+            return psutil.virtual_memory().percent
+        except Exception:
+            pass
+    return 0.0
+
+
+def _mcp_available_gb() -> float:
+    """Return available memory in GB, broker-first.
+
+    Falls back to psutil.virtual_memory().available if broker is unavailable.
+    """
+    try:
+        from backend.core.memory_budget_broker import get_memory_budget_broker
+        _b = get_memory_budget_broker()
+        if _b is not None:
+            _snap = _b.latest_snapshot
+            if _snap is not None:
+                return round(_snap.usable_bytes / (1024 ** 3), 2)
+    except Exception:
+        pass
+    if PSUTIL_AVAILABLE:
+        try:
+            return round(psutil.virtual_memory().available / (1024 ** 3), 2)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _mcp_total_gb() -> float:
+    """Return total physical memory in GB, broker-first."""
+    try:
+        from backend.core.memory_budget_broker import get_memory_budget_broker
+        _b = get_memory_budget_broker()
+        if _b is not None:
+            _snap = _b.latest_snapshot
+            if _snap is not None:
+                return round(_snap.physical_total / (1024 ** 3), 2)
+    except Exception:
+        pass
+    if PSUTIL_AVAILABLE:
+        try:
+            return round(psutil.virtual_memory().total / (1024 ** 3), 2)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _mcp_pressure_tier() -> Optional[int]:
+    """Return current PressureTier ordinal (0-5), or None if unavailable."""
+    try:
+        from backend.core.memory_budget_broker import get_memory_budget_broker
+        _b = get_memory_budget_broker()
+        if _b is not None:
+            _snap = _b.latest_snapshot
+            if _snap is not None:
+                return int(_snap.pressure_tier)
+    except Exception:
+        pass
+    return None
 
 
 async def _read_startup_memory_snapshot_async(
@@ -8367,18 +8460,32 @@ def update_dashboard_component_status(
         _live_dashboard.update_component(component, status, detail)
 
 def update_dashboard_memory() -> None:
-    """Helper to refresh memory stats on the dashboard (if available)."""
+    """Helper to refresh memory stats on the dashboard (if available).
+
+    v260.1: Uses MCP broker snapshot when available for consistent pressure data.
+    """
     if _live_dashboard:
         try:
-            import psutil
-            mem = psutil.virtual_memory()
-            _live_dashboard.update_memory(
-                percent=mem.percent,
-                used_gb=mem.used / (1024**3),
-                total_gb=mem.total / (1024**3)
-            )
+            _pct = _mcp_memory_percent()
+            _total = _mcp_total_gb()
+            _tier = _mcp_pressure_tier()
+            if _pct > 0.0 and _total > 0.0:
+                _used = _total * (_pct / 100)
+                _live_dashboard.update_memory(
+                    percent=_pct,
+                    used_gb=_used,
+                    total_gb=_total,
+                )
+            else:
+                import psutil
+                mem = psutil.virtual_memory()
+                _live_dashboard.update_memory(
+                    percent=mem.percent,
+                    used_gb=mem.used / (1024**3),
+                    total_gb=mem.total / (1024**3),
+                )
         except Exception:
-            pass  # psutil may not be available
+            pass
 
 # =============================================================================
 # v249.0: SUPERVISOR EVENT BUS & CLI PRESENTATION LAYER
@@ -18855,11 +18962,11 @@ class IntelligentChromeIncognitoManager:
         """
         try:
             import psutil
-            
-            # Check memory pressure
-            mem = psutil.virtual_memory()
-            if mem.percent > 90:
-                return (False, f"Critical memory pressure: {mem.percent}% used")
+
+            # v260.1: Check memory pressure via MCP broker first
+            _mem_pct = _mcp_memory_percent()
+            if _mem_pct > 90:
+                return (False, f"Critical memory pressure: {_mem_pct}% used")
             
             # Check if Chrome is already consuming excessive resources
             chrome_memory_mb = 0
@@ -19537,12 +19644,12 @@ class BrowserCrashMonitor:
         return success
     
     async def _get_memory_pressure(self) -> Optional[float]:
-        """Get current memory pressure as percentage."""
-        try:
-            mem = psutil.virtual_memory()
-            return mem.percent
-        except Exception:
-            return None
+        """Get current memory pressure as percentage.
+
+        v260.1: Prefers MCP broker snapshot.
+        """
+        pct = _mcp_memory_percent()
+        return pct if pct > 0.0 else None
     
     def _calculate_crash_rate(self) -> int:
         """Calculate crash rate in the recent window."""
@@ -22113,14 +22220,17 @@ class IntelligentModelManager:
         )
 
     def get_available_memory_gb(self) -> float:
-        """Get available system memory in GB."""
+        """Get available system memory in GB.
+
+        v260.1: Prefers MCP broker snapshot.
+        """
+        avail = _mcp_available_gb()
+        if avail > 0.0:
+            return avail
         try:
             import psutil
-
-            mem = psutil.virtual_memory()
-            return mem.available / (1024**3)
+            return psutil.virtual_memory().available / (1024**3)
         except ImportError:
-            # Fallback: assume 8GB available
             return 8.0
 
     def select_optimal_model(self) -> Optional[str]:
@@ -24065,13 +24175,18 @@ class HybridIntelligenceCoordinator(IntelligenceManagerBase):
             await asyncio.sleep(self._monitoring_interval)
 
     async def _get_current_ram_usage(self) -> float:
-        """Get current RAM usage percentage."""
+        """Get current RAM usage percentage (0.0-1.0).
+
+        v260.1: Prefers MCP broker snapshot.
+        """
+        pct = _mcp_memory_percent()
+        if pct > 0.0:
+            return pct / 100.0
         try:
             import psutil
-            mem = psutil.virtual_memory()
-            return mem.percent / 100.0
+            return psutil.virtual_memory().percent / 100.0
         except Exception:
-            return 0.5  # Default if psutil unavailable
+            return 0.5
 
     async def _handle_emergency(self, ram_usage: float) -> None:
         """Handle emergency RAM situation."""
@@ -26908,21 +27023,24 @@ class GracefulDegradationManager(SystemService):
                 await asyncio.sleep(self._check_interval)
 
     async def _check_resources(self) -> None:
-        """Check system resources and adjust degradation level."""
+        """Check system resources and adjust degradation level.
+
+        v260.1: Prefers MCP broker for memory pressure.
+        """
         try:
             import psutil
 
-            memory = psutil.virtual_memory()
+            _mem_pct = _mcp_memory_percent()
             cpu = await asyncio.to_thread(psutil.cpu_percent, 0.1)
 
             # Determine degradation level
             new_level = 0
 
-            if memory.percent >= self._memory_threshold_extreme or cpu >= self._cpu_threshold_extreme:
+            if _mem_pct >= self._memory_threshold_extreme or cpu >= self._cpu_threshold_extreme:
                 new_level = 3  # Extreme
-            elif memory.percent >= self._memory_threshold_high or cpu >= self._cpu_threshold_high:
+            elif _mem_pct >= self._memory_threshold_high or cpu >= self._cpu_threshold_high:
                 new_level = 2  # High
-            elif memory.percent >= self._memory_threshold_high * 0.9 or cpu >= self._cpu_threshold_high * 0.9:
+            elif _mem_pct >= self._memory_threshold_high * 0.9 or cpu >= self._cpu_threshold_high * 0.9:
                 new_level = 1  # Moderate
 
             if new_level != self._degradation_level:
@@ -28417,9 +28535,8 @@ class ResourceQuotaManager:
             self._usage["rss_memory"] = memory_info.rss
             self._usage["vms_memory"] = memory_info.vms
 
-            # Check against system memory
-            system_memory = psutil.virtual_memory()
-            memory_ratio = system_memory.percent / 100
+            # v260.1: Check against system memory via MCP broker
+            memory_ratio = _mcp_memory_percent() / 100
 
             if memory_ratio >= self._critical_threshold:
                 self._stats["critical_alerts"] += 1
@@ -58167,17 +58284,17 @@ class StartupWatchdog:
             os.environ.get("USE_GCP_INFERENCE", "").lower() in ("true", "1", "yes"),
         ]
 
-        # Check for limited RAM (hollow client mode auto-activates below 32GB)
-        try:
-            import psutil
-            total_ram_gb = psutil.virtual_memory().total / (1024**3)
-            if total_ram_gb < 32.0:
-                hollow_indicators.append(True)
-                self._logger.debug(f"[DMS] Detected limited RAM: {total_ram_gb:.1f}GB (hollow client likely)")
-        except ImportError:
-            pass
-        except Exception as e:
-            self._logger.debug(f"[DMS] Could not detect RAM: {e}")
+        # v260.1: Check for limited RAM via MCP helper (hollow client auto-activates below 32GB)
+        total_ram_gb = _mcp_total_gb()
+        if total_ram_gb <= 0.0:
+            try:
+                import psutil
+                total_ram_gb = psutil.virtual_memory().total / (1024**3)
+            except Exception as e:
+                self._logger.debug(f"[DMS] Could not detect RAM: {e}")
+        if total_ram_gb > 0.0 and total_ram_gb < 32.0:
+            hollow_indicators.append(True)
+            self._logger.debug(f"[DMS] Detected limited RAM: {total_ram_gb:.1f}GB (hollow client likely)")
 
         return any(hollow_indicators)
 
@@ -59615,14 +59732,16 @@ class TrinityIntegrator:
         return timeout
 
     def _detect_limited_ram(self) -> bool:
-        """Detect if machine has limited RAM (hollow client mode auto-activates below 32GB)."""
+        """Detect if machine has limited RAM (hollow client mode auto-activates below 32GB).
+
+        v260.1: Prefers MCP broker for total RAM.
+        """
+        total_gb = _mcp_total_gb()
+        if total_gb > 0.0:
+            return total_gb < 32.0
         try:
             import psutil
-            total_ram_gb = psutil.virtual_memory().total / (1024**3)
-            return total_ram_gb < 32.0
-        except ImportError:
-            # If psutil not available, assume normal mode
-            return False
+            return psutil.virtual_memory().total / (1024**3) < 32.0
         except Exception:
             return False
 
@@ -63275,6 +63394,7 @@ class JarvisSystemKernel:
             "system_services": {"status": "pending", "message": "Waiting for flag"},  # v239.0: SSR
             "voice_sidecar": {"status": "pending", "message": "Waiting for flag"},
             "frontend": {"status": "pending", "message": "Waiting to start"},
+            "autonomy_contracts": {"status": "pending", "message": "Waiting for Trinity"},  # v300.0: Phase 2
         }
 
         # v182.0: Trinity readiness flags - ALL must be true before redirect
@@ -63283,6 +63403,11 @@ class JarvisSystemKernel:
             "jarvis_prime": False,     # Local LLM or Hollow Client
             "reactor_core": False,     # Training pipeline
         }
+
+        # v300.0: Phase 2 — Autonomy mode flag.
+        # "disabled" until contracts checked, "active" on pass, "read_only" on mismatch.
+        self._autonomy_mode: str = "disabled"
+        self._autonomy_checks: Dict[str, Any] = {}
 
         # Background tasks
         self._shutdown_event = asyncio.Event()
@@ -64979,6 +65104,33 @@ class JarvisSystemKernel:
                 await asyncio.to_thread(_write_crash_marker)
             except Exception:
                 pass
+
+        # v260.1: Shutdown DisplayPressureController + release display lease
+        # Must happen BEFORE Trinity/broker teardown (controller depends on broker)
+        if self._display_pressure_controller is not None:
+            try:
+                await asyncio.wait_for(
+                    self._display_pressure_controller.shutdown(),
+                    timeout=5.0,
+                )
+                self.logger.info("[Kernel] DisplayPressureController shutdown complete (lease released)")
+            except asyncio.TimeoutError:
+                self.logger.warning("[Kernel] DisplayPressureController shutdown timed out (5s)")
+            except Exception as _dpc_err:
+                self.logger.debug(f"[Kernel] DisplayPressureController shutdown error: {_dpc_err}")
+            finally:
+                self._display_pressure_controller = None
+
+        # v260.1: Cancel ghost display background tasks
+        for _gd_attr in ("_ghost_display_init_task", "_ghost_display_recovery_task", "_ghost_display_health_task"):
+            _gd_task = getattr(self, _gd_attr, None)
+            if _gd_task is not None and not _gd_task.done():
+                _gd_task.cancel()
+                try:
+                    await asyncio.wait_for(_gd_task, timeout=2.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+                setattr(self, _gd_attr, None)
 
         # v181.0/v206.0: Stop Trinity components FIRST (prevents orphaned processes)
         # v206.0: PILLAR 5 - Use tiered_stop() for idempotent, bounded, never-raises cleanup
@@ -76056,34 +76208,72 @@ class JarvisSystemKernel:
                     )
 
                     if consecutive_failures >= max_failures:
-                        self.logger.warning("[GhostDisplay] Attempting auto-recovery...")
-                        self._update_component_status(
-                            "ghost_display", "running", "Recovering ghost display..."
-                        )
+                        # v260.1: Consult MCP pressure tier before recovery
+                        _skip_recovery = False
+                        _current_tier = None
                         try:
-                            recovery_timeout = _get_env_float(
-                                "JARVIS_GHOST_DISPLAY_TIMEOUT", 30.0
-                            )
-                            success, error = await asyncio.wait_for(
-                                phantom_mgr.ensure_ghost_display_exists_async(),
-                                timeout=recovery_timeout,
-                            )
-                            if success:
-                                consecutive_failures = 0
-                                self._update_component_status(
-                                    "ghost_display", "complete", "Ghost Display recovered"
-                                )
-                                self.logger.info("[GhostDisplay] Recovery successful")
-                                await self._publish_ghost_display_state(phantom_mgr)
-                            else:
-                                self._update_component_status(
-                                    "ghost_display", "error",
-                                    f"Recovery failed: {error}",
-                                )
-                        except asyncio.TimeoutError:
+                            from backend.core.memory_budget_broker import get_memory_budget_broker
+                            from backend.core.memory_types import PressureTier
+                            _hb = get_memory_budget_broker()
+                            if _hb is not None:
+                                _snap = _hb.latest_snapshot
+                                if _snap is not None:
+                                    _current_tier = _snap.pressure_tier
+                                    if _current_tier >= PressureTier.EMERGENCY:
+                                        _skip_recovery = True
+                                        self.logger.info(
+                                            "[GhostDisplay] Skipping recovery — pressure tier is %s",
+                                            _current_tier.name,
+                                        )
+                        except Exception:
+                            pass  # Broker unavailable — proceed with recovery
+
+                        if _skip_recovery:
                             self._update_component_status(
-                                "ghost_display", "error", "Recovery timed out"
+                                "ghost_display", "error",
+                                f"Recovery deferred (pressure={_current_tier.name})",
                             )
+                        else:
+                            self.logger.warning("[GhostDisplay] Attempting auto-recovery...")
+                            self._update_component_status(
+                                "ghost_display", "running", "Recovering ghost display..."
+                            )
+                            try:
+                                recovery_timeout = _get_env_float(
+                                    "JARVIS_GHOST_DISPLAY_TIMEOUT", 30.0
+                                )
+                                success, error = await asyncio.wait_for(
+                                    phantom_mgr.ensure_ghost_display_exists_async(),
+                                    timeout=recovery_timeout,
+                                )
+                                if success:
+                                    consecutive_failures = 0
+                                    self._update_component_status(
+                                        "ghost_display", "complete", "Ghost Display recovered"
+                                    )
+                                    self.logger.info("[GhostDisplay] Recovery successful")
+                                    await self._publish_ghost_display_state(phantom_mgr)
+                                    # v260.1: Re-activate pressure controller after recovery
+                                    if self._display_pressure_controller is not None:
+                                        try:
+                                            _ctrl = self._display_pressure_controller
+                                            _res = getattr(phantom_mgr, "preferred_resolution", "1920x1080")
+                                            if hasattr(_ctrl, '_lease_id') and _ctrl._lease_id:
+                                                await _ctrl.activate(_ctrl._lease_id, _res)
+                                        except Exception as _reactivate_err:
+                                            self.logger.debug(
+                                                "[GhostDisplay] Controller re-activation: %s",
+                                                _reactivate_err,
+                                            )
+                                else:
+                                    self._update_component_status(
+                                        "ghost_display", "error",
+                                        f"Recovery failed: {error}",
+                                    )
+                            except asyncio.TimeoutError:
+                                self._update_component_status(
+                                    "ghost_display", "error", "Recovery timed out"
+                                )
 
             except asyncio.CancelledError:
                 break
@@ -81209,6 +81399,51 @@ class JarvisSystemKernel:
                     if _get_env_bool("JARVIS_CONTRACT_FAIL_CLOSED", True):
                         raise
 
+                # v300.0: Phase 2 — Autonomy contract gate (boot-time)
+                # Checks schema version compatibility across Body, Prime, and
+                # Reactor.  Mismatch degrades to read-only autonomy mode rather
+                # than fail-closed (autonomy is non-critical at boot).
+                try:
+                    self._update_component_status(
+                        "autonomy_contracts", "running",
+                        "Checking autonomy schema compatibility...",
+                    )
+                    from backend.supervisor.cross_repo_startup_orchestrator import (
+                        check_autonomy_contracts,
+                    )
+                    _auto_pass, _auto_status, _auto_checks = await check_autonomy_contracts()
+                    self._autonomy_checks = _auto_checks
+
+                    if _auto_pass:
+                        self._autonomy_mode = "active"
+                        self._update_component_status(
+                            "autonomy_contracts", "complete",
+                            "All autonomy contracts compatible — full autonomy mode",
+                        )
+                        self.logger.info(
+                            "[Kernel] Phase 2 autonomy contracts validated — mode=active"
+                        )
+                    else:
+                        self._autonomy_mode = "read_only"
+                        self._update_component_status(
+                            "autonomy_contracts", "degraded",
+                            f"Contract mismatch — read-only autonomy ({_auto_status})",
+                        )
+                        self.logger.warning(
+                            "[Kernel] Autonomy contract mismatch — degraded to read_only. "
+                            "Checks: %s", _auto_checks,
+                        )
+                except Exception as _auto_err:
+                    self._autonomy_mode = "disabled"
+                    self._update_component_status(
+                        "autonomy_contracts", "error",
+                        f"Contract check failed: {_auto_err}",
+                    )
+                    self.logger.warning(
+                        "[Kernel] Autonomy contract check error (non-fatal): %s",
+                        _auto_err,
+                    )
+
                 return True  # Trinity is optional
 
             except Exception as e:
@@ -86036,6 +86271,54 @@ class JarvisSystemKernel:
                         finally:
                             self._contract_runtime_last_check = _now
 
+                # v300.0: Phase 2 — Runtime autonomy contract monitor.
+                # Re-checks autonomy schema compatibility every 60s.  Detects
+                # when a component restarts with an incompatible schema version
+                # and transitions autonomy mode accordingly.
+                if _get_env_bool("JARVIS_AUTONOMY_MONITOR_ENABLED", True):
+                    _auto_interval = max(
+                        10.0,
+                        _get_env_float("JARVIS_AUTONOMY_MONITOR_INTERVAL_S", 60.0),
+                    )
+                    _auto_now = time.time()
+                    _auto_last = float(
+                        getattr(self, "_autonomy_runtime_last_check", 0.0) or 0.0
+                    )
+                    if (_auto_now - _auto_last) >= _auto_interval:
+                        try:
+                            from backend.supervisor.cross_repo_startup_orchestrator import (
+                                check_autonomy_contracts,
+                            )
+                            _a_pass, _a_status, _a_checks = await check_autonomy_contracts()
+                            _prev_mode = self._autonomy_mode
+                            self._autonomy_checks = _a_checks
+
+                            if _a_pass and _prev_mode != "active":
+                                self._autonomy_mode = "active"
+                                self._update_component_status(
+                                    "autonomy_contracts", "complete",
+                                    "Autonomy contracts recovered — full autonomy mode",
+                                )
+                                self.logger.info(
+                                    "[Autonomy] Contracts recovered: read_only → active"
+                                )
+                            elif not _a_pass and _prev_mode == "active":
+                                self._autonomy_mode = "read_only"
+                                self._update_component_status(
+                                    "autonomy_contracts", "degraded",
+                                    f"Contract drift detected — read-only ({_a_status})",
+                                )
+                                self.logger.warning(
+                                    "[Autonomy] Contract drift: active → read_only. "
+                                    "Checks: %s", _a_checks,
+                                )
+                        except Exception as _auto_err:
+                            self.logger.debug(
+                                "[Autonomy] Runtime monitor error: %s", _auto_err,
+                            )
+                        finally:
+                            self._autonomy_runtime_last_check = _auto_now
+
                 await asyncio.sleep(10.0)  # Check every 10 seconds
             except asyncio.CancelledError:
                 self.logger.debug("[Readiness] Monitoring loop cancelled")
@@ -87705,16 +87988,16 @@ class JarvisSystemKernel:
         try:
             import psutil
 
-            # Quick CPU and memory check (v259.0: moved to executor)
+            # v260.1: Quick CPU and memory check (MCP-aware)
             cpu_percent = await asyncio.to_thread(psutil.cpu_percent, 0.05)
-            memory = psutil.virtual_memory()
+            _mem_pct = _mcp_memory_percent()
 
             # Calculate load multiplier
-            if cpu_percent > 90 or memory.percent > 95:
+            if cpu_percent > 90 or _mem_pct > 95:
                 multiplier = 2.0  # Heavy load - double timeout
-            elif cpu_percent > 75 or memory.percent > 85:
+            elif cpu_percent > 75 or _mem_pct > 85:
                 multiplier = 1.5  # Moderate load - 50% more time
-            elif cpu_percent > 50 or memory.percent > 70:
+            elif cpu_percent > 50 or _mem_pct > 70:
                 multiplier = 1.25  # Light load - 25% more time
             else:
                 multiplier = 1.0  # Normal
@@ -87764,13 +88047,15 @@ class JarvisSystemKernel:
         try:
             import psutil
 
+            # v260.1: Use MCP helpers (single broker read) instead of 3 psutil calls
             diagnostics["system"] = {
                 "cpu_count": psutil.cpu_count(),
                 "cpu_percent": await asyncio.to_thread(psutil.cpu_percent, 0.1),
-                "memory_total_gb": round(psutil.virtual_memory().total / (1024**3), 2),
-                "memory_available_gb": round(psutil.virtual_memory().available / (1024**3), 2),
-                "memory_percent": psutil.virtual_memory().percent,
+                "memory_total_gb": _mcp_total_gb() or round(psutil.virtual_memory().total / (1024**3), 2),
+                "memory_available_gb": _mcp_available_gb() or round(psutil.virtual_memory().available / (1024**3), 2),
+                "memory_percent": _mcp_memory_percent() or psutil.virtual_memory().percent,
                 "disk_free_gb": round(psutil.disk_usage('/').free / (1024**3), 2),
+                "mcp_pressure_tier": _mcp_pressure_tier(),
             }
         except ImportError:
             diagnostics["system"]["note"] = "psutil not available"
@@ -87794,6 +88079,40 @@ class JarvisSystemKernel:
                 "reactor_enabled": self.config.reactor_enabled,
             },
         }
+
+        # v260.1: MCP + display state
+        try:
+            from backend.core.memory_budget_broker import get_memory_budget_broker
+            _b = get_memory_budget_broker()
+            if _b is not None:
+                _snap = _b.latest_snapshot
+                _mcp_info: Dict[str, Any] = {
+                    "broker_available": True,
+                    "active_leases": len(getattr(_b, '_leases', {})),
+                }
+                if _snap is not None:
+                    _mcp_info["pressure_tier"] = _snap.pressure_tier.name
+                    _mcp_info["pressure_tier_value"] = int(_snap.pressure_tier)
+                    _mcp_info["thrash_state"] = _snap.thrash_state.value
+                    _mcp_info["headroom_bytes"] = _snap.headroom_bytes
+                    _mcp_info["signal_quality"] = _snap.signal_quality.value
+                diagnostics["components"]["memory_control_plane"] = _mcp_info
+            else:
+                diagnostics["components"]["memory_control_plane"] = {"broker_available": False}
+        except Exception:
+            diagnostics["components"]["memory_control_plane"] = {"broker_available": False}
+
+        if self._display_pressure_controller is not None:
+            try:
+                _dpc = self._display_pressure_controller
+                diagnostics["components"]["ghost_display_mcp"] = {
+                    "state": _dpc._state.value if hasattr(_dpc._state, 'value') else str(_dpc._state),
+                    "lease_id": _dpc._lease_id,
+                    "resolution": _dpc._current_resolution,
+                    "failure_count": getattr(_dpc, '_failure_count', 0),
+                }
+            except Exception:
+                pass
 
         # Performance metrics
         if self._started_at:
@@ -87897,9 +88216,9 @@ class JarvisSystemKernel:
         try:
             import psutil
 
-            # Memory quota (default: 80% of available)
+            # v260.1: Memory quota (default: 80% of available) — MCP-aware
             mem_quota_percent = float(os.environ.get("JARVIS_MEM_QUOTA_PERCENT", "80"))
-            mem_current = psutil.virtual_memory().percent
+            mem_current = _mcp_memory_percent() or psutil.virtual_memory().percent
             result["quotas"]["memory"] = {
                 "current_percent": mem_current,
                 "quota_percent": mem_quota_percent,
@@ -88670,9 +88989,13 @@ class JarvisSystemKernel:
             }
             try:
                 import psutil
-                mem = psutil.virtual_memory()
-                total_gb = mem.total / (1024 ** 3)
-                available_gb = mem.available / (1024 ** 3)
+                # v260.1: Prefer MCP broker for readiness probe
+                total_gb = _mcp_total_gb()
+                available_gb = _mcp_available_gb()
+                if total_gb <= 0.0 or available_gb <= 0.0:
+                    mem = psutil.virtual_memory()
+                    total_gb = mem.total / (1024 ** 3)
+                    available_gb = mem.available / (1024 ** 3)
                 # Adaptive thresholds based on total RAM
                 if total_gb >= 32:
                     required_gb = 2.5
