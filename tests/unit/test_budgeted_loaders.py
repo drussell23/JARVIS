@@ -320,12 +320,12 @@ class TestEmbeddingLoader:
     def test_no_degradation(self) -> None:
         assert EmbeddingBudgetedLoader().degradation_options == []
 
-    def test_load_with_grant_raises(self) -> None:
+    def test_load_with_grant_implemented(self) -> None:
+        """load_with_grant is implemented (Task 9); no longer raises NotImplementedError."""
+        import inspect
+
         loader = EmbeddingBudgetedLoader()
-        with pytest.raises(NotImplementedError, match="Task 7"):
-            asyncio.get_event_loop().run_until_complete(
-                loader.load_with_grant(None)  # type: ignore[arg-type]
-            )
+        assert inspect.iscoroutinefunction(loader.load_with_grant)
 
     def test_prove_config_returns_compliant(self) -> None:
         proof = EmbeddingBudgetedLoader().prove_config({"dim": 384})

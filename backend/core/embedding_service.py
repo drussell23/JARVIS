@@ -149,6 +149,8 @@ class EmbeddingService:
         self._cache_hits = 0
         self._cache_misses = 0
 
+        self._active_grant = None  # Memory Control Plane grant, if loaded via broker
+
         # Register cleanup
         atexit.register(self._sync_cleanup)
         self._register_with_shutdown_manager()
@@ -242,7 +244,20 @@ class EmbeddingService:
         if self._shutdown_requested:
             logger.warning("[EmbeddingService] Cannot load model during shutdown")
             return False
-        
+
+        # Memory Control Plane: Try broker-mediated loading
+        try:
+            from backend.core.memory_budget_broker import get_memory_budget_broker
+            from backend.core.budgeted_loaders import EmbeddingBudgetedLoader
+
+            _broker = get_memory_budget_broker()
+            if _broker is not None:
+                return await self._load_model_via_broker(_broker)
+        except ImportError:
+            pass
+        except Exception as e:
+            logger.debug(f"[EmbeddingService] Broker unavailable, using legacy path: {e}")
+
         # v2.0: Check memory budget BEFORE loading
         if not await self._check_memory_budget():
             logger.error("[EmbeddingService] ❌ Insufficient memory to load model")
@@ -285,6 +300,41 @@ class EmbeddingService:
                 return False
             except Exception as e:
                 logger.error(f"[EmbeddingService] ❌ Failed to load model: {e}")
+                return False
+
+    async def _load_model_via_broker(self, broker) -> bool:
+        """Load embedding model via Memory Control Plane broker."""
+        from backend.core.budgeted_loaders import EmbeddingBudgetedLoader
+
+        loader = EmbeddingBudgetedLoader()
+        estimate = loader.estimate_bytes({})
+
+        try:
+            grant = await broker.request(
+                component=loader.component_id,
+                bytes_requested=estimate,
+                priority=loader.priority,
+                phase=loader.phase,
+            )
+        except Exception as e:
+            logger.warning(f"[EmbeddingService] Broker denied embedding grant: {e}")
+            return False
+
+        async with grant:
+            result = await loader.load_with_grant(grant)
+            if result.success and result.model_handle is not None:
+                self._model = result.model_handle
+                await grant.commit(result.actual_bytes, result.config_proof)
+                self._active_grant = grant
+                logger.info(
+                    f"[EmbeddingService] Loaded via broker grant "
+                    f"(bytes={grant.granted_bytes})"
+                )
+                return True
+            else:
+                logger.error(
+                    f"[EmbeddingService] Broker-mediated load failed: {result.error}"
+                )
                 return False
 
     async def encode(
@@ -412,16 +462,31 @@ class EmbeddingService:
         """
         with self._thread_lock:
             if self._model is None:
-                # Synchronous model loading
+                # Try to load via async path if possible
                 try:
-                    from sentence_transformers import SentenceTransformer
-                    self._model = SentenceTransformer(
-                        self._config.model_name,
-                        device=self._config.device,
+                    asyncio.get_running_loop()
+                    # We're in an async context - can't load synchronously
+                    logger.warning(
+                        "[EmbeddingService] encode_sync called without model loaded. "
+                        "Call await _load_model() first."
                     )
-                except Exception as e:
-                    logger.error(f"[EmbeddingService] Sync model load failed: {e}")
                     return None
+                except RuntimeError:
+                    # No event loop running - load synchronously (legacy fallback)
+                    try:
+                        from sentence_transformers import SentenceTransformer
+
+                        logger.warning(
+                            "[EmbeddingService] Loading SentenceTransformer synchronously "
+                            "(legacy fallback - prefer async _load_model())"
+                        )
+                        self._model = SentenceTransformer(
+                            self._config.model_name,
+                            device=self._config.device,
+                        )
+                    except Exception as e:
+                        logger.error(f"[EmbeddingService] Sync model load failed: {e}")
+                        return None
 
             if isinstance(texts, str):
                 texts = [texts]
