@@ -163,7 +163,7 @@ class TestProactiveVmManagerInit:
         """The function should use PressureTier for broker-based decisions."""
         from backend.core.gcp_vm_manager import proactive_vm_manager_init
         source = inspect.getsource(proactive_vm_manager_init)
-        assert "PressureTier.OPTIMAL" in source
+        assert "PressureTier.CONSTRAINED" in source
 
     def test_source_references_broker_latest_snapshot(self):
         """The function should read broker.latest_snapshot."""
@@ -194,12 +194,23 @@ class TestProactiveVmManagerInit:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_attempts_init_when_broker_pressure_elevated(self):
-        """When broker reports ELEVATED, should attempt to init VM manager."""
+    async def test_defers_init_when_broker_pressure_elevated(self):
+        """When broker reports ELEVATED (below CONSTRAINED), should defer init."""
         from backend.core.gcp_vm_manager import proactive_vm_manager_init
 
         broker = _mock_broker()
         broker.latest_snapshot = _mock_snapshot(tier=PressureTier.ELEVATED)
+
+        result = await proactive_vm_manager_init(broker=broker)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_attempts_init_when_broker_pressure_constrained(self):
+        """When broker reports CONSTRAINED, should attempt to init VM manager."""
+        from backend.core.gcp_vm_manager import proactive_vm_manager_init
+
+        broker = _mock_broker()
+        broker.latest_snapshot = _mock_snapshot(tier=PressureTier.CONSTRAINED)
 
         with patch(
             "backend.core.gcp_vm_manager.get_gcp_vm_manager_safe",
@@ -249,9 +260,11 @@ class TestProactiveVmManagerInit:
         mock_mem = MagicMock()
         mock_mem.percent = 50.0  # Below threshold
 
-        with patch("psutil.virtual_memory", return_value=mock_mem):
+        with patch("psutil.virtual_memory", return_value=mock_mem) as mock_psutil:
             result = await proactive_vm_manager_init(broker=broker)
             assert result is None
+            # Verify psutil was actually called as fallback
+            mock_psutil.assert_called()
 
 
 # ---------------------------------------------------------------------------

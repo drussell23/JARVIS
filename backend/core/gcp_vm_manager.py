@@ -10079,7 +10079,7 @@ async def proactive_vm_manager_init(
 
     When a ``broker`` is provided, the function uses the broker's cached
     pressure tier instead of calling ``psutil.virtual_memory()`` directly.
-    Pressure at or below ``OPTIMAL`` is treated as "below threshold".
+    Pressure below ``CONSTRAINED`` is treated as "below threshold".
 
     Args:
         memory_threshold: Memory percentage threshold to trigger init (default 70%)
@@ -10097,7 +10097,7 @@ async def proactive_vm_manager_init(
             # MCP path: use broker's cached pressure tier
             _snap = broker.latest_snapshot
             if _snap is not None:
-                if _snap.pressure_tier > PressureTier.OPTIMAL:
+                if _snap.pressure_tier >= PressureTier.CONSTRAINED:
                     _needs_init = True
                     logger.info(
                         f"[v95.0] Pressure elevated ({_snap.pressure_tier.name}) - "
@@ -10114,7 +10114,7 @@ async def proactive_vm_manager_init(
                     "[v95.0] Broker has no snapshot yet — falling back to psutil"
                 )
 
-        if not _needs_init and broker is None:
+        if not _needs_init and (broker is None or broker.latest_snapshot is None):
             # Legacy path: raw psutil
             import psutil
             mem_percent = psutil.virtual_memory().percent
