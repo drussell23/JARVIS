@@ -62,8 +62,13 @@ from datetime import datetime, timedelta
 from enum import Enum, auto
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 import traceback
+
+from backend.core.memory_types import PressureTier
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 # =============================================================================
 # CRITICAL: ENFORCE STRICT OFFLINE MODE BEFORE ANY IMPORTS
@@ -1273,6 +1278,29 @@ class ECAPAModelManager:
         # Immediately check for pre-baked manifest on construction
         self._prebaked_manifest = CloudECAPAConfig.load_prebaked_manifest()
 
+        # MCP broker integration (Task 12)
+        self._mcp_active: bool = False
+        self._broker: Optional["MemoryBudgetBroker"] = None
+
+    # ------------------------------------------------------------------
+    # MCP broker registration
+    # ------------------------------------------------------------------
+
+    def register_with_broker(self, broker: "MemoryBudgetBroker") -> None:
+        """Register this manager with the MCP ``MemoryBudgetBroker``.
+
+        Once registered, the memory-pressure check in ``_load_model`` uses
+        ``PressureTier`` from the broker's cached snapshot instead of raw
+        ``psutil.virtual_memory()``.  The legacy psutil fallback remains
+        for when ``_mcp_active`` is False or the snapshot is unavailable.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "ECAPAModelManager registered with MCP broker (epoch=%s)",
+            getattr(broker, "current_epoch", "?"),
+        )
+
     @property
     def is_ready(self) -> bool:
         # Ready if we have an optimized loader with a strategy, or a standard model
@@ -1421,16 +1449,40 @@ class ECAPAModelManager:
         use_cloud_fallback = os.getenv('ECAPA_CLOUD_FALLBACK', 'true').lower() == 'true'
         
         # Check memory pressure first - if low RAM, skip local loading entirely
+        _skip_local = False
         try:
-            import psutil
-            available_gb = psutil.virtual_memory().available / (1024**3)
-            memory_threshold = float(os.getenv('ECAPA_MEMORY_THRESHOLD_GB', '4.0'))
-            
-            if available_gb < memory_threshold:
-                logger.warning(
-                    f"⚠️ LOW MEMORY: {available_gb:.1f}GB available < {memory_threshold}GB threshold"
-                )
-                logger.info("🌐 Skipping local model load - will use cloud routing")
+            if self._mcp_active and self._broker is not None:
+                _snap = self._broker.latest_snapshot
+                if _snap is not None:
+                    if _snap.pressure_tier >= PressureTier.CONSTRAINED:
+                        logger.warning(
+                            "MCP pressure tier %s >= CONSTRAINED — skipping local ECAPA load",
+                            _snap.pressure_tier.name,
+                        )
+                        _skip_local = True
+                    else:
+                        logger.debug(
+                            "MCP pressure tier %s — local ECAPA load OK",
+                            _snap.pressure_tier.name,
+                        )
+                else:
+                    logger.debug("MCP broker has no snapshot yet, falling back to psutil")
+
+            # Legacy psutil fallback (no broker or no snapshot)
+            if not _skip_local and not (self._mcp_active and self._broker is not None
+                                        and self._broker.latest_snapshot is not None):
+                import psutil
+                available_gb = psutil.virtual_memory().available / (1024**3)
+                memory_threshold = float(os.getenv('ECAPA_MEMORY_THRESHOLD_GB', '4.0'))
+                if available_gb < memory_threshold:
+                    logger.warning(
+                        "LOW MEMORY: %.1fGB available < %.1fGB threshold",
+                        available_gb, memory_threshold,
+                    )
+                    _skip_local = True
+
+            if _skip_local:
+                logger.info("Skipping local model load - will use cloud routing")
                 self._cloud_only_mode = True
                 self._ready = False  # Not ready locally, but cloud fallback available
                 self._startup_state = StartupState.DEGRADED
