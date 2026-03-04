@@ -2171,6 +2171,12 @@ DEFAULT_HOT_RELOAD_INTERVAL = 10.0
 DEFAULT_HOT_RELOAD_GRACE_PERIOD = 120.0
 DEFAULT_IDLE_TIMEOUT = 300
 
+# Canonical default for the JARVIS Prime inference server port.
+# Both local Trinity launcher (prime_api_port) and GCP VM propagation
+# (invincible_node_port) must agree on this value to prevent port mismatch
+# that triggers false flapping protection in PrimeRouter.
+DEFAULT_PRIME_INFERENCE_PORT = 8000
+
 # v222.0: Progress-aware Trinity deadline configuration
 # These enable dynamic timeout extension based on observed model loading progress
 TRINITY_PROGRESS_POLL_INTERVAL = 15.0  # Seconds between progress checks
@@ -4567,7 +4573,7 @@ class SystemKernelConfig:
     # v238.0: Rewired to use SAME env vars as Trinity launcher.
     # Previously defaulted to 8011/8012 (ghost ports never actually used by Trinity).
     # Now reads TRINITY_JPRIME_PORT / TRINITY_REACTOR_PORT with correct defaults.
-    prime_api_port: int = field(default_factory=lambda: _get_env_int("TRINITY_JPRIME_PORT", _get_env_int("JARVIS_PRIME_PORT", 8001)))
+    prime_api_port: int = field(default_factory=lambda: _get_env_int("TRINITY_JPRIME_PORT", _get_env_int("JARVIS_PRIME_PORT", DEFAULT_PRIME_INFERENCE_PORT)))
     reactor_api_port: int = field(default_factory=lambda: _get_env_int("TRINITY_REACTOR_PORT", _get_env_int("REACTOR_CORE_PORT", _get_env_int("REACTOR_CORE_API_PORT", 8090))))
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -4597,7 +4603,7 @@ class SystemKernelConfig:
     # v210.0: Added default names for auto-creation - no manual setup required
     invincible_node_static_ip_name: str = field(default_factory=lambda: os.environ.get("GCP_VM_STATIC_IP_NAME", "jarvis-prime-ip"))
     invincible_node_instance_name: str = field(default_factory=lambda: os.environ.get("GCP_VM_INSTANCE_NAME", "jarvis-prime-node"))
-    invincible_node_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_PORT", 8000))
+    invincible_node_port: int = field(default_factory=lambda: _get_env_int("JARVIS_PRIME_PORT", DEFAULT_PRIME_INFERENCE_PORT))
     invincible_node_health_timeout: float = field(default_factory=lambda: _get_env_float("GCP_STATIC_VM_HEALTH_TIMEOUT", 300.0))
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -7112,7 +7118,7 @@ class LiveProgressDashboard:
             },
             "jarvis-prime": {
                 "status": "pending",
-                "port": int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", "8001"))),
+                "port": int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT)))),
                 "pid": None
             },
             "reactor-core": {
@@ -14835,7 +14841,7 @@ class TrinityLaunchConfig:
 
     # Port Configuration
     jprime_ports: List[int] = field(default_factory=lambda:
-        [int(p) for p in os.getenv("TRINITY_JPRIME_PORTS", os.getenv("JARVIS_PRIME_PORT", "8001")).split(",")]
+        [int(p) for p in os.getenv("TRINITY_JPRIME_PORTS", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))).split(",")]
     )
     reactor_core_ports: List[int] = field(default_factory=lambda:
         [int(p) for p in os.getenv("TRINITY_REACTOR_PORTS", "8090").split(",")]
@@ -27431,7 +27437,7 @@ class OuroborosEngine:
         self._improvement_goals: List[Dict[str, Any]] = []
 
         # LLM client (JARVIS Prime)
-        self._jprime_url = os.getenv("JARVIS_PRIME_URL", f"http://localhost:{os.getenv('JARVIS_PRIME_PORT', '8001')}")  # v238.0: Dynamic port
+        self._jprime_url = os.getenv("JARVIS_PRIME_URL", f"http://localhost:{os.getenv('JARVIS_PRIME_PORT', str(DEFAULT_PRIME_INFERENCE_PORT))}")  # v238.0: Dynamic port
 
         # Git integration
         self._git_enabled = self._check_git_available()
@@ -56296,7 +56302,7 @@ class ComprehensiveZombieCleanup:
             ports["jarvis-websocket"] = [ws_port]
 
         # Trinity ports from environment
-        jprime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", "8001")))
+        jprime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))))
         reactor_port = int(os.getenv("TRINITY_REACTOR_PORT", os.getenv("REACTOR_CORE_PORT", "8090")))
         ports["jarvis-prime"] = [jprime_port]
         ports["reactor-core"] = [reactor_port]
@@ -59392,10 +59398,8 @@ class TrinityIntegrator:
 
         # Initialize components
         if jprime_path:
-            # v238.0: Default 8001 (was 8000). Aligns with trinity_config.py v192.2
-            # which changed to 8001 to avoid conflicts with unified_supervisor.
-            # Resolution chain: TRINITY_JPRIME_PORT → JARVIS_PRIME_PORT → 8001
-            jprime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", "8001")))
+            # Resolution chain: TRINITY_JPRIME_PORT → JARVIS_PRIME_PORT → DEFAULT_PRIME_INFERENCE_PORT (8000)
+            jprime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))))
             self._jprime = TrinityComponent(
                 name="jarvis-prime",
                 repo_path=jprime_path,
@@ -68368,7 +68372,7 @@ class JarvisSystemKernel:
                 try:
                     # Import TrinityIntegrator to start Prime
                     prime_repo = os.getenv("JARVIS_PRIME_REPO_PATH", os.path.expanduser("~/Documents/repos/JARVIS-Prime"))
-                    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", "8001")))
+                    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))))
                     
                     if not os.path.exists(prime_repo):
                         self.logger.warning(f"[EarlyPrime] Prime repo not found: {prime_repo}")
@@ -68662,7 +68666,7 @@ class JarvisSystemKernel:
 
                         _port = int(os.getenv(
                             "TRINITY_JPRIME_PORT",
-                            os.getenv("JARVIS_PRIME_PORT", "8001"),
+                            os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT)),
                         ))
                         _timeout = float(os.getenv(
                             "JARVIS_GCP_RECOVERY_TIMEOUT", "450"
@@ -79085,7 +79089,7 @@ class JarvisSystemKernel:
                         import aiohttp as _aiohttp
                         # v224.0: Resolve Prime's actual port from multiple sources.
                         # Priority: 1) cross-repo state file, 2) TRINITY_JPRIME_PORT env,
-                        # 3) JARVIS_PRIME_PORT env, 4) default 8001 (v238.0 aligned)
+                        # 3) JARVIS_PRIME_PORT env, 4) DEFAULT_PRIME_INFERENCE_PORT (8000)
                         prime_port = None
                         try:
                             import json as _json
@@ -79101,7 +79105,7 @@ class JarvisSystemKernel:
                         if prime_port is None:
                             prime_port = int(os.environ.get(
                                 "TRINITY_JPRIME_PORT",
-                                os.environ.get("JARVIS_PRIME_PORT", "8001")
+                                os.environ.get("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))
                             ))
                         async with _aiohttp.ClientSession() as _sess:
                             async with _sess.get(
@@ -79254,7 +79258,7 @@ class JarvisSystemKernel:
                         import aiohttp as _cd_aiohttp
                         _cd_port = int(os.environ.get(
                             "TRINITY_JPRIME_PORT",
-                            os.environ.get("JARVIS_PRIME_PORT", "8001")
+                            os.environ.get("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))
                         ))
                         async with _cd_aiohttp.ClientSession() as _cd_sess:
                             async with _cd_sess.get(
@@ -79480,7 +79484,7 @@ class JarvisSystemKernel:
         _max_interval = _get_env_float("JARVIS_JPRIME_WATCH_MAX_INTERVAL", 30.0)
         _max_wait = _get_env_float("JARVIS_JPRIME_WATCH_MAX_WAIT", 900.0)  # 15 min
         _port = int(os.environ.get("JARVIS_EARLY_PRIME_PORT",
-                                   os.environ.get("TRINITY_JPRIME_PORT", os.environ.get("JARVIS_PRIME_PORT", "8001"))))
+                                   os.environ.get("TRINITY_JPRIME_PORT", os.environ.get("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT)))))
         _url = f"http://localhost:{_port}"
 
         start_time = time.time()
@@ -92116,7 +92120,7 @@ class JarvisSystemKernel:
             prime_status = await self._check_trinity_component(
                 "jarvis-prime",
                 self.config.prime_repo_path,
-                self.config.prime_api_port if hasattr(self.config, 'prime_api_port') else 8001
+                self.config.prime_api_port if hasattr(self.config, 'prime_api_port') else DEFAULT_PRIME_INFERENCE_PORT
             )
             trinity_status["components"]["jarvis-prime"] = prime_status
             if not prime_status.get("healthy", False):
@@ -92367,7 +92371,7 @@ def create_argument_parser() -> argparse.ArgumentParser:
 🌍 Environment Variables:
   JARVIS_MODE                 🎮 Operating mode (supervisor|standalone|minimal)
   JARVIS_BACKEND_PORT         🔌 Backend server port (auto-detected if not set)
-  JARVIS_PRIME_PORT           🧠 J-Prime server port (default: 8001)
+  JARVIS_PRIME_PORT           🧠 J-Prime server port (default: 8000)
   TRINITY_REACTOR_PORT        ⚛️  Reactor Core port (default: 8090)
   JARVIS_DEV_MODE             🛠️  Enable dev mode / hot reload (true|false)
   JARVIS_DEBUG                🔍 Enable debug logging (true|false)
@@ -94646,7 +94650,7 @@ async def handle_monitor_prime() -> int:
     print(box.bold(box.MAGENTA) + box.separator() + box.RESET)
 
     # Get port from environment (same source as TrinityIntegrator)
-    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", "8001")))
+    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))))
     prime_host = os.getenv("TRINITY_JPRIME_HOST", "localhost")
 
     # Try IPC first (kernel running)
@@ -94942,7 +94946,7 @@ async def handle_monitor_trinity() -> int:
     # 🧠 Prime section
     print(box.section_header("🧠 J-Prime — The Mind"))
     prime_data = trinity_status.get("components", {}).get("jarvis-prime", {})
-    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", "8001")))
+    prime_port = int(os.getenv("TRINITY_JPRIME_PORT", os.getenv("JARVIS_PRIME_PORT", str(DEFAULT_PRIME_INFERENCE_PORT))))
 
     if prime_data:
         running = prime_data.get("running", False)
