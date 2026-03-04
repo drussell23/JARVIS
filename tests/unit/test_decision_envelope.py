@@ -195,6 +195,24 @@ class TestPressurePolicy:
         with pytest.raises(dataclasses.FrozenInstanceError):
             policy.version = "v2.0"  # type: ignore[misc]
 
+    def test_invalid_hysteresis_raises_value_error(self) -> None:
+        """exit >= enter must raise ValueError, not pass silently."""
+        with pytest.raises(ValueError, match="Hysteresis violated"):
+            PressurePolicy(
+                enter_thresholds={
+                    PressureTier.ELEVATED: 70.0,
+                    PressureTier.CONSTRAINED: 80.0,
+                    PressureTier.CRITICAL: 90.0,
+                    PressureTier.EMERGENCY: 95.0,
+                },
+                exit_thresholds={
+                    PressureTier.ELEVATED: 75.0,  # invalid: 75 >= 70
+                    PressureTier.CONSTRAINED: 75.0,
+                    PressureTier.CRITICAL: 85.0,
+                    PressureTier.EMERGENCY: 90.0,
+                },
+            )
+
 
 # ===================================================================
 # ActuatorAction tests

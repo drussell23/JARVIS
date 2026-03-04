@@ -487,19 +487,24 @@ class PressurePolicy:
             PressureTier.CRITICAL,
             PressureTier.EMERGENCY,
         }
-        assert set(self.enter_thresholds.keys()) >= _actionable, \
-            "enter_thresholds must cover all actionable PressureTiers"
-        assert set(self.exit_thresholds.keys()) >= _actionable, \
-            "exit_thresholds must cover all actionable PressureTiers"
+        if not set(self.enter_thresholds.keys()) >= _actionable:
+            raise ValueError("enter_thresholds must cover all actionable PressureTiers")
+        if not set(self.exit_thresholds.keys()) >= _actionable:
+            raise ValueError("exit_thresholds must cover all actionable PressureTiers")
         for tier in _actionable:
-            assert self.exit_thresholds[tier] < self.enter_thresholds[tier], (
-                f"Hysteresis violated for {tier}: "
-                f"exit={self.exit_thresholds[tier]} >= enter={self.enter_thresholds[tier]}"
-            )
-        assert self.min_dwell_seconds > 0.0, "min_dwell_seconds must be positive"
-        assert self.cooldown_seconds > 0.0, "cooldown_seconds must be positive"
-        assert self.max_actions_per_hour > 0, "max_actions_per_hour must be positive"
-        assert self.version.startswith("v"), "version must start with 'v'"
+            if self.exit_thresholds[tier] >= self.enter_thresholds[tier]:
+                raise ValueError(
+                    f"Hysteresis violated for {tier}: "
+                    f"exit={self.exit_thresholds[tier]} >= enter={self.enter_thresholds[tier]}"
+                )
+        if self.min_dwell_seconds <= 0.0:
+            raise ValueError("min_dwell_seconds must be positive")
+        if self.cooldown_seconds <= 0.0:
+            raise ValueError("cooldown_seconds must be positive")
+        if self.max_actions_per_hour <= 0:
+            raise ValueError("max_actions_per_hour must be positive")
+        if not self.version.startswith("v"):
+            raise ValueError("version must start with 'v'")
 
     @classmethod
     def for_ram_gb(cls, total_gb: float) -> PressurePolicy:
