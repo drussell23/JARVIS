@@ -330,7 +330,7 @@ DEFAULT_OPTIONAL_COMPONENTS: FrozenSet[str] = frozenset({
 })
 
 # Default timeout values
-DEFAULT_VERIFICATION_TIMEOUT = 60.0  # seconds
+DEFAULT_VERIFICATION_TIMEOUT = 15.0  # seconds (v284: reduced from 60s — parallel checks complete in <5s)
 DEFAULT_UNHEALTHY_THRESHOLD_FAILURES = 3  # consecutive failures
 DEFAULT_UNHEALTHY_THRESHOLD_SECONDS = 30.0  # seconds
 DEFAULT_REVOCATION_COOLDOWN_SECONDS = 5.0  # seconds

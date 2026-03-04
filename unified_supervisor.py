@@ -71001,7 +71001,7 @@ class JarvisSystemKernel:
             # network probing stalls at a lower level.
             _verify_outer_timeout = _get_env_float(
                 "JARVIS_VERIFY_OUTER_TIMEOUT",
-                self._get_verification_timeout() + 15.0,
+                self._get_verification_timeout() + 5.0,
             )
             try:
                 verification = await asyncio.wait_for(
@@ -71099,6 +71099,43 @@ class JarvisSystemKernel:
                     self.logger.info(f"  - Optional component degraded: {component}")
 
             # =====================================================================
+            # v284.0: EARLY PROGRESS COMPLETION
+            # The system is functionally ready once the readiness tier is
+            # determined.  Set progress=100 HERE so the TUI doesn't show
+            # "99%" during non-critical cosmetic work (banners, narration).
+            # =====================================================================
+
+            # Dashboard completion sweep — mark "running" components as
+            # "healthy" (✅) BEFORE setting 100% so the TUI shows clean state.
+            try:
+                _sweep_dashboard = get_live_dashboard()
+                if _sweep_dashboard.enabled:
+                    _sweep_targets = {"running", "starting", "initializing"}
+                    for _comp_name, _comp_data in list(
+                        _sweep_dashboard._components.items()
+                    ):
+                        _comp_status = _comp_data.get("status", "")
+                        if _comp_status in _sweep_targets:
+                            _sweep_dashboard.update_component(
+                                _comp_name, "healthy",
+                                detail="Startup complete",
+                            )
+            except Exception:
+                pass  # Dashboard updates are non-critical
+
+            self._current_startup_phase = "complete"
+            self._current_startup_progress = 100
+            _set_startup_env(
+                "JARVIS_STARTUP_COMPLETE", "true",
+                "all_phases_done", caller="_startup_impl",
+            )
+            self._set_asr_startup_admission(
+                True,
+                "startup_complete",
+                phase="complete",
+            )
+
+            # =====================================================================
             # v180.0: READINESS TIER ANNOUNCEMENT
             # Announce when FULLY_READY tier is reached (visible to users).
             # =====================================================================
@@ -71176,27 +71213,9 @@ class JarvisSystemKernel:
                 await self._startup_watchdog.stop()
 
             # v197.1: Stop live progress dashboard and show final summary
+            # v284.0: Completion sweep moved earlier (before progress=100)
             dashboard = get_live_dashboard()
             if dashboard.enabled:
-                # v280.2: Completion sweep — mark all "running" components as
-                # "healthy" (✅). Root cause: components like ecapa_backend and
-                # enterprise_services are set to "running" (⚙️) when their
-                # initialization STARTS, but never updated to "healthy" when
-                # they FINISH. At this point startup has completed successfully,
-                # so any component still in "running" state is implicitly healthy.
-                # This sweep also catches future components that forget to
-                # set their final status.
-                _sweep_targets = {"running", "starting", "initializing"}
-                try:
-                    for _comp_name, _comp_data in list(dashboard._components.items()):
-                        _comp_status = _comp_data.get("status", "")
-                        if _comp_status in _sweep_targets:
-                            dashboard.update_component(
-                                _comp_name, "healthy",
-                                detail="Startup complete",
-                            )
-                except Exception:
-                    pass  # Dashboard updates are non-critical
                 dashboard.stop()
                 update_dashboard_memory()
 
@@ -71231,8 +71250,8 @@ class JarvisSystemKernel:
                     pass
 
             self._mark_startup_activity("completion_hooks")  # v278.1
-            # v257.0: Completion hooks are optional. Bound their runtime so
-            # startup can never hang at 100% waiting on narration/event sinks.
+            # v284.0: Completion hooks run as a background task so they never
+            # delay the startup return path.  Budget-bounded internally.
             completion_step_timeout = max(
                 0.25,
                 _get_env_float("JARVIS_STARTUP_COMPLETION_STEP_TIMEOUT", 8.0),
@@ -71241,88 +71260,63 @@ class JarvisSystemKernel:
                 completion_step_timeout,
                 _get_env_float("JARVIS_STARTUP_COMPLETION_TOTAL_TIMEOUT", 20.0),
             )
-            completion_deadline = time.monotonic() + completion_total_timeout
 
-            async def _run_completion_hook(
-                name: str,
-                hook_factory: Callable[[], Awaitable[Any]],
-            ) -> None:
-                remaining = completion_deadline - time.monotonic()
-                if remaining <= 0:
-                    self.logger.warning(
-                        "[Kernel] Skipping completion hook '%s': completion budget exhausted "
-                        "(%.1fs)",
-                        name,
-                        completion_total_timeout,
-                    )
-                    return
+            # Capture references for the background closure
+            _narrator_ref = self._narrator
+            _startup_dur = startup_duration
 
-                hook_timeout = max(0.1, min(completion_step_timeout, remaining))
+            async def _run_completion_hooks_bg() -> None:
+                """Best-effort completion hooks (voice narration, events)."""
+                _deadline = time.monotonic() + completion_total_timeout
+
+                async def _run_hook(
+                    name: str,
+                    hook_factory: Callable[[], Awaitable[Any]],
+                ) -> None:
+                    remaining = _deadline - time.monotonic()
+                    if remaining <= 0:
+                        return
+                    hook_timeout = max(0.1, min(completion_step_timeout, remaining))
+                    try:
+                        await asyncio.wait_for(hook_factory(), timeout=hook_timeout)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        pass  # Best-effort — logged at DEBUG if needed
+
                 try:
-                    hook_coro = hook_factory()
-                    await asyncio.wait_for(hook_coro, timeout=hook_timeout)
-                except asyncio.TimeoutError:
-                    # v258.3: INFO not WARNING — completion hooks are
-                    # best-effort by design (startup continues regardless).
-                    # Under CPU pressure, TTS/narration routinely exceeds
-                    # budget. A timeout here is expected, not actionable.
-                    self.logger.info(
-                        "[Kernel] Completion hook '%s' timed out after %.1fs "
-                        "(startup continues)",
-                        name,
-                        hook_timeout,
-                    )
-                except asyncio.CancelledError:
-                    raise
-                except Exception as hook_err:
-                    self.logger.debug(
-                        "[Kernel] Completion hook '%s' failed: %s",
-                        name,
-                        hook_err,
-                    )
+                    if _narrator_ref:
+                        await _run_hook(
+                            "async_narrator.startup_complete",
+                            lambda: _narrator_ref.narrate_startup_complete(
+                                duration_sec=_startup_dur,
+                            ),
+                        )
+                    if BACKEND_NARRATOR_FUNCS_AVAILABLE and _narrate_backend_complete:
+                        await _run_hook(
+                            "startup_narrator.complete",
+                            lambda: _narrate_backend_complete(
+                                f"All systems online in {_startup_dur:.1f} seconds"
+                            ),
+                        )
+                    if ORCHESTRATOR_NARRATOR_AVAILABLE and emit_orchestrator_event:
+                        await _run_hook(
+                            "orchestrator_narrator.startup_complete",
+                            lambda: emit_orchestrator_event(
+                                OrchestratorEvent.STARTUP_COMPLETE,
+                                elapsed_seconds=_startup_dur,
+                            ),
+                        )
+                except Exception as _hooks_err:
+                    logger.debug("[Kernel] Completion hooks bg error: %s", _hooks_err)
 
-            # Voice narrator startup complete announcement
-            if self._narrator:
-                await _run_completion_hook(
-                    "async_narrator.startup_complete",
-                    lambda: self._narrator.narrate_startup_complete(
-                        duration_sec=startup_duration,
-                    ),
-                )
-
-            # v223.0: Rich startup narrator completion with service details
-            if BACKEND_NARRATOR_FUNCS_AVAILABLE and _narrate_backend_complete:
-                await _run_completion_hook(
-                    "startup_narrator.complete",
-                    lambda: _narrate_backend_complete(
-                        f"All systems online in {startup_duration:.1f} seconds"
-                    ),
-                )
-
-            # v223.0: Emit orchestrator startup complete event
-            if ORCHESTRATOR_NARRATOR_AVAILABLE and emit_orchestrator_event:
-                await _run_completion_hook(
-                    "orchestrator_narrator.startup_complete",
-                    lambda: emit_orchestrator_event(
-                        OrchestratorEvent.STARTUP_COMPLETE,
-                        elapsed_seconds=startup_duration,
-                    ),
-                )
-
-            # v278.1: TRUE completion. All post-frontend finalization is done:
-            # service verification, readiness predicate, health report, completion hooks.
-            # NOW the ProgressController and external consumers can see "complete".
-            self._current_startup_phase = "complete"
-            self._current_startup_progress = 100
-            _set_startup_env(
-                "JARVIS_STARTUP_COMPLETE", "true",
-                "all_phases_done", caller="_startup_impl",
+            create_safe_task(
+                _run_completion_hooks_bg(), name="completion-hooks",
             )
-            self._set_asr_startup_admission(
-                True,
-                "startup_complete",
-                phase="complete",
-            )
+
+            # v284.0: progress=100 + STARTUP_COMPLETE + ASR admission moved
+            # earlier (right after readiness predicate). These are no longer
+            # gated behind completion hooks.
 
             self._emit_event(
                 SupervisorEventType.PHASE_END,
@@ -90986,8 +90980,8 @@ class JarvisSystemKernel:
             status: Dict[str, Any] = {"healthy": False, "name": "backend"}
 
             # v260.2: Env-var configurable timeouts with memory-pressure awareness
-            _base_timeout = _get_env_float("JARVIS_VERIFY_BACKEND_TIMEOUT", 5.0)
-            _max_retries = int(_get_env_float("JARVIS_VERIFY_BACKEND_RETRIES", 2.0))
+            _base_timeout = _get_env_float("JARVIS_VERIFY_BACKEND_TIMEOUT", 3.0)
+            _max_retries = int(_get_env_float("JARVIS_VERIFY_BACKEND_RETRIES", 1))
             _check_timeout = _base_timeout
             _saw_open_port = False
             _hard_failure = False
@@ -91106,7 +91100,7 @@ class JarvisSystemKernel:
                 return status
             port = self.config.prime_api_port
             # v260.2: Env-var configurable timeout
-            _prime_timeout = _get_env_float("JARVIS_VERIFY_PRIME_TIMEOUT", 5.0)
+            _prime_timeout = _get_env_float("JARVIS_VERIFY_PRIME_TIMEOUT", 2.0)
             try:
                 # Non-blocking socket check
                 port_open = await _async_port_check("localhost", port, timeout=_prime_timeout)
@@ -91124,7 +91118,7 @@ class JarvisSystemKernel:
                 return status
             port = self.config.reactor_api_port
             # v260.2: Env-var configurable timeout
-            _reactor_timeout = _get_env_float("JARVIS_VERIFY_REACTOR_TIMEOUT", 5.0)
+            _reactor_timeout = _get_env_float("JARVIS_VERIFY_REACTOR_TIMEOUT", 2.0)
             try:
                 # Non-blocking socket check
                 port_open = await _async_port_check("localhost", port, timeout=_reactor_timeout)
