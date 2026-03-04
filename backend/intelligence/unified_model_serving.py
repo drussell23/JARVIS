@@ -58,6 +58,12 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum, auto
+from typing import TYPE_CHECKING
+
+from backend.core.memory_types import PressureTier
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 from pathlib import Path
 from typing import (
     Any,
@@ -438,6 +444,28 @@ class PrimeLocalClient(ModelClient):
 
         # Memory Control Plane: active grant from broker (if loaded via broker)
         self._active_grant = None
+
+        # MCP broker integration
+        self._mcp_active: bool = False
+        self._broker: Optional["MemoryBudgetBroker"] = None
+
+    # ------------------------------------------------------------------
+    # MCP broker integration
+    # ------------------------------------------------------------------
+
+    def register_with_broker(self, broker: "MemoryBudgetBroker") -> None:
+        """Register with the MCP MemoryBudgetBroker.
+
+        Once registered, psutil call sites that read memory state for
+        decision-making will prefer ``broker.latest_snapshot`` over raw
+        psutil, falling back to psutil when no snapshot is available.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        self.logger.info(
+            "PrimeLocalClient registered with MCP broker (epoch=%d)",
+            broker.current_epoch,
+        )
 
     def _discover_model(self, model_name: str) -> Optional[Path]:
         """
@@ -1029,9 +1057,17 @@ class PrimeLocalClient(ModelClient):
 
                 # v235.1: Post-load memory validation (Fix C2)
                 try:
-                    import psutil
-                    _post_mem = psutil.virtual_memory()
-                    _post_available = _post_mem.available / (1024 ** 3)
+                    _post_available = None
+                    # MCP broker path — prefer snapshot for consistency
+                    if self._mcp_active and self._broker is not None:
+                        _snap = self._broker.latest_snapshot
+                        if _snap is not None:
+                            _post_available = _snap.physical_free / (1024 ** 3)
+                    # Legacy psutil fallback
+                    if _post_available is None:
+                        import psutil
+                        _post_mem = psutil.virtual_memory()
+                        _post_available = _post_mem.available / (1024 ** 3)
                     _ram_delta = (available_gb - _post_available) if available_gb else 0
                     self.logger.info(
                         f"[v235.1] Post-load RAM: available={_post_available:.1f}GB "
@@ -1275,18 +1311,26 @@ class PrimeLocalClient(ModelClient):
         try:
             # Step 1: Determine available RAM
             available_gb = None
-            try:
-                from backend.core.memory_quantizer import get_memory_quantizer
-                _mq = await get_memory_quantizer()
-                _metrics = _mq.get_current_metrics()
-                available_gb = _metrics.system_memory_available_gb
-            except Exception:
-                # Conservative fallback if MemoryQuantizer unavailable
+            # MCP broker path — prefer snapshot for admission decisions
+            if self._mcp_active and self._broker is not None:
+                _snap = self._broker.latest_snapshot
+                if _snap is not None:
+                    available_gb = _snap.physical_free / (1024 ** 3)
+
+            # Legacy path: MemoryQuantizer -> psutil -> safe default
+            if available_gb is None:
                 try:
-                    import psutil
-                    available_gb = psutil.virtual_memory().available / (1024 ** 3)
+                    from backend.core.memory_quantizer import get_memory_quantizer
+                    _mq = await get_memory_quantizer()
+                    _metrics = _mq.get_current_metrics()
+                    available_gb = _metrics.system_memory_available_gb
                 except Exception:
-                    available_gb = 3.0  # Safe default for 16GB Mac
+                    # Conservative fallback if MemoryQuantizer unavailable
+                    try:
+                        import psutil
+                        available_gb = psutil.virtual_memory().available / (1024 ** 3)
+                    except Exception:
+                        available_gb = 3.0  # Safe default for 16GB Mac
 
             # Step 2: Find best downloadable model that fits RAM
             _use_mmap = os.getenv(
