@@ -21,21 +21,51 @@ _16_GB = 16 * 1024 ** 3  # 17_179_869_184
 
 def _make_snapshot(**overrides: Any) -> "MemorySnapshot":
     """Return a MemorySnapshot with 16 GB Mac defaults, overridden by kwargs."""
-    from backend.core.memory_types import MemorySnapshot, PressureTier
+    from backend.core.memory_types import (
+        KernelPressure,
+        MemorySnapshot,
+        PressureTier,
+        PressureTrend,
+        SignalQuality,
+        ThrashState,
+    )
 
     defaults: Dict[str, Any] = dict(
-        total_bytes=_16_GB,
-        available_bytes=int(4 * 1024 ** 3),  # 4 GB free
-        used_bytes=int(12 * 1024 ** 3),       # 12 GB used
-        swap_used_bytes=0,
-        swap_growth_rate_bps=0,
-        kernel_pressure_level="normal",
-        pressure_tier=PressureTier.OPTIMAL,
+        # Physical truth (bytes)
+        physical_total=_16_GB,
+        physical_wired=int(2 * 1024 ** 3),      # 2 GB wired
+        physical_active=int(6 * 1024 ** 3),      # 6 GB active
+        physical_inactive=int(3 * 1024 ** 3),    # 3 GB inactive
+        physical_compressed=int(1 * 1024 ** 3),  # 1 GB compressed
+        physical_free=int(4 * 1024 ** 3),        # 4 GB free
+        # Swap state
+        swap_total=int(2 * 1024 ** 3),           # 2 GB swap total
+        swap_used=0,
+        swap_growth_rate_bps=0.0,
+        # Derived budget fields
+        usable_bytes=int(10 * 1024 ** 3),        # 10 GB usable
+        committed_bytes=int(7 * 1024 ** 3),      # 7 GB committed
         available_budget_bytes=int(3 * 1024 ** 3),
+        # Pressure signals
+        kernel_pressure=KernelPressure.NORMAL,
+        pressure_tier=PressureTier.OPTIMAL,
+        thrash_state=ThrashState.HEALTHY,
+        pageins_per_sec=0.0,
+        # Trend derivatives (30s window)
+        host_rss_slope_bps=0.0,
+        jarvis_tree_rss_slope_bps=0.0,
+        swap_slope_bps=0.0,
+        pressure_trend=PressureTrend.STABLE,
+        # Safety
         safety_floor_bytes=int(1 * 1024 ** 3),
-        active_leases_bytes=int(2 * 1024 ** 3),
-        pending_grants_bytes=0,
-        timestamp_ns=1_000_000_000,
+        compressed_trend_bytes=0,
+        # Signal quality
+        signal_quality=SignalQuality.GOOD,
+        # Metadata
+        timestamp=1_000_000_000.0,
+        max_age_ms=500,
+        epoch=1,
+        snapshot_id="test-snap-0001",
     )
     defaults.update(overrides)
     return MemorySnapshot(**defaults)
@@ -276,7 +306,7 @@ class TestMemorySnapshot:
     def test_frozen_immutable(self):
         snap = _make_snapshot()
         with pytest.raises(dataclasses.FrozenInstanceError):
-            snap.total_bytes = 999  # type: ignore[misc]
+            snap.physical_total = 999  # type: ignore[misc]
 
     def test_headroom_bytes_positive(self):
         snap = _make_snapshot(
@@ -308,19 +338,19 @@ class TestMemorySnapshot:
         from backend.core.memory_types import PressureTier
 
         snap = _make_snapshot(pressure_tier=PressureTier.OPTIMAL)
-        assert snap.pressure_factor == 0.9
+        assert snap.pressure_factor == 0.95
 
     def test_pressure_factor_elevated(self):
         from backend.core.memory_types import PressureTier
 
         snap = _make_snapshot(pressure_tier=PressureTier.ELEVATED)
-        assert snap.pressure_factor == 0.75
+        assert snap.pressure_factor == 0.85
 
     def test_pressure_factor_constrained(self):
         from backend.core.memory_types import PressureTier
 
         snap = _make_snapshot(pressure_tier=PressureTier.CONSTRAINED)
-        assert snap.pressure_factor == 0.6
+        assert snap.pressure_factor == 0.7
 
     def test_pressure_factor_critical(self):
         from backend.core.memory_types import PressureTier
@@ -351,18 +381,67 @@ class TestMemorySnapshot:
         assert snap.swap_hysteresis_active is True
 
     def test_all_fields_accessible(self):
+        from backend.core.memory_types import (
+            KernelPressure,
+            PressureTier,
+            PressureTrend,
+            SignalQuality,
+            ThrashState,
+        )
+
         snap = _make_snapshot()
-        assert snap.total_bytes == _16_GB
-        assert snap.available_bytes == int(4 * 1024 ** 3)
-        assert snap.used_bytes == int(12 * 1024 ** 3)
-        assert snap.swap_used_bytes == 0
-        assert snap.swap_growth_rate_bps == 0
-        assert snap.kernel_pressure_level == "normal"
+
+        # Physical truth (bytes) -- 6 fields
+        assert snap.physical_total == _16_GB
+        assert snap.physical_wired == int(2 * 1024 ** 3)
+        assert snap.physical_active == int(6 * 1024 ** 3)
+        assert snap.physical_inactive == int(3 * 1024 ** 3)
+        assert snap.physical_compressed == int(1 * 1024 ** 3)
+        assert snap.physical_free == int(4 * 1024 ** 3)
+
+        # Swap state -- 3 fields
+        assert snap.swap_total == int(2 * 1024 ** 3)
+        assert snap.swap_used == 0
+        assert snap.swap_growth_rate_bps == 0.0
+
+        # Derived budget fields -- 3 fields
+        assert snap.usable_bytes == int(10 * 1024 ** 3)
+        assert snap.committed_bytes == int(7 * 1024 ** 3)
         assert snap.available_budget_bytes == int(3 * 1024 ** 3)
+
+        # Pressure signals -- 4 fields
+        assert snap.kernel_pressure is KernelPressure.NORMAL
+        assert snap.pressure_tier is PressureTier.OPTIMAL
+        assert snap.thrash_state is ThrashState.HEALTHY
+        assert snap.pageins_per_sec == 0.0
+
+        # Trend derivatives -- 4 fields
+        assert snap.host_rss_slope_bps == 0.0
+        assert snap.jarvis_tree_rss_slope_bps == 0.0
+        assert snap.swap_slope_bps == 0.0
+        assert snap.pressure_trend is PressureTrend.STABLE
+
+        # Safety -- 2 fields
         assert snap.safety_floor_bytes == int(1 * 1024 ** 3)
-        assert snap.active_leases_bytes == int(2 * 1024 ** 3)
-        assert snap.pending_grants_bytes == 0
-        assert snap.timestamp_ns == 1_000_000_000
+        assert snap.compressed_trend_bytes == 0
+
+        # Signal quality -- 1 field
+        assert snap.signal_quality is SignalQuality.GOOD
+
+        # Metadata -- 4 fields
+        assert snap.timestamp == 1_000_000_000.0
+        assert snap.max_age_ms == 500
+        assert snap.epoch == 1
+        assert snap.snapshot_id == "test-snap-0001"
+
+    def test_field_count_is_27(self):
+        """MemorySnapshot must have exactly 27 fields (spec listing)."""
+        snap = _make_snapshot()
+        fields = dataclasses.fields(snap)
+        assert len(fields) == 27, (
+            f"Expected 27 fields, got {len(fields)}: "
+            f"{[f.name for f in fields]}"
+        )
 
 
 # ===================================================================

@@ -173,9 +173,9 @@ class MemoryBudgetEventType(str, Enum):
 
 _PRESSURE_FACTORS: Dict[PressureTier, float] = {
     PressureTier.ABUNDANT: 1.0,
-    PressureTier.OPTIMAL: 0.9,
-    PressureTier.ELEVATED: 0.75,
-    PressureTier.CONSTRAINED: 0.6,
+    PressureTier.OPTIMAL: 0.95,
+    PressureTier.ELEVATED: 0.85,
+    PressureTier.CONSTRAINED: 0.7,
     PressureTier.CRITICAL: 0.5,
     PressureTier.EMERGENCY: 0.3,
 }
@@ -194,6 +194,9 @@ class MemorySnapshot:
     Created by the broker's sampler and passed to all decision logic.
     Replaces raw ``psutil`` calls throughout the codebase.
 
+    All 28 fields are required and represent a complete picture of system
+    memory at a single point in time.
+
     Computed properties
     -------------------
     * ``headroom_bytes`` -- budget minus safety floor, floored at 0.
@@ -201,29 +204,48 @@ class MemorySnapshot:
     * ``swap_hysteresis_active`` -- True when swap growth exceeds threshold.
     """
 
-    # --- Physical memory ---
-    total_bytes: int
-    available_bytes: int
-    used_bytes: int
+    # --- Physical truth (bytes) ---
+    physical_total: int
+    physical_wired: int
+    physical_active: int
+    physical_inactive: int
+    physical_compressed: int
+    physical_free: int
 
-    # --- Swap ---
-    swap_used_bytes: int
-    swap_growth_rate_bps: int  # bytes per second
+    # --- Swap state ---
+    swap_total: int
+    swap_used: int
+    swap_growth_rate_bps: float  # bytes per second
 
-    # --- Kernel signal ---
-    kernel_pressure_level: str
-
-    # --- Pressure classification ---
-    pressure_tier: PressureTier
-
-    # --- Budget accounting ---
+    # --- Derived budget fields ---
+    usable_bytes: int
+    committed_bytes: int
     available_budget_bytes: int
-    safety_floor_bytes: int
-    active_leases_bytes: int
-    pending_grants_bytes: int
 
-    # --- Timestamp ---
-    timestamp_ns: int
+    # --- Pressure signals ---
+    kernel_pressure: KernelPressure  # typed enum, NOT str
+    pressure_tier: PressureTier
+    thrash_state: ThrashState  # typed enum
+    pageins_per_sec: float
+
+    # --- Trend derivatives (30s window) ---
+    host_rss_slope_bps: float
+    jarvis_tree_rss_slope_bps: float
+    swap_slope_bps: float
+    pressure_trend: PressureTrend
+
+    # --- Safety ---
+    safety_floor_bytes: int
+    compressed_trend_bytes: int
+
+    # --- Signal quality ---
+    signal_quality: SignalQuality
+
+    # --- Metadata ---
+    timestamp: float
+    max_age_ms: int
+    epoch: int
+    snapshot_id: str
 
     # --- Computed properties ---
 
