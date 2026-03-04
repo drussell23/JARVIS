@@ -46,6 +46,7 @@ import warnings
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, List, Optional, Set
 
+from backend.core.memory_actuator_coordinator import MemoryActuatorCoordinator
 from backend.core.memory_types import (
     BudgetPriority,
     ConfigProof,
@@ -53,6 +54,8 @@ from backend.core.memory_types import (
     LeaseState,
     MemoryBudgetEventType,
     MemorySnapshot,
+    PressurePolicy,
+    PressureTier,
     SignalQuality,
     StartupPhase,
 )
@@ -401,6 +404,10 @@ class MemoryBudgetBroker:
 
         self._pressure_observers: List[Any] = []  # async callables (tier, snapshot)
 
+        self._coordinator = MemoryActuatorCoordinator()
+        self._sequence: int = 0
+        self._policy = PressurePolicy.for_ram_gb(self._detect_total_ram_gb())
+
         # Wire the quantizer to read committed_bytes from us
         if hasattr(quantizer, "set_broker_ref"):
             quantizer.set_broker_ref(self)
@@ -427,6 +434,38 @@ class MemoryBudgetBroker:
     @property
     def current_phase(self) -> StartupPhase:
         return self._phase
+
+    # --- Coordinator / sequence / policy ---
+
+    @property
+    def coordinator(self) -> MemoryActuatorCoordinator:
+        """The shared actuator coordinator."""
+        return self._coordinator
+
+    @property
+    def current_sequence(self) -> int:
+        """Current monotonic sequence number."""
+        return self._sequence
+
+    @property
+    def policy(self) -> PressurePolicy:
+        """The active pressure policy."""
+        return self._policy
+
+    def _advance_sequence(self) -> int:
+        """Advance the sequence counter and sync with coordinator."""
+        self._sequence += 1
+        self._coordinator.advance_epoch(self._epoch, self._sequence)
+        return self._sequence
+
+    @staticmethod
+    def _detect_total_ram_gb() -> float:
+        """Detect total system RAM in GB."""
+        try:
+            import psutil
+            return psutil.virtual_memory().total / (1024 ** 3)
+        except Exception:
+            return 16.0
 
     # --- Committed bytes ---
 
@@ -856,6 +895,7 @@ class MemoryBudgetBroker:
         Observer exceptions are caught and logged -- one bad observer
         must never block others.
         """
+        self._advance_sequence()
         for obs in self._pressure_observers:
             try:
                 await obs(tier, snapshot)
