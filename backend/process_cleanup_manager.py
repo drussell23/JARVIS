@@ -4241,7 +4241,10 @@ class ProcessCleanupManager:
                 "JARVIS_CLOUD_ML_ENDPOINT",
                 ""
             ),
-            "memory_percent": self._get_memory_percent_from_broker() or psutil.virtual_memory().percent,
+            "memory_percent": (
+                _bp if (_bp := self._get_memory_percent_from_broker()) is not None
+                else psutil.virtual_memory().percent
+            ),
             "cloud_first_mode": os.getenv("JARVIS_CLOUD_FIRST_MODE", "false").lower() == "true",
             "ml_offload_recommended": False,
         }
