@@ -147,7 +147,10 @@ class PhantomHardwareManager:
             "displays_created": 0,
             "cli_discoveries": 0,
             "registration_waits": 0,
-            "total_queries": 0
+            "total_queries": 0,
+            "resolution_changes": 0,
+            "disconnects": 0,
+            "reconnects": 0,
         }
 
         logger.info("[v68.0] 👻 PHANTOM HARDWARE: Manager initialized")
@@ -802,6 +805,227 @@ class PhantomHardwareManager:
         except Exception as e:
             logger.warning("[v283.1] Ghost display connect error: %s", e)
             return False
+
+    # -----------------------------------------------------------------
+    # Runtime display control methods (used by DisplayPressureController)
+    # -----------------------------------------------------------------
+
+    async def set_resolution_async(self, resolution: str) -> bool:
+        """
+        Change the ghost display resolution at runtime.
+
+        Idempotent: returns True immediately if the current resolution
+        already matches *resolution*. Returns False when no CLI path
+        is available or the subprocess fails.
+        """
+        if not self._cached_cli_path:
+            logger.debug("[phantom] set_resolution_async: no CLI path available")
+            return False
+
+        if (
+            self._ghost_display_info is not None
+            and self._ghost_display_info.resolution == resolution
+        ):
+            logger.debug(
+                "[phantom] set_resolution_async: already at %s, skipping",
+                resolution,
+            )
+            return True
+
+        display_name = self.ghost_display_name.replace("_", " ")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._cached_cli_path, "set",
+                f"-virtualScreenName={display_name}",
+                f"-resolution={resolution}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=10.0,
+            )
+            combined = (stdout.decode() + stderr.decode()).strip()
+
+            if proc.returncode == 0 and "failed" not in combined.lower():
+                if self._ghost_display_info is not None:
+                    self._ghost_display_info.resolution = resolution
+                self._stats["resolution_changes"] += 1
+                logger.info(
+                    "[phantom] Ghost display resolution set to %s", resolution,
+                )
+                return True
+
+            logger.error(
+                "[phantom] set_resolution_async failed: %s (rc=%s)",
+                combined or "(empty)",
+                proc.returncode,
+            )
+            return False
+
+        except asyncio.TimeoutError:
+            logger.error("[phantom] set_resolution_async timed out (10s)")
+            return False
+        except Exception as e:
+            logger.error("[phantom] set_resolution_async error: %s", e)
+            return False
+
+    async def disconnect_async(self) -> bool:
+        """
+        Disconnect (deactivate) the ghost display from the GPU framebuffer.
+
+        Idempotent: returns True immediately when the display is already
+        inactive. Returns False when no CLI path is available or the
+        subprocess fails.
+        """
+        if not self._cached_cli_path:
+            logger.debug("[phantom] disconnect_async: no CLI path available")
+            return False
+
+        if (
+            self._ghost_display_info is not None
+            and not self._ghost_display_info.is_active
+        ):
+            logger.debug("[phantom] disconnect_async: already disconnected, skipping")
+            return True
+
+        display_name = self.ghost_display_name.replace("_", " ")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._cached_cli_path, "set",
+                f"-virtualScreenName={display_name}",
+                "-connected=off",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=10.0,
+            )
+            combined = (stdout.decode() + stderr.decode()).strip()
+
+            if proc.returncode == 0 and "failed" not in combined.lower():
+                if self._ghost_display_info is not None:
+                    self._ghost_display_info.is_active = False
+                self._stats["disconnects"] += 1
+                logger.info("[phantom] Ghost display disconnected")
+                return True
+
+            logger.error(
+                "[phantom] disconnect_async failed: %s (rc=%s)",
+                combined or "(empty)",
+                proc.returncode,
+            )
+            return False
+
+        except asyncio.TimeoutError:
+            logger.error("[phantom] disconnect_async timed out (10s)")
+            return False
+        except Exception as e:
+            logger.error("[phantom] disconnect_async error: %s", e)
+            return False
+
+    async def reconnect_async(self, resolution: str = "") -> bool:
+        """
+        Reconnect (reactivate) the ghost display on the GPU framebuffer.
+
+        If *resolution* is provided, ``set_resolution_async`` is called
+        after a successful reconnect. Returns False when no CLI path is
+        available or the subprocess fails.
+        """
+        if not self._cached_cli_path:
+            logger.debug("[phantom] reconnect_async: no CLI path available")
+            return False
+
+        display_name = self.ghost_display_name.replace("_", " ")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._cached_cli_path, "set",
+                f"-virtualScreenName={display_name}",
+                "-connected=on",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=10.0,
+            )
+            combined = (stdout.decode() + stderr.decode()).strip()
+
+            if proc.returncode == 0 and "failed" not in combined.lower():
+                if self._ghost_display_info is not None:
+                    self._ghost_display_info.is_active = True
+                self._stats["reconnects"] += 1
+                logger.info("[phantom] Ghost display reconnected")
+
+                if resolution:
+                    return await self.set_resolution_async(resolution)
+                return True
+
+            logger.error(
+                "[phantom] reconnect_async failed: %s (rc=%s)",
+                combined or "(empty)",
+                proc.returncode,
+            )
+            return False
+
+        except asyncio.TimeoutError:
+            logger.error("[phantom] reconnect_async timed out (10s)")
+            return False
+        except Exception as e:
+            logger.error("[phantom] reconnect_async error: %s", e)
+            return False
+
+    async def get_current_mode_async(self) -> Dict[str, Any]:
+        """
+        Query the live resolution and connected state of the ghost display.
+
+        Returns a dict with ``resolution`` (str), ``connected`` (bool),
+        and ``raw_output`` (str). On any error the defaults are
+        ``"unknown"`` / ``False``.
+        """
+        defaults: Dict[str, Any] = {
+            "resolution": "unknown",
+            "connected": False,
+            "raw_output": "",
+        }
+
+        if not self._cached_cli_path:
+            logger.debug("[phantom] get_current_mode_async: no CLI path available")
+            return defaults
+
+        display_name = self.ghost_display_name.replace("_", " ")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self._cached_cli_path, "get",
+                f"-virtualScreenName={display_name}",
+                "-connected",
+                "-resolution",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(), timeout=10.0,
+            )
+            raw = stdout.decode().strip()
+            result: Dict[str, Any] = {
+                "resolution": "unknown",
+                "connected": False,
+                "raw_output": raw,
+            }
+
+            for line in raw.splitlines():
+                lower = line.strip().lower()
+                if lower.startswith("resolution:"):
+                    result["resolution"] = line.split(":", 1)[1].strip()
+                elif lower.startswith("connected:"):
+                    result["connected"] = "true" in lower
+
+            return result
+
+        except asyncio.TimeoutError:
+            logger.error("[phantom] get_current_mode_async timed out (10s)")
+            return defaults
+        except Exception as e:
+            logger.error("[phantom] get_current_mode_async error: %s", e)
+            return defaults
 
     async def _wait_for_display_registration_async(
         self,
