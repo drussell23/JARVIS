@@ -1869,6 +1869,48 @@ async def parallel_lifespan(app: FastAPI):
         # Launch Trinity initialization in background
         create_safe_task(_init_trinity_background(), name="trinity_init_v85")
 
+        # =================================================================
+        # AGENT RUNTIME: Autonomous housekeeping (email triage, goals)
+        # =================================================================
+        # Mirrors unified_supervisor._start_agent_runtime() so both entry
+        # points (supervisor and main.py) get the same autonomous behavior.
+        # Non-fatal: degraded mode without triage if this fails.
+        app.state.agent_runtime = None
+
+        async def _init_agent_runtime_background():
+            """Start agent runtime + housekeeping loop in background."""
+            try:
+                from autonomy.agent_runtime import create_agent_runtime
+                from autonomy.autonomous_agent import get_default_agent
+            except ImportError:
+                try:
+                    from backend.autonomy.agent_runtime import create_agent_runtime
+                    from backend.autonomy.autonomous_agent import get_default_agent
+                except ImportError:
+                    logger.debug("[AgentRuntime] autonomy modules not available")
+                    return
+
+            try:
+                agent = get_default_agent()
+                if not agent._initialized:
+                    await agent.initialize()
+
+                runtime = await create_agent_runtime(agent)
+                agent._runtime = runtime
+                app.state.agent_runtime = runtime
+
+                # Spawn housekeeping (email triage, goal promotion, timeouts)
+                create_safe_task(
+                    runtime.housekeeping_loop(),
+                    name="agent-runtime-housekeeping",
+                )
+                logger.info("[AgentRuntime] Started via main.py lifespan")
+            except Exception as e:
+                logger.warning("[AgentRuntime] Failed to start (non-critical): %s", e)
+                app.state.agent_runtime = None
+
+        create_safe_task(_init_agent_runtime_background(), name="agent_runtime_init")
+
         yield
 
         # =====================================================================
@@ -1930,6 +1972,19 @@ async def parallel_lifespan(app: FastAPI):
                 logger.info("✅ Trinity ecosystem shutdown complete")
             except Exception as e:
                 logger.debug(f"Trinity shutdown error (non-critical): {e}")
+
+        # =================================================================
+        # AGENT RUNTIME: Graceful shutdown
+        # =================================================================
+        if hasattr(app.state, 'agent_runtime') and app.state.agent_runtime:
+            try:
+                logger.info("[AgentRuntime] Shutting down...")
+                await asyncio.wait_for(app.state.agent_runtime.stop(), timeout=5.0)
+                logger.info("[AgentRuntime] Shutdown complete")
+            except asyncio.TimeoutError:
+                logger.warning("[AgentRuntime] Shutdown timed out (5s)")
+            except Exception as e:
+                logger.debug(f"[AgentRuntime] Shutdown error (non-critical): {e}")
 
         # =================================================================
         # HYPER-SPEED AI LOADER: Graceful shutdown
@@ -4122,6 +4177,37 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             except Exception as lifecycle_err:
                 logger.debug(f"[v112.0] Lifecycle stable signal (legacy): {lifecycle_err}")
 
+    # =================================================================
+    # AGENT RUNTIME: Background startup (email triage, goal pursuit)
+    # =================================================================
+    app.state.agent_runtime = None
+
+    async def _init_agent_runtime_bg():
+        try:
+            from autonomy.agent_runtime import create_agent_runtime
+            from autonomy.autonomous_agent import get_default_agent
+        except ImportError:
+            try:
+                from backend.autonomy.agent_runtime import create_agent_runtime
+                from backend.autonomy.autonomous_agent import get_default_agent
+            except ImportError:
+                logger.debug("[AgentRuntime] autonomy modules not available")
+                return
+        try:
+            agent = get_default_agent()
+            if not agent._initialized:
+                await agent.initialize()
+            runtime = await create_agent_runtime(agent)
+            agent._runtime = runtime
+            app.state.agent_runtime = runtime
+            create_safe_task(runtime.housekeeping_loop(), name="agent-runtime-housekeeping")
+            logger.info("[AgentRuntime] Started via main.py lifespan (non-parallel)")
+        except Exception as e:
+            logger.warning("[AgentRuntime] Failed to start (non-critical): %s", e)
+            app.state.agent_runtime = None
+
+    create_safe_task(_init_agent_runtime_bg(), name="agent_runtime_init")
+
     yield
 
     # Cleanup
@@ -4190,6 +4276,19 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
             pass  # Trinity not available
         except Exception as e:
             logger.debug(f"Trinity shutdown error (non-critical): {e}")
+
+    # =================================================================
+    # AGENT RUNTIME: Graceful shutdown
+    # =================================================================
+    if hasattr(app.state, 'agent_runtime') and app.state.agent_runtime:
+        try:
+            logger.info("[AgentRuntime] Shutting down...")
+            await asyncio.wait_for(app.state.agent_runtime.stop(), timeout=5.0)
+            logger.info("[AgentRuntime] Shutdown complete")
+        except asyncio.TimeoutError:
+            logger.warning("[AgentRuntime] Shutdown timed out (5s)")
+        except Exception as e:
+            logger.debug(f"[AgentRuntime] Shutdown error (non-critical): {e}")
 
     # =================================================================
     # HYPER-SPEED AI LOADER: Graceful shutdown
@@ -7126,10 +7225,36 @@ async def autonomous_status():
         except Exception as e:
             mesh_status = {"error": str(e)}
 
+    # Agent runtime + email triage liveness
+    runtime_status = None
+    if hasattr(app.state, "agent_runtime") and app.state.agent_runtime:
+        rt = app.state.agent_runtime
+        runtime_status = {
+            "running": getattr(rt, "_running", False),
+            "active_goals": len(getattr(rt, "_active_runners", {})),
+        }
+        # Email triage liveness
+        _last_triage = getattr(rt, "_last_email_triage_run", 0.0)
+        if _last_triage > 0:
+            import time as _t
+            runtime_status["email_triage"] = {
+                "enabled": True,
+                "last_run_ago_s": round(_t.monotonic() - _last_triage, 1),
+                "triage_disabled_logged": getattr(rt, "_triage_disabled_logged", False),
+            }
+        else:
+            _disabled = getattr(rt, "_triage_disabled_logged", False)
+            runtime_status["email_triage"] = {
+                "enabled": not _disabled,
+                "last_run_ago_s": None,
+                "status": "disabled" if _disabled else "not_yet_run",
+            }
+
     return {
         "autonomous_enabled": orchestrator_status is not None or mesh_status is not None,
         "orchestrator": orchestrator_status,
         "mesh": mesh_status,
+        "agent_runtime": runtime_status,
     }
 
 
