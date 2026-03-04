@@ -42,6 +42,29 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# Lazy imports for memory_types used by DisplayPressureController
+# (deferred to avoid circular imports during early startup)
+_memory_types_loaded = False
+DisplayState = None
+PressureTier = None
+MemoryBudgetEventType = None
+
+
+def _ensure_memory_types():
+    """Load memory_types on first use to avoid circular import at module load."""
+    global _memory_types_loaded, DisplayState, PressureTier, MemoryBudgetEventType
+    if _memory_types_loaded:
+        return
+    from backend.core.memory_types import (
+        DisplayState as _DS,
+        PressureTier as _PT,
+        MemoryBudgetEventType as _MBET,
+    )
+    DisplayState = _DS
+    PressureTier = _PT
+    MemoryBudgetEventType = _MBET
+    _memory_types_loaded = True
+
 
 # =============================================================================
 # v68.0: DISPLAY STATUS DATACLASS
@@ -1261,6 +1284,534 @@ class PhantomHardwareManager:
             "cli_path": self._cached_cli_path,
             "cli_version": self._cli_version
         }
+
+
+# =============================================================================
+# v68.1: DISPLAY PRESSURE CONTROLLER — State Machine for Shedding / Recovery
+# =============================================================================
+
+class DisplayPressureController:
+    """State machine for pressure-driven ghost display resolution management.
+
+    Implements the shedding ladder (ACTIVE -> DEGRADED_1 -> DEGRADED_2 ->
+    MINIMUM -> DISCONNECTED) and recovery ladder (reverse, one step at a time).
+    All transitions use a two-phase protocol (prepare -> apply -> verify ->
+    commit/rollback).
+
+    Flap guards:
+        - Dwell timer: minimum seconds between transitions
+        - Cooldown: extra delay after any transition
+        - Rate limit: max transitions per hour
+        - Failure budget with quarantine per transition path
+
+    Calibration:
+        - Before/after memory snapshot deltas
+        - Per-resolution exponential moving average (EMA)
+
+    Events emitted (via broker._emit_event):
+        DISPLAY_DEGRADE_REQUESTED, DISPLAY_DEGRADED,
+        DISPLAY_DISCONNECT_REQUESTED, DISPLAY_DISCONNECTED,
+        DISPLAY_RECOVERY_REQUESTED, DISPLAY_RECOVERED,
+        DISPLAY_ACTION_FAILED, DISPLAY_ACTION_PHASE
+    """
+
+    # -- class-level tables (populated on first access) --
+
+    _RESOLUTION_MAP: Dict[str, str] = {}     # DisplayState -> resolution
+    _ESTIMATE_MAP: Dict[str, int] = {
+        "1920x1080": 32_000_000,
+        "1600x900": 22_000_000,
+        "1280x720": 14_000_000,
+        "1024x576": 9_000_000,
+    }
+
+    _SHED_ORDER: Dict[str, str] = {}         # state -> next-shed state
+    _RECOVER_ORDER: Dict[str, str] = {}      # state -> next-recover state
+    _SHED_TRIGGER: Dict[str, int] = {}       # target -> PressureTier threshold
+    _CLEAR_TRIGGER: Dict[str, int] = {}      # current -> PressureTier clear level
+
+    _tables_initialized = False
+
+    @classmethod
+    def _init_tables(cls):
+        """Populate lookup tables once memory_types are loaded."""
+        if cls._tables_initialized:
+            return
+        _ensure_memory_types()
+        cls._RESOLUTION_MAP = {
+            DisplayState.ACTIVE: "1920x1080",
+            DisplayState.DEGRADED_1: "1600x900",
+            DisplayState.DEGRADED_2: "1280x720",
+            DisplayState.MINIMUM: "1024x576",
+        }
+        cls._SHED_ORDER = {
+            DisplayState.ACTIVE: DisplayState.DEGRADED_1,
+            DisplayState.DEGRADED_1: DisplayState.DEGRADED_2,
+            DisplayState.DEGRADED_2: DisplayState.MINIMUM,
+            DisplayState.MINIMUM: DisplayState.DISCONNECTED,
+        }
+        cls._RECOVER_ORDER = {
+            DisplayState.DISCONNECTED: DisplayState.MINIMUM,
+            DisplayState.MINIMUM: DisplayState.DEGRADED_2,
+            DisplayState.DEGRADED_2: DisplayState.DEGRADED_1,
+            DisplayState.DEGRADED_1: DisplayState.ACTIVE,
+        }
+        cls._SHED_TRIGGER = {
+            DisplayState.DEGRADED_1: PressureTier.CONSTRAINED,
+            DisplayState.DEGRADED_2: PressureTier.CRITICAL,
+            DisplayState.MINIMUM: PressureTier.CRITICAL,
+            DisplayState.DISCONNECTED: PressureTier.EMERGENCY,
+        }
+        cls._CLEAR_TRIGGER = {
+            DisplayState.DEGRADED_1: PressureTier.OPTIMAL,
+            DisplayState.DEGRADED_2: PressureTier.ELEVATED,
+            DisplayState.MINIMUM: PressureTier.CONSTRAINED,
+            DisplayState.DISCONNECTED: PressureTier.ELEVATED,
+        }
+        cls._tables_initialized = True
+
+    # -- instance lifecycle --
+
+    def __init__(self, phantom_mgr, broker) -> None:
+        _ensure_memory_types()
+        self.__class__._init_tables()
+
+        self._phantom_mgr = phantom_mgr
+        self._broker = broker
+        self._state = DisplayState.INACTIVE
+        self._lease_id: Optional[str] = None
+        self._current_resolution: str = phantom_mgr.preferred_resolution
+        self._last_transition_time: float = 0.0
+        self._transition_timestamps: list = []
+        self._failure_counts: Dict[str, int] = {}
+        self._quarantined_until: Dict[str, float] = {}
+        self._calibration_ema: Dict[str, float] = {}
+        self._sequence_no: int = 0
+
+        # All tunables are env-driven; no hardcoded magic numbers.
+        self._degrade_dwell_s = float(
+            os.environ.get("JARVIS_DISPLAY_DEGRADE_DWELL_S", "30"))
+        self._recovery_dwell_s = float(
+            os.environ.get("JARVIS_DISPLAY_RECOVERY_DWELL_S", "60"))
+        self._cooldown_s = float(
+            os.environ.get("JARVIS_DISPLAY_COOLDOWN_S", "20"))
+        self._max_transitions_1h = int(
+            os.environ.get("JARVIS_DISPLAY_MAX_TRANSITIONS_1H", "6"))
+        self._lockout_duration_s = float(
+            os.environ.get("JARVIS_DISPLAY_LOCKOUT_DURATION_S", "600"))
+        self._verify_window_s = float(
+            os.environ.get("JARVIS_DISPLAY_VERIFY_WINDOW_S", "5"))
+        self._failure_budget = int(
+            os.environ.get("JARVIS_DISPLAY_FAILURE_BUDGET", "3"))
+        self._quarantine_duration_s = float(
+            os.environ.get("JARVIS_DISPLAY_QUARANTINE_DURATION_S", "300"))
+        self._latched_dep_s = float(
+            os.environ.get("JARVIS_DISPLAY_LATCHED_DEPENDENCY_S", "30"))
+        self._scale_factor = float(
+            os.environ.get("JARVIS_DISPLAY_SCALE_FACTOR", "1.0"))
+        self._refresh_factor = float(
+            os.environ.get("JARVIS_DISPLAY_REFRESH_FACTOR", "1.0"))
+        self._compositor_overhead = float(
+            os.environ.get("JARVIS_DISPLAY_COMPOSITOR_OVERHEAD", "0.3"))
+
+        broker.register_pressure_observer(self._on_pressure_change)
+
+    # -- public properties --
+
+    @property
+    def state(self):
+        """Current display lifecycle state."""
+        return self._state
+
+    # -- byte estimation --
+
+    def estimate_bytes(self, resolution: str) -> int:
+        """Return estimated framebuffer bytes for *resolution*.
+
+        Uses calibration EMA when available, otherwise falls back to the
+        static estimate map adjusted by scale / refresh / compositor factors.
+        """
+        if resolution in self._calibration_ema:
+            return int(self._calibration_ema[resolution])
+        base = self._ESTIMATE_MAP.get(resolution, 32_000_000)
+        return int(
+            base * self._scale_factor
+            * self._refresh_factor
+            * (1 + self._compositor_overhead)
+        )
+
+    # -- shedding target computation --
+
+    def _compute_target_state(self, snapshot):
+        """Determine the next shedding target, or None if no action needed.
+
+        Enforces one-step-at-a-time, dwell timer, cooldown, and rate limit.
+        """
+        now = time.monotonic()
+
+        # Rate limit: prune old timestamps, reject if over max.
+        recent = [t for t in self._transition_timestamps if now - t < 3600]
+        self._transition_timestamps = recent
+        if len(recent) >= self._max_transitions_1h:
+            return None
+
+        # Dwell & cooldown: skip if no prior transition (sentinel 0).
+        if self._last_transition_time > 0:
+            dwell = self._degrade_dwell_s
+            if now - self._last_transition_time < dwell:
+                return None
+            if now - self._last_transition_time < self._cooldown_s:
+                return None
+
+        tier = snapshot.pressure_tier
+        thrash = str(
+            getattr(snapshot.thrash_state, "value", snapshot.thrash_state)
+        ).lower()
+
+        # One step only: look at the immediate next shed state.
+        next_state = self._SHED_ORDER.get(self._state)
+        if next_state is None:
+            return None
+
+        trigger = self._SHED_TRIGGER.get(next_state)
+        if trigger is None:
+            return None
+
+        # MINIMUM has a tighter gate — requires thrashing signal too.
+        if next_state == DisplayState.MINIMUM:
+            if (tier >= PressureTier.CRITICAL
+                    and thrash in ("thrashing", "emergency")):
+                return next_state
+            return None
+
+        # General case: shed if tier >= trigger.
+        if tier >= trigger:
+            return next_state
+
+        return None
+
+    # -- recovery target computation --
+
+    def _compute_recovery_target(self, snapshot):
+        """Determine the next recovery target, or None.
+
+        Recovery is more conservative than shedding: longer dwell, requires
+        swap hysteresis to be clear and pressure trend to not be rising.
+        """
+        now = time.monotonic()
+
+        if self._last_transition_time > 0:
+            if now - self._last_transition_time < self._recovery_dwell_s:
+                return None
+
+        if snapshot.swap_hysteresis_active:
+            return None
+        trend = str(
+            getattr(snapshot.pressure_trend, "value", snapshot.pressure_trend)
+        ).lower()
+        if trend == "rising":
+            return None
+
+        tier = snapshot.pressure_tier
+        clear_tier = self._CLEAR_TRIGGER.get(self._state)
+        if clear_tier is None:
+            return None
+
+        if tier <= clear_tier:
+            return self._RECOVER_ORDER.get(self._state)
+
+        return None
+
+    # -- dependency-aware disconnect --
+
+    def _check_disconnect_dependencies(self):
+        """Return (blocked: bool, reason: str).
+
+        Scans active leases for ``requires_display`` metadata.
+        """
+        try:
+            active = self._broker.get_active_leases()
+            blocking = []
+            for lease in active:
+                meta = getattr(lease, "metadata", None) or {}
+                if meta.get("requires_display"):
+                    if not getattr(lease.state, "is_terminal", False):
+                        blocking.append(lease.component_id)
+            if blocking:
+                return True, f"Blocked by: {', '.join(blocking)}"
+        except Exception as e:
+            logger.warning("Dependency check failed: %s", e)
+            return True, f"Dependency check error: {e}"
+        return False, ""
+
+    # -- pressure observer callback --
+
+    async def _on_pressure_change(self, tier, snapshot) -> None:
+        """Called by the broker when pressure tier changes."""
+        if self._state == DisplayState.INACTIVE:
+            return
+        if self._state.is_transitional:
+            return
+
+        target = self._compute_target_state(snapshot)
+        if target is not None:
+            await self._execute_transition(
+                target, snapshot, direction="degrade")
+            return
+
+        target = self._compute_recovery_target(snapshot)
+        if target is not None:
+            await self._execute_transition(
+                target, snapshot, direction="recover")
+
+    # -- two-phase transition execution --
+
+    async def _execute_transition(
+        self, target, snapshot, *, direction: str,
+    ) -> bool:
+        """Execute a two-phase transition (prepare -> apply -> verify ->
+        commit/rollback).
+
+        Returns True on success, False on failure (with rollback).
+        """
+        from_state = self._state
+        action_id = f"act_{self._sequence_no:04d}"
+        self._sequence_no += 1
+
+        transition_key = f"{from_state.value}->{target.value}"
+
+        # Quarantine check.
+        if time.monotonic() < self._quarantined_until.get(transition_key, 0):
+            return False
+
+        # Dependency gate for disconnect.
+        if target == DisplayState.DISCONNECTED:
+            blocked, reason = self._check_disconnect_dependencies()
+            if blocked:
+                self._emit_display_event(
+                    MemoryBudgetEventType.DISPLAY_ACTION_FAILED,
+                    from_state, target, snapshot, action_id,
+                    failure_code="DEPENDENCY_BLOCKED",
+                    extra={"dependency_reason": reason},
+                )
+                return False
+
+        # Phase 1: enter transitional state.
+        transitional = {
+            "degrade": DisplayState.DEGRADING,
+            "recover": DisplayState.RECOVERING,
+        }.get(direction, DisplayState.DEGRADING)
+        if target == DisplayState.DISCONNECTED:
+            transitional = DisplayState.DISCONNECTING
+
+        self._state = transitional
+        pre_free = getattr(snapshot, "physical_free", 0)
+
+        # Emit *_REQUESTED event.
+        req_event = {
+            MemoryBudgetEventType.DISPLAY_DEGRADE_REQUESTED: (
+                direction == "degrade"
+                and target != DisplayState.DISCONNECTED
+            ),
+            MemoryBudgetEventType.DISPLAY_RECOVERY_REQUESTED: (
+                direction == "recover"
+            ),
+            MemoryBudgetEventType.DISPLAY_DISCONNECT_REQUESTED: (
+                target == DisplayState.DISCONNECTED
+            ),
+        }
+        for evt, condition in req_event.items():
+            if condition:
+                self._emit_display_event(
+                    evt, from_state, target, snapshot, action_id)
+                break
+
+        # Phase 2: apply the hardware action.
+        success = False
+        try:
+            if target == DisplayState.DISCONNECTED:
+                success = await self._phantom_mgr.disconnect_async()
+            elif target in self._RESOLUTION_MAP:
+                target_res = self._RESOLUTION_MAP[target]
+                if from_state == DisplayState.DISCONNECTED:
+                    success = await self._phantom_mgr.reconnect_async(
+                        target_res)
+                else:
+                    success = await self._phantom_mgr.set_resolution_async(
+                        target_res)
+            else:
+                success = False
+        except Exception as e:
+            logger.error("Display action failed: %s", e)
+            success = False
+
+        if not success:
+            self._state = from_state
+            self._failure_counts[transition_key] = (
+                self._failure_counts.get(transition_key, 0) + 1
+            )
+            if self._failure_counts[transition_key] >= self._failure_budget:
+                self._quarantined_until[transition_key] = (
+                    time.monotonic() + self._quarantine_duration_s
+                )
+            self._emit_display_event(
+                MemoryBudgetEventType.DISPLAY_ACTION_FAILED,
+                from_state, target, snapshot, action_id,
+                failure_code="CLI_ERROR",
+            )
+            return False
+
+        # Phase 3: verify the action took effect.
+        await asyncio.sleep(self._verify_window_s)
+        mode = await self._phantom_mgr.get_current_mode_async()
+        verify_ok = True
+        if target == DisplayState.DISCONNECTED:
+            verify_ok = not mode.get("connected", True)
+        elif target in self._RESOLUTION_MAP:
+            expected_res = self._RESOLUTION_MAP[target]
+            actual_res = mode.get("resolution", "")
+            verify_ok = (
+                expected_res in actual_res or actual_res in expected_res
+            )
+
+        if not verify_ok:
+            # Rollback.
+            self._state = from_state
+            self._failure_counts[transition_key] = (
+                self._failure_counts.get(transition_key, 0) + 1
+            )
+            if self._failure_counts[transition_key] >= self._failure_budget:
+                self._quarantined_until[transition_key] = (
+                    time.monotonic() + self._quarantine_duration_s
+                )
+            self._emit_display_event(
+                MemoryBudgetEventType.DISPLAY_ACTION_FAILED,
+                from_state, target, snapshot, action_id,
+                failure_code="VERIFY_MISMATCH",
+            )
+            return False
+
+        # Phase 4: commit.
+        self._state = target
+        self._current_resolution = self._RESOLUTION_MAP.get(target, "")
+        self._last_transition_time = time.monotonic()
+        self._transition_timestamps.append(time.monotonic())
+        self._failure_counts.pop(transition_key, None)
+
+        # Amend or release the lease.
+        if self._lease_id and target in self._RESOLUTION_MAP:
+            new_bytes = self.estimate_bytes(self._RESOLUTION_MAP[target])
+            try:
+                await self._broker.amend_lease_bytes(
+                    self._lease_id, new_bytes)
+            except Exception as e:
+                logger.warning("Failed to amend lease bytes: %s", e)
+        elif self._lease_id and target == DisplayState.DISCONNECTED:
+            try:
+                await self._broker.release(self._lease_id)
+                self._lease_id = None
+            except Exception as e:
+                logger.warning("Failed to release display lease: %s", e)
+
+        # Emit success event.
+        success_events = {
+            "degrade": MemoryBudgetEventType.DISPLAY_DEGRADED,
+            "recover": MemoryBudgetEventType.DISPLAY_RECOVERED,
+        }
+        if target == DisplayState.DISCONNECTED:
+            evt = MemoryBudgetEventType.DISPLAY_DISCONNECTED
+        else:
+            evt = success_events.get(
+                direction, MemoryBudgetEventType.DISPLAY_DEGRADED)
+        self._emit_display_event(
+            evt, from_state, target, snapshot, action_id)
+
+        # Calibration: capture post-transition memory delta.
+        try:
+            from backend.core.memory_quantizer import (
+                get_memory_quantizer_instance,
+            )
+            _mq = get_memory_quantizer_instance()
+            if _mq is not None:
+                post_snap = await _mq.snapshot()
+                post_free = getattr(post_snap, "physical_free", 0)
+                delta = post_free - pre_free
+                res = self._RESOLUTION_MAP.get(target, "unknown")
+                if res in self._calibration_ema:
+                    self._calibration_ema[res] = (
+                        0.8 * self._calibration_ema[res] + 0.2 * abs(delta)
+                    )
+                else:
+                    self._calibration_ema[res] = (
+                        abs(delta) if delta != 0
+                        else self._ESTIMATE_MAP.get(res, 0)
+                    )
+        except Exception:
+            pass
+
+        return True
+
+    # -- event emission --
+
+    def _emit_display_event(
+        self, event_type, from_state, to_state, snapshot, action_id,
+        *, failure_code=None, extra=None,
+    ) -> None:
+        """Emit a structured display lifecycle event via the broker."""
+        data = {
+            "from_state": (
+                from_state.value
+                if hasattr(from_state, "value") else str(from_state)
+            ),
+            "to_state": (
+                to_state.value
+                if hasattr(to_state, "value") else str(to_state)
+            ),
+            "trigger_tier": (
+                snapshot.pressure_tier.name
+                if hasattr(snapshot.pressure_tier, "name")
+                else str(snapshot.pressure_tier)
+            ),
+            "snapshot_id": getattr(snapshot, "snapshot_id", "unknown"),
+            "lease_id": self._lease_id,
+            "action_id": action_id,
+            "sequence_no": self._sequence_no,
+            "from_resolution": self._current_resolution,
+            "to_resolution": (
+                self._RESOLUTION_MAP.get(to_state, "none")
+                if hasattr(to_state, "value") else "none"
+            ),
+            "ts_monotonic": time.monotonic(),
+            "event_schema_version": "1.0",
+            "state_machine_version": "1.0",
+        }
+        if failure_code:
+            data["failure_code"] = failure_code
+        if extra:
+            data.update(extra)
+        self._broker._emit_event(event_type, data)
+
+    # -- public lifecycle helpers --
+
+    async def activate(self, lease_id: str, resolution: str) -> None:
+        """Mark the controller as active with a granted lease."""
+        _ensure_memory_types()
+        self._lease_id = lease_id
+        self._state = DisplayState.ACTIVE
+        self._current_resolution = resolution
+        self._last_transition_time = time.monotonic()
+
+    async def shutdown(self) -> None:
+        """Unregister from pressure observer and release any held lease."""
+        _ensure_memory_types()
+        self._broker.unregister_pressure_observer(self._on_pressure_change)
+        if self._lease_id:
+            try:
+                await self._broker.release(self._lease_id)
+            except Exception:
+                pass
+            self._lease_id = None
+        self._state = DisplayState.INACTIVE
 
 
 # =============================================================================
