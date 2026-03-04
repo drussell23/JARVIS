@@ -77,7 +77,12 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from backend.core.memory_types import PressureTier
+
+if TYPE_CHECKING:
+    from backend.core.memory_budget_broker import MemoryBudgetBroker
 
 logger = logging.getLogger(__name__)
 
@@ -525,6 +530,11 @@ class GCPOOMPreventionBridge:
         self._offload_mode_active = False
         self._lock = asyncio.Lock()
 
+        # MCP broker integration — when registered, _get_memory_status()
+        # reads from the broker's cached snapshot instead of raw psutil.
+        self._mcp_active: bool = False
+        self._broker: Optional[MemoryBudgetBroker] = None
+
         # v2.0.0: Adaptive memory estimation
         self._adaptive_estimator = get_adaptive_estimator()
 
@@ -548,6 +558,29 @@ class GCPOOMPreventionBridge:
         logger.info("[OOMBridge] Initialized GCP OOM Prevention Bridge v2.0.0")
         logger.info(f"  Auto-enable GCP on critical: {OOM_PREVENTION_THRESHOLDS['auto_enable_gcp_on_critical']}")
         logger.info(f"  Graceful degradation: {OOM_PREVENTION_THRESHOLDS['enable_graceful_degradation']}")
+
+    def register_with_broker(self, broker: MemoryBudgetBroker) -> None:
+        """Register this OOM bridge with the MCP memory budget broker.
+
+        Once registered, ``_get_memory_status()`` reads available memory
+        and pressure from the broker's cached ``MemorySnapshot`` as the
+        PRIMARY path (before the env-var path, MemoryAwareStartup, and
+        psutil fallback).  The legacy fallback chain remains intact for
+        when ``_mcp_active`` is ``False`` or when the broker has no
+        snapshot yet.
+
+        Before/after measurement calls in ``_try_aggressive_memory_optimization``
+        remain as raw psutil because they measure the delta effect of a
+        specific operation and must reflect the instantaneous system state.
+
+        Args:
+            broker: The ``MemoryBudgetBroker`` singleton.
+        """
+        self._broker = broker
+        self._mcp_active = True
+        logger.info(
+            "[OOMBridge] Registered with MCP broker (mcp_active=True)"
+        )
 
     async def initialize(self) -> bool:
         """
@@ -605,6 +638,19 @@ class GCPOOMPreventionBridge:
         Returns:
             Tuple of (available_ram_gb, memory_pressure_percent)
         """
+        # MCP broker path (highest priority) — uses the broker's cached
+        # MemorySnapshot instead of any raw psutil / env-var reading.
+        if self._mcp_active and self._broker is not None:
+            snap = self._broker.latest_snapshot
+            if snap is not None:
+                available_gb = snap.physical_free / (1024**3)
+                pressure = (
+                    ((snap.physical_total - snap.physical_free) / snap.physical_total * 100)
+                    if snap.physical_total > 0
+                    else 50.0
+                )
+                return available_gb, pressure
+
         # v258.3 (GCP-5): Use ResourceOrchestrator's measured snapshot if available.
         # This avoids a race condition where two psutil calls seconds apart see
         # different memory states (e.g., between ResourceOrchestrator and OOM bridge).
