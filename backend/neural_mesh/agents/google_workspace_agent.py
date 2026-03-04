@@ -771,6 +771,49 @@ def _get_token_refresh_flights_lock() -> asyncio.Lock:
     return _TOKEN_REFRESH_FLIGHTS_LOCK
 
 # =============================================================================
+# Phase 2: Autonomy Event Vocabulary (v300.0 — Trinity Autonomy Wiring)
+# Canonical event types, required/optional metadata, and schema version.
+# Events ride inside ExperienceEvent.metadata as a strict extension.
+# =============================================================================
+
+AUTONOMY_SCHEMA_VERSION = "1.0"
+
+AUTONOMY_EVENT_TYPES: frozenset = frozenset({
+    "intent_written",    # Pre-write journal entry created
+    "committed",         # Write succeeded, journal committed
+    "failed",            # Write failed, journal marked failed
+    "policy_denied",     # Autonomy policy blocked action
+    "deduplicated",      # Idempotency key suppressed duplicate
+    "superseded",        # Stale intent from crash marked superseded
+    "no_journal_lease",  # Write rejected, no durable backing
+})
+
+AUTONOMY_REQUIRED_KEYS: frozenset = frozenset({
+    "autonomy_event_type",
+    "autonomy_schema_version",
+    "idempotency_key",
+    "trace_id",
+    "correlation_id",
+    "action",
+    "request_kind",
+})
+
+AUTONOMY_OPTIONAL_KEYS: frozenset = frozenset({
+    "action_risk",
+    "policy_decision",
+    "journal_seq",
+    "goal_id",
+    "step_id",
+    "emitted_at",
+})
+
+# Training label classification — mirrors reactor-core AutonomyEventClassifier
+_AUTONOMY_TRAINABLE: frozenset = frozenset({"committed", "failed"})
+_AUTONOMY_INFRASTRUCTURE: frozenset = frozenset({"policy_denied", "no_journal_lease"})
+_AUTONOMY_EXCLUDE: frozenset = frozenset({"deduplicated", "intent_written"})
+_AUTONOMY_RECONCILE_ONLY: frozenset = frozenset({"superseded"})
+
+# =============================================================================
 # Action Risk Classification
 # =============================================================================
 
@@ -3916,6 +3959,25 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
         standalone_ok, standalone_reason = _can_create_standalone_workspace_agent()
         _check("standalone_gate", standalone_ok, False, standalone_reason)
 
+        # v300.0: Reconciliation surface — count stale intents from crash recovery
+        reconcile_count = 0
+        try:
+            from core.orchestration_journal import OrchestrationJournal
+            j = OrchestrationJournal.get_instance()
+            if j:
+                stale = j.replay_from(0, action_filter="workspace:")
+                reconcile_count = sum(
+                    1 for entry in stale if entry.get("result") == "superseded"
+                )
+        except Exception:
+            pass  # Journal unavailable — not blocking
+        _check(
+            "reconcile_required",
+            reconcile_count == 0,
+            False,  # Informational only
+            f"{reconcile_count} superseded intents pending reconciliation",
+        )
+
         # Overall
         if blocking > 0:
             overall = "fail"
@@ -3934,6 +3996,7 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
             "blocking_issues": blocking,
             "checks": checks,
             "action_required": action_required,
+            "pending_reconciliation": reconcile_count,
             "ts": _time.time(),
         }
 
@@ -4148,6 +4211,114 @@ Return ONLY a JSON object with these keys (use null if not found):
             # Don't fail the main operation if logging fails
             logger.debug(f"[GoogleWorkspaceAgent] Failed to log experience: {e}")
 
+    # ------------------------------------------------------------------
+    # Phase 2: Autonomy Event Emission (v300.0 — Trinity Autonomy Wiring)
+    # ------------------------------------------------------------------
+
+    async def _emit_autonomy_event(
+        self,
+        event_type: str,
+        action: str,
+        idempotency_key: str,
+        trace_id: str,
+        correlation_id: str,
+        *,
+        request_kind: Optional[str] = None,
+        policy_decision: Optional[Dict[str, Any]] = None,
+        journal_seq: Optional[int] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit a structured autonomy lifecycle event via the experience forwarder.
+
+        Events flow to Reactor-Core where ``AutonomyEventClassifier`` determines
+        training eligibility.  This method is fire-and-forget: it must never fail
+        the calling operation.
+
+        Parameters
+        ----------
+        event_type : str
+            One of ``AUTONOMY_EVENT_TYPES`` (7 canonical types).
+        action : str
+            Workspace action name (e.g. ``"send_email"``).
+        idempotency_key : str
+            Canonical idempotency key for dedup across the pipeline.
+        trace_id : str
+            From ``TraceEnvelope`` or request-scoped trace.
+        correlation_id : str
+            Request correlation ID.
+        request_kind : str, optional
+            ``"autonomous"`` or interactive — default ``"autonomous"``.
+        policy_decision : dict, optional
+            Frozen snapshot of the policy decision at emission time.
+        journal_seq : int, optional
+            Body-local journal sequence number (nullable).
+        extra : dict, optional
+            Additional metadata merged into the event.
+        """
+        if not EXPERIENCE_FORWARDER_AVAILABLE or not get_experience_forwarder:
+            return
+
+        try:
+            import time as _time
+
+            forwarder = await get_experience_forwarder()
+            if forwarder is None:
+                return
+
+            # Build strict autonomy metadata block (all 7 required keys)
+            autonomy_meta: Dict[str, Any] = {
+                "autonomy_event_type": event_type,
+                "autonomy_schema_version": AUTONOMY_SCHEMA_VERSION,
+                "idempotency_key": idempotency_key or "",
+                "trace_id": trace_id or "",
+                "correlation_id": correlation_id or "",
+                "action": action,
+                "request_kind": request_kind or "autonomous",
+            }
+
+            # Optional keys
+            autonomy_meta["action_risk"] = _classify_action_risk(action)
+            autonomy_meta["emitted_at"] = _time.monotonic()
+            if policy_decision is not None:
+                autonomy_meta["policy_decision"] = policy_decision
+            if journal_seq is not None:
+                autonomy_meta["journal_seq"] = journal_seq
+            if extra:
+                autonomy_meta.update(extra)
+
+            # Use the forwarder's autonomy-specific helper if available,
+            # otherwise fall through to forward_experience with METRIC type.
+            if hasattr(forwarder, "forward_autonomy_event"):
+                await forwarder.forward_autonomy_event(
+                    event_type=event_type,
+                    action=action,
+                    idempotency_key=idempotency_key or "",
+                    trace_id=trace_id or "",
+                    correlation_id=correlation_id or "",
+                    **{k: v for k, v in autonomy_meta.items()
+                       if k not in AUTONOMY_REQUIRED_KEYS},
+                )
+            else:
+                await forwarder.forward_experience(
+                    experience_type=f"autonomy:{event_type}",
+                    input_data={"action": action, "event_type": event_type},
+                    output_data={"idempotency_key": idempotency_key or ""},
+                    quality_score=0.0,
+                    confidence=1.0,
+                    success=event_type in _AUTONOMY_TRAINABLE,
+                    component="google_workspace_agent",
+                    metadata=autonomy_meta,
+                )
+
+            logger.debug(
+                "[GWS] Autonomy event emitted: type=%s action=%s idem=%s",
+                event_type, action, idempotency_key,
+            )
+
+        except Exception as exc:
+            # Fire-and-forget — never fail the calling operation
+            logger.debug("[GWS] Autonomy event emission failed: %s", exc)
+
     def _sanitize_for_logging(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Sanitize data for logging by removing sensitive PII.
@@ -4282,6 +4453,18 @@ Return ONLY a JSON object with these keys (use null if not found):
                 "[GWS] Autonomy policy denied: action=%s reason=%s remediation=%s",
                 action, decision.reason, decision.remediation,
             )
+            # v300.0: Emit policy_denied autonomy event
+            await self._emit_autonomy_event(
+                "policy_denied", action, idempotency_key or "",
+                request_id or "", correlation_id or "",
+                request_kind=request_kind_val,
+                policy_decision={
+                    "allowed": False,
+                    "reason": decision.reason,
+                    "escalation": decision.escalation,
+                    "remediation": decision.remediation,
+                },
+            )
             return {
                 "success": False,
                 "error": f"Autonomy policy: {decision.reason}",
@@ -4326,6 +4509,12 @@ Return ONLY a JSON object with these keys (use null if not found):
                         "[GWS] Duplicate autonomous write suppressed: %s key=%s",
                         action, idempotency_key,
                     )
+                    # v300.0: Emit deduplicated autonomy event
+                    await self._emit_autonomy_event(
+                        "deduplicated", action, idempotency_key,
+                        request_id or "", correlation_id or "",
+                        request_kind=request_kind_val,
+                    )
                     return {"success": True, "deduplicated": True, "idempotency_key": idempotency_key}
             except Exception:
                 pass
@@ -4337,6 +4526,12 @@ Return ONLY a JSON object with these keys (use null if not found):
                 if journal is None or not journal.has_lease:
                     logger.warning(
                         "[GWS] Autonomous write rejected: no journal lease for durable intent tracking"
+                    )
+                    # v300.0: Emit no_journal_lease BEFORE fail-closed return
+                    await self._emit_autonomy_event(
+                        "no_journal_lease", action, idempotency_key,
+                        request_id or "", correlation_id or "",
+                        request_kind=request_kind_val,
                     )
                     return {
                         "success": False,
@@ -4352,6 +4547,13 @@ Return ONLY a JSON object with these keys (use null if not found):
                     target=idempotency_key,
                     idempotency_key=f"ws:{action}:{idempotency_key}",
                     payload={"action": action, "request_kind": request_kind_val},
+                )
+                # v300.0: Emit intent_written after successful fenced_write
+                await self._emit_autonomy_event(
+                    "intent_written", action, idempotency_key,
+                    request_id or "", correlation_id or "",
+                    request_kind=request_kind_val,
+                    journal_seq=_journal_seq,
                 )
             except Exception as exc:
                 logger.debug("[GWS] Journal write skipped (no lease or unavailable): %s", exc)
@@ -4497,14 +4699,25 @@ Return ONLY a JSON object with these keys (use null if not found):
 
         # v284.0: Commit durable intent result
         if _journal_seq is not None:
+            _commit_outcome = None
             try:
                 from core.orchestration_journal import OrchestrationJournal
                 _j = OrchestrationJournal.get_instance()
                 if _j:
                     _success = isinstance(result, dict) and result.get("success")
-                    _j.mark_result(_journal_seq, "committed" if _success else "failed")
+                    _commit_outcome = "committed" if _success else "failed"
+                    _j.mark_result(_journal_seq, _commit_outcome)
             except Exception:
                 pass  # Best-effort commit — idempotency key prevents re-execution
+
+            # v300.0: Emit committed or failed autonomy event
+            if _commit_outcome:
+                await self._emit_autonomy_event(
+                    _commit_outcome, action, idempotency_key or "",
+                    request_id or "", correlation_id or "",
+                    request_kind=request_kind_val,
+                    journal_seq=_journal_seq,
+                )
 
         if isinstance(result, dict):
             result.setdefault("request_id", request_id)

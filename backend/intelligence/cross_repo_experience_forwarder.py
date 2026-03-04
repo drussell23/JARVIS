@@ -99,6 +99,9 @@ OVERFLOW_WARNING_THRESHOLD = int(os.getenv("CROSS_REPO_OVERFLOW_WARNING", "8000"
 # Deduplication
 DEDUP_CACHE_SIZE = int(os.getenv("CROSS_REPO_DEDUP_CACHE_SIZE", "5000"))
 
+# v300.0: Autonomy event rate limiting (during startup reconciliation bulk emission)
+AUTONOMY_EVENT_RATE_LIMIT = int(os.getenv("JARVIS_AUTONOMY_EVENT_RATE_LIMIT", "50"))
+
 # Circuit breaker
 CIRCUIT_BREAKER_THRESHOLD = int(os.getenv("CROSS_REPO_CB_THRESHOLD", "5"))
 CIRCUIT_BREAKER_TIMEOUT = float(os.getenv("CROSS_REPO_CB_TIMEOUT", "60.0"))
@@ -490,6 +493,82 @@ class CrossRepoExperienceForwarder:
                     self.logger.debug(f"Overflow callback error: {e}")
 
         return ForwardingStatus.QUEUED if accepted > 0 else ForwardingStatus.DROPPED, accepted
+
+    # ------------------------------------------------------------------
+    # v300.0: Phase 2 — Autonomy Event Forwarding (Trinity Autonomy Wiring)
+    # ------------------------------------------------------------------
+
+    async def forward_autonomy_event(
+        self,
+        event_type: str,
+        action: str,
+        idempotency_key: str,
+        trace_id: str,
+        correlation_id: str,
+        **extra: Any,
+    ) -> ForwardingStatus:
+        """Forward a structured autonomy lifecycle event to Reactor-Core.
+
+        Builds the canonical autonomy metadata block (7 required keys) and
+        delegates to ``forward_experience()`` with ``experience_type="autonomy:<event_type>"``.
+
+        Rate limiting is applied when the event rate exceeds
+        ``JARVIS_AUTONOMY_EVENT_RATE_LIMIT`` (default 50/sec) to prevent
+        replay storms during startup reconciliation.
+
+        Parameters
+        ----------
+        event_type : str
+            One of the 7 canonical autonomy event types.
+        action : str
+            Workspace action name.
+        idempotency_key, trace_id, correlation_id : str
+            Required tracing identifiers.
+        **extra
+            Additional metadata keys (e.g. ``journal_seq``, ``policy_decision``).
+        """
+        # Rate limiting — token bucket with monotonic clock
+        if not hasattr(self, "_autonomy_rate_tokens"):
+            self._autonomy_rate_tokens: float = float(AUTONOMY_EVENT_RATE_LIMIT)
+            self._autonomy_rate_last: float = time.monotonic()
+
+        now = time.monotonic()
+        elapsed = now - self._autonomy_rate_last
+        self._autonomy_rate_last = now
+        self._autonomy_rate_tokens = min(
+            float(AUTONOMY_EVENT_RATE_LIMIT),
+            self._autonomy_rate_tokens + elapsed * AUTONOMY_EVENT_RATE_LIMIT,
+        )
+        if self._autonomy_rate_tokens < 1.0:
+            # Throttled — yield and retry once
+            await asyncio.sleep(1.0 / AUTONOMY_EVENT_RATE_LIMIT)
+            self._autonomy_rate_tokens = 1.0
+
+        self._autonomy_rate_tokens -= 1.0
+
+        # Build strict autonomy metadata
+        autonomy_meta: Dict[str, Any] = {
+            "autonomy_event_type": event_type,
+            "autonomy_schema_version": "1.0",
+            "idempotency_key": idempotency_key,
+            "trace_id": trace_id,
+            "correlation_id": correlation_id,
+            "action": action,
+            "request_kind": extra.pop("request_kind", "autonomous"),
+            "emitted_at": time.monotonic(),
+        }
+        autonomy_meta.update(extra)
+
+        return await self.forward_experience(
+            experience_type=f"autonomy:{event_type}",
+            input_data={"action": action, "event_type": event_type},
+            output_data={"idempotency_key": idempotency_key},
+            quality_score=0.0,
+            confidence=1.0,
+            success=event_type in {"committed"},
+            component="google_workspace_agent",
+            metadata=autonomy_meta,
+        )
 
     async def get_metrics(self) -> Dict[str, Any]:
         """
