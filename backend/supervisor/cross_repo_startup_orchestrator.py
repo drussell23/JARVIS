@@ -24771,6 +24771,13 @@ def get_orchestrator_shutdown_state() -> dict:
 # v300.0: Phase 2 — Autonomy Contract Compatibility Check
 # =============================================================================
 
+def _version_gte(a: str, b: str) -> bool:
+    """True if semantic version *a* >= *b* (numeric tuple compare)."""
+    def _parse(v: str) -> Tuple[int, ...]:
+        return tuple(int(x) for x in v.split("."))
+    return _parse(a) >= _parse(b)
+
+
 AUTONOMY_SCHEMA_COMPATIBILITY: Dict[str, Dict[str, str]] = {
     "1.0": {"min_prime": "1.0", "min_reactor": "1.0"},
 }
@@ -24864,10 +24871,10 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
     min_reactor = compat.get("min_reactor", "999")
 
     checks["prime_compatible"] = (
-        prime_schema is not None and prime_schema >= min_prime
+        prime_schema is not None and _version_gte(prime_schema, min_prime)
     )
     checks["reactor_compatible"] = (
-        reactor_schema is not None and reactor_schema >= min_reactor
+        reactor_schema is not None and _version_gte(reactor_schema, min_reactor)
     )
 
     all_pass = (
