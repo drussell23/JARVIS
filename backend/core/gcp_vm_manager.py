@@ -682,8 +682,9 @@ class VMManagerConfig:
     )
     idle_timeout_minutes: int = field(
         # Prefer JARVIS_SPOT_VM_IDLE_TIMEOUT (used by hybrid cloud stack), fall back to legacy GCP_*
+        # Reduced from 30 to 5 for cost optimization in solo dev mode
         default_factory=lambda: int(
-            os.getenv("GCP_IDLE_TIMEOUT_MINUTES", os.getenv("JARVIS_SPOT_VM_IDLE_TIMEOUT", "30"))
+            os.getenv("GCP_IDLE_TIMEOUT_MINUTES", os.getenv("JARVIS_SPOT_VM_IDLE_TIMEOUT", "5"))
         )
     )
 
@@ -2481,6 +2482,39 @@ wait
         return len(deleted), deleted
 
 
+class ZoneFallbackPolicy:
+    """Manages zone selection with blacklisting for Spot VM preemption/capacity exhaustion."""
+
+    def __init__(self):
+        self._zones = os.getenv(
+            "JARVIS_GCP_ZONES", "us-central1-a,us-central1-b,us-central1-c,us-central1-f"
+        ).split(",")
+        self._blacklist: Dict[str, float] = {}  # zone → blacklist_until (monotonic)
+        self._blacklist_duration = float(os.getenv("JARVIS_ZONE_BLACKLIST_DURATION_S", "1800"))
+
+    def get_next_zone(self) -> Optional[str]:
+        """Return first non-blacklisted zone, or None if all blacklisted."""
+        now = time.monotonic()
+        for zone in self._zones:
+            if zone not in self._blacklist or self._blacklist[zone] < now:
+                self._blacklist.pop(zone, None)
+                return zone
+        return None
+
+    def blacklist_zone(self, zone: str, reason: str) -> None:
+        """Blacklist a zone after capacity failure."""
+        self._blacklist[zone] = time.monotonic() + self._blacklist_duration
+        logger.warning(
+            "[ZoneFallback] Blacklisted %s for %ds: %s",
+            zone, int(self._blacklist_duration), reason,
+        )
+
+    def get_available_zones(self) -> List[str]:
+        """Return list of all currently available (non-blacklisted) zones."""
+        now = time.monotonic()
+        return [z for z in self._zones if z not in self._blacklist or self._blacklist[z] < now]
+
+
 class GCPVMManager:
     """
     Advanced GCP Spot VM auto-creation and lifecycle manager.
@@ -2580,6 +2614,9 @@ class GCPVMManager:
                 recovery_timeout=_quota_rt,
             ),
         }
+
+        # Zone fallback for Spot VM capacity exhaustion
+        self._zone_fallback = ZoneFallbackPolicy()
 
         # v232.0: Golden image corruption detection
         self._golden_image_stall_history: Dict[str, List[float]] = {}
@@ -3855,6 +3892,15 @@ class GCPVMManager:
         # === Propagate to routing layer ===
         url = f"http://{vm.ip_address}:{port}"
 
+        # Snapshot env vars before setting (for rollback on full sink failure)
+        _env_keys = [
+            "JARVIS_PRIME_URL", "GCP_PRIME_ENDPOINT", "JARVIS_PRIME_CLOUD_RUN_URL",
+            "JARVIS_PRIME_API_URL", "JARVIS_HOLLOW_CLIENT_ACTIVE",
+            "JARVIS_INVINCIBLE_NODE_IP", "JARVIS_INVINCIBLE_NODE_PORT",
+            "JARVIS_PRIME_VISION_URL", "JARVIS_PRIME_VISION_PORT",
+        ]
+        _prev_env = {k: os.environ.get(k) for k in _env_keys}
+
         # Set environment variables (consumed by PrimeClient, HybridBackendClient, etc.)
         # v236.3 (H2 fix): Parity with _propagate_invincible_node_url() — same env vars
         os.environ["JARVIS_PRIME_URL"] = url
@@ -3965,6 +4011,16 @@ class GCPVMManager:
                 f"[EndpointPropagation] VM '{vm.name}' partially propagated — "
                 f"failed sinks: {', '.join(_failed)} — will retry on next call"
             )
+
+            # Rollback env vars when ALL sinks failed (no partial state)
+            if not _router_ok and not _model_ok:
+                for key, prev_val in _prev_env.items():
+                    if prev_val is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = prev_val
+                logger.info("[EndpointPropagation] Env vars rolled back (full sink failure)")
+
         return _fully_propagated
 
     async def _ensure_endpoint_depropagated(self, vm: VMInstance) -> bool:
@@ -5928,9 +5984,89 @@ class GCPVMManager:
         return yaml.dump(manifest, default_flow_style=False)
 
     # ═══════════════════════════════════════════════════════════════════════════════
+    # GOLDEN IMAGE COST INTELLIGENCE
+    # ═══════════════════════════════════════════════════════════════════════════════
+
+    async def _should_use_golden_image(self) -> bool:
+        """Cost-intelligent golden image gate. Uses deterministic ROI formula.
+
+        USE golden image IF AND ONLY IF:
+            startup_savings_daily > image_storage_daily + disk_premium_daily
+
+        Returns False (skip golden image) when ROI is negative for solo dev usage.
+        """
+        if not self.config.use_golden_image:
+            return False
+
+        # 1. Image age gate
+        try:
+            builder = self.get_golden_image_builder()
+            latest = await builder.get_latest_golden_image()
+            if not latest:
+                return False
+            if latest.is_stale(self.config.golden_image_max_age_days):
+                logger.info("[GoldenImage] Latest image is stale (%d day limit)", self.config.golden_image_max_age_days)
+                return False
+        except Exception as e:
+            logger.debug("[GoldenImage] Availability check failed: %s", e)
+            return False
+
+        # 2. Deterministic ROI calculation
+        script_startup_min = float(os.getenv("JARVIS_SCRIPT_STARTUP_MINUTES", "10"))
+        golden_startup_min = float(os.getenv("JARVIS_GOLDEN_STARTUP_MINUTES", "2"))
+        vm_hourly = self.config.spot_vm_hourly_cost
+
+        # Estimate sessions per day from cost tracker
+        sessions_per_day = 2.0  # conservative default
+        try:
+            from backend.core.cost_tracker import get_cost_tracker
+            ct = get_cost_tracker()
+            summary = await ct.get_cost_summary("week")
+            total_sessions = summary.get("total_sessions", 14)  # 2/day default
+            sessions_per_day = max(1.0, total_sessions / 7.0)
+        except Exception:
+            pass
+
+        startup_savings_daily = (
+            (script_startup_min - golden_startup_min) / 60.0
+            * vm_hourly * sessions_per_day
+        )
+
+        image_size_gb = getattr(latest, "disk_size_gb", None) or self.config.boot_disk_size_gb
+        image_storage_daily = image_size_gb * 0.050 / 30.0  # $0.050/GB/month
+
+        disk_premium_gb = max(0, image_size_gb - self.config.boot_disk_size_gb)
+        # Estimate avg VM hours from sessions
+        avg_vm_hours = sessions_per_day * 1.0  # assume ~1hr per session
+        disk_premium_daily = disk_premium_gb * 0.040 / 30.0 * avg_vm_hours / 24.0
+
+        total_cost_daily = image_storage_daily + disk_premium_daily
+
+        if startup_savings_daily <= total_cost_daily:
+            breakeven_sessions = int(total_cost_daily / (startup_savings_daily / max(sessions_per_day, 1))) + 1
+            logger.info(
+                "[GoldenImage] ROI negative: savings=$%.4f/day < cost=$%.4f/day (need %d+ sessions)",
+                startup_savings_daily, total_cost_daily, breakeven_sessions,
+            )
+            return False
+
+        # 3. Budget gate via two-phase spend (just checking, not committing)
+        try:
+            from backend.core.cost_tracker import get_cost_tracker
+            ct = get_cost_tracker()
+            allowed, reason = await ct.can_spend(total_cost_daily / 24.0, "golden_image")
+            if not allowed:
+                logger.info("[GoldenImage] Budget gate blocked: %s", reason)
+                return False
+        except Exception:
+            pass
+
+        return True
+
+    # ═══════════════════════════════════════════════════════════════════════════════
     # v224.0: GOLDEN IMAGE MANAGEMENT METHODS
     # ═══════════════════════════════════════════════════════════════════════════════
-    
+
     def get_golden_image_builder(self) -> GoldenImageBuilder:
         """
         Get or create the golden image builder instance.
@@ -6032,16 +6168,19 @@ class GCPVMManager:
         builder = self.get_golden_image_builder()
         return await builder.list_golden_images()
     
-    async def cleanup_old_golden_images(self, keep_count: int = 3) -> Tuple[int, List[str]]:
+    async def cleanup_old_golden_images(self, keep_count: Optional[int] = None) -> Tuple[int, List[str]]:
         """
         Clean up old golden images, keeping only the most recent ones.
-        
+
         Args:
-            keep_count: Number of recent images to keep (default: 3)
-            
+            keep_count: Number of recent images to keep.
+                        Defaults to JARVIS_GOLDEN_IMAGE_RETAIN_COUNT (default: 2).
+
         Returns:
             Tuple of (deleted_count, list of deleted image names)
         """
+        if keep_count is None:
+            keep_count = int(os.getenv("JARVIS_GOLDEN_IMAGE_RETAIN_COUNT", "2"))
         builder = self.get_golden_image_builder()
         return await builder.cleanup_old_images(keep_count=keep_count)
     
@@ -7538,6 +7677,27 @@ class GCPVMManager:
                             )
                             self._efficiency_warning_times[vm_name] = time.time()
 
+                # === STEP 5b: Static IP idle release (cost savings ~$7/mo) ===
+                # Release static IPs that have been idle (no running VMs) for
+                # JARVIS_STATIC_IP_RELEASE_TIMEOUT_HOURS. Re-allocated on next VM creation.
+                try:
+                    _ip_release_timeout_h = float(os.getenv("JARVIS_STATIC_IP_RELEASE_TIMEOUT_HOURS", "4"))
+                    _has_running_vms = any(
+                        vm.state == VMState.RUNNING for vm in self.managed_vms.values()
+                    )
+                    if not _has_running_vms and self._static_ip_tracking:
+                        now_mono = time.monotonic()
+                        for ip_name, alloc_time in list(self._static_ip_tracking.items()):
+                            idle_hours = (now_mono - alloc_time) / 3600.0
+                            if idle_hours >= _ip_release_timeout_h:
+                                logger.info(
+                                    f"[CostAware] Static IP '{ip_name}' idle for "
+                                    f"{idle_hours:.1f}h (limit {_ip_release_timeout_h}h) — releasing"
+                                )
+                                await self._release_static_ip(ip_name)
+                except Exception as ip_release_err:
+                    logger.debug(f"Static IP release check failed (non-critical): {ip_release_err}")
+
                 # === STEP 6: Publish VM state for cross-repo coordination ===
                 # Called once per monitoring cycle (not per-VM) — writes to ~/.jarvis/cross_repo/gcp/
                 try:
@@ -8121,6 +8281,46 @@ class GCPVMManager:
         except Exception as e:
             logger.warning(f"[InvincibleNode] Error creating static IP: {e}")
             return None
+
+    async def _release_static_ip(self, ip_name: str) -> bool:
+        """Release a static IP address to stop incurring idle costs ($0.010/hr).
+
+        Called when no VMs have been active for JARVIS_STATIC_IP_RELEASE_TIMEOUT_HOURS.
+        The IP will be re-allocated on next VM creation.
+        """
+        try:
+            import subprocess
+
+            logger.info(f"[CostAware] Releasing idle static IP '{ip_name}' in {self.config.region}")
+
+            result = await asyncio.to_thread(
+                subprocess.run,
+                [
+                    "gcloud", "compute", "addresses", "delete", ip_name,
+                    "--project", self.config.project_id,
+                    "--region", self.config.region,
+                    "--quiet",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+            if result.returncode == 0:
+                self._static_ip_tracking.pop(ip_name, None)
+                logger.info(f"[CostAware] Static IP '{ip_name}' released (saving $0.010/hr)")
+                return True
+            else:
+                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
+                if "was not found" in error_msg.lower() or "not found" in error_msg.lower():
+                    self._static_ip_tracking.pop(ip_name, None)
+                    return True  # Already gone
+                logger.warning(f"[CostAware] Failed to release static IP: {error_msg}")
+                return False
+
+        except Exception as e:
+            logger.warning(f"[CostAware] Error releasing static IP '{ip_name}': {e}")
+            return False
 
     async def _ping_health_endpoint(
         self, ip: str, port: int, timeout: float = 10.0

@@ -45,7 +45,10 @@ import asyncio
 import json
 import logging
 import os
+import socket
 import statistics
+import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -411,6 +414,10 @@ class CostTracker:
         self._redis_available = False
         self._websocket_subscribers: Set[Callable] = set()
 
+        # Budget reservation system (durable, fenced by supervisor epoch)
+        self._reservation_lock = asyncio.Lock()
+        self._supervisor_epoch = f"{socket.gethostname()}-{os.getpid()}-{time.time():.0f}"
+
         logger.info(f"💰 Advanced CostTracker v3.0 initialized")
         logger.info(f"   DB: {self.config.db_path}")
         logger.info(f"   VM Type: {self.config.vm_instance_type}")
@@ -430,6 +437,13 @@ class CostTracker:
             logger.info(
                 f"✅ Auto-cleanup enabled (every {self.config.cleanup_check_interval_hours}h)"
             )
+
+        # Always-on cost ticker: records Cloud SQL + Static IP costs hourly
+        # for accurate real-time budget view
+        self._cost_ticker_task: Optional[asyncio.Task] = asyncio.create_task(
+            self._always_on_cost_ticker()
+        )
+        logger.info("💰 Always-on cost ticker started")
 
     async def shutdown(self):
         """
@@ -465,6 +479,14 @@ class CostTracker:
                 pass
             except Exception as e:
                 logger.debug(f"Cleanup task termination error (non-critical): {e}")
+
+        # Cancel cost ticker
+        if hasattr(self, '_cost_ticker_task') and self._cost_ticker_task and not self._cost_ticker_task.done():
+            self._cost_ticker_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(self._cost_ticker_task), timeout=3.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
 
         # Shutdown Redis (v3.0)
         await self._shutdown_redis()
@@ -901,6 +923,29 @@ class CostTracker:
                         """
                         CREATE INDEX IF NOT EXISTS idx_cloud_service_costs_timestamp
                         ON cloud_service_costs(timestamp)
+                    """
+                    )
+
+                    # Budget reservations table (durable, fenced by supervisor epoch)
+                    # Prevents budget leaks from crash between reserve and commit.
+                    await db.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS budget_reservations (
+                            reservation_id TEXT PRIMARY KEY,
+                            category TEXT NOT NULL,
+                            amount REAL NOT NULL,
+                            supervisor_epoch TEXT NOT NULL,
+                            created_at REAL NOT NULL,
+                            expires_at REAL NOT NULL,
+                            status TEXT NOT NULL DEFAULT 'active'
+                        )
+                    """
+                    )
+
+                    await db.execute(
+                        """
+                        CREATE INDEX IF NOT EXISTS idx_budget_reservations_status
+                        ON budget_reservations(status)
                     """
                     )
 
@@ -2112,6 +2157,258 @@ class CostTracker:
                     callback(event_type, data)
             except Exception as e:
                 logger.error(f"Alert callback failed: {e}")
+
+    # =========================================================================
+    # BUDGET RESERVATION SYSTEM (Durable, Fenced, Two-Phase Spend)
+    # =========================================================================
+
+    async def _get_daily_spend(self) -> float:
+        """Get today's total recorded spend (VM + cloud services)."""
+        summary = await self.get_cost_summary("day")
+        daily = summary.get("total_estimated_cost", 0.0)
+        # Include currently running VMs
+        for session in self.active_sessions.values():
+            daily += session.calculate_cost(self.config.spot_vm_hourly_cost)
+        return daily
+
+    async def _get_monthly_spend(self) -> float:
+        """Get this month's total recorded spend (VM + cloud services)."""
+        summary = await self.get_cost_summary("month")
+        monthly = summary.get("total_estimated_cost", 0.0)
+        for session in self.active_sessions.values():
+            monthly += session.calculate_cost(self.config.spot_vm_hourly_cost)
+        return monthly
+
+    async def _get_active_reservations_total(self) -> float:
+        """Sum of active (non-expired) reservations from SQLite."""
+        try:
+            import aiosqlite
+            now = time.time()
+            async with aiosqlite.connect(
+                self.config.db_path, timeout=self.config.db_timeout
+            ) as db:
+                # Sweep expired reservations
+                await db.execute(
+                    "UPDATE budget_reservations SET status='expired' "
+                    "WHERE status='active' AND expires_at < ?",
+                    (now,),
+                )
+                await db.commit()
+
+                cursor = await db.execute(
+                    "SELECT COALESCE(SUM(amount), 0) FROM budget_reservations WHERE status='active'"
+                )
+                row = await cursor.fetchone()
+                return row[0] if row else 0.0
+        except Exception as e:
+            logger.warning("[CostTracker] Failed to read reservations: %s", e)
+            return 0.0
+
+    async def reserve_spend(
+        self, estimated_cost: float, category: str
+    ) -> Tuple[bool, str, Optional[str]]:
+        """Phase 1: Reserve budget atomically. Returns (allowed, reason, reservation_id).
+
+        Uses existing CostTrackerConfig fields:
+          - self.config.alert_threshold_daily  (env: COST_ALERT_DAILY, default: 1.00)
+          - self.config.alert_threshold_monthly (env: COST_ALERT_MONTHLY, default: 20.00)
+
+        Categories: 'vm_create', 'vm_extend', 'cloud_sql', 'static_ip', 'cloud_run', 'golden_image'.
+        """
+        async with self._reservation_lock:
+            try:
+                import aiosqlite
+                now = time.time()
+                ttl_seconds = float(os.getenv("JARVIS_RESERVATION_TTL_S", "300"))
+
+                async with aiosqlite.connect(
+                    self.config.db_path, timeout=self.config.db_timeout
+                ) as db:
+                    # 1. Sweep expired reservations
+                    await db.execute(
+                        "UPDATE budget_reservations SET status='expired' "
+                        "WHERE status='active' AND expires_at < ?",
+                        (now,),
+                    )
+
+                    # 2. Sum active reservations (from ANY epoch)
+                    cursor = await db.execute(
+                        "SELECT COALESCE(SUM(amount), 0) FROM budget_reservations WHERE status='active'"
+                    )
+                    row = await cursor.fetchone()
+                    reserved_total = row[0] if row else 0.0
+
+                    # 3. Budget check
+                    daily_spent = await self._get_daily_spend()
+                    monthly_spent = await self._get_monthly_spend()
+
+                    daily_remaining = self.config.alert_threshold_daily - daily_spent - reserved_total
+                    monthly_remaining = self.config.alert_threshold_monthly - monthly_spent - reserved_total
+
+                    if self.config.hard_budget_enforcement:
+                        if estimated_cost > daily_remaining:
+                            return (
+                                False,
+                                f"Daily budget exceeded ({daily_remaining:.2f} remaining)",
+                                None,
+                            )
+                        if estimated_cost > monthly_remaining:
+                            return (
+                                False,
+                                f"Monthly budget exceeded ({monthly_remaining:.2f} remaining)",
+                                None,
+                            )
+
+                    # 4. Persist reservation with TTL and epoch
+                    reservation_id = f"{category}:{uuid.uuid4().hex[:8]}"
+                    await db.execute(
+                        "INSERT INTO budget_reservations "
+                        "(reservation_id, category, amount, supervisor_epoch, created_at, expires_at, status) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'active')",
+                        (
+                            reservation_id,
+                            category,
+                            estimated_cost,
+                            self._supervisor_epoch,
+                            now,
+                            now + ttl_seconds,
+                        ),
+                    )
+                    await db.commit()
+
+                    logger.info(
+                        "[CostTracker] Reserved $%.4f for %s (id=%s, ttl=%.0fs)",
+                        estimated_cost, category, reservation_id, ttl_seconds,
+                    )
+                    return True, "reserved", reservation_id
+
+            except Exception as e:
+                logger.error("[CostTracker] reserve_spend failed: %s", e)
+                return False, f"Reservation error: {e}", None
+
+    async def commit_spend(self, reservation_id: str) -> None:
+        """Phase 2a: Commit — resource was created, record actual cost.
+
+        Must match current supervisor epoch (fencing).
+        """
+        async with self._reservation_lock:
+            try:
+                import aiosqlite
+                async with aiosqlite.connect(
+                    self.config.db_path, timeout=self.config.db_timeout
+                ) as db:
+                    cursor = await db.execute(
+                        "SELECT supervisor_epoch, status FROM budget_reservations "
+                        "WHERE reservation_id=?",
+                        (reservation_id,),
+                    )
+                    row = await cursor.fetchone()
+                    if not row or row[1] != "active":
+                        logger.warning(
+                            "[CostTracker] Commit for unknown/inactive reservation %s",
+                            reservation_id,
+                        )
+                        return
+                    if row[0] != self._supervisor_epoch:
+                        logger.error(
+                            "[CostTracker] FENCING: Commit from stale epoch %s (current: %s)",
+                            row[0], self._supervisor_epoch,
+                        )
+                        return  # Reject stale commit
+                    await db.execute(
+                        "UPDATE budget_reservations SET status='committed' "
+                        "WHERE reservation_id=?",
+                        (reservation_id,),
+                    )
+                    await db.commit()
+                    logger.info("[CostTracker] Committed reservation %s", reservation_id)
+            except Exception as e:
+                logger.error("[CostTracker] commit_spend failed: %s", e)
+
+    async def release_spend(self, reservation_id: str) -> None:
+        """Phase 2b: Release — resource creation failed, free the reservation."""
+        async with self._reservation_lock:
+            try:
+                import aiosqlite
+                async with aiosqlite.connect(
+                    self.config.db_path, timeout=self.config.db_timeout
+                ) as db:
+                    await db.execute(
+                        "UPDATE budget_reservations SET status='released' "
+                        "WHERE reservation_id=?",
+                        (reservation_id,),
+                    )
+                    await db.commit()
+                    logger.debug("[CostTracker] Released reservation %s", reservation_id)
+            except Exception as e:
+                logger.error("[CostTracker] release_spend failed: %s", e)
+
+    async def can_spend(self, estimated_cost: float, category: str) -> Tuple[bool, str]:
+        """Simple check without holding reservation. For read-only queries / MCP tools."""
+        allowed, reason, res_id = await self.reserve_spend(estimated_cost, category)
+        if allowed and res_id:
+            await self.release_spend(res_id)
+        return allowed, reason
+
+    # =========================================================================
+    # Always-On Cost Ticker — records hourly costs for persistent services
+    # =========================================================================
+
+    async def _always_on_cost_ticker(self) -> None:
+        """Background task that records Cloud SQL + Static IP costs hourly.
+
+        Without this, budget view only sees costs at session start/end,
+        missing hours of accumulation for always-on services.
+        """
+        ticker_interval_s = float(os.getenv("JARVIS_COST_TICKER_INTERVAL_S", "3600"))
+        cloud_sql_hourly = float(os.getenv("JARVIS_CLOUD_SQL_HOURLY_COST", "0.0150"))
+        static_ip_hourly = float(os.getenv("JARVIS_STATIC_IP_HOURLY_COST", "0.010"))
+
+        try:
+            while True:
+                await asyncio.sleep(ticker_interval_s)
+
+                # Check if Cloud SQL proxy is running
+                try:
+                    from backend.core.proxy.cost_aware_proxy import get_cost_aware_proxy
+                    proxy = get_cost_aware_proxy()
+                    if proxy.is_running:
+                        await self.record_cloud_service_cost(
+                            service_type=CloudServiceType.CLOUD_SQL,
+                            duration_hours=ticker_interval_s / 3600.0,
+                            hourly_rate=cloud_sql_hourly,
+                            metadata={"source": "cost_ticker", "interval_s": ticker_interval_s},
+                        )
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"[CostTicker] Cloud SQL cost recording failed: {e}")
+
+                # Record static IP costs for tracked IPs
+                try:
+                    from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                    mgr = get_gcp_vm_manager_safe()
+                    if mgr and mgr._static_ip_tracking:
+                        ip_count = len(mgr._static_ip_tracking)
+                        await self.record_cloud_service_cost(
+                            service_type=CloudServiceType.STATIC_IP,
+                            duration_hours=ticker_interval_s / 3600.0 * ip_count,
+                            hourly_rate=static_ip_hourly,
+                            metadata={
+                                "source": "cost_ticker",
+                                "ip_count": ip_count,
+                                "interval_s": ticker_interval_s,
+                            },
+                        )
+                except ImportError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"[CostTicker] Static IP cost recording failed: {e}")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"[CostTicker] Ticker loop error: {e}")
 
     # =========================================================================
     # v2.0: BUDGET ENFORCEMENT (Solo Developer Protection)

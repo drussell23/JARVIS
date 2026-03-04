@@ -21,8 +21,8 @@ from backend.core.memory_types import (
 logger = logging.getLogger(__name__)
 
 # --- Configuration (all env-var-driven, no hardcoding) ---
-_SPOT_CREATE_COOLDOWN_S = float(os.getenv("JARVIS_SPOT_CREATE_COOLDOWN_S", "120"))
-_CRITICAL_SUSTAIN_S = float(os.getenv("JARVIS_CRITICAL_SUSTAIN_THRESHOLD_S", "30"))
+_SPOT_CREATE_COOLDOWN_S = float(os.getenv("JARVIS_SPOT_CREATE_COOLDOWN_S", "300"))
+_CRITICAL_SUSTAIN_S = float(os.getenv("JARVIS_CRITICAL_SUSTAIN_THRESHOLD_S", "60"))
 _QUEUE_DEPTH_OFFLOAD = int(os.getenv("JARVIS_QUEUE_DEPTH_OFFLOAD", "8"))
 
 # Module-level singleton for cross-module access

@@ -282,8 +282,8 @@ class LoadingServerConfig:
     # Trinity service discovery
     backend_port: int = field(default_factory=lambda: int(os.getenv("JARVIS_BACKEND_PORT", "8010")))
     frontend_port: int = field(default_factory=lambda: int(os.getenv("JARVIS_FRONTEND_PORT", "3000")))
-    # v238.0: Default 8001 to match trinity_config.py v192.2 alignment
-    prime_port: int = field(default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8001")))
+    # Unified to 8000: JARVIS Prime inference server default port
+    prime_port: int = field(default_factory=lambda: int(os.getenv("JARVIS_PRIME_PORT", "8000")))
     reactor_port: int = field(default_factory=lambda: int(os.getenv("REACTOR_CORE_PORT", "8090")))
 
     # Paths

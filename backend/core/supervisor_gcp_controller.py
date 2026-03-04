@@ -152,7 +152,7 @@ class GCPControllerConfig:
         default_factory=lambda: int(os.getenv("GCP_IDLE_WARN_MINS", "10"))
     )
     idle_shutdown_minutes: int = field(
-        default_factory=lambda: int(os.getenv("GCP_IDLE_SHUTDOWN_MINS", "15"))
+        default_factory=lambda: int(os.getenv("GCP_IDLE_SHUTDOWN_MINS", "5"))
     )
     
     # Memory thresholds (override defaults)

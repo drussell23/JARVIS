@@ -65584,10 +65584,10 @@ class JarvisSystemKernel:
 
         try:
             from core.infrastructure_orchestrator import cleanup_infrastructure_on_shutdown
-            await asyncio.wait_for(cleanup_infrastructure_on_shutdown(), timeout=10.0)
+            await asyncio.wait_for(cleanup_infrastructure_on_shutdown(), timeout=60.0)
             self.logger.debug("[Kernel] v266.2: InfrastructureOrchestrator cleaned up")
         except asyncio.TimeoutError:
-            self.logger.debug("[Kernel] v266.2: InfraOrch cleanup timed out (10s)")
+            self.logger.debug("[Kernel] v266.2: InfraOrch cleanup timed out (60s)")
         except Exception as _io_err:
             self.logger.debug(f"[Kernel] v266.2: InfraOrch cleanup error: {_io_err}")
 

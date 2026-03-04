@@ -206,7 +206,7 @@ class SystemKernelConfig:
         Path.home() / "Documents" / "repos" / "reactor-core"
     ))
     
-    jarvis_prime_port: int = field(default_factory=lambda: _env_int("JARVIS_PRIME_PORT", 8001))
+    jarvis_prime_port: int = field(default_factory=lambda: _env_int("JARVIS_PRIME_PORT", 8000))
     reactor_core_port: int = field(default_factory=lambda: _env_int("REACTOR_CORE_PORT", 8090))
     
     # =========================================================================

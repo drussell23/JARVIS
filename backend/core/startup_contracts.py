@@ -130,7 +130,7 @@ ENV_CONTRACTS: List[EnvContract] = [
         "JARVIS_INVINCIBLE_NODE_PORT", "Port of the Invincible Node",
         value_type="int",
         pattern=r"^\d{1,5}$",
-        default="8001",
+        default="8000",
     ),
     EnvContract(
         "JARVIS_GCP_OFFLOAD_ACTIVE", "Whether GCP offload is active",

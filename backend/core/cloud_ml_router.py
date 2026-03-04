@@ -53,7 +53,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 # SCALE-TO-ZERO CONFIGURATION (Dynamic, no hardcoding)
 # =============================================================================
-SCALE_TO_ZERO_IDLE_MINUTES = int(os.getenv("SCALE_TO_ZERO_IDLE_MINUTES", "15"))
+SCALE_TO_ZERO_IDLE_MINUTES = int(os.getenv("SCALE_TO_ZERO_IDLE_MINUTES", "5"))
 SCALE_TO_ZERO_ENABLED = os.getenv("SCALE_TO_ZERO_ENABLED", "true").lower() == "true"
 SCALE_TO_ZERO_CHECK_INTERVAL = int(os.getenv("SCALE_TO_ZERO_CHECK_INTERVAL", "60"))  # seconds
 

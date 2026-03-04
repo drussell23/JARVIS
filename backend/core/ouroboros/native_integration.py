@@ -23107,7 +23107,7 @@ async def register_service_with_mesh(
     Usage:
         await register_service_with_mesh(
             "jarvis-prime",
-            port=8001,
+            port=8000,
             dependencies=["jarvis-core"],
             restart_fn=restart_prime,
         )
@@ -25850,7 +25850,7 @@ class CrossRepoHealthCoordinator:
                     Path.home() / "Documents/repos/JARVIS-Prime"
                 )),
                 "health_file": ".jarvis_prime_health",
-                "port": int(os.environ.get("JARVIS_PRIME_PORT", 8001)),
+                "port": int(os.environ.get("JARVIS_PRIME_PORT", 8000)),
             },
             "reactor_core": {
                 "path": Path(os.environ.get(

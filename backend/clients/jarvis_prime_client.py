@@ -467,14 +467,13 @@ class IntelligentServiceDiscovery:
     """
 
     # Known ports to probe (ordered by preference)
-    # v192.2: Changed default from 8000 to 8001 to avoid conflict with unified_supervisor
     PROBE_PORTS: List[int] = [
-        int(os.getenv("JARVIS_PRIME_PORT", "8001")),  # Default/configured
-        8001,  # Standard J-Prime port (v192.2)
+        int(os.getenv("JARVIS_PRIME_PORT", "8000")),  # Default/configured
+        8000,  # Standard J-Prime port
+        8001,  # Vision server / legacy
         8002,  # First fallback
         8003,  # v228.0: Extended fallback range
         8004,  # v228.0: Extended fallback range
-        8000,  # Legacy (conflicts with jarvis-body)
         11434, # Ollama compatibility
     ]
 
@@ -742,10 +741,9 @@ class IntelligentServiceDiscovery:
         discovered = []
 
         # Get unique ports to probe
-        # v192.2: Changed default from 8000 to 8001
         probe_ports = list(dict.fromkeys([
-            int(os.getenv("JARVIS_PRIME_PORT", "8001")),
-            8001, 8000, 8002, 11434
+            int(os.getenv("JARVIS_PRIME_PORT", "8000")),
+            8000, 8001, 8002, 11434
         ]))
 
         # Probe ports in parallel
@@ -1023,9 +1021,8 @@ class JARVISPrimeConfig(ClientConfig):
     Set JARVIS_PRIME_URL environment variable to override.
     """
     name: str = "jarvis_prime"
-    # v192.2: Changed from 8000 to 8001 to avoid conflict with jarvis-body
     base_url: str = field(default_factory=lambda: _env_str(
-        "JARVIS_PRIME_URL", "http://localhost:8001"
+        "JARVIS_PRIME_URL", "http://localhost:8000"
     ))
     timeout: float = field(default_factory=lambda: _env_float(
         "JARVIS_PRIME_TIMEOUT", 60.0
@@ -1129,6 +1126,11 @@ class JARVISPrimeClient(TrinityBaseClient[Dict[str, Any]]):
         # HTTP session
         self._session = None
 
+        # Cold-start awareness for Cloud Run endpoints
+        self._endpoint_warm = False
+        self._cold_start_timeout = float(os.getenv("JARVIS_CLOUD_RUN_COLD_START_TIMEOUT", "45"))
+        self._steady_state_timeout = float(os.getenv("JARVIS_CLOUD_RUN_STEADY_TIMEOUT", "8"))
+
         logger.info(
             f"[JARVISPrime] Client initialized (discovery={'enabled' if self._prime_config.enable_discovery else 'disabled'})"
         )
@@ -1215,7 +1217,14 @@ class JARVISPrimeClient(TrinityBaseClient[Dict[str, Any]]):
             session = await self._get_session()
 
             # v89.0: Use configurable timeout (default 10s, was hardcoded 5s)
-            health_timeout = float(os.getenv("PRIME_HEALTH_CHECK_TIMEOUT", "10.0"))
+            # Cold-start awareness: use longer timeout if endpoint hasn't responded yet
+            if self._endpoint_warm:
+                health_timeout = float(os.getenv("PRIME_HEALTH_CHECK_TIMEOUT", "10.0"))
+            else:
+                health_timeout = max(
+                    float(os.getenv("PRIME_HEALTH_CHECK_TIMEOUT", "10.0")),
+                    self._cold_start_timeout,
+                )
 
             # v89.0: Reordered by likelihood - /v1/models is most reliable for OpenAI format
             # /health is standard, /api/health is legacy fallback
@@ -1230,6 +1239,9 @@ class JARVISPrimeClient(TrinityBaseClient[Dict[str, Any]]):
                         timeout=aiohttp.ClientTimeout(total=health_timeout)
                     ) as response:
                         if response.status == 200:
+                            if not self._endpoint_warm:
+                                logger.info("[JARVISPrime] Endpoint now warm (first successful response)")
+                            self._endpoint_warm = True
                             logger.debug(f"[JARVISPrime] Health check passed: {endpoint}")
                             return True
                         else:

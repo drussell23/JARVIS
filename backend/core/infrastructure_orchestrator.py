@@ -619,13 +619,26 @@ class InfrastructureOrchestrator:
         return targets
 
     def _get_resources_to_destroy(self) -> List[str]:
-        """Get resources that WE created and should destroy."""
+        """Get resources that WE created and should destroy.
+
+        In aggressive mode (default in solo dev), also includes resources
+        tracked locally with jarvis provenance metadata.
+        """
         targets = []
+        aggressive = os.getenv(
+            "JARVIS_CLEANUP_AGGRESSIVE",
+            "true" if os.getenv("JARVIS_SOLO_DEVELOPER_MODE", "true").lower() == "true"
+            else "false",
+        ).lower() == "true"
 
         for key, resource in self.state.resources.items():
-            if resource.we_created_it and resource.state == ResourceState.PROVISIONED:
-                targets.append(resource.terraform_module)
-                logger.debug(f"[InfraOrchestrator] Will destroy: {resource.name}")
+            if resource.state == ResourceState.PROVISIONED:
+                if resource.we_created_it:
+                    targets.append(resource.terraform_module)
+                    logger.debug(f"[InfraOrchestrator] Will destroy: {resource.name}")
+                elif aggressive and resource.metadata.get("created_by") == "jarvis":
+                    targets.append(resource.terraform_module)
+                    logger.info("[InfraOrchestrator] Aggressive cleanup: including %s (jarvis metadata)", key)
 
         return targets
 
@@ -2160,17 +2173,26 @@ async def cleanup_infrastructure_on_shutdown():
     """
     global _orchestrator_instance, _reconciler_instance, _orphan_loop_instance
 
-    # Stop orphan detection first
+    # Stop orphan detection first (5s budget)
     if _orphan_loop_instance:
-        await _orphan_loop_instance.stop()
+        try:
+            await asyncio.wait_for(_orphan_loop_instance.stop(), timeout=5.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("[InfraOrchestrator] Orphan loop stop failed: %s", e)
 
-    # Cleanup infrastructure
+    # Cleanup infrastructure (45s budget — terraform/gcloud needs this)
     if _orchestrator_instance:
-        await _orchestrator_instance.cleanup_infrastructure()
+        try:
+            await asyncio.wait_for(_orchestrator_instance.cleanup_infrastructure(), timeout=45.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("[InfraOrchestrator] Infrastructure cleanup failed: %s", e)
 
-    # Release session lock
+    # Release session lock (5s budget)
     if _reconciler_instance:
-        await _reconciler_instance.release_lock()
+        try:
+            await asyncio.wait_for(_reconciler_instance.release_lock(), timeout=5.0)
+        except (asyncio.TimeoutError, Exception) as e:
+            logger.warning("[InfraOrchestrator] Session lock release failed: %s", e)
 
     logger.info("[InfraOrchestrator] Shutdown cleanup complete")
 
@@ -2222,7 +2244,10 @@ def register_shutdown_hook():
             _emergency_cleanup_sync()
 
     def _emergency_cleanup_sync():
-        """Emergency cleanup using gcloud CLI (sync, no async)."""
+        """Emergency cleanup using gcloud CLI (sync, no async).
+
+        Lists instances with labels.created-by=jarvis and actually deletes them.
+        """
         import subprocess
 
         project_id = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT"))
@@ -2232,8 +2257,8 @@ def register_shutdown_hook():
         logger.warning("[InfraOrchestrator] Running emergency gcloud cleanup...")
 
         try:
-            # Delete all JARVIS VMs
-            subprocess.run(
+            # List instances with our label
+            result = subprocess.run(
                 [
                     "gcloud", "compute", "instances", "list",
                     f"--project={project_id}",
@@ -2241,9 +2266,32 @@ def register_shutdown_hook():
                     "--format=value(name,zone)",
                 ],
                 capture_output=True,
-                timeout=15
+                text=True,
+                timeout=15,
             )
-            # Note: actual deletion would follow, but we're just trying best-effort
+
+            # Actually delete them
+            for line in result.stdout.strip().splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                name, zone = parts[0], parts[1]
+                logger.warning("[InfraOrchestrator] Emergency deleting VM: %s (%s)", name, zone)
+                try:
+                    subprocess.run(
+                        [
+                            "gcloud", "compute", "instances", "delete", name,
+                            f"--project={project_id}",
+                            f"--zone={zone}",
+                            "--quiet",
+                        ],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                except Exception as del_err:
+                    logger.error("[InfraOrchestrator] Emergency delete of %s failed: %s", name, del_err)
         except Exception as e:
             logger.error(f"[InfraOrchestrator] Emergency cleanup failed: {e}")
 

@@ -121,11 +121,17 @@ class _EndpointAwareCircuitBreaker:
             return False
         return True  # half_open
 
-    def get_timeout_override(self, default_timeout: float) -> float:
-        """Probe timeout only for cold/half_open on NON-promoted endpoints."""
+    def get_timeout_override(self, default_timeout: float, is_cloud_run: bool = False) -> float:
+        """Probe timeout for cold/half_open endpoints.
+
+        Cloud Run endpoints get longer timeouts to tolerate cold starts (10-30s).
+        """
         if self._state in ("cold", "half_open") and not self._endpoint_promoted:
-            probe_s = _get_env_float("PRIME_PROBE_TIMEOUT_S", 5.0)
-            return min(probe_s, default_timeout)
+            if is_cloud_run:
+                probe_s = _get_env_float("JARVIS_CLOUD_RUN_PROBE_TIMEOUT", 45.0)
+            else:
+                probe_s = _get_env_float("PRIME_PROBE_TIMEOUT_S", 5.0)
+            return min(probe_s, default_timeout) if not is_cloud_run else probe_s
         return default_timeout
 
     def record_success(self):
@@ -304,6 +310,13 @@ class PrimeRouter:
         # In-flight flag: prevents concurrent promote/demote while network I/O
         # is in progress outside the lock
         self._transition_in_flight: bool = False
+        # Cloud Run endpoint detection patterns
+        self._cloud_run_patterns = (".run.app", ".a.run.app")
+
+    def _is_cloud_run_endpoint(self, host: Optional[str] = None) -> bool:
+        """Detect if the given (or current GCP) host is a Cloud Run endpoint."""
+        h = host or self._gcp_host or ""
+        return any(h.endswith(pat) for pat in self._cloud_run_patterns)
 
     async def initialize(self) -> None:
         """Initialize the router and its clients."""
@@ -519,6 +532,11 @@ class PrimeRouter:
             # while we perform the network call outside the lock.
             self._transition_in_flight = True
 
+            # Save prior state for rollback on failure
+            _prev_gcp_promoted = self._gcp_promoted
+            _prev_gcp_host = self._gcp_host
+            _prev_gcp_port = self._gcp_port
+
         # Phase 2: Network call outside lock — avoids holding lock during I/O
         logger.info(f"[PrimeRouter] v232.0: GCP VM promotion requested: {host}:{port}")
         try:
@@ -540,7 +558,10 @@ class PrimeRouter:
                         endpoint_id=f"gcp:{host}:{port}", health_checked=True
                     )
                 else:
-                    self._gcp_promoted = False
+                    # Restore prior valid state instead of blindly clearing
+                    self._gcp_promoted = _prev_gcp_promoted
+                    self._gcp_host = _prev_gcp_host
+                    self._gcp_port = _prev_gcp_port
 
         # Phase 4: Post-commit side effects (no lock needed, no state mutation)
         if success:

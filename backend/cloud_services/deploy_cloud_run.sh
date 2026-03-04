@@ -40,21 +40,21 @@ IMAGE_NAME="${ECAPA_IMAGE_NAME:-ecapa-cloud-service}"
 # Cloud Run configuration
 MEMORY="${CLOUD_RUN_MEMORY:-4Gi}"
 CPU="${CLOUD_RUN_CPU:-2}"
-# v20.5.0: min-instances=1 eliminates cold starts for latency-sensitive ML inference.
-# Cloud Run cold start for ECAPA model = 10-30s. Client probe timeout = 8-12s.
-# With min-instances=0, probe ALWAYS times out when container is cold.
-# Cost: ~$145/month for 1 always-warm instance (2 vCPU, 4Gi).
-# Override with CLOUD_RUN_MIN_INSTANCES=0 for dev/staging to save costs.
-MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-1}"
+# v20.5.0: min-instances + cpu-throttling depend on deployment mode.
+# Solo developer mode: scale-to-zero (cold starts acceptable, saves ~$145/month).
+# Production override: set CLOUD_RUN_MIN_INSTANCES=1 explicitly for warm instances.
+if [ "${JARVIS_SOLO_DEVELOPER_MODE:-true}" = "true" ]; then
+    MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-0}"
+    CPU_THROTTLING="${CLOUD_RUN_CPU_THROTTLING:-true}"   # request-based billing
+else
+    MIN_INSTANCES="${CLOUD_RUN_MIN_INSTANCES:-1}"
+    CPU_THROTTLING="${CLOUD_RUN_CPU_THROTTLING:-false}"  # always-on CPU
+fi
 MAX_INSTANCES="${CLOUD_RUN_MAX_INSTANCES:-3}"
 # v20.5.0: Concurrency reduced from 10 to 6 for CPU-bound ECAPA inference.
 # 2 vCPU can realistically handle 2 concurrent inference + 4 headroom for health/IO.
 CONCURRENCY="${CLOUD_RUN_CONCURRENCY:-6}"
 TIMEOUT="${CLOUD_RUN_TIMEOUT:-300s}"
-# v20.5.0: Instance-based billing keeps CPU always allocated. Prevents latency
-# spike on first request after idle (CPU re-allocation delay). Required for ML
-# inference where model must stay warm in memory.
-CPU_THROTTLING="${CLOUD_RUN_CPU_THROTTLING:-false}"  # false = always-on CPU
 # v20.5.0: Startup CPU Boost temporarily doubles vCPU during container startup.
 # 2 vCPU → 4 vCPU for model loading. Cuts cold start by 30-50%.
 CPU_BOOST="${CLOUD_RUN_CPU_BOOST:-true}"

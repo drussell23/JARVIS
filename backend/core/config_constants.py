@@ -80,12 +80,12 @@ WEBSOCKET_PORT: int = _env_int(
 
 JARVIS_PRIME_PORT: int = _env_int(
     "JARVIS_PRIME_PORT",
-    default=8001,
+    default=8000,
 )
 
 INVINCIBLE_NODE_PORT: int = _env_int(
     "JARVIS_INVINCIBLE_NODE_PORT",
-    default=8001,
+    default=8000,
 )
 
 

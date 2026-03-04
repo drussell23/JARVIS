@@ -669,18 +669,30 @@ class LaunchdServiceManager:
             return False
 
     async def unload(self) -> bool:
-        """Unload the launchd service."""
+        """Unload launchd service and delete plist. Does NOT manage process directly."""
         try:
+            # Use bootout (modern replacement for deprecated unload)
             result = await asyncio.create_subprocess_exec(
-                "launchctl", "unload", str(self._plist_path),
+                "launchctl", "bootout", f"gui/{os.getuid()}", str(self._plist_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            await result.communicate()
-            # Ignore errors (service may not be loaded)
+            await asyncio.wait_for(result.communicate(), timeout=5.0)
+
+            # Delete plist to prevent auto-restart on next login
+            if self._plist_path.exists():
+                self._plist_path.unlink()
+                logger.info("[LaunchdManager] Deleted plist: %s", self._plist_path)
+
             return True
         except Exception as e:
-            logger.warning(f"[LaunchdManager] Unload warning: {e}")
+            logger.warning("[LaunchdManager] Unload failed: %s", e)
+            # Best-effort plist removal even on launchctl failure
+            try:
+                if self._plist_path.exists():
+                    self._plist_path.unlink()
+            except OSError:
+                pass
             return False
 
     async def is_running(self) -> bool:
@@ -1224,6 +1236,16 @@ class ProxyLifecycleController:
                     self._process.kill()
                 except Exception:
                     pass
+
+            # Post-unload verification — ensure process actually stopped
+            if self._pid:
+                await asyncio.sleep(0.5)
+                if self._is_process_running(self._pid):
+                    logger.warning("[LifecycleController] Process %d survived unload — force killing", self._pid)
+                    try:
+                        os.kill(self._pid, signal.SIGKILL)
+                    except (OSError, ProcessLookupError):
+                        pass
 
             # v271.0: Record Cloud SQL proxy session cost BEFORE clearing state.
             # This makes proxy runtime visible to budget enforcement so
