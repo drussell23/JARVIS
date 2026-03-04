@@ -61,6 +61,27 @@ logger = logging.getLogger(__name__)
 
 
 # ===================================================================
+# Ghost display connectivity helper
+# ===================================================================
+
+
+async def _query_ghost_display_connected() -> bool:
+    """Check whether the ghost display is still connected via BetterDisplay CLI.
+
+    Returns ``True`` when the phantom hardware manager reports a connected
+    display, ``False`` on any error or disconnection.
+    """
+    try:
+        from backend.system.phantom_hardware_manager import get_phantom_manager
+
+        mgr = get_phantom_manager()
+        mode = await mgr.get_current_mode_async()
+        return mode.get("connected", False)
+    except Exception:
+        return False
+
+
+# ===================================================================
 # Errors
 # ===================================================================
 
@@ -493,10 +514,32 @@ class MemoryBudgetBroker:
         leases = data.get("leases", [])
 
         for lease_data in leases:
+            component_id = lease_data.get("component_id", "")
             state = lease_data.get("state", "")
             lease_epoch = lease_data.get("epoch", 0)
             pid = lease_data.get("pid", 0)
             actual = lease_data.get("actual_bytes") or lease_data.get("granted_bytes", 0)
+
+            # Special handling for display leases: check live connectivity
+            # rather than relying solely on PID / epoch heuristics.
+            if component_id.startswith("display:"):
+                connected = await _query_ghost_display_connected()
+                if connected:
+                    # Display is still active -- restore (keep) the lease.
+                    logger.info(
+                        "Display lease %s (%s) restored -- display still connected",
+                        lease_data.get("lease_id", "?"), component_id,
+                    )
+                    continue
+                else:
+                    # Display disconnected -- reclaim its memory.
+                    report["stale"] += 1
+                    report["reclaimed_bytes"] += actual
+                    logger.info(
+                        "Display lease %s (%s) reclaimed -- display disconnected",
+                        lease_data.get("lease_id", "?"), component_id,
+                    )
+                    continue
 
             is_stale = False
             if lease_epoch != self._epoch:
