@@ -3060,6 +3060,43 @@ def _get_env_float(key: str, default: float) -> float:
     except (ValueError, TypeError):
         return default
 
+# ── v311.0: Organ Persistence Utilities ──────────────────────────────
+# Atomic JSON write/read for organ state persistence.
+# Storage layout: ~/.jarvis/organs/{organ_name}/{filename}.json
+
+_ORGAN_STORAGE_ROOT = Path.home() / ".jarvis" / "organs"
+
+def _atomic_write_json(path: Path, data: Any, *, schema_version: str = "1.0") -> None:
+    """Atomically write JSON data with schema version envelope.
+
+    Uses tempfile + fsync + rename pattern for crash consistency.
+    """
+    envelope = {
+        "_schema_version": schema_version,
+        "_written_at": time.time(),
+        "data": data,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        os.write(tmp_fd, json.dumps(envelope, indent=2, default=str).encode("utf-8"))
+        os.fsync(tmp_fd)
+    finally:
+        os.close(tmp_fd)
+    os.rename(tmp_path, str(path))
+
+
+def _load_json_state(path: Path) -> Optional[Dict[str, Any]]:
+    """Load JSON state from organ storage, returning the data dict or None."""
+    try:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw.get("data", raw)
+    except Exception:
+        return None
+
+
 def _get_env_command(key: str, default: Optional[List[str]] = None) -> List[str]:
     """Parse a shell-style command from environment into argv tokens."""
     if default is None:
@@ -37432,7 +37469,7 @@ class APIRoute:
             "avg_latency_ms": self.total_latency_ms / max(1, self.request_count),
         }
 
-class APIGatewayManager:
+class APIGatewayManager(SystemService):
     """
     API gateway for request routing.
 
@@ -37685,6 +37722,30 @@ class APIGatewayManager:
             "auth_validators": len(self._auth_validators),
             "stats": self._stats.copy(),
         }
+
+    async def initialize(self) -> None:
+        """Initialize APIGatewayManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="APIGatewayManager",
+            version="1.0.0",
+            inputs=['api.route.register', 'api.request'],
+            outputs=['api.response', 'api.route.registered'],
+            side_effects=['routes_api_traffic'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['api.request']
 
 # =============================================================================
 # ZONE 4.12: DEPLOYMENT AND INFRASTRUCTURE ORCHESTRATION
@@ -38834,7 +38895,7 @@ class BlueGreenState:
         self.green_version: Optional[str] = None
         self.last_switch_at: Optional[float] = None
 
-class BlueGreenDeployer:
+class BlueGreenDeployer(SystemService):
     """
     Zero-downtime blue-green deployments.
 
@@ -39003,6 +39064,30 @@ class BlueGreenDeployer:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize BlueGreenDeployer. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="BlueGreenDeployer",
+            version="1.0.0",
+            inputs=['deploy.blue_green', 'deploy.rollback'],
+            outputs=['deploy.switched', 'deploy.rolled_back'],
+            side_effects=['switches_traffic'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['deploy.blue_green']
+
 class CanaryReleaseState:
     """State for canary release."""
 
@@ -39027,7 +39112,7 @@ class CanaryReleaseState:
         self.stable_requests = 0
         self.stable_errors = 0
 
-class CanaryReleaseManager:
+class CanaryReleaseManager(SystemService):
     """
     Progressive canary deployments.
 
@@ -39271,6 +39356,30 @@ class CanaryReleaseManager:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize CanaryReleaseManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CanaryReleaseManager",
+            version="1.0.0",
+            inputs=['deploy.canary.start', 'deploy.canary.abort'],
+            outputs=['deploy.canary.promoted', 'deploy.canary.aborted'],
+            side_effects=['adjusts_traffic_split'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['deploy.canary.start']
+
 class RollbackCheckpoint:
     """Represents a rollback checkpoint."""
 
@@ -39298,7 +39407,7 @@ class RollbackCheckpoint:
             "metadata": self.metadata,
         }
 
-class RollbackCoordinator:
+class RollbackCoordinator(SystemService):
     """
     Automated rollback with checkpoints.
 
@@ -39486,6 +39595,30 @@ class RollbackCoordinator:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize RollbackCoordinator. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RollbackCoordinator",
+            version="1.0.0",
+            inputs=['deploy.rollback.create', 'deploy.rollback.execute'],
+            outputs=['deploy.checkpoint.created', 'deploy.rolled_back'],
+            side_effects=['writes_checkpoint_storage'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['deploy.rollback.execute']
+
 class InfrastructureResource:
     """Represents an infrastructure resource."""
 
@@ -39554,7 +39687,7 @@ class InfrastructureStack:
             },
         }
 
-class InfrastructureProvisionerManager:
+class InfrastructureProvisionerManager(SystemService):
     """
     Infrastructure provisioning management.
 
@@ -39721,6 +39854,30 @@ class InfrastructureProvisionerManager:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize InfrastructureProvisionerManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="InfrastructureProvisionerManager",
+            version="1.0.0",
+            inputs=['infra.provision', 'infra.destroy'],
+            outputs=['infra.provisioned', 'infra.destroyed'],
+            side_effects=['writes_infra_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['infra.provision']
+
 # =============================================================================
 # ZONE 4.13: DATA PIPELINE AND MESSAGING INFRASTRUCTURE
 # =============================================================================
@@ -39831,7 +39988,7 @@ class PipelineRun:
         self.current_stage: Optional[str] = None
         self.errors: List[Dict[str, Any]] = []
 
-class DataPipelineManager:
+class DataPipelineManager(SystemService):
     """
     ETL pipeline orchestration.
 
@@ -39999,6 +40156,30 @@ class DataPipelineManager:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize DataPipelineManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataPipelineManager",
+            version="1.0.0",
+            inputs=['pipeline.register', 'pipeline.run'],
+            outputs=['pipeline.completed', 'pipeline.failed'],
+            side_effects=['writes_pipeline_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['pipeline.run']
+
 class StreamEvent:
     """Represents an event in a stream."""
 
@@ -40051,7 +40232,7 @@ class StreamConsumerGroup:
         """Remove a consumer from the group."""
         self.consumers.discard(consumer_id)
 
-class StreamProcessor:
+class StreamProcessor(SystemService):
     """
     Real-time event stream processing.
 
@@ -40288,6 +40469,30 @@ class StreamProcessor:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize StreamProcessor. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="StreamProcessor",
+            version="1.0.0",
+            inputs=['stream.publish', 'stream.subscribe'],
+            outputs=['stream.delivered', 'stream.processed'],
+            side_effects=['writes_stream_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['stream.publish']
+
 class Topic:
     """Represents a pub/sub topic."""
 
@@ -40516,7 +40721,7 @@ class ScheduledJob:
         self.failure_count = 0
         self.last_error: Optional[str] = None
 
-class CronScheduler:
+class CronScheduler(SystemService):
     """
     Cron-style job scheduling.
 
@@ -40745,6 +40950,30 @@ class CronScheduler:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize CronScheduler. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CronScheduler",
+            version="1.0.0",
+            inputs=['cron.schedule', 'cron.trigger'],
+            outputs=['cron.executed', 'cron.scheduled'],
+            side_effects=['executes_scheduled_jobs'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['cron.schedule']
+
 class Webhook:
     """Represents a webhook endpoint."""
 
@@ -40769,7 +40998,7 @@ class Webhook:
         self.last_delivery_at: Optional[float] = None
         self.last_failure_at: Optional[float] = None
 
-class WebhookDispatcher:
+class WebhookDispatcher(SystemService):
     """
     Outgoing webhook management.
 
@@ -40932,6 +41161,30 @@ class WebhookDispatcher:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize WebhookDispatcher. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="WebhookDispatcher",
+            version="1.0.0",
+            inputs=['webhook.register', 'webhook.dispatch'],
+            outputs=['webhook.delivered', 'webhook.registered'],
+            side_effects=['sends_http_requests'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['webhook.dispatch']
+
 class CacheRegion:
     """Represents a cache region for invalidation coordination."""
 
@@ -40946,7 +41199,7 @@ class CacheRegion:
         self.last_invalidation_at: Optional[float] = None
         self.invalidation_count = 0
 
-class CacheInvalidationCoordinator:
+class CacheInvalidationCoordinator(SystemService):
     """
     Distributed cache invalidation.
 
@@ -41130,6 +41383,30 @@ class CacheInvalidationCoordinator:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize CacheInvalidationCoordinator. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CacheInvalidationCoordinator",
+            version="1.0.0",
+            inputs=['cache.invalidate', 'cache.register_region'],
+            outputs=['cache.invalidated', 'cache.region_registered'],
+            side_effects=['invalidates_cache_entries'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['cache.invalidate']
+
 class LoadSheddingPolicy:
     """Load shedding policy configuration."""
 
@@ -41145,7 +41422,7 @@ class LoadSheddingPolicy:
         self.action = action
         self.priority_threshold = priority_threshold
 
-class LoadSheddingController:
+class LoadSheddingController(SystemService):
     """
     Graceful degradation under load.
 
@@ -41325,6 +41602,30 @@ class LoadSheddingController:
             "requests_degraded": self._requests_degraded,
             "stats": self._stats.copy(),
         }
+
+    async def initialize(self) -> None:
+        """Initialize LoadSheddingController. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="LoadSheddingController",
+            version="1.0.0",
+            inputs=['loadshed.evaluate', 'loadshed.configure'],
+            outputs=['loadshed.decision', 'loadshed.shed'],
+            side_effects=['rejects_excess_load'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['loadshed.evaluate']
 
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
@@ -43173,7 +43474,7 @@ class EncryptionKey:
     purpose: str = "general"  # general, data, auth, signing
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class EncryptionServiceManager:
+class EncryptionServiceManager(SystemService):
     """
     Enterprise encryption and key management service.
 
@@ -43198,7 +43499,7 @@ class EncryptionServiceManager:
         self._logger = logging.getLogger("EncryptionServiceManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize encryption service with a master key."""
         try:
             async with self._lock:
@@ -43390,6 +43691,26 @@ class EncryptionServiceManager:
                     needs_rotation.append(key_id)
 
         return needs_rotation
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="EncryptionServiceManager",
+            version="1.0.0",
+            inputs=['crypto.encrypt', 'crypto.decrypt', 'crypto.rotate_key'],
+            outputs=['crypto.encrypted', 'crypto.decrypted'],
+            side_effects=['manages_encryption_keys'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['crypto.encrypt']
 
 @dataclass
 class AnomalyScore:
@@ -44730,7 +45051,7 @@ class ConfigurationChangeEvent:
     changed_at: datetime = field(default_factory=datetime.now)
     changed_by: str = "system"
 
-class ConfigurationManager:
+class ConfigurationManager(SystemService):
     """
     Centralized configuration management system.
 
@@ -44758,7 +45079,7 @@ class ConfigurationManager:
         self._logger = logging.getLogger("ConfigurationManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize configuration manager."""
         try:
             async with self._lock:
@@ -44991,6 +45312,26 @@ class ConfigurationManager:
             history = [e for e in history if e.key == key]
         return history[-limit:]
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ConfigurationManager",
+            version="1.0.0",
+            inputs=['config.set', 'config.get', 'config.reload'],
+            outputs=['config.changed', 'config.loaded'],
+            side_effects=['writes_config_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['config.set']
+
 @dataclass
 class DependencyDefinition:
     """Definition of a dependency."""
@@ -45000,7 +45341,7 @@ class DependencyDefinition:
     dependencies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class DependencyContainer:
+class DependencyContainer(SystemService):
     """
     Dependency injection container.
 
@@ -45025,7 +45366,7 @@ class DependencyContainer:
         self._logger = logging.getLogger("DependencyContainer")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize dependency container."""
         try:
             self._initialized = True
@@ -45152,6 +45493,26 @@ class DependencyContainer:
     def get_registered(self) -> List[str]:
         """Get list of registered dependency names."""
         return list(self._definitions.keys())
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DependencyContainer",
+            version="1.0.0",
+            inputs=['di.register', 'di.resolve'],
+            outputs=['di.resolved', 'di.registered'],
+            side_effects=['manages_singletons'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['di.resolve']
 
 @dataclass
 class Event:
@@ -45425,7 +45786,7 @@ class GraphEdge:
     properties: Dict[str, Any]
     created_at: datetime = field(default_factory=datetime.now)
 
-class GraphDatabaseManager:
+class GraphDatabaseManager(SystemService):
     """
     In-memory graph database manager.
 
@@ -45451,7 +45812,7 @@ class GraphDatabaseManager:
         self._logger = logging.getLogger("GraphDatabaseManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize graph database."""
         try:
             self._initialized = True
@@ -45745,6 +46106,26 @@ class GraphDatabaseManager:
             "edge_types": list(set(e.edge_type for e in self._edges.values()))
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="GraphDatabaseManager",
+            version="1.0.0",
+            inputs=['graph.node.add', 'graph.edge.add', 'graph.query'],
+            outputs=['graph.query.result', 'graph.updated'],
+            side_effects=['writes_graph_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['graph.query']
+
 @dataclass
 class SearchDocument:
     """A document in the search index."""
@@ -45762,7 +46143,7 @@ class SearchResult:
     highlights: List[str]
     document: SearchDocument
 
-class SearchEngineManager:
+class SearchEngineManager(SystemService):
     """
     Full-text search engine manager.
 
@@ -45799,7 +46180,7 @@ class SearchEngineManager:
         self._logger = logging.getLogger("SearchEngineManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize search engine."""
         try:
             self._initialized = True
@@ -46016,6 +46397,26 @@ class SearchEngineManager:
             ) / max(1, len(self._documents))
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SearchEngineManager",
+            version="1.0.0",
+            inputs=['search.index', 'search.query'],
+            outputs=['search.results', 'search.indexed'],
+            side_effects=['writes_search_index'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['search.query']
+
 @dataclass
 class IntegrationMessage:
     """A message on the integration bus."""
@@ -46029,7 +46430,7 @@ class IntegrationMessage:
     correlation_id: Optional[str] = None
     reply_to: Optional[str] = None
 
-class IntegrationBusManager:
+class IntegrationBusManager(SystemService):
     """
     Message-based integration bus.
 
@@ -46058,7 +46459,7 @@ class IntegrationBusManager:
         self._logger = logging.getLogger("IntegrationBusManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize integration bus."""
         try:
             self._initialized = True
@@ -46261,6 +46662,26 @@ class IntegrationBusManager:
         """Get dead letter messages."""
         return list(self._dead_letter)[-limit:]
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="IntegrationBusManager",
+            version="1.0.0",
+            inputs=['bus.publish', 'bus.subscribe'],
+            outputs=['bus.delivered', 'bus.subscribed'],
+            side_effects=['routes_messages'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['bus.publish']
+
 @dataclass
 class APIVersion:
     """An API version definition."""
@@ -46273,7 +46694,7 @@ class APIVersion:
     migration_guide: Optional[str] = None
     changes_from_previous: List[str] = field(default_factory=list)
 
-class APIVersionManager:
+class APIVersionManager(SystemService):
     """
     API versioning and lifecycle management.
 
@@ -46298,7 +46719,7 @@ class APIVersionManager:
         self._logger = logging.getLogger("APIVersionManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize API version manager."""
         try:
             # Register default versions
@@ -46464,6 +46885,26 @@ class APIVersionManager:
                 if self._versions.get(v, APIVersion(v, "", "")).status == "deprecated"
             )
         }
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="APIVersionManager",
+            version="1.0.0",
+            inputs=['api.version.register', 'api.version.deprecate'],
+            outputs=['api.version.registered', 'api.version.sunset'],
+            side_effects=['writes_version_registry'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['api.version.register']
 
 # =============================================================================
 # ZONE 4.16: RESOURCE MANAGEMENT AND MULTI-TENANCY
@@ -46823,7 +47264,7 @@ class TenantContext:
     session_id: Optional[str] = None
     request_id: Optional[str] = None
 
-class TenantManager:
+class TenantManager(SystemService):
     """
     Multi-tenant management system.
 
@@ -46851,7 +47292,7 @@ class TenantManager:
         self._logger = logging.getLogger("TenantManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize tenant manager."""
         try:
             async with self._lock:
@@ -47089,6 +47530,26 @@ class TenantManager:
             tenants = [t for t in tenants if t.status == status]
 
         return tenants
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="TenantManager",
+            version="1.0.0",
+            inputs=['tenant.create', 'tenant.configure'],
+            outputs=['tenant.created', 'tenant.updated'],
+            side_effects=['writes_tenant_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['tenant.create']
 
 @dataclass
 class RateLimitRule:
@@ -49072,7 +49533,7 @@ class ExperimentAssignment:
     variant: str
     assigned_at: datetime = field(default_factory=datetime.now)
 
-class ABTestingFramework:
+class ABTestingFramework(SystemService):
     """
     A/B testing and experimentation framework.
 
@@ -49098,7 +49559,7 @@ class ABTestingFramework:
         self._logger = logging.getLogger("ABTestingFramework")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize A/B testing framework."""
         try:
             self._initialized = True
@@ -49348,6 +49809,26 @@ class ABTestingFramework:
         experiment.end_date = datetime.now()
         return True
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ABTestingFramework",
+            version="1.0.0",
+            inputs=['experiment.create', 'experiment.assign'],
+            outputs=['experiment.assigned', 'experiment.concluded'],
+            side_effects=['writes_experiment_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['experiment.create']
+
 @dataclass
 class FeatureFlag:
     """A feature flag definition."""
@@ -49363,7 +49844,7 @@ class FeatureFlag:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class FeatureFlagManager:
+class FeatureFlagManager(SystemService):
     """
     Feature flag and toggle management.
 
@@ -49388,7 +49869,7 @@ class FeatureFlagManager:
         self._logger = logging.getLogger("FeatureFlagManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize feature flag manager."""
         try:
             self._initialized = True
@@ -49577,6 +50058,26 @@ class FeatureFlagManager:
     def get_all_flags(self) -> List[FeatureFlag]:
         """Get all feature flags."""
         return list(self._flags.values())
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="FeatureFlagManager",
+            version="1.0.0",
+            inputs=['flag.create', 'flag.evaluate'],
+            outputs=['flag.evaluated', 'flag.toggled'],
+            side_effects=['writes_flag_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['flag.evaluate']
 
 @dataclass
 class Rule:
@@ -49859,7 +50360,7 @@ class ValidationResult:
     errors: List[ValidationError]
     validated_data: Dict[str, Any]
 
-class DataValidationManager:
+class DataValidationManager(SystemService):
     """
     Data validation and schema enforcement.
 
@@ -49883,7 +50384,7 @@ class DataValidationManager:
         self._logger = logging.getLogger("DataValidationManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize data validation manager."""
         try:
             self._initialized = True
@@ -50065,6 +50566,26 @@ class DataValidationManager:
                 return None
         return current
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataValidationManager",
+            version="1.0.0",
+            inputs=['validation.validate', 'validation.register_schema'],
+            outputs=['validation.result', 'validation.schema_registered'],
+            side_effects=['writes_schema_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['validation.validate']
+
 @dataclass
 class Template:
     """A template definition."""
@@ -50076,7 +50597,7 @@ class Template:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class TemplateEngine:
+class TemplateEngine(SystemService):
     """
     Dynamic template rendering engine.
 
@@ -50100,7 +50621,7 @@ class TemplateEngine:
         self._logger = logging.getLogger("TemplateEngine")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize template engine."""
         try:
             # Register default filters
@@ -50275,6 +50796,26 @@ class TemplateEngine:
             # Clean up temporary template
             self._templates.pop(temp_id, None)
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="TemplateEngine",
+            version="1.0.0",
+            inputs=['template.register', 'template.render'],
+            outputs=['template.rendered'],
+            side_effects=['caches_templates'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['template.render']
+
 @dataclass
 class ReportSection:
     """A section in a report."""
@@ -50293,7 +50834,7 @@ class Report:
     summary: str
     metadata: Dict[str, Any]
 
-class ReportGenerator:
+class ReportGenerator(SystemService):
     """
     Dynamic report generation system.
 
@@ -50317,7 +50858,7 @@ class ReportGenerator:
         self._logger = logging.getLogger("ReportGenerator")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize report generator."""
         try:
             self._initialized = True
@@ -50558,6 +51099,26 @@ class ReportGenerator:
 
         return None
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ReportGenerator",
+            version="1.0.0",
+            inputs=['report.generate', 'report.schedule'],
+            outputs=['report.generated', 'report.ready'],
+            side_effects=['writes_report_cache'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['report.generate']
+
 # =============================================================================
 # ZONE 4.18: PLUGIN SYSTEM AND EXTENDED SERVICES
 # =============================================================================
@@ -50596,7 +51157,7 @@ class PluginEvent:
     data: Dict[str, Any]
     timestamp: datetime = field(default_factory=datetime.now)
 
-class PluginManager:
+class PluginManager(SystemService):
     """
     Plugin lifecycle and dependency management system.
 
@@ -50623,7 +51184,7 @@ class PluginManager:
         self._logger = logging.getLogger("PluginManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize plugin manager."""
         try:
             self._initialized = True
@@ -50842,6 +51403,26 @@ class PluginManager:
             "event_log_size": len(self._event_log)
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="PluginManager",
+            version="1.0.0",
+            inputs=['plugin.install', 'plugin.enable', 'plugin.disable'],
+            outputs=['plugin.installed', 'plugin.enabled', 'plugin.disabled'],
+            side_effects=['manages_plugin_lifecycle'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['plugin.install']
+
 @dataclass
 class LocaleData:
     """Locale-specific data."""
@@ -50856,7 +51437,7 @@ class LocaleData:
     currency_code: str = "USD"
     currency_symbol: str = "$"
 
-class LocalizationManager:
+class LocalizationManager(SystemService):
     """
     Internationalization (i18n) and localization (l10n) manager.
 
@@ -50882,7 +51463,7 @@ class LocalizationManager:
         self._logger = logging.getLogger("LocalizationManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize localization manager."""
         try:
             # Register default English locale
@@ -51114,6 +51695,26 @@ class LocalizationManager:
             return {locale: self._missing_translations.get(locale, set())}
         return dict(self._missing_translations)
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="LocalizationManager",
+            version="1.0.0",
+            inputs=['i18n.translate', 'i18n.register_locale'],
+            outputs=['i18n.translated', 'i18n.locale_registered'],
+            side_effects=['writes_locale_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['i18n.translate']
+
 @dataclass
 class AuditEntry:
     """An audit trail entry."""
@@ -51130,7 +51731,7 @@ class AuditEntry:
     user_agent: Optional[str] = None
     session_id: Optional[str] = None
 
-class AuditTrailManager:
+class AuditTrailManager(SystemService):
     """
     Enhanced audit trail and activity logging system.
 
@@ -51161,7 +51762,7 @@ class AuditTrailManager:
         self._logger = logging.getLogger("AuditTrailManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize audit trail manager."""
         try:
             self._initialized = True
@@ -51370,6 +51971,26 @@ class AuditTrailManager:
             "unique_actors": len(actor_counts),
             "top_actors": sorted(actor_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         }
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AuditTrailManager",
+            version="1.0.0",
+            inputs=['audit.record', 'audit.search'],
+            outputs=['audit.recorded', 'audit.results'],
+            side_effects=['writes_audit_log'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['audit.record']
 
 @dataclass
 class NetworkEndpoint:
@@ -51918,7 +52539,7 @@ class ExternalService:
     request_count: int = 0
     error_count: int = 0
 
-class ExternalServiceRegistry:
+class ExternalServiceRegistry(SystemService):
     """
     External service integration registry.
 
@@ -52014,7 +52635,7 @@ class ExternalServiceRegistry:
             # Keep backward-compat dict in sync
             self._circuit_breakers[service_id] = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize external service registry."""
         try:
             self._initialized = True
@@ -52222,6 +52843,26 @@ class ExternalServiceRegistry:
             "last_request": service.last_request.isoformat() if service.last_request else None
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ExternalServiceRegistry",
+            version="1.0.0",
+            inputs=['external.register', 'external.call'],
+            outputs=['external.registered', 'external.response'],
+            side_effects=['manages_external_connections'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['external.call']
+
 @dataclass
 class ScheduledEvent:
     """A scheduled calendar event."""
@@ -52232,7 +52873,7 @@ class ScheduledEvent:
     recurrence: Optional[str] = None  # daily, weekly, monthly, yearly
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class CalendarService:
+class CalendarService(SystemService):
     """
     Date/time and scheduling utilities service.
 
@@ -52256,7 +52897,7 @@ class CalendarService:
         self._logger = logging.getLogger("CalendarService")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize calendar service."""
         try:
             # Add some common US holidays for the current year
@@ -52473,6 +53114,26 @@ class CalendarService:
 
         return occurrences
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CalendarService",
+            version="1.0.0",
+            inputs=['calendar.schedule', 'calendar.query'],
+            outputs=['calendar.scheduled', 'calendar.events'],
+            side_effects=['writes_calendar_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['calendar.schedule']
+
 @dataclass
 class Command:
     """A command for the command pattern."""
@@ -52486,7 +53147,7 @@ class Command:
     result: Optional[Any] = None
     undone: bool = False
 
-class CommandPatternManager:
+class CommandPatternManager(SystemService):
     """
     Command pattern implementation for undo/redo support.
 
@@ -52513,7 +53174,7 @@ class CommandPatternManager:
         self._logger = logging.getLogger("CommandPatternManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize command pattern manager."""
         try:
             self._initialized = True
@@ -52674,6 +53335,26 @@ class CommandPatternManager:
             "macros_recorded": len(self._macros),
             "recording": self._recording_macro is not None
         }
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CommandPatternManager",
+            version="1.0.0",
+            inputs=['command.execute', 'command.undo'],
+            outputs=['command.executed', 'command.undone'],
+            side_effects=['writes_command_history'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['command.execute']
 
 # =============================================================================
 # ZONE 4.19: ADVANCED ENTERPRISE PATTERNS AND OPERATIONS
@@ -56998,7 +57679,7 @@ class TelemetryEvent(NamedTuple):
     severity: str
     source: str
 
-class SystemTelemetryCollector:
+class SystemTelemetryCollector(SystemService):
     """
     Centralized telemetry collection for the kernel.
 
@@ -57020,7 +57701,7 @@ class SystemTelemetryCollector:
         self._collect_task: Optional[asyncio.Task[None]] = None
         self._exporters: List[Callable[[List[TelemetryMetric], List[TelemetryEvent]], Awaitable[None]]] = []
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize the telemetry collector."""
         self._running = True
         self._collect_task = create_safe_task(self._collection_loop())
@@ -57256,6 +57937,22 @@ class SystemTelemetryCollector:
             "exporters": len(self._exporters),
             "flush_interval": self._flush_interval,
         }
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SystemTelemetryCollector",
+            version="1.0.0",
+            inputs=['telemetry.record', 'telemetry.flush'],
+            outputs=['telemetry.flushed', 'telemetry.metrics'],
+            side_effects=['writes_telemetry_data'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['telemetry.record']
 
 # -----------------------------------------------------------------------------
 # 4.20.3: Graceful Degradation Manager
@@ -57592,7 +58289,7 @@ class CleanupReport(NamedTuple):
     results: List[CleanupResult]
     overall_success: bool
 
-class ResourceCleanupCoordinator:
+class ResourceCleanupCoordinator(SystemService):
     """
     Coordinates graceful cleanup of all kernel resources.
 
@@ -57801,6 +58498,30 @@ class ResourceCleanupCoordinator:
             "default_timeout": self._default_timeout,
             "last_cleanup_success": self._last_report.overall_success if self._last_report else None,
         }
+
+    async def initialize(self) -> None:
+        """Initialize ResourceCleanupCoordinator. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourceCleanupCoordinator",
+            version="1.0.0",
+            inputs=['cleanup.register', 'cleanup.execute'],
+            outputs=['cleanup.completed', 'cleanup.report'],
+            side_effects=['cleans_system_resources'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['cleanup.execute']
 
 # =============================================================================
 # =============================================================================
