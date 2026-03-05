@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import logging
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Callable, Optional, Union, Dict, List
 from datetime import datetime, timezone
 
@@ -56,6 +56,106 @@ class ComponentStatus(Enum):
     DEGRADED = "degraded"     # Running with reduced capability
     FAILED = "failed"         # Startup failed
     DISABLED = "disabled"     # Explicitly disabled
+
+
+# --- Governance Enums (Wave 0) ---
+
+class PromotionLevel(Enum):
+    """Whether a component has been promoted to governance-aware status."""
+    LEGACY = "legacy"
+    PROMOTED = "promoted"
+
+
+class ActivationMode(Enum):
+    """How a component is activated at runtime."""
+    ALWAYS_ON = "always_on"
+    WARM_STANDBY = "warm_standby"
+    EVENT_DRIVEN = "event_driven"
+    BATCH_WINDOW = "batch_window"
+
+
+class ReadinessClass(Enum):
+    """How a component participates in system readiness."""
+    BLOCK_READY = "block_ready"
+    NON_BLOCKING = "non_blocking"
+    DEFERRED_AFTER_READY = "deferred_after_ready"
+
+
+class ActivationTier(IntEnum):
+    """Biological-metaphor tiers controlling activation order."""
+    FOUNDATION = 0
+    IMMUNE = 1
+    NERVOUS = 2
+    METABOLIC = 3
+    HIGHER = 4
+
+
+class RetryStrategy(Enum):
+    """Retry strategies for component failure recovery."""
+    NONE = "none"
+    FIXED_DELAY = "fixed_delay"
+    EXP_BACKOFF = "exp_backoff"
+    EXP_BACKOFF_JITTER = "exp_backoff_jitter"
+
+
+class OwnershipMode(Enum):
+    """Ownership semantics for a state domain."""
+    EXCLUSIVE_WRITE = "exclusive_write"
+    SHARED_READ_ONLY = "shared_read_only"
+
+
+# --- Governance Dataclasses (Wave 0) ---
+
+@dataclass(frozen=True)
+class ResourceBudget:
+    """Hard resource limits for a governed component."""
+    max_memory_mb: int
+    max_cpu_percent: float
+    max_concurrency: int
+    max_startup_time_s: float
+
+
+@dataclass(frozen=True)
+class FailurePolicy:
+    """Retry/circuit-breaker policy for a governed component."""
+    retry_strategy: RetryStrategy
+    max_retries: int
+    backoff_base_s: float
+    backoff_max_s: float
+    circuit_breaker: bool
+    breaker_threshold: int
+    breaker_recovery_s: float
+    quarantine_on_repeated: bool
+
+
+@dataclass(frozen=True)
+class StateDomain:
+    """Declares a named state domain and its ownership semantics."""
+    domain: str
+    ownership_mode: OwnershipMode
+
+
+@dataclass(frozen=True)
+class ObservabilityContract:
+    """Observability requirements for a governed component."""
+    schema_version: str = "1.0"
+    emit_trace_id: bool = True
+    emit_reason_codes: bool = True
+    required_log_fields: tuple = (
+        "trace_id", "reason_code", "service_name",
+        "activation_mode", "readiness_class",
+    )
+    health_check_interval_s: float = 30.0
+
+
+@dataclass(frozen=True)
+class HealthPolicy:
+    """Health-check policy for a governed component."""
+    supports_liveness: bool = True
+    supports_readiness: bool = True
+    supports_drain: bool = False
+    hysteresis_window: int = 3
+    health_check_timeout_s: float = 5.0
 
 
 @dataclass
