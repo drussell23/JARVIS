@@ -34,11 +34,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import Any, Callable, Dict, Optional, List
+
+from backend.core.time_utils import monotonic_s
 
 logger = logging.getLogger(__name__)
 
@@ -159,12 +162,11 @@ class RestartCoordinator:
         self._grace_period_ended = False
 
         # v310.0: Backoff and quarantine for restart loop prevention
-        import os as _os
         self._restart_count_total: int = 0
         self._last_restart_mono: float = 0.0
         self._quarantine_until: float = 0.0  # monotonic; 0 = not quarantined
         self._backoff_reset_healthy_s: float = float(
-            _os.environ.get("JARVIS_RESTART_BACKOFF_RESET_S", "120.0")
+            os.environ.get("JARVIS_RESTART_BACKOFF_RESET_S", "120.0")
         )
         self._quarantine_threshold: int = 5
         self._quarantine_duration_s: float = 600.0  # 10 min lockout
@@ -237,7 +239,6 @@ class RestartCoordinator:
             return False
 
         # v310.0: Quarantine check
-        from backend.core.time_utils import monotonic_s
         now_mono = monotonic_s()
         if now_mono < self._quarantine_until:
             if urgency != RestartUrgency.CRITICAL:
@@ -267,7 +268,6 @@ class RestartCoordinator:
                     return False
 
                 # Calculate backoff with jitter
-                import random
                 delay = min(_base * (2 ** self._restart_count_total), self._backoff_max_s)
                 jitter = delay * self._backoff_jitter_pct * (random.random() * 2 - 1)
                 cooldown = max(0.0, delay + jitter)
@@ -479,6 +479,9 @@ class RestartCoordinator:
             "countdown_remaining": self._countdown_remaining,
             "current_request": self._current_request.to_dict() if self._current_request else None,
             "pending_requests": len(self._pending_requests),
+            "restart_count": self._restart_count_total,
+            "quarantine_until": self._quarantine_until,
+            "in_quarantine": monotonic_s() < self._quarantine_until if self._quarantine_until > 0 else False,
         }
 
     def on_restart_requested(self, callback: Callable[[RestartRequest], None]) -> None:
@@ -500,6 +503,9 @@ class RestartCoordinator:
         self._is_restarting = False
         self._current_request = None
         self._pending_requests.clear()
+        self._restart_count_total = 0
+        self._last_restart_mono = 0.0
+        self._quarantine_until = 0.0
         logger.debug("Restart coordinator cleaned up")
 
 
