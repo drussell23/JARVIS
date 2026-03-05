@@ -99544,6 +99544,70 @@ def _generate_launchd_plist() -> str:
 </dict>
 </plist>"""
 
+# =============================================================================
+# ROOT AUTHORITY WIRING (Task 15 -- Shadow Mode)
+# =============================================================================
+# Factory functions for creating a RootAuthorityWatcher instance at kernel boot.
+# Opt-in via JARVIS_ROOT_AUTHORITY_MODE env var ("shadow" or "active").
+# Shadow mode: verdicts are logged but NOT executed.
+# Active mode: verdicts are forwarded to the VerdictExecutor for execution.
+# =============================================================================
+
+
+def create_root_authority_watcher() -> "Optional[RootAuthorityWatcher]":
+    """Create a RootAuthorityWatcher if JARVIS_ROOT_AUTHORITY_MODE is set.
+
+    Returns None if the env var is not set (opt-in only).
+    In shadow mode, verdicts are logged but not executed.
+    """
+    mode = os.environ.get("JARVIS_ROOT_AUTHORITY_MODE", "")
+    if not mode:
+        return None
+
+    ra_logger = logging.getLogger("jarvis.root_authority")
+
+    from backend.core.root_authority import RootAuthorityWatcher
+    from backend.core.root_authority_types import TimeoutPolicy, RestartPolicy
+
+    session_id = os.environ.get("JARVIS_ROOT_SESSION_ID", "")
+
+    def shadow_event_sink(event: "LifecycleEvent") -> None:
+        """Log lifecycle events in shadow mode."""
+        ra_logger.info(
+            "[SHADOW] %s: %s %s -> %s reason=%s",
+            event.event_type,
+            event.subsystem,
+            getattr(event.from_state, "value", ""),
+            getattr(event.to_state, "value", ""),
+            event.reason_code or "",
+        )
+
+    watcher = RootAuthorityWatcher(
+        session_id=session_id,
+        timeout_policy=TimeoutPolicy(),
+        restart_policy=RestartPolicy(),
+        event_sink=shadow_event_sink if mode == "shadow" else None,
+    )
+
+    ra_logger.info(
+        "RootAuthorityWatcher created in %s mode (session=%s...)",
+        mode, session_id[:8] if session_id else "none",
+    )
+    return watcher
+
+
+def get_watched_subsystems() -> "list":
+    """Return the list of subsystems the root authority should watch.
+
+    Reads from JARVIS_ROOT_AUTHORITY_SUBSYSTEMS env var (comma-separated).
+    Defaults to ["jarvis-prime", "reactor-core"] if unset or empty.
+    """
+    raw = os.environ.get("JARVIS_ROOT_AUTHORITY_SUBSYSTEMS", "")
+    if not raw:
+        return ["jarvis-prime", "reactor-core"]
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
 def main() -> int:
     """
     Main entry point for JARVIS Unified System Kernel.
