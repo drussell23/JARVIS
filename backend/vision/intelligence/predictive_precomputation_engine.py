@@ -56,6 +56,9 @@ BASE_MEMORY_LIMITS = {
     "result_cache": 50 * 1024 * 1024,  # 50MB baseline
 }
 
+# Cache schema version — bump when StateVector fields change
+CACHE_SCHEMA_VERSION = 2
+
 
 def get_memory_limits_predictive(memory_manager=None) -> Dict[str, int]:
     """Get memory limits adjusted for current memory pressure"""
@@ -216,6 +219,10 @@ class TransitionMatrix:
 
     def add_state(self, state: StateVector) -> int:
         """Add state to matrix if not exists"""
+        if not isinstance(state, StateVector):
+            raise TypeError(
+                f"TransitionMatrix.add_state expects StateVector, got {type(state).__name__}"
+            )
         state_tuple = state.to_tuple()
 
         with self._lock:
@@ -305,8 +312,12 @@ class TransitionMatrix:
             predictions = []
             for idx in top_indices:
                 if idx in self.idx_to_state and probs[idx] > 0:
+                    candidate = self.idx_to_state[idx]
+                    if not isinstance(candidate, StateVector):
+                        logger.debug(f"Skipping legacy non-StateVector at idx {idx}")
+                        continue
                     predictions.append(
-                        (self.idx_to_state[idx], float(probs[idx]), float(confidences[idx]))
+                        (candidate, float(probs[idx]), float(confidences[idx]))
                     )
 
             return predictions
