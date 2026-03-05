@@ -113,3 +113,29 @@ class TestAtomicStatePersistence:
                         )
                         return
         pytest.fail(f"{class_name}.{method_name} not found")
+
+
+class TestBoundedCollections:
+    """4G: Unbounded lists must have growth limits."""
+
+    @pytest.mark.parametrize("class_name", [
+        "IntelligentCacheManager",
+        "AnimatedProgressBar",
+        "RichCliRenderer",
+        "SpotInstanceResilienceHandler",
+    ])
+    def test_class_uses_deque(self, class_name):
+        """Target classes must use collections.deque for bounded growth."""
+        import ast
+
+        with open("unified_supervisor.py", "r") as f:
+            tree = ast.parse(f.read())
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                body = ast.dump(node)
+                assert "deque" in body, (
+                    f"{class_name} must use collections.deque(maxlen=...) for bounded growth"
+                )
+                return
+        pytest.fail(f"{class_name} not found")

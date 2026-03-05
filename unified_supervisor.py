@@ -659,6 +659,7 @@ del _early_time
 # =============================================================================
 import argparse
 import asyncio
+import collections
 import contextlib
 import errno
 import functools
@@ -8969,7 +8970,7 @@ class RichCliRenderer(CliRenderer):
         super().__init__(verbosity)
         self._no_animation = no_animation
         self._dashboard: Optional[LiveProgressDashboard] = None
-        self._phase_timeline: List[Dict[str, Any]] = []
+        self._phase_timeline: collections.deque = collections.deque(maxlen=200)
 
     def start(self) -> None:
         super().start()
@@ -9623,7 +9624,7 @@ class AnimatedProgressBar:
         self.description = description
         self.current = 0
         self._start_time = time.time()
-        self._step_times: List[float] = []
+        self._step_times: collections.deque = collections.deque(maxlen=500)
 
         filled_char, empty_char = self.STYLES.get(style, self.STYLES["blocks"])
         self._filled = filled_char
@@ -13931,7 +13932,7 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
         # Preemption tracking
         self.preemption_count = 0
         self.last_preemption_time: Optional[float] = None
-        self.preemption_history: List[Dict[str, Any]] = []
+        self.preemption_history: collections.deque = collections.deque(maxlen=50)
 
         # Callbacks
         self._preemption_callback: Optional[Callable[[], Awaitable[None]]] = None
@@ -13952,7 +13953,9 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
         preserved = await self.load_preserved_state()
         if preserved:
             self.preemption_count = preserved.get("preemption_count", 0)
-            self.preemption_history = preserved.get("preemption_history", [])[-10:]
+            self.preemption_history = collections.deque(
+                preserved.get("preemption_history", [])[-50:], maxlen=50
+            )
             self._logger.info(f"Loaded preserved state: {self.preemption_count} previous preemptions")
 
         self._initialized = True
@@ -14207,7 +14210,7 @@ class IntelligentCacheManager(ResourceManagerBase):
         self._warmup_modules_loaded = 0
         self._last_clear_time: Optional[float] = None
         self._clear_count = 0
-        self._errors: List[str] = []
+        self._errors: collections.deque = collections.deque(maxlen=1000)
 
         # Project root for bytecode cleanup
         self._project_root: Optional[Path] = None
@@ -22519,7 +22522,7 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
         # Preemption tracking
         self.preemption_count = 0
         self.last_preemption_time: Optional[float] = None
-        self.preemption_history: List[Dict[str, Any]] = []
+        self.preemption_history: collections.deque = collections.deque(maxlen=50)
 
         # State preservation
         state_file_path = os.getenv(
