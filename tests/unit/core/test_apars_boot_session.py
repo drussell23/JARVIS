@@ -298,5 +298,14 @@ class TestAtomicWriteBoundary:
     def test_startup_script_checks_filesystem_boundary(self):
         """Startup script must verify temp and target are on same mount."""
         script = _get_golden_startup_script()
-        # Must check filesystem/mount for atomicity
-        assert "df " in script or "mount" in script or "same_fs" in script or "same_mount" in script
+        # Extract update_apars function body
+        match = re.search(
+            r'update_apars\(\)\s*\{(.*?)\n\}',
+            script,
+            re.DOTALL,
+        )
+        assert match, "Could not find update_apars function in startup script"
+        func_body = match.group(1)
+        # Must check filesystem/mount for atomicity within update_apars
+        assert "df " in func_body or "same_fs" in func_body or "same_mount" in func_body or "_target_mount" in func_body, \
+            "update_apars must verify temp and target are on same filesystem"

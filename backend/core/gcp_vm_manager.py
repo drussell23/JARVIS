@@ -8843,6 +8843,14 @@ update_apars() {
     local elapsed=$((now - START_TIME))
 
     local tmp_file="${PROGRESS_FILE}.tmp.$$"
+
+    # Verify atomic rename safety (same filesystem)
+    local _target_mount=$(df -P "$(dirname "$PROGRESS_FILE")" 2>/dev/null | tail -1 | awk '{print $6}')
+    local _tmp_mount=$(df -P "$(dirname "$tmp_file")" 2>/dev/null | tail -1 | awk '{print $6}')
+    if [ -n "$_target_mount" ] && [ -n "$_tmp_mount" ] && [ "$_target_mount" != "$_tmp_mount" ]; then
+        log "WARNING: APARS temp and target on different mounts ($_tmp_mount vs $_target_mount). Atomic rename may fail."
+    fi
+
     cat > "$tmp_file" << EOFPROGRESS
 {
     "phase": ${phase},

@@ -64222,6 +64222,8 @@ class KernelBackgroundTaskRegistry:
     - De-duplicates task registration.
     - Rejects late registrations once shutdown begins.
     - Auto-prunes completed tasks to prevent stale-handle buildup.
+
+    v311.0: Added threading.Lock for thread-safe list mutations.
     """
 
     def __init__(
@@ -64233,6 +64235,7 @@ class KernelBackgroundTaskRegistry:
         self._logger = logger
         self._can_accept_new = can_accept_new or (lambda: True)
         self._tasks: List["asyncio.Task[Any]"] = []
+        self._guard = threading.Lock()  # v311.0: thread-safe mutations
 
     @staticmethod
     def _task_name(task: "asyncio.Task[Any]") -> str:
@@ -64242,33 +64245,31 @@ class KernelBackgroundTaskRegistry:
             return "unnamed-task"
 
     def _on_task_done(self, task: "asyncio.Task[Any]") -> None:
-        try:
-            self._tasks.remove(task)
-        except ValueError:
-            pass
+        with self._guard:
+            try:
+                self._tasks.remove(task)
+            except ValueError:
+                pass
 
     def append(self, task: Optional["asyncio.Task[Any]"]) -> bool:
         """Register one background task. Returns True if accepted."""
         if task is None:
             return False
-
         if task.done():
             return False
-
-        if task in self._tasks:
-            return False
-
-        if not self._can_accept_new():
-            if not task.done():
-                task.cancel()
-            if self._logger:
-                self._logger.debug(
-                    "[Kernel] Rejected background task registration during shutdown: %s",
-                    self._task_name(task),
-                )
-            return False
-
-        self._tasks.append(task)
+        with self._guard:
+            if task in self._tasks:
+                return False
+            if not self._can_accept_new():
+                if not task.done():
+                    task.cancel()
+                if self._logger:
+                    self._logger.debug(
+                        "[Kernel] Rejected background task registration during shutdown: %s",
+                        self._task_name(task),
+                    )
+                return False
+            self._tasks.append(task)
         task.add_done_callback(self._on_task_done)
         return True
 
@@ -64281,21 +64282,25 @@ class KernelBackgroundTaskRegistry:
         return accepted
 
     def remove(self, task: "asyncio.Task[Any]") -> None:
-        self._tasks.remove(task)
+        with self._guard:
+            self._tasks.remove(task)
 
     def snapshot(self, *, include_done: bool = True) -> List["asyncio.Task[Any]"]:
-        if include_done:
-            return list(self._tasks)
-        return [task for task in self._tasks if not task.done()]
+        with self._guard:
+            if include_done:
+                return list(self._tasks)
+            return [task for task in self._tasks if not task.done()]
 
     def __iter__(self):
         return iter(self.snapshot(include_done=True))
 
     def __contains__(self, task: object) -> bool:
-        return task in self._tasks
+        with self._guard:
+            return task in self._tasks
 
     def __len__(self) -> int:
-        return len(self._tasks)
+        with self._guard:
+            return len(self._tasks)
 
 
 # ============================================================================
