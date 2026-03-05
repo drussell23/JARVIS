@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import random
 import time
 import uuid
@@ -434,6 +435,12 @@ class RootAuthorityWatcher:
         self, name: str, gate: ContractGate, data: dict,
     ) -> bool:
         """Verify that the health response satisfies the contract gate."""
+        # Emergency bypass
+        bypass_list = os.environ.get("JARVIS_CONTRACT_BYPASS", "")
+        if name in [s.strip() for s in bypass_list.split(",") if s.strip()]:
+            logger.warning("Contract bypass active for %s", name)
+            return True
+
         schema = data.get("schema_version", "")
         if not gate.is_schema_compatible(schema):
             logger.error(
@@ -448,6 +455,16 @@ class RootAuthorityWatcher:
                 "Missing required health fields for %s: %s", name, missing,
             )
             return False
+
+        # Capability hash check
+        if gate.expected_capability_hash:
+            actual_hash = data.get("capability_hash", "")
+            if actual_hash != gate.expected_capability_hash:
+                logger.error(
+                    "Capability hash mismatch for %s: expected %s, got %s",
+                    name, gate.expected_capability_hash, actual_hash,
+                )
+                return False
 
         return True
 
@@ -572,6 +589,73 @@ class RootAuthorityWatcher:
                 verdict = self.process_health_failure(name)
             if verdict:
                 await self._verdict_queue.put(verdict)
+
+    # ------------------------------------------------------------------
+    # Verdict dispatch (active mode)
+    # ------------------------------------------------------------------
+
+    async def run_verdict_dispatch(
+        self, executor: "VerdictExecutor",
+        active_subsystems: Optional[Set[str]] = None,
+    ) -> None:
+        """Consume verdicts from queue and dispatch to executor.
+
+        In active mode, this runs as a background task.
+        Only dispatches verdicts for subsystems in *active_subsystems*.
+        If *active_subsystems* is ``None``, all subsystems are active.
+        """
+        escalation = EscalationEngine(self._timeout)
+
+        while True:
+            verdict = await self._verdict_queue.get()
+
+            # Per-subsystem kill switch
+            if active_subsystems is not None and verdict.subsystem not in active_subsystems:
+                logger.info(
+                    "[SHADOW] Verdict for %s logged but not executed "
+                    "(not in active subsystems): %s - %s",
+                    verdict.subsystem, verdict.action.value, verdict.reason,
+                )
+                continue
+
+            logger.info(
+                "[ACTIVE] Dispatching verdict for %s: %s - %s",
+                verdict.subsystem, verdict.action.value, verdict.reason,
+            )
+
+            try:
+                if verdict.action == LifecycleAction.RESTART:
+                    delay = self._restart_policy.compute_delay(
+                        self._trackers[verdict.subsystem].restart_count
+                        if verdict.subsystem in self._trackers else 0
+                    )
+                    await executor.execute_restart(verdict.subsystem, delay)
+
+                elif verdict.action == LifecycleAction.DRAIN:
+                    result = await escalation.escalate(
+                        verdict.subsystem, verdict.identity, executor,
+                        verdict.correlation_id,
+                    )
+                    logger.info("Escalation result for %s: %s", verdict.subsystem, result)
+
+                elif verdict.action == LifecycleAction.TERM:
+                    await executor.execute_term(
+                        verdict.subsystem, verdict.identity,
+                        self._timeout.term_timeout_s,
+                    )
+
+                elif verdict.action == LifecycleAction.GROUP_KILL:
+                    await executor.execute_group_kill(
+                        verdict.subsystem, verdict.identity,
+                    )
+
+                elif verdict.action == LifecycleAction.ESCALATE_OPERATOR:
+                    logger.critical(
+                        "OPERATOR ESCALATION for %s: %s (code=%s)",
+                        verdict.subsystem, verdict.reason, verdict.reason_code,
+                    )
+            except Exception:
+                logger.exception("Error dispatching verdict for %s", verdict.subsystem)
 
 
 class EscalationEngine:
