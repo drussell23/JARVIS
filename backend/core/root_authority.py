@@ -10,7 +10,9 @@ ZERO imports from orchestrator or USP.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
 import time
 import uuid
 from datetime import datetime, timezone
@@ -124,6 +126,7 @@ class RootAuthorityWatcher:
         self._trackers: Dict[str, _SubsystemTracker] = {}
         self._recent_incidents: Set[str] = set()
         self._incident_timestamps: Dict[str, int] = {}
+        self._verdict_queue: asyncio.Queue = asyncio.Queue()
         self.verdicts_coalesced_total: int = 0
         self.verdicts_dropped_total: int = 0
 
@@ -536,6 +539,39 @@ class RootAuthorityWatcher:
             policy_source="root_authority",
         )
         self._event_sink(event)
+
+    # ------------------------------------------------------------------
+    # Active monitoring (async)
+    # ------------------------------------------------------------------
+
+    async def watch_process(self, name: str, proc: "asyncio.subprocess.Process") -> None:
+        """Active crash detection -- fires within ms of process exit."""
+        exit_code = await proc.wait()
+        verdict = self.process_crash(name, exit_code)
+        if verdict:
+            await self._verdict_queue.put(verdict)
+
+    async def poll_health(self, name: str, health_url: str, session: Any) -> None:
+        """Passive health polling with jitter. Runs forever until cancelled."""
+        import aiohttp
+
+        while True:
+            interval = self._timeout.health_poll_interval_s * (1 + random.uniform(-0.2, 0.2))
+            await asyncio.sleep(interval)
+            try:
+                async with session.get(
+                    health_url,
+                    timeout=aiohttp.ClientTimeout(total=self._timeout.health_timeout_s),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        verdict = self.process_health_response(name, data)
+                    else:
+                        verdict = self.process_health_failure(name)
+            except Exception:
+                verdict = self.process_health_failure(name)
+            if verdict:
+                await self._verdict_queue.put(verdict)
 
 
 class EscalationEngine:
