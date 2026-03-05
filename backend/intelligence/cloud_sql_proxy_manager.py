@@ -336,6 +336,7 @@ class CloudSQLProxyManager:
         self.pid_path = temp_dir / "cloud-sql-proxy.pid"
         self.service_name = "com.jarvis.cloudsql-proxy"
         self.process: Optional[subprocess.Popen] = None
+        self._atexit_registered = False
 
         # v224.0: Startup concurrency guard - prevents race conditions when
         # multiple callers invoke start() simultaneously (e.g., supervisor +
@@ -590,6 +591,89 @@ class CloudSQLProxyManager:
             'bin/cloud-sql-proxy',  # Binary path match
         ]
         return any(keyword in proc_name_lower for keyword in keywords)
+
+    # ── v310.0: Atexit cleanup & stale PID reconciliation (Item 19) ─────────
+
+    def _register_atexit_cleanup(self) -> None:
+        """Register atexit handler (once) for proxy cleanup on normal exit."""
+        if self._atexit_registered:
+            return
+        import atexit
+        atexit.register(self._cleanup_proxy_atexit)
+        self._atexit_registered = True
+        logger.debug("[ProxyManager] Registered atexit cleanup handler")
+
+    def _cleanup_proxy_atexit(self) -> None:
+        """Best-effort cleanup on normal exit. Does NOT run on SIGKILL/SIGSEGV."""
+        if self.process and self.process.returncode is None:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=5)
+            except Exception:
+                pass
+        if self.pid_path and self.pid_path.exists():
+            try:
+                self.pid_path.unlink()
+            except Exception:
+                pass
+
+    def _cleanup_stale_proxy_sync(self) -> None:
+        """Kill stale proxy from previous crashed session with identity verification.
+
+        Safe against PID reuse: checks process name, cmdline, and uid before killing.
+        """
+        if not (self.pid_path and self.pid_path.exists()):
+            return
+
+        try:
+            stale_pid = int(self.pid_path.read_text().strip())
+        except (ValueError, OSError):
+            self.pid_path.unlink(missing_ok=True)
+            return
+
+        # Check if process exists AND is actually a proxy
+        if not self._is_cloud_sql_proxy_process(stale_pid):
+            logger.info(
+                f"[ProxyManager] PID {stale_pid} is not a proxy process -- "
+                f"PID reuse detected, removing stale PID file"
+            )
+            self.pid_path.unlink(missing_ok=True)
+            return
+
+        # Verify process ownership (same user)
+        try:
+            import psutil
+            proc = psutil.Process(stale_pid)
+            if proc.uids().real != os.getuid():
+                logger.warning(
+                    f"[ProxyManager] PID {stale_pid} is a proxy but owned by "
+                    f"uid={proc.uids().real} (expected {os.getuid()}) -- skipping kill"
+                )
+                self.pid_path.unlink(missing_ok=True)
+                return
+        except Exception:
+            # Process gone or psutil unavailable -- safe to clean up PID file
+            self.pid_path.unlink(missing_ok=True)
+            return
+
+        # Safe to kill -- it's our stale proxy
+        try:
+            os.kill(stale_pid, signal.SIGTERM)
+            logger.info(f"[ProxyManager] Killed stale proxy (PID {stale_pid})")
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    os.kill(stale_pid, signal.SIGKILL)
+                    logger.warning(f"[ProxyManager] Force-killed stale proxy (PID {stale_pid})")
+                except ProcessLookupError:
+                    pass
+        except ProcessLookupError:
+            pass  # Already gone
+
+        self.pid_path.unlink(missing_ok=True)
+
+    # ── End v310.0 ──────────────────────────────────────────────────────────
 
     def _get_pid_using_port(self, port: int) -> Optional[int]:
         """
@@ -1652,6 +1736,9 @@ class CloudSQLProxyManager:
         """
         last_error = None
 
+        # v310.0: Clean up stale proxy from previous crash
+        await asyncio.to_thread(self._cleanup_stale_proxy_sync)
+
         # v218.0: Use intelligent credential detection to determine auth strategy
         cred_info = IntelligentCredentialDetector.detect_credentials()
         
@@ -1823,6 +1910,9 @@ class CloudSQLProxyManager:
                 self.process = await asyncio.to_thread(_start_proxy_process_sync)
                 logger.info(f"   PID: {self.process.pid}")
                 self._effective_port = port
+
+                # v310.0: Register atexit cleanup after successful start
+                self._register_atexit_cleanup()
 
                 # Wait for proxy to be ready (max 15 seconds) - ASYNC!
                 # v124.0: All checks in this loop are now async to not block event loop
