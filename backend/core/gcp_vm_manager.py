@@ -8686,6 +8686,7 @@ LOG_FILE="/var/log/jarvis-golden-startup.log"
 PROGRESS_FILE="/tmp/jarvis_progress.json"
 JARVIS_DIR="/opt/jarvis-prime"
 START_TIME=$(date +%s)
+BOOT_SESSION_ID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null || echo "unknown-$$")
 STARTUP_SCRIPT_VERSION="__STARTUP_SCRIPT_VERSION__"
 STARTUP_SCRIPT_METADATA_VERSION=""
 
@@ -8722,7 +8723,8 @@ update_apars() {
     "skipped_phases": [2, 3],
     "version": "${STARTUP_SCRIPT_VERSION}",
     "startup_script_version": "${STARTUP_SCRIPT_VERSION}",
-    "startup_script_metadata_version": "${STARTUP_SCRIPT_METADATA_VERSION}"
+    "startup_script_metadata_version": "${STARTUP_SCRIPT_METADATA_VERSION}",
+    "boot_session_id": "${BOOT_SESSION_ID}"
 }
 EOFPROGRESS
 }
@@ -9144,6 +9146,7 @@ def _build_apars_payload(state):
         "deployment_mode": state.get("deployment_mode", "golden_image"),
         "deps_prebaked": state.get("deps_prebaked", True),
         "skipped_phases": state.get("skipped_phases", [2, 3]),
+        "boot_session_id": state.get("boot_session_id", "unknown"),
     }
 
 # ─── ASGI middleware: enrich /health responses with APARS data ───
