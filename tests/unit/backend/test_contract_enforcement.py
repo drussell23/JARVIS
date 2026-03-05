@@ -210,16 +210,17 @@ class TestEnvResolution:
             assert isinstance(result, EnvResolution)
             assert result.value == "8010"
             assert result.origin == "explicit"
+            assert result.canonical_name == "JARVIS_BACKEND_PORT"
 
     def test_alias_origin(self):
         import os
         from unittest.mock import patch
-        with patch.dict(os.environ, {}, clear=True):
-            os.environ["BACKEND_PORT"] = "9090"
+        with patch.dict(os.environ, {"BACKEND_PORT": "9090"}, clear=True):
             result = get_canonical_env("JARVIS_BACKEND_PORT")
             assert isinstance(result, EnvResolution)
             assert result.value == "9090"
             assert result.origin == "alias:BACKEND_PORT"
+            assert result.canonical_name == "JARVIS_BACKEND_PORT"
 
     def test_default_origin(self):
         import os
@@ -229,6 +230,16 @@ class TestEnvResolution:
             assert isinstance(result, EnvResolution)
             assert result.value == "8010"
             assert result.origin == "default"
+            assert result.canonical_name == "JARVIS_BACKEND_PORT"
+
+    def test_canonical_takes_precedence_over_alias(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"JARVIS_BACKEND_PORT": "8010", "BACKEND_PORT": "9999"}, clear=True):
+            result = get_canonical_env("JARVIS_BACKEND_PORT")
+            assert isinstance(result, EnvResolution)
+            assert result.value == "8010"
+            assert result.origin == "explicit"
 
     def test_unset_no_default_returns_none(self):
         import os

@@ -499,7 +499,7 @@ class EnvResolution:
     canonical_name: str
 
 
-def get_canonical_env(contract_name: str) -> Optional["EnvResolution"]:
+def get_canonical_env(contract_name: str) -> Optional[EnvResolution]:
     """Get the value of a contracted env var with origin tracing.
 
     Returns EnvResolution with value + origin, or None if unset with no default.
