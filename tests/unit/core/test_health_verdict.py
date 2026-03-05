@@ -89,3 +89,27 @@ class TestPingHealthEndpointAST:
                         "_ping_health_endpoint contains 'return False, ...' — "
                         "must use HealthVerdict instead"
                     )
+
+
+class TestContractHashCheck:
+    def test_startup_script_computes_contract_hash(self):
+        """Startup script must compute and include contract_hash."""
+        from backend.core.gcp_vm_manager import VMManagerConfig, GCPVMManager
+        mgr = GCPVMManager.__new__(GCPVMManager)
+        mgr.config = VMManagerConfig()
+        script = mgr._generate_golden_startup_script()
+        assert "CONTRACT_HASH=" in script
+        assert "contract_hash" in script
+
+    def test_ping_health_logs_contract_mismatch(self):
+        """AST check: _ping_health_endpoint must reference contract_hash."""
+        import ast
+        from pathlib import Path
+        src = Path("backend/core/gcp_vm_manager.py").read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ping_health_endpoint":
+                func_src = ast.get_source_segment(src, node)
+                assert "contract_hash" in func_src, \
+                    "_ping_health_endpoint must check contract_hash"
+                break

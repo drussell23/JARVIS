@@ -8465,6 +8465,16 @@ class GCPVMManager:
                             except ImportError:
                                 pass
                         verdict = HealthVerdict.READY if is_ready else HealthVerdict.ALIVE_NOT_READY
+                        # Contract hash advisory check
+                        apars_data = data.get("apars", {})
+                        if isinstance(apars_data, dict):
+                            remote_hash = apars_data.get("contract_hash", "")
+                            if remote_hash and hasattr(self, '_expected_contract_hash') and self._expected_contract_hash:
+                                if remote_hash != self._expected_contract_hash:
+                                    logger.warning(
+                                        "[GCPVMManager] Contract hash mismatch: remote=%s, expected=%s",
+                                        remote_hash, self._expected_contract_hash,
+                                    )
                         return verdict, data
                     return HealthVerdict.UNHEALTHY, {"status": resp.status}
         except asyncio.TimeoutError:
@@ -8740,6 +8750,16 @@ JARVIS_DIR="/opt/jarvis-prime"
 START_TIME=$(date +%s)
 BOOT_SESSION_ID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null || echo "unknown-$$")
 PROCESS_EPOCH=$(python3 -c "import uuid; print(uuid.uuid4().hex[:12])" 2>/dev/null || echo "$$")
+# Compute contract hash from key package versions
+CONTRACT_HASH=$(python3 -c "
+import hashlib, importlib.metadata as m
+pkgs = sorted(['torch', 'transformers', 'llama-cpp-python', 'fastapi', 'uvicorn'])
+versions = []
+for p in pkgs:
+    try: versions.append(f'{p}={m.version(p)}')
+    except: versions.append(f'{p}=unknown')
+print(hashlib.sha256('|'.join(versions).encode()).hexdigest()[:16])
+" 2>/dev/null || echo "unknown")
 STARTUP_SCRIPT_VERSION="__STARTUP_SCRIPT_VERSION__"
 STARTUP_SCRIPT_METADATA_VERSION=""
 
@@ -8779,7 +8799,8 @@ update_apars() {
     "startup_script_version": "${STARTUP_SCRIPT_VERSION}",
     "startup_script_metadata_version": "${STARTUP_SCRIPT_METADATA_VERSION}",
     "boot_session_id": "${BOOT_SESSION_ID}",
-    "process_epoch": "${PROCESS_EPOCH}"
+    "process_epoch": "${PROCESS_EPOCH}",
+    "contract_hash": "${CONTRACT_HASH}"
 }
 EOFPROGRESS
     mv "$tmp_file" "$PROGRESS_FILE"
@@ -9227,6 +9248,7 @@ def _build_apars_payload(state):
         "skipped_phases": state.get("skipped_phases", [2, 3]),
         "boot_session_id": state.get("boot_session_id", "unknown"),
         "process_epoch": state.get("process_epoch", ""),
+        "contract_hash": state.get("contract_hash", ""),
     }
 
 # ─── ASGI middleware: enrich /health responses with APARS data ───
