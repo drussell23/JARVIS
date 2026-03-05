@@ -426,12 +426,14 @@ def validate_contracts_at_boot() -> List[ContractViolationRecord]:
         val = resolution.value
 
         # Pattern validation
+        port_range_emitted = False
         if contract.pattern and not re.match(contract.pattern, val):
             reason = ViolationReasonCode.PATTERN_MISMATCH
             if contract.value_type == "int" and val.isdigit():
                 port = int(val)
                 if port < 1 or port > 65535:
                     reason = ViolationReasonCode.PORT_OUT_OF_RANGE
+                    port_range_emitted = True
             elif contract.value_type == "url":
                 reason = ViolationReasonCode.MALFORMED_URL
 
@@ -451,7 +453,10 @@ def validate_contracts_at_boot() -> List[ContractViolationRecord]:
             ))
 
         # Semantic port range check (pattern may pass for values like "99999")
-        if contract.value_type == "int" and "PORT" in contract.canonical_name and val.isdigit():
+        if (not port_range_emitted
+                and contract.value_type == "int"
+                and "PORT" in contract.canonical_name
+                and val.isdigit()):
             port = int(val)
             if port < 1 or port > 65535:
                 violations.append(ContractViolationRecord(
