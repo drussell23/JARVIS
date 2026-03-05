@@ -18,6 +18,7 @@ v270.3: Created as part of Phase 6 hardening.
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -285,6 +286,88 @@ class StartupContractViolation(Exception):
             + "\n".join(lines)
         )
         super().__init__(message)
+
+
+# =========================================================================
+# CONTRACT STATE AUTHORITY (Disease 4: enforceable contracts)
+# =========================================================================
+
+class ContractStateAuthority:
+    """Central authority for all contract violation state.
+
+    Accumulates violations with dedup semantics: same (contract_name, reason_code)
+    updates counter/timestamp rather than appending a new entry.
+    Thread-safe via lock.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._violations: Dict[tuple, ContractViolationRecord] = {}
+        self._counts: Dict[tuple, int] = {}
+
+    def record(self, violation: ContractViolationRecord) -> None:
+        key = (violation.contract_name, violation.reason_code)
+        with self._lock:
+            self._violations[key] = violation
+            self._counts[key] = self._counts.get(key, 0) + 1
+
+    def get_violations(self, *, severity_filter=None, phase_filter=None):
+        with self._lock:
+            records = list(self._violations.values())
+        if severity_filter is not None:
+            records = [r for r in records if r.effective_severity == severity_filter]
+        if phase_filter is not None:
+            records = [r for r in records if r.phase == phase_filter]
+        return records
+
+    def has_blockers(self) -> bool:
+        with self._lock:
+            return any(
+                v.effective_severity in (ContractSeverity.PRECHECK_BLOCKER, ContractSeverity.BOOT_BLOCKER)
+                for v in self._violations.values()
+            )
+
+    def blocking_reasons(self):
+        with self._lock:
+            return [
+                v.reason_code.value
+                for v in self._violations.values()
+                if v.effective_severity in (ContractSeverity.PRECHECK_BLOCKER, ContractSeverity.BOOT_BLOCKER)
+            ]
+
+    def health_summary(self, *, max_detail: int = 5):
+        with self._lock:
+            all_v = list(self._violations.values())
+        blockers = [v for v in all_v if v.effective_severity in (
+            ContractSeverity.PRECHECK_BLOCKER, ContractSeverity.BOOT_BLOCKER
+        )]
+        return {
+            "total_violations": len(all_v),
+            "blocker_count": len(blockers),
+            "top_blockers": [
+                {"contract": v.contract_name, "reason": v.reason_code.value}
+                for v in blockers[:max_detail]
+            ],
+        }
+
+    def full_report(self):
+        with self._lock:
+            all_v = list(self._violations.values())
+            counts = dict(self._counts)
+        return {
+            "violations": [
+                {
+                    "contract_name": v.contract_name,
+                    "severity": v.effective_severity.value,
+                    "reason_code": v.reason_code.value,
+                    "violation": v.violation,
+                    "value_origin": v.value_origin,
+                    "phase": v.phase,
+                    "occurrence_count": counts.get((v.contract_name, v.reason_code), 1),
+                }
+                for v in all_v
+            ],
+        }
 
 
 # =========================================================================

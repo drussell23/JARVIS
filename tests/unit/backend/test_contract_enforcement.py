@@ -110,3 +110,83 @@ class TestStartupContractViolation:
 
     def test_exception_is_exception(self):
         assert issubclass(StartupContractViolation, Exception)
+
+
+class TestContractStateAuthority:
+    """Central violation state authority with dedup."""
+
+    def _make_record(self, name="TEST", severity=None, reason=None, phase="precheck"):
+        from backend.core.startup_contracts import ContractSeverity, ViolationReasonCode, ContractViolationRecord
+        sev = severity or ContractSeverity.ADVISORY
+        rc = reason or ViolationReasonCode.PATTERN_MISMATCH
+        return ContractViolationRecord(
+            contract_name=name, base_severity=sev, effective_severity=sev,
+            reason_code=rc, violation=f"{name} violation", value_origin="explicit",
+            checked_at_monotonic=0.0, checked_at_utc="2026-03-05T00:00:00Z", phase=phase,
+        )
+
+    def test_record_and_retrieve(self):
+        from backend.core.startup_contracts import ContractStateAuthority
+        auth = ContractStateAuthority()
+        auth.record(self._make_record())
+        assert len(auth.get_violations()) == 1
+
+    def test_dedup_same_contract_and_reason(self):
+        from backend.core.startup_contracts import ContractStateAuthority, ViolationReasonCode
+        auth = ContractStateAuthority()
+        auth.record(self._make_record("A", reason=ViolationReasonCode.PATTERN_MISMATCH))
+        auth.record(self._make_record("A", reason=ViolationReasonCode.PATTERN_MISMATCH))
+        auth.record(self._make_record("A", reason=ViolationReasonCode.PATTERN_MISMATCH))
+        assert len(auth.get_violations()) == 1
+
+    def test_different_reasons_not_deduped(self):
+        from backend.core.startup_contracts import ContractStateAuthority, ViolationReasonCode
+        auth = ContractStateAuthority()
+        auth.record(self._make_record("A", reason=ViolationReasonCode.PATTERN_MISMATCH))
+        auth.record(self._make_record("A", reason=ViolationReasonCode.ALIAS_CONFLICT))
+        assert len(auth.get_violations()) == 2
+
+    def test_has_blockers(self):
+        from backend.core.startup_contracts import ContractStateAuthority, ContractSeverity
+        auth = ContractStateAuthority()
+        auth.record(self._make_record(severity=ContractSeverity.ADVISORY))
+        assert not auth.has_blockers()
+        auth.record(self._make_record("PORT", severity=ContractSeverity.PRECHECK_BLOCKER))
+        assert auth.has_blockers()
+
+    def test_blocking_reasons(self):
+        from backend.core.startup_contracts import ContractStateAuthority, ContractSeverity, ViolationReasonCode
+        auth = ContractStateAuthority()
+        auth.record(self._make_record("PORT", severity=ContractSeverity.PRECHECK_BLOCKER,
+                                       reason=ViolationReasonCode.PORT_CONFLICT))
+        reasons = auth.blocking_reasons()
+        assert "port_conflict" in reasons
+
+    def test_severity_filter(self):
+        from backend.core.startup_contracts import ContractStateAuthority, ContractSeverity
+        auth = ContractStateAuthority()
+        auth.record(self._make_record("A", severity=ContractSeverity.ADVISORY))
+        auth.record(self._make_record("B", severity=ContractSeverity.PRECHECK_BLOCKER))
+        advisory = auth.get_violations(severity_filter=ContractSeverity.ADVISORY)
+        assert len(advisory) == 1
+        assert advisory[0].contract_name == "A"
+
+    def test_health_summary_bounded(self):
+        from backend.core.startup_contracts import ContractStateAuthority, ContractSeverity, ViolationReasonCode
+        auth = ContractStateAuthority()
+        for i in range(20):
+            auth.record(self._make_record(
+                f"C{i}", severity=ContractSeverity.PRECHECK_BLOCKER,
+                reason=ViolationReasonCode.PORT_CONFLICT
+            ))
+        summary = auth.health_summary(max_detail=5)
+        assert summary["total_violations"] == 20
+        assert len(summary["top_blockers"]) <= 5
+
+    def test_full_report_includes_all(self):
+        from backend.core.startup_contracts import ContractStateAuthority
+        auth = ContractStateAuthority()
+        for i in range(10):
+            auth.record(self._make_record(f"C{i}"))
+        report = auth.full_report()
+        assert len(report["violations"]) == 10
