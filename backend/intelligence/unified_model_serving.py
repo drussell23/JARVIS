@@ -1135,6 +1135,15 @@ class PrimeLocalClient(ModelClient):
             model_name=str(self._model_path.name) if self._model_path else "unknown",
         )
 
+        # Fast-fail during model swap — don't queue behind the swap operation.
+        # Callers (e.g. email triage extraction) catch the failure and fall
+        # through to heuristic-only processing.
+        if getattr(self, '_model_swapping', False):
+            response.success = False
+            response.error = "model_swap_in_progress"
+            response.latency_ms = (time.time() - start_time) * 1000
+            return response
+
         if not self._loaded or self._model is None:
             if not await self.load_model():
                 response.success = False
