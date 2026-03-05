@@ -12060,8 +12060,8 @@ class DynamicPortManager(ResourceManagerBase):
 
         return self.selected_port
 
-    async def _find_dynamic_port(self) -> Optional[int]:
-        """Find an available port in the dynamic range."""
+    def _sync_find_dynamic_port(self) -> Optional[int]:
+        """Synchronous port-probing helper (runs in executor thread)."""
         import socket
         import random
 
@@ -12085,6 +12085,15 @@ class DynamicPortManager(ResourceManagerBase):
                 continue
 
         return None
+
+    async def _find_dynamic_port(self) -> Optional[int]:
+        """Find an available port in the dynamic range (offloaded to executor)."""
+        try:
+            return await _run_in_supervisor_thread(self._sync_find_dynamic_port, timeout=15.0)
+        except asyncio.TimeoutError:
+            if hasattr(self, '_logger') and self._logger:
+                self._logger.warning("_find_dynamic_port timed out after 15s, returning None")
+            return None
 
     async def cleanup_stuck_port(self, port: int) -> bool:
         """
@@ -12197,60 +12206,21 @@ class PortAssignment(NamedTuple):
     conflicts_resolved: int
     assignment_method: str  # "explicit", "environment", "dynamic"
 
-async def assign_all_ports(
-    config: Optional["SystemKernelConfig"] = None,
-    port_manager: Optional[DynamicPortManager] = None,
+def _sync_assign_all_ports(
+    backend_port: int,
+    websocket_port: int,
+    loading_port: int,
+    frontend_port: int,
+    default_backend_port: int,
+    default_websocket_port: int,
+    default_loading_port: int,
+    default_frontend_port: int,
+    selected_port: Optional[int],
 ) -> PortAssignment:
-    """
-    Coordinated port assignment for all JARVIS services.
-
-    This function assigns non-overlapping ports for all services in a single
-    atomic operation, preventing race conditions and port conflicts.
-
-    Port Assignment Strategy:
-    1. Check explicit environment variables first
-    2. If not set, use default base ports with conflict resolution
-    3. Ensure minimum 10-port separation between services
-    4. Verify all ports are available before committing
-
-    Args:
-        config: Optional SystemKernelConfig for reading defaults
-        port_manager: Optional DynamicPortManager for availability checking
-
-    Returns:
-        PortAssignment with all assigned ports
-    """
+    """Synchronous port-assignment helper (runs in executor thread)."""
     import socket
 
-    # Default base ports
-    # v233.0: Harmonize with backend/main.py and frontend DynamicConfigService
-    # Both default to 8010 via BACKEND_PORT env var. Previous mismatch (8000 vs 8010)
-    # caused frontend connection failures when Docker occupied 8010.
-    # v270.3: Use canonical config_constants with inline fallback for import safety.
-    try:
-        from backend.core.config_constants import (
-            BACKEND_PORT as _cc_bp, WEBSOCKET_PORT as _cc_wsp,
-            LOADING_SERVER_PORT as _cc_lsp, FRONTEND_PORT as _cc_fp,
-        )
-        DEFAULT_BACKEND_PORT = _cc_bp
-        DEFAULT_WEBSOCKET_PORT = _cc_wsp
-        DEFAULT_LOADING_PORT = _cc_lsp
-        DEFAULT_FRONTEND_PORT = _cc_fp
-    except ImportError:
-        DEFAULT_BACKEND_PORT = int(os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010")))
-        DEFAULT_WEBSOCKET_PORT = 8765
-        DEFAULT_LOADING_PORT = 3001
-        DEFAULT_FRONTEND_PORT = 3000
-
-    # Minimum separation between services
     MIN_PORT_SEPARATION = 10
-
-    # Read from environment or use defaults
-    backend_port = int(os.getenv("JARVIS_BACKEND_PORT", "0"))
-    websocket_port = int(os.getenv("JARVIS_WEBSOCKET_PORT", "0"))
-    loading_port = int(os.getenv("JARVIS_LOADING_PORT", "0"))
-    frontend_port = int(os.getenv("JARVIS_FRONTEND_PORT", "0"))
-
     assignment_method = "explicit"
     conflicts_resolved = 0
 
@@ -12282,10 +12252,10 @@ async def assign_all_ports(
     # Assign backend port
     if backend_port == 0:
         assignment_method = "dynamic"
-        if port_manager and port_manager.selected_port:
-            backend_port = port_manager.selected_port
+        if selected_port:
+            backend_port = selected_port
         else:
-            backend_port = DEFAULT_BACKEND_PORT
+            backend_port = default_backend_port
 
     if not is_port_available(backend_port):
         backend_port = find_available_port(backend_port, assigned_ports)
@@ -12296,7 +12266,7 @@ async def assign_all_ports(
     # Assign websocket port (must be different from backend)
     if websocket_port == 0:
         assignment_method = "dynamic"
-        websocket_port = DEFAULT_WEBSOCKET_PORT
+        websocket_port = default_websocket_port
 
     while websocket_port in assigned_ports or not is_port_available(websocket_port):
         websocket_port = find_available_port(websocket_port + 1, assigned_ports)
@@ -12312,7 +12282,7 @@ async def assign_all_ports(
     # Assign loading server port
     if loading_port == 0:
         assignment_method = "dynamic"
-        loading_port = DEFAULT_LOADING_PORT
+        loading_port = default_loading_port
 
     while loading_port in assigned_ports or not is_port_available(loading_port):
         loading_port = find_available_port(loading_port + 1, assigned_ports)
@@ -12323,7 +12293,7 @@ async def assign_all_ports(
     # Assign frontend port
     if frontend_port == 0:
         assignment_method = "dynamic"
-        frontend_port = DEFAULT_FRONTEND_PORT
+        frontend_port = default_frontend_port
 
     while frontend_port in assigned_ports or not is_port_available(frontend_port):
         frontend_port = find_available_port(frontend_port + 1, assigned_ports)
@@ -12344,6 +12314,79 @@ async def assign_all_ports(
         conflicts_resolved=conflicts_resolved,
         assignment_method=assignment_method,
     )
+
+
+async def assign_all_ports(
+    config: Optional["SystemKernelConfig"] = None,
+    port_manager: Optional[DynamicPortManager] = None,
+) -> PortAssignment:
+    """
+    Coordinated port assignment for all JARVIS services (offloaded to executor).
+
+    This function assigns non-overlapping ports for all services in a single
+    atomic operation, preventing race conditions and port conflicts.
+
+    Port Assignment Strategy:
+    1. Check explicit environment variables first
+    2. If not set, use default base ports with conflict resolution
+    3. Ensure minimum 10-port separation between services
+    4. Verify all ports are available before committing
+
+    Args:
+        config: Optional SystemKernelConfig for reading defaults
+        port_manager: Optional DynamicPortManager for availability checking
+
+    Returns:
+        PortAssignment with all assigned ports
+    """
+    # Default base ports (pure dict lookups, no I/O)
+    # v233.0: Harmonize with backend/main.py and frontend DynamicConfigService
+    # Both default to 8010 via BACKEND_PORT env var. Previous mismatch (8000 vs 8010)
+    # caused frontend connection failures when Docker occupied 8010.
+    # v270.3: Use canonical config_constants with inline fallback for import safety.
+    try:
+        from backend.core.config_constants import (
+            BACKEND_PORT as _cc_bp, WEBSOCKET_PORT as _cc_wsp,
+            LOADING_SERVER_PORT as _cc_lsp, FRONTEND_PORT as _cc_fp,
+        )
+        default_backend_port = _cc_bp
+        default_websocket_port = _cc_wsp
+        default_loading_port = _cc_lsp
+        default_frontend_port = _cc_fp
+    except ImportError:
+        default_backend_port = int(os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010")))
+        default_websocket_port = 8765
+        default_loading_port = 3001
+        default_frontend_port = 3000
+
+    # Read from environment or use defaults (pure dict lookups)
+    backend_port = int(os.getenv("JARVIS_BACKEND_PORT", "0"))
+    websocket_port = int(os.getenv("JARVIS_WEBSOCKET_PORT", "0"))
+    loading_port = int(os.getenv("JARVIS_LOADING_PORT", "0"))
+    frontend_port = int(os.getenv("JARVIS_FRONTEND_PORT", "0"))
+
+    selected_port = port_manager.selected_port if port_manager else None
+
+    try:
+        return await _run_in_supervisor_thread(
+            _sync_assign_all_ports,
+            backend_port, websocket_port, loading_port, frontend_port,
+            default_backend_port, default_websocket_port, default_loading_port, default_frontend_port,
+            selected_port,
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger("jarvis.supervisor").warning(
+            "assign_all_ports timed out after 30s, returning defaults"
+        )
+        return PortAssignment(
+            backend_port=backend_port or default_backend_port,
+            websocket_port=websocket_port or default_websocket_port,
+            loading_server_port=loading_port or default_loading_port,
+            frontend_port=frontend_port or default_frontend_port,
+            conflicts_resolved=0,
+            assignment_method="timeout_fallback",
+        )
 
 # =============================================================================
 # SEMANTIC VOICE CACHE MANAGER
@@ -21263,14 +21306,9 @@ class ParallelProcessCleaner:
 
         return killed_count
 
-    async def _is_supervisor_truly_stale(self, holder_pid: int) -> bool:
-        """
-        v152.0: Determine if a supervisor process is truly stale.
-
-        A supervisor is NOT stale if:
-        1. Readiness state file was updated in the last 120 seconds
-        2. Heartbeat file was updated in the last 60 seconds
-        """
+    @staticmethod
+    def _sync_is_supervisor_truly_stale(holder_pid: int) -> bool:
+        """Synchronous staleness-check helper (runs in executor thread)."""
         now = time.time()
 
         # Check 1: Readiness state file freshness
@@ -21318,6 +21356,26 @@ class ParallelProcessCleaner:
             pass
 
         return True
+
+    async def _is_supervisor_truly_stale(self, holder_pid: int) -> bool:
+        """
+        v152.0: Determine if a supervisor process is truly stale (offloaded to executor).
+
+        A supervisor is NOT stale if:
+        1. Readiness state file was updated in the last 120 seconds
+        2. Heartbeat file was updated in the last 60 seconds
+        """
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_is_supervisor_truly_stale, holder_pid, timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            if hasattr(self, '_logger') and self._logger:
+                self._logger.warning(
+                    "_is_supervisor_truly_stale timed out after 10s for pid=%d, assuming stale",
+                    holder_pid,
+                )
+            return True
 
 # =============================================================================
 # ZOMBIE PROCESS INFO DATACLASS - Extended Process Metadata
