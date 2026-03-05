@@ -47333,6 +47333,28 @@ class RateLimiterManager(SystemService):
             "algorithm": self._algorithm
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._rules)} rules active"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._states.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RateLimiterManager",
+            version="1.0.0",
+            inputs=["ratelimit.check"],
+            outputs=["ratelimit.result"],
+            side_effects=["writes_ratelimit_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class CoalescedRequest:
     """A coalesced request waiting for result."""
@@ -47795,7 +47817,7 @@ class RetryPolicyDef:
     retryable_exceptions: List[type] = field(default_factory=list)
     non_retryable_exceptions: List[type] = field(default_factory=list)
 
-class RetryPolicyManager:
+class RetryPolicyManager(SystemService):
     """
     Configurable retry policy manager.
 
@@ -47817,7 +47839,7 @@ class RetryPolicyManager:
         self._logger = logging.getLogger("RetryPolicyManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize retry policy manager."""
         try:
             # Register default policies
@@ -47947,6 +47969,28 @@ class RetryPolicyManager:
             return self._metrics.get(policy_id, {})
         return dict(self._metrics)
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._policies)} policies registered"
+
+    async def cleanup(self) -> None:
+        self._policies.clear()
+        self._metrics.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RetryPolicyManager",
+            version="1.0.0",
+            inputs=["retry.configure"],
+            outputs=["retry.policy.updated"],
+            side_effects=["writes_retry_policies"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class PooledResource:
     """A resource in the pool."""
@@ -47957,7 +48001,7 @@ class PooledResource:
     use_count: int = 0
     healthy: bool = True
 
-class ResourcePoolManager:
+class ResourcePoolManager(SystemService):
     """
     Generic resource pooling manager.
 
@@ -47999,7 +48043,7 @@ class ResourcePoolManager:
         self._logger = logging.getLogger(f"ResourcePool[{name}]")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize the resource pool."""
         try:
             # Create minimum number of resources
@@ -48167,6 +48211,28 @@ class ResourcePoolManager:
 
         self._logger.info(f"Resource pool '{self.name}' shutdown complete")
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        avail = len(self._pool)
+        total = len(self._all_resources)
+        return self._initialized, f"ok: {avail}/{total} resources available"
+
+    async def cleanup(self) -> None:
+        await self.shutdown()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourcePoolManager",
+            version="1.0.0",
+            inputs=["resource.acquire"],
+            outputs=["resource.acquired"],
+            side_effects=["writes_resource_pool_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class CostEntry:
     """A cost accounting entry."""
@@ -48180,7 +48246,7 @@ class CostEntry:
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class CostAccountingManager:
+class CostAccountingManager(SystemService):
     """
     Resource usage cost tracking system.
 
@@ -48206,7 +48272,7 @@ class CostAccountingManager:
         self._logger = logging.getLogger("CostAccountingManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize cost accounting manager."""
         try:
             # Set default unit costs
@@ -48384,6 +48450,27 @@ class CostAccountingManager:
             "budget_usage_percent": round((total / budget) * 100, 2) if budget != float("inf") else None
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._entries)} cost entries tracked"
+
+    async def cleanup(self) -> None:
+        self._entries.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CostAccountingManager",
+            version="1.0.0",
+            inputs=["cost.record"],
+            outputs=["cost.report"],
+            side_effects=["writes_cost_ledger"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 # =============================================================================
 # ZONE 4.17: MONITORING, TESTING, AND RULES ENGINE
 # =============================================================================
@@ -48432,7 +48519,7 @@ class Alert:
     acknowledged_by: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class AlertingManager:
+class AlertingManager(SystemService):
     """
     Alert management and notification system.
 
@@ -48460,7 +48547,7 @@ class AlertingManager:
         self._logger = logging.getLogger("AlertingManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize alerting manager."""
         try:
             async with self._lock:
@@ -48711,6 +48798,28 @@ class AlertingManager:
             "history_size": len(self._alert_history)
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._active_alerts)} active alerts"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._active_alerts.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AlertingManager",
+            version="1.0.0",
+            inputs=["alert.trigger"],
+            outputs=["alert.fired", "alert.resolved"],
+            side_effects=["writes_alert_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["alert.trigger"]  # event_driven
+
 @dataclass
 class ProfileEntry:
     """A profiling entry."""
@@ -48724,7 +48833,7 @@ class ProfileEntry:
     memory_after: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class PerformanceProfiler:
+class PerformanceProfiler(SystemService):
     """
     Code performance profiling system.
 
@@ -48750,7 +48859,7 @@ class PerformanceProfiler:
         self._logger = logging.getLogger("PerformanceProfiler")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize performance profiler."""
         try:
             self._initialized = True
@@ -48889,6 +48998,28 @@ class PerformanceProfiler:
     def set_sample_rate(self, rate: float) -> None:
         """Set sampling rate (0.0 to 1.0)."""
         self._sample_rate = max(0.0, min(1.0, rate))
+
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._profiles)} functions profiled"
+
+    async def cleanup(self) -> None:
+        self._profiles.clear()
+        self._active_profiles.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="PerformanceProfiler",
+            version="1.0.0",
+            inputs=["profile.start"],
+            outputs=["profile.report"],
+            side_effects=["writes_profile_data"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["profile.start"]  # event_driven
 
 @dataclass
 class Experiment:
@@ -51226,7 +51357,7 @@ class NetworkEndpoint:
     response_time_ms: float = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class NetworkManager:
+class NetworkManager(SystemService):
     """
     Network connectivity and diagnostics manager.
 
@@ -51252,7 +51383,7 @@ class NetworkManager:
         self._logger = logging.getLogger("NetworkManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize network manager."""
         try:
             self._initialized = True
@@ -51404,6 +51535,29 @@ class NetworkManager:
         """Get all healthy endpoints."""
         return [e for e in self._endpoints.values() if e.healthy]
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        healthy = sum(1 for e in self._endpoints.values() if e.healthy)
+        return self._initialized, f"ok: {healthy}/{len(self._endpoints)} endpoints healthy"
+
+    async def cleanup(self) -> None:
+        self._endpoints.clear()
+        self._dns_cache.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="NetworkManager",
+            version="1.0.0",
+            inputs=["network.check"],
+            outputs=["network.status"],
+            side_effects=["writes_network_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class FileMetadata:
     """Metadata for a file."""
@@ -51417,7 +51571,7 @@ class FileMetadata:
     permissions: str
     checksum: Optional[str] = None
 
-class FileSystemManager:
+class FileSystemManager(SystemService):
     """
     Abstracted file system operations manager.
 
@@ -51444,7 +51598,7 @@ class FileSystemManager:
         self._logger = logging.getLogger("FileSystemManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize file system manager."""
         try:
             self._initialized = True
@@ -51691,6 +51845,35 @@ class FileSystemManager:
                 await callback(path, event_type)
             except Exception as e:
                 self._logger.error(f"Watcher callback error: {e}")
+
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._metadata_cache)} cached entries"
+
+    async def cleanup(self) -> None:
+        self._metadata_cache.clear()
+        self._cache_timestamps.clear()
+        for temp_path in list(self._temp_files):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+        self._temp_files.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="FileSystemManager",
+            version="1.0.0",
+            inputs=["fs.operation"],
+            outputs=["fs.completed"],
+            side_effects=["writes_fs_metadata"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 @dataclass
 class ExternalService:
@@ -52539,7 +52722,7 @@ class ModelExperiment(NamedTuple):
     logs: List[str]
     tags: List[str]
 
-class MLOpsModelRegistry:
+class MLOpsModelRegistry(SystemService):
     """
     Machine Learning Operations model registry.
 
@@ -52558,13 +52741,36 @@ class MLOpsModelRegistry:
         self._lock = asyncio.Lock()
         self._initialized = False
 
-    async def initialize(self) -> bool:
-        """Initialize the MLOps registry."""
+    async def initialize(self) -> None:
+        """Initialize the MLOps registry. Called once during activation."""
         async with self._lock:
-            if self._initialized:
-                return True
             self._initialized = True
-            return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message). Called periodically by registries."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._models)} models, {len(self._experiments)} experiments"
+
+    async def cleanup(self) -> None:
+        """Release resources. Called during shutdown."""
+        self._initialized = False
+        async with self._lock:
+            self._models.clear()
+            self._experiments.clear()
+            self._deployments.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="MLOpsModelRegistry",
+            version="1.0.0",
+            inputs=["model.register", "model.deploy", "experiment.start"],
+            outputs=["model.registered", "model.deployed", "experiment.completed"],
+            side_effects=["writes_model_registry"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["model.register", "experiment.start"]
 
     async def register_model(
         self,
