@@ -149,13 +149,7 @@ class RootAuthorityWatcher:
             prior_restart_timestamps=prior_timestamps,
         )
 
-        # Clear stale incident dedup entries for this subsystem so a new
-        # incarnation is not incorrectly coalesced with the prior one.
-        stale_ids = [
-            iid for iid in self._recent_incidents
-            if iid in self._incident_timestamps
-        ]
-        # We clear ALL recent incidents for simplicity -- a more targeted
+        # Clear ALL recent incidents for simplicity -- a more targeted
         # approach would key by subsystem, but the 60s bucket already
         # provides scoping and re-registration implies a new incarnation.
         self._recent_incidents.clear()
