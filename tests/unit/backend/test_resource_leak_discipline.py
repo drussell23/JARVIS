@@ -13,6 +13,26 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
 
+class TestSubprocessCleanupPattern:
+    """4C: Subprocess code must kill on timeout and cancel."""
+
+    def test_memory_pressure_subprocess_has_cleanup(self):
+        """memory_pressure subprocess must have kill/wait on TimeoutError."""
+        with open("unified_supervisor.py", "r") as f:
+            tree = ast.parse(f.read())
+
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                body_dump = ast.dump(node)
+                if "memory_pressure" in body_dump and "create_subprocess_exec" in body_dump:
+                    assert "kill" in body_dump or "terminate" in body_dump, (
+                        f"Method {node.name} spawns memory_pressure subprocess "
+                        f"but has no kill/terminate cleanup"
+                    )
+                    return
+        pytest.skip("memory_pressure subprocess method not found")
+
+
 class TestTerminalAtexitSafetyNet:
     """4B: atexit handler must be registered when keyboard listener starts."""
 

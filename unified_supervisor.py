@@ -14530,6 +14530,7 @@ class DynamicRAMMonitor:
         try:
             # Method 1: Try memory_pressure command
             pressure_level = 1
+            proc = None
             try:
                 proc = await asyncio.create_subprocess_exec(
                     "memory_pressure",
@@ -14543,16 +14544,57 @@ class DynamicRAMMonitor:
                     pressure_level = 4
                 elif "warn" in output.lower():
                     pressure_level = 2
-            except (FileNotFoundError, asyncio.TimeoutError):
+            except FileNotFoundError:
                 pass
+            except asyncio.TimeoutError:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+            except asyncio.CancelledError:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+                raise
 
             # Method 2: Use vm_stat for page in/out rates
-            proc = await asyncio.create_subprocess_exec(
-                "vm_stat",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            proc = None
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "vm_stat",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+            except asyncio.TimeoutError:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+                return {
+                    "pressure_level": pressure_level,
+                    "pressure_status": {1: "normal", 2: "warn", 4: "critical"}.get(
+                        pressure_level, "unknown"
+                    ),
+                    "page_ins": 0,
+                    "page_outs": 0,
+                    "is_under_pressure": pressure_level >= 2,
+                }
+            except asyncio.CancelledError:
+                if proc is not None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
+                raise
             output = stdout.decode()
 
             page_ins = 0
