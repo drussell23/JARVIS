@@ -6147,8 +6147,9 @@ class IntelligentKernelTakeover:
 
         return cleaned
 
-    async def _find_process_on_port(self, port: int) -> Optional[int]:
-        """Find process listening on a specific port."""
+    @staticmethod
+    def _sync_find_process_on_port(port: int) -> Optional[int]:
+        """Sync helper: scan net_connections for a listening port. Called via executor."""
         try:
             import psutil
 
@@ -6160,6 +6161,15 @@ class IntelligentKernelTakeover:
         except Exception:
             pass
         return None
+
+    async def _find_process_on_port(self, port: int) -> Optional[int]:
+        """Find process listening on a specific port."""
+        try:
+            return await _run_in_supervisor_thread(
+                lambda: self._sync_find_process_on_port(port), timeout=5.0
+            )
+        except (asyncio.TimeoutError, Exception):
+            return None
 
     def _detect_repo_origin(self, cmdline: str) -> str:
         """Detect which repo a process belongs to based on command line."""
@@ -16881,8 +16891,9 @@ class IntelligentResourceOrchestrator:
             memory_pressure=memory_pressure,
         )
 
-    async def _check_memory_detailed(self) -> Dict[str, Any]:
-        """Get detailed memory analysis."""
+    @staticmethod
+    def _sync_check_memory_detailed() -> Dict[str, Any]:
+        """Sync helper: read psutil virtual_memory. Called via executor."""
         try:
             mem = psutil.virtual_memory()
             pressure = (mem.used / mem.total) * 100 if mem.total > 0 else 0
@@ -16895,6 +16906,21 @@ class IntelligentResourceOrchestrator:
                 "percent_used": mem.percent,
             }
         except Exception:
+            return {
+                "available_gb": 0.0,
+                "total_gb": 0.0,
+                "used_gb": 0.0,
+                "pressure": 100.0,
+                "percent_used": 100.0,
+            }
+
+    async def _check_memory_detailed(self) -> Dict[str, Any]:
+        """Get detailed memory analysis."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_check_memory_detailed, timeout=5.0
+            )
+        except asyncio.TimeoutError:
             return {
                 "available_gb": 0.0,
                 "total_gb": 0.0,
@@ -18739,8 +18765,9 @@ class StabilizedChromeLauncher:
         self._logger.info(f"[StabilizedChrome] Restarting Chrome (attempt {self._restart_count}/{self._max_restarts})")
         return await self.launch_stabilized_chrome(url=url, incognito=incognito, kill_existing=True)
     
-    async def get_chrome_memory_usage(self) -> float:
-        """Get current Chrome memory usage in MB."""
+    @staticmethod
+    def _sync_get_chrome_memory_usage() -> float:
+        """Sync helper: iterate psutil processes for Chrome RSS. Called via executor."""
         try:
             import psutil
             total_mb = 0.0
@@ -18752,6 +18779,15 @@ class StabilizedChromeLauncher:
                     continue
             return total_mb
         except Exception:
+            return 0.0
+
+    async def get_chrome_memory_usage(self) -> float:
+        """Get current Chrome memory usage in MB."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_get_chrome_memory_usage, timeout=5.0
+            )
+        except (asyncio.TimeoutError, Exception):
             return 0.0
     
     async def preemptive_restart_if_needed(self, memory_threshold_mb: float = 4096) -> bool:
@@ -19372,40 +19408,53 @@ class IntelligentChromeIncognitoManager:
         except Exception:
             return []
 
-    async def _check_system_health_for_browser(self) -> Tuple[bool, str]:
-        """
-        v197.2: Pre-flight check before launching browser.
-        
-        Prevents crash code 5 (GPU/OOM) by checking system resources BEFORE
-        attempting to launch Chrome. This is proactive crash prevention.
-        
-        Returns:
-            Tuple of (safe_to_launch, reason_if_not_safe)
-        """
+    @staticmethod
+    def _sync_get_chrome_memory_mb() -> float:
+        """Sync helper: sum Chrome process RSS via psutil. Called via executor."""
         try:
             import psutil
-
-            # v260.1: Check memory pressure via MCP broker first
-            _mem_pct = _mcp_memory_percent()
-            if _mem_pct > 90:
-                return (False, f"Critical memory pressure: {_mem_pct}% used")
-            
-            # Check if Chrome is already consuming excessive resources
-            chrome_memory_mb = 0
+            chrome_memory_mb = 0.0
             for proc in psutil.process_iter(['name', 'memory_info']):
                 try:
                     if 'chrome' in proc.info['name'].lower():
                         chrome_memory_mb += proc.info['memory_info'].rss / (1024 * 1024)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
                     continue
-            
+            return chrome_memory_mb
+        except Exception:
+            return 0.0
+
+    async def _check_system_health_for_browser(self) -> Tuple[bool, str]:
+        """
+        v197.2: Pre-flight check before launching browser.
+
+        Prevents crash code 5 (GPU/OOM) by checking system resources BEFORE
+        attempting to launch Chrome. This is proactive crash prevention.
+
+        Returns:
+            Tuple of (safe_to_launch, reason_if_not_safe)
+        """
+        try:
+            # v260.1: Check memory pressure via MCP broker first
+            _mem_pct = _mcp_memory_percent()
+            if _mem_pct > 90:
+                return (False, f"Critical memory pressure: {_mem_pct}% used")
+
+            # Check if Chrome is already consuming excessive resources (offloaded)
+            try:
+                chrome_memory_mb = await _run_in_supervisor_thread(
+                    self._sync_get_chrome_memory_mb, timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                chrome_memory_mb = 0.0
+
             # If Chrome is already using > 4GB, warn
             if chrome_memory_mb > 4096:
                 self._logger.warning(
                     f"[Browser] Chrome already using {chrome_memory_mb:.0f}MB RAM. "
                     "Consider closing some tabs to prevent crash."
                 )
-            
+
             # Check crash rate from monitor
             try:
                 crash_monitor = get_browser_crash_monitor()
@@ -19414,11 +19463,9 @@ class IntelligentChromeIncognitoManager:
                     return (False, f"Recent browser instability: {stats['consecutive_failures']} consecutive failures")
             except Exception:
                 pass  # Monitor might not be available
-            
+
             return (True, "")
-            
-        except ImportError:
-            return (True, "")  # psutil not available, proceed anyway
+
         except Exception as e:
             self._logger.debug(f"[Browser] Health check error: {e}")
             return (True, "")  # Non-critical, proceed
@@ -20121,13 +20168,31 @@ class BrowserCrashMonitor:
             return sum(pressures) / len(pressures)
         return None
 
+    @staticmethod
+    def _sync_proactive_health_check() -> Tuple[float, int]:
+        """Sync helper: scan Chrome processes for memory/count. Called via executor."""
+        try:
+            import psutil
+            chrome_memory_mb = 0.0
+            chrome_process_count = 0
+            for proc in psutil.process_iter(['name', 'memory_info']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        chrome_memory_mb += proc.info['memory_info'].rss / (1024 * 1024)
+                        chrome_process_count += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                    continue
+            return (chrome_memory_mb, chrome_process_count)
+        except Exception:
+            return (0.0, 0)
+
     async def proactive_health_check(self) -> Dict[str, Any]:
         """
         v197.2: Proactive browser health assessment.
-        
+
         Checks Chrome memory usage and crash patterns to predict
         and prevent crash code 5 (GPU/OOM) before it happens.
-        
+
         Returns:
             Dict with health status and recommended actions
         """
@@ -20139,22 +20204,23 @@ class BrowserCrashMonitor:
             "crash_risk_score": 0.0,
             "recommended_action": None,
         }
-        
+
         try:
-            import psutil
-            
-            # Check Chrome memory usage
-            for proc in psutil.process_iter(['name', 'memory_info']):
-                try:
-                    if 'chrome' in proc.info['name'].lower():
-                        result["chrome_memory_mb"] += proc.info['memory_info'].rss / (1024 * 1024)
-                        result["chrome_process_count"] += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
-                    continue
-            
+            # Offload psutil process scan to executor
+            try:
+                chrome_memory_mb, chrome_process_count = await _run_in_supervisor_thread(
+                    self._sync_proactive_health_check, timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                self._logger.warning("[BrowserHealth] Proactive check timed out")
+                return result
+
+            result["chrome_memory_mb"] = chrome_memory_mb
+            result["chrome_process_count"] = chrome_process_count
+
             # Calculate crash risk score (0-1)
             risk_score = 0.0
-            
+
             # Memory contribution to risk
             if result["chrome_memory_mb"] > 6144:
                 risk_score += 0.5  # Very high memory = high risk
@@ -20162,22 +20228,22 @@ class BrowserCrashMonitor:
                 risk_score += 0.3
             elif result["chrome_memory_mb"] > 2048:
                 risk_score += 0.1
-            
+
             # Recent crash history contribution
             crash_rate = self._calculate_crash_rate()
             if crash_rate >= 3:
                 risk_score += 0.4
             elif crash_rate >= 1:
                 risk_score += 0.2
-            
+
             # Consecutive failures contribution
             if self._consecutive_failures >= 2:
                 risk_score += 0.3
             elif self._consecutive_failures >= 1:
                 risk_score += 0.1
-            
+
             result["crash_risk_score"] = min(risk_score, 1.0)
-            
+
             # Determine risk level and action
             if risk_score >= 0.7:
                 result["healthy"] = False
@@ -20198,12 +20264,10 @@ class BrowserCrashMonitor:
             elif risk_score >= 0.2:
                 result["risk_level"] = "medium"
                 result["recommended_action"] = "monitor"
-            
-        except ImportError:
-            pass  # psutil not available
+
         except Exception as e:
             self._logger.debug(f"[BrowserHealth] Check failed: {e}")
-        
+
         return result
 
     async def preemptive_restart_if_needed(self) -> bool:
@@ -21422,8 +21486,8 @@ class ComprehensiveZombieCleanup:
 
         return True
 
-    async def _discover_all_zombies(self) -> Dict[int, ZombieProcessInfo]:
-        """Discover all zombie processes across repos."""
+    def _sync_discover_all_zombies(self) -> Dict[int, "ZombieProcessInfo"]:
+        """Sync helper: full psutil process scan for zombies. Called via executor."""
         zombies: Dict[int, ZombieProcessInfo] = {}
 
         try:
@@ -21431,22 +21495,22 @@ class ComprehensiveZombieCleanup:
         except ImportError:
             return zombies
 
-        # Scan all processes
-        all_ports = []
-        for ports in self.TRINITY_PORTS.values():
-            all_ports.extend(ports)
+        # Snapshot read-only attrs
+        my_pid = self._my_pid
+        my_parent = self._my_parent
+        repo_patterns = self.REPO_PATTERNS
 
         for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info', 'cpu_percent', 'status']):
             try:
                 pid = proc.info['pid']
-                if pid in (self._my_pid, self._my_parent):
+                if pid in (my_pid, my_parent):
                     continue
 
                 cmdline = " ".join(proc.info.get('cmdline') or []).lower()
 
                 # Check if matches any repo pattern
                 repo_origin = "unknown"
-                for repo, patterns in self.REPO_PATTERNS.items():
+                for repo, patterns in repo_patterns.items():
                     if any(p in cmdline for p in patterns):
                         repo_origin = repo
                         break
@@ -21484,6 +21548,17 @@ class ComprehensiveZombieCleanup:
 
         return zombies
 
+    async def _discover_all_zombies(self) -> Dict[int, ZombieProcessInfo]:
+        """Discover all zombie processes across repos."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_discover_all_zombies, timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            return {}
+        except Exception:
+            return {}
+
     async def _terminate_zombies(self, zombies: Dict[int, ZombieProcessInfo]) -> int:
         """Terminate zombie processes."""
         try:
@@ -21513,25 +21588,26 @@ class ComprehensiveZombieCleanup:
 
         return killed
 
-    async def _free_ports(self) -> int:
-        """Free up Trinity ports."""
+    def _sync_free_ports(self) -> int:
+        """Sync helper: scan net_connections and kill port holders. Called via executor."""
         freed = 0
-
         try:
             import psutil
         except ImportError:
             return freed
 
-        all_ports = []
+        all_ports = set()
         for ports in self.TRINITY_PORTS.values():
-            all_ports.extend(ports)
+            all_ports.update(ports)
+
+        my_pid = self._my_pid
+        my_parent = self._my_parent
 
         try:
             for conn in psutil.net_connections(kind='inet'):
                 if conn.laddr.port in all_ports and conn.pid:
-                    if conn.pid in (self._my_pid, self._my_parent):
+                    if conn.pid in (my_pid, my_parent):
                         continue
-
                     try:
                         os.kill(conn.pid, signal.SIGKILL)
                         freed += 1
@@ -21541,6 +21617,17 @@ class ComprehensiveZombieCleanup:
             pass
 
         return freed
+
+    async def _free_ports(self) -> int:
+        """Free up Trinity ports."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_free_ports, timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            return 0
+        except Exception:
+            return 0
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cleanup statistics."""
@@ -24615,9 +24702,11 @@ class HybridIntelligenceCoordinator(IntelligenceManagerBase):
         if pct > 0.0:
             return pct / 100.0
         try:
-            import psutil
-            return psutil.virtual_memory().percent / 100.0
-        except Exception:
+            return await _run_in_supervisor_thread(
+                lambda: __import__('psutil').virtual_memory().percent / 100.0,
+                timeout=5.0,
+            )
+        except (asyncio.TimeoutError, Exception):
             return 0.5
 
     async def _handle_emergency(self, ram_usage: float) -> None:
@@ -28986,14 +29075,12 @@ class ResourceQuotaManager:
     async def _check_processes(self) -> None:
         """Check process count."""
         try:
-            import psutil
-
-            process = psutil.Process()
-            children = process.children(recursive=True)
-            self._usage["child_processes"] = len(children)
-        except ImportError:
-            pass
-        except Exception:
+            count = await _run_in_supervisor_thread(
+                lambda: len(__import__('psutil').Process().children(recursive=True)),
+                timeout=5.0,
+            )
+            self._usage["child_processes"] = count
+        except (asyncio.TimeoutError, Exception):
             pass
 
     def reserve_resources(
@@ -83560,15 +83647,17 @@ class JarvisSystemKernel:
             }
             self.logger.info(f"[DMS] Kernel status: {kernel_status}")
             
-            # Log memory if available
+            # Log memory if available (offloaded to executor)
             try:
-                import psutil
-                process = psutil.Process()
-                mem = process.memory_info()
-                self.logger.info(f"[DMS] Memory: RSS={mem.rss / 1024 / 1024:.1f}MB, VMS={mem.vms / 1024 / 1024:.1f}MB")
-            except Exception:
+                def _read_mem():
+                    import psutil
+                    m = psutil.Process().memory_info()
+                    return (m.rss, m.vms)
+                rss, vms = await _run_in_supervisor_thread(_read_mem, timeout=5.0)
+                self.logger.info(f"[DMS] Memory: RSS={rss / 1024 / 1024:.1f}MB, VMS={vms / 1024 / 1024:.1f}MB")
+            except (asyncio.TimeoutError, Exception):
                 pass
-            
+
             # Log active background tasks
             active_tasks = [t.get_name() for t in self._background_tasks if not t.done()]
             if active_tasks:
