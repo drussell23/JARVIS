@@ -13927,8 +13927,10 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
         try:
             from backend.core.gcp_lifecycle_bridge import notify_bridge
             notify_bridge("notify_spot_preempted", source="SpotInstanceResilienceHandler")
-        except Exception:
-            pass
+        except Exception as e:
+            self._logger.warning(
+                f"[SpotResilience] Failed to notify_spot_preempted: {e}", exc_info=True
+            )
         self._logger.warning("⚠️ SPOT PREEMPTION NOTICE - 30 seconds to shutdown!")
 
         self.preemption_count += 1
@@ -22352,8 +22354,10 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
         try:
             from backend.core.gcp_lifecycle_bridge import notify_bridge
             notify_bridge("notify_spot_preempted", source="GCPSpotResilienceManager")
-        except Exception:
-            pass
+        except Exception as e:
+            self._logger.warning(
+                f"[DeprecatedSpotResilience] Failed to notify_spot_preempted: {e}", exc_info=True
+            )
         self._logger.warning(
             "⚠️ SPOT PREEMPTION NOTICE - 30 seconds to shutdown!"
         )
@@ -41731,6 +41735,44 @@ class ComplianceAuditor(SystemService):
 
         report["summary"]["by_status"] = status_counts
         return report
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        reqs = len(self._requirements)
+        return (True, f"ComplianceAuditor: {reqs} requirements tracked")
+
+    async def cleanup(self) -> None:
+        self._audit_log.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"ComplianceAuditor: initialized={self._initialized}, requirements={len(self._requirements)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ComplianceAuditor",
+            version="1.0.0",
+            inputs=["health.report"],
+            outputs=["compliance.violation", "compliance.pass"],
+            side_effects=["writes_compliance_report"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # batch_window (always_on for lifecycle purposes)
 
 @dataclass
 class DataClassification:
@@ -64842,8 +64884,10 @@ class JarvisSystemKernel:
                 self._notify_prime_router_of_gcp(node_ip, port),
                 name="notify_prime_router_gcp_up",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_prime_router_gcp_up: {e}", exc_info=True
+            )
 
         # v234.0: Notify UnifiedModelServing of GCP endpoint
         try:
@@ -64851,8 +64895,10 @@ class JarvisSystemKernel:
                 self._notify_model_serving_of_gcp(node_ip, port),
                 name="notify_model_serving_gcp_up",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_model_serving_gcp_up: {e}", exc_info=True
+            )
 
         # v271.1: Schedule deferred validation of propagation success.
         # Runs 5s after propagation to verify PrimeRouter actually accepted
@@ -65337,8 +65383,10 @@ class JarvisSystemKernel:
                 self._notify_prime_router_demote(),
                 name="notify_prime_router_demote",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_prime_router_demote: {e}", exc_info=True
+            )
 
         # v234.0: Notify UnifiedModelServing to demote from GCP
         try:
@@ -65346,8 +65394,10 @@ class JarvisSystemKernel:
                 self._notify_model_serving_demote(),
                 name="notify_model_serving_demote",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_model_serving_demote: {e}", exc_info=True
+            )
 
         # v235.1: Clear Trinity GCP ready event so orchestrator knows to re-provision
         try:
@@ -78769,8 +78819,10 @@ class JarvisSystemKernel:
                         )
                         await _ngcp(self._pending_gcp_endpoint)
                         self._pending_gcp_endpoint = None
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[ModelServing-Recovery] Failed to notify_gcp_endpoint_ready: {e}", exc_info=True
+                        )
                 if self._pending_jprime_api_url:
                     try:
                         from backend.intelligence.unified_model_serving import (
@@ -78778,8 +78830,10 @@ class JarvisSystemKernel:
                         )
                         await _njp(self._pending_jprime_api_url)
                         self._pending_jprime_api_url = None
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[ModelServing-Recovery] Failed to notify_jprime_api_ready: {e}", exc_info=True
+                        )
                 # Wire audio pipeline if AudioBus is ready
                 if self._audio_bus is not None and getattr(self._audio_bus, "is_running", False):
                     try:
