@@ -121,6 +121,8 @@ PRIME_API_WAIT_TIMEOUT = float(os.getenv("JARVIS_PRIME_API_WAIT_TIMEOUT", "15.0"
 PRIME_LOCAL_ENABLED = os.getenv("JARVIS_PRIME_LOCAL_ENABLED", "true").lower() == "true"
 PRIME_CLOUD_RUN_ENABLED = os.getenv("JARVIS_PRIME_CLOUD_RUN_ENABLED", "false").lower() == "true"
 PRIME_CLOUD_RUN_URL = os.getenv("JARVIS_PRIME_CLOUD_RUN_URL", "")
+# v290.1: Factory token — only the factory function should construct clients
+_FACTORY_SECRET = "__unified_model_serving_factory__"
 PRIME_MODELS_DIR = Path(os.getenv("JARVIS_PRIME_MODELS_DIR", str(Path.home() / "models")))
 PRIME_DEFAULT_MODEL = os.getenv("JARVIS_PRIME_DEFAULT_MODEL", "prime-7b-chat-v1.Q4_K_M.gguf")
 PRIME_CONTEXT_LENGTH = int(os.getenv("JARVIS_PRIME_CONTEXT_LENGTH", "4096"))
@@ -424,7 +426,15 @@ class PrimeLocalClient(ModelClient):
         for entry in QUANT_CATALOG
     }
 
-    def __init__(self):
+    def __init__(self, _factory_token: str = ""):
+        if _factory_token != _FACTORY_SECRET:
+            import warnings
+            warnings.warn(
+                "Direct PrimeLocalClient() construction is deprecated. "
+                "Use get_model_serving() factory.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.logger = logging.getLogger("PrimeLocalClient")
         self._model = None
         self._model_path: Optional[Path] = None
@@ -1430,7 +1440,17 @@ class PrimeAPIClient(ModelClient):
         base_url: str = PRIME_API_URL,
         timeout: float = PRIME_API_TIMEOUT,
         wait_timeout: float = PRIME_API_WAIT_TIMEOUT,
+        _factory_token: str = "",
     ):
+        if _factory_token != _FACTORY_SECRET:
+            import warnings
+            warnings.warn(
+                "Direct PrimeAPIClient() construction is deprecated. "
+                "Use get_model_serving() factory. "
+                "This will become an error in a future version.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.logger = logging.getLogger("PrimeAPIClient")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -1778,7 +1798,15 @@ class PrimeAPIClient(ModelClient):
 class PrimeCloudRunClient(ModelClient):
     """Client for JARVIS Prime on Cloud Run."""
 
-    def __init__(self, url: str = PRIME_CLOUD_RUN_URL):
+    def __init__(self, url: str = PRIME_CLOUD_RUN_URL, _factory_token: str = ""):
+        if _factory_token != _FACTORY_SECRET:
+            import warnings
+            warnings.warn(
+                "Direct PrimeCloudRunClient() construction is deprecated. "
+                "Use get_model_serving() factory.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self.logger = logging.getLogger("PrimeCloudRunClient")
         self.url = url
         self._session = None
@@ -2636,7 +2664,7 @@ class UnifiedModelServing:
         if PRIME_API_ENABLED:
             self.logger.info("  🔄 Checking J-Prime API availability...")
             _quick_timeout = float(os.getenv("JARVIS_PRIME_API_QUICK_TIMEOUT", "2.0"))
-            probe_client = PrimeAPIClient(wait_timeout=_quick_timeout)
+            probe_client = PrimeAPIClient(wait_timeout=_quick_timeout, _factory_token=_FACTORY_SECRET)
             if await probe_client.wait_for_ready(quiet=True):
                 # J-Prime already available — register immediately
                 self._clients[ModelProvider.PRIME_API] = probe_client
@@ -2653,7 +2681,7 @@ class UnifiedModelServing:
         # Model loads lazily on first generate() call to conserve RAM
         if PRIME_LOCAL_ENABLED:
             self.logger.info("  🔄 Registering Prime Local (Tier 2, lazy-load)...")
-            client = PrimeLocalClient()
+            client = PrimeLocalClient(_factory_token=_FACTORY_SECRET)
             self._clients[ModelProvider.PRIME_LOCAL] = client
             self.logger.info(
                 "  ✓ Prime Local client registered (model loads on demand)"
@@ -2662,7 +2690,7 @@ class UnifiedModelServing:
                 prime_available = True
 
         if PRIME_CLOUD_RUN_ENABLED and PRIME_CLOUD_RUN_URL:
-            client = PrimeCloudRunClient()
+            client = PrimeCloudRunClient(_factory_token=_FACTORY_SECRET)
             if await client.health_check():
                 self._clients[ModelProvider.PRIME_CLOUD_RUN] = client
                 self.logger.info("  ✓ Prime Cloud Run client ready")
@@ -4431,7 +4459,7 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
     client = _model_serving._clients.get(ModelProvider.PRIME_API)
     if client and isinstance(client, PrimeAPIClient):
         # v234.0: Validate new endpoint BEFORE closing old session
-        test_client = PrimeAPIClient(base_url=url)
+        test_client = PrimeAPIClient(base_url=url, _factory_token=_FACTORY_SECRET)
         if not await test_client.wait_for_ready():
             logger.warning(
                 f"[v234.0] GCP endpoint failed validation ({url}), "
@@ -4463,7 +4491,7 @@ async def notify_gcp_endpoint_ready(url: str) -> bool:
         return True
     else:
         # No PrimeAPIClient yet — create one pointing at GCP
-        new_client = PrimeAPIClient(base_url=url)
+        new_client = PrimeAPIClient(base_url=url, _factory_token=_FACTORY_SECRET)
         if await new_client.wait_for_ready():
             _model_serving._clients[ModelProvider.PRIME_API] = new_client
             _model_serving._circuit_breaker.record_success(
@@ -4544,6 +4572,7 @@ async def notify_jprime_api_ready(url: str) -> bool:
     test_client = PrimeAPIClient(
         base_url=url,
         wait_timeout=float(os.getenv("JARVIS_JPRIME_VALIDATION_TIMEOUT", "10.0")),
+        _factory_token=_FACTORY_SECRET,
     )
     if not await test_client.wait_for_ready():
         logger.warning(f"[v261.0] J-Prime endpoint validation failed ({url})")
