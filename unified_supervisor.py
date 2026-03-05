@@ -53294,7 +53294,7 @@ class WorkflowOrchestrator(SystemService):
             version="1.0.0",
             inputs=["workflow.define", "workflow.start"],
             outputs=["workflow.completed", "workflow.failed"],
-            side_effects=["writes_workflow_state"],
+            side_effects=["writes_workflow_definitions"],
         )
 
     def activation_triggers(self) -> List[str]:

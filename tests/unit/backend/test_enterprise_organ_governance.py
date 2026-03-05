@@ -78,7 +78,7 @@ class TestWorkflowOrchestratorGovernance:
         wf = WorkflowOrchestrator()
         contract = wf.capability_contract()
         assert contract.name == "WorkflowOrchestrator"
-        assert "writes_workflow_state" in contract.side_effects
+        assert "writes_workflow_definitions" in contract.side_effects
 
     def test_activation_triggers(self):
         from unified_supervisor import WorkflowOrchestrator
