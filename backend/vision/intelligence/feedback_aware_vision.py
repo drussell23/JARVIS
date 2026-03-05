@@ -17,6 +17,8 @@ from typing import Dict, Any, Optional, List
 from datetime import datetime
 from dataclasses import dataclass
 
+from .boundary_adapters import safe_text
+
 logger = logging.getLogger(__name__)
 
 
@@ -169,20 +171,21 @@ class FeedbackAwareVisionIntelligence:
                 f"adjusted={adjusted_importance:.2f})"
             )
 
-            user_response = await original_callback(change)
+            user_response = safe_text(await original_callback(change))
 
             # Calculate response time
             time_to_respond = time.time() - notification_start_time
 
             # Map response to UserResponse enum
             from backend.core.learning.feedback_loop import UserResponse
-            if 'detail' in user_response.lower() or 'yes' in user_response.lower() or 'tell me' in user_response.lower():
+            user_response_lower = user_response.lower()
+            if 'detail' in user_response_lower or 'yes' in user_response_lower or 'tell me' in user_response_lower:
                 response_type = UserResponse.ENGAGED
-            elif 'no' in user_response.lower() or 'dismiss' in user_response.lower():
+            elif 'no' in user_response_lower or 'dismiss' in user_response_lower:
                 response_type = UserResponse.DISMISSED
-            elif 'later' in user_response.lower() or 'not now' in user_response.lower():
+            elif 'later' in user_response_lower or 'not now' in user_response_lower:
                 response_type = UserResponse.DEFERRED
-            elif 'stop' in user_response.lower() or 'never' in user_response.lower():
+            elif 'stop' in user_response_lower or 'never' in user_response_lower:
                 response_type = UserResponse.NEGATIVE_FEEDBACK
             else:
                 # Default to dismissal if unclear
