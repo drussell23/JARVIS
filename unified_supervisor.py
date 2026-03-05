@@ -52769,9 +52769,29 @@ class MLOpsModelRegistry(SystemService):
         self._initialized = False
 
     async def initialize(self) -> None:
-        """Initialize the MLOps registry. Called once during activation."""
+        """Initialize the MLOps registry and subscribe to model lifecycle events."""
         async with self._lock:
             self._initialized = True
+        # Phase B: Subscribe to model lifecycle events from event bus
+        try:
+            from backend.core.trinity_event_bus import get_event_bus
+            _bus = get_event_bus()
+            if hasattr(_bus, 'subscribe'):
+                await _bus.subscribe("model.*", self._on_model_event)
+        except Exception:
+            pass  # Event bus unavailable — registry still works standalone
+
+    async def _on_model_event(self, event: Any) -> None:
+        """Handle model lifecycle events from event bus (Phase B)."""
+        try:
+            data = getattr(event, 'data', {}) if not isinstance(event, dict) else event
+            event_type = data.get("type", "")
+            if event_type == "model.loaded":
+                model_name = data.get("model_name", "unknown")
+                if model_name not in {m.name for m in self._models.values()}:
+                    await self.register_model(name=model_name, framework=data.get("framework", "unknown"))
+        except Exception:
+            pass
 
     async def health_check(self) -> Tuple[bool, str]:
         """Return (healthy, message). Called periodically by registries."""
@@ -53249,15 +53269,24 @@ class WorkflowOrchestrator(SystemService):
         self._executor_task: Optional[asyncio.Task[None]] = None
 
     async def initialize(self) -> None:
-        """Initialize the workflow orchestrator."""
+        """Initialize the workflow orchestrator and bridge to WorkflowEngine."""
         self._running = True
         self._executor_task = create_safe_task(self._executor_loop())
+        # Phase B: Bridge to WorkflowEngine for DAG execution
+        self._workflow_engine: Optional[Any] = None
+        try:
+            # WorkflowEngine is the execution layer; Orchestrator owns BPM definitions
+            self._workflow_engine = WorkflowEngine()
+            await self._workflow_engine.start()
+        except Exception:
+            self._workflow_engine = None
 
     async def health_check(self) -> Tuple[bool, str]:
         """Return (healthy, message)."""
         if not self._running:
             return False, "not running"
-        return True, f"ok: {len(self._definitions)} workflows, {len(self._instances)} instances"
+        engine_status = "connected" if self._workflow_engine else "standalone"
+        return True, f"ok: {len(self._definitions)} workflows, {len(self._instances)} instances, engine={engine_status}"
 
     def capability_contract(self) -> "CapabilityContract":
         return CapabilityContract(
@@ -54209,10 +54238,17 @@ class NotificationHub(SystemService):
         self._preferences_loaded = False
 
     async def initialize(self) -> None:
-        """Initialize the notification hub."""
+        """Initialize the notification hub and connect to event bus."""
         self._running = True
         self._delivery_task = create_safe_task(self._delivery_loop())
         await self._load_persisted_preferences()
+        # Phase B: Connect to TrinityEventBus for delivery event publishing
+        self._event_bus: Optional[Any] = None
+        try:
+            from backend.core.trinity_event_bus import get_event_bus
+            self._event_bus = get_event_bus()
+        except Exception:
+            pass  # Event bus unavailable — notifications still work locally
 
     async def health_check(self) -> Tuple[bool, str]:
         """Return (healthy, message)."""
@@ -54480,6 +54516,22 @@ class NotificationHub(SystemService):
 
                 self._notifications[notification.notification_id] = updated
 
+            # Phase B: Publish delivery event to TrinityEventBus
+            if self._event_bus and hasattr(self._event_bus, 'publish_raw'):
+                try:
+                    _topic = "notification.delivered" if success else "notification.failed"
+                    await self._event_bus.publish_raw(
+                        topic=_topic,
+                        data={
+                            "notification_id": notification.notification_id,
+                            "channel": channel.channel_type,
+                            "recipient": notification.recipient,
+                            "status": "sent" if success else "failed",
+                        },
+                    )
+                except Exception:
+                    pass  # Best-effort event publishing
+
         except Exception as e:
             async with self._lock:
                 updated = notification._replace(
@@ -54686,7 +54738,9 @@ class SessionManager(SystemService):
     - Session hijacking protection
 
     v311.0: Upgraded to governed SystemService (Phase A).
-    Phase B will delegate to GlobalSessionManager as state authority.
+    v311.0 Phase B: Delegates to GlobalSessionManager as state authority
+    for system-level session tracking. Local sessions are still managed
+    for user-level TTL/expiration concerns.
     """
 
     def __init__(
@@ -54701,17 +54755,24 @@ class SessionManager(SystemService):
         self._lock = asyncio.Lock()
         self._running = False
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        self._global_mgr: Optional[Any] = None  # resolved in initialize()
 
     async def initialize(self) -> None:
-        """Initialize the session manager."""
+        """Initialize the session manager and connect to GlobalSessionManager."""
         self._running = True
         self._cleanup_task = create_safe_task(self._cleanup_loop())
+        # Connect to the global session authority
+        try:
+            self._global_mgr = GlobalSessionManager()
+        except Exception:
+            self._global_mgr = None
 
     async def health_check(self) -> Tuple[bool, str]:
         """Return (healthy, message)."""
         if not self._running:
             return False, "not running"
-        return True, f"ok: {len(self._sessions)} active sessions"
+        global_id = getattr(self._global_mgr, 'session_id', 'N/A') if self._global_mgr else 'disconnected'
+        return True, f"ok: {len(self._sessions)} local sessions, global={global_id[:8]}"
 
     def capability_contract(self) -> "CapabilityContract":
         return CapabilityContract(
@@ -57288,7 +57349,7 @@ class LegacyDegradationManager(SystemService):
         )
 
     async def initialize(self) -> None:
-        """Initialize the degradation manager."""
+        """Initialize the degradation manager and register event emission."""
         self._current_state = DegradationState(
             current_level="normal",
             active_since=time.time(),
@@ -57297,6 +57358,31 @@ class LegacyDegradationManager(SystemService):
             reason="System startup",
         )
         self._initialized = True
+        # Phase B: Register event-emitting callback for manual level changes
+        self._event_bus: Optional[Any] = None
+        try:
+            from backend.core.trinity_event_bus import get_event_bus
+            self._event_bus = get_event_bus()
+        except Exception:
+            pass
+        # Auto-register event emission callback
+        self.register_state_callback(self._emit_level_change_event)
+
+    async def _emit_level_change_event(self, state: DegradationState) -> None:
+        """Emit degradation level change to event bus (Phase B)."""
+        if self._event_bus and hasattr(self._event_bus, 'publish_raw'):
+            try:
+                await self._event_bus.publish_raw(
+                    topic="degradation.level_changed",
+                    data={
+                        "current_level": state.current_level,
+                        "disabled_features": state.disabled_features,
+                        "reason": state.reason,
+                        "source": "LegacyDegradationManager",
+                    },
+                )
+            except Exception:
+                pass
 
     async def health_check(self) -> Tuple[bool, str]:
         """Return (healthy, message)."""
