@@ -202,10 +202,10 @@ class TestContractValidation:
         key = "JARVIS_STARTUP_MEMORY_MODE"
         try:
             os.environ[key] = "INVALID_MODE_VALUE"
-            warnings = validate_contracts_at_boot()
-            pattern_warns = [w for w in warnings if key in w and "pattern" in w.lower()]
-            assert len(pattern_warns) >= 1, (
-                f"Expected pattern violation warning for {key}=INVALID_MODE_VALUE"
+            violations = validate_contracts_at_boot()
+            pattern_violations = [v for v in violations if v.contract_name == key]
+            assert len(pattern_violations) >= 1, (
+                f"Expected pattern violation for {key}=INVALID_MODE_VALUE"
             )
         finally:
             os.environ.pop(key, None)
@@ -217,19 +217,20 @@ class TestContractValidation:
         try:
             os.environ[canonical] = "8010"
             os.environ[alias] = "9999"  # Conflict!
-            warnings = validate_contracts_at_boot()
-            conflict_warns = [w for w in warnings if "conflict" in w.lower()]
-            assert len(conflict_warns) >= 1, (
-                f"Expected alias conflict warning for {canonical}=8010 vs {alias}=9999"
+            violations = validate_contracts_at_boot()
+            conflict_violations = [v for v in violations
+                                   if v.contract_name == canonical
+                                   and v.reason_code.value == "alias_conflict"]
+            assert len(conflict_violations) >= 1, (
+                f"Expected alias conflict for {canonical}=8010 vs {alias}=9999"
             )
         finally:
             os.environ.pop(canonical, None)
             os.environ.pop(alias, None)
 
     def test_validate_no_warnings_when_clean(self):
-        """With no env vars set, there should be no warnings."""
+        """With no env vars set, there should be no violations."""
         from backend.core.startup_contracts import validate_contracts_at_boot
-        # Clear all contracted env vars temporarily
         keys = [
             "JARVIS_STARTUP_MEMORY_MODE", "JARVIS_BACKEND_PORT",
             "BACKEND_PORT", "JARVIS_API_PORT", "JARVIS_PORT",
@@ -239,8 +240,8 @@ class TestContractValidation:
             if k in os.environ:
                 saved[k] = os.environ.pop(k)
         try:
-            warnings = validate_contracts_at_boot()
-            assert len(warnings) == 0, f"Unexpected warnings: {warnings}"
+            violations = validate_contracts_at_boot()
+            assert len(violations) == 0, f"Unexpected violations: {violations}"
         finally:
             for k, v in saved.items():
                 os.environ[k] = v
@@ -300,7 +301,8 @@ class TestGetCanonicalEnv:
         try:
             os.environ[key] = "8888"
             result = get_canonical_env(key)
-            assert result == "8888"
+            assert result is not None
+            assert result.value == "8888"
         finally:
             os.environ.pop(key, None)
 
@@ -313,7 +315,8 @@ class TestGetCanonicalEnv:
         try:
             os.environ[alias] = "7777"
             result = get_canonical_env(canonical)
-            assert result == "7777"
+            assert result is not None
+            assert result.value == "7777"
         finally:
             os.environ.pop(alias, None)
 
@@ -323,7 +326,8 @@ class TestGetCanonicalEnv:
         for k in ("JARVIS_BACKEND_PORT", "BACKEND_PORT", "JARVIS_API_PORT", "JARVIS_PORT"):
             os.environ.pop(k, None)
         result = get_canonical_env("JARVIS_BACKEND_PORT")
-        assert result == "8010"  # default from contract
+        assert result is not None
+        assert result.value == "8010"  # default from contract
 
     def test_non_contracted_var_falls_through(self):
         from backend.core.startup_contracts import get_canonical_env
@@ -331,7 +335,8 @@ class TestGetCanonicalEnv:
         try:
             os.environ[key] = "hello"
             result = get_canonical_env(key)
-            assert result == "hello"
+            assert result is not None
+            assert result.value == "hello"
         finally:
             os.environ.pop(key, None)
 
