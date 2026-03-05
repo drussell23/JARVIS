@@ -13144,6 +13144,37 @@ class ServiceDescriptor:
     init_time_ms: float = 0.0
     memory_delta_mb: float = 0.0
 
+    # --- Dependencies extension ---
+    soft_depends_on: List[str] = field(default_factory=list)  # non-blocking deps
+
+    # --- Governance ---
+    tier: str = "optional"                # immune | nervous | metabolic | higher | optional
+    activation_mode: str = "always_on"    # always_on | warm_standby | event_driven | batch_window
+    boot_policy: str = "non_blocking"     # block_ready | non_blocking | deferred_after_ready
+    criticality: str = "optional"         # kernel_critical | control_plane | optional
+
+    # --- Budget policy ---
+    max_memory_mb: float = 50.0
+    max_cpu_percent: float = 10.0
+    max_concurrent_ops: int = 10
+
+    # --- Failure policy ---
+    max_init_retries: int = 2
+    init_timeout_s: float = 30.0
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_recovery_s: float = 60.0
+    quarantine_after_failures: int = 10
+
+    # --- Health semantics ---
+    health_check_interval_s: float = 30.0
+    liveness_timeout_s: float = 10.0
+    readiness_timeout_s: float = 5.0
+
+    # --- Runtime state extensions ---
+    state: str = "pending"                # pending|initializing|ready|active|degraded|draining|stopped|quarantined
+    activation_count: int = 0
+    last_health_check: float = 0.0
+
 
 # =========================================================================
 # GOVERNANCE DATACLASSES (Enterprise Organ Activation Program v1.0)
