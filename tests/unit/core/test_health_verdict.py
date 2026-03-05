@@ -115,6 +115,24 @@ class TestContractHashCheck:
                 break
 
 
+class TestReadinessHysteresis:
+    def test_config_has_hysteresis_fields(self):
+        """VMManagerConfig must have hysteresis configuration."""
+        from backend.core.gcp_vm_manager import VMManagerConfig
+        config = VMManagerConfig()
+        assert hasattr(config, "readiness_hysteresis_up")
+        assert hasattr(config, "readiness_hysteresis_down")
+        assert config.readiness_hysteresis_up >= 2
+        assert config.readiness_hysteresis_down >= 1
+
+    def test_hysteresis_default_values(self):
+        """Default hysteresis: up=3, down=2."""
+        from backend.core.gcp_vm_manager import VMManagerConfig
+        config = VMManagerConfig()
+        assert config.readiness_hysteresis_up == 3
+        assert config.readiness_hysteresis_down == 2
+
+
 class TestCorrelationIdPropagation:
     def test_ping_health_sends_correlation_header(self):
         """AST check: _ping_health_endpoint must send X-Correlation-ID."""

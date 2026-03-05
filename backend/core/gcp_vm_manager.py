@@ -715,6 +715,14 @@ class VMManagerConfig:
         default_factory=lambda: float(os.getenv("GCP_SERVICE_HEALTH_TIMEOUT", "90.0"))
     )
 
+    # Readiness hysteresis: consecutive checks required for state transition
+    readiness_hysteresis_up: int = field(
+        default_factory=lambda: int(os.getenv("GCP_READINESS_HYSTERESIS_UP", "3"))
+    )
+    readiness_hysteresis_down: int = field(
+        default_factory=lambda: int(os.getenv("GCP_READINESS_HYSTERESIS_DOWN", "2"))
+    )
+
     # Health Check Configuration
     health_check_interval: int = field(
         default_factory=lambda: int(os.getenv("GCP_HEALTH_CHECK_INTERVAL", "30"))
@@ -9787,19 +9795,33 @@ fi
         has_seen_any_response = False  # v235.3: Track if VM has responded at all
         self._current_boot_session_id = None  # v237.0: Reset boot session for fresh polling
         self._current_process_epoch = None  # v237.1: Reset process epoch for fresh polling
+        _consecutive_ready = 0
+        _consecutive_not_ready = 0
+        _hysteresis_met = False
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
             verdict, health_data = await self._ping_health_endpoint(ip, port, timeout=10.0)
 
             if verdict == HealthVerdict.READY:
-                # v220.1: Report 100% on success
-                if progress_callback:
-                    try:
-                        progress_callback(100, "ready", f"VM ready at {ip}")
-                    except Exception:
-                        pass
-                return True, "ready_for_inference"
+                _consecutive_ready += 1
+                _consecutive_not_ready = 0
+                if _consecutive_ready >= self.config.readiness_hysteresis_up:
+                    _hysteresis_met = True
+                    if progress_callback:
+                        try:
+                            progress_callback(100, "ready", f"VM ready at {ip}")
+                        except Exception:
+                            pass
+                    return True, "ready_for_inference"
+                else:
+                    logger.info(
+                        f"☁️ [InvincibleNode] Health READY ({_consecutive_ready}/"
+                        f"{self.config.readiness_hysteresis_up} for hysteresis)"
+                    )
+            else:
+                _consecutive_not_ready += 1
+                _consecutive_ready = 0
 
             # Extract progress info for logging and callback
             progress_pct = 0
