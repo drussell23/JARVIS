@@ -331,6 +331,27 @@ DEFAULT_OPTIONAL_COMPONENTS: FrozenSet[str] = frozenset({
 
 # Default timeout values
 DEFAULT_VERIFICATION_TIMEOUT = 15.0  # seconds (v284: reduced from 60s — parallel checks complete in <5s)
+
+
+def get_default_verification_timeout() -> float:
+    """Get verification timeout, using adaptive value if available.
+
+    Falls through to DEFAULT_VERIFICATION_TIMEOUT if adaptive
+    infrastructure is not initialized (bootstrap fail-open).
+    """
+    try:
+        from backend.core.adaptive_timeout_manager import (
+            adaptive_get_sync,
+            OperationType,
+        )
+        return adaptive_get_sync(
+            OperationType.SERVICE_VERIFICATION,
+            default_s=DEFAULT_VERIFICATION_TIMEOUT,
+        )
+    except Exception:
+        return DEFAULT_VERIFICATION_TIMEOUT
+
+
 DEFAULT_UNHEALTHY_THRESHOLD_FAILURES = 3  # consecutive failures
 DEFAULT_UNHEALTHY_THRESHOLD_SECONDS = 30.0  # seconds
 DEFAULT_REVOCATION_COOLDOWN_SECONDS = 5.0  # seconds
@@ -514,6 +535,8 @@ __all__ = [
     # Configuration
     "DEFAULT_CRITICAL_COMPONENTS",
     "DEFAULT_OPTIONAL_COMPONENTS",
+    "DEFAULT_VERIFICATION_TIMEOUT",
+    "get_default_verification_timeout",
     "ReadinessConfig",
     "get_readiness_config",
     "_reset_config",

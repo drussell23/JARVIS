@@ -201,6 +201,52 @@ See `tests/README.md` for the per-file matrix and commands.
          └── Frontend           port 3000   • Web UI
 ```
 
+### Adaptive Timeout Intelligence Backbone (Planned Integration)
+
+The timeout system is being hardened into a **single adaptive backbone** so startup and health verification no longer depend on static timeout constants. This design treats timeout selection as a controlled system primitive with strict contracts:
+
+- **Deterministic precedence:** `ENV override -> Learned adaptive -> Static default` in all modes
+- **Safe fallback behavior:** if adaptive infrastructure fails, startup fails open to static defaults with no bootstrap blocking
+- **Supervisor authority:** `unified_supervisor.py` owns lifecycle and persistence; non-supervisor processes are read-only snapshots
+- **Copy-on-write snapshots:** hot sync reads are zero-I/O and lock-free against immutable timeout snapshots
+- **Durable learning:** SQLite WAL persistence with bounded retention, schema versioning, and migration rollback safety
+- **Operational control:** kill switch + shadow mode + rate-limited decision telemetry
+
+**Control-plane flow (timeout decision and feedback loop):**
+
+```mermaid
+flowchart TD
+    A[Timeout Call Site<br/>adaptive_get / adaptive_get_sync] --> B{ENV override set?}
+    B -->|yes| C[Return ENV value<br/>source=env]
+    B -->|no| D{Adaptive enabled?}
+    D -->|no| E[Return static default<br/>source=default]
+    D -->|yes| F{Shadow mode?}
+    F -->|yes| G[Compute adaptive value<br/>log delta only]
+    G --> E
+    F -->|no| H[Read immutable stats snapshot]
+    H --> I{Quality gates pass?}
+    I -->|no| E
+    I -->|yes| J[Compute learned timeout<br/>p95 + load + bounds]
+    J --> K[Apply TimeoutBudget allocation]
+    K --> L[Return adaptive value<br/>source=learned]
+
+    L --> M[track_operation outcome]
+    M --> N[Mutable stats update]
+    N --> O[Periodic snapshot rebuild]
+    N --> P[Periodic SQLite persist<br/>WAL + bounded retention]
+```
+
+### Architecture Bullets (Profile-Ready)
+
+Use these in the Architecture section on your GitHub profile to keep the narrative consistent with this repo:
+
+- **Unified Kernel Authority:** one-command boot via `python3 unified_supervisor.py` with deterministic lifecycle sequencing across Body, Prime, and Reactor
+- **Adaptive Timeout Control Plane:** policy-driven timeout resolution (`env > learned > default`) with shadow mode, kill switch, and fail-open bootstrap guarantees
+- **Crash-Consistent Learning:** per-operation timeout statistics persisted to SQLite WAL with bounded retention and migration-safe schema versioning
+- **Cross-Process Safety Model:** supervisor is the sole writer; other processes consume read-only adaptive snapshots with bounded staleness refresh
+- **Budgeted Verification Semantics:** nested checks allocate from a parent verification budget, making timeout exhaustion explicit and observable
+- **Observability by Contract:** fixed-enum decision reasons, source attribution (`env/learned/default`), and rate-limited telemetry to prevent noise storms
+
 **Key files:**
 
 | File | Purpose |

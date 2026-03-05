@@ -1025,17 +1025,38 @@ class StartupConfig:
         """
         Create a StartupTimeoutCalculator using this config's settings.
 
+        If no history is provided, attempts to auto-wire the
+        StartupMetricsHistoryAdapter from the adaptive timeout manager.
+        Falls through gracefully if the manager is not initialized.
+
         Args:
             history: Optional metrics history for adaptive timeouts
 
         Returns:
             Configured StartupTimeoutCalculator instance
         """
+        if history is None:
+            history = self._try_auto_wire_history()
         return StartupTimeoutCalculator(
             trinity_enabled=self.trinity_enabled,
             gcp_enabled=self.gcp_enabled,
             history=history,
         )
+
+    @staticmethod
+    def _try_auto_wire_history() -> Optional[StartupMetricsHistory]:
+        """Auto-wire adaptive timeout history if manager is available."""
+        try:
+            from backend.core.adaptive_timeout_manager import (
+                get_timeout_manager_sync,
+                StartupMetricsHistoryAdapter,
+            )
+            mgr = get_timeout_manager_sync()
+            if mgr is not None:
+                return StartupMetricsHistoryAdapter(mgr)
+        except Exception:
+            pass
+        return None
 
 
 # =============================================================================

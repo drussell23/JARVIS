@@ -86408,12 +86408,19 @@ class JarvisSystemKernel:
         Get verification timeout from config or environment.
 
         v209.0: Unified timeout retrieval with fallback to sensible default.
+        v290.0: Tries adaptive timeout first via get_default_verification_timeout().
 
         Returns:
             Timeout in seconds for service verification.
         """
         try:
             if READINESS_CONFIG_AVAILABLE and get_readiness_config is not None:
+                # v290.0: Use adaptive-aware getter if available
+                try:
+                    from backend.core.readiness_config import get_default_verification_timeout
+                    return get_default_verification_timeout()
+                except ImportError:
+                    pass
                 return get_readiness_config().verification_timeout
         except Exception:
             pass  # Fall through to default
@@ -90955,6 +90962,25 @@ class JarvisSystemKernel:
 
         start_time = time.time()
 
+        # Adaptive timeout integration (v290.0)
+        _atm_available = False
+        _timeout_mgr = None
+        try:
+            from backend.core.adaptive_timeout_manager import (
+                adaptive_get,
+                get_timeout_manager,
+                get_timeout_manager_sync,
+                OperationType as ATMOpType,
+            )
+            # Initialize manager (loads from SQLite, starts auto-persist)
+            _timeout_mgr = get_timeout_manager_sync()
+            if _timeout_mgr is None:
+                _timeout_mgr = await get_timeout_manager()
+                await _timeout_mgr.start_auto_persist()
+            _atm_available = True
+        except Exception:
+            pass
+
         # Helper for non-blocking port check
         async def _async_port_check(host: str, port: int, timeout: float = 5.0) -> bool:
             """Non-blocking port check using async_check_port or fallback."""
@@ -90980,7 +91006,10 @@ class JarvisSystemKernel:
             status: Dict[str, Any] = {"healthy": False, "name": "backend"}
 
             # v260.2: Env-var configurable timeouts with memory-pressure awareness
-            _base_timeout = _get_env_float("JARVIS_VERIFY_BACKEND_TIMEOUT", 3.0)
+            if _atm_available:
+                _base_timeout = await adaptive_get(ATMOpType.BACKEND_HEALTH, default_s=3.0)
+            else:
+                _base_timeout = _get_env_float("JARVIS_VERIFY_BACKEND_TIMEOUT", 3.0)
             _max_retries = int(_get_env_float("JARVIS_VERIFY_BACKEND_RETRIES", 1))
             _check_timeout = _base_timeout
             _saw_open_port = False
@@ -91082,7 +91111,10 @@ class JarvisSystemKernel:
                 status["note"] = "WebSocket port not configured"
                 return status
             # v260.2: Env-var configurable timeout
-            _ws_timeout = _get_env_float("JARVIS_VERIFY_WEBSOCKET_TIMEOUT", 5.0)
+            if _atm_available:
+                _ws_timeout = await adaptive_get(ATMOpType.WEBSOCKET_CHECK, default_s=5.0)
+            else:
+                _ws_timeout = _get_env_float("JARVIS_VERIFY_WEBSOCKET_TIMEOUT", 5.0)
             try:
                 # Non-blocking socket check
                 port_open = await _async_port_check("localhost", port, timeout=_ws_timeout)
@@ -91100,7 +91132,10 @@ class JarvisSystemKernel:
                 return status
             port = self.config.prime_api_port
             # v260.2: Env-var configurable timeout
-            _prime_timeout = _get_env_float("JARVIS_VERIFY_PRIME_TIMEOUT", 2.0)
+            if _atm_available:
+                _prime_timeout = await adaptive_get(ATMOpType.PRIME_HEALTH, default_s=2.0)
+            else:
+                _prime_timeout = _get_env_float("JARVIS_VERIFY_PRIME_TIMEOUT", 2.0)
             try:
                 # Non-blocking socket check
                 port_open = await _async_port_check("localhost", port, timeout=_prime_timeout)
@@ -91118,7 +91153,10 @@ class JarvisSystemKernel:
                 return status
             port = self.config.reactor_api_port
             # v260.2: Env-var configurable timeout
-            _reactor_timeout = _get_env_float("JARVIS_VERIFY_REACTOR_TIMEOUT", 2.0)
+            if _atm_available:
+                _reactor_timeout = await adaptive_get(ATMOpType.REACTOR_HEALTH, default_s=2.0)
+            else:
+                _reactor_timeout = _get_env_float("JARVIS_VERIFY_REACTOR_TIMEOUT", 2.0)
             try:
                 # Non-blocking socket check
                 port_open = await _async_port_check("localhost", port, timeout=_reactor_timeout)
@@ -91149,6 +91187,37 @@ class JarvisSystemKernel:
                     result["all_healthy"] = False
 
         result["total_check_time_ms"] = (time.time() - start_time) * 1000
+
+        # Record service verification duration for adaptive learning
+        if _timeout_mgr is not None:
+            try:
+                all_ok = result.get("all_healthy", False)
+                _timeout_mgr.record_duration(
+                    ATMOpType.SERVICE_VERIFICATION,
+                    duration_ms=result["total_check_time_ms"],
+                    success=all_ok,
+                    context={"service_name": "verify_all_services"},
+                )
+                # Record per-service durations
+                for svc_name, svc_data in result.get("services", {}).items():
+                    if isinstance(svc_data, dict):
+                        svc_healthy = svc_data.get("healthy", False) or bool(svc_data.get("note"))
+                        op_map = {
+                            "backend": ATMOpType.BACKEND_HEALTH,
+                            "websocket": ATMOpType.WEBSOCKET_CHECK,
+                            "prime": ATMOpType.PRIME_HEALTH,
+                            "reactor": ATMOpType.REACTOR_HEALTH,
+                        }
+                        atm_op = op_map.get(svc_name)
+                        if atm_op:
+                            _timeout_mgr.record_duration(
+                                atm_op,
+                                duration_ms=result["total_check_time_ms"],
+                                success=svc_healthy,
+                                context={"service_name": svc_name},
+                            )
+            except Exception:
+                pass
 
         return result
 
