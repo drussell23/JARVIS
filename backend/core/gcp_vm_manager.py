@@ -8468,6 +8468,10 @@ class GCPVMManager:
                             except ImportError:
                                 pass
                         verdict = HealthVerdict.READY if is_ready else HealthVerdict.ALIVE_NOT_READY
+                        logger.debug(
+                            "[GCPVMManager] Health probe %s → %s",
+                            correlation_id, verdict.value,
+                        )
                         # Contract hash advisory check
                         apars_data = data.get("apars", {})
                         if isinstance(apars_data, dict):

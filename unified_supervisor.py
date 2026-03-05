@@ -14684,15 +14684,21 @@ class LazyAsyncLock:
 
     asyncio.Lock() cannot be created outside of an async context in Python 3.9.
     This wrapper delays initialization until first use within an async context.
+
+    v311.0: Added threading.Lock guard to prevent duplicate Lock creation
+    under concurrent access (design doc: 2026-03-05 Phase 2A).
     """
 
     def __init__(self):
         self._lock: Optional[asyncio.Lock] = None
+        self._init_guard = threading.Lock()
 
     def _ensure_lock(self) -> asyncio.Lock:
-        """Ensure lock exists, creating it if needed."""
+        """Ensure lock exists, creating it if needed. Thread-safe."""
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            with self._init_guard:
+                if self._lock is None:
+                    self._lock = asyncio.Lock()
         return self._lock
 
     async def __aenter__(self):
@@ -31748,7 +31754,7 @@ class EventSourcingManager(SystemService):
         self._events.clear()
         self._handlers.clear()
 
-class DynamicConfigurationManager:
+class DynamicConfigurationManager(SystemService):
     """
     Dynamic configuration with hot reload and validation.
 
@@ -31959,6 +31965,33 @@ class DynamicConfigurationManager:
             "last_loaded": self._last_loaded,
             "stats": self._stats,
         }
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Load initial configuration from file."""
+        if self._config_file.exists():
+            await self._load_config()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._schema)} options, {len(self._feature_flags)} flags"
+
+    async def cleanup(self) -> None:
+        self._running = False
+        if self._reload_task and not self._reload_task.done():
+            self._reload_task.cancel()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DynamicConfigurationManager",
+            version="1.0.0",
+            inputs=["config.update"],
+            outputs=["config.changed"],
+            side_effects=["writes_config_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 # =============================================================================
 # ZONE 4.10: DISTRIBUTED SYSTEMS INFRASTRUCTURE
@@ -33811,7 +33844,7 @@ class FeatureGate:
             "enabled_count": self.enabled_count,
         }
 
-class FeatureGateManager:
+class FeatureGateManager(SystemService):
     """
     Feature gate manager for gradual rollouts.
 
@@ -34105,6 +34138,33 @@ class FeatureGateManager:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Initialize feature gate storage."""
+        self._storage_path.mkdir(parents=True, exist_ok=True)
+        await self._load_gates()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._gates)} gates"
+
+    async def cleanup(self) -> None:
+        self._running = False
+        if self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="FeatureGateManager",
+            version="1.0.0",
+            inputs=["feature.toggle"],
+            outputs=["feature.changed"],
+            side_effects=["writes_feature_gates"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class ScalingDecision:
     """Represents an auto-scaling decision."""
 
@@ -34134,7 +34194,7 @@ class ScalingDecision:
             "timestamp": self.timestamp,
         }
 
-class AutoScalingController:
+class AutoScalingController(SystemService):
     """
     Auto-scaling controller for resource management.
 
@@ -34451,6 +34511,29 @@ class AutoScalingController:
             "idle_seconds": time.time() - self._last_activity,
             "stats": self._stats.copy(),
         }
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {self._current_replicas} replicas"
+
+    async def cleanup(self) -> None:
+        self._decision_history.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AutoScalingController",
+            version="1.0.0",
+            inputs=["scaling.trigger"],
+            outputs=["scaling.completed"],
+            side_effects=["writes_scaling_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["scaling.trigger"]  # event_driven
 
 class SecretEntry:
     """
@@ -35450,7 +35533,7 @@ class WorkflowInstance:
             },
         }
 
-class WorkflowEngine:
+class WorkflowEngine(SystemService):
     """
     DAG-based workflow execution engine.
 
@@ -35768,6 +35851,31 @@ class WorkflowEngine:
             "total_instances": len(self._instances),
             "stats": self._stats.copy(),
         }
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Initialize workflow engine resources."""
+        self._storage_path.mkdir(parents=True, exist_ok=True)
+
+    async def health_check(self) -> Tuple[bool, str]:
+        running = len([i for i in self._instances.values() if i.status == "running"])
+        return True, f"ok: {len(self._definitions)} defs, {running} running"
+
+    async def cleanup(self) -> None:
+        self._running = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="WorkflowEngine",
+            version="1.0.0",
+            inputs=["workflow.submit", "workflow.cancel"],
+            outputs=["workflow.completed", "workflow.failed"],
+            side_effects=["writes_workflow_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # warm_standby
 
 class TaskPriority(Enum):
     """Task priority levels."""
@@ -36328,7 +36436,7 @@ class StateMachineInstance:
             "transition_count": len(self.transition_history),
         }
 
-class StateMachineManager:
+class StateMachineManager(SystemService):
     """
     Finite state machine manager.
 
@@ -36493,6 +36601,29 @@ class StateMachineManager:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._definitions)} defs, {len(self._instances)} instances"
+
+    async def cleanup(self) -> None:
+        self._instances.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="StateMachineManager",
+            version="1.0.0",
+            inputs=["state.transition.request"],
+            outputs=["state.transition.completed"],
+            side_effects=["writes_state_machine_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class BatchItem:
     """Represents an item in a batch operation."""
 
@@ -36508,7 +36639,7 @@ class BatchItem:
         self.error: Optional[str] = None
         self.processed_at: Optional[float] = None
 
-class BatchProcessor:
+class BatchProcessor(SystemService):
     """
     Batch processing system with progress tracking.
 
@@ -36685,6 +36816,30 @@ class BatchProcessor:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        active = len([j for j in self._jobs.values() if j.get("status") == "running"])
+        return True, f"ok: {active} active jobs"
+
+    async def cleanup(self) -> None:
+        self._jobs.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="BatchProcessor",
+            version="1.0.0",
+            inputs=["batch.submit"],
+            outputs=["batch.completed"],
+            side_effects=["writes_batch_results"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["batch.submit"]  # event_driven
+
 class NotificationChannel(Enum):
     """Notification channels."""
     LOG = "log"
@@ -36740,7 +36895,7 @@ class Notification:
             "failed_channels": self.failed_channels,
         }
 
-class NotificationDispatcher:
+class NotificationDispatcher(SystemService):
     """
     Multi-channel notification dispatcher.
 
@@ -36903,6 +37058,29 @@ class NotificationDispatcher:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {self._stats['notifications_sent']} sent"
+
+    async def cleanup(self) -> None:
+        self._history.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="NotificationDispatcher",
+            version="1.0.0",
+            inputs=["notification.send"],
+            outputs=["notification.delivered"],
+            side_effects=["writes_notification_log"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["notification.send"]  # event_driven
+
 class SchemaVersion:
     """Represents a schema version."""
 
@@ -36918,7 +37096,7 @@ class SchemaVersion:
         self.created_at = created_at
         self.description = description
 
-class SchemaRegistry:
+class SchemaRegistry(SystemService):
     """
     Schema registry for data validation.
 
@@ -37102,6 +37280,31 @@ class SchemaRegistry:
             "total_versions": sum(len(v) for v in self._schemas.values()),
             "stats": self._stats.copy(),
         }
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Initialize schema storage."""
+        self._storage_path.mkdir(parents=True, exist_ok=True)
+
+    async def health_check(self) -> Tuple[bool, str]:
+        total = sum(len(v) for v in self._schemas.values())
+        return True, f"ok: {len(self._schemas)} schemas, {total} versions"
+
+    async def cleanup(self) -> None:
+        self._schemas.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SchemaRegistry",
+            version="1.0.0",
+            inputs=["schema.register"],
+            outputs=["schema.validated"],
+            side_effects=["writes_schema_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 class APIRoute:
     """Represents an API route in the gateway."""
@@ -44095,7 +44298,7 @@ class ServiceQuery:
     status: Optional[str] = None
     metadata_filters: Optional[Dict[str, Any]] = None
 
-class ServiceRegistryManager:
+class ServiceRegistryManager(SystemService):
     """
     Service discovery and registration system.
 
@@ -44346,6 +44549,29 @@ class ServiceRegistryManager:
             "by_type": by_type,
             "by_status": by_status
         }
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._services)} services registered"
+
+    async def cleanup(self) -> None:
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+        self._services.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ServiceRegistryManager",
+            version="1.0.0",
+            inputs=["service.register"],
+            outputs=["service.discovered"],
+            side_effects=["writes_service_registry_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 @dataclass
 class ConfigurationEntry:
@@ -46985,7 +47211,7 @@ class CoalescedRequest:
     future: asyncio.Future
     created_at: datetime = field(default_factory=datetime.now)
 
-class RequestCoalescer:
+class RequestCoalescer(SystemService):
     """
     Request coalescing and deduplication system.
 
@@ -47129,6 +47355,30 @@ class RequestCoalescer:
             ) * 100
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {self._metrics['coalesced']} coalesced"
+
+    async def cleanup(self) -> None:
+        for task in self._in_flight.values():
+            task.cancel()
+        self._in_flight.clear()
+        self._pending.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RequestCoalescer",
+            version="1.0.0",
+            inputs=["request.coalesce"],
+            outputs=["request.completed"],
+            side_effects=[],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["request.coalesce"]  # event_driven
+
 @dataclass
 class BackgroundJob:
     """A background job definition."""
@@ -47148,7 +47398,7 @@ class BackgroundJob:
     error: Optional[str] = None
     attempts: int = 0
 
-class BackgroundJobManager:
+class BackgroundJobManager(SystemService):
     """
     Background job processing system.
 
@@ -47381,6 +47631,27 @@ class BackgroundJobManager:
 
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._logger.info("Background job manager shutdown complete")
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._jobs)} jobs, {self._running_count} running"
+
+    async def cleanup(self) -> None:
+        await self.shutdown()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="BackgroundJobManager",
+            version="1.0.0",
+            inputs=["job.submit"],
+            outputs=["job.completed", "job.failed"],
+            side_effects=["writes_job_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # warm_standby
 
 @dataclass
 class RetryPolicyDef:
@@ -49041,7 +49312,7 @@ class RuleResult:
     data_modified: Dict[str, Any]
     execution_time_ms: float
 
-class RulesEngine:
+class RulesEngine(SystemService):
     """
     Business rules execution engine.
 
@@ -49254,6 +49525,28 @@ class RulesEngine:
             else:
                 return None
         return current
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._rules)} rules"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._rule_groups.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RulesEngine",
+            version="1.0.0",
+            inputs=["rule.evaluate"],
+            outputs=["rule.result"],
+            side_effects=[],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # warm_standby
 
 @dataclass
 class ValidationRule:
@@ -64708,7 +65001,7 @@ class JarvisSystemKernel:
     # ── v239.0: System Service Registry wiring ────────────────────────
 
     def _init_service_registry(self) -> None:
-        """Construct (but do NOT initialise) the 18 priority system services."""
+        """Construct (but do NOT initialise) the 30 priority system services."""
         self._service_registry = SystemServiceRegistry()
         _r = self._service_registry.register
 
@@ -64916,7 +65209,117 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_DATA_CLASSIFICATION_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 18 services registered across phases 1-6")
+        # Phase 7 (Nervous System) ─ control-plane orchestration
+        _r(ServiceDescriptor(
+            name="workflow_engine",
+            service=WorkflowEngine(),
+            phase=7, tier="nervous",
+            activation_mode="warm_standby",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_WORKFLOW_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="state_machines",
+            service=StateMachineManager(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_STATE_MACHINES_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="config_manager",
+            service=DynamicConfigurationManager(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="block_ready",
+            enabled_env="JARVIS_SERVICE_CONFIG_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="feature_gates",
+            service=FeatureGateManager(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_FEATURE_GATES_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="schema_registry",
+            service=SchemaRegistry(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="block_ready",
+            enabled_env="JARVIS_SERVICE_SCHEMA_REGISTRY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="service_discovery",
+            service=ServiceRegistryManager(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_DISCOVERY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rules_engine",
+            service=RulesEngine(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_RULES_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="batch_processor",
+            service=BatchProcessor(),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_BATCH_PROCESSOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="notifications",
+            service=NotificationDispatcher(),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_NOTIFICATIONS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="request_coalescer",
+            service=RequestCoalescer(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_REQUEST_COALESCER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="job_manager",
+            service=BackgroundJobManager(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_JOB_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="auto_scaler",
+            service=AutoScalingController(),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_AUTO_SCALER_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 30 services registered across phases 1-7")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
