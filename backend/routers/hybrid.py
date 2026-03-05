@@ -9,7 +9,7 @@ Features: REST API, WebSocket support, cleanup triggers, alerts, forecasting.
 import asyncio
 import logging
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from core.cost_tracker import get_cost_tracker, initialize_cost_tracking
 from fastapi import (
@@ -28,8 +28,8 @@ logger = logging.getLogger(__name__)
 # Create router
 router = APIRouter(prefix="/hybrid", tags=["Hybrid Cloud"])
 
-# WebSocket connections
-_ws_connections: List[WebSocket] = []
+# WebSocket connections — use a set for O(1) add/discard and snapshot-iterate
+_ws_connections: Set[WebSocket] = set()
 
 
 # ============================================================================
@@ -574,7 +574,7 @@ async def websocket_endpoint(websocket: WebSocket):
     - Configuration changes
     """
     await websocket.accept()
-    _ws_connections.append(websocket)
+    _ws_connections.add(websocket)
 
     logger.info(f"WebSocket client connected (total: {len(_ws_connections)})")
 
@@ -595,12 +595,11 @@ async def websocket_endpoint(websocket: WebSocket):
             logger.debug(f"Received from WebSocket: {data}")
 
     except WebSocketDisconnect:
-        _ws_connections.remove(websocket)
+        _ws_connections.discard(websocket)
         logger.info(f"WebSocket client disconnected (total: {len(_ws_connections)})")
     except Exception as e:
         logger.error(f"WebSocket error: {e}")
-        if websocket in _ws_connections:
-            _ws_connections.remove(websocket)
+        _ws_connections.discard(websocket)
 
 
 async def _broadcast_ws_event(event_data: Dict[str, Any]):
@@ -609,7 +608,7 @@ async def _broadcast_ws_event(event_data: Dict[str, Any]):
         return
 
     disconnected = []
-    for ws in _ws_connections:
+    for ws in list(_ws_connections):  # snapshot to avoid mutation during iteration
         try:
             await ws.send_json(event_data)
         except Exception as e:
@@ -618,8 +617,7 @@ async def _broadcast_ws_event(event_data: Dict[str, Any]):
 
     # Clean up disconnected clients
     for ws in disconnected:
-        if ws in _ws_connections:
-            _ws_connections.remove(ws)
+        _ws_connections.discard(ws)
 
 
 # Register callback to broadcast events

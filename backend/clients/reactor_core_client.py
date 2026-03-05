@@ -303,6 +303,7 @@ class ReactorCoreClient:
         """
         self.config = config or ReactorCoreConfig()
         self._session: Optional[Any] = None  # aiohttp.ClientSession
+        self._prime_session: Optional[Any] = None  # Persistent session for JARVIS Prime calls
         self._initialized = False
         self._is_online = False
         self._last_health_check: Optional[datetime] = None
@@ -477,15 +478,25 @@ class ReactorCoreClient:
             except asyncio.CancelledError:
                 pass
 
-        # Close session
+        # Close sessions
         if self._session:
             await self._session.close()
             self._session = None
+        if self._prime_session:
+            await self._prime_session.close()
+            self._prime_session = None
 
         self._initialized = False
         self._is_online = False
 
         logger.info("[ReactorClient] Shutdown complete")
+
+    async def _get_prime_session(self) -> Any:
+        """Get or create a persistent aiohttp session for JARVIS Prime calls."""
+        import aiohttp
+        if self._prime_session is None or self._prime_session.closed:
+            self._prime_session = aiohttp.ClientSession()
+        return self._prime_session
 
     # =========================================================================
     # Health & Status
@@ -1005,30 +1016,30 @@ class ReactorCoreClient:
                 "validate_before_swap": True,
             }
 
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{jarvis_prime_url}/model/swap",
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=120.0),  # Models can take time to load
-                ) as response:
-                    if response.status == 200:
-                        result = await response.json()
-                        logger.info(
-                            f"[ReactorClient] JARVIS Prime model swap SUCCESS: "
-                            f"{result.get('old_version')} → {result.get('new_version')} "
-                            f"({result.get('duration_seconds', 0):.2f}s)"
-                        )
-                        return result
-                    else:
-                        text = await response.text()
-                        logger.error(
-                            f"[ReactorClient] JARVIS Prime model swap FAILED: "
-                            f"{response.status} - {text}"
-                        )
-                        return {
-                            "success": False,
-                            "error_message": f"HTTP {response.status}: {text}",
-                        }
+            session = await self._get_prime_session()
+            async with session.post(
+                f"{jarvis_prime_url}/model/swap",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=120.0),  # Models can take time to load
+            ) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    logger.info(
+                        f"[ReactorClient] JARVIS Prime model swap SUCCESS: "
+                        f"{result.get('old_version')} → {result.get('new_version')} "
+                        f"({result.get('duration_seconds', 0):.2f}s)"
+                    )
+                    return result
+                else:
+                    text = await response.text()
+                    logger.error(
+                        f"[ReactorClient] JARVIS Prime model swap FAILED: "
+                        f"{response.status} - {text}"
+                    )
+                    return {
+                        "success": False,
+                        "error_message": f"HTTP {response.status}: {text}",
+                    }
 
         except Exception as e:
             logger.error(f"[ReactorClient] JARVIS Prime model swap error: {e}")
@@ -1049,14 +1060,14 @@ class ReactorCoreClient:
         try:
             import aiohttp
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{jarvis_prime_url}/model/status",
-                    timeout=aiohttp.ClientTimeout(total=10.0),
-                ) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    return None
+            session = await self._get_prime_session()
+            async with session.get(
+                f"{jarvis_prime_url}/model/status",
+                timeout=aiohttp.ClientTimeout(total=10.0),
+            ) as response:
+                if response.status == 200:
+                    return await response.json()
+                return None
 
         except Exception as e:
             logger.warning(f"[ReactorClient] JARVIS Prime status check failed: {e}")
@@ -1074,12 +1085,12 @@ class ReactorCoreClient:
         try:
             import aiohttp
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    f"{jarvis_prime_url}/health",
-                    timeout=aiohttp.ClientTimeout(total=5.0),
-                ) as response:
-                    return response.status == 200
+            session = await self._get_prime_session()
+            async with session.get(
+                f"{jarvis_prime_url}/health",
+                timeout=aiohttp.ClientTimeout(total=5.0),
+            ) as response:
+                return response.status == 200
 
         except Exception:
             return False
