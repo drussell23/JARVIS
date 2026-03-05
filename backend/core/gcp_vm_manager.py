@@ -9797,7 +9797,6 @@ fi
         self._current_process_epoch = None  # v237.1: Reset process epoch for fresh polling
         _consecutive_ready = 0
         _consecutive_not_ready = 0
-        _hysteresis_met = False
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
@@ -9807,7 +9806,6 @@ fi
                 _consecutive_ready += 1
                 _consecutive_not_ready = 0
                 if _consecutive_ready >= self.config.readiness_hysteresis_up:
-                    _hysteresis_met = True
                     if progress_callback:
                         try:
                             progress_callback(100, "ready", f"VM ready at {ip}")
