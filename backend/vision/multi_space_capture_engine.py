@@ -650,24 +650,25 @@ class MultiSpaceCaptureEngine:
         """Capture a single space using best available method"""
         capture_start = time.time()
 
-        # v290.0: Pre-check — skip empty spaces (with freshness guard)
+        # v300.0: Pre-check — skip empty spaces using window_count from detector.
+        # The detector data is always fresh (queried live from Yabai/CGWindowList),
+        # so no staleness guard is needed — the call itself is the freshness check.
         try:
             from .multi_space_window_detector import MultiSpaceWindowDetector
             _detector = MultiSpaceWindowDetector()
             _window_info = _detector.get_all_windows_across_spaces()
             _spaces = _window_info.get("spaces", {})
             _space_data = _spaces.get(space_id, {})
-            _win_count = len(_space_data.get("windows", []))
-            _freshness = time.time() - _space_data.get("timestamp", 0)
-            if _win_count == 0 and _freshness < 5.0:
+            _win_count = _space_data.get("window_count", len(_space_data.get("windows", [])))
+            if _win_count == 0:
                 logger.info(
-                    f"[CAPTURE] Skipping space {space_id} "
-                    f"(empty, fresh check {_freshness:.1f}s ago)"
+                    f"[CAPTURE] Skipping space {space_id} (empty, 0 windows)"
                 )
                 return (False, None, None,
                         f"Space {space_id} is empty (0 windows)")
-        except Exception:
-            pass  # Detector unavailable — continue with capture
+        except Exception as _precheck_err:
+            logger.debug(f"[CAPTURE] Empty-space pre-check unavailable: {_precheck_err}")
+            # Detector unavailable — continue with capture attempt
 
         # Adapt quality based on memory pressure
         effective_quality = self.get_quality_for_pressure(request.quality)
@@ -944,13 +945,21 @@ class MultiSpaceCaptureEngine:
         """
         Capture windows from a specific space using Core Graphics API.
         This can capture windows from ANY space without switching!
+
+        v300.0: Bounded by CG_CAPTURE_TIMEOUT_S. Individual window capture
+        attempts are bounded by PER_WINDOW_CAPTURE_TIMEOUT_S. If the overall
+        budget expires, we return None and let the caller fall back.
         """
+        _cg_timeout = float(os.environ.get("JARVIS_CG_CAPTURE_TIMEOUT", "8"))
+        _per_window_timeout = float(os.environ.get("JARVIS_PER_WINDOW_CAPTURE_TIMEOUT", "4"))
+        _cg_deadline = time.time() + _cg_timeout
+
         try:
             logger.info(
-                f"[CG_CAPTURE] Attempting to capture windows from space {space_id} without switching"
+                f"[CG_CAPTURE] Attempting capture from space {space_id} "
+                f"(budget={_cg_timeout}s, per_window={_per_window_timeout}s)"
             )
 
-            # Import our CG capture module
             try:
                 from .cg_window_capture import CGWindowCapture
                 from .multi_space_window_detector import MultiSpaceWindowDetector
@@ -961,11 +970,8 @@ class MultiSpaceCaptureEngine:
             detector = MultiSpaceWindowDetector()
             window_data = detector.get_all_windows_across_spaces()
 
-            # Find windows in the target space
-            # Windows are EnhancedWindowInfo objects, not dicts
             target_windows = []
             for window in window_data.get("windows", []):
-                # Check if it's an object with attributes or a dict
                 if hasattr(window, "space_id"):
                     if window.space_id == space_id:
                         target_windows.append(window)
@@ -976,51 +982,27 @@ class MultiSpaceCaptureEngine:
                 logger.warning(f"[CG_CAPTURE] No windows found in space {space_id}")
                 return None
 
-            # Look specifically for Terminal first if that's what was requested
             query_wants_terminal = any(
                 term in str(request.reason).lower() for term in ["terminal", "shell", "command"]
             )
-            logger.info(
-                f"[CG_CAPTURE] Query wants terminal: {query_wants_terminal}, reason: {request.reason}"
-            )
 
-            # Priority: Terminal > Other apps
-            priority_order = []
             if query_wants_terminal:
-                priority_order = [
-                    "terminal",
-                    "iterm",
-                    "chrome",
-                    "safari",
-                    "firefox",
-                    "code",
-                ]
+                priority_order = ["terminal", "iterm", "chrome", "safari", "firefox", "code"]
             else:
-                priority_order = [
-                    "chrome",
-                    "safari",
-                    "firefox",
-                    "terminal",
-                    "iterm",
-                    "code",
-                ]
+                priority_order = ["chrome", "safari", "firefox", "terminal", "iterm", "code"]
 
-            # Log all windows in target space
-            logger.info(f"[CG_CAPTURE] Windows in space {space_id}:")
-            # Handle both object attributes and dict keys for logging purposes here
-            for window in target_windows:
-                # Handle both object attributes and dict keys here for logging purposes
-                if hasattr(window, "app_name"):
-                    logger.info(f"  - {window.app_name}: {window.window_title}")
-                else:
-                    logger.info(
-                        f"  - {window.get('app', 'Unknown')}: {window.get('title', 'Unknown')}"
-                    )
+            logger.info(f"[CG_CAPTURE] {len(target_windows)} windows in space {space_id}")
 
-            # Try to capture the most relevant window
             for priority_app in priority_order:
+                if time.time() > _cg_deadline:
+                    logger.warning(f"[CG_CAPTURE] Budget exhausted ({_cg_timeout}s)")
+                    return None
+
                 for window in target_windows:
-                    # Handle both object attributes and dict keys
+                    if time.time() > _cg_deadline:
+                        logger.warning(f"[CG_CAPTURE] Budget exhausted ({_cg_timeout}s)")
+                        return None
+
                     if hasattr(window, "app_name"):
                         app_name = window.app_name
                         window_title = window.window_title
@@ -1028,57 +1010,70 @@ class MultiSpaceCaptureEngine:
                         app_name = window.get("app", "")
                         window_title = window.get("title", "")
 
-                    if priority_app in app_name.lower():
-                        logger.info(
-                            f"[CG_CAPTURE] Found {app_name} '{window_title}' in space {space_id}, capturing..."
-                        )
+                    if priority_app not in app_name.lower():
+                        continue
 
-                        # Find window ID (try yabai first for more reliable ID)
-                        if hasattr(window, "window_id"):
-                            window_id = window.window_id
-                        else:
-                            window_id = CGWindowCapture.find_window_by_name(app_name, window_title)
+                    logger.info(
+                        f"[CG_CAPTURE] Trying {app_name} '{window_title}' in space {space_id}"
+                    )
 
-                        if window_id:
-                            # Try WindowCaptureManager first for robust edge case handling
-                            if WINDOW_CAPTURE_AVAILABLE:
+                    if hasattr(window, "window_id"):
+                        window_id = window.window_id
+                    else:
+                        window_id = CGWindowCapture.find_window_by_name(app_name, window_title)
+
+                    if not window_id:
+                        continue
+
+                    # Try WindowCaptureManager with per-window timeout
+                    if WINDOW_CAPTURE_AVAILABLE:
+                        try:
+                            capture_manager = get_window_capture_manager()
+                            capture_result = await asyncio.wait_for(
+                                capture_manager.capture_window(
+                                    window_id=window_id, space_id=space_id, use_fallback=True
+                                ),
+                                timeout=_per_window_timeout,
+                            )
+                            if capture_result.success:
+                                img = Image.open(capture_result.image_path)
+                                screenshot = np.array(img)
                                 logger.info(
-                                    f"[CG_CAPTURE] Using WindowCaptureManager for window {window_id} in space {space_id}"
-                                )
-                                try:
-                                    capture_manager = get_window_capture_manager()
-                                    capture_result = await capture_manager.capture_window(
-                                        window_id=window_id, space_id=space_id, use_fallback=True
-                                    )
-
-                                    if capture_result.success:
-                                        # Load image as numpy array
-                                        img = Image.open(capture_result.image_path)
-                                        screenshot = np.array(img)
-                                        logger.info(
-                                            f"[CG_CAPTURE] Successfully captured {app_name} (ID: {window_id}) from space {space_id} using WindowCaptureManager!"
-                                        )
-                                        if capture_result.status.value == "fallback_used":
-                                            logger.info(
-                                                f"[CG_CAPTURE] Used fallback window {capture_result.fallback_window_id}"
-                                            )
-                                        return screenshot
-                                    else:
-                                        logger.warning(
-                                            f"[CG_CAPTURE] WindowCaptureManager failed: {capture_result.error}, falling back to CGWindowCapture"
-                                        )
-                                except Exception as e:
-                                    logger.warning(
-                                        f"[CG_CAPTURE] WindowCaptureManager exception: {e}, falling back to CGWindowCapture"
-                                    )
-
-                            # Fallback to CGWindowCapture
-                            screenshot = CGWindowCapture.capture_window_by_id(window_id)
-                            if screenshot is not None:
-                                logger.info(
-                                    f"[CG_CAPTURE] Successfully captured {app_name} (ID: {window_id}) from space {space_id} using CGWindowCapture!"
+                                    f"[CG_CAPTURE] Captured {app_name} (ID:{window_id}) "
+                                    f"via WindowCaptureManager"
                                 )
                                 return screenshot
+                            else:
+                                logger.debug(
+                                    f"[CG_CAPTURE] WCM failed for {window_id}: {capture_result.error}"
+                                )
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"[CG_CAPTURE] WCM timed out for {app_name} ({_per_window_timeout}s)"
+                            )
+                        except Exception as e:
+                            logger.debug(f"[CG_CAPTURE] WCM exception: {e}")
+
+                    # Fallback: synchronous CGWindowCapture with thread timeout
+                    try:
+                        screenshot = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None, CGWindowCapture.capture_window_by_id, window_id
+                            ),
+                            timeout=_per_window_timeout,
+                        )
+                        if screenshot is not None:
+                            logger.info(
+                                f"[CG_CAPTURE] Captured {app_name} (ID:{window_id}) "
+                                f"via CGWindowCapture"
+                            )
+                            return screenshot
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"[CG_CAPTURE] CGWindowCapture timed out for {app_name} ({_per_window_timeout}s)"
+                        )
+                    except Exception as e:
+                        logger.debug(f"[CG_CAPTURE] CGWindowCapture failed: {e}")
 
             logger.warning(f"[CG_CAPTURE] Could not capture any windows from space {space_id}")
             return None

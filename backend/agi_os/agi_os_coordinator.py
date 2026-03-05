@@ -1874,27 +1874,52 @@ class AGIOSCoordinator:
             else:
                 vision_handler = ClaudeVisionAnalyzer(api_key=api_key)
 
-            # v237.3: Permission pre-check — test capture before starting monitoring.
-            # macOS requires Screen Recording permission for Quartz/CGDisplay capture.
-            # Without it, capture returns None or unusably small images.
+            # v300.0: Permission pre-check — lightweight screencapture probe.
+            # Only purpose is to verify Screen Recording permission. Uses a
+            # direct subprocess screencapture call instead of the full vision
+            # pipeline (which involves multi-space detection, CG window enum,
+            # Yabai queries, etc. and can hang during startup).
             try:
                 await self._report_init_progress("screen_analyzer", "Capture probe")
                 capture_probe_timeout = min(
-                    _env_float("JARVIS_AGI_OS_SCREEN_CAPTURE_PROBE_TIMEOUT", 12.0),
-                    max(2.0, _sa_remaining() * 0.4),  # v253.3: budget-aware
+                    _env_float("JARVIS_AGI_OS_SCREEN_CAPTURE_PROBE_TIMEOUT", 8.0),
+                    max(2.0, _sa_remaining() * 0.3),
                 )
+
+                async def _lightweight_capture_probe():
+                    """Direct screencapture — bypasses full vision pipeline."""
+                    import subprocess
+                    import tempfile
+                    _fd, _path = tempfile.mkstemp(suffix=".png", prefix="jarvis_probe_")
+                    os.close(_fd)
+                    try:
+                        proc = await asyncio.create_subprocess_exec(
+                            "screencapture", "-x", _path,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        _, stderr = await asyncio.wait_for(
+                            proc.communicate(), timeout=capture_probe_timeout - 0.5,
+                        )
+                        if proc.returncode != 0:
+                            return None
+                        from PIL import Image
+                        img = Image.open(_path)
+                        return img
+                    finally:
+                        try:
+                            os.unlink(_path)
+                        except OSError:
+                            pass
+
                 test_capture = await asyncio.wait_for(
-                    vision_handler.capture_screen(),
+                    _lightweight_capture_probe(),
                     timeout=capture_probe_timeout,
                 )
                 capture_ok = test_capture is not None
-                # Check for permission-denied indicators (1x1 or tiny images)
                 if capture_ok and hasattr(test_capture, 'size'):
                     w, h = test_capture.size
                     if w < 100 or h < 100:
-                        capture_ok = False
-                if capture_ok and hasattr(test_capture, 'shape'):
-                    if test_capture.shape[0] < 100 or test_capture.shape[1] < 100:
                         capture_ok = False
             except Exception:
                 capture_ok = False
