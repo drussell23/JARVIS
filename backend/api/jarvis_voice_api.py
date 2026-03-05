@@ -2291,16 +2291,14 @@ class JARVISVoiceAPI:
                         f"🔇 [SELF-VOICE-API] Rejecting command - "
                         f"reason: {rejection.reason}, text: '{command.text[:50]}...'"
                     )
-                    return CommandResponse(
-                        response="",
-                        command_type="self_voice_suppression",
-                        success=False,
-                        metadata={
-                            "rejected": True,
-                            "rejection_reason": rejection.reason,
-                            "rejection_details": rejection.details,
-                        }
-                    )
+                    return {
+                        "response": "",
+                        "command_type": "self_voice_suppression",
+                        "success": False,
+                        "rejected": True,
+                        "rejection_reason": rejection.reason,
+                        "rejection_details": rejection.details,
+                    }
             except ImportError:
                 pass  # Manager not available
             except Exception as e:

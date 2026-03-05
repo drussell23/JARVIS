@@ -3093,18 +3093,27 @@ class GoogleWorkspaceClient:
         emails = []
 
         for msg_data in messages:
-            msg = self._gmail_service.users().messages().get(
-                userId='me',
-                id=msg_data['id'],
-                format='metadata',
-                metadataHeaders=['From', 'To', 'Subject', 'Date'],
-            ).execute()
+            msg_id = msg_data.get('id')
+            if not msg_id:
+                logger.debug("[Gmail] Skipping message entry with no 'id' field")
+                continue
+
+            try:
+                msg = self._gmail_service.users().messages().get(
+                    userId='me',
+                    id=msg_id,
+                    format='metadata',
+                    metadataHeaders=['From', 'To', 'Subject', 'Date'],
+                ).execute()
+            except Exception as fetch_err:
+                logger.warning("[Gmail] Failed to fetch message %s: %s", msg_id, fetch_err)
+                continue
 
             headers = {h['name']: h['value'] for h in msg.get('payload', {}).get('headers', [])}
 
             emails.append({
-                "id": msg['id'],
-                "thread_id": msg['threadId'],
+                "id": msg.get('id', msg_id),
+                "thread_id": msg.get('threadId', ''),
                 "from": headers.get('From', 'Unknown'),
                 "to": headers.get('To', ''),
                 "subject": headers.get('Subject', '(no subject)'),
