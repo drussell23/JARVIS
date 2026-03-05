@@ -14,7 +14,7 @@ import logging
 import time
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Protocol, Set, runtime_checkable
 
 from backend.core.root_authority_types import (
     ContractGate,
@@ -30,6 +30,28 @@ from backend.core.root_authority_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+@runtime_checkable
+class VerdictExecutor(Protocol):
+    """Interface that ProcessOrchestrator must implement.
+
+    The watcher decides WHAT to do. The executor decides HOW.
+    """
+
+    async def execute_drain(self, subsystem: str, identity: ProcessIdentity,
+                            drain_timeout_s: float) -> ExecutionResult: ...
+
+    async def execute_term(self, subsystem: str, identity: ProcessIdentity,
+                           term_timeout_s: float) -> ExecutionResult: ...
+
+    async def execute_group_kill(self, subsystem: str,
+                                 identity: ProcessIdentity) -> ExecutionResult: ...
+
+    async def execute_restart(self, subsystem: str,
+                              delay_s: float) -> ExecutionResult: ...
+
+    def get_current_identity(self, subsystem: str) -> Optional[ProcessIdentity]: ...
 
 
 class _SubsystemTracker:
