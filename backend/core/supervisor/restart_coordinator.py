@@ -38,7 +38,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Optional, List
+from typing import Any, Callable, Dict, Optional, List
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +158,29 @@ class RestartCoordinator:
         self._startup_time = time.time()
         self._grace_period_ended = False
 
+        # v310.0: Backoff and quarantine for restart loop prevention
+        import os as _os
+        self._restart_count_total: int = 0
+        self._last_restart_mono: float = 0.0
+        self._quarantine_until: float = 0.0  # monotonic; 0 = not quarantined
+        self._backoff_reset_healthy_s: float = float(
+            _os.environ.get("JARVIS_RESTART_BACKOFF_RESET_S", "120.0")
+        )
+        self._quarantine_threshold: int = 5
+        self._quarantine_duration_s: float = 600.0  # 10 min lockout
+
+        # Backoff base by source category (seconds)
+        self._backoff_base: Dict[str, float] = {
+            "crash": 5.0,
+            "dependency": 15.0,
+            "oom": 30.0,
+            "user": 0.0,        # No backoff for user requests
+            "upgrade": 2.0,
+            "default": 5.0,
+        }
+        self._backoff_max_s: float = 300.0
+        self._backoff_jitter_pct: float = 0.25
+
         logger.info("🔄 Restart coordinator initialized")
 
     async def initialize(self) -> None:
@@ -167,6 +190,20 @@ class RestartCoordinator:
 
         self._initialized = True
         logger.debug("Restart coordinator ready")
+
+    def _classify_restart_source(
+        self, source: RestartSource, metadata: Optional[dict] = None,
+    ) -> str:
+        """Classify restart source into backoff category."""
+        if source == RestartSource.USER_REQUEST:
+            return "user"
+        if source == RestartSource.REMOTE_UPDATE:
+            return "upgrade"
+        if source == RestartSource.DEPENDENCY_UPDATE:
+            return "dependency"
+        if metadata and metadata.get("oom"):
+            return "oom"
+        return "crash"
 
     async def request_restart(
         self,
@@ -198,6 +235,54 @@ class RestartCoordinator:
         if self._is_restarting and urgency != RestartUrgency.CRITICAL:
             logger.debug(f"Restart already in progress, ignoring {source.value} request")
             return False
+
+        # v310.0: Quarantine check
+        from backend.core.time_utils import monotonic_s
+        now_mono = monotonic_s()
+        if now_mono < self._quarantine_until:
+            if urgency != RestartUrgency.CRITICAL:
+                remaining = self._quarantine_until - now_mono
+                logger.error(
+                    f"Restart QUARANTINED ({remaining:.0f}s remaining). "
+                    f"System requires manual intervention or quarantine expiry."
+                )
+                return False
+
+        # v310.0: Reset counters if healthy long enough
+        if self._last_restart_mono > 0 and (now_mono - self._last_restart_mono) > self._backoff_reset_healthy_s:
+            self._restart_count_total = 0
+
+        # v310.0: Source-classified backoff with jitter
+        _source_category = self._classify_restart_source(source, metadata)
+        _base = self._backoff_base.get(_source_category, self._backoff_base["default"])
+        if _base > 0 and urgency not in (RestartUrgency.CRITICAL,):
+            if source != RestartSource.USER_REQUEST:
+                # Check quarantine threshold
+                if self._restart_count_total >= self._quarantine_threshold:
+                    self._quarantine_until = now_mono + self._quarantine_duration_s
+                    logger.error(
+                        f"Entering QUARANTINE: {self._restart_count_total} restarts in window. "
+                        f"No restarts for {self._quarantine_duration_s}s."
+                    )
+                    return False
+
+                # Calculate backoff with jitter
+                import random
+                delay = min(_base * (2 ** self._restart_count_total), self._backoff_max_s)
+                jitter = delay * self._backoff_jitter_pct * (random.random() * 2 - 1)
+                cooldown = max(0.0, delay + jitter)
+
+                if self._last_restart_mono > 0:
+                    elapsed = now_mono - self._last_restart_mono
+                    if elapsed < cooldown:
+                        logger.warning(
+                            f"Restart cooldown: {cooldown:.1f}s ({_source_category}, "
+                            f"attempt #{self._restart_count_total}, elapsed={elapsed:.1f}s)"
+                        )
+                        return False
+
+        self._restart_count_total += 1
+        self._last_restart_mono = now_mono
 
         # v108.4: Skip non-critical restarts during startup grace period
         # This prevents hot-reload from killing JARVIS before it's fully started
