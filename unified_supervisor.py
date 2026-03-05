@@ -13298,7 +13298,43 @@ class SystemServiceRegistry:
     # ── registration ────────────────────────────────────────────────────
 
     def register(self, desc: ServiceDescriptor) -> None:
+        """Register a service. Raises ValueError if adding it would create a dependency cycle."""
         self._services[desc.name] = desc
+        try:
+            self._check_cycles()
+        except ValueError:
+            del self._services[desc.name]
+            raise
+
+    def _check_cycles(self) -> None:
+        """Detect dependency cycles across all registered services. Raises ValueError on cycle."""
+        adj: Dict[str, set] = {}
+        for name, desc in self._services.items():
+            deps = set(desc.depends_on)
+            if hasattr(desc, "soft_depends_on"):
+                deps |= set(desc.soft_depends_on)
+            adj[name] = {d for d in deps if d in self._services}
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {name: WHITE for name in adj}
+        path: List[str] = []
+
+        def dfs(node: str) -> None:
+            color[node] = GRAY
+            path.append(node)
+            for dep in adj.get(node, set()):
+                if color[dep] == GRAY:
+                    cycle_start = path.index(dep)
+                    cycle = path[cycle_start:] + [dep]
+                    raise ValueError(f"Dependency cycle detected: {' -> '.join(cycle)}")
+                if color[dep] == WHITE:
+                    dfs(dep)
+            path.pop()
+            color[node] = BLACK
+
+        for node in adj:
+            if color[node] == WHITE:
+                dfs(node)
 
     def get(self, name: str) -> Optional[Any]:
         """Return a service instance if it is initialised, else None."""
