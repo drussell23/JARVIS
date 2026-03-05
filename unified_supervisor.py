@@ -16440,8 +16440,10 @@ class AsyncVoiceNarrator:
         if self._process and self._process.returncode is None:
             try:
                 self._process.terminate()
-            except Exception:
-                pass
+            except ProcessLookupError:
+                pass  # Process already dead — expected
+            except Exception as e:
+                _unified_logger.debug(f"[Speech] Emergency stop error: {e}")
         self._speaking = False
 
     # =========================================================================
@@ -21018,8 +21020,11 @@ class ParallelProcessCleaner:
                     proc = psutil.Process(target_pid)
                     os.kill(target_pid, sig)
                     return True
-                except (Exception, ProcessLookupError, OSError):
+                except (ProcessLookupError, psutil.NoSuchProcess, OSError):
                     return True  # Process already gone
+                except Exception as e:
+                    self.logger.debug(f"[SafeKill] Unexpected error killing PID {target_pid}: {e}")
+                    return False
 
             async def _async_wait(proc: Any, timeout: float) -> bool:
                 """
@@ -29831,8 +29836,8 @@ class DistributedStateCoordinator:
                 self._local_state = data.get("namespaces", {})
                 self._vector_clock = data.get("vector_clock", {self._component_name: 0})
                 self._version = data.get("version", 0)
-            except Exception:
-                pass
+            except Exception as e:
+                _unified_logger.warning(f"[StateCoordinator] Failed to load state: {e}")
 
     async def _save_state(self) -> None:
         """Save state to disk."""
@@ -29846,8 +29851,8 @@ class DistributedStateCoordinator:
                 "timestamp": time.time(),
             }
             state_file.write_text(json.dumps(data, indent=2))
-        except Exception:
-            pass
+        except Exception as e:
+            _unified_logger.warning(f"[StateCoordinator] Failed to save state: {e}")
 
     async def create_snapshot(self) -> str:
         """Create a state snapshot for backup."""
@@ -30239,8 +30244,8 @@ class TrinityOrchestrationEngine:
                 self._current_term = data.get("term", 0)
                 self._voted_for = data.get("voted_for")
                 self._commit_index = data.get("commit_index", 0)
-            except Exception:
-                pass
+            except Exception as e:
+                _unified_logger.warning(f"[OrchestrationEngine] Failed to load state: {e}")
 
     async def _save_state(self) -> None:
         """Persist state."""
@@ -31652,8 +31657,8 @@ class DynamicConfigurationManager:
                 file_config = json.loads(content)
                 for key, value in file_config.items():
                     self.set(key, value)
-            except Exception:
-                pass
+            except Exception as e:
+                _unified_logger.warning(f"[ConfigManager] Failed to load config: {e}")
 
         # Load from environment
         for key in self._schema.keys():
@@ -31967,7 +31972,8 @@ class DistributedLockManager(SystemService):
 
             return token
 
-        except Exception:
+        except Exception as e:
+            _unified_logger.debug(f"[DLM] Lock acquire error: {e}")
             return None
 
     async def release(self, resource_id: str) -> bool:
@@ -32002,7 +32008,8 @@ class DistributedLockManager(SystemService):
 
             return True
 
-        except Exception:
+        except Exception as e:
+            _unified_logger.warning(f"[DLM] Lock release error: {e}")
             return False
 
     async def _notify_waiters(self, resource_id: str) -> None:
