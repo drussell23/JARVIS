@@ -318,6 +318,13 @@ class PrimeRouter:
         h = host or self._gcp_host or ""
         return any(h.endswith(pat) for pat in self._cloud_run_patterns)
 
+    def is_endpoint_healthy(self) -> bool:
+        """Read-only health query for ModelRouter delegation.
+
+        Returns True if the prime endpoint circuit breaker allows execution.
+        """
+        return self._local_circuit.can_execute()
+
     async def initialize(self) -> None:
         """Initialize the router and its clients."""
         if self._initialized:
