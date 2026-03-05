@@ -19,9 +19,48 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 CONTRACT_VERSION = "1.0.0"
+
+
+# =========================================================================
+# SEVERITY & VIOLATION ENUMS (Disease 4: enforceable contracts)
+# =========================================================================
+
+class ContractSeverity(str, Enum):
+    """How severely a contract violation should be treated.
+
+    Ordered from most severe to least severe:
+      PRECHECK_BLOCKER  - Fail before any component starts
+      BOOT_BLOCKER      - Fail during boot sequence
+      BLOCK_BEFORE_READY - Allow boot but block readiness advertisement
+      DEGRADED_ALLOWED  - Allow startup in degraded mode with warnings
+      ADVISORY          - Log only, never block (legacy behaviour)
+    """
+    PRECHECK_BLOCKER = "precheck_blocker"
+    BOOT_BLOCKER = "boot_blocker"
+    BLOCK_BEFORE_READY = "block_before_ready"
+    DEGRADED_ALLOWED = "degraded_allowed"
+    ADVISORY = "advisory"
+
+
+class ViolationReasonCode(str, Enum):
+    """Machine-readable reason why a contract was violated."""
+    MALFORMED_URL = "malformed_url"
+    PORT_CONFLICT = "port_conflict"
+    PORT_OUT_OF_RANGE = "port_out_of_range"
+    MISSING_SECRET = "missing_secret"
+    CAPABILITY_MISSING = "capability_missing"
+    SCHEMA_INCOMPATIBLE = "schema_incompatible"
+    VERSION_INCOMPATIBLE = "version_incompatible"
+    HASH_DRIFT_DETECTED = "hash_drift_detected"
+    HANDSHAKE_FAILED = "handshake_failed"
+    HEALTH_UNREACHABLE = "health_unreachable"
+    ALIAS_CONFLICT = "alias_conflict"
+    PATTERN_MISMATCH = "pattern_mismatch"
+    DEFAULT_FALLBACK_USED = "default_fallback_used"
 
 
 # =========================================================================
@@ -38,6 +77,7 @@ class EnvContract:
     aliases: tuple = ()  # legacy names that map to same concept
     default: Optional[str] = None
     version: str = "1.0.0"
+    severity: ContractSeverity = ContractSeverity.ADVISORY
 
 
 # Registry of all cross-repo environment variable contracts.
@@ -94,6 +134,7 @@ ENV_CONTRACTS: List[EnvContract] = [
         pattern=r"^\d{1,5}$",
         aliases=("BACKEND_PORT", "JARVIS_API_PORT", "JARVIS_PORT"),
         default="8010",
+        severity=ContractSeverity.PRECHECK_BLOCKER,
     ),
     EnvContract(
         "JARVIS_FRONTEND_PORT", "Frontend dev server port",
@@ -101,6 +142,7 @@ ENV_CONTRACTS: List[EnvContract] = [
         pattern=r"^\d{1,5}$",
         aliases=("FRONTEND_PORT",),
         default="3000",
+        severity=ContractSeverity.PRECHECK_BLOCKER,
     ),
     EnvContract(
         "JARVIS_LOADING_SERVER_PORT", "Loading server port",
@@ -108,6 +150,7 @@ ENV_CONTRACTS: List[EnvContract] = [
         pattern=r"^\d{1,5}$",
         aliases=("LOADING_SERVER_PORT", "JARVIS_LOADING_PORT"),
         default="3001",
+        severity=ContractSeverity.PRECHECK_BLOCKER,
     ),
 
     # --- GCP / Cloud ---
@@ -115,34 +158,40 @@ ENV_CONTRACTS: List[EnvContract] = [
         "JARVIS_PRIME_URL", "URL to J-Prime inference endpoint",
         value_type="url",
         pattern=r"^https?://[\w.\-]+:\d{1,5}(/.*)?$",
+        severity=ContractSeverity.PRECHECK_BLOCKER,
     ),
     EnvContract(
         "GCP_PRIME_ENDPOINT", "GCP Prime endpoint (alias for JARVIS_PRIME_URL)",
         value_type="url",
         pattern=r"^https?://[\w.\-]+:\d{1,5}(/.*)?$",
+        severity=ContractSeverity.DEGRADED_ALLOWED,
     ),
     EnvContract(
         "JARVIS_INVINCIBLE_NODE_IP", "IP of the GCP Invincible Node",
         value_type="str",
         pattern=r"^[\d.]+$",
+        severity=ContractSeverity.DEGRADED_ALLOWED,
     ),
     EnvContract(
         "JARVIS_INVINCIBLE_NODE_PORT", "Port of the Invincible Node",
         value_type="int",
         pattern=r"^\d{1,5}$",
         default="8000",
+        severity=ContractSeverity.DEGRADED_ALLOWED,
     ),
     EnvContract(
         "JARVIS_GCP_OFFLOAD_ACTIVE", "Whether GCP offload is active",
         value_type="bool",
         pattern=r"^(true|false|1|0)$",
         default="false",
+        severity=ContractSeverity.DEGRADED_ALLOWED,
     ),
     EnvContract(
         "JARVIS_INVINCIBLE_NODE_BOOTING", "Whether Invincible Node is booting",
         value_type="bool",
         pattern=r"^(true|false|1|0)$",
         default="false",
+        severity=ContractSeverity.DEGRADED_ALLOWED,
     ),
 
     # --- Hollow Client ---
@@ -152,6 +201,7 @@ ENV_CONTRACTS: List[EnvContract] = [
         pattern=r"^(true|false|1|0)$",
         aliases=("JARVIS_HOLLOW_CLIENT", "JARVIS_HOLLOW_CLIENT_MODE"),
         default="false",
+        severity=ContractSeverity.DEGRADED_ALLOWED,
     ),
 
     # --- Backend ---
@@ -160,6 +210,7 @@ ENV_CONTRACTS: List[EnvContract] = [
         value_type="bool",
         pattern=r"^(true|false)$",
         default="false",
+        severity=ContractSeverity.DEGRADED_ALLOWED,
     ),
 
     # --- Memory ---
@@ -188,6 +239,52 @@ _ALIAS_MAP: Dict[str, str] = {}
 for _c in ENV_CONTRACTS:
     for _a in _c.aliases:
         _ALIAS_MAP[_a] = _c.canonical_name
+
+
+# =========================================================================
+# VIOLATION RECORDS (Disease 4: enforceable contracts)
+# =========================================================================
+
+@dataclass(frozen=True)
+class ContractViolationRecord:
+    """Immutable record of a single contract violation.
+
+    Captures everything needed for enforcement decisions and forensic
+    investigation: what contract failed, how bad it is, why it failed,
+    where the value came from, and when the check ran.
+    """
+    contract_name: str
+    base_severity: ContractSeverity
+    effective_severity: ContractSeverity  # may differ from base via overrides
+    reason_code: ViolationReasonCode
+    violation: str  # human-readable description
+    value_origin: str  # "explicit", "alias", "default", "missing"
+    checked_at_monotonic: float
+    checked_at_utc: str
+    phase: str  # "precheck", "boot", "readiness", "runtime"
+
+
+class StartupContractViolation(Exception):
+    """Raised when one or more contract violations exceed the allowed severity.
+
+    Carries structured violation records so callers can inspect, log, or
+    report exactly which contracts failed and why.
+    """
+
+    def __init__(self, violations: List[ContractViolationRecord]) -> None:
+        self.violations = violations
+        lines = []
+        for v in violations:
+            lines.append(
+                f"  [{v.effective_severity.value}] {v.contract_name}: "
+                f"{v.violation} (reason={v.reason_code.value}, "
+                f"origin={v.value_origin}, phase={v.phase})"
+            )
+        message = (
+            f"{len(violations)} contract violation(s) prevent startup:\n"
+            + "\n".join(lines)
+        )
+        super().__init__(message)
 
 
 # =========================================================================
