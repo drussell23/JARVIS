@@ -33,6 +33,40 @@ class TestSubprocessCleanupPattern:
         pytest.skip("memory_pressure subprocess method not found")
 
 
+class TestChromaDBCleanup:
+    """4D: ChromaDB client must be explicitly closed in cleanup()."""
+
+    def test_cleanup_closes_client_and_nullifies_refs(self):
+        """cleanup() must close/reset ChromaDB client AND set references to None."""
+        import ast
+
+        with open("unified_supervisor.py", "r") as f:
+            tree = ast.parse(f.read())
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "SemanticVoiceCacheManager":
+                for item in node.body:
+                    if isinstance(item, ast.AsyncFunctionDef) and item.name == "cleanup":
+                        body = ast.dump(item)
+                        has_reset = "reset" in body
+                        has_nullify_client = False
+                        has_nullify_collection = False
+                        # Check for _client = None and _collection = None assignments
+                        for sub in ast.walk(item):
+                            if isinstance(sub, ast.Assign):
+                                for target in sub.targets:
+                                    if isinstance(target, ast.Attribute):
+                                        if target.attr == "_client" and isinstance(sub.value, ast.Constant) and sub.value.value is None:
+                                            has_nullify_client = True
+                                        if target.attr == "_collection" and isinstance(sub.value, ast.Constant) and sub.value.value is None:
+                                            has_nullify_collection = True
+                        assert has_reset, "cleanup() must call reset() on ChromaDB client"
+                        assert has_nullify_client, "cleanup() must set self._client = None"
+                        assert has_nullify_collection, "cleanup() must set self._collection = None"
+                        return
+        pytest.fail("SemanticVoiceCacheManager.cleanup() not found")
+
+
 class TestTerminalAtexitSafetyNet:
     """4B: atexit handler must be registered when keyboard listener starts."""
 

@@ -12561,6 +12561,12 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
                 self._client.persist()
             except Exception:
                 pass
+            try:
+                self._client.reset()
+            except Exception:
+                pass
+            self._client = None
+            self._collection = None
         self._initialized = False
 
     async def query_cache(
