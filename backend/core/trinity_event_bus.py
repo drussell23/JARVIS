@@ -169,7 +169,7 @@ class EventBusConfig:
         str(Path.home() / "Documents/repos/jarvis-prime")
     ))
     REACTOR_PATH = Path(_env_str(
-        "REACTOR_CORE_REPO",
+        "REACTOR_CORE_PATH",  # v310.0: standardized to match trinity_bridge.py
         str(Path.home() / "Documents/repos/reactor-core")
     ))
 
