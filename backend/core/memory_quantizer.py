@@ -466,6 +466,11 @@ class MemoryQuantizer:
         logger.info(f"  SAI: {'✅' if sai_engine else '❌'}")
         logger.info(f"  Learning DB: {'✅' if learning_db else '❌'}")
 
+    @property
+    def thrash_state(self) -> str:
+        """Current thrash state: 'healthy', 'thrashing', or 'emergency'."""
+        return self._thrash_state
+
     async def initialize(self):
         """Async initialization - load patterns from Learning DB"""
         if self.learning_db:
@@ -1373,7 +1378,13 @@ class MemoryQuantizer:
             self._thrash_warning_since = 0.0
             self._thrash_emergency_since = 0.0
             self._thrash_recovery_since = 0.0
-            if old_state == "emergency":
+            # Hysteresis: hold emergency until rate drops below exit threshold
+            # (70% of entry) to prevent flapping between states.
+            _exit_ratio = float(os.environ.get("THRASH_EXIT_RATIO", "0.7"))
+            _emergency_exit = THRASH_PAGEIN_EMERGENCY * _exit_ratio
+            if old_state == "emergency" and rate >= _emergency_exit:
+                return  # Hold emergency state
+            elif old_state == "emergency":
                 new_state = "thrashing"
             elif old_state == "thrashing":
                 return
