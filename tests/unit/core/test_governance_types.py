@@ -121,3 +121,27 @@ class TestComponentDefinitionGovernanceFields:
         )
         assert defn.promotion_level == PromotionLevel.PROMOTED
         assert defn.activation_tier == ActivationTier.IMMUNE
+
+
+class TestHealthProbeRegistration:
+    def test_register_health_probes(self):
+        from backend.core.component_registry import (
+            ComponentRegistry, ComponentDefinition, Criticality, ProcessType,
+            HealthProbeSet,
+        )
+        reg = ComponentRegistry()
+        defn = ComponentDefinition(
+            name="test_svc", criticality=Criticality.OPTIONAL,
+            process_type=ProcessType.IN_PROCESS,
+        )
+        reg.register(defn)
+        probes = HealthProbeSet(liveness=lambda: True)
+        reg.register_health_probes("test_svc", probes)
+        assert "test_svc" in reg._health_probes
+
+    def test_register_probes_for_unregistered_fails(self):
+        import pytest
+        from backend.core.component_registry import ComponentRegistry, HealthProbeSet
+        reg = ComponentRegistry()
+        with pytest.raises(KeyError):
+            reg.register_health_probes("nonexistent", HealthProbeSet())

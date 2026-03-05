@@ -161,6 +161,14 @@ class HealthPolicy:
 
 
 @dataclass
+class HealthProbeSet:
+    """Runtime health probe callbacks for a governed component."""
+    liveness: Optional[Callable] = None
+    readiness: Optional[Callable] = None
+    degradation: Optional[Callable] = None
+
+
+@dataclass
 class Dependency:
     """A dependency on another component."""
     component: str
@@ -299,6 +307,7 @@ class ComponentRegistry:
         self._components: Dict[str, ComponentState] = {}
         self._capabilities: Dict[str, str] = {}  # capability -> component name
         self._state_domains: Dict[str, str] = {}  # domain -> component name
+        self._health_probes: Dict[str, HealthProbeSet] = {}
         self._initialized = False
 
     @classmethod
@@ -313,6 +322,7 @@ class ComponentRegistry:
         self._components.clear()
         self._capabilities.clear()
         self._state_domains.clear()
+        self._health_probes.clear()
         self._initialized = False
 
     def register(self, definition: ComponentDefinition) -> ComponentState:
@@ -355,6 +365,12 @@ class ComponentRegistry:
 
         logger.debug(f"Registered component: {definition.name}")
         return state
+
+    def register_health_probes(self, name: str, probes: HealthProbeSet) -> None:
+        """Register health probe callbacks for a component."""
+        if name not in self._components:
+            raise KeyError(f"Component not registered: {name}")
+        self._health_probes[name] = probes
 
     def _check_kill_switch(self, defn: ComponentDefinition) -> Tuple[bool, str]:
         """Check kill-switch hierarchy: global > tier > service."""
