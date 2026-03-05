@@ -285,6 +285,11 @@ flowchart TD
 Use these in the Architecture section on your GitHub profile to keep the narrative consistent with this repo:
 
 - **Unified Kernel Authority:** one-command boot via `python3 unified_supervisor.py` with deterministic lifecycle sequencing across Body, Prime, and Reactor
+- **Triple Authority Resolution:** replaced competing supervisor decisions with a root-authority policy model (`RootAuthorityWatcher`) and executor-only process orchestration
+- **Policy vs Execution Separation:** watcher decides `WHAT` (`drain/term/group_kill/restart`); orchestrator executes `HOW`, eliminating dual-authority restart storms
+- **Managed-Mode Contract:** `JARVIS_ROOT_MANAGED` + session-gated health/drain contract with HMAC-authenticated control-plane lifecycle commands
+- **Crash and Deadlock Detection:** active `process.wait()` crash detection (ms latency) plus passive jittered health polling for soft-failure detection
+- **Contract-Gated Readiness:** schema compatibility (N/N-1) + capability-hash handshake blocks "healthy but incompatible" subsystem activation
 - **Adaptive Timeout Control Plane:** policy-driven timeout resolution (`env > learned > default`) with shadow mode, kill switch, and fail-open bootstrap guarantees
 - **Crash-Consistent Learning:** per-operation timeout statistics persisted to SQLite WAL with bounded retention and migration-safe schema versioning
 - **Cross-Process Safety Model:** supervisor is the sole writer; other processes consume read-only adaptive snapshots with bounded staleness refresh
@@ -322,6 +327,110 @@ JARVIS is the **orchestrator** for the three repos:
 ```
 body:HEAL | prime:STAR | reactorc:STAR | gcpvm:STAR | trinity:STAR
 ```
+
+### Triple Authority Resolution (Status Overview)
+
+#### The disease
+
+Three repositories had independent supervisor control loops making overlapping lifecycle decisions (restart, health, and kill), causing:
+- restart storms from competing recovery logic
+- readiness split-brain across subsystem and root control loops
+- contract drift between repo-local behavior and root orchestration
+- async safety degradation from uncoordinated escalation paths
+
+#### What was built (21 tasks, 5 waves, 3 repos)
+
+**Wave 0 — Foundation Types**
+- Added canonical root-authority types (`LifecycleAction`, `SubsystemState`, `ProcessIdentity`, `LifecycleVerdict`, `ExecutionResult`, `TimeoutPolicy`, `RestartPolicy`, `ContractGate`) under `backend/core/root_authority_types.py`
+- Added managed-mode contract utilities in `backend/core/managed_mode.py` and mirrored conformance in Prime/Reactor
+- Added golden contract conformance tests across all repos to detect protocol drift
+
+**Wave 1 — Root Authority Watcher**
+- Added `backend/core/root_authority.py` with state machine ownership:
+  `STARTING -> HANDSHAKE -> ALIVE -> READY -> DEGRADED -> DRAINING -> STOPPED/CRASHED/REJECTED`
+- Added `VerdictExecutor` protocol to hard-separate policy decisions from execution mechanics
+- Added escalation ladder: `drain -> SIGTERM -> process-group SIGKILL`, with identity checks at each step
+
+**Wave 2 — Prime/Reactor Conformance**
+- Managed-mode conformance for `jarvis-prime` and `reactor-core`:
+  - disable process-level self-restart when root-managed
+  - enrich `/health` with managed-mode envelope
+  - add session-gated `/lifecycle/drain` with HMAC auth
+- Established hash-parity expectation for mirrored contract utility implementations
+
+**Wave 3 — Orchestrator Integration + Shadow Mode**
+- Integrated `ProcessOrchestrator` as a `VerdictExecutor` implementation:
+  `execute_drain`, `execute_term`, `execute_group_kill`, `execute_restart`, `get_current_identity`
+- Wired root-authority watcher creation and monitored-subsystem selection in supervisor boot flow
+- Enabled active crash detection (`process.wait()`) plus passive health polling with jitter
+
+**Wave 4 — Activation + Hardening**
+- Added active verdict dispatch with subsystem-level kill switches
+- Added boot-time contract gating for schema/capability compatibility with emergency bypass controls
+- Added policy-delegation hooks so orchestrator can defer health/restart policy to root authority
+
+#### Architecture flow
+
+```mermaid
+flowchart TD
+    U[Unified Supervisor<br/>Root Control Plane] --> W[RootAuthorityWatcher<br/>Policy Brain]
+    U --> O[ProcessOrchestrator<br/>Execution Plane]
+    O --> P[Jarvis-Prime Process Group]
+    O --> R[Reactor-Core Process Group]
+
+    W -->|LifecycleVerdict| O
+    O -->|ExecutionResult| W
+    P -->|/health + /lifecycle/drain| W
+    R -->|/health + /lifecycle/drain| W
+
+    W --> S{Handshake Gate}
+    S -->|schema N/N-1 + capability hash pass| A[ALIVE/READY]
+    S -->|mismatch| X[REJECTED + escalate_operator]
+
+    W --> E[Escalation Engine]
+    E --> D[drain]
+    E --> T[SIGTERM]
+    E --> K[process-group SIGKILL]
+```
+
+#### What this resolves
+
+- **Restart storms:** resolved by centralized restart policy budget + incident deduplication
+- **Readiness split-brain:** resolved by single watcher-owned liveness/readiness model
+- **Contract drift:** resolved by conformance tests + schema/capability handshake gates
+- **Crash detection latency:** resolved by active `process.wait()` monitoring
+- **Competing supervisors:** resolved in managed mode via root-owned process lifecycle authority
+- **Escalation ambiguity:** resolved by bounded deterministic kill ladder
+- **PID reuse risk:** resolved by multi-factor process identity validation
+- **Control-plane security gaps:** resolved by HMAC-authenticated lifecycle commands
+
+#### Remaining rollout work
+
+1. **Shadow soak:** run with root authority in shadow mode and validate decision parity over sustained runtime windows
+2. **Per-subsystem activation:** enable active mode one subsystem at a time (`reactor-core` then `jarvis-prime`)
+3. **Deep policy cutover:** finalize orchestrator policy bypass so autonomous restart/health decisions are watcher-owned in active mode
+4. **CI anti-drift:** enforce cross-repo contract utility parity checks on every PR
+
+#### Profile-ready snippet (for `drussell23` architecture section)
+
+- **Triple Authority Resolution:** converted three independent supervisors into a single root-authority control-plane model
+- **Root Policy + Executor Split:** `RootAuthorityWatcher` decides lifecycle policy; `ProcessOrchestrator` executes lifecycle actions
+- **Managed-Mode Contract:** session-gated health/drain protocol with HMAC-authenticated control-plane commands
+- **Deterministic Escalation:** `drain -> term -> process-group kill` with bounded deadlines and race-safe identity checks
+- **Contract-Gated Readiness:** schema + capability hash handshake prevents healthy-but-incompatible subsystem activation
+- **Staged Activation:** shadow mode parity -> per-subsystem activation -> full cutover -> deprecate old policy paths
+
+<details>
+<summary>Condensed GitHub profile version (hidden)</summary>
+
+- **Single Root Authority:** one control plane for restart, health, and kill decisions across JARVIS, Prime, and Reactor
+- **Policy/Execution Split:** `RootAuthorityWatcher` owns policy; `ProcessOrchestrator` executes lifecycle actions
+- **Managed-Mode Safety:** Prime/Reactor stop self-restarting under `JARVIS_ROOT_MANAGED` and report via enriched health envelopes
+- **Secure Lifecycle Control:** HMAC-authenticated drain/lifecycle endpoints with session-aware identity checks
+- **Deterministic Recovery:** bounded escalation ladder (`drain -> term -> group_kill`) plus active crash detection
+- **Contract-Gated Readiness:** schema compatibility + capability hash handshake prevents incompatible activation
+
+</details>
 
 ### Phase 2: Trinity Autonomy Wiring
 
