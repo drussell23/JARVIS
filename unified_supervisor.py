@@ -99640,6 +99640,30 @@ def get_watched_subsystems() -> "list":
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def create_umf_engine(
+    dedup_db_path: "Optional[Path]" = None,
+    expected_capability_hash: "Optional[str]" = None,
+) -> "Optional[object]":
+    """Create a UMF DeliveryEngine if JARVIS_UMF_MODE is set.
+
+    Returns None if the env var is unset or 'disabled' (opt-in only).
+    Modes: 'shadow' (log only), 'active' (full authority).
+    """
+    mode = os.environ.get("JARVIS_UMF_MODE", "")
+    if not mode or mode == "disabled":
+        return None
+
+    from backend.core.umf.delivery_engine import DeliveryEngine
+
+    if dedup_db_path is None:
+        dedup_db_path = Path.home() / ".jarvis" / "umf_dedup.db"
+
+    return DeliveryEngine(
+        dedup_db_path=dedup_db_path,
+        expected_capability_hash=expected_capability_hash,
+    )
+
+
 def main() -> int:
     """
     Main entry point for JARVIS Unified System Kernel.
