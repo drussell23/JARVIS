@@ -267,9 +267,11 @@ class CapabilityRouter:
             from backend.intelligence.unified_model_serving import get_model_serving
             serving = await get_model_serving()
             if serving and hasattr(serving, 'router'):
+                # Use preferred_provider if given, otherwise report delegation
+                provider = preferred_provider or "model_router"
                 return RoutingDecision(
                     capability=capability,
-                    provider="model_router_delegation",
+                    provider=provider,
                     is_fallback=False,
                 )
         except Exception:

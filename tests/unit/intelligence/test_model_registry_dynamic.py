@@ -1,4 +1,10 @@
-"""Test that models defined in hybrid_config.yaml are loaded dynamically."""
+"""Test that models defined in hybrid_config.yaml are loaded dynamically.
+
+Note: Tests verify config-level structure (YAML) rather than runtime registry loading,
+because ModelRegistry initialization requires the full backend (GCP credentials, model
+files, etc.). Config-level tests provide static verification that the data-driven
+loading pipeline has the correct input.
+"""
 import pytest
 from pathlib import Path
 

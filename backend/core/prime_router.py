@@ -318,10 +318,15 @@ class PrimeRouter:
         h = host or self._gcp_host or ""
         return any(h.endswith(pat) for pat in self._cloud_run_patterns)
 
-    def is_endpoint_healthy(self) -> bool:
+    def is_endpoint_healthy(self, endpoint_name: str = "prime") -> bool:
         """Read-only health query for ModelRouter delegation.
 
-        Returns True if the prime endpoint circuit breaker allows execution.
+        Args:
+            endpoint_name: Currently unused — PrimeRouter uses a single circuit
+                breaker. Parameter exists for forward-compatible API when
+                per-endpoint circuits are added.
+        Returns:
+            True if the prime endpoint circuit breaker allows execution.
         """
         return self._local_circuit.can_execute()
 

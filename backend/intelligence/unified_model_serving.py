@@ -2287,7 +2287,7 @@ class ModelRouter:
         }
 
         # v290.1: Cached capability manifests (populated by contract gate)
-        self._capability_manifests = {}
+        self._capability_manifests: Dict[ModelProvider, Any] = {}
 
         # v290.1: Health authority delegation (PrimeRouter tells us IF reachable)
         self._health_authority = None  # Set via set_health_authority()
@@ -2384,8 +2384,9 @@ class ModelRouter:
         # Start with task preferences
         preferred = self._task_preferences.get(request.task_type, [ModelProvider.CLAUDE])
 
-        # Filter to available providers
+        # Filter to available providers, then exclude unhealthy ones
         result = [p for p in preferred if p in available_providers]
+        result = [p for p in result if self._is_provider_healthy(p)]
 
         # v239.0: When GCP boot is in progress and PRIME_LOCAL has no model loaded,
         # promote CLAUDE ahead of PRIME_LOCAL to avoid triggering an expensive
