@@ -13144,6 +13144,62 @@ class ServiceDescriptor:
     init_time_ms: float = 0.0
     memory_delta_mb: float = 0.0
 
+
+# =========================================================================
+# GOVERNANCE DATACLASSES (Enterprise Organ Activation Program v1.0)
+# =========================================================================
+
+@dataclass(frozen=True)
+class ServiceHealthReport:
+    """Structured health report from a governed service organ."""
+    alive: bool                          # liveness: process/task exists
+    ready: bool                          # readiness: can accept work
+    degraded: bool = False               # working but impaired
+    draining: bool = False               # finishing but not accepting new work
+    message: str = ""
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CapabilityContract:
+    """Formal declaration of what a service does."""
+    name: str
+    version: str                         # semver
+    inputs: List[str]                    # event topics consumed
+    outputs: List[str]                   # event topics produced
+    side_effects: List[str]              # state mutations this service performs
+    idempotent: bool = True
+    cross_repo: bool = False             # touches Prime or Reactor
+
+
+@dataclass
+class BudgetGate:
+    """Resource conditions that must be met for service activation."""
+    max_memory_percent: float = 85.0
+    max_cpu_percent: float = 80.0
+    min_available_mb: float = 200.0
+
+
+@dataclass
+class BackoffGate:
+    """Exponential backoff after activation failures."""
+    initial_delay_s: float = 5.0
+    max_delay_s: float = 300.0
+    multiplier: float = 2.0
+    jitter: bool = True
+
+
+@dataclass
+class ActivationContract:
+    """When and how an event-driven service activates."""
+    trigger_events: List[str]
+    dependency_gate: List[str]           # services that must be healthy first
+    budget_gate: BudgetGate = field(default_factory=BudgetGate)
+    backoff_gate: BackoffGate = field(default_factory=BackoffGate)
+    max_activations_per_hour: int = 100
+    deactivate_after_idle_s: float = 300.0
+
+
 class SystemServiceRegistry:
     """Manages lifecycle of system services in dependency-ordered waves.
 
