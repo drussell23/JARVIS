@@ -63408,6 +63408,9 @@ class JarvisSystemKernel:
             "reactor_core": False,     # Training pipeline
         }
 
+        # v290.1: Cross-repo contract gate status
+        self._contract_status: str = "pending"
+
         # v300.0: Phase 2 — Autonomy mode flag.
         # "pending" until contracts checked, "active" on pass, "read_only" on hard failure.
         self._autonomy_mode: str = "pending"
@@ -70135,6 +70138,16 @@ class JarvisSystemKernel:
                     }
                 }
             )
+
+            # v290.1: Cross-repo contract validation
+            try:
+                contract_result = await self._validate_cross_repo_contracts()
+                if contract_result == "fail":
+                    self.logger.error("[ContractGate] FAILED — incompatible cross-repo versions")
+                self._contract_status = contract_result
+            except Exception as _cg_err:
+                self.logger.warning(f"[ContractGate] Error during validation: {_cg_err}")
+                self._contract_status = "degraded"
 
             # v239.0: Activate Reactor Core training pipeline
             try:
@@ -88203,6 +88216,68 @@ class JarvisSystemKernel:
             }
 
         return diagnostics
+
+    async def _validate_cross_repo_contracts(self) -> str:
+        """Validate cross-repo contracts before declaring ready.
+
+        v290.1: Checks that JARVIS-Prime's capability manifest is compatible
+        with the local contract version. Used by the startup sequence to
+        gate readiness and set _contract_status.
+
+        Returns:
+            "pass" — all contracts satisfied
+            "degraded" — some services unreachable, continuing with warnings
+            "fail" — incompatible versions, blocking startup
+        """
+        from backend.contracts.contract_version import LOCAL_CONTRACT, compute_policy_hash
+        from backend.contracts.manifest_schema import ProviderManifest
+        from backend.contracts.routing_authority import ROUTING_INVARIANTS
+
+        results = {}
+        local_hash = compute_policy_hash(ROUTING_INVARIANTS)
+
+        # 1. Check Prime capability manifest
+        try:
+            prime_url = None
+            # Get Prime endpoint from env (single source of truth set by _propagate_invincible_node_url)
+            prime_url = (
+                os.environ.get("PRIME_API_URL")
+                or os.environ.get("JARVIS_PRIME_URL")
+                or os.environ.get("JARVIS_PRIME_CLOUD_RUN_URL")
+            )
+            if prime_url:
+                import aiohttp
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        f"{prime_url}/capabilities",
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            manifest = ProviderManifest.from_dict(data)
+                            compat, reason = LOCAL_CONTRACT.is_compatible(manifest.contract_version)
+                            if not compat:
+                                results["prime"] = ("fail", reason)
+                            else:
+                                results["prime"] = ("pass", f"compatible (hash={local_hash[:8]})")
+                        else:
+                            results["prime"] = ("degraded", f"http_{resp.status}")
+            else:
+                results["prime"] = ("degraded", "no_endpoint")
+        except Exception as e:
+            results["prime"] = ("degraded", f"unreachable: {type(e).__name__}")
+
+        # 2. Log contract status
+        for service, (status, reason) in results.items():
+            level = logging.WARNING if status != "pass" else logging.INFO
+            self.logger.log(level, f"[ContractGate] {service} = {status} ({reason})")
+
+        # 3. Decision
+        if any(s == "fail" for s, _ in results.values()):
+            return "fail"
+        if any(s == "degraded" for s, _ in results.values()):
+            return "degraded"
+        return "pass"
 
     async def _validate_trinity_repos(self) -> Dict[str, Any]:
         """
