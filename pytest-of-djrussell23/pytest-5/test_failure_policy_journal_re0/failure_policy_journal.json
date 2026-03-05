@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "updated_at": 1772709015.798996,
-  "supervisor_pid": 28489,
+  "updated_at": 1772710137.532355,
+  "supervisor_pid": 76297,
   "idempotency_state": {
     "jarvis-prime|restart": {
-      "operation_id": "op-1772709015789-60bf8d81",
+      "operation_id": "op-1772710137527-412c9224",
       "status": "succeeded",
-      "updated_at": 1772709015.7913878,
+      "updated_at": 1772710137.528699,
       "attempts": 1,
       "source_service": "reactor-core",
       "target_service": "jarvis-prime",
@@ -18,7 +18,7 @@
   },
   "history": [
     {
-      "timestamp": 1772709015.7935832,
+      "timestamp": 1772710137.529676,
       "source_service": "reactor-core",
       "target_service": "jarvis-prime",
       "action": "restart",
@@ -27,7 +27,7 @@
       "note": "restart_attempted"
     },
     {
-      "timestamp": 1772709015.798989,
+      "timestamp": 1772710137.532351,
       "source_service": "reactor-core",
       "target_service": "jarvis-prime",
       "action": "restart",
