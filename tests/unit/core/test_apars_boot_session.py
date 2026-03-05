@@ -1,7 +1,9 @@
-"""Tests for APARS boot session UUID binding."""
+"""Tests for APARS boot session UUID binding and health check configuration."""
+import ast
 import json
 import re
 import textwrap
+from pathlib import Path
 from unittest.mock import patch
 
 
@@ -114,3 +116,49 @@ class TestAPARSBootSession:
         progress_json_template = match.group(1)
         assert '"boot_session_id"' in progress_json_template
         assert "${BOOT_SESSION_ID}" in progress_json_template
+
+
+class TestConfigurableHealthTimeout:
+    def test_startup_script_uses_configurable_health_timeout(self):
+        """Startup script must use GCP_SERVICE_HEALTH_TIMEOUT, not hardcoded 30s."""
+        script = _get_golden_startup_script()
+        assert "GCP_SERVICE_HEALTH_TIMEOUT" in script
+        assert "seq 1 15" not in script
+
+    def test_startup_script_health_timeout_default_90s(self):
+        """Default health check timeout should be 90s."""
+        script = _get_golden_startup_script()
+        assert "GCP_SERVICE_HEALTH_TIMEOUT:-90" in script
+
+    def test_startup_script_no_progress_threshold_readiness(self):
+        """Startup script must NOT use total_progress >= 95 as readiness signal."""
+        script = _get_golden_startup_script()
+        # Extract the health check Python inline code
+        inline_py = re.findall(r'python3 -c "(.*?)"', script, re.DOTALL)
+        for code in inline_py:
+            assert "total_progress" not in code, \
+                "Inline Python health check must not use total_progress for readiness"
+
+    def test_ping_health_no_progress_threshold_readiness(self):
+        """_ping_health_endpoint must NOT accept total_progress as readiness."""
+        src = Path("backend/core/gcp_vm_manager.py").read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ping_health_endpoint":
+                func_src = ast.get_source_segment(src, node)
+                assert "total_progress" not in func_src, \
+                    "_ping_health_endpoint must not use total_progress for readiness"
+                break
+
+    def test_startup_script_timeout_uses_null_readiness(self):
+        """On timeout, startup script must write null readiness, not false."""
+        script = _get_golden_startup_script()
+        timeout_calls = re.findall(r'update_apars.*service_start_timeout.*', script)
+        assert len(timeout_calls) >= 1
+        for call in timeout_calls:
+            assert "null" in call, f"Timeout must use null readiness: {call}"
+            # Should NOT have 'false' after the checkpoint name
+            parts_after_checkpoint = call.split('"service_start_timeout"')[1] if '"service_start_timeout"' in call else call.split("service_start_timeout")[1]
+            # The two args after checkpoint should be null null, not true false
+            assert "false" not in parts_after_checkpoint.split('"')[0], \
+                f"Must not assert ready=false on timeout: {call}"

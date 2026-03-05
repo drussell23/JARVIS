@@ -664,6 +664,10 @@ class VMManagerConfig:
     static_vm_health_timeout: float = field(
         default_factory=lambda: float(os.getenv("GCP_STATIC_VM_HEALTH_TIMEOUT", "300.0"))
     )
+    # INV-1: Configurable health check timeout for startup script (bash-side)
+    service_health_timeout: float = field(
+        default_factory=lambda: float(os.getenv("GCP_SERVICE_HEALTH_TIMEOUT", "90.0"))
+    )
 
     # Health Check Configuration
     health_check_interval: int = field(
@@ -8384,11 +8388,9 @@ class GCPVMManager:
                         # but don't set ready_for_inference explicitly.
                         if not is_ready and data.get("model_loaded") and data.get("status") == "healthy":
                             is_ready = True
-                        # v235.2: Also check APARS payload injected by enrichment middleware
-                        if not is_ready:
-                            apars = data.get("apars", {})
-                            if isinstance(apars, dict) and apars.get("total_progress", 0) >= 100:
-                                is_ready = True
+                        # INV-2: Removed APARS progress-based readiness shortcut.
+                        # Readiness is determined solely by J-Prime's live response fields,
+                        # never from the progress file (which can be stale).
                         # v235.4: Accept J-Prime NATIVE health format (without APARS).
                         # J-Prime's /health returns {status:"healthy", phase:"ready",
                         # model_load_progress_pct:100, model_loading_in_progress:false}
@@ -8699,8 +8701,8 @@ update_apars() {
     local phase_progress=$2
     local total_progress=$3
     local checkpoint=$4
-    local model_loaded=${5:-false}
-    local ready=${6:-false}
+    local model_loaded=${5:-null}
+    local ready=${6:-null}
     local error=${7:-null}
     local now=$(date +%s)
     local elapsed=$((now - START_TIME))
@@ -9187,11 +9189,10 @@ class APARSEnrichmentMiddleware:
                 payload = _build_apars_payload(state)
                 if payload:
                     data["apars"] = payload
-                    # Propagate readiness flags from progress file
-                    if state:
-                        data.setdefault("model_loaded", state.get("model_loaded", False))
-                        if state.get("ready_for_inference", False):
-                            data["ready_for_inference"] = True
+                    # INV-1/INV-2: APARS is observational metadata only.
+                    # Readiness is determined solely by J-Prime's live response.
+                    # Do NOT propagate readiness flags from the progress file
+                    # into the health response -- the file can be stale.
                     body = json.dumps(data, separators=(",", ":")).encode()
                     # Rebuild headers with updated content-length
                     captured_headers = [
@@ -9317,11 +9318,17 @@ fi
 # v235.2: Verify response CONTENT, not just HTTP 200. J-Prime returns 200
 # with status="starting" immediately — but model may not be loaded yet.
 # Check ready_for_inference OR model_loaded in the JSON response.
-update_apars 6 0 90 "verifying_service" true false
+# Configurable health check timeout (same env var supervisor respects)
+SERVICE_HEALTH_TIMEOUT=${GCP_SERVICE_HEALTH_TIMEOUT:-90}
+HEALTH_CHECK_INTERVAL=2
+MAX_ATTEMPTS=$((SERVICE_HEALTH_TIMEOUT / HEALTH_CHECK_INTERVAL))
+log "Health check: ${MAX_ATTEMPTS} attempts x ${HEALTH_CHECK_INTERVAL}s = ${SERVICE_HEALTH_TIMEOUT}s timeout"
+
+update_apars 6 0 90 "verifying_service"
 
 READY=false
-for attempt in $(seq 1 15); do
-    sleep 2
+for attempt in $(seq 1 $MAX_ATTEMPTS); do
+    sleep $HEALTH_CHECK_INTERVAL
     HEALTH_RESPONSE=$(curl -sf "http://localhost:${JARVIS_PORT}/health" 2>/dev/null || echo "")
     if [ -n "$HEALTH_RESPONSE" ]; then
         # Check for readiness indicators in the JSON response
@@ -9329,26 +9336,23 @@ for attempt in $(seq 1 15); do
 import sys, json
 try:
     d = json.load(sys.stdin)
-    # v235.3: Only accept definitive readiness signals
+    # v235.3: Only accept definitive readiness signals from J-Prime live response.
     # model_loaded alone is NOT sufficient — J-Prime sets it during loading_tensors
-    # before inference is actually possible
+    # before inference is actually possible.
+    # INV-2: Do NOT use APARS progress for readiness — it can be stale.
     if d.get('ready_for_inference') or d.get('status') == 'healthy':
-        sys.exit(0)
-    # Also check APARS payload (enrichment middleware may have injected it)
-    apars = d.get('apars', {})
-    if apars.get('total_progress', 0) >= 95:
         sys.exit(0)
     sys.exit(1)
 except: sys.exit(1)
 " 2>/dev/null; then
             READY=true
-            log "✅ Service healthy after $((attempt * 2)) seconds"
+            log "✅ Service healthy after $((attempt * HEALTH_CHECK_INTERVAL)) seconds"
             break
         else
             log "  Attempt $attempt: HTTP 200 but not ready yet (response: ${HEALTH_RESPONSE:0:120})"
         fi
     fi
-    update_apars 6 $((attempt * 6)) $((90 + attempt / 2)) "verifying_attempt_${attempt}" true false
+    update_apars 6 $((attempt * 100 / MAX_ATTEMPTS)) $((90 + attempt * 7 / MAX_ATTEMPTS)) "verifying_attempt_${attempt}"
 done
 
 if [ "$READY" = true ]; then
@@ -9359,8 +9363,8 @@ if [ "$READY" = true ]; then
     log "   Port: $JARVIS_PORT | Mode: golden_image | Ready: true"
     log "═══════════════════════════════════════════════════════════════════════════════"
 else
-    update_apars 6 100 95 "service_start_timeout" true false '"service_health_check_failed"'
-    log "⚠️  Service not responding after 30s — may need more time"
+    update_apars 6 100 95 "service_start_timeout" null null '"service_health_check_failed"'
+    log "⚠️  Service not responding after ${SERVICE_HEALTH_TIMEOUT}s — may need more time"
     log "   Check: curl http://localhost:${JARVIS_PORT}/health"
     log "   Logs:  journalctl -u jarvis-prime.service"
 fi
