@@ -65927,7 +65927,139 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_AUTO_SCALER_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 30 services registered across phases 1-7")
+        # Phase 7 (Metabolic System) — resource management / infrastructure
+        _r(ServiceDescriptor(
+            name="service_mesh",
+            service=ServiceMeshRouter(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_SERVICE_MESH_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="connection_pools",
+            service=ConnectionPoolManager(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_CONNECTION_POOLS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_quotas",
+            service=ResourceQuotaManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RESOURCE_QUOTAS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_pools",
+            service=ResourcePoolManager(
+                config=_config,
+                name="default",
+                factory=lambda: asyncio.ensure_future(asyncio.sleep(0, result=object())),
+            ),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RESOURCE_POOLS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cost_accounting",
+            service=CostAccountingManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="optional",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_COST_ACCOUNTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="alerting",
+            service=AlertingManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_ALERTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="performance_profiler",
+            service=PerformanceProfiler(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_PERFORMANCE_PROFILER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rate_limiter",
+            service=RateLimiterManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RATE_LIMITER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="retry_policy",
+            service=RetryPolicyManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RETRY_POLICY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="secret_vault",
+            service=SecretVaultManager(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_SECRET_VAULT_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="network_manager",
+            service=NetworkManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_NETWORK_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="filesystem_manager",
+            service=FileSystemManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_FILESYSTEM_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="health_check_orchestrator",
+            service=HealthCheckOrchestrator(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_HEALTH_CHECK_ORCHESTRATOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="deployment_coordinator",
+            service=DeploymentCoordinator(),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DEPLOYMENT_COORDINATOR_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 44 services registered across phases 1-7")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
@@ -84804,6 +84936,45 @@ class JarvisSystemKernel:
                     )
                 except Exception as _ssr_e:
                     self.logger.warning(f"[Kernel] Phase 7 SSR activation error: {_ssr_e}")
+
+            # v311.0: Phase 7 — Enterprise Organ Services
+            # Register all 10 governed enterprise organs with per-service kill switches.
+            # All default to event_driven / deferred_after_ready so they don't block startup.
+            if self._service_registry:
+                _organ_phase = 7
+                _organ_specs = [
+                    ("MLOpsModelRegistry", MLOpsModelRegistry, "JARVIS_MLOPS_ENABLED"),
+                    ("WorkflowOrchestrator", WorkflowOrchestrator, "JARVIS_WORKFLOW_ENABLED"),
+                    ("DocumentManagementSystem", DocumentManagementSystem, "JARVIS_DMS_ENABLED"),
+                    ("NotificationHub", NotificationHub, "JARVIS_NOTIFICATIONS_ENABLED"),
+                    ("SessionManager", SessionManager, "JARVIS_SESSIONS_ENABLED"),
+                    ("DataLakeManager", DataLakeManager, "JARVIS_DATALAKE_ENABLED"),
+                    ("StreamingAnalyticsEngine", StreamingAnalyticsEngine, "JARVIS_STREAMING_ENABLED"),
+                    ("ConsentManagementSystem", ConsentManagementSystem, "JARVIS_CONSENT_ENABLED"),
+                    ("DigitalSignatureService", DigitalSignatureService, "JARVIS_SIGNATURES_ENABLED"),
+                    ("LegacyDegradationManager", LegacyDegradationManager, "JARVIS_LEGACY_DEGRADATION_ENABLED"),
+                ]
+                _organ_registered = 0
+                for _organ_name, _organ_cls, _organ_env in _organ_specs:
+                    try:
+                        self._service_registry.register(ServiceDescriptor(
+                            name=_organ_name,
+                            service=_organ_cls(),
+                            phase=_organ_phase,
+                            tier="higher",
+                            activation_mode="event_driven",
+                            boot_policy="deferred_after_ready",
+                            enabled_env=_organ_env,
+                        ))
+                        _organ_registered += 1
+                    except Exception as _organ_err:
+                        self.logger.debug(f"[Kernel] Skipped organ {_organ_name}: {_organ_err}")
+
+                if _organ_registered > 0:
+                    self.logger.info(
+                        f"[Zone6] Registered {_organ_registered}/{len(_organ_specs)} "
+                        f"enterprise organ services (phase {_organ_phase}, deferred)"
+                    )
 
             return True  # Enterprise services are optional
 
