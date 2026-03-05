@@ -15965,7 +15965,10 @@ class AsyncVoiceNarrator:
         self._duplicate_prevention_window: float = 2.0  # Seconds to prevent same message
 
         # Queue management with priority
-        self._queue: asyncio.PriorityQueue[Tuple[int, float, str]] = asyncio.PriorityQueue()
+        _voice_queue_max = int(os.environ.get("JARVIS_VOICE_QUEUE_MAXSIZE", "50"))
+        self._queue: asyncio.PriorityQueue[Tuple[int, float, str]] = asyncio.PriorityQueue(
+            maxsize=_voice_queue_max
+        )
         self._queue_processor_task: Optional[asyncio.Task[None]] = None
 
         # Statistics
@@ -16029,7 +16032,10 @@ class AsyncVoiceNarrator:
             return
 
         if queue:
-            await self._queue.put((priority.value, time.time(), text))
+            try:
+                self._queue.put_nowait((priority.value, time.time(), text))
+            except asyncio.QueueFull:
+                self._messages_skipped += 1
             return
 
         await self._speak_internal(text, wait=wait, priority=priority)

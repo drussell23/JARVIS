@@ -139,3 +139,23 @@ class TestBoundedCollections:
                 )
                 return
         pytest.fail(f"{class_name} not found")
+
+
+class TestVoiceNarratorQueueBounded:
+    """4H: Voice narrator queue must have a maxsize."""
+
+    def test_queue_has_maxsize(self):
+        """AsyncVoiceNarrator._queue must be created with maxsize parameter."""
+        import ast
+
+        with open("unified_supervisor.py", "r") as f:
+            tree = ast.parse(f.read())
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "AsyncVoiceNarrator":
+                body = ast.dump(node)
+                assert "maxsize" in body, (
+                    "AsyncVoiceNarrator._queue must be created with maxsize parameter"
+                )
+                return
+        pytest.fail("AsyncVoiceNarrator not found")
