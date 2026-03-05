@@ -59,22 +59,52 @@ async function checkBackendReady(hostname) {
   return false;
 }
 
-const spinnerKeyframes = `@keyframes jarvis-gate-spin { to { transform: rotate(360deg); } }`;
+const gateStyles = `
+@import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Rajdhani:wght@300;400;700&display=swap');
+@keyframes jarvis-gate-spin {
+  to { transform: rotate(360deg); }
+}
+@keyframes jarvis-gate-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.8; }
+}
+@keyframes jarvis-gate-glow {
+  0%, 100% { filter: drop-shadow(0 0 8px rgba(0,255,65,0.4)); }
+  50% { filter: drop-shadow(0 0 20px rgba(0,255,65,0.7)); }
+}
+`;
 
 const LoadingIndicator = () => (
   <div style={{
     display: 'flex', justifyContent: 'center', alignItems: 'center',
     height: '100vh', background: '#000', color: '#00ff41',
-    fontFamily: 'monospace', fontSize: '1.2rem',
-    flexDirection: 'column', gap: '1rem',
+    fontFamily: "'Rajdhani', sans-serif", fontSize: '1.2rem',
+    flexDirection: 'column', gap: '1.5rem',
   }}>
+    <style>{gateStyles}</style>
     <div style={{
-      width: '40px', height: '40px', border: '3px solid #00ff41',
-      borderTop: '3px solid transparent', borderRadius: '50%',
-      animation: 'jarvis-gate-spin 1s linear infinite',
+      fontFamily: "'Orbitron', monospace", fontSize: 'clamp(1.8rem, 5vw, 3rem)',
+      fontWeight: 900, letterSpacing: '0.05em',
+      background: 'linear-gradient(135deg, #00ff41 0%, #00aa2e 100%)',
+      WebkitBackgroundClip: 'text', WebkitTextFillColor: 'transparent',
+      backgroundClip: 'text',
+      animation: 'jarvis-gate-pulse 2s ease-in-out infinite',
+    }}>
+      J.A.R.V.I.S.
+    </div>
+    <div style={{
+      width: '50px', height: '50px',
+      border: '3px solid #00ff41', borderTop: '3px solid transparent',
+      borderRadius: '50%', animation: 'jarvis-gate-spin 1s linear infinite',
+      boxShadow: '0 0 15px rgba(0,255,65,0.3), inset 0 0 15px rgba(0,255,65,0.1)',
     }} />
-    <div>Connecting to J.A.R.V.I.S...</div>
-    <style>{spinnerKeyframes}</style>
+    <div style={{
+      fontFamily: "'Rajdhani', sans-serif", fontWeight: 400,
+      fontSize: 'clamp(0.95rem, 2vw, 1.2rem)', letterSpacing: '0.15em',
+      textTransform: 'uppercase', color: '#00aa2e',
+    }}>
+      Connecting...
+    </div>
   </div>
 );
 
@@ -82,28 +112,58 @@ const OfflineFallback = ({ onRetry, autoRetryIn }) => (
   <div style={{
     display: 'flex', justifyContent: 'center', alignItems: 'center',
     height: '100vh', background: '#000', color: '#ccc',
-    fontFamily: 'monospace', flexDirection: 'column', gap: '1.2rem',
-    textAlign: 'center', padding: '2rem',
+    fontFamily: "'Rajdhani', sans-serif", flexDirection: 'column',
+    gap: '1.5rem', textAlign: 'center', padding: '2rem',
   }}>
-    <div style={{ fontSize: '1.5rem', color: '#ff4444' }}>J.A.R.V.I.S. Offline</div>
-    <div style={{ color: '#888', lineHeight: 1.6 }}>
+    <style>{gateStyles}</style>
+    <div style={{
+      fontFamily: "'Orbitron', monospace", fontSize: 'clamp(1.5rem, 4vw, 2.5rem)',
+      fontWeight: 900, color: '#ff4444', letterSpacing: '0.05em',
+      textShadow: '0 0 20px rgba(255,68,68,0.4)',
+    }}>
+      J.A.R.V.I.S. Offline
+    </div>
+    <div style={{
+      fontFamily: "'Rajdhani', sans-serif", fontWeight: 400,
+      color: '#888', lineHeight: 1.7, fontSize: 'clamp(0.9rem, 1.8vw, 1.1rem)',
+      maxWidth: '500px',
+    }}>
       Backend and loading server are not responding.<br />
-      Start JARVIS: <code style={{ color: '#00ff41' }}>python3 unified_supervisor.py</code>
+      Start JARVIS:{' '}
+      <code style={{
+        fontFamily: "'Orbitron', monospace", fontSize: '0.85em',
+        color: '#00ff41', textShadow: '0 0 8px rgba(0,255,65,0.4)',
+      }}>
+        python3 unified_supervisor.py
+      </code>
     </div>
     <button
       onClick={onRetry}
       style={{
-        marginTop: '0.5rem', padding: '0.6rem 1.8rem',
+        marginTop: '0.5rem', padding: '0.7rem 2rem',
         background: 'transparent', border: '1px solid #00ff41',
-        color: '#00ff41', fontFamily: 'monospace', fontSize: '1rem',
-        cursor: 'pointer', borderRadius: '4px',
+        color: '#00ff41', fontFamily: "'Rajdhani', sans-serif",
+        fontWeight: 700, fontSize: '1rem', letterSpacing: '0.1em',
+        textTransform: 'uppercase', cursor: 'pointer', borderRadius: '4px',
+        transition: 'all 0.3s ease',
+      }}
+      onMouseEnter={e => {
+        e.currentTarget.style.background = 'rgba(0,255,65,0.1)';
+        e.currentTarget.style.boxShadow = '0 0 15px rgba(0,255,65,0.3)';
+      }}
+      onMouseLeave={e => {
+        e.currentTarget.style.background = 'transparent';
+        e.currentTarget.style.boxShadow = 'none';
       }}
     >
       Retry Connection
     </button>
     {autoRetryIn != null && (
-      <div style={{ color: '#555', fontSize: '0.85rem' }}>
-        Auto-retrying in {Math.ceil(autoRetryIn / 1000)}s...
+      <div style={{
+        fontFamily: "'Orbitron', monospace", fontSize: '0.8rem',
+        color: '#00aa2e', letterSpacing: '0.1em',
+      }}>
+        AUTO-RETRY IN {Math.ceil(autoRetryIn / 1000)}s
       </div>
     )}
   </div>
