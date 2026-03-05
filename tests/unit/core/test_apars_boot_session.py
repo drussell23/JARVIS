@@ -292,3 +292,11 @@ class TestAtomicWritesAndVersion:
         version = float(_STARTUP_SCRIPT_VERSION)
         assert version >= 237.0, \
             f"Startup script version must be >= 237.0, got {version}"
+
+
+class TestAtomicWriteBoundary:
+    def test_startup_script_checks_filesystem_boundary(self):
+        """Startup script must verify temp and target are on same mount."""
+        script = _get_golden_startup_script()
+        # Must check filesystem/mount for atomicity
+        assert "df " in script or "mount" in script or "same_fs" in script or "same_mount" in script

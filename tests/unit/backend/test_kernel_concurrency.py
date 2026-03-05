@@ -113,3 +113,55 @@ class TestUnifiedSignalHandler:
         assert results[0] == results[1], (
             f"Two threads got different Event objects: {results[0]} != {results[1]}"
         )
+
+
+class TestKernelBackgroundTaskRegistry:
+    """Tests for task registry thread safety."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_append_no_corruption(self):
+        """Concurrent appends must not corrupt the internal list."""
+        from unified_supervisor import KernelBackgroundTaskRegistry
+
+        registry = KernelBackgroundTaskRegistry()
+
+        async def noop():
+            await asyncio.sleep(10)
+
+        tasks = [asyncio.create_task(noop(), name=f"task-{i}") for i in range(20)]
+
+        # Append all tasks from concurrent coroutines
+        results = await asyncio.gather(
+            *[asyncio.to_thread(registry.append, t) for t in tasks]
+        )
+
+        accepted = sum(1 for r in results if r)
+        assert accepted == 20, f"Expected 20 accepted, got {accepted}"
+        assert len(registry) == 20
+
+        # Cleanup
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_snapshot_returns_copy(self):
+        """snapshot() must return a copy, not a reference to internals."""
+        from unified_supervisor import KernelBackgroundTaskRegistry
+
+        registry = KernelBackgroundTaskRegistry()
+
+        async def noop():
+            await asyncio.sleep(100)
+
+        t = asyncio.create_task(noop())
+        registry.append(t)
+        snap = registry.snapshot()
+        assert len(snap) == 1
+        assert snap is not registry._tasks  # Must be a copy
+
+        t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
