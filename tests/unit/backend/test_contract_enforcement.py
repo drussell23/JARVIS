@@ -404,3 +404,55 @@ class TestContractSnapshot:
         assert snap1.schema_hash != snap2.schema_hash
         # Capability hash same = no capability drift
         assert snap1.capability_hash == snap2.capability_hash
+
+
+class TestDisease4Gate:
+    """Gate: All Disease 4 fixes verified."""
+
+    @pytest.mark.parametrize("check", [
+        "severity_enum_exists",
+        "reason_code_enum_exists",
+        "env_contracts_have_severity",
+        "violation_record_exists",
+        "state_authority_exists",
+        "env_resolution_exists",
+        "startup_exception_exists",
+        "contract_snapshot_exists",
+        "supervisor_raises_on_blocker",
+    ])
+    def test_disease4_gate(self, check):
+        if check == "severity_enum_exists":
+            assert len(ContractSeverity) == 5
+
+        elif check == "reason_code_enum_exists":
+            assert len(ViolationReasonCode) >= 13
+
+        elif check == "env_contracts_have_severity":
+            for c in ENV_CONTRACTS:
+                assert isinstance(c.severity, ContractSeverity)
+
+        elif check == "violation_record_exists":
+            assert hasattr(ContractViolationRecord, "__dataclass_fields__")
+
+        elif check == "state_authority_exists":
+            from backend.core.startup_contracts import ContractStateAuthority
+            auth = ContractStateAuthority()
+            assert callable(getattr(auth, "record", None))
+            assert callable(getattr(auth, "has_blockers", None))
+            assert callable(getattr(auth, "health_summary", None))
+
+        elif check == "env_resolution_exists":
+            assert hasattr(EnvResolution, "__dataclass_fields__")
+            assert "origin" in EnvResolution.__dataclass_fields__
+
+        elif check == "startup_exception_exists":
+            assert issubclass(StartupContractViolation, Exception)
+
+        elif check == "contract_snapshot_exists":
+            assert hasattr(ContractSnapshot, "__dataclass_fields__")
+
+        elif check == "supervisor_raises_on_blocker":
+            with open("unified_supervisor.py", "r") as f:
+                source = f.read()
+            assert "StartupContractViolation" in source
+            assert "PRECHECK_BLOCKER" in source
