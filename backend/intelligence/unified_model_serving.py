@@ -3014,7 +3014,14 @@ class UnifiedModelServing:
         reason: str = "unspecified",
         arm_recovery: Optional[bool] = None,
     ) -> bool:
-        """v235.1/v277.0: Safely unload local GGUF model and arm recovery when needed."""
+        """v235.1/v277.0/v310.0: Safely unload local GGUF model with in-flight drain.
+
+        v310.0 additions:
+        - Trip circuit breaker FIRST to stop new inference from being routed.
+        - Drain the ThreadPoolExecutor with a bounded 30s deadline so running
+          inference completes (or is abandoned) before the model is deleted.
+        - Recreate executor for future use after drain.
+        """
         _local = self._clients.get(ModelProvider.PRIME_LOCAL)
         if not _local or getattr(_local, "_model", None) is None:
             self._last_local_unload_reason = reason
@@ -3023,14 +3030,42 @@ class UnifiedModelServing:
         _arm = self._resolve_recovery_arm(reason, arm_recovery)
         try:
             _model_path = getattr(_local._model, "model_path", "unknown")
+
+            # v310.0: Trip circuit breaker FIRST to prevent new inference
+            # from being routed while we drain in-flight tasks.
+            self.force_open_local_circuit_breaker(reason=f"unload:{reason}")
+
+            # v310.0: Drain in-flight inference with bounded 30s deadline.
+            disposition = "no_executor"
+            if hasattr(_local, "_inference_executor"):
+                import concurrent.futures
+
+                executor = _local._inference_executor
+                executor.shutdown(wait=False, cancel_futures=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(
+                            None, lambda: executor.shutdown(wait=True)
+                        ),
+                        timeout=30.0,
+                    )
+                    disposition = "completed"
+                except asyncio.TimeoutError:
+                    disposition = "abandoned"
+                    self.logger.warning(
+                        "[v310.0] Inference drain timed out after 30s -- forcing teardown"
+                    )
+                # Recreate executor for future use
+                _local._inference_executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="llm-inference"
+                )
+
             del _local._model
             _local._model = None
             _local._loaded = False
             import gc
 
             gc.collect()
-            # Trip PRIME_LOCAL circuit breaker so routing skips to cloud fallback.
-            self.force_open_local_circuit_breaker(reason=f"unload:{reason}")
             self._memory_recovery_armed = _arm
             self._last_local_unload_reason = reason
             self._local_ready_verified = False
@@ -3043,14 +3078,16 @@ class UnifiedModelServing:
             if not _arm:
                 self._memory_recovery_in_progress = False
             self.logger.info(
-                "[v235.1] Local model unloaded (%s). circuit=open reason=%s recovery_armed=%s",
+                "[v310.0] Local model unloaded (%s). circuit=open reason=%s "
+                "recovery_armed=%s drain=%s",
                 _model_path,
                 reason,
                 _arm,
+                disposition,
             )
             return True
         except Exception as e:
-            self.logger.warning(f"[v235.1] Model unload error: {e}")
+            self.logger.warning(f"[v310.0] Model unload error: {e}")
             return False
 
     def reset_local_circuit_breaker(self) -> bool:
