@@ -78,6 +78,8 @@ THRASH_PANIC_REQUIRE_CORROBORATION = (
 THRASH_PANIC_CORROBORATION_EMA_RATIO = float(
     os.getenv("THRASH_PANIC_CORROBORATION_EMA_RATIO", "0.70")
 )
+THRASH_EXIT_RATIO = float(os.getenv("THRASH_EXIT_RATIO", "0.7"))
+THRASH_PAGEIN_EMERGENCY_EXIT = THRASH_PAGEIN_EMERGENCY * THRASH_EXIT_RATIO
 
 
 # ============================================================================
@@ -1380,9 +1382,7 @@ class MemoryQuantizer:
             self._thrash_recovery_since = 0.0
             # Hysteresis: hold emergency until rate drops below exit threshold
             # (70% of entry) to prevent flapping between states.
-            _exit_ratio = float(os.environ.get("THRASH_EXIT_RATIO", "0.7"))
-            _emergency_exit = THRASH_PAGEIN_EMERGENCY * _exit_ratio
-            if old_state == "emergency" and rate >= _emergency_exit:
+            if old_state == "emergency" and rate >= THRASH_PAGEIN_EMERGENCY_EXIT:
                 return  # Hold emergency state
             elif old_state == "emergency":
                 new_state = "thrashing"
