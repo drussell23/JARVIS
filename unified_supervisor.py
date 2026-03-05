@@ -21020,8 +21020,13 @@ class ParallelProcessCleaner:
                     proc = psutil.Process(target_pid)
                     os.kill(target_pid, sig)
                     return True
-                except (ProcessLookupError, psutil.NoSuchProcess, OSError):
+                except (ProcessLookupError, psutil.NoSuchProcess):
                     return True  # Process already gone
+                except PermissionError as e:
+                    self.logger.debug(f"[SafeKill] Permission denied killing PID {target_pid}: {e}")
+                    return False
+                except OSError:
+                    return True  # Other OS-level errors (ESRCH, etc.) — treat as gone
                 except Exception as e:
                     self.logger.debug(f"[SafeKill] Unexpected error killing PID {target_pid}: {e}")
                     return False
@@ -64441,7 +64446,7 @@ class JarvisSystemKernel:
     # ── v239.0: System Service Registry wiring ────────────────────────
 
     def _init_service_registry(self) -> None:
-        """Construct (but do NOT initialise) the 10 priority system services."""
+        """Construct (but do NOT initialise) the 18 priority system services."""
         self._service_registry = SystemServiceRegistry()
         _r = self._service_registry.register
 
@@ -64569,7 +64574,87 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_DEGRADATION_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 10 services registered across phases 1-5")
+        # Phase 6 (Immune System) ─ security, anomaly detection, audit, compliance
+        _config = self._config if hasattr(self, "_config") else None
+
+        _r(ServiceDescriptor(
+            name="security_policy",
+            service=SecurityPolicyEngine(config=_config),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_SECURITY_POLICY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="anomaly_detector",
+            service=AnomalyDetector(config=_config),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_ANOMALY_DETECTOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="audit_trail",
+            service=AuditTrailRecorder(),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_AUDIT_TRAIL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="access_control",
+            service=AccessControlManager(config=_config),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability", "security_policy"],
+            enabled_env="JARVIS_SERVICE_ACCESS_CONTROL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="threat_intel",
+            service=ThreatIntelligenceManager(config=_config),
+            phase=6, tier="immune",
+            activation_mode="event_driven",
+            boot_policy="deferred_after_ready",
+            depends_on=["anomaly_detector"],
+            enabled_env="JARVIS_SERVICE_THREAT_INTEL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="incident_response",
+            service=IncidentResponseCoordinator(config=_config),
+            phase=6, tier="immune",
+            activation_mode="event_driven",
+            boot_policy="deferred_after_ready",
+            depends_on=["threat_intel"],
+            enabled_env="JARVIS_SERVICE_INCIDENT_RESPONSE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="compliance",
+            service=ComplianceAuditor(config=_config),
+            phase=6, tier="immune",
+            activation_mode="batch_window",
+            boot_policy="deferred_after_ready",
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_COMPLIANCE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="data_classification",
+            service=DataClassificationManager(config=_config),
+            phase=6, tier="immune",
+            activation_mode="event_driven",
+            boot_policy="deferred_after_ready",
+            depends_on=["event_sourcing"],
+            enabled_env="JARVIS_SERVICE_DATA_CLASSIFICATION_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 18 services registered across phases 1-6")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
