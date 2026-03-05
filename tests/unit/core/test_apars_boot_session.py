@@ -193,6 +193,58 @@ class TestConfigurableHealthTimeout:
                 f"Must not assert ready=false on timeout: {call}"
 
 
+class TestProcessEpochValidation:
+    def test_startup_script_contains_process_epoch(self):
+        """Startup script must generate a PROCESS_EPOCH."""
+        script = _get_golden_startup_script()
+        assert "PROCESS_EPOCH=" in script
+        assert "process_epoch" in script
+
+    def test_update_apars_includes_process_epoch(self):
+        """update_apars JSON template must include process_epoch."""
+        script = _get_golden_startup_script()
+        match = re.search(
+            r'cat > "\$tmp_file" << EOFPROGRESS\n(.*?)\nEOFPROGRESS',
+            script,
+            re.DOTALL,
+        )
+        assert match, "Could not find EOFPROGRESS heredoc"
+        progress_json = match.group(1)
+        assert '"process_epoch"' in progress_json
+        assert "${PROCESS_EPOCH}" in progress_json
+
+    def test_is_apars_current_session_validates_epoch(self):
+        """Mismatched process_epoch within same boot must return False."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        # Same boot, same epoch → True
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch="epoch-1", expected_epoch="epoch-1",
+        ) is True
+        # Same boot, different epoch → False (stale from crashed process)
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch="epoch-2", expected_epoch="epoch-1",
+        ) is False
+        # Different boot → False (regardless of epoch)
+        assert _is_apars_current_session(
+            "boot-B", expected="boot-A",
+            process_epoch="epoch-1", expected_epoch="epoch-1",
+        ) is False
+
+    def test_is_apars_current_session_unknown_epoch_accepted(self):
+        """Unknown/empty process_epoch accepted for backward compat."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch="", expected_epoch="epoch-1",
+        ) is True
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch=None, expected_epoch="epoch-1",
+        ) is True
+
+
 class TestAtomicWritesAndVersion:
     def test_startup_script_uses_atomic_apars_write(self):
         """APARS progress file must be written atomically (write temp + mv)."""

@@ -185,15 +185,32 @@ def is_gcp_shutdown_requested() -> bool:
 # ============================================================================
 
 
-def _is_apars_current_session(session_id: str, expected: str) -> bool:
-    """Check if APARS data belongs to the current boot session.
+def _is_apars_current_session(
+    session_id: str,
+    expected: str,
+    process_epoch: Optional[str] = None,
+    expected_epoch: Optional[str] = None,
+) -> bool:
+    """Check if APARS data belongs to current boot session AND process epoch.
 
     Returns True if session matches or is 'unknown' (backward compat).
     Returns False if session is from a different boot (stale data).
+
+    v237.1: Added process_epoch validation. If a process restarts within
+    the same VM boot, the boot_session_id alone won't detect stale APARS
+    data from the crashed process. The process_epoch adds a second
+    dimension of validation — same boot + same epoch = current data.
+    Backward compat: unknown/empty epoch is always accepted.
     """
+    # Boot session check (backward compat: unknown/empty accepted)
     if not session_id or session_id == "unknown":
         return True  # Backward compat: old scripts don't have session ID
-    return session_id == expected
+    if session_id != expected:
+        return False
+    # Process epoch check (backward compat: unknown/empty accepted)
+    if not process_epoch or not expected_epoch:
+        return True
+    return process_epoch == expected_epoch
 
 
 # ============================================================================
@@ -8722,6 +8739,7 @@ PROGRESS_FILE="/tmp/jarvis_progress.json"
 JARVIS_DIR="/opt/jarvis-prime"
 START_TIME=$(date +%s)
 BOOT_SESSION_ID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null || echo "unknown-$$")
+PROCESS_EPOCH=$(python3 -c "import uuid; print(uuid.uuid4().hex[:12])" 2>/dev/null || echo "$$")
 STARTUP_SCRIPT_VERSION="__STARTUP_SCRIPT_VERSION__"
 STARTUP_SCRIPT_METADATA_VERSION=""
 
@@ -8760,7 +8778,8 @@ update_apars() {
     "version": "${STARTUP_SCRIPT_VERSION}",
     "startup_script_version": "${STARTUP_SCRIPT_VERSION}",
     "startup_script_metadata_version": "${STARTUP_SCRIPT_METADATA_VERSION}",
-    "boot_session_id": "${BOOT_SESSION_ID}"
+    "boot_session_id": "${BOOT_SESSION_ID}",
+    "process_epoch": "${PROCESS_EPOCH}"
 }
 EOFPROGRESS
     mv "$tmp_file" "$PROGRESS_FILE"
@@ -9728,6 +9747,7 @@ fi
         has_seen_version = False  # v235.3: Track if valid startup_script_version ever received
         has_seen_any_response = False  # v235.3: Track if VM has responded at all
         self._current_boot_session_id = None  # v237.0: Reset boot session for fresh polling
+        self._current_process_epoch = None  # v237.1: Reset process epoch for fresh polling
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
@@ -9771,6 +9791,23 @@ fi
                         logger.info(
                             f"☁️ [InvincibleNode] Locked onto boot session: {apars_session}"
                         )
+                # v237.1: Validate process epoch — detect stale APARS from crashed process
+                # within the same VM boot (boot_session_id matches but process restarted)
+                apars_epoch = apars.get("process_epoch", "")
+                if self._current_process_epoch:
+                    if not _is_apars_current_session(
+                        apars_session, self._current_boot_session_id,
+                        process_epoch=apars_epoch,
+                        expected_epoch=self._current_process_epoch,
+                    ):
+                        logger.warning(
+                            f"☁️ [InvincibleNode] Stale APARS data: "
+                            f"process_epoch={apars_epoch}, expected={self._current_process_epoch}"
+                        )
+                        has_real_data = False
+                else:
+                    if apars_epoch:
+                        self._current_process_epoch = apars_epoch
                 # v235.2: Detect startup script version mismatches at runtime
                 # Grace period: ignore version mismatch for first 60s of polling.
                 # The progress file (/tmp/jarvis_progress.json) may persist across
