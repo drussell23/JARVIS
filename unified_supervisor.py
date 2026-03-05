@@ -53451,6 +53451,12 @@ class MLOpsModelRegistry(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the MLOps registry and subscribe to model lifecycle events."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "mlops" / "models.json")
+        if _state:
+            async with self._lock:
+                for mid, mdata in _state.get("models", {}).items():
+                    self._models[mid] = mdata if not isinstance(mdata, dict) else mdata
         async with self._lock:
             self._initialized = True
         # Phase B: Subscribe to model lifecycle events from event bus
@@ -53460,7 +53466,7 @@ class MLOpsModelRegistry(SystemService):
             if hasattr(_bus, 'subscribe'):
                 await _bus.subscribe("model.*", self._on_model_event)
         except Exception:
-            pass  # Event bus unavailable — registry still works standalone
+            pass
 
     async def _on_model_event(self, event: Any) -> None:
         """Handle model lifecycle events from event bus (Phase B)."""
@@ -53481,7 +53487,15 @@ class MLOpsModelRegistry(SystemService):
         return True, f"ok: {len(self._models)} models, {len(self._experiments)} experiments"
 
     async def cleanup(self) -> None:
-        """Release resources. Called during shutdown."""
+        """Release resources and persist state."""
+        # Phase C: Persist state before clearing
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "mlops" / "models.json",
+                {"models": {k: str(v) for k, v in self._models.items()}},
+            )
+        except Exception:
+            pass
         self._initialized = False
         async with self._lock:
             self._models.clear()
@@ -53951,12 +53965,17 @@ class WorkflowOrchestrator(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the workflow orchestrator and bridge to WorkflowEngine."""
+        # Phase C: Load persisted definitions
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "workflows" / "definitions.json")
+        if _state:
+            for wid, wdata in _state.get("definitions", {}).items():
+                if wid not in self._definitions:
+                    self._definitions[wid] = wdata if not isinstance(wdata, dict) else wdata
         self._running = True
         self._executor_task = create_safe_task(self._executor_loop())
         # Phase B: Bridge to WorkflowEngine for DAG execution
         self._workflow_engine: Optional[Any] = None
         try:
-            # WorkflowEngine is the execution layer; Orchestrator owns BPM definitions
             self._workflow_engine = WorkflowEngine()
             await self._workflow_engine.start()
         except Exception:
@@ -53982,7 +54001,15 @@ class WorkflowOrchestrator(SystemService):
         return ["workflow.start"]
 
     async def cleanup(self) -> None:
-        """Cleanup orchestrator resources."""
+        """Cleanup orchestrator resources and persist state."""
+        # Phase C: Persist workflow definitions
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "workflows" / "definitions.json",
+                {"definitions": {k: str(v) for k, v in self._definitions.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._executor_task:
             self._executor_task.cancel()
@@ -54423,6 +54450,12 @@ class DocumentManagementSystem(SystemService):
             if self._initialized:
                 return
 
+            # Phase C: Load persisted state
+            _state = _load_json_state(_ORGAN_STORAGE_ROOT / "dms" / "documents.json")
+            if _state:
+                for k, v in _state.get("documents", {}).items():
+                    self._documents[k] = v
+
             if self._storage_path is None:
                 self._storage_path = str(Path.home() / ".jarvis" / "dms_storage")
 
@@ -54462,6 +54495,14 @@ class DocumentManagementSystem(SystemService):
 
     async def cleanup(self) -> None:
         """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "dms" / "documents.json",
+                {"documents": {k: str(v) for k, v in self._documents.items()}},
+            )
+        except Exception:
+            pass
         self._initialized = False
 
     async def create_folder(
@@ -54920,6 +54961,11 @@ class NotificationHub(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the notification hub and connect to event bus."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "notifications" / "templates.json")
+        if _state:
+            for k, v in _state.get("templates", {}).items():
+                self._templates[k] = v
         self._running = True
         self._delivery_task = create_safe_task(self._delivery_loop())
         await self._load_persisted_preferences()
@@ -54951,6 +54997,14 @@ class NotificationHub(SystemService):
 
     async def cleanup(self) -> None:
         """Cleanup notification hub resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "notifications" / "templates.json",
+                {"templates": {k: str(v) for k, v in self._templates.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._delivery_task:
             self._delivery_task.cancel()
@@ -55810,6 +55864,11 @@ class DataLakeManager(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the data lake manager."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "datalake" / "catalog.json")
+        if _state:
+            for k, v in _state.get("catalog", {}).items():
+                self._catalog[k] = v
         if self._storage_root is None:
             self._storage_root = str(Path.home() / ".jarvis" / "data_lake")
         self._running = True
@@ -55835,6 +55894,14 @@ class DataLakeManager(SystemService):
 
     async def cleanup(self) -> None:
         """Cleanup data lake manager resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "datalake" / "catalog.json",
+                {"catalog": {k: str(v) for k, v in self._catalog.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._retention_task:
             self._retention_task.cancel()
@@ -56258,6 +56325,11 @@ class StreamingAnalyticsEngine(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the streaming engine."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "streaming" / "state.json")
+        if _state:
+            for k, v in _state.get("aggregations", {}).items():
+                self._aggregations[k] = v
         self._running = True
         self._process_task = create_safe_task(self._processing_loop())
 
@@ -56281,6 +56353,14 @@ class StreamingAnalyticsEngine(SystemService):
 
     async def cleanup(self) -> None:
         """Cleanup streaming engine resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "streaming" / "state.json",
+                {"aggregations": {k: str(v) for k, v in self._aggregations.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._process_task:
             self._process_task.cancel()
@@ -56615,6 +56695,11 @@ class ConsentManagementSystem(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the consent management system."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "consent" / "records.json")
+        if _state:
+            for k, v in _state.get("purposes", {}).items():
+                self._purposes[k] = v
         self._initialized = True
 
     async def health_check(self) -> Tuple[bool, str]:
@@ -56625,6 +56710,14 @@ class ConsentManagementSystem(SystemService):
 
     async def cleanup(self) -> None:
         """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "consent" / "records.json",
+                {"purposes": {k: str(v) for k, v in self._purposes.items()}, "consents": {k: str(v) for k, v in self._consents.items()}},
+            )
+        except Exception:
+            pass
         self._initialized = False
 
     def capability_contract(self) -> "CapabilityContract":
@@ -57050,6 +57143,11 @@ class DigitalSignatureService(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the signature service."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "signatures" / "keys.json")
+        if _state:
+            for k, v in _state.get("signatures", {}).items():
+                self._signatures[k] = v
         self._initialized = True
 
     async def health_check(self) -> Tuple[bool, str]:
@@ -57060,6 +57158,14 @@ class DigitalSignatureService(SystemService):
 
     async def cleanup(self) -> None:
         """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "signatures" / "keys.json",
+                {"signatures": {k: str(v) for k, v in self._signatures.items()}},
+            )
+        except Exception:
+            pass
         self._initialized = False
 
     def capability_contract(self) -> "CapabilityContract":
@@ -58047,6 +58153,11 @@ class LegacyDegradationManager(SystemService):
 
     async def initialize(self) -> None:
         """Initialize the degradation manager and register event emission."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "degradation" / "state.json")
+        if _state:
+            for k, v in _state.get("feature_priorities", {}).items():
+                self._feature_priorities[k] = v
         self._current_state = DegradationState(
             current_level="normal",
             active_since=time.time(),
@@ -58090,6 +58201,14 @@ class LegacyDegradationManager(SystemService):
 
     async def cleanup(self) -> None:
         """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "degradation" / "state.json",
+                {"feature_priorities": self._feature_priorities},
+            )
+        except Exception:
+            pass
         self._initialized = False
         self._current_state = None
 
@@ -66866,7 +66985,297 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_DEPLOYMENT_COORDINATOR_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 44 services registered across phases 1-7")
+        # Phase 8 (Higher Functions) — enterprise application services
+        _r(ServiceDescriptor(
+            name="blue_green_deployer",
+            service=BlueGreenDeployer(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_BLUE_GREEN_DEPLOYER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="canary_release",
+            service=CanaryReleaseManager(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CANARY_RELEASE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rollback_coordinator",
+            service=RollbackCoordinator(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_ROLLBACK_COORDINATOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="data_pipeline",
+            service=DataPipelineManager(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DATA_PIPELINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="infra_provisioner",
+            service=InfrastructureProvisionerManager(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_INFRA_PROVISIONER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="api_gateway",
+            service=APIGatewayManager(),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_API_GATEWAY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="api_versioning",
+            service=APIVersionManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_API_VERSIONING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="graph_database",
+            service=GraphDatabaseManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_GRAPH_DATABASE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="search_engine",
+            service=SearchEngineManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_SEARCH_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="integration_bus",
+            service=IntegrationBusManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_INTEGRATION_BUS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="tenant_manager",
+            service=TenantManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_TENANT_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="encryption_service",
+            service=EncryptionServiceManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_ENCRYPTION_SERVICE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="template_engine",
+            service=TemplateEngine(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_TEMPLATE_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="report_generator",
+            service=ReportGenerator(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_REPORT_GENERATOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="plugin_manager",
+            service=PluginManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_PLUGIN_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="localization",
+            service=LocalizationManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_LOCALIZATION_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="ab_testing",
+            service=ABTestingFramework(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_AB_TESTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="feature_flags",
+            service=FeatureFlagManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_FEATURE_FLAGS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="external_services",
+            service=ExternalServiceRegistry(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_EXTERNAL_SERVICES_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="calendar_service",
+            service=CalendarService(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CALENDAR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="command_pattern",
+            service=CommandPatternManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_COMMAND_PATTERN_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="config_manager_v2",
+            service=ConfigurationManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CONFIG_MANAGER_V2_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="dependency_container",
+            service=DependencyContainer(config=_config),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DEPENDENCY_CONTAINER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="data_validation",
+            service=DataValidationManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DATA_VALIDATION_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="audit_trail_v2",
+            service=AuditTrailManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_AUDIT_TRAIL_V2_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cron_scheduler",
+            service=CronScheduler(),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CRON_SCHEDULER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="webhook_dispatcher",
+            service=WebhookDispatcher(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_WEBHOOK_DISPATCHER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cache_invalidation",
+            service=CacheInvalidationCoordinator(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CACHE_INVALIDATION_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="load_shedding",
+            service=LoadSheddingController(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_LOAD_SHEDDING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="stream_processor",
+            service=StreamProcessor(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_STREAM_PROCESSOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_cleanup",
+            service=ResourceCleanupCoordinator(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_RESOURCE_CLEANUP_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="system_telemetry",
+            service=SystemTelemetryCollector(),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_SYSTEM_TELEMETRY_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 76 services registered across phases 1-8")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
