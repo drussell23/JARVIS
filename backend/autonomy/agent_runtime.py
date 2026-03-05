@@ -456,6 +456,7 @@ class UnifiedAgentRuntime:
         # Email triage integration — last run timestamp (monotonic clock).
         # Sentinel 0.0 means "never ran" — first call always passes cooldown.
         self._last_email_triage_run: float = 0.0
+        self._triage_pressure_skip_count: int = 0
         # v284.0: Log triage-disabled once, not every cycle
         self._triage_disabled_logged: bool = False
 
@@ -2783,6 +2784,45 @@ class UnifiedAgentRuntime:
             return
 
         self._last_email_triage_run = now
+
+        # ── Memory pressure admission gate ──────────────────────────
+        # Hard gate: refuse to launch triage when system is thrashing or
+        # in emergency. Prevents the feedback loop where email triage
+        # inference triggers mmap page faults → thrash detection → model
+        # swap → inference stalls → triage timeout → retry → repeat.
+        try:
+            from core.memory_quantizer import get_memory_quantizer_instance
+            _mq = get_memory_quantizer_instance()
+            if _mq:
+                _thrash = getattr(_mq, 'thrash_state', 'healthy')
+                if _thrash in ('thrashing', 'emergency'):
+                    self._triage_pressure_skip_count += 1
+                    # Exponential backoff with jitter: 60s, 120s, 240s... cap 600s
+                    import random
+                    _base_interval = interval
+                    _exp = min(self._triage_pressure_skip_count - 1, 4)
+                    _backoff = min(600.0, _base_interval * (2 ** _exp))
+                    _backoff *= (0.8 + 0.4 * random.random())  # ±20% jitter
+                    self._last_email_triage_run = now - interval + _backoff
+                    logger.info(
+                        "[AgentRuntime] Email triage deferred: memory_state=%s, "
+                        "consecutive_skips=%d, next_attempt_in=%.0fs",
+                        _thrash, self._triage_pressure_skip_count, _backoff,
+                    )
+                    # Drift guard: auto-disable extraction after 5 consecutive blocks
+                    if self._triage_pressure_skip_count >= 5:
+                        os.environ.setdefault('EMAIL_TRIAGE_EXTRACTION_ENABLED', 'false')
+                        logger.warning(
+                            "[AgentRuntime] Drift guard: extraction auto-disabled after %d "
+                            "consecutive memory pressure blocks",
+                            self._triage_pressure_skip_count,
+                        )
+                    return
+                else:
+                    self._triage_pressure_skip_count = 0
+        except Exception:
+            pass  # Gate import failure = proceed (fail-open on gate itself)
+
         try:
             from autonomy.email_triage.runner import EmailTriageRunner
             from core.distributed_lock_manager import get_lock_manager
