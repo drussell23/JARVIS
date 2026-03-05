@@ -38794,6 +38794,33 @@ class DeploymentCoordinator(SystemService):
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        pass  # no background work needed at init
+
+    async def health_check(self) -> Tuple[bool, str]:
+        active = len([
+            d for d in self._deployments.values()
+            if d.phase in (DeploymentPhase.PREPARING, DeploymentPhase.DEPLOYING, DeploymentPhase.VERIFYING)
+        ])
+        return True, f"ok: {active} active deployments"
+
+    async def cleanup(self) -> None:
+        self._deployments.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DeploymentCoordinator",
+            version="1.0.0",
+            inputs=["deploy.request"],
+            outputs=["deploy.completed", "deploy.failed"],
+            side_effects=["writes_deploy_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["deploy.request"]  # event_driven
+
 class BlueGreenState:
     """State for blue-green deployment."""
 
@@ -46474,7 +46501,7 @@ class ResourceUsage:
     last_updated: datetime = field(default_factory=datetime.now)
     history: List[Tuple[datetime, float]] = field(default_factory=list)
 
-class ResourceQuotaManager:
+class ResourceQuotaManager(SystemService):
     """
     Resource quota enforcement system.
 
@@ -46503,7 +46530,7 @@ class ResourceQuotaManager:
         self._logger = logging.getLogger("ResourceQuotaManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize resource quota manager."""
         try:
             async with self._lock:
@@ -46751,6 +46778,28 @@ class ResourceQuotaManager:
         rate_per_second = total_change / total_time
         forecast = usage.current_usage + (rate_per_second * hours_ahead * 3600)
         return max(0, forecast)
+
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._quotas)} quotas configured"
+
+    async def cleanup(self) -> None:
+        self._quotas.clear()
+        self._usage.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourceQuotaManager",
+            version="1.0.0",
+            inputs=["quota.check"],
+            outputs=["quota.result"],
+            side_effects=["writes_quota_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 @dataclass
 class Tenant:
@@ -47061,7 +47110,7 @@ class RateLimitState:
     last_update: datetime
     request_count: int = 0
 
-class RateLimiterManager:
+class RateLimiterManager(SystemService):
     """
     Advanced rate limiting system.
 
@@ -47087,7 +47136,7 @@ class RateLimiterManager:
         self._logger = logging.getLogger("RateLimiterManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize rate limiter."""
         try:
             async with self._lock:
@@ -47310,6 +47359,28 @@ class RateLimiterManager:
             "active_states": len(self._states),
             "algorithm": self._algorithm
         }
+
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._rules)} rules active"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._states.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RateLimiterManager",
+            version="1.0.0",
+            inputs=["ratelimit.check"],
+            outputs=["ratelimit.result"],
+            side_effects=["writes_ratelimit_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 @dataclass
 class CoalescedRequest:
@@ -47773,7 +47844,7 @@ class RetryPolicyDef:
     retryable_exceptions: List[type] = field(default_factory=list)
     non_retryable_exceptions: List[type] = field(default_factory=list)
 
-class RetryPolicyManager:
+class RetryPolicyManager(SystemService):
     """
     Configurable retry policy manager.
 
@@ -47795,7 +47866,7 @@ class RetryPolicyManager:
         self._logger = logging.getLogger("RetryPolicyManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize retry policy manager."""
         try:
             # Register default policies
@@ -47925,6 +47996,28 @@ class RetryPolicyManager:
             return self._metrics.get(policy_id, {})
         return dict(self._metrics)
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._policies)} policies registered"
+
+    async def cleanup(self) -> None:
+        self._policies.clear()
+        self._metrics.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RetryPolicyManager",
+            version="1.0.0",
+            inputs=["retry.configure"],
+            outputs=["retry.policy.updated"],
+            side_effects=["writes_retry_policies"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class PooledResource:
     """A resource in the pool."""
@@ -47935,7 +48028,7 @@ class PooledResource:
     use_count: int = 0
     healthy: bool = True
 
-class ResourcePoolManager:
+class ResourcePoolManager(SystemService):
     """
     Generic resource pooling manager.
 
@@ -47977,7 +48070,7 @@ class ResourcePoolManager:
         self._logger = logging.getLogger(f"ResourcePool[{name}]")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize the resource pool."""
         try:
             # Create minimum number of resources
@@ -48145,6 +48238,28 @@ class ResourcePoolManager:
 
         self._logger.info(f"Resource pool '{self.name}' shutdown complete")
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        avail = len(self._pool)
+        total = len(self._all_resources)
+        return self._initialized, f"ok: {avail}/{total} resources available"
+
+    async def cleanup(self) -> None:
+        await self.shutdown()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourcePoolManager",
+            version="1.0.0",
+            inputs=["resource.acquire"],
+            outputs=["resource.acquired"],
+            side_effects=["writes_resource_pool_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class CostEntry:
     """A cost accounting entry."""
@@ -48158,7 +48273,7 @@ class CostEntry:
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class CostAccountingManager:
+class CostAccountingManager(SystemService):
     """
     Resource usage cost tracking system.
 
@@ -48184,7 +48299,7 @@ class CostAccountingManager:
         self._logger = logging.getLogger("CostAccountingManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize cost accounting manager."""
         try:
             # Set default unit costs
@@ -48362,6 +48477,27 @@ class CostAccountingManager:
             "budget_usage_percent": round((total / budget) * 100, 2) if budget != float("inf") else None
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._entries)} cost entries tracked"
+
+    async def cleanup(self) -> None:
+        self._entries.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CostAccountingManager",
+            version="1.0.0",
+            inputs=["cost.record"],
+            outputs=["cost.report"],
+            side_effects=["writes_cost_ledger"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 # =============================================================================
 # ZONE 4.17: MONITORING, TESTING, AND RULES ENGINE
 # =============================================================================
@@ -48410,7 +48546,7 @@ class Alert:
     acknowledged_by: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class AlertingManager:
+class AlertingManager(SystemService):
     """
     Alert management and notification system.
 
@@ -48438,7 +48574,7 @@ class AlertingManager:
         self._logger = logging.getLogger("AlertingManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize alerting manager."""
         try:
             async with self._lock:
@@ -48689,6 +48825,28 @@ class AlertingManager:
             "history_size": len(self._alert_history)
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._active_alerts)} active alerts"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._active_alerts.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AlertingManager",
+            version="1.0.0",
+            inputs=["alert.trigger"],
+            outputs=["alert.fired", "alert.resolved"],
+            side_effects=["writes_alert_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["alert.trigger"]  # event_driven
+
 @dataclass
 class ProfileEntry:
     """A profiling entry."""
@@ -48702,7 +48860,7 @@ class ProfileEntry:
     memory_after: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class PerformanceProfiler:
+class PerformanceProfiler(SystemService):
     """
     Code performance profiling system.
 
@@ -48728,7 +48886,7 @@ class PerformanceProfiler:
         self._logger = logging.getLogger("PerformanceProfiler")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize performance profiler."""
         try:
             self._initialized = True
@@ -48867,6 +49025,28 @@ class PerformanceProfiler:
     def set_sample_rate(self, rate: float) -> None:
         """Set sampling rate (0.0 to 1.0)."""
         self._sample_rate = max(0.0, min(1.0, rate))
+
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._profiles)} functions profiled"
+
+    async def cleanup(self) -> None:
+        self._profiles.clear()
+        self._active_profiles.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="PerformanceProfiler",
+            version="1.0.0",
+            inputs=["profile.start"],
+            outputs=["profile.report"],
+            side_effects=["writes_profile_data"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["profile.start"]  # event_driven
 
 @dataclass
 class Experiment:
@@ -51204,7 +51384,7 @@ class NetworkEndpoint:
     response_time_ms: float = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class NetworkManager:
+class NetworkManager(SystemService):
     """
     Network connectivity and diagnostics manager.
 
@@ -51230,7 +51410,7 @@ class NetworkManager:
         self._logger = logging.getLogger("NetworkManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize network manager."""
         try:
             self._initialized = True
@@ -51382,6 +51562,29 @@ class NetworkManager:
         """Get all healthy endpoints."""
         return [e for e in self._endpoints.values() if e.healthy]
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        healthy = sum(1 for e in self._endpoints.values() if e.healthy)
+        return self._initialized, f"ok: {healthy}/{len(self._endpoints)} endpoints healthy"
+
+    async def cleanup(self) -> None:
+        self._endpoints.clear()
+        self._dns_cache.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="NetworkManager",
+            version="1.0.0",
+            inputs=["network.check"],
+            outputs=["network.status"],
+            side_effects=["writes_network_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class FileMetadata:
     """Metadata for a file."""
@@ -51395,7 +51598,7 @@ class FileMetadata:
     permissions: str
     checksum: Optional[str] = None
 
-class FileSystemManager:
+class FileSystemManager(SystemService):
     """
     Abstracted file system operations manager.
 
@@ -51422,7 +51625,7 @@ class FileSystemManager:
         self._logger = logging.getLogger("FileSystemManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize file system manager."""
         try:
             self._initialized = True
@@ -51669,6 +51872,36 @@ class FileSystemManager:
                 await callback(path, event_type)
             except Exception as e:
                 self._logger.error(f"Watcher callback error: {e}")
+
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._metadata_cache)} cached entries"
+
+    async def cleanup(self) -> None:
+        self._metadata_cache.clear()
+        self._cache_timestamps.clear()
+        # Clean up temp files
+        for temp_path in list(self._temp_files):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+        self._temp_files.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="FileSystemManager",
+            version="1.0.0",
+            inputs=["fs.operation"],
+            outputs=["fs.completed"],
+            side_effects=["writes_fs_metadata"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 @dataclass
 class ExternalService:
@@ -52444,3721 +52677,6 @@ class CommandPatternManager:
         }
 
 # =============================================================================
-# ZONE 4.19: ADVANCED ENTERPRISE PATTERNS AND OPERATIONS
-# =============================================================================
-# This zone provides enterprise-grade patterns for:
-# - MLOps: Machine learning model lifecycle management
-# - Workflow Orchestration: BPMN-like business process automation
-# - Document Management: Version-controlled document storage
-# - Notification Hub: Multi-channel notification delivery
-# - Session Management: Distributed session handling
-# - Data Lake: Large-scale data storage abstraction
-# - Streaming Analytics: Real-time data processing
-# - Consent Management: GDPR/privacy compliance
-# - Digital Signatures: Document signing and verification
-# =============================================================================
-
-# -----------------------------------------------------------------------------
-# 4.19.1: MLOps Model Registry
-# -----------------------------------------------------------------------------
-
-class ModelArtifact(NamedTuple):
-    """Machine learning model artifact."""
-    artifact_id: str
-    model_id: str
-    version: str
-    artifact_type: str  # weights, config, tokenizer, etc.
-    storage_path: str
-    checksum: str
-    size_bytes: int
-    created_at: float
-    metadata: Dict[str, Any]
-
-class ModelVersion(NamedTuple):
-    """Model version with artifacts and metrics."""
-    version_id: str
-    model_id: str
-    version_number: str
-    stage: str  # development, staging, production, archived
-    artifacts: List[ModelArtifact]
-    metrics: Dict[str, float]
-    parameters: Dict[str, Any]
-    tags: List[str]
-    created_at: float
-    created_by: str
-    description: str
-
-class RegisteredModel(NamedTuple):
-    """Registered ML model in the registry."""
-    model_id: str
-    name: str
-    description: str
-    task_type: str  # classification, regression, nlp, etc.
-    framework: str  # pytorch, tensorflow, sklearn, etc.
-    versions: Dict[str, ModelVersion]
-    latest_version: Optional[str]
-    production_version: Optional[str]
-    created_at: float
-    updated_at: float
-    owner: str
-    tags: List[str]
-
-class ModelExperiment(NamedTuple):
-    """ML experiment tracking."""
-    experiment_id: str
-    name: str
-    model_id: Optional[str]
-    status: str  # running, completed, failed
-    start_time: float
-    end_time: Optional[float]
-    parameters: Dict[str, Any]
-    metrics: Dict[str, List[Tuple[float, float]]]  # metric -> [(step, value), ...]
-    artifacts: List[str]
-    logs: List[str]
-    tags: List[str]
-
-class MLOpsModelRegistry:
-    """
-    Machine Learning Operations model registry.
-
-    Provides model versioning, experiment tracking, and deployment management:
-    - Model registration and versioning
-    - Experiment tracking with metrics
-    - Model stage transitions (dev → staging → production)
-    - Model lineage and provenance
-    - A/B deployment support
-    """
-
-    def __init__(self) -> None:
-        self._models: Dict[str, RegisteredModel] = {}
-        self._experiments: Dict[str, ModelExperiment] = {}
-        self._deployments: Dict[str, Dict[str, Any]] = {}  # endpoint_id -> deployment info
-        self._lock = asyncio.Lock()
-        self._initialized = False
-
-    async def initialize(self) -> bool:
-        """Initialize the MLOps registry."""
-        async with self._lock:
-            if self._initialized:
-                return True
-            self._initialized = True
-            return True
-
-    async def register_model(
-        self,
-        name: str,
-        description: str = "",
-        task_type: str = "unknown",
-        framework: str = "unknown",
-        owner: str = "system",
-        tags: Optional[List[str]] = None,
-    ) -> RegisteredModel:
-        """
-        Register a new model in the registry.
-
-        Args:
-            name: Unique model name
-            description: Model description
-            task_type: ML task type (classification, regression, etc.)
-            framework: ML framework (pytorch, tensorflow, etc.)
-            owner: Model owner identifier
-            tags: Optional tags for categorization
-
-        Returns:
-            RegisteredModel instance
-        """
-        async with self._lock:
-            model_id = f"model_{hashlib.sha256(f'{name}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            model = RegisteredModel(
-                model_id=model_id,
-                name=name,
-                description=description,
-                task_type=task_type,
-                framework=framework,
-                versions={},
-                latest_version=None,
-                production_version=None,
-                created_at=now,
-                updated_at=now,
-                owner=owner,
-                tags=tags or [],
-            )
-
-            self._models[model_id] = model
-            return model
-
-    async def log_model_version(
-        self,
-        model_id: str,
-        version_number: str,
-        artifacts: List[Dict[str, Any]],
-        metrics: Optional[Dict[str, float]] = None,
-        parameters: Optional[Dict[str, Any]] = None,
-        created_by: str = "system",
-        description: str = "",
-        tags: Optional[List[str]] = None,
-    ) -> Optional[ModelVersion]:
-        """
-        Log a new version of a model.
-
-        Args:
-            model_id: Model identifier
-            version_number: Semantic version string
-            artifacts: List of artifact dicts with type, path, checksum
-            metrics: Model performance metrics
-            parameters: Training/model parameters
-            created_by: Creator identifier
-            description: Version description
-            tags: Version tags
-
-        Returns:
-            ModelVersion if successful, None otherwise
-        """
-        async with self._lock:
-            model = self._models.get(model_id)
-            if not model:
-                return None
-
-            version_id = f"ver_{hashlib.sha256(f'{model_id}:{version_number}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            # Create artifact objects
-            artifact_list = []
-            for art in artifacts:
-                art_type = art.get("type", "unknown")
-                art_id_str = f"{version_id}:{art_type}:{time.time()}"
-                artifact = ModelArtifact(
-                    artifact_id=f"art_{hashlib.sha256(art_id_str.encode()).hexdigest()[:12]}",
-                    model_id=model_id,
-                    version=version_number,
-                    artifact_type=art.get("type", "unknown"),
-                    storage_path=art.get("path", ""),
-                    checksum=art.get("checksum", ""),
-                    size_bytes=art.get("size", 0),
-                    created_at=now,
-                    metadata=art.get("metadata", {}),
-                )
-                artifact_list.append(artifact)
-
-            version = ModelVersion(
-                version_id=version_id,
-                model_id=model_id,
-                version_number=version_number,
-                stage="development",
-                artifacts=artifact_list,
-                metrics=metrics or {},
-                parameters=parameters or {},
-                tags=tags or [],
-                created_at=now,
-                created_by=created_by,
-                description=description,
-            )
-
-            # Update model with new version
-            versions = dict(model.versions)
-            versions[version_number] = version
-
-            updated_model = model._replace(
-                versions=versions,
-                latest_version=version_number,
-                updated_at=now,
-            )
-            self._models[model_id] = updated_model
-
-            return version
-
-    async def transition_stage(
-        self,
-        model_id: str,
-        version_number: str,
-        target_stage: str,
-        archive_existing: bool = True,
-    ) -> bool:
-        """
-        Transition a model version to a new stage.
-
-        Args:
-            model_id: Model identifier
-            version_number: Version to transition
-            target_stage: Target stage (staging, production, archived)
-            archive_existing: Whether to archive current production version
-
-        Returns:
-            True if transition successful
-        """
-        valid_stages = {"development", "staging", "production", "archived"}
-        if target_stage not in valid_stages:
-            return False
-
-        async with self._lock:
-            model = self._models.get(model_id)
-            if not model:
-                return False
-
-            version = model.versions.get(version_number)
-            if not version:
-                return False
-
-            # Archive existing production if moving to production
-            if target_stage == "production" and archive_existing and model.production_version:
-                existing_prod = model.versions.get(model.production_version)
-                if existing_prod:
-                    archived = existing_prod._replace(stage="archived")
-                    versions = dict(model.versions)
-                    versions[model.production_version] = archived
-                    model = model._replace(versions=versions)
-
-            # Update version stage
-            updated_version = version._replace(stage=target_stage)
-            versions = dict(model.versions)
-            versions[version_number] = updated_version
-
-            # Update production pointer if needed
-            production_version = model.production_version
-            if target_stage == "production":
-                production_version = version_number
-            elif version_number == model.production_version and target_stage != "production":
-                production_version = None
-
-            updated_model = model._replace(
-                versions=versions,
-                production_version=production_version,
-                updated_at=time.time(),
-            )
-            self._models[model_id] = updated_model
-
-            return True
-
-    async def start_experiment(
-        self,
-        name: str,
-        model_id: Optional[str] = None,
-        parameters: Optional[Dict[str, Any]] = None,
-        tags: Optional[List[str]] = None,
-    ) -> ModelExperiment:
-        """
-        Start a new ML experiment.
-
-        Args:
-            name: Experiment name
-            model_id: Optional associated model
-            parameters: Experiment parameters
-            tags: Experiment tags
-
-        Returns:
-            ModelExperiment instance
-        """
-        async with self._lock:
-            experiment_id = f"exp_{hashlib.sha256(f'{name}:{time.time()}'.encode()).hexdigest()[:16]}"
-
-            experiment = ModelExperiment(
-                experiment_id=experiment_id,
-                name=name,
-                model_id=model_id,
-                status="running",
-                start_time=time.time(),
-                end_time=None,
-                parameters=parameters or {},
-                metrics={},
-                artifacts=[],
-                logs=[],
-                tags=tags or [],
-            )
-
-            self._experiments[experiment_id] = experiment
-            return experiment
-
-    async def log_metrics(
-        self,
-        experiment_id: str,
-        metrics: Dict[str, float],
-        step: Optional[int] = None,
-    ) -> bool:
-        """
-        Log metrics for an experiment.
-
-        Args:
-            experiment_id: Experiment identifier
-            metrics: Dict of metric name to value
-            step: Optional step/epoch number
-
-        Returns:
-            True if logged successfully
-        """
-        async with self._lock:
-            experiment = self._experiments.get(experiment_id)
-            if not experiment or experiment.status != "running":
-                return False
-
-            step_val = step if step is not None else int(time.time() - experiment.start_time)
-
-            updated_metrics = dict(experiment.metrics)
-            for name, value in metrics.items():
-                if name not in updated_metrics:
-                    updated_metrics[name] = []
-                updated_metrics[name].append((float(step_val), value))
-
-            updated = experiment._replace(metrics=updated_metrics)
-            self._experiments[experiment_id] = updated
-
-            return True
-
-    async def end_experiment(
-        self,
-        experiment_id: str,
-        status: str = "completed",
-        final_metrics: Optional[Dict[str, float]] = None,
-    ) -> Optional[ModelExperiment]:
-        """
-        End an experiment.
-
-        Args:
-            experiment_id: Experiment identifier
-            status: Final status (completed, failed)
-            final_metrics: Final metric values
-
-        Returns:
-            Updated experiment if successful
-        """
-        async with self._lock:
-            experiment = self._experiments.get(experiment_id)
-            if not experiment:
-                return None
-
-            if final_metrics:
-                await self.log_metrics(experiment_id, final_metrics)
-                experiment = self._experiments[experiment_id]
-
-            updated = experiment._replace(
-                status=status,
-                end_time=time.time(),
-            )
-            self._experiments[experiment_id] = updated
-
-            return updated
-
-    async def deploy_model(
-        self,
-        model_id: str,
-        version_number: str,
-        endpoint_name: str,
-        config: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[bool, str]:
-        """
-        Deploy a model version to an endpoint.
-
-        Args:
-            model_id: Model identifier
-            version_number: Version to deploy
-            endpoint_name: Deployment endpoint name
-            config: Deployment configuration
-
-        Returns:
-            Tuple of (success, endpoint_id or error message)
-        """
-        async with self._lock:
-            model = self._models.get(model_id)
-            if not model:
-                return False, "Model not found"
-
-            version = model.versions.get(version_number)
-            if not version:
-                return False, "Version not found"
-
-            endpoint_id = f"endpoint_{hashlib.sha256(f'{endpoint_name}:{time.time()}'.encode()).hexdigest()[:12]}"
-
-            deployment = {
-                "endpoint_id": endpoint_id,
-                "endpoint_name": endpoint_name,
-                "model_id": model_id,
-                "version_number": version_number,
-                "status": "deployed",
-                "config": config or {},
-                "deployed_at": time.time(),
-                "traffic_split": {version_number: 100.0},
-            }
-
-            self._deployments[endpoint_id] = deployment
-
-            return True, endpoint_id
-
-    def get_model(self, model_id: str) -> Optional[RegisteredModel]:
-        """Get a model by ID."""
-        return self._models.get(model_id)
-
-    def get_experiment(self, experiment_id: str) -> Optional[ModelExperiment]:
-        """Get an experiment by ID."""
-        return self._experiments.get(experiment_id)
-
-    def get_deployment(self, endpoint_id: str) -> Optional[Dict[str, Any]]:
-        """Get deployment info by endpoint ID."""
-        return self._deployments.get(endpoint_id)
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get registry statistics."""
-        return {
-            "total_models": len(self._models),
-            "total_versions": sum(len(m.versions) for m in self._models.values()),
-            "total_experiments": len(self._experiments),
-            "running_experiments": sum(1 for e in self._experiments.values() if e.status == "running"),
-            "total_deployments": len(self._deployments),
-            "active_deployments": sum(1 for d in self._deployments.values() if d.get("status") == "deployed"),
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.2: Workflow Orchestration Engine
-# -----------------------------------------------------------------------------
-
-class WorkflowTaskDef(NamedTuple):
-    """Workflow task definition."""
-    task_id: str
-    name: str
-    task_type: str  # service, script, human, gateway
-    handler: Optional[str]  # Handler function/service name
-    inputs: Dict[str, str]  # Input variable mappings
-    outputs: Dict[str, str]  # Output variable mappings
-    timeout_seconds: float
-    retry_policy: Dict[str, Any]
-    conditions: List[str]  # Conditional expressions
-
-class WorkflowTransition(NamedTuple):
-    """Transition between workflow tasks."""
-    from_task: str
-    to_task: str
-    condition: Optional[str]  # Transition condition expression
-
-class BPMWorkflowDef(NamedTuple):
-    """BPMN workflow process definition (distinct from WorkflowEngine's WorkflowDefinition)."""
-    workflow_id: str
-    name: str
-    version: str
-    description: str
-    tasks: Dict[str, WorkflowTaskDef]
-    transitions: List[WorkflowTransition]
-    start_task: str
-    end_tasks: List[str]
-    variables: Dict[str, Any]  # Default variable values
-    created_at: float
-    updated_at: float
-
-class WorkflowTaskInstance(NamedTuple):
-    """Running workflow task instance."""
-    instance_id: str
-    task_def: WorkflowTaskDef
-    status: str  # pending, running, completed, failed, skipped
-    started_at: Optional[float]
-    completed_at: Optional[float]
-    inputs: Dict[str, Any]
-    outputs: Dict[str, Any]
-    error: Optional[str]
-    retry_count: int
-
-class BPMWorkflowInst(NamedTuple):
-    """Running BPMN workflow instance (distinct from WorkflowEngine's WorkflowInstance)."""
-    instance_id: str
-    workflow_id: str
-    workflow_name: str
-    status: str  # running, completed, failed, suspended, cancelled
-    started_at: float
-    completed_at: Optional[float]
-    current_tasks: List[str]  # Currently active task IDs
-    task_instances: Dict[str, WorkflowTaskInstance]
-    variables: Dict[str, Any]
-    parent_instance_id: Optional[str]  # For sub-workflows
-
-class WorkflowOrchestrator:
-    """
-    BPMN-like workflow orchestration engine.
-
-    Provides business process automation with:
-    - Visual workflow definition support
-    - Parallel and sequential task execution
-    - Exclusive/inclusive gateways for branching
-    - Error handling and compensation
-    - Human task integration
-    - Sub-workflow support
-    - Event triggers and timers
-    """
-
-    def __init__(self) -> None:
-        self._definitions: Dict[str, BPMWorkflowDef] = {}
-        self._instances: Dict[str, BPMWorkflowInst] = {}
-        self._handlers: Dict[str, Callable[..., Awaitable[Dict[str, Any]]]] = {}
-        self._lock = asyncio.Lock()
-        self._running = False
-        self._executor_task: Optional[asyncio.Task[None]] = None
-
-    async def initialize(self) -> bool:
-        """Initialize the workflow orchestrator."""
-        self._running = True
-        self._executor_task = create_safe_task(self._executor_loop())
-        return True
-
-    async def cleanup(self) -> None:
-        """Cleanup orchestrator resources."""
-        self._running = False
-        if self._executor_task:
-            self._executor_task.cancel()
-            try:
-                await self._executor_task
-            except asyncio.CancelledError:
-                pass
-
-    def register_handler(
-        self,
-        handler_name: str,
-        handler_func: Callable[..., Awaitable[Dict[str, Any]]],
-    ) -> None:
-        """Register a task handler function."""
-        self._handlers[handler_name] = handler_func
-
-    async def define_workflow(
-        self,
-        name: str,
-        version: str = "1.0.0",
-        description: str = "",
-        tasks: Optional[List[Dict[str, Any]]] = None,
-        transitions: Optional[List[Dict[str, str]]] = None,
-        start_task: str = "",
-        end_tasks: Optional[List[str]] = None,
-        variables: Optional[Dict[str, Any]] = None,
-    ) -> BPMWorkflowDef:
-        """
-        Define a new workflow.
-
-        Args:
-            name: Workflow name
-            version: Workflow version
-            description: Workflow description
-            tasks: List of task definitions
-            transitions: List of transitions between tasks
-            start_task: Starting task ID
-            end_tasks: List of ending task IDs
-            variables: Default workflow variables
-
-        Returns:
-            BPMWorkflowDef instance
-        """
-        async with self._lock:
-            workflow_id = f"wf_{hashlib.sha256(f'{name}:{version}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            # Build task definitions
-            task_defs: Dict[str, WorkflowTaskDef] = {}
-            for task_data in (tasks or []):
-                task_def = WorkflowTaskDef(
-                    task_id=task_data.get("id", f"task_{len(task_defs)}"),
-                    name=task_data.get("name", "Unnamed Task"),
-                    task_type=task_data.get("type", "service"),
-                    handler=task_data.get("handler"),
-                    inputs=task_data.get("inputs", {}),
-                    outputs=task_data.get("outputs", {}),
-                    timeout_seconds=task_data.get("timeout", 300.0),
-                    retry_policy=task_data.get("retry_policy", {"max_retries": 3, "backoff": 1.0}),
-                    conditions=task_data.get("conditions", []),
-                )
-                task_defs[task_def.task_id] = task_def
-
-            # Build transitions
-            transition_list = [
-                WorkflowTransition(
-                    from_task=t.get("from", ""),
-                    to_task=t.get("to", ""),
-                    condition=t.get("condition"),
-                )
-                for t in (transitions or [])
-            ]
-
-            definition = BPMWorkflowDef(
-                workflow_id=workflow_id,
-                name=name,
-                version=version,
-                description=description,
-                tasks=task_defs,
-                transitions=transition_list,
-                start_task=start_task or (list(task_defs.keys())[0] if task_defs else ""),
-                end_tasks=end_tasks or [],
-                variables=variables or {},
-                created_at=now,
-                updated_at=now,
-            )
-
-            self._definitions[workflow_id] = definition
-            return definition
-
-    async def start_workflow(
-        self,
-        workflow_id: str,
-        variables: Optional[Dict[str, Any]] = None,
-        parent_instance_id: Optional[str] = None,
-    ) -> Optional[BPMWorkflowInst]:
-        """
-        Start a new workflow instance.
-
-        Args:
-            workflow_id: Workflow definition ID
-            variables: Initial variable values
-            parent_instance_id: Parent instance for sub-workflows
-
-        Returns:
-            BPMWorkflowInst if started successfully
-        """
-        async with self._lock:
-            definition = self._definitions.get(workflow_id)
-            if not definition:
-                return None
-
-            instance_id = f"inst_{hashlib.sha256(f'{workflow_id}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            # Merge default variables with provided ones
-            merged_vars = dict(definition.variables)
-            if variables:
-                merged_vars.update(variables)
-
-            instance = BPMWorkflowInst(
-                instance_id=instance_id,
-                workflow_id=workflow_id,
-                workflow_name=definition.name,
-                status="running",
-                started_at=now,
-                completed_at=None,
-                current_tasks=[definition.start_task],
-                task_instances={},
-                variables=merged_vars,
-                parent_instance_id=parent_instance_id,
-            )
-
-            self._instances[instance_id] = instance
-            return instance
-
-    async def _executor_loop(self) -> None:
-        """Background loop to execute workflow tasks."""
-        while self._running:
-            try:
-                await self._process_pending_tasks()
-                await asyncio.sleep(0.1)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(1.0)
-
-    async def _process_pending_tasks(self) -> None:
-        """Process all pending tasks across workflow instances."""
-        async with self._lock:
-            instances_to_process = [
-                inst for inst in self._instances.values()
-                if inst.status == "running"
-            ]
-
-        for instance in instances_to_process:
-            await self._process_instance(instance)
-
-    async def _process_instance(self, instance: BPMWorkflowInst) -> None:
-        """Process a single workflow instance."""
-        definition = self._definitions.get(instance.workflow_id)
-        if not definition:
-            return
-
-        for task_id in list(instance.current_tasks):
-            task_def = definition.tasks.get(task_id)
-            if not task_def:
-                continue
-
-            # Get or create task instance
-            task_instance = instance.task_instances.get(task_id)
-            if not task_instance:
-                task_instance = WorkflowTaskInstance(
-                    instance_id=f"ti_{hashlib.sha256(f'{instance.instance_id}:{task_id}:{time.time()}'.encode()).hexdigest()[:12]}",
-                    task_def=task_def,
-                    status="pending",
-                    started_at=None,
-                    completed_at=None,
-                    inputs={},
-                    outputs={},
-                    error=None,
-                    retry_count=0,
-                )
-                async with self._lock:
-                    task_instances = dict(instance.task_instances)
-                    task_instances[task_id] = task_instance
-                    instance = instance._replace(task_instances=task_instances)
-                    self._instances[instance.instance_id] = instance
-
-            if task_instance.status == "pending":
-                await self._execute_task(instance, task_instance)
-
-    async def _execute_task(
-        self,
-        instance: BPMWorkflowInst,
-        task_instance: WorkflowTaskInstance,
-    ) -> None:
-        """Execute a single workflow task."""
-        task_def = task_instance.task_def
-
-        # Resolve inputs from workflow variables
-        inputs = {}
-        for input_name, var_expr in task_def.inputs.items():
-            inputs[input_name] = instance.variables.get(var_expr, var_expr)
-
-        # Mark as running
-        async with self._lock:
-            updated_task = task_instance._replace(
-                status="running",
-                started_at=time.time(),
-                inputs=inputs,
-            )
-            task_instances = dict(instance.task_instances)
-            task_instances[task_def.task_id] = updated_task
-            instance = instance._replace(task_instances=task_instances)
-            self._instances[instance.instance_id] = instance
-
-        try:
-            # Execute the handler
-            handler = self._handlers.get(task_def.handler or "")
-            if handler:
-                outputs = await asyncio.wait_for(
-                    handler(**inputs),
-                    timeout=task_def.timeout_seconds,
-                )
-            else:
-                outputs = {}
-
-            # Update workflow variables with outputs
-            updated_vars = dict(instance.variables)
-            for output_name, var_name in task_def.outputs.items():
-                if output_name in outputs:
-                    updated_vars[var_name] = outputs[output_name]
-
-            # Mark completed and advance
-            async with self._lock:
-                completed_task = task_instance._replace(
-                    status="completed",
-                    completed_at=time.time(),
-                    outputs=outputs,
-                )
-                task_instances = dict(instance.task_instances)
-                task_instances[task_def.task_id] = completed_task
-
-                # Find next tasks
-                definition = self._definitions[instance.workflow_id]
-                next_tasks = [
-                    t.to_task for t in definition.transitions
-                    if t.from_task == task_def.task_id
-                ]
-
-                current_tasks = [t for t in instance.current_tasks if t != task_def.task_id]
-                current_tasks.extend(next_tasks)
-
-                # Check if workflow is complete
-                status = instance.status
-                if not current_tasks or task_def.task_id in definition.end_tasks:
-                    if not current_tasks:
-                        status = "completed"
-
-                instance = instance._replace(
-                    task_instances=task_instances,
-                    variables=updated_vars,
-                    current_tasks=current_tasks,
-                    status=status,
-                    completed_at=time.time() if status == "completed" else None,
-                )
-                self._instances[instance.instance_id] = instance
-
-        except asyncio.TimeoutError:
-            await self._handle_task_failure(instance, task_instance, "Task timed out")
-        except Exception as e:
-            await self._handle_task_failure(instance, task_instance, str(e))
-
-    async def _handle_task_failure(
-        self,
-        instance: BPMWorkflowInst,
-        task_instance: WorkflowTaskInstance,
-        error: str,
-    ) -> None:
-        """Handle task execution failure."""
-        task_def = task_instance.task_def
-        max_retries = task_def.retry_policy.get("max_retries", 3)
-
-        async with self._lock:
-            new_retry_count = task_instance.retry_count + 1
-
-            if new_retry_count < max_retries:
-                # Retry the task
-                updated_task = task_instance._replace(
-                    status="pending",
-                    retry_count=new_retry_count,
-                    error=error,
-                )
-            else:
-                # Mark as failed
-                updated_task = task_instance._replace(
-                    status="failed",
-                    completed_at=time.time(),
-                    error=error,
-                )
-                instance = instance._replace(status="failed")
-
-            task_instances = dict(instance.task_instances)
-            task_instances[task_def.task_id] = updated_task
-            instance = instance._replace(task_instances=task_instances)
-            self._instances[instance.instance_id] = instance
-
-    async def suspend_workflow(self, instance_id: str) -> bool:
-        """Suspend a running workflow."""
-        async with self._lock:
-            instance = self._instances.get(instance_id)
-            if not instance or instance.status != "running":
-                return False
-
-            updated = instance._replace(status="suspended")
-            self._instances[instance_id] = updated
-            return True
-
-    async def resume_workflow(self, instance_id: str) -> bool:
-        """Resume a suspended workflow."""
-        async with self._lock:
-            instance = self._instances.get(instance_id)
-            if not instance or instance.status != "suspended":
-                return False
-
-            updated = instance._replace(status="running")
-            self._instances[instance_id] = updated
-            return True
-
-    async def cancel_workflow(self, instance_id: str) -> bool:
-        """Cancel a workflow instance."""
-        async with self._lock:
-            instance = self._instances.get(instance_id)
-            if not instance:
-                return False
-
-            updated = instance._replace(
-                status="cancelled",
-                completed_at=time.time(),
-            )
-            self._instances[instance_id] = updated
-            return True
-
-    def get_workflow_definition(self, workflow_id: str) -> Optional[BPMWorkflowDef]:
-        """Get a workflow definition."""
-        return self._definitions.get(workflow_id)
-
-    def get_workflow_instance(self, instance_id: str) -> Optional[BPMWorkflowInst]:
-        """Get a workflow instance."""
-        return self._instances.get(instance_id)
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get orchestrator statistics."""
-        status_counts = {"running": 0, "completed": 0, "failed": 0, "suspended": 0, "cancelled": 0}
-        for inst in self._instances.values():
-            status_counts[inst.status] = status_counts.get(inst.status, 0) + 1
-
-        return {
-            "total_definitions": len(self._definitions),
-            "total_instances": len(self._instances),
-            "registered_handlers": len(self._handlers),
-            "instance_status": status_counts,
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.3: Document Management System
-# -----------------------------------------------------------------------------
-
-class DocumentVersion(NamedTuple):
-    """Document version information."""
-    version_id: str
-    version_number: int
-    content_hash: str
-    storage_path: str
-    size_bytes: int
-    created_at: float
-    created_by: str
-    change_summary: str
-
-class Document(NamedTuple):
-    """Document with version history."""
-    document_id: str
-    name: str
-    document_type: str  # pdf, docx, txt, etc.
-    folder_path: str
-    current_version: int
-    versions: Dict[int, DocumentVersion]
-    metadata: Dict[str, Any]
-    tags: List[str]
-    permissions: Dict[str, List[str]]  # role -> [read, write, delete]
-    locked_by: Optional[str]
-    locked_at: Optional[float]
-    created_at: float
-    updated_at: float
-    owner: str
-
-class Folder(NamedTuple):
-    """Document folder."""
-    folder_id: str
-    name: str
-    parent_path: str
-    full_path: str
-    metadata: Dict[str, Any]
-    permissions: Dict[str, List[str]]
-    created_at: float
-    updated_at: float
-    owner: str
-
-class DocumentManagementSystem:
-    """
-    Enterprise document management system.
-
-    Provides:
-    - Version-controlled document storage
-    - Folder hierarchy organization
-    - Document locking for concurrent editing
-    - Permission-based access control
-    - Full-text search capability
-    - Document lifecycle management
-    - Audit trail for all operations
-    """
-
-    def __init__(self, storage_path: Optional[str] = None) -> None:
-        self._storage_path = storage_path or "/tmp/dms_storage"
-        self._documents: Dict[str, Document] = {}
-        self._folders: Dict[str, Folder] = {}
-        self._search_index: Dict[str, Set[str]] = {}  # word -> doc_ids
-        self._lock = asyncio.Lock()
-        self._initialized = False
-
-    async def initialize(self) -> bool:
-        """Initialize the document management system."""
-        async with self._lock:
-            if self._initialized:
-                return True
-
-            # Create root folder
-            root_folder = Folder(
-                folder_id="root",
-                name="/",
-                parent_path="",
-                full_path="/",
-                metadata={},
-                permissions={"admin": ["read", "write", "delete"]},
-                created_at=time.time(),
-                updated_at=time.time(),
-                owner="system",
-            )
-            self._folders["/"] = root_folder
-
-            self._initialized = True
-            return True
-
-    async def create_folder(
-        self,
-        name: str,
-        parent_path: str = "/",
-        owner: str = "system",
-        permissions: Optional[Dict[str, List[str]]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Folder]:
-        """
-        Create a new folder.
-
-        Args:
-            name: Folder name
-            parent_path: Parent folder path
-            owner: Folder owner
-            permissions: Access permissions
-            metadata: Folder metadata
-
-        Returns:
-            Folder if created successfully
-        """
-        async with self._lock:
-            # Validate parent exists
-            if parent_path not in self._folders and parent_path != "/":
-                return None
-
-            full_path = f"{parent_path.rstrip('/')}/{name}"
-            if full_path in self._folders:
-                return None  # Already exists
-
-            folder_id = f"folder_{hashlib.sha256(f'{full_path}:{time.time()}'.encode()).hexdigest()[:12]}"
-            now = time.time()
-
-            folder = Folder(
-                folder_id=folder_id,
-                name=name,
-                parent_path=parent_path,
-                full_path=full_path,
-                metadata=metadata or {},
-                permissions=permissions or {"admin": ["read", "write", "delete"]},
-                created_at=now,
-                updated_at=now,
-                owner=owner,
-            )
-
-            self._folders[full_path] = folder
-            return folder
-
-    async def create_document(
-        self,
-        name: str,
-        document_type: str,
-        content: bytes,
-        folder_path: str = "/",
-        owner: str = "system",
-        tags: Optional[List[str]] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        permissions: Optional[Dict[str, List[str]]] = None,
-    ) -> Optional[Document]:
-        """
-        Create a new document.
-
-        Args:
-            name: Document name
-            document_type: Document type (pdf, docx, etc.)
-            content: Document content bytes
-            folder_path: Folder path
-            owner: Document owner
-            tags: Document tags
-            metadata: Document metadata
-            permissions: Access permissions
-
-        Returns:
-            Document if created successfully
-        """
-        async with self._lock:
-            # Validate folder exists
-            if folder_path not in self._folders:
-                return None
-
-            document_id = f"doc_{hashlib.sha256(f'{name}:{folder_path}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            # Create first version
-            content_hash = hashlib.sha256(content).hexdigest()
-            storage_path = f"{self._storage_path}/{document_id}/v1"
-
-            version = DocumentVersion(
-                version_id=f"ver_{document_id}_1",
-                version_number=1,
-                content_hash=content_hash,
-                storage_path=storage_path,
-                size_bytes=len(content),
-                created_at=now,
-                created_by=owner,
-                change_summary="Initial version",
-            )
-
-            document = Document(
-                document_id=document_id,
-                name=name,
-                document_type=document_type,
-                folder_path=folder_path,
-                current_version=1,
-                versions={1: version},
-                metadata=metadata or {},
-                tags=tags or [],
-                permissions=permissions or {"admin": ["read", "write", "delete"]},
-                locked_by=None,
-                locked_at=None,
-                created_at=now,
-                updated_at=now,
-                owner=owner,
-            )
-
-            self._documents[document_id] = document
-
-            # Index for search
-            self._index_document(document_id, name, tags or [])
-
-            return document
-
-    def _index_document(self, document_id: str, name: str, tags: List[str]) -> None:
-        """Index document for search."""
-        words = set(name.lower().split())
-        words.update(t.lower() for t in tags)
-
-        for word in words:
-            if word not in self._search_index:
-                self._search_index[word] = set()
-            self._search_index[word].add(document_id)
-
-    async def update_document(
-        self,
-        document_id: str,
-        content: bytes,
-        updated_by: str = "system",
-        change_summary: str = "",
-    ) -> Optional[DocumentVersion]:
-        """
-        Update a document with a new version.
-
-        Args:
-            document_id: Document identifier
-            content: New content bytes
-            updated_by: User making the update
-            change_summary: Description of changes
-
-        Returns:
-            New DocumentVersion if successful
-        """
-        async with self._lock:
-            document = self._documents.get(document_id)
-            if not document:
-                return None
-
-            # Check lock
-            if document.locked_by and document.locked_by != updated_by:
-                return None
-
-            new_version_number = document.current_version + 1
-            now = time.time()
-
-            content_hash = hashlib.sha256(content).hexdigest()
-            storage_path = f"{self._storage_path}/{document_id}/v{new_version_number}"
-
-            version = DocumentVersion(
-                version_id=f"ver_{document_id}_{new_version_number}",
-                version_number=new_version_number,
-                content_hash=content_hash,
-                storage_path=storage_path,
-                size_bytes=len(content),
-                created_at=now,
-                created_by=updated_by,
-                change_summary=change_summary,
-            )
-
-            versions = dict(document.versions)
-            versions[new_version_number] = version
-
-            updated_doc = document._replace(
-                current_version=new_version_number,
-                versions=versions,
-                updated_at=now,
-            )
-            self._documents[document_id] = updated_doc
-
-            return version
-
-    async def lock_document(self, document_id: str, user: str) -> bool:
-        """
-        Lock a document for exclusive editing.
-
-        Args:
-            document_id: Document identifier
-            user: User requesting the lock
-
-        Returns:
-            True if lock acquired
-        """
-        async with self._lock:
-            document = self._documents.get(document_id)
-            if not document:
-                return False
-
-            # Already locked by someone else
-            if document.locked_by and document.locked_by != user:
-                # Check if lock is stale (>1 hour)
-                if document.locked_at and (time.time() - document.locked_at) < 3600:
-                    return False
-
-            updated = document._replace(
-                locked_by=user,
-                locked_at=time.time(),
-            )
-            self._documents[document_id] = updated
-            return True
-
-    async def unlock_document(self, document_id: str, user: str) -> bool:
-        """
-        Unlock a document.
-
-        Args:
-            document_id: Document identifier
-            user: User releasing the lock
-
-        Returns:
-            True if unlocked successfully
-        """
-        async with self._lock:
-            document = self._documents.get(document_id)
-            if not document:
-                return False
-
-            if document.locked_by and document.locked_by != user:
-                return False
-
-            updated = document._replace(
-                locked_by=None,
-                locked_at=None,
-            )
-            self._documents[document_id] = updated
-            return True
-
-    async def search_documents(
-        self,
-        query: str,
-        folder_path: Optional[str] = None,
-        document_type: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        limit: int = 50,
-    ) -> List[Document]:
-        """
-        Search for documents.
-
-        Args:
-            query: Search query
-            folder_path: Filter by folder
-            document_type: Filter by type
-            tags: Filter by tags
-            limit: Maximum results
-
-        Returns:
-            List of matching documents
-        """
-        async with self._lock:
-            # Find candidate documents from search index
-            words = query.lower().split()
-            candidate_ids: Optional[Set[str]] = None
-
-            for word in words:
-                word_matches = self._search_index.get(word, set())
-                if candidate_ids is None:
-                    candidate_ids = word_matches.copy()
-                else:
-                    candidate_ids &= word_matches
-
-            if candidate_ids is None:
-                candidate_ids = set(self._documents.keys())
-
-            # Filter and collect results
-            results = []
-            for doc_id in candidate_ids:
-                doc = self._documents.get(doc_id)
-                if not doc:
-                    continue
-
-                # Apply filters
-                if folder_path and doc.folder_path != folder_path:
-                    continue
-                if document_type and doc.document_type != document_type:
-                    continue
-                if tags and not all(t in doc.tags for t in tags):
-                    continue
-
-                results.append(doc)
-                if len(results) >= limit:
-                    break
-
-            return results
-
-    async def get_document(self, document_id: str) -> Optional[Document]:
-        """Get a document by ID."""
-        return self._documents.get(document_id)
-
-    async def get_folder(self, folder_path: str) -> Optional[Folder]:
-        """Get a folder by path."""
-        return self._folders.get(folder_path)
-
-    async def list_folder_contents(
-        self,
-        folder_path: str,
-    ) -> Tuple[List[Folder], List[Document]]:
-        """
-        List contents of a folder.
-
-        Returns:
-            Tuple of (subfolders, documents)
-        """
-        async with self._lock:
-            subfolders = [
-                f for f in self._folders.values()
-                if f.parent_path == folder_path
-            ]
-            documents = [
-                d for d in self._documents.values()
-                if d.folder_path == folder_path
-            ]
-            return subfolders, documents
-
-    async def delete_document(self, document_id: str, user: str) -> bool:
-        """
-        Delete a document.
-
-        Args:
-            document_id: Document identifier
-            user: User performing deletion
-
-        Returns:
-            True if deleted
-        """
-        async with self._lock:
-            document = self._documents.get(document_id)
-            if not document:
-                return False
-
-            # Check lock
-            if document.locked_by and document.locked_by != user:
-                return False
-
-            # Remove from search index
-            words = set(document.name.lower().split())
-            words.update(t.lower() for t in document.tags)
-            for word in words:
-                if word in self._search_index:
-                    self._search_index[word].discard(document_id)
-
-            del self._documents[document_id]
-            return True
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get DMS statistics."""
-        total_size = sum(
-            sum(v.size_bytes for v in d.versions.values())
-            for d in self._documents.values()
-        )
-        total_versions = sum(len(d.versions) for d in self._documents.values())
-
-        return {
-            "total_documents": len(self._documents),
-            "total_folders": len(self._folders),
-            "total_versions": total_versions,
-            "total_size_bytes": total_size,
-            "locked_documents": sum(1 for d in self._documents.values() if d.locked_by),
-            "index_terms": len(self._search_index),
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.4: Notification Hub
-# -----------------------------------------------------------------------------
-
-class NotificationChannel(NamedTuple):
-    """Notification delivery channel configuration."""
-    channel_id: str
-    channel_type: str  # email, sms, push, webhook, slack, teams
-    name: str
-    config: Dict[str, Any]
-    enabled: bool
-    rate_limit: int  # Max notifications per hour
-    created_at: float
-
-class NotificationTemplate(NamedTuple):
-    """Notification template."""
-    template_id: str
-    name: str
-    channel_type: str
-    subject_template: str
-    body_template: str
-    variables: List[str]
-    created_at: float
-    updated_at: float
-
-class Notification(NamedTuple):
-    """Notification record."""
-    notification_id: str
-    channel_id: str
-    template_id: Optional[str]
-    recipient: str
-    subject: str
-    body: str
-    priority: str  # low, normal, high, urgent
-    status: str  # pending, sent, delivered, failed
-    scheduled_at: Optional[float]
-    sent_at: Optional[float]
-    delivered_at: Optional[float]
-    error: Optional[str]
-    metadata: Dict[str, Any]
-    created_at: float
-
-class NotificationPreference(NamedTuple):
-    """User notification preferences."""
-    user_id: str
-    channel_preferences: Dict[str, bool]  # channel_type -> enabled
-    quiet_hours: Optional[Tuple[int, int]]  # (start_hour, end_hour) in UTC
-    frequency_limit: Dict[str, int]  # notification_type -> max per day
-    opt_outs: List[str]  # List of notification types to not receive
-
-class NotificationHub:
-    """
-    Multi-channel notification delivery system.
-
-    Provides:
-    - Multiple delivery channels (email, SMS, push, webhooks)
-    - Template-based notifications
-    - Scheduling and rate limiting
-    - User preference management
-    - Delivery tracking and retries
-    - Priority-based routing
-    """
-
-    def __init__(self) -> None:
-        self._channels: Dict[str, NotificationChannel] = {}
-        self._templates: Dict[str, NotificationTemplate] = {}
-        self._notifications: Dict[str, Notification] = {}
-        self._preferences: Dict[str, NotificationPreference] = {}
-        self._rate_counters: Dict[str, Dict[str, int]] = {}  # channel_id -> {hour: count}
-        self._lock = asyncio.Lock()
-        self._running = False
-        self._delivery_task: Optional[asyncio.Task[None]] = None
-        self._handlers: Dict[str, Callable[..., Awaitable[bool]]] = {}
-        self._preferences_loaded = False
-
-    async def initialize(self) -> bool:
-        """Initialize the notification hub."""
-        self._running = True
-        self._delivery_task = create_safe_task(self._delivery_loop())
-        await self._load_persisted_preferences()
-        return True
-
-    async def cleanup(self) -> None:
-        """Cleanup notification hub resources."""
-        self._running = False
-        if self._delivery_task:
-            self._delivery_task.cancel()
-            try:
-                await self._delivery_task
-            except asyncio.CancelledError:
-                pass
-
-    def register_channel_handler(
-        self,
-        channel_type: str,
-        handler: Callable[..., Awaitable[bool]],
-    ) -> None:
-        """Register a handler for a channel type."""
-        self._handlers[channel_type] = handler
-
-    async def add_channel(
-        self,
-        channel_type: str,
-        name: str,
-        config: Dict[str, Any],
-        rate_limit: int = 100,
-    ) -> NotificationChannel:
-        """
-        Add a notification channel.
-
-        Args:
-            channel_type: Channel type (email, sms, etc.)
-            name: Channel name
-            config: Channel configuration
-            rate_limit: Max notifications per hour
-
-        Returns:
-            NotificationChannel instance
-        """
-        async with self._lock:
-            channel_id = f"channel_{hashlib.sha256(f'{channel_type}:{name}:{time.time()}'.encode()).hexdigest()[:12]}"
-
-            channel = NotificationChannel(
-                channel_id=channel_id,
-                channel_type=channel_type,
-                name=name,
-                config=config,
-                enabled=True,
-                rate_limit=rate_limit,
-                created_at=time.time(),
-            )
-
-            self._channels[channel_id] = channel
-            return channel
-
-    async def create_template(
-        self,
-        name: str,
-        channel_type: str,
-        subject_template: str,
-        body_template: str,
-        variables: Optional[List[str]] = None,
-    ) -> NotificationTemplate:
-        """
-        Create a notification template.
-
-        Args:
-            name: Template name
-            channel_type: Target channel type
-            subject_template: Subject template with {{variables}}
-            body_template: Body template with {{variables}}
-            variables: List of required variables
-
-        Returns:
-            NotificationTemplate instance
-        """
-        async with self._lock:
-            template_id = f"template_{hashlib.sha256(f'{name}:{channel_type}:{time.time()}'.encode()).hexdigest()[:12]}"
-            now = time.time()
-
-            template = NotificationTemplate(
-                template_id=template_id,
-                name=name,
-                channel_type=channel_type,
-                subject_template=subject_template,
-                body_template=body_template,
-                variables=variables or [],
-                created_at=now,
-                updated_at=now,
-            )
-
-            self._templates[template_id] = template
-            return template
-
-    def _render_template(
-        self,
-        template_text: str,
-        variables: Dict[str, Any],
-    ) -> str:
-        """Render a template with variables."""
-        result = template_text
-        for key, value in variables.items():
-            result = result.replace(f"{{{{{key}}}}}", str(value))
-        return result
-
-    async def send_notification(
-        self,
-        channel_id: str,
-        recipient: str,
-        subject: str = "",
-        body: str = "",
-        template_id: Optional[str] = None,
-        template_vars: Optional[Dict[str, Any]] = None,
-        priority: str = "normal",
-        schedule_at: Optional[float] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Notification]:
-        """
-        Send a notification.
-
-        Args:
-            channel_id: Target channel ID
-            recipient: Recipient identifier
-            subject: Notification subject (or use template)
-            body: Notification body (or use template)
-            template_id: Template to use
-            template_vars: Variables for template
-            priority: Notification priority
-            schedule_at: Optional scheduled delivery time
-            metadata: Additional metadata
-
-        Returns:
-            Notification if queued successfully
-        """
-        async with self._lock:
-            channel = self._channels.get(channel_id)
-            if not channel or not channel.enabled:
-                return None
-
-            # Use template if provided
-            if template_id:
-                template = self._templates.get(template_id)
-                if template:
-                    vars_dict = template_vars or {}
-                    subject = self._render_template(template.subject_template, vars_dict)
-                    body = self._render_template(template.body_template, vars_dict)
-
-            notification_id = f"notif_{hashlib.sha256(f'{channel_id}:{recipient}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            notification = Notification(
-                notification_id=notification_id,
-                channel_id=channel_id,
-                template_id=template_id,
-                recipient=recipient,
-                subject=subject,
-                body=body,
-                priority=priority,
-                status="pending",
-                scheduled_at=schedule_at,
-                sent_at=None,
-                delivered_at=None,
-                error=None,
-                metadata=metadata or {},
-                created_at=now,
-            )
-
-            self._notifications[notification_id] = notification
-            return notification
-
-    async def _delivery_loop(self) -> None:
-        """Background loop to deliver notifications."""
-        while self._running:
-            try:
-                await self._process_pending_notifications()
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(5.0)
-
-    async def _process_pending_notifications(self) -> None:
-        """Process pending notifications."""
-        now = time.time()
-        current_hour = int(now // 3600)
-
-        async with self._lock:
-            pending = [
-                n for n in self._notifications.values()
-                if n.status == "pending"
-                and (n.scheduled_at is None or n.scheduled_at <= now)
-            ]
-
-        # Sort by priority
-        priority_order = {"urgent": 0, "high": 1, "normal": 2, "low": 3}
-        pending.sort(key=lambda n: priority_order.get(n.priority, 2))
-
-        for notification in pending:
-            await self._deliver_notification(notification, current_hour)
-
-    async def _deliver_notification(
-        self,
-        notification: Notification,
-        current_hour: int,
-    ) -> None:
-        """Deliver a single notification."""
-        channel = self._channels.get(notification.channel_id)
-        if not channel:
-            return
-
-        # Check rate limit
-        if channel.channel_id not in self._rate_counters:
-            self._rate_counters[channel.channel_id] = {}
-
-        hour_key = str(current_hour)
-        current_count = self._rate_counters[channel.channel_id].get(hour_key, 0)
-        if current_count >= channel.rate_limit:
-            return  # Rate limited, try later
-
-        try:
-            # Deliver via handler
-            handler = self._handlers.get(channel.channel_type)
-            if handler:
-                success = await handler(
-                    recipient=notification.recipient,
-                    subject=notification.subject,
-                    body=notification.body,
-                    config=channel.config,
-                )
-            else:
-                # Default: just mark as sent (no actual delivery)
-                success = True
-
-            now = time.time()
-
-            async with self._lock:
-                if success:
-                    updated = notification._replace(
-                        status="sent",
-                        sent_at=now,
-                    )
-                    self._rate_counters[channel.channel_id][hour_key] = current_count + 1
-                else:
-                    updated = notification._replace(
-                        status="failed",
-                        error="Delivery handler returned false",
-                    )
-
-                self._notifications[notification.notification_id] = updated
-
-        except Exception as e:
-            async with self._lock:
-                updated = notification._replace(
-                    status="failed",
-                    error=str(e),
-                )
-                self._notifications[notification.notification_id] = updated
-
-    async def set_user_preferences(
-        self,
-        user_id: str,
-        channel_preferences: Optional[Dict[str, bool]] = None,
-        quiet_hours: Optional[Tuple[int, int]] = None,
-        frequency_limit: Optional[Dict[str, int]] = None,
-        opt_outs: Optional[List[str]] = None,
-    ) -> NotificationPreference:
-        """
-        Set user notification preferences.
-
-        Args:
-            user_id: User identifier
-            channel_preferences: Enable/disable by channel type
-            quiet_hours: Quiet hours (start, end) in UTC
-            frequency_limit: Max notifications per type per day
-            opt_outs: Notification types to opt out of
-
-        Returns:
-            NotificationPreference instance
-        """
-        async with self._lock:
-            existing = self._preferences.get(user_id)
-
-            pref = NotificationPreference(
-                user_id=user_id,
-                channel_preferences=channel_preferences or (existing.channel_preferences if existing else {}),
-                quiet_hours=quiet_hours if quiet_hours is not None else (existing.quiet_hours if existing else None),
-                frequency_limit=frequency_limit or (existing.frequency_limit if existing else {}),
-                opt_outs=opt_outs or (existing.opt_outs if existing else []),
-            )
-
-            self._preferences[user_id] = pref
-
-        await self._persist_preference(pref)
-        return pref
-
-    async def _load_persisted_preferences(self) -> None:
-        """Load notification preferences from persistent learning storage."""
-        if self._preferences_loaded:
-            return
-
-        try:
-            try:
-                from backend.intelligence.learning_database import get_learning_database
-            except Exception:
-                from intelligence.learning_database import get_learning_database
-
-            learning_db = await get_learning_database(config={"enable_ml_features": False})
-            rows = await learning_db.get_preferences(
-                category="notification",
-                min_confidence=0.4,
-                limit=1000,
-            )
-
-            for row in rows:
-                key = str(row.get("key", ""))
-                if not key.endswith(".preferences"):
-                    continue
-                user_id = key[: -len(".preferences")]
-                if not user_id:
-                    continue
-
-                raw_value = row.get("value")
-                if not isinstance(raw_value, str) or not raw_value:
-                    continue
-
-                try:
-                    data = json.loads(raw_value)
-                except Exception:
-                    continue
-
-                quiet_hours_val = data.get("quiet_hours")
-                quiet_hours: Optional[Tuple[int, int]] = None
-                if (
-                    isinstance(quiet_hours_val, (list, tuple))
-                    and len(quiet_hours_val) == 2
-                ):
-                    try:
-                        quiet_hours = (
-                            int(quiet_hours_val[0]),
-                            int(quiet_hours_val[1]),
-                        )
-                    except Exception:
-                        quiet_hours = None
-
-                channel_preferences_raw = data.get("channel_preferences", {})
-                frequency_limit_raw = data.get("frequency_limit", {})
-                opt_outs_raw = data.get("opt_outs", [])
-
-                pref = NotificationPreference(
-                    user_id=user_id,
-                    channel_preferences=(
-                        dict(channel_preferences_raw)
-                        if isinstance(channel_preferences_raw, dict)
-                        else {}
-                    ),
-                    quiet_hours=quiet_hours,
-                    frequency_limit=(
-                        dict(frequency_limit_raw)
-                        if isinstance(frequency_limit_raw, dict)
-                        else {}
-                    ),
-                    opt_outs=list(opt_outs_raw) if isinstance(opt_outs_raw, list) else [],
-                )
-                self._preferences[user_id] = pref
-
-            self._preferences_loaded = True
-        except Exception:
-            # Preference persistence is best-effort and must not block startup.
-            pass
-
-    async def _persist_preference(self, pref: NotificationPreference) -> None:
-        """Persist a notification preference record to learning storage."""
-        try:
-            payload = {
-                "channel_preferences": pref.channel_preferences,
-                "quiet_hours": list(pref.quiet_hours) if pref.quiet_hours else None,
-                "frequency_limit": pref.frequency_limit,
-                "opt_outs": pref.opt_outs,
-            }
-
-            try:
-                from backend.intelligence.learning_database import get_learning_database
-            except Exception:
-                from intelligence.learning_database import get_learning_database
-
-            learning_db = await get_learning_database(config={"enable_ml_features": False})
-            await learning_db.learn_preference(
-                category="notification",
-                key=f"{pref.user_id}.preferences",
-                value=json.dumps(payload),
-                confidence=0.9,
-                learned_from="explicit",
-            )
-        except Exception:
-            # Best-effort persistence to avoid impacting notification flow.
-            pass
-
-    def get_notification(self, notification_id: str) -> Optional[Notification]:
-        """Get a notification by ID."""
-        return self._notifications.get(notification_id)
-
-    def get_channel(self, channel_id: str) -> Optional[NotificationChannel]:
-        """Get a channel by ID."""
-        return self._channels.get(channel_id)
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get notification hub statistics."""
-        status_counts = {"pending": 0, "sent": 0, "delivered": 0, "failed": 0}
-        for n in self._notifications.values():
-            status_counts[n.status] = status_counts.get(n.status, 0) + 1
-
-        return {
-            "total_channels": len(self._channels),
-            "active_channels": sum(1 for c in self._channels.values() if c.enabled),
-            "total_templates": len(self._templates),
-            "total_notifications": len(self._notifications),
-            "notification_status": status_counts,
-            "user_preferences": len(self._preferences),
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.5: Session Management
-# -----------------------------------------------------------------------------
-
-class Session(NamedTuple):
-    """User session."""
-    session_id: str
-    user_id: str
-    created_at: float
-    last_activity: float
-    expires_at: float
-    ip_address: Optional[str]
-    user_agent: Optional[str]
-    data: Dict[str, Any]
-    is_valid: bool
-
-class SessionStore(NamedTuple):
-    """Session store configuration."""
-    store_id: str
-    store_type: str  # memory, redis, database
-    config: Dict[str, Any]
-    default_ttl: float
-
-class SessionManager:
-    """
-    Distributed session management system.
-
-    Provides:
-    - Session creation and validation
-    - Automatic expiration
-    - Session data storage
-    - Multi-device session tracking
-    - Concurrent session limits
-    - Session hijacking protection
-    """
-
-    def __init__(
-        self,
-        default_ttl: float = 3600.0,
-        max_sessions_per_user: int = 5,
-    ) -> None:
-        self._sessions: Dict[str, Session] = {}
-        self._user_sessions: Dict[str, Set[str]] = {}  # user_id -> session_ids
-        self._default_ttl = default_ttl
-        self._max_sessions_per_user = max_sessions_per_user
-        self._lock = asyncio.Lock()
-        self._running = False
-        self._cleanup_task: Optional[asyncio.Task[None]] = None
-
-    async def initialize(self) -> bool:
-        """Initialize the session manager."""
-        self._running = True
-        self._cleanup_task = create_safe_task(self._cleanup_loop())
-        return True
-
-    async def cleanup(self) -> None:
-        """Cleanup session manager resources."""
-        self._running = False
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
-
-    async def create_session(
-        self,
-        user_id: str,
-        ip_address: Optional[str] = None,
-        user_agent: Optional[str] = None,
-        ttl: Optional[float] = None,
-        data: Optional[Dict[str, Any]] = None,
-    ) -> Session:
-        """
-        Create a new session.
-
-        Args:
-            user_id: User identifier
-            ip_address: Client IP address
-            user_agent: Client user agent
-            ttl: Session TTL (uses default if not specified)
-            data: Initial session data
-
-        Returns:
-            Session instance
-        """
-        async with self._lock:
-            # Check session limit and remove oldest if needed
-            user_session_ids = self._user_sessions.get(user_id, set())
-            if len(user_session_ids) >= self._max_sessions_per_user:
-                # Remove oldest session
-                oldest_session = min(
-                    (self._sessions[sid] for sid in user_session_ids if sid in self._sessions),
-                    key=lambda s: s.created_at,
-                    default=None,
-                )
-                if oldest_session:
-                    await self._invalidate_session_internal(oldest_session.session_id)
-
-            session_id = secrets.token_urlsafe(32)
-            now = time.time()
-            session_ttl = ttl or self._default_ttl
-
-            session = Session(
-                session_id=session_id,
-                user_id=user_id,
-                created_at=now,
-                last_activity=now,
-                expires_at=now + session_ttl,
-                ip_address=ip_address,
-                user_agent=user_agent,
-                data=data or {},
-                is_valid=True,
-            )
-
-            self._sessions[session_id] = session
-
-            if user_id not in self._user_sessions:
-                self._user_sessions[user_id] = set()
-            self._user_sessions[user_id].add(session_id)
-
-            return session
-
-    async def validate_session(
-        self,
-        session_id: str,
-        ip_address: Optional[str] = None,
-    ) -> Optional[Session]:
-        """
-        Validate and refresh a session.
-
-        Args:
-            session_id: Session identifier
-            ip_address: Current client IP (for hijacking detection)
-
-        Returns:
-            Session if valid, None otherwise
-        """
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if not session:
-                return None
-
-            now = time.time()
-
-            # Check expiration
-            if not session.is_valid or now > session.expires_at:
-                await self._invalidate_session_internal(session_id)
-                return None
-
-            # Check IP change (potential hijacking)
-            if ip_address and session.ip_address and ip_address != session.ip_address:
-                # Log security event but don't invalidate (could be mobile user)
-                pass
-
-            # Refresh session
-            updated = session._replace(
-                last_activity=now,
-                expires_at=now + self._default_ttl,
-            )
-            self._sessions[session_id] = updated
-
-            return updated
-
-    async def get_session_data(
-        self,
-        session_id: str,
-        key: Optional[str] = None,
-    ) -> Any:
-        """
-        Get session data.
-
-        Args:
-            session_id: Session identifier
-            key: Specific key to get (returns all data if None)
-
-        Returns:
-            Session data or specific value
-        """
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if not session or not session.is_valid:
-                return None
-
-            if key:
-                return session.data.get(key)
-            return dict(session.data)
-
-    async def set_session_data(
-        self,
-        session_id: str,
-        key: str,
-        value: Any,
-    ) -> bool:
-        """
-        Set session data.
-
-        Args:
-            session_id: Session identifier
-            key: Data key
-            value: Data value
-
-        Returns:
-            True if set successfully
-        """
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if not session or not session.is_valid:
-                return False
-
-            data = dict(session.data)
-            data[key] = value
-
-            updated = session._replace(
-                data=data,
-                last_activity=time.time(),
-            )
-            self._sessions[session_id] = updated
-
-            return True
-
-    async def invalidate_session(self, session_id: str) -> bool:
-        """
-        Invalidate a session.
-
-        Args:
-            session_id: Session identifier
-
-        Returns:
-            True if invalidated
-        """
-        async with self._lock:
-            return await self._invalidate_session_internal(session_id)
-
-    async def _invalidate_session_internal(self, session_id: str) -> bool:
-        """Internal session invalidation (must hold lock)."""
-        session = self._sessions.get(session_id)
-        if not session:
-            return False
-
-        # Remove from user sessions
-        if session.user_id in self._user_sessions:
-            self._user_sessions[session.user_id].discard(session_id)
-
-        # Mark as invalid
-        updated = session._replace(is_valid=False)
-        self._sessions[session_id] = updated
-
-        return True
-
-    async def invalidate_user_sessions(self, user_id: str) -> int:
-        """
-        Invalidate all sessions for a user.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            Number of sessions invalidated
-        """
-        async with self._lock:
-            session_ids = list(self._user_sessions.get(user_id, set()))
-            count = 0
-            for session_id in session_ids:
-                if await self._invalidate_session_internal(session_id):
-                    count += 1
-            return count
-
-    async def get_user_sessions(self, user_id: str) -> List[Session]:
-        """
-        Get all active sessions for a user.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            List of active sessions
-        """
-        async with self._lock:
-            session_ids = self._user_sessions.get(user_id, set())
-            return [
-                self._sessions[sid]
-                for sid in session_ids
-                if sid in self._sessions and self._sessions[sid].is_valid
-            ]
-
-    async def _cleanup_loop(self) -> None:
-        """Background loop to cleanup expired sessions."""
-        while self._running:
-            try:
-                await self._cleanup_expired()
-                await asyncio.sleep(60.0)  # Cleanup every minute
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(60.0)
-
-    async def _cleanup_expired(self) -> int:
-        """Cleanup expired sessions."""
-        now = time.time()
-        count = 0
-
-        async with self._lock:
-            expired_ids = [
-                sid for sid, session in self._sessions.items()
-                if now > session.expires_at or not session.is_valid
-            ]
-
-            for session_id in expired_ids:
-                if await self._invalidate_session_internal(session_id):
-                    del self._sessions[session_id]
-                    count += 1
-
-        return count
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get session manager statistics."""
-        valid_sessions = sum(1 for s in self._sessions.values() if s.is_valid)
-        return {
-            "total_sessions": len(self._sessions),
-            "valid_sessions": valid_sessions,
-            "invalid_sessions": len(self._sessions) - valid_sessions,
-            "unique_users": len(self._user_sessions),
-            "default_ttl": self._default_ttl,
-            "max_sessions_per_user": self._max_sessions_per_user,
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.6: Data Lake Manager
-# -----------------------------------------------------------------------------
-
-class DataPartition(NamedTuple):
-    """Data partition metadata."""
-    partition_id: str
-    dataset_id: str
-    partition_key: str  # e.g., "date=2026-01-31"
-    storage_path: str
-    file_format: str  # parquet, json, csv, avro
-    size_bytes: int
-    row_count: int
-    created_at: float
-    metadata: Dict[str, Any]
-
-class Dataset(NamedTuple):
-    """Data lake dataset."""
-    dataset_id: str
-    name: str
-    description: str
-    schema: Dict[str, Any]  # Column definitions
-    partition_columns: List[str]
-    storage_location: str
-    file_format: str
-    partitions: Dict[str, DataPartition]
-    retention_days: Optional[int]
-    created_at: float
-    updated_at: float
-    owner: str
-    tags: List[str]
-
-class DataCatalogEntry(NamedTuple):
-    """Data catalog entry for discovery."""
-    entry_id: str
-    dataset_id: str
-    name: str
-    description: str
-    schema_summary: str
-    tags: List[str]
-    lineage: List[str]  # Source dataset IDs
-    quality_score: float
-    last_updated: float
-
-class DataLakeManager:
-    """
-    Large-scale data lake management system.
-
-    Provides:
-    - Dataset registration and discovery
-    - Partitioned data storage
-    - Schema evolution
-    - Data lineage tracking
-    - Data quality monitoring
-    - Retention policy enforcement
-    - Query optimization hints
-    """
-
-    def __init__(self, storage_root: Optional[str] = None) -> None:
-        self._storage_root = storage_root or "/tmp/data_lake"
-        self._datasets: Dict[str, Dataset] = {}
-        self._catalog: Dict[str, DataCatalogEntry] = {}
-        self._lock = asyncio.Lock()
-        self._running = False
-        self._retention_task: Optional[asyncio.Task[None]] = None
-
-    async def initialize(self) -> bool:
-        """Initialize the data lake manager."""
-        self._running = True
-        self._retention_task = create_safe_task(self._retention_loop())
-        return True
-
-    async def cleanup(self) -> None:
-        """Cleanup data lake manager resources."""
-        self._running = False
-        if self._retention_task:
-            self._retention_task.cancel()
-            try:
-                await self._retention_task
-            except asyncio.CancelledError:
-                pass
-
-    async def register_dataset(
-        self,
-        name: str,
-        schema: Dict[str, Any],
-        partition_columns: Optional[List[str]] = None,
-        file_format: str = "parquet",
-        description: str = "",
-        retention_days: Optional[int] = None,
-        owner: str = "system",
-        tags: Optional[List[str]] = None,
-    ) -> Dataset:
-        """
-        Register a new dataset.
-
-        Args:
-            name: Dataset name
-            schema: Column schema definition
-            partition_columns: Columns to partition by
-            file_format: Storage format
-            description: Dataset description
-            retention_days: Data retention period
-            owner: Dataset owner
-            tags: Dataset tags
-
-        Returns:
-            Dataset instance
-        """
-        async with self._lock:
-            dataset_id = f"ds_{hashlib.sha256(f'{name}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            storage_location = f"{self._storage_root}/{dataset_id}"
-
-            dataset = Dataset(
-                dataset_id=dataset_id,
-                name=name,
-                description=description,
-                schema=schema,
-                partition_columns=partition_columns or [],
-                storage_location=storage_location,
-                file_format=file_format,
-                partitions={},
-                retention_days=retention_days,
-                created_at=now,
-                updated_at=now,
-                owner=owner,
-                tags=tags or [],
-            )
-
-            self._datasets[dataset_id] = dataset
-
-            # Create catalog entry
-            catalog_entry = DataCatalogEntry(
-                entry_id=f"cat_{dataset_id}",
-                dataset_id=dataset_id,
-                name=name,
-                description=description,
-                schema_summary=self._summarize_schema(schema),
-                tags=tags or [],
-                lineage=[],
-                quality_score=1.0,
-                last_updated=now,
-            )
-            self._catalog[dataset_id] = catalog_entry
-
-            return dataset
-
-    def _summarize_schema(self, schema: Dict[str, Any]) -> str:
-        """Create a summary of the schema."""
-        columns = schema.get("columns", [])
-        if isinstance(columns, list):
-            return f"{len(columns)} columns"
-        return f"{len(columns)} fields"
-
-    async def add_partition(
-        self,
-        dataset_id: str,
-        partition_key: str,
-        data_size: int = 0,
-        row_count: int = 0,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[DataPartition]:
-        """
-        Add a data partition to a dataset.
-
-        Args:
-            dataset_id: Dataset identifier
-            partition_key: Partition key (e.g., "date=2026-01-31")
-            data_size: Size in bytes
-            row_count: Number of rows
-            metadata: Partition metadata
-
-        Returns:
-            DataPartition if added successfully
-        """
-        async with self._lock:
-            dataset = self._datasets.get(dataset_id)
-            if not dataset:
-                return None
-
-            partition_id = f"part_{hashlib.sha256(f'{dataset_id}:{partition_key}:{time.time()}'.encode()).hexdigest()[:12]}"
-            storage_path = f"{dataset.storage_location}/{partition_key}"
-
-            partition = DataPartition(
-                partition_id=partition_id,
-                dataset_id=dataset_id,
-                partition_key=partition_key,
-                storage_path=storage_path,
-                file_format=dataset.file_format,
-                size_bytes=data_size,
-                row_count=row_count,
-                created_at=time.time(),
-                metadata=metadata or {},
-            )
-
-            partitions = dict(dataset.partitions)
-            partitions[partition_key] = partition
-
-            updated = dataset._replace(
-                partitions=partitions,
-                updated_at=time.time(),
-            )
-            self._datasets[dataset_id] = updated
-
-            # Update catalog
-            if dataset_id in self._catalog:
-                cat_entry = self._catalog[dataset_id]
-                self._catalog[dataset_id] = cat_entry._replace(last_updated=time.time())
-
-            return partition
-
-    async def evolve_schema(
-        self,
-        dataset_id: str,
-        new_columns: Dict[str, Any],
-        removed_columns: Optional[List[str]] = None,
-    ) -> bool:
-        """
-        Evolve a dataset's schema.
-
-        Args:
-            dataset_id: Dataset identifier
-            new_columns: New columns to add
-            removed_columns: Columns to mark as deprecated
-
-        Returns:
-            True if schema evolved successfully
-        """
-        async with self._lock:
-            dataset = self._datasets.get(dataset_id)
-            if not dataset:
-                return False
-
-            schema = dict(dataset.schema)
-            columns = list(schema.get("columns", []))
-
-            # Add new columns
-            for col_name, col_def in new_columns.items():
-                columns.append({"name": col_name, **col_def})
-
-            # Mark removed columns as deprecated
-            if removed_columns:
-                for col in columns:
-                    if col.get("name") in removed_columns:
-                        col["deprecated"] = True
-
-            schema["columns"] = columns
-            schema["version"] = schema.get("version", 0) + 1
-
-            updated = dataset._replace(
-                schema=schema,
-                updated_at=time.time(),
-            )
-            self._datasets[dataset_id] = updated
-
-            return True
-
-    async def set_lineage(
-        self,
-        dataset_id: str,
-        source_dataset_ids: List[str],
-    ) -> bool:
-        """
-        Set data lineage for a dataset.
-
-        Args:
-            dataset_id: Target dataset
-            source_dataset_ids: Source dataset IDs
-
-        Returns:
-            True if lineage set successfully
-        """
-        async with self._lock:
-            if dataset_id not in self._catalog:
-                return False
-
-            entry = self._catalog[dataset_id]
-            self._catalog[dataset_id] = entry._replace(
-                lineage=source_dataset_ids,
-                last_updated=time.time(),
-            )
-            return True
-
-    async def search_datasets(
-        self,
-        query: Optional[str] = None,
-        tags: Optional[List[str]] = None,
-        owner: Optional[str] = None,
-        limit: int = 50,
-    ) -> List[DataCatalogEntry]:
-        """
-        Search for datasets in the catalog.
-
-        Args:
-            query: Text search query
-            tags: Filter by tags
-            owner: Filter by owner
-            limit: Maximum results
-
-        Returns:
-            List of matching catalog entries
-        """
-        async with self._lock:
-            results = []
-            query_lower = query.lower() if query else None
-
-            for entry in self._catalog.values():
-                # Text search
-                if query_lower:
-                    if (query_lower not in entry.name.lower() and
-                        query_lower not in entry.description.lower()):
-                        continue
-
-                # Tag filter
-                if tags and not all(t in entry.tags for t in tags):
-                    continue
-
-                # Owner filter
-                dataset = self._datasets.get(entry.dataset_id)
-                if owner and dataset and dataset.owner != owner:
-                    continue
-
-                results.append(entry)
-                if len(results) >= limit:
-                    break
-
-            return results
-
-    async def get_dataset(self, dataset_id: str) -> Optional[Dataset]:
-        """Get a dataset by ID."""
-        return self._datasets.get(dataset_id)
-
-    async def get_partitions(
-        self,
-        dataset_id: str,
-        partition_filter: Optional[Dict[str, str]] = None,
-    ) -> List[DataPartition]:
-        """
-        Get partitions for a dataset.
-
-        Args:
-            dataset_id: Dataset identifier
-            partition_filter: Filter by partition values
-
-        Returns:
-            List of matching partitions
-        """
-        async with self._lock:
-            dataset = self._datasets.get(dataset_id)
-            if not dataset:
-                return []
-
-            partitions = list(dataset.partitions.values())
-
-            if partition_filter:
-                filtered = []
-                for p in partitions:
-                    match = True
-                    for key, value in partition_filter.items():
-                        expected = f"{key}={value}"
-                        if expected not in p.partition_key:
-                            match = False
-                            break
-                    if match:
-                        filtered.append(p)
-                return filtered
-
-            return partitions
-
-    async def _retention_loop(self) -> None:
-        """Background loop to enforce retention policies."""
-        while self._running:
-            try:
-                await self._enforce_retention()
-                await asyncio.sleep(3600.0)  # Check hourly
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(3600.0)
-
-    async def _enforce_retention(self) -> int:
-        """Enforce data retention policies."""
-        now = time.time()
-        deleted_count = 0
-
-        async with self._lock:
-            for dataset in self._datasets.values():
-                if not dataset.retention_days:
-                    continue
-
-                retention_threshold = now - (dataset.retention_days * 86400)
-
-                partitions_to_delete = [
-                    key for key, partition in dataset.partitions.items()
-                    if partition.created_at < retention_threshold
-                ]
-
-                if partitions_to_delete:
-                    partitions = dict(dataset.partitions)
-                    for key in partitions_to_delete:
-                        del partitions[key]
-                        deleted_count += 1
-
-                    updated = dataset._replace(partitions=partitions)
-                    self._datasets[dataset.dataset_id] = updated
-
-        return deleted_count
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get data lake statistics."""
-        total_size = sum(
-            sum(p.size_bytes for p in ds.partitions.values())
-            for ds in self._datasets.values()
-        )
-        total_rows = sum(
-            sum(p.row_count for p in ds.partitions.values())
-            for ds in self._datasets.values()
-        )
-        total_partitions = sum(len(ds.partitions) for ds in self._datasets.values())
-
-        return {
-            "total_datasets": len(self._datasets),
-            "total_partitions": total_partitions,
-            "total_size_bytes": total_size,
-            "total_rows": total_rows,
-            "catalog_entries": len(self._catalog),
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.7: Streaming Analytics Engine
-# -----------------------------------------------------------------------------
-
-class StreamWindow(NamedTuple):
-    """Streaming window specification."""
-    window_type: str  # tumbling, sliding, session
-    duration_seconds: float
-    slide_seconds: Optional[float]  # For sliding windows
-    gap_seconds: Optional[float]  # For session windows
-
-class StreamAggregation(NamedTuple):
-    """Stream aggregation specification."""
-    aggregation_id: str
-    stream_id: str
-    window: StreamWindow
-    group_by: List[str]
-    aggregations: Dict[str, str]  # output_field -> agg_expression
-    filter_expr: Optional[str]
-
-class StreamEvent(NamedTuple):
-    """Streaming event."""
-    event_id: str
-    stream_id: str
-    timestamp: float
-    event_type: str
-    data: Dict[str, Any]
-    partition_key: Optional[str]
-
-class StreamState(NamedTuple):
-    """Stateful stream processing state."""
-    state_id: str
-    aggregation_id: str
-    window_start: float
-    window_end: float
-    group_key: str
-    values: Dict[str, Any]
-    count: int
-
-class StreamingAnalyticsEngine:
-    """
-    Real-time streaming analytics engine.
-
-    Provides:
-    - Windowed aggregations (tumbling, sliding, session)
-    - Stream joins
-    - Pattern detection
-    - Stateful processing
-    - Exactly-once semantics
-    - Late event handling
-    """
-
-    def __init__(self, max_lateness_seconds: float = 60.0) -> None:
-        self._streams: Dict[str, List[StreamEvent]] = {}
-        self._aggregations: Dict[str, StreamAggregation] = {}
-        self._state: Dict[str, Dict[str, StreamState]] = {}  # agg_id -> {group_key -> state}
-        self._max_lateness = max_lateness_seconds
-        self._watermarks: Dict[str, float] = {}  # stream_id -> watermark timestamp
-        self._lock = asyncio.Lock()
-        self._running = False
-        self._process_task: Optional[asyncio.Task[None]] = None
-        self._output_handlers: Dict[str, Callable[[str, Dict[str, Any]], Awaitable[None]]] = {}
-
-    async def initialize(self) -> bool:
-        """Initialize the streaming engine."""
-        self._running = True
-        self._process_task = create_safe_task(self._processing_loop())
-        return True
-
-    async def cleanup(self) -> None:
-        """Cleanup streaming engine resources."""
-        self._running = False
-        if self._process_task:
-            self._process_task.cancel()
-            try:
-                await self._process_task
-            except asyncio.CancelledError:
-                pass
-
-    def register_output_handler(
-        self,
-        aggregation_id: str,
-        handler: Callable[[str, Dict[str, Any]], Awaitable[None]],
-    ) -> None:
-        """Register an output handler for aggregation results."""
-        self._output_handlers[aggregation_id] = handler
-
-    async def create_stream(self, stream_id: str) -> bool:
-        """Create a new stream."""
-        async with self._lock:
-            if stream_id in self._streams:
-                return False
-            self._streams[stream_id] = []
-            self._watermarks[stream_id] = 0.0
-            return True
-
-    async def register_aggregation(
-        self,
-        stream_id: str,
-        window_type: str = "tumbling",
-        window_duration: float = 60.0,
-        slide_duration: Optional[float] = None,
-        group_by: Optional[List[str]] = None,
-        aggregations: Optional[Dict[str, str]] = None,
-        filter_expr: Optional[str] = None,
-    ) -> StreamAggregation:
-        """
-        Register a stream aggregation.
-
-        Args:
-            stream_id: Source stream ID
-            window_type: Window type (tumbling, sliding, session)
-            window_duration: Window duration in seconds
-            slide_duration: Slide duration for sliding windows
-            group_by: Fields to group by
-            aggregations: Aggregation expressions
-            filter_expr: Filter expression
-
-        Returns:
-            StreamAggregation instance
-        """
-        async with self._lock:
-            aggregation_id = f"agg_{hashlib.sha256(f'{stream_id}:{time.time()}'.encode()).hexdigest()[:12]}"
-
-            window = StreamWindow(
-                window_type=window_type,
-                duration_seconds=window_duration,
-                slide_seconds=slide_duration,
-                gap_seconds=None,
-            )
-
-            aggregation = StreamAggregation(
-                aggregation_id=aggregation_id,
-                stream_id=stream_id,
-                window=window,
-                group_by=group_by or [],
-                aggregations=aggregations or {"count": "count(*)"},
-                filter_expr=filter_expr,
-            )
-
-            self._aggregations[aggregation_id] = aggregation
-            self._state[aggregation_id] = {}
-
-            return aggregation
-
-    async def ingest_event(
-        self,
-        stream_id: str,
-        event_type: str,
-        data: Dict[str, Any],
-        timestamp: Optional[float] = None,
-        partition_key: Optional[str] = None,
-    ) -> Optional[StreamEvent]:
-        """
-        Ingest an event into a stream.
-
-        Args:
-            stream_id: Target stream
-            event_type: Event type
-            data: Event data
-            timestamp: Event timestamp (uses current time if not specified)
-            partition_key: Partition key for routing
-
-        Returns:
-            StreamEvent if ingested successfully
-        """
-        async with self._lock:
-            if stream_id not in self._streams:
-                return None
-
-            event_timestamp = timestamp or time.time()
-            event_id = f"evt_{hashlib.sha256(f'{stream_id}:{event_timestamp}:{random.random()}'.encode()).hexdigest()[:12]}"
-
-            event = StreamEvent(
-                event_id=event_id,
-                stream_id=stream_id,
-                timestamp=event_timestamp,
-                event_type=event_type,
-                data=data,
-                partition_key=partition_key,
-            )
-
-            self._streams[stream_id].append(event)
-
-            # Update watermark
-            if event_timestamp > self._watermarks.get(stream_id, 0.0):
-                self._watermarks[stream_id] = event_timestamp
-
-            return event
-
-    async def _processing_loop(self) -> None:
-        """Background loop for stream processing."""
-        while self._running:
-            try:
-                await self._process_windows()
-                await asyncio.sleep(1.0)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                await asyncio.sleep(1.0)
-
-    async def _process_windows(self) -> None:
-        """Process windows and emit aggregation results."""
-        now = time.time()
-
-        async with self._lock:
-            for agg_id, aggregation in self._aggregations.items():
-                stream_events = self._streams.get(aggregation.stream_id, [])
-                if not stream_events:
-                    continue
-
-                watermark = self._watermarks.get(aggregation.stream_id, 0.0)
-                window = aggregation.window
-
-                # Process events into windows
-                for event in stream_events:
-                    # Check if event is too late
-                    if event.timestamp < watermark - self._max_lateness:
-                        continue
-
-                    # Determine window boundaries
-                    if window.window_type == "tumbling":
-                        window_start = (event.timestamp // window.duration_seconds) * window.duration_seconds
-                        window_end = window_start + window.duration_seconds
-                    else:
-                        window_start = event.timestamp
-                        window_end = window_start + window.duration_seconds
-
-                    # Create group key
-                    group_values = [str(event.data.get(f, "")) for f in aggregation.group_by]
-                    group_key = ":".join(group_values) if group_values else "__all__"
-                    state_key = f"{window_start}:{group_key}"
-
-                    # Update state
-                    state = self._state[agg_id].get(state_key)
-                    if not state:
-                        state = StreamState(
-                            state_id=f"state_{agg_id}_{state_key}",
-                            aggregation_id=agg_id,
-                            window_start=window_start,
-                            window_end=window_end,
-                            group_key=group_key,
-                            values={},
-                            count=0,
-                        )
-
-                    # Apply aggregations
-                    values = dict(state.values)
-                    for output_field, agg_expr in aggregation.aggregations.items():
-                        if agg_expr == "count(*)":
-                            values[output_field] = values.get(output_field, 0) + 1
-                        elif agg_expr.startswith("sum("):
-                            field_name = agg_expr[4:-1]
-                            values[output_field] = values.get(output_field, 0) + event.data.get(field_name, 0)
-                        elif agg_expr.startswith("max("):
-                            field_name = agg_expr[4:-1]
-                            current = values.get(output_field)
-                            new_val = event.data.get(field_name)
-                            if current is None or (new_val is not None and new_val > current):
-                                values[output_field] = new_val
-                        elif agg_expr.startswith("min("):
-                            field_name = agg_expr[4:-1]
-                            current = values.get(output_field)
-                            new_val = event.data.get(field_name)
-                            if current is None or (new_val is not None and new_val < current):
-                                values[output_field] = new_val
-
-                    updated_state = state._replace(
-                        values=values,
-                        count=state.count + 1,
-                    )
-                    self._state[agg_id][state_key] = updated_state
-
-                # Emit closed windows
-                closed_windows = [
-                    (key, state) for key, state in self._state[agg_id].items()
-                    if state.window_end <= watermark - self._max_lateness
-                ]
-
-                for key, state in closed_windows:
-                    # Emit result
-                    handler = self._output_handlers.get(agg_id)
-                    if handler:
-                        result = {
-                            "window_start": state.window_start,
-                            "window_end": state.window_end,
-                            "group_key": state.group_key,
-                            "count": state.count,
-                            **state.values,
-                        }
-                        try:
-                            await handler(agg_id, result)
-                        except Exception:
-                            pass
-
-                    # Clean up state
-                    del self._state[agg_id][key]
-
-                # Clean up old events
-                self._streams[aggregation.stream_id] = [
-                    e for e in stream_events
-                    if e.timestamp >= watermark - self._max_lateness - 60
-                ]
-
-    async def get_current_state(
-        self,
-        aggregation_id: str,
-        group_key: Optional[str] = None,
-    ) -> List[StreamState]:
-        """
-        Get current aggregation state.
-
-        Args:
-            aggregation_id: Aggregation identifier
-            group_key: Optional filter by group key
-
-        Returns:
-            List of current state entries
-        """
-        async with self._lock:
-            states = list(self._state.get(aggregation_id, {}).values())
-            if group_key:
-                states = [s for s in states if s.group_key == group_key]
-            return states
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get streaming engine statistics."""
-        total_events = sum(len(events) for events in self._streams.values())
-        total_state = sum(len(states) for states in self._state.values())
-
-        return {
-            "total_streams": len(self._streams),
-            "total_aggregations": len(self._aggregations),
-            "buffered_events": total_events,
-            "active_state_entries": total_state,
-            "registered_handlers": len(self._output_handlers),
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.8: Consent Management System
-# -----------------------------------------------------------------------------
-
-class ConsentPurpose(NamedTuple):
-    """Consent purpose definition."""
-    purpose_id: str
-    name: str
-    description: str
-    legal_basis: str  # consent, contract, legal_obligation, legitimate_interest
-    data_categories: List[str]
-    retention_days: int
-    third_party_sharing: bool
-    required: bool  # Required for service
-    created_at: float
-
-class ConsentRecord(NamedTuple):
-    """Individual consent record."""
-    consent_id: str
-    user_id: str
-    purpose_id: str
-    granted: bool
-    timestamp: float
-    method: str  # explicit, implicit, withdrawal
-    version: str  # Consent policy version
-    ip_address: Optional[str]
-    user_agent: Optional[str]
-    proof: Optional[str]  # Signature or token
-
-class DataSubjectRequest(NamedTuple):
-    """GDPR data subject request."""
-    request_id: str
-    user_id: str
-    request_type: str  # access, rectification, erasure, portability, restriction
-    status: str  # pending, processing, completed, rejected
-    created_at: float
-    due_date: float
-    completed_at: Optional[float]
-    notes: str
-    data_delivered: Optional[str]
-
-class ConsentManagementSystem:
-    """
-    GDPR-compliant consent management system.
-
-    Provides:
-    - Consent collection and tracking
-    - Purpose-based consent management
-    - Data subject rights handling
-    - Consent proof and audit trail
-    - Preference center support
-    - Third-party consent sharing
-    """
-
-    def __init__(self, dsr_response_days: int = 30) -> None:
-        self._purposes: Dict[str, ConsentPurpose] = {}
-        self._consents: Dict[str, List[ConsentRecord]] = {}  # user_id -> [records]
-        self._requests: Dict[str, DataSubjectRequest] = {}
-        self._policy_version = "1.0"
-        self._dsr_response_days = dsr_response_days
-        self._lock = asyncio.Lock()
-
-    async def initialize(self) -> bool:
-        """Initialize the consent management system."""
-        return True
-
-    async def define_purpose(
-        self,
-        name: str,
-        description: str,
-        legal_basis: str = "consent",
-        data_categories: Optional[List[str]] = None,
-        retention_days: int = 365,
-        third_party_sharing: bool = False,
-        required: bool = False,
-    ) -> ConsentPurpose:
-        """
-        Define a consent purpose.
-
-        Args:
-            name: Purpose name
-            description: Purpose description
-            legal_basis: Legal basis for processing
-            data_categories: Categories of data processed
-            retention_days: Data retention period
-            third_party_sharing: Whether data is shared with third parties
-            required: Whether consent is required for service
-
-        Returns:
-            ConsentPurpose instance
-        """
-        async with self._lock:
-            purpose_id = f"purpose_{hashlib.sha256(f'{name}:{time.time()}'.encode()).hexdigest()[:12]}"
-
-            purpose = ConsentPurpose(
-                purpose_id=purpose_id,
-                name=name,
-                description=description,
-                legal_basis=legal_basis,
-                data_categories=data_categories or [],
-                retention_days=retention_days,
-                third_party_sharing=third_party_sharing,
-                required=required,
-                created_at=time.time(),
-            )
-
-            self._purposes[purpose_id] = purpose
-            return purpose
-
-    async def record_consent(
-        self,
-        user_id: str,
-        purpose_id: str,
-        granted: bool,
-        method: str = "explicit",
-        ip_address: Optional[str] = None,
-        user_agent: Optional[str] = None,
-        proof: Optional[str] = None,
-    ) -> Optional[ConsentRecord]:
-        """
-        Record a consent decision.
-
-        Args:
-            user_id: User identifier
-            purpose_id: Purpose identifier
-            granted: Whether consent was granted
-            method: Consent collection method
-            ip_address: Client IP address
-            user_agent: Client user agent
-            proof: Consent proof (signature, etc.)
-
-        Returns:
-            ConsentRecord if recorded successfully
-        """
-        async with self._lock:
-            if purpose_id not in self._purposes:
-                return None
-
-            consent_id = f"consent_{hashlib.sha256(f'{user_id}:{purpose_id}:{time.time()}'.encode()).hexdigest()[:16]}"
-
-            record = ConsentRecord(
-                consent_id=consent_id,
-                user_id=user_id,
-                purpose_id=purpose_id,
-                granted=granted,
-                timestamp=time.time(),
-                method=method,
-                version=self._policy_version,
-                ip_address=ip_address,
-                user_agent=user_agent,
-                proof=proof,
-            )
-
-            if user_id not in self._consents:
-                self._consents[user_id] = []
-            self._consents[user_id].append(record)
-
-            return record
-
-    async def check_consent(
-        self,
-        user_id: str,
-        purpose_id: str,
-    ) -> Tuple[bool, Optional[ConsentRecord]]:
-        """
-        Check if user has granted consent for a purpose.
-
-        Args:
-            user_id: User identifier
-            purpose_id: Purpose identifier
-
-        Returns:
-            Tuple of (has_consent, latest_record)
-        """
-        async with self._lock:
-            records = self._consents.get(user_id, [])
-
-            # Find latest record for this purpose
-            relevant = [r for r in records if r.purpose_id == purpose_id]
-            if not relevant:
-                return False, None
-
-            latest = max(relevant, key=lambda r: r.timestamp)
-            return latest.granted, latest
-
-    async def withdraw_consent(
-        self,
-        user_id: str,
-        purpose_id: str,
-        ip_address: Optional[str] = None,
-    ) -> Optional[ConsentRecord]:
-        """
-        Withdraw consent for a purpose.
-
-        Args:
-            user_id: User identifier
-            purpose_id: Purpose identifier
-            ip_address: Client IP address
-
-        Returns:
-            ConsentRecord for the withdrawal
-        """
-        return await self.record_consent(
-            user_id=user_id,
-            purpose_id=purpose_id,
-            granted=False,
-            method="withdrawal",
-            ip_address=ip_address,
-        )
-
-    async def get_user_consents(
-        self,
-        user_id: str,
-    ) -> Dict[str, bool]:
-        """
-        Get all current consent states for a user.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            Dict mapping purpose_id to consent state
-        """
-        async with self._lock:
-            records = self._consents.get(user_id, [])
-
-            # Get latest state for each purpose
-            latest_by_purpose: Dict[str, ConsentRecord] = {}
-            for record in records:
-                existing = latest_by_purpose.get(record.purpose_id)
-                if not existing or record.timestamp > existing.timestamp:
-                    latest_by_purpose[record.purpose_id] = record
-
-            return {
-                purpose_id: record.granted
-                for purpose_id, record in latest_by_purpose.items()
-            }
-
-    async def submit_data_request(
-        self,
-        user_id: str,
-        request_type: str,
-        notes: str = "",
-    ) -> DataSubjectRequest:
-        """
-        Submit a data subject request.
-
-        Args:
-            user_id: User identifier
-            request_type: Request type (access, erasure, etc.)
-            notes: Additional notes
-
-        Returns:
-            DataSubjectRequest instance
-        """
-        async with self._lock:
-            request_id = f"dsr_{hashlib.sha256(f'{user_id}:{request_type}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            request = DataSubjectRequest(
-                request_id=request_id,
-                user_id=user_id,
-                request_type=request_type,
-                status="pending",
-                created_at=now,
-                due_date=now + (self._dsr_response_days * 86400),
-                completed_at=None,
-                notes=notes,
-                data_delivered=None,
-            )
-
-            self._requests[request_id] = request
-            return request
-
-    async def process_data_request(
-        self,
-        request_id: str,
-        status: str = "processing",
-        data_delivered: Optional[str] = None,
-    ) -> Optional[DataSubjectRequest]:
-        """
-        Update a data subject request.
-
-        Args:
-            request_id: Request identifier
-            status: New status
-            data_delivered: Data package location (for access requests)
-
-        Returns:
-            Updated DataSubjectRequest
-        """
-        async with self._lock:
-            request = self._requests.get(request_id)
-            if not request:
-                return None
-
-            completed_at = time.time() if status == "completed" else None
-
-            updated = request._replace(
-                status=status,
-                completed_at=completed_at,
-                data_delivered=data_delivered,
-            )
-            self._requests[request_id] = updated
-
-            return updated
-
-    async def erase_user_data(self, user_id: str) -> bool:
-        """
-        Execute right to erasure for a user.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            True if erased successfully
-        """
-        async with self._lock:
-            # Remove consent records (keep audit trail showing erasure)
-            if user_id in self._consents:
-                # In production, would anonymize rather than delete
-                del self._consents[user_id]
-
-            return True
-
-    async def export_user_data(self, user_id: str) -> Dict[str, Any]:
-        """
-        Export all user data for portability.
-
-        Args:
-            user_id: User identifier
-
-        Returns:
-            Dict containing all user data
-        """
-        async with self._lock:
-            return {
-                "user_id": user_id,
-                "export_date": time.time(),
-                "consents": [
-                    {
-                        "purpose": r.purpose_id,
-                        "granted": r.granted,
-                        "timestamp": r.timestamp,
-                        "method": r.method,
-                    }
-                    for r in self._consents.get(user_id, [])
-                ],
-                "data_requests": [
-                    {
-                        "request_id": r.request_id,
-                        "type": r.request_type,
-                        "status": r.status,
-                        "created_at": r.created_at,
-                    }
-                    for r in self._requests.values()
-                    if r.user_id == user_id
-                ],
-            }
-
-    def get_purpose(self, purpose_id: str) -> Optional[ConsentPurpose]:
-        """Get a consent purpose by ID."""
-        return self._purposes.get(purpose_id)
-
-    def get_data_request(self, request_id: str) -> Optional[DataSubjectRequest]:
-        """Get a data subject request by ID."""
-        return self._requests.get(request_id)
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get consent management statistics."""
-        total_users = len(self._consents)
-        total_consents = sum(len(records) for records in self._consents.values())
-
-        request_status = {"pending": 0, "processing": 0, "completed": 0, "rejected": 0}
-        for r in self._requests.values():
-            request_status[r.status] = request_status.get(r.status, 0) + 1
-
-        return {
-            "total_purposes": len(self._purposes),
-            "total_users_with_consent": total_users,
-            "total_consent_records": total_consents,
-            "total_data_requests": len(self._requests),
-            "request_status": request_status,
-            "policy_version": self._policy_version,
-        }
-
-# -----------------------------------------------------------------------------
-# 4.19.9: Digital Signature Service
-# -----------------------------------------------------------------------------
-
-class SignatureAlgorithm(NamedTuple):
-    """Signature algorithm specification."""
-    algorithm_id: str
-    name: str
-    hash_algorithm: str
-    key_type: str
-    key_size: int
-
-class SigningKey(NamedTuple):
-    """Signing key."""
-    key_id: str
-    key_type: str
-    public_key: str
-    private_key_ref: str  # Reference to secure storage
-    algorithm: str
-    created_at: float
-    expires_at: Optional[float]
-    owner: str
-    status: str  # active, revoked, expired
-
-class DigitalSignature(NamedTuple):
-    """Digital signature record."""
-    signature_id: str
-    document_hash: str
-    signer_id: str
-    key_id: str
-    algorithm: str
-    signature_value: str
-    timestamp: float
-    certificate_chain: Optional[List[str]]
-    metadata: Dict[str, Any]
-
-class SignatureVerification(NamedTuple):
-    """Signature verification result."""
-    is_valid: bool
-    signature_id: str
-    signer_id: str
-    timestamp: float
-    algorithm: str
-    reason: str
-
-class DigitalSignatureService:
-    """
-    Digital signature service for document signing.
-
-    Provides:
-    - Key pair generation and management
-    - Document signing
-    - Signature verification
-    - Timestamp authority integration
-    - Certificate chain validation
-    - Multi-signature support
-    """
-
-    def __init__(self) -> None:
-        self._keys: Dict[str, SigningKey] = {}
-        self._signatures: Dict[str, DigitalSignature] = {}
-        self._algorithms = {
-            "RSA-SHA256": SignatureAlgorithm(
-                algorithm_id="RSA-SHA256",
-                name="RSA with SHA-256",
-                hash_algorithm="sha256",
-                key_type="rsa",
-                key_size=2048,
-            ),
-            "RSA-SHA512": SignatureAlgorithm(
-                algorithm_id="RSA-SHA512",
-                name="RSA with SHA-512",
-                hash_algorithm="sha512",
-                key_type="rsa",
-                key_size=4096,
-            ),
-            "ECDSA-SHA256": SignatureAlgorithm(
-                algorithm_id="ECDSA-SHA256",
-                name="ECDSA with SHA-256",
-                hash_algorithm="sha256",
-                key_type="ec",
-                key_size=256,
-            ),
-        }
-        self._lock = asyncio.Lock()
-
-    async def initialize(self) -> bool:
-        """Initialize the signature service."""
-        return True
-
-    async def generate_key_pair(
-        self,
-        owner: str,
-        algorithm: str = "RSA-SHA256",
-        expires_in_days: Optional[int] = None,
-    ) -> Optional[SigningKey]:
-        """
-        Generate a new signing key pair.
-
-        Args:
-            owner: Key owner identifier
-            algorithm: Signing algorithm
-            expires_in_days: Key expiration period
-
-        Returns:
-            SigningKey if generated successfully
-        """
-        async with self._lock:
-            algo = self._algorithms.get(algorithm)
-            if not algo:
-                return None
-
-            key_id = f"key_{hashlib.sha256(f'{owner}:{algorithm}:{time.time()}'.encode()).hexdigest()[:16]}"
-            now = time.time()
-
-            # Generate key material (simplified - in production use proper crypto)
-            private_key_ref = f"keystore://{key_id}/private"
-            public_key = f"-----BEGIN PUBLIC KEY-----\nMIIB...{key_id}...AQAB\n-----END PUBLIC KEY-----"
-
-            key = SigningKey(
-                key_id=key_id,
-                key_type=algo.key_type,
-                public_key=public_key,
-                private_key_ref=private_key_ref,
-                algorithm=algorithm,
-                created_at=now,
-                expires_at=now + (expires_in_days * 86400) if expires_in_days else None,
-                owner=owner,
-                status="active",
-            )
-
-            self._keys[key_id] = key
-            return key
-
-    async def sign_document(
-        self,
-        document_content: bytes,
-        signer_id: str,
-        key_id: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> Optional[DigitalSignature]:
-        """
-        Sign a document.
-
-        Args:
-            document_content: Document bytes to sign
-            signer_id: Signer identifier
-            key_id: Signing key ID (uses signer's default if not specified)
-            metadata: Additional signature metadata
-
-        Returns:
-            DigitalSignature if signed successfully
-        """
-        async with self._lock:
-            # Find key
-            key = None
-            if key_id:
-                key = self._keys.get(key_id)
-            else:
-                # Find signer's active key
-                for k in self._keys.values():
-                    if k.owner == signer_id and k.status == "active":
-                        key = k
-                        break
-
-            if not key or key.status != "active":
-                return None
-
-            # Check expiration
-            if key.expires_at and time.time() > key.expires_at:
-                return None
-
-            # Create document hash
-            document_hash = hashlib.sha256(document_content).hexdigest()
-
-            # Create signature (simplified - in production use proper crypto)
-            signature_data = f"{document_hash}:{key.key_id}:{time.time()}"
-            signature_value = hashlib.sha512(signature_data.encode()).hexdigest()
-
-            signature_id = f"sig_{hashlib.sha256(f'{document_hash}:{signer_id}:{time.time()}'.encode()).hexdigest()[:16]}"
-
-            signature = DigitalSignature(
-                signature_id=signature_id,
-                document_hash=document_hash,
-                signer_id=signer_id,
-                key_id=key.key_id,
-                algorithm=key.algorithm,
-                signature_value=signature_value,
-                timestamp=time.time(),
-                certificate_chain=None,
-                metadata=metadata or {},
-            )
-
-            self._signatures[signature_id] = signature
-            return signature
-
-    async def verify_signature(
-        self,
-        document_content: bytes,
-        signature_id: str,
-    ) -> SignatureVerification:
-        """
-        Verify a document signature.
-
-        Args:
-            document_content: Document bytes
-            signature_id: Signature identifier
-
-        Returns:
-            SignatureVerification result
-        """
-        async with self._lock:
-            signature = self._signatures.get(signature_id)
-            if not signature:
-                return SignatureVerification(
-                    is_valid=False,
-                    signature_id=signature_id,
-                    signer_id="",
-                    timestamp=0,
-                    algorithm="",
-                    reason="Signature not found",
-                )
-
-            # Verify document hash
-            document_hash = hashlib.sha256(document_content).hexdigest()
-            if document_hash != signature.document_hash:
-                return SignatureVerification(
-                    is_valid=False,
-                    signature_id=signature_id,
-                    signer_id=signature.signer_id,
-                    timestamp=signature.timestamp,
-                    algorithm=signature.algorithm,
-                    reason="Document hash mismatch - document has been modified",
-                )
-
-            # Verify key validity
-            key = self._keys.get(signature.key_id)
-            if not key:
-                return SignatureVerification(
-                    is_valid=False,
-                    signature_id=signature_id,
-                    signer_id=signature.signer_id,
-                    timestamp=signature.timestamp,
-                    algorithm=signature.algorithm,
-                    reason="Signing key not found",
-                )
-
-            if key.status == "revoked":
-                return SignatureVerification(
-                    is_valid=False,
-                    signature_id=signature_id,
-                    signer_id=signature.signer_id,
-                    timestamp=signature.timestamp,
-                    algorithm=signature.algorithm,
-                    reason="Signing key has been revoked",
-                )
-
-            # Verify signature value (simplified)
-            expected_data = f"{document_hash}:{signature.key_id}:{signature.timestamp}"
-            expected_value = hashlib.sha512(expected_data.encode()).hexdigest()
-
-            if signature.signature_value != expected_value:
-                return SignatureVerification(
-                    is_valid=False,
-                    signature_id=signature_id,
-                    signer_id=signature.signer_id,
-                    timestamp=signature.timestamp,
-                    algorithm=signature.algorithm,
-                    reason="Signature verification failed",
-                )
-
-            return SignatureVerification(
-                is_valid=True,
-                signature_id=signature_id,
-                signer_id=signature.signer_id,
-                timestamp=signature.timestamp,
-                algorithm=signature.algorithm,
-                reason="Signature is valid",
-            )
-
-    async def revoke_key(self, key_id: str, reason: str = "") -> bool:
-        """
-        Revoke a signing key.
-
-        Args:
-            key_id: Key identifier
-            reason: Revocation reason
-
-        Returns:
-            True if revoked successfully
-        """
-        async with self._lock:
-            key = self._keys.get(key_id)
-            if not key:
-                return False
-
-            updated = key._replace(status="revoked")
-            self._keys[key_id] = updated
-            return True
-
-    async def get_document_signatures(
-        self,
-        document_content: bytes,
-    ) -> List[DigitalSignature]:
-        """
-        Get all signatures for a document.
-
-        Args:
-            document_content: Document bytes
-
-        Returns:
-            List of signatures
-        """
-        document_hash = hashlib.sha256(document_content).hexdigest()
-
-        async with self._lock:
-            return [
-                sig for sig in self._signatures.values()
-                if sig.document_hash == document_hash
-            ]
-
-    def get_key(self, key_id: str) -> Optional[SigningKey]:
-        """Get a signing key by ID."""
-        return self._keys.get(key_id)
-
-    def get_signature(self, signature_id: str) -> Optional[DigitalSignature]:
-        """Get a signature by ID."""
-        return self._signatures.get(signature_id)
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get signature service statistics."""
-        key_status = {"active": 0, "revoked": 0, "expired": 0}
-        now = time.time()
-        for key in self._keys.values():
-            if key.status == "revoked":
-                key_status["revoked"] += 1
-            elif key.expires_at and now > key.expires_at:
-                key_status["expired"] += 1
-            else:
-                key_status[key.status] = key_status.get(key.status, 0) + 1
-
-        return {
-            "total_keys": len(self._keys),
-            "key_status": key_status,
-            "total_signatures": len(self._signatures),
-            "supported_algorithms": list(self._algorithms.keys()),
-        }
-
-# =============================================================================
 # ZONE 4.20: FINAL UTILITIES AND SYSTEM INTEGRATION
 # =============================================================================
 # This zone provides the final set of utility managers for:
@@ -56762,255 +53280,6 @@ class SystemTelemetryCollector:
             "custom_collectors": len(self._custom_collectors),
             "exporters": len(self._exporters),
             "flush_interval": self._flush_interval,
-        }
-
-# -----------------------------------------------------------------------------
-# 4.20.3: Graceful Degradation Manager
-# -----------------------------------------------------------------------------
-
-class DegradationLevel(NamedTuple):
-    """Degradation level definition."""
-    level_id: str
-    name: str
-    threshold: float  # Health score threshold
-    disabled_features: List[str]
-    reduced_capacity: Dict[str, float]  # feature -> capacity multiplier
-    description: str
-
-class DegradationState(NamedTuple):
-    """Current degradation state."""
-    current_level: str
-    active_since: float
-    disabled_features: List[str]
-    capacity_limits: Dict[str, float]
-    reason: str
-
-class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulDegradationManager at line ~23485
-    """
-    Manages graceful degradation during system stress.
-
-    Provides:
-    - Multi-level degradation modes
-    - Automatic feature disabling based on health
-    - Capacity reduction management
-    - Recovery detection and escalation
-    - Feature priority configuration
-    """
-
-    def __init__(self) -> None:
-        self._levels: Dict[str, DegradationLevel] = {}
-        self._current_state: Optional[DegradationState] = None
-        self._feature_priorities: Dict[str, int] = {}  # feature -> priority (lower = more critical)
-        self._lock = asyncio.Lock()
-        self._state_callbacks: List[Callable[[DegradationState], Awaitable[None]]] = []
-
-        # Initialize default levels
-        self._setup_default_levels()
-
-    def _setup_default_levels(self) -> None:
-        """Setup default degradation levels."""
-        self._levels["normal"] = DegradationLevel(
-            level_id="normal",
-            name="Normal Operation",
-            threshold=0.9,
-            disabled_features=[],
-            reduced_capacity={},
-            description="All features operational at full capacity",
-        )
-        self._levels["degraded_1"] = DegradationLevel(
-            level_id="degraded_1",
-            name="Light Degradation",
-            threshold=0.7,
-            disabled_features=["analytics", "recommendations"],
-            reduced_capacity={"rate_limit": 0.8, "batch_size": 0.8},
-            description="Non-critical features disabled, capacity slightly reduced",
-        )
-        self._levels["degraded_2"] = DegradationLevel(
-            level_id="degraded_2",
-            name="Moderate Degradation",
-            threshold=0.5,
-            disabled_features=["analytics", "recommendations", "search", "export"],
-            reduced_capacity={"rate_limit": 0.5, "batch_size": 0.5, "concurrent_tasks": 0.5},
-            description="Multiple features disabled, capacity significantly reduced",
-        )
-        self._levels["critical"] = DegradationLevel(
-            level_id="critical",
-            name="Critical Mode",
-            threshold=0.3,
-            disabled_features=["analytics", "recommendations", "search", "export", "webhooks", "notifications"],
-            reduced_capacity={"rate_limit": 0.2, "batch_size": 0.2, "concurrent_tasks": 0.2},
-            description="Only core features operational, minimal capacity",
-        )
-        self._levels["emergency"] = DegradationLevel(
-            level_id="emergency",
-            name="Emergency Mode",
-            threshold=0.0,
-            disabled_features=["*"],  # All non-critical
-            reduced_capacity={"rate_limit": 0.1, "batch_size": 0.1, "concurrent_tasks": 0.1},
-            description="Emergency mode - only authentication and basic read operations",
-        )
-
-    async def initialize(self) -> bool:
-        """Initialize the degradation manager."""
-        self._current_state = DegradationState(
-            current_level="normal",
-            active_since=time.time(),
-            disabled_features=[],
-            capacity_limits={},
-            reason="System startup",
-        )
-        return True
-
-    def register_state_callback(
-        self,
-        callback: Callable[[DegradationState], Awaitable[None]],
-    ) -> None:
-        """Register a callback for state changes."""
-        self._state_callbacks.append(callback)
-
-    def set_feature_priority(self, feature: str, priority: int) -> None:
-        """
-        Set feature priority (lower = more critical).
-
-        Args:
-            feature: Feature name
-            priority: Priority level (0 = most critical)
-        """
-        self._feature_priorities[feature] = priority
-
-    async def evaluate_degradation(self, health_score: float) -> DegradationState:
-        """
-        Evaluate and update degradation level based on health score.
-
-        Args:
-            health_score: Current system health score (0.0 to 1.0)
-
-        Returns:
-            New DegradationState
-        """
-        async with self._lock:
-            # Find appropriate level
-            sorted_levels = sorted(
-                self._levels.values(),
-                key=lambda l: l.threshold,
-                reverse=True,
-            )
-
-            new_level = "emergency"
-            for level in sorted_levels:
-                if health_score >= level.threshold:
-                    new_level = level.level_id
-                    break
-
-            level_config = self._levels[new_level]
-
-            # Check if level changed
-            if self._current_state and self._current_state.current_level == new_level:
-                return self._current_state
-
-            # Create new state
-            new_state = DegradationState(
-                current_level=new_level,
-                active_since=time.time(),
-                disabled_features=level_config.disabled_features,
-                capacity_limits=level_config.reduced_capacity,
-                reason=f"Health score: {health_score:.2f}",
-            )
-
-            self._current_state = new_state
-
-            # Notify callbacks
-            for callback in self._state_callbacks:
-                try:
-                    await callback(new_state)
-                except Exception:
-                    pass
-
-            return new_state
-
-    def is_feature_enabled(self, feature: str) -> bool:
-        """
-        Check if a feature is currently enabled.
-
-        Args:
-            feature: Feature name
-
-        Returns:
-            True if feature is enabled
-        """
-        if not self._current_state:
-            return True
-
-        disabled = self._current_state.disabled_features
-        if "*" in disabled:
-            # Check if feature is critical
-            priority = self._feature_priorities.get(feature, 100)
-            return priority <= 10  # Only very critical features
-
-        return feature not in disabled
-
-    def get_capacity_limit(self, resource: str, default: float = 1.0) -> float:
-        """
-        Get current capacity limit for a resource.
-
-        Args:
-            resource: Resource name
-            default: Default limit if not specified
-
-        Returns:
-            Capacity multiplier (0.0 to 1.0)
-        """
-        if not self._current_state:
-            return default
-
-        return self._current_state.capacity_limits.get(resource, default)
-
-    def get_current_state(self) -> Optional[DegradationState]:
-        """Get current degradation state."""
-        return self._current_state
-
-    async def force_level(self, level_id: str, reason: str = "") -> Optional[DegradationState]:
-        """
-        Force a specific degradation level.
-
-        Args:
-            level_id: Level to force
-            reason: Reason for forcing
-
-        Returns:
-            New DegradationState if successful
-        """
-        async with self._lock:
-            level_config = self._levels.get(level_id)
-            if not level_config:
-                return None
-
-            new_state = DegradationState(
-                current_level=level_id,
-                active_since=time.time(),
-                disabled_features=level_config.disabled_features,
-                capacity_limits=level_config.reduced_capacity,
-                reason=reason or f"Manually forced to {level_id}",
-            )
-
-            self._current_state = new_state
-
-            for callback in self._state_callbacks:
-                try:
-                    await callback(new_state)
-                except Exception:
-                    pass
-
-            return new_state
-
-    def get_statistics(self) -> Dict[str, Any]:
-        """Get degradation manager statistics."""
-        return {
-            "configured_levels": len(self._levels),
-            "feature_priorities": len(self._feature_priorities),
-            "current_level": self._current_state.current_level if self._current_state else None,
-            "active_since": self._current_state.active_since if self._current_state else None,
-            "disabled_features_count": len(self._current_state.disabled_features) if self._current_state else 0,
         }
 
 # -----------------------------------------------------------------------------
@@ -65466,7 +61735,139 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_AUTO_SCALER_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 30 services registered across phases 1-7")
+        # Phase 7 (Metabolic System) ─ resource management / infrastructure
+        _r(ServiceDescriptor(
+            name="service_mesh",
+            service=ServiceMeshRouter(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_SERVICE_MESH_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="connection_pools",
+            service=ConnectionPoolManager(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_CONNECTION_POOLS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_quotas",
+            service=ResourceQuotaManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RESOURCE_QUOTAS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_pools",
+            service=ResourcePoolManager(
+                config=_config,
+                name="default",
+                factory=lambda: asyncio.ensure_future(asyncio.sleep(0, result=object())),
+            ),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="optional",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RESOURCE_POOLS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cost_accounting",
+            service=CostAccountingManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="optional",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_COST_ACCOUNTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="alerting",
+            service=AlertingManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_ALERTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="profiler",
+            service=PerformanceProfiler(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_PROFILER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rate_limiter_mgr",
+            service=RateLimiterManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RATE_LIMITER_MGR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="retry_policies",
+            service=RetryPolicyManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="optional",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RETRY_POLICIES_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="secret_vault",
+            service=SecretVaultManager(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="block_ready",
+            enabled_env="JARVIS_SERVICE_SECRET_VAULT_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="network_monitor",
+            service=NetworkManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="optional",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_NETWORK_MONITOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="filesystem",
+            service=FileSystemManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="optional",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_FILESYSTEM_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="health_orchestrator",
+            service=HealthCheckOrchestrator(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_HEALTH_ORCHESTRATOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="deploy_coordinator",
+            service=DeploymentCoordinator(),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DEPLOY_COORDINATOR_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 44 services registered across phases 1-7")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
