@@ -9226,6 +9226,7 @@ def _build_apars_payload(state):
         "deps_prebaked": state.get("deps_prebaked", True),
         "skipped_phases": state.get("skipped_phases", [2, 3]),
         "boot_session_id": state.get("boot_session_id", "unknown"),
+        "process_epoch": state.get("process_epoch", ""),
     }
 
 # ─── ASGI middleware: enrich /health responses with APARS data ───
@@ -9808,6 +9809,9 @@ fi
                 else:
                     if apars_epoch:
                         self._current_process_epoch = apars_epoch
+                        logger.info(
+                            f"☁️ [InvincibleNode] Locked onto process epoch: {apars_epoch}"
+                        )
                 # v235.2: Detect startup script version mismatches at runtime
                 # Grace period: ignore version mismatch for first 60s of polling.
                 # The progress file (/tmp/jarvis_progress.json) may persist across

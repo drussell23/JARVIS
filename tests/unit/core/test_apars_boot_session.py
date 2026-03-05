@@ -244,6 +244,22 @@ class TestProcessEpochValidation:
             process_epoch=None, expected_epoch="epoch-1",
         ) is True
 
+    def test_build_apars_payload_includes_process_epoch(self):
+        """APARS payload must include process_epoch from progress file."""
+        script = _get_golden_startup_script()
+        _build_apars_payload = _extract_embedded_build_apars_payload(script)
+        state = {
+            "phase_number": 6,
+            "total_progress": 95,
+            "checkpoint": "verifying_service",
+            "boot_session_id": "abc-123-def",
+            "process_epoch": "a1b2c3d4e5f6",
+            "updated_at": 1000,
+        }
+        payload = _build_apars_payload(state)
+        assert payload is not None
+        assert payload.get("process_epoch") == "a1b2c3d4e5f6"
+
 
 class TestAtomicWritesAndVersion:
     def test_startup_script_uses_atomic_apars_write(self):
