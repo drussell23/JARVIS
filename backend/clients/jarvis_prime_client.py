@@ -2,6 +2,12 @@
 JARVIS Prime Client - Cognitive Mind Integration.
 ==================================================
 
+DEPRECATED: This is the legacy Prime client. New code should use:
+    from backend.core.prime_client import get_prime_client
+The canonical PrimeClient in backend/core/prime_client.py provides
+the same functionality with proper circuit breaking and hot-swap support.
+This module is retained for backward compatibility with existing callers.
+
 v84.0 - Advanced Trinity Integration with Intelligent Routing
 
 Provides robust communication with JARVIS Prime (the cognitive mind
@@ -1843,7 +1849,10 @@ _client_lock: Optional[asyncio.Lock] = None  # v90.0: Lazy lock initialization
 async def get_jarvis_prime_client(
     config: Optional[JARVISPrimeConfig] = None,
 ) -> JARVISPrimeClient:
-    """Get or create the singleton JARVIS Prime client."""
+    """Get or create the singleton JARVIS Prime client.
+
+    DEPRECATED: Use backend.core.prime_client.get_prime_client() for new code.
+    """
     global _client, _client_lock
 
     # v90.0: Lazy lock creation to avoid "no event loop" errors at module load
