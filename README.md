@@ -432,6 +432,36 @@ flowchart TD
 
 </details>
 
+<details>
+<summary>Ultra-short TL;DR (hidden)</summary>
+
+- **Triple Authority Fixed:** one root control plane now governs restart, readiness, and lifecycle actions
+- **Safe by Contract:** managed-mode + HMAC-authenticated lifecycle controls + schema/capability handshake gates
+- **Production Rollout Path:** shadow parity -> subsystem-by-subsystem activation -> full active cutover
+
+</details>
+
+<details>
+<summary>Recruiter-friendly version (hidden)</summary>
+
+- **Architecture leadership:** designed and shipped a cross-repo control-plane unification that removed conflicting supervisor logic across three production systems
+- **Reliability outcomes:** eliminated restart storms and readiness split-brain by centralizing lifecycle policy in a single root authority
+- **Security and governance:** introduced HMAC-authenticated lifecycle controls and contract-gated subsystem activation
+- **Operational excellence:** delivered a staged rollout strategy (shadow, canary subsystem activation, full cutover) for safe production adoption
+
+</details>
+
+<details>
+<summary>Infra-architect version (hidden)</summary>
+
+- **Control-plane convergence:** consolidated Body/Prime/Reactor lifecycle ownership under `RootAuthorityWatcher` with explicit state-machine transitions
+- **Policy/execution isolation:** formalized `VerdictExecutor` boundary so policy computes lifecycle verdicts while `ProcessOrchestrator` performs side-effecting actions
+- **Crash-safe escalation:** enforced deterministic ladder (`drain -> SIGTERM -> process-group SIGKILL`) with bounded deadlines and race-safe `ProcessIdentity` verification
+- **Protocol hardening:** added schema N/N-1 + capability-hash handshake gating and managed-mode health/drain envelopes
+- **Progressive activation strategy:** shadow parity validation, per-subsystem active enablement, and final deprecation of legacy autonomous restart paths
+
+</details>
+
 ### Phase 2: Trinity Autonomy Wiring
 
 Phase 2 adds **autonomy lifecycle events** to the Trinity loop. The Body emits structured events for every autonomous action (Google Workspace agent), which flow through the existing cross-repo transport to Reactor-Core for ingestion and classification, while JARVIS-Prime provides policy constraints and structured action plans.
