@@ -2834,9 +2834,11 @@ class UnifiedAgentRuntime:
                         request_kind=RequestKind.AUTONOMOUS,
                         root_reason=RootReason.USER_JOB,
                     ):
-                        report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+                        _deadline = time.monotonic() + timeout
+                        report = await asyncio.wait_for(runner.run_cycle(deadline=_deadline), timeout=timeout)
                 except ImportError:
-                    report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+                    _deadline = time.monotonic() + timeout
+                    report = await asyncio.wait_for(runner.run_cycle(deadline=_deadline), timeout=timeout)
                 if report and not report.skipped:
                     logger.info(
                         "[AgentRuntime] Email triage: %d fetched, %d processed, "
@@ -2861,7 +2863,8 @@ class UnifiedAgentRuntime:
                     from autonomy.email_triage.runner import EmailTriageRunner
                     runner = EmailTriageRunner.get_instance()
                     timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
-                    report = await asyncio.wait_for(runner.run_cycle(), timeout=timeout)
+                    _deadline = time.monotonic() + timeout
+                    report = await asyncio.wait_for(runner.run_cycle(deadline=_deadline), timeout=timeout)
                 except Exception as inner:
                     logger.warning("[AgentRuntime] Email triage unguarded cycle also failed: %s", inner)
             else:

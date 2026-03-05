@@ -212,7 +212,7 @@ class EmailTriageRunner:
         except Exception as e:
             logger.warning("Cold-start recovery failed: %s", e)
 
-    async def run_cycle(self) -> TriageCycleReport:
+    async def run_cycle(self, *, deadline: Optional[float] = None) -> TriageCycleReport:
         """Execute a single triage cycle."""
         cycle_id = uuid4().hex[:12]
         started_at = time.time()
@@ -337,7 +337,8 @@ class EmailTriageRunner:
             try:
                 # Extract features
                 features = await extract_features(
-                    email, self._resolver.get("router"), config=self._config,
+                    email, self._resolver.get("router"),
+                    deadline=deadline, config=self._config,
                 )
 
                 # Get sender reputation bonus (WS5)
