@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 
 logger = logging.getLogger("jarvis.component_registry")
 
+_GLOBAL_KILL_SWITCH = "JARVIS_PROMOTED_SERVICES_ENABLED"
+
 
 class Criticality(Enum):
     """Component criticality levels determining log severity and startup behavior."""
@@ -296,6 +298,7 @@ class ComponentRegistry:
     def __init__(self):
         self._components: Dict[str, ComponentState] = {}
         self._capabilities: Dict[str, str] = {}  # capability -> component name
+        self._state_domains: Dict[str, str] = {}  # domain -> component name
         self._initialized = False
 
     @classmethod
@@ -309,10 +312,27 @@ class ComponentRegistry:
         """Reset registry state for testing. NOT for production use."""
         self._components.clear()
         self._capabilities.clear()
+        self._state_domains.clear()
         self._initialized = False
 
     def register(self, definition: ComponentDefinition) -> ComponentState:
         """Register a component definition."""
+        # Kill-switch check (promoted only)
+        killed, reason = self._check_kill_switch(definition)
+        if killed:
+            state = ComponentState(definition=definition)
+            state.mark_disabled(reason)
+            self._components[definition.name] = state
+            logger.info(f"Component {definition.name} disabled by kill-switch: {reason}")
+            return state
+
+        # Promotion-level validation
+        if definition.promotion_level == PromotionLevel.PROMOTED:
+            self._validate_promoted(definition)
+        elif definition.promotion_level == PromotionLevel.LEGACY:
+            self._warn_missing_governance(definition)
+
+        # --- Existing registration logic ---
         if definition.name in self._components:
             logger.warning(f"Component {definition.name} already registered, updating")
 
@@ -328,8 +348,70 @@ class ComponentRegistry:
                 )
             self._capabilities[cap] = definition.name
 
+        # Track state domain
+        if (definition.state_domain and
+                definition.state_domain.ownership_mode == OwnershipMode.EXCLUSIVE_WRITE):
+            self._state_domains[definition.state_domain.domain] = definition.name
+
         logger.debug(f"Registered component: {definition.name}")
         return state
+
+    def _check_kill_switch(self, defn: ComponentDefinition) -> Tuple[bool, str]:
+        """Check kill-switch hierarchy: global > tier > service."""
+        if defn.promotion_level == PromotionLevel.PROMOTED:
+            global_val = os.environ.get(_GLOBAL_KILL_SWITCH, "true").lower()
+            if global_val in ("false", "0", "no", "disabled"):
+                return True, "global_kill_switch"
+        if defn.tier_kill_switch_env:
+            tier_val = os.environ.get(defn.tier_kill_switch_env, "true").lower()
+            if tier_val in ("false", "0", "no", "disabled"):
+                return True, f"tier_kill_switch:{defn.tier_kill_switch_env}"
+        if defn.kill_switch_env:
+            svc_val = os.environ.get(defn.kill_switch_env, "true").lower()
+            if svc_val in ("false", "0", "no", "disabled"):
+                return True, f"service_kill_switch:{defn.kill_switch_env}"
+        return False, ""
+
+    def _validate_promoted(self, defn: ComponentDefinition) -> None:
+        """Fail-fast validation for promoted services."""
+        errors = []
+        for field_name in ("activation_mode", "readiness_class", "resource_budget",
+                           "failure_policy_gov", "state_domain", "observability_contract"):
+            if getattr(defn, field_name) is None:
+                errors.append(f"Missing required field: {field_name}")
+        if not defn.constructor_pure:
+            errors.append("constructor_pure must be True for promoted services")
+        if defn.state_domain and defn.state_domain.ownership_mode == OwnershipMode.EXCLUSIVE_WRITE:
+            existing = self._state_domains.get(defn.state_domain.domain)
+            if existing and existing != defn.name:
+                errors.append(f"State domain '{defn.state_domain.domain}' already owned by '{existing}'")
+        if defn.activation_tier is not None and defn.max_dependency_tier is not None:
+            for dep in defn.dependencies:
+                dep_name = dep.component if isinstance(dep, Dependency) else dep
+                if dep_name in self._components:
+                    dep_tier = self._components[dep_name].definition.activation_tier
+                    if dep_tier is not None and dep_tier > defn.max_dependency_tier:
+                        if dep_name not in defn.cross_tier_dependency_allowlist:
+                            errors.append(
+                                f"Dependency '{dep_name}' (tier {dep_tier}) exceeds "
+                                f"max_dependency_tier ({defn.max_dependency_tier})"
+                            )
+        if (defn.criticality == Criticality.REQUIRED and
+                defn.readiness_class == ReadinessClass.DEFERRED_AFTER_READY):
+            errors.append("REQUIRED criticality cannot be DEFERRED_AFTER_READY")
+        if errors:
+            raise ValueError(
+                f"Promoted registration failed for '{defn.name}': {'; '.join(errors)}"
+            )
+
+    def _warn_missing_governance(self, defn: ComponentDefinition) -> None:
+        """Warn about missing governance fields on legacy components."""
+        missing = []
+        for field_name in ("activation_mode", "readiness_class", "resource_budget"):
+            if getattr(defn, field_name) is None:
+                missing.append(field_name)
+        if missing:
+            logger.debug(f"Legacy component {defn.name} missing governance fields: {missing}")
 
     def has(self, name: str) -> bool:
         """Check if a component is registered."""
