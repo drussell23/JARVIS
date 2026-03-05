@@ -46474,7 +46474,7 @@ class ResourceUsage:
     last_updated: datetime = field(default_factory=datetime.now)
     history: List[Tuple[datetime, float]] = field(default_factory=list)
 
-class ResourceQuotaManager:
+class ResourceQuotaManager(SystemService):
     """
     Resource quota enforcement system.
 
@@ -46503,7 +46503,7 @@ class ResourceQuotaManager:
         self._logger = logging.getLogger("ResourceQuotaManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize resource quota manager."""
         try:
             async with self._lock:
@@ -46751,6 +46751,28 @@ class ResourceQuotaManager:
         rate_per_second = total_change / total_time
         forecast = usage.current_usage + (rate_per_second * hours_ahead * 3600)
         return max(0, forecast)
+
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._quotas)} quotas configured"
+
+    async def cleanup(self) -> None:
+        self._quotas.clear()
+        self._usage.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourceQuotaManager",
+            version="1.0.0",
+            inputs=["quota.check"],
+            outputs=["quota.result"],
+            side_effects=["writes_quota_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 @dataclass
 class Tenant:
@@ -47061,7 +47083,7 @@ class RateLimitState:
     last_update: datetime
     request_count: int = 0
 
-class RateLimiterManager:
+class RateLimiterManager(SystemService):
     """
     Advanced rate limiting system.
 
@@ -47087,7 +47109,7 @@ class RateLimiterManager:
         self._logger = logging.getLogger("RateLimiterManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize rate limiter."""
         try:
             async with self._lock:
