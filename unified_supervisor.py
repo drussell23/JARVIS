@@ -2264,6 +2264,39 @@ def _calculate_effective_startup_timeout(
         "components": components,
     }
 
+
+# =============================================================================
+# SUPERVISOR BLOCKING EXECUTOR & RATE-LIMITED LOGGER
+# =============================================================================
+# Dedicated executor for supervisor blocking ops — bounded to prevent
+# threadpool starvation when 30-40 to_thread calls run concurrently.
+# Rate-limited logger prevents log storms in hot loops.
+# =============================================================================
+
+_SUPERVISOR_BLOCKING_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="supervisor-blocking"
+)
+
+
+def _run_in_supervisor_thread(fn, *args, timeout: float = 10.0):
+    """Run blocking fn in dedicated executor with deadline. Returns awaitable."""
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(_SUPERVISOR_BLOCKING_EXECUTOR, fn, *args)
+    return asyncio.wait_for(fut, timeout=timeout)
+
+
+_RATE_LIMIT_CACHE: Dict[str, float] = {}
+
+
+def _rate_limited_log(logger, level: str, key: str, msg: str, interval: float = 30.0):
+    """Log at most once per interval seconds per key."""
+    now = time.time()
+    last = _RATE_LIMIT_CACHE.get(key, 0.0)
+    if now - last >= interval:
+        _RATE_LIMIT_CACHE[key] = now
+        getattr(logger, level)(msg)
+
+
 # =============================================================================
 # v225.0: PROGRESS-AWARE STARTUP CONTROLLER
 # =============================================================================
@@ -41910,6 +41943,45 @@ class DataClassificationManager:
             ):
                 child.classification = parent.classification
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        classified = len(self._classified_data)
+        return (True, f"DataClassificationManager: {classified} items classified")
+
+    async def cleanup(self) -> None:
+        self._classified_data.clear()
+        self._lineage.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"DataClassificationManager: initialized={self._initialized}, classified={len(self._classified_data)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataClassificationManager",
+            version="1.0.0",
+            inputs=["data.ingested"],
+            outputs=["data.classified"],
+            side_effects=["writes_classification_labels"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["data.ingested"]  # event_driven
+
 @dataclass
 class AccessPermission:
     """Defines an access permission."""
@@ -41941,7 +42013,7 @@ class AccessGrant:
     granted_by: str = "system"
     conditions: Dict[str, Any] = field(default_factory=dict)
 
-class AccessControlManager:
+class AccessControlManager(SystemService):
     """
     Enterprise RBAC/ABAC access control system.
 
@@ -42319,6 +42391,45 @@ class AccessControlManager:
 
         return entries[-limit:]
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        roles = len(self._roles)
+        grants = len(self._grants)
+        return (True, f"AccessControlManager: {roles} roles, {grants} grants")
+
+    async def cleanup(self) -> None:
+        self._audit_log.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"AccessControlManager: initialized={self._initialized}, roles={len(self._roles)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AccessControlManager",
+            version="1.0.0",
+            inputs=["cross_repo.request"],
+            outputs=["access.granted", "access.denied"],
+            side_effects=["writes_access_log"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class EncryptionKey:
     """Represents an encryption key."""
@@ -42560,7 +42671,7 @@ class AnomalyScore:
     is_anomaly: bool
     timestamp: datetime = field(default_factory=datetime.now)
 
-class AnomalyDetector:
+class AnomalyDetector(SystemService):
     """
     Machine learning-based anomaly detection system.
 
@@ -42771,6 +42882,46 @@ class AnomalyDetector:
 
         return entries[-limit:]
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        anomalies = len(self._anomaly_log)
+        baselines = len(self._baselines)
+        return (True, f"AnomalyDetector: {baselines} baselines, {anomalies} anomalies logged")
+
+    async def cleanup(self) -> None:
+        self._anomaly_log.clear()
+        self._history.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"AnomalyDetector: initialized={self._initialized}, baselines={len(self._baselines)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AnomalyDetector",
+            version="1.0.0",
+            inputs=["telemetry.metric"],
+            outputs=["anomaly.detected"],
+            side_effects=["writes_anomaly_scores"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class SecurityIncident:
     """Represents a security incident."""
@@ -42788,7 +42939,7 @@ class SecurityIncident:
     remediation_steps: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class IncidentResponseCoordinator:
+class IncidentResponseCoordinator(SystemService):
     """
     Security incident response coordination system.
 
@@ -43161,6 +43312,46 @@ class IncidentResponseCoordinator:
                     return (resolve_time - incident.detected_at).total_seconds() / 60
         return None
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        open_incidents = sum(
+            1 for i in self._incidents.values() if i.status not in ("resolved", "closed")
+        )
+        return (True, f"IncidentResponseCoordinator: {open_incidents} open incidents")
+
+    async def cleanup(self) -> None:
+        pass  # Incidents are forensic records; do not clear
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"IncidentResponseCoordinator: initialized={self._initialized}, incidents={len(self._incidents)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="IncidentResponseCoordinator",
+            version="1.0.0",
+            inputs=["threat.confirmed"],
+            outputs=["incident.opened", "incident.resolved"],
+            side_effects=["writes_incident_log"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["threat.confirmed"]  # event_driven
+
 @dataclass
 class ThreatIndicator:
     """Represents a threat indicator (IOC)."""
@@ -43176,7 +43367,7 @@ class ThreatIndicator:
     tags: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class ThreatIntelligenceManager:
+class ThreatIntelligenceManager(SystemService):
     """
     Threat intelligence aggregation and correlation system.
 
@@ -43432,6 +43623,45 @@ class ThreatIntelligenceManager:
             })
 
         return rules
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        indicators = len(self._indicators)
+        sources = len(self._sources)
+        return (True, f"ThreatIntelligenceManager: {indicators} indicators, {sources} sources")
+
+    async def cleanup(self) -> None:
+        self._correlations.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"ThreatIntelligenceManager: initialized={self._initialized}, indicators={len(self._indicators)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ThreatIntelligenceManager",
+            version="1.0.0",
+            inputs=["anomaly.detected"],
+            outputs=["threat.confirmed", "threat.dismissed"],
+            side_effects=["writes_threat_indicators"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["anomaly.detected"]  # event_driven
 
 # =============================================================================
 # ZONE 4.15: INTEGRATION AND API MANAGEMENT
