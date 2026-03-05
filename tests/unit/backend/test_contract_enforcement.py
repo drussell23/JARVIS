@@ -15,6 +15,7 @@ from backend.core.startup_contracts import (
     ContractSeverity, ViolationReasonCode, EnvContract, ENV_CONTRACTS,
     ContractViolationRecord, StartupContractViolation,
     EnvResolution, get_canonical_env, validate_contracts_at_boot,
+    ContractSnapshot,
 )
 
 
@@ -363,3 +364,43 @@ class TestPrecheckGateWiring:
             source = f.read()
         assert "StartupContractViolation" in source
         assert "PRECHECK_BLOCKER" in source
+
+
+class TestContractSnapshot:
+    """Contract hash snapshots for drift detection."""
+
+    def test_snapshot_fields(self):
+        snap = ContractSnapshot(
+            target="jarvis_prime",
+            schema_hash="abc123",
+            capability_hash="def456",
+            session_id="session-1",
+            checked_at_monotonic=1000.0,
+        )
+        assert snap.target == "jarvis_prime"
+        assert snap.schema_hash == "abc123"
+        assert snap.capability_hash == "def456"
+        assert snap.session_id == "session-1"
+        assert snap.checked_at_monotonic == 1000.0
+
+    def test_snapshot_is_frozen(self):
+        snap = ContractSnapshot(
+            target="t", schema_hash="s", capability_hash="c",
+            session_id="s1", checked_at_monotonic=0.0,
+        )
+        with pytest.raises(AttributeError):
+            snap.target = "changed"
+
+    def test_drift_detection_pattern(self):
+        snap1 = ContractSnapshot(
+            target="prime", schema_hash="aaa", capability_hash="bbb",
+            session_id="s1", checked_at_monotonic=100.0,
+        )
+        snap2 = ContractSnapshot(
+            target="prime", schema_hash="ccc", capability_hash="bbb",
+            session_id="s1", checked_at_monotonic=200.0,
+        )
+        # Schema hash changed = drift
+        assert snap1.schema_hash != snap2.schema_hash
+        # Capability hash same = no capability drift
+        assert snap1.capability_hash == snap2.capability_hash

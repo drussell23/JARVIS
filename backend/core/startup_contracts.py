@@ -371,6 +371,24 @@ class ContractStateAuthority:
 
 
 # =========================================================================
+# CONTRACT SNAPSHOTS (drift detection)
+# =========================================================================
+
+@dataclass(frozen=True)
+class ContractSnapshot:
+    """Point-in-time snapshot of a contract check for drift detection.
+
+    Stored at initial check and compared at CONTRACT_GATE to detect
+    if contract state changed during startup.
+    """
+    target: str
+    schema_hash: str
+    capability_hash: str
+    session_id: str
+    checked_at_monotonic: float
+
+
+# =========================================================================
 # HEALTH ENDPOINT SCHEMAS
 # =========================================================================
 
