@@ -24334,6 +24334,205 @@ echo "=== JARVIS Prime started ==="
 
         return shutdown_order
 
+    # ----------------------------------------------------------------
+    # VerdictExecutor interface (Task 14)
+    # ----------------------------------------------------------------
+
+    _verdict_executor_mode: bool = False
+
+    def set_verdict_executor_mode(self, enabled: bool) -> None:
+        """Enable/disable verdict executor mode.
+
+        When enabled, the ProcessOrchestrator can serve as the executor
+        for RootAuthorityWatcher verdicts.  Existing health monitoring
+        is NOT affected -- this is purely additive.
+        """
+        self._verdict_executor_mode = enabled
+
+    def get_current_identity(self, subsystem: str) -> "Optional[ProcessIdentity]":
+        """Return the current ProcessIdentity for a subsystem, or None."""
+        from backend.core.root_authority_types import ProcessIdentity  # noqa: F811
+
+        mp = self._get_managed_process(subsystem)
+        if mp is None or mp.process is None:
+            return None
+        return self._build_process_identity(mp)
+
+    async def execute_drain(
+        self,
+        subsystem: str,
+        identity: "ProcessIdentity",
+        drain_timeout_s: float,
+    ) -> "ExecutionResult":
+        """Send drain request to subsystem via HTTP.
+
+        Posts to ``/lifecycle/drain`` on the subsystem's port.  The
+        request is authenticated with HMAC if a control-plane secret is
+        available.
+        """
+        from backend.core.root_authority_types import ExecutionResult  # noqa: F811
+        from backend.core.managed_mode import build_hmac_auth, get_control_plane_secret
+
+        mp = self._get_managed_process(subsystem)
+        if mp is None or mp.process is None:
+            return ExecutionResult(False, False, "not_found", None, "subsystem_not_found", "")
+
+        # Stale identity check
+        current = self._build_process_identity(mp)
+        if current != identity:
+            return ExecutionResult(False, False, "stale_identity", None, "stale_identity", "")
+
+        port = mp.port
+        if port is None:
+            return ExecutionResult(True, False, "error", None, "no_port", "")
+
+        url = f"http://localhost:{port}/lifecycle/drain"
+        session_id = os.environ.get("JARVIS_ROOT_SESSION_ID", "")
+        secret = get_control_plane_secret()
+        auth_header = build_hmac_auth(session_id, secret) if secret else ""
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json={"session_id": session_id},
+                    headers={"X-Root-Auth": auth_header},
+                    timeout=aiohttp.ClientTimeout(total=drain_timeout_s),
+                ) as resp:
+                    if resp.status in (200, 202):
+                        return ExecutionResult(True, True, "success", None, None, "")
+                    else:
+                        return ExecutionResult(
+                            True, False, "drain_rejected", None, f"status_{resp.status}", "",
+                        )
+        except asyncio.TimeoutError:
+            return ExecutionResult(True, False, "timeout", None, "drain_timeout", "")
+        except Exception as exc:
+            return ExecutionResult(True, False, "error", None, str(exc), "")
+
+    async def execute_term(
+        self,
+        subsystem: str,
+        identity: "ProcessIdentity",
+        term_timeout_s: float,
+    ) -> "ExecutionResult":
+        """Send SIGTERM to subsystem process and wait up to *term_timeout_s*."""
+        from backend.core.root_authority_types import ExecutionResult  # noqa: F811
+
+        mp = self._get_managed_process(subsystem)
+        if mp is None or mp.process is None:
+            return ExecutionResult(False, False, "not_found", None, "subsystem_not_found", "")
+
+        current = self._build_process_identity(mp)
+        if current != identity:
+            return ExecutionResult(False, False, "stale_identity", None, "stale_identity", "")
+
+        try:
+            mp.process.send_signal(signal.SIGTERM)
+            try:
+                await asyncio.wait_for(mp.process.wait(), timeout=term_timeout_s)
+                return ExecutionResult(True, True, "success", None, None, "")
+            except asyncio.TimeoutError:
+                return ExecutionResult(True, True, "timeout", None, "term_timeout", "")
+        except ProcessLookupError:
+            return ExecutionResult(True, True, "success", None, None, "")
+        except Exception as exc:
+            return ExecutionResult(True, False, "error", None, str(exc), "")
+
+    async def execute_group_kill(
+        self,
+        subsystem: str,
+        identity: "ProcessIdentity",
+    ) -> "ExecutionResult":
+        """Send SIGKILL to the process group of a subsystem."""
+        from backend.core.root_authority_types import ExecutionResult  # noqa: F811
+
+        mp = self._get_managed_process(subsystem)
+        if mp is None or mp.process is None:
+            return ExecutionResult(False, False, "not_found", None, "subsystem_not_found", "")
+
+        try:
+            pgid = os.getpgid(mp.process.pid)
+            os.killpg(pgid, signal.SIGKILL)
+            return ExecutionResult(True, True, "success", None, None, "")
+        except ProcessLookupError:
+            return ExecutionResult(True, True, "success", None, None, "")
+        except Exception as exc:
+            return ExecutionResult(True, False, "error", None, str(exc), "")
+
+    async def execute_restart(
+        self,
+        subsystem: str,
+        delay_s: float,
+    ) -> "ExecutionResult":
+        """Restart a subsystem after *delay_s* seconds.
+
+        This is a best-effort restart using the existing spawn infrastructure.
+        The actual restart logic depends on how ``_spawn_service_core``
+        stores service configuration; a full implementation will be wired
+        once shadow-mode validation is complete.
+        """
+        from backend.core.root_authority_types import ExecutionResult  # noqa: F811
+
+        if delay_s > 0:
+            await asyncio.sleep(delay_s)
+
+        mp = self._get_managed_process(subsystem)
+        if mp is None:
+            return ExecutionResult(False, False, "not_found", None, "subsystem_not_found", "")
+
+        # Use existing spawn infrastructure
+        try:
+            definition = mp.definition
+            if definition is None:
+                return ExecutionResult(True, False, "error", None, "no_definition", "")
+
+            success = await self._spawn_service_core(mp, definition)
+            if success:
+                new_id = self._build_process_identity(mp)
+                return ExecutionResult(True, True, "success", new_id, None, "")
+            else:
+                return ExecutionResult(True, False, "error", None, "spawn_failed", "")
+        except Exception as exc:
+            return ExecutionResult(True, False, "error", None, str(exc), "")
+
+    def _get_managed_process(self, subsystem: str) -> "Optional[ManagedProcess]":
+        """Look up a ManagedProcess by subsystem name.
+
+        The ``self.processes`` dict maps service names to
+        ``ManagedProcess`` instances.
+        """
+        return self.processes.get(subsystem)
+
+    def _build_process_identity(self, mp: "ManagedProcess") -> "ProcessIdentity":
+        """Build a ProcessIdentity from a ManagedProcess."""
+        from backend.core.root_authority_types import ProcessIdentity  # noqa: F811
+        from backend.core.managed_mode import compute_exec_fingerprint
+        import time as _time
+
+        pid = mp.process.pid if mp.process else 0
+        # Use the process start time if available, otherwise approximate
+        start_time_ns = int(getattr(mp, 'start_time_ns', 0))
+        if start_time_ns == 0 and mp.start_time > 0:
+            # Convert seconds-based start_time to nanoseconds
+            start_time_ns = int(mp.start_time * 1_000_000_000)
+        if start_time_ns == 0:
+            start_time_ns = _time.monotonic_ns()
+
+        session_id = os.environ.get("JARVIS_ROOT_SESSION_ID", "")
+
+        # Build a fingerprint from the service definition
+        binary_path = "python3"
+        cmdline_str = mp.definition.name if mp.definition else "unknown"
+        fingerprint = compute_exec_fingerprint(binary_path, [cmdline_str])
+
+        return ProcessIdentity(
+            pid=pid,
+            start_time_ns=start_time_ns,
+            session_id=session_id,
+            exec_fingerprint=fingerprint,
+        )
+
 
 # =============================================================================
 # Convenience Functions (Backward Compatibility)
