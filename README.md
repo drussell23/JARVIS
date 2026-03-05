@@ -462,6 +462,77 @@ flowchart TD
 
 </details>
 
+### Disease 1: God File / Monolith Paradox (Status Overview)
+
+`unified_supervisor.py` remains a high-risk monolith change surface (currently ~96K lines), where multiple orchestration domains are co-located in one file. This creates systemic coupling risk: safe local edits become global-risk edits.
+
+#### Monolith concentration map
+
+| Class | Lines (approx) | Responsibility |
+|------|-----------------|----------------|
+| `JarvisSystemKernel` | ~33K | The actual kernel |
+| `IntelligentKernelTakeover` | ~3K | Process takeover |
+| `SupervisorEventBus` | ~2K | Internal events |
+| `IntelligentResourceOrchestrator` | ~10K | Resource management |
+| `TrainingOrchestrator` | ~600 | Training coordination |
+| `AGIOrchestrator` | ~2K | AGI layer |
+| `SelfHealingOrchestrator` | ~8K | Self-healing |
+| `HealthCheckOrchestrator` | ~15K | Health checking |
+| `WorkflowOrchestrator` | ~11K | Workflow execution |
+| `KernelBackgroundTaskRegistry` | ~400 | Task tracking |
+
+#### Why this is structurally dangerous
+
+- **Reasoning ceiling:** one file carries too many orthogonal concerns to safely reason about in one change
+- **Test isolation gap:** subsystem logic is harder to unit test without loading broad kernel context
+- **Coupling blast radius:** low-scope edits can trigger side effects in distant lifecycle paths
+- **Merge pressure:** concurrent edits target the same file and increase conflict frequency
+- **Tooling degradation:** IDE navigation, symbol indexing, and refactor confidence degrade at this file size
+
+#### Architectural flow (cure path without breaking single-entry boot)
+
+```mermaid
+flowchart TD
+    E["python3 unified_supervisor.py<br/>Single Entry Point"] --> K["Kernel Shell (thin)"]
+    K --> R["Registry of Domain Controllers"]
+
+    R --> C1["Lifecycle Controller"]
+    R --> C2["Health Controller"]
+    R --> C3["Workflow Controller"]
+    R --> C4["Resource Controller"]
+    R --> C5["Self-Healing Controller"]
+    R --> C6["Training/AGI Controllers"]
+
+    C1 --> B["Contract Boundaries<br/>typed DTOs + protocol interfaces"]
+    C2 --> B
+    C3 --> B
+    C4 --> B
+    C5 --> B
+    C6 --> B
+
+    B --> T["Isolated Tests per Domain"]
+    B --> O["Observability + Correlation IDs"]
+```
+
+#### Structural cure pattern
+
+1. **Single entrypoint preserved:** keep `unified_supervisor.py` as boot shell, not as full policy container  
+2. **Controller boundaries:** extract domain policy into contract-driven controllers (health/workflow/resources/self-healing)  
+3. **Protocol-first seams:** replace direct cross-domain calls with typed interfaces + versioned contracts  
+4. **Isolation-first tests:** domain-level test suites run without requiring full kernel assembly  
+5. **Measured extraction:** enforce "no net coupling increase" per extraction wave with parity checks
+
+<details>
+<summary>Hidden profile bullet packs (copy-ready)</summary>
+
+- **Monolith Risk Identified:** `unified_supervisor.py` is a concentrated high-coupling surface across lifecycle, health, workflow, and recovery domains
+- **Single Entrypoint, Modular Core:** keep one boot command while enforcing domain controller boundaries under a thin kernel shell
+- **Contract-Driven Decomposition:** protocol interfaces + typed contracts reduce cross-domain direct coupling
+- **Isolation-First Testing:** each controller gains independent testability without loading the full kernel
+- **Migration Strategy:** staged extraction with parity gates and observability guardrails to prevent behavioral drift
+
+</details>
+
 ### Phase 2: Trinity Autonomy Wiring
 
 Phase 2 adds **autonomy lifecycle events** to the Trinity loop. The Body emits structured events for every autonomous action (Google Workspace agent), which flow through the existing cross-repo transport to Reactor-Core for ingestion and classification, while JARVIS-Prime provides policy constraints and structured action plans.
