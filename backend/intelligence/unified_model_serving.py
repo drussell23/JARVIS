@@ -2627,6 +2627,15 @@ class UnifiedModelServing:
         self._thrash_last_gcp_offload_at: float = 0.0
         self._thrash_emergency_event_count: int = 0
 
+        # v310.0: Oscillation guard state
+        self._model_lifecycle_cycles: int = 0
+        self._model_lifecycle_window_start: float = 0.0
+        self._model_committed_off: bool = False
+        self._model_committed_off_time: float = 0.0
+        self.OSCILLATION_CYCLE_LIMIT = 3
+        self.OSCILLATION_WINDOW_S = 600.0  # 10 minutes
+        self.COMMITTED_OFF_COOLDOWN_S = 300.0  # 5 min
+
         # v100.1: Model registry for Trinity Loop hot-swap
         self._registered_models: Dict[str, RegisteredModel] = {}
         self._model_versions: Dict[str, List[str]] = defaultdict(list)  # model_id -> [versions]
@@ -3035,6 +3044,35 @@ class UnifiedModelServing:
             # from being routed while we drain in-flight tasks.
             self.force_open_local_circuit_breaker(reason=f"unload:{reason}")
 
+            # v310.0: Oscillation tracking
+            now_mono = time.monotonic()
+            if now_mono - self._model_lifecycle_window_start > self.OSCILLATION_WINDOW_S:
+                self._model_lifecycle_cycles = 0
+                self._model_lifecycle_window_start = now_mono
+            self._model_lifecycle_cycles += 1
+
+            self._emit_lifecycle_event({
+                "event": "model_unload",
+                "reason": reason,
+                "cycle_count": self._model_lifecycle_cycles,
+                "window_elapsed_s": now_mono - self._model_lifecycle_window_start,
+            })
+
+            if self._model_lifecycle_cycles >= self.OSCILLATION_CYCLE_LIMIT:
+                self._model_committed_off = True
+                self._model_committed_off_time = now_mono
+                self.logger.warning(
+                    "[v310.0] Model oscillation detected (%d cycles in %.0fs). "
+                    "Entering committed-off state.",
+                    self._model_lifecycle_cycles,
+                    self.OSCILLATION_WINDOW_S,
+                )
+                self._emit_lifecycle_event({
+                    "event": "oscillation_guard_triggered",
+                    "total_cycles": self._model_lifecycle_cycles,
+                    "quarantine_duration_s": self.COMMITTED_OFF_COOLDOWN_S,
+                })
+
             # v310.0: Drain in-flight inference with bounded 30s deadline.
             disposition = "no_executor"
             if hasattr(_local, "_inference_executor"):
@@ -3130,6 +3168,13 @@ class UnifiedModelServing:
         )
         return _verified
 
+    def _emit_lifecycle_event(self, event: dict) -> None:
+        """Emit structured lifecycle event for diagnostics."""
+        import json as _json
+        event["ts"] = time.monotonic()
+        event["component"] = "unified_model_serving"
+        self.logger.info("LIFECYCLE_EVENT: %s", _json.dumps(event))
+
     def force_open_local_circuit_breaker(self, reason: str = "recovery_reload") -> None:
         """Force PRIME_LOCAL circuit OPEN so routing stays on cloud during reload."""
         _provider = ModelProvider.PRIME_LOCAL.value
@@ -3176,6 +3221,24 @@ class UnifiedModelServing:
 
     async def _run_local_recovery_flow(self, *, trigger: str) -> Dict[str, Any]:
         """Execute canonical local model recovery lifecycle."""
+        # v310.0: Oscillation guard check
+        if self._model_committed_off:
+            elapsed = time.monotonic() - self._model_committed_off_time
+            if elapsed < self.COMMITTED_OFF_COOLDOWN_S:
+                self.logger.debug(
+                    "[v310.0] Recovery blocked: committed-off (%.0fs remaining)",
+                    self.COMMITTED_OFF_COOLDOWN_S - elapsed,
+                )
+                return self._build_local_recovery_result(
+                    ok=False,
+                    reason=f"committed-off ({self.COMMITTED_OFF_COOLDOWN_S - elapsed:.0f}s remaining)",
+                    trigger=trigger,
+                    skipped=True,
+                )
+            self._model_committed_off = False
+            self._model_lifecycle_cycles = 0
+            self._emit_lifecycle_event({"event": "committed_off_expired"})
+
         self._set_local_ready_handshake(
             source="local_recovery",
             reason="recovery_started",
