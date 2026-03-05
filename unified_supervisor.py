@@ -3337,13 +3337,13 @@ def _mcp_memory_percent() -> float:
                 if _total > 0:
                     _used = _total - _snap.physical_free - _snap.physical_inactive
                     return round(max(0.0, min(100.0, (_used / _total) * 100)), 1)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_mem_pct", f"Memory percent error: {e}")
     if PSUTIL_AVAILABLE:
         try:
             return psutil.virtual_memory().percent
-        except Exception:
-            pass
+        except Exception as e:
+            _rate_limited_log(_unified_logger, "debug", "mcp_mem_pct", f"Memory percent error: {e}")
     return 0.0
 
 
@@ -3359,13 +3359,13 @@ def _mcp_available_gb() -> float:
             _snap = _b.latest_snapshot
             if _snap is not None:
                 return round(_snap.usable_bytes / (1024 ** 3), 2)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_avail_gb", f"Available GB error: {e}")
     if PSUTIL_AVAILABLE:
         try:
             return round(psutil.virtual_memory().available / (1024 ** 3), 2)
-        except Exception:
-            pass
+        except Exception as e:
+            _rate_limited_log(_unified_logger, "debug", "mcp_avail_gb", f"Available GB error: {e}")
     return 0.0
 
 
@@ -3378,13 +3378,13 @@ def _mcp_total_gb() -> float:
             _snap = _b.latest_snapshot
             if _snap is not None:
                 return round(_snap.physical_total / (1024 ** 3), 2)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_total_gb", f"Total GB error: {e}")
     if PSUTIL_AVAILABLE:
         try:
             return round(psutil.virtual_memory().total / (1024 ** 3), 2)
-        except Exception:
-            pass
+        except Exception as e:
+            _rate_limited_log(_unified_logger, "debug", "mcp_total_gb", f"Total GB error: {e}")
     return 0.0
 
 
@@ -3397,8 +3397,8 @@ def _mcp_pressure_tier() -> Optional[int]:
             _snap = _b.latest_snapshot
             if _snap is not None:
                 return int(_snap.pressure_tier)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_pressure", f"Pressure tier error: {e}")
     return None
 
 
@@ -7717,9 +7717,10 @@ class LiveProgressDashboard:
                 await asyncio.sleep(self.refresh_rate)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
-    
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "render_loop", f"Render loop error: {e}", interval=60.0)
+                await asyncio.sleep(1.0)
+
     def _render(self, final: bool = False) -> None:
         """
         Render the dashboard to terminal.
@@ -29773,8 +29774,9 @@ class DistributedStateCoordinator:
                 self._stats["sync_cycles"] += 1
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "state_sync_loop", f"State sync error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _sync_with_peers(self) -> None:
         """Sync state with peer components."""
@@ -30029,8 +30031,9 @@ class TrinityOrchestrationEngine:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "election_loop", f"Election loop error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _start_election(self) -> None:
         """Start a leader election."""
@@ -30075,8 +30078,9 @@ class TrinityOrchestrationEngine:
                 await asyncio.sleep(self._heartbeat_interval)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "trinity_heartbeat_loop", f"Heartbeat loop error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _send_heartbeat(self) -> None:
         """Send heartbeat to cluster."""
@@ -32023,8 +32027,9 @@ class DistributedLockManager(SystemService):
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "warning", "dlm_heartbeat_loop", f"DLM heartbeat error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _refresh_lock(self, resource_id: str, token: FencingToken) -> bool:
         """Refresh lock expiration time."""
