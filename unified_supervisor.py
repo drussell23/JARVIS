@@ -7258,12 +7258,21 @@ class LiveProgressDashboard:
         user sees feedback within ~100ms instead of waiting up to 5s for
         the next passthrough render cycle.
         """
+        import atexit
         import select as _sel
         import termios as _termios
         import tty as _tty
 
         fd = sys.stdin.fileno()
         old_settings = _termios.tcgetattr(fd)
+
+        def _restore_terminal():
+            try:
+                _termios.tcsetattr(fd, _termios.TCSADRAIN, old_settings)
+            except Exception:
+                pass
+
+        atexit.register(_restore_terminal)
         try:
             _tty.setcbreak(fd)
             while self._running:
@@ -7276,8 +7285,9 @@ class LiveProgressDashboard:
         except Exception:
             pass
         finally:
+            _restore_terminal()
             try:
-                _termios.tcsetattr(fd, _termios.TCSADRAIN, old_settings)
+                atexit.unregister(_restore_terminal)
             except Exception:
                 pass
 
