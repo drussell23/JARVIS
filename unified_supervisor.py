@@ -72715,11 +72715,16 @@ class JarvisSystemKernel:
                                         try:
                                             _syn_apars_last = float(_live_dashboard._gcp_state.get("progress", 0))
                                             _syn_source = _live_dashboard._gcp_state.get("source", "none")
+                                            _syn_checkpoint = str(_live_dashboard._gcp_state.get("checkpoint", ""))
                                             if _syn_source == "apars" and _syn_apars_last > 0:
-                                                # v235.0: Cap synthetic to APARS value + small buffer
-                                                # Allows synthetic to slightly lead (smoother UX)
-                                                # but never race far ahead of real data
-                                                _syn_apars_cap = min(95, int(_syn_apars_last) + 5)
+                                                # v237.0: When service_start_timeout, cap strictly
+                                                # to APARS value to avoid misleading 97% display
+                                                if "service_start_timeout" in _syn_checkpoint:
+                                                    _syn_apars_cap = int(_syn_apars_last)
+                                                else:
+                                                    # v237.0: Reduced buffer from +5 to +2
+                                                    # (smoother UX without racing ahead of truth)
+                                                    _syn_apars_cap = min(95, int(_syn_apars_last) + 2)
                                         except Exception:
                                             pass
 
