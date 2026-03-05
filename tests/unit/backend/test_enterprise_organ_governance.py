@@ -444,3 +444,98 @@ class TestGovernanceCompliance:
         import unified_supervisor as us
         instance = getattr(us, class_name)()
         assert instance is not None
+
+
+# ── Phase C Gate: Persistence Verification ────────────────────────────
+
+class TestAtomicWriteHelper:
+    """Tests for _atomic_write_json and _load_json_state."""
+
+    def test_roundtrip_write_read(self, tmp_path):
+        from unified_supervisor import _atomic_write_json, _load_json_state
+        test_file = tmp_path / "test" / "data.json"
+        test_data = {"key": "value", "count": 42}
+        _atomic_write_json(test_file, test_data)
+        loaded = _load_json_state(test_file)
+        assert loaded is not None
+        assert loaded["key"] == "value"
+        assert loaded["count"] == 42
+
+    def test_schema_version_envelope(self, tmp_path):
+        from unified_supervisor import _atomic_write_json
+        import json
+        test_file = tmp_path / "test" / "versioned.json"
+        _atomic_write_json(test_file, {"x": 1}, schema_version="2.0")
+        raw = json.loads(test_file.read_text())
+        assert raw["_schema_version"] == "2.0"
+        assert "_written_at" in raw
+        assert raw["data"]["x"] == 1
+
+    def test_load_nonexistent_returns_none(self, tmp_path):
+        from unified_supervisor import _load_json_state
+        result = _load_json_state(tmp_path / "nonexistent.json")
+        assert result is None
+
+    def test_atomic_overwrites_safely(self, tmp_path):
+        from unified_supervisor import _atomic_write_json, _load_json_state
+        test_file = tmp_path / "overwrite.json"
+        _atomic_write_json(test_file, {"v": 1})
+        _atomic_write_json(test_file, {"v": 2})
+        loaded = _load_json_state(test_file)
+        assert loaded["v"] == 2
+
+
+PERSISTENT_ORGANS = [
+    "MLOpsModelRegistry",
+    "WorkflowOrchestrator",
+    "DocumentManagementSystem",
+    "NotificationHub",
+    "DataLakeManager",
+    "StreamingAnalyticsEngine",
+    "ConsentManagementSystem",
+    "DigitalSignatureService",
+    "LegacyDegradationManager",
+]
+
+
+@pytest.mark.parametrize("class_name", PERSISTENT_ORGANS)
+class TestOrganPersistence:
+    """Verify all 9 persistent organs reference persistence helpers."""
+
+    def test_initialize_references_load(self, class_name):
+        """initialize() must call _load_json_state."""
+        import ast
+        with open("unified_supervisor.py") as f:
+            source = f.read()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                for method in node.body:
+                    if isinstance(method, ast.AsyncFunctionDef) and method.name == "initialize":
+                        method_src = source[method.col_offset:method.end_col_offset] if hasattr(method, 'end_col_offset') else ""
+                        # Fallback: check line range
+                        lines = source.split("\n")
+                        method_lines = "\n".join(lines[method.lineno - 1:method.end_lineno])
+                        assert "_load_json_state" in method_lines, (
+                            f"{class_name}.initialize() missing _load_json_state call"
+                        )
+                        return
+        pytest.fail(f"{class_name} not found or missing initialize()")
+
+    def test_cleanup_references_save(self, class_name):
+        """cleanup() must call _atomic_write_json."""
+        import ast
+        with open("unified_supervisor.py") as f:
+            source = f.read()
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                for method in node.body:
+                    if isinstance(method, ast.AsyncFunctionDef) and method.name == "cleanup":
+                        lines = source.split("\n")
+                        method_lines = "\n".join(lines[method.lineno - 1:method.end_lineno])
+                        assert "_atomic_write_json" in method_lines, (
+                            f"{class_name}.cleanup() missing _atomic_write_json call"
+                        )
+                        return
+        pytest.fail(f"{class_name} not found or missing cleanup()")
