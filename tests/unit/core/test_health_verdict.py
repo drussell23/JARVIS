@@ -133,6 +133,35 @@ class TestReadinessHysteresis:
         assert config.readiness_hysteresis_down == 2
 
 
+class TestTimeoutPolicyTiering:
+    def test_timeout_profiles_exist(self):
+        """VMManagerConfig must support GCP_TIMEOUT_PROFILE."""
+        from backend.core.gcp_vm_manager import VMManagerConfig, TIMEOUT_PROFILES
+        assert "dev" in TIMEOUT_PROFILES
+        assert "staging" in TIMEOUT_PROFILES
+        assert "production" in TIMEOUT_PROFILES
+        assert "golden_image" in TIMEOUT_PROFILES
+
+    def test_timeout_profile_values(self):
+        from backend.core.gcp_vm_manager import TIMEOUT_PROFILES
+        assert TIMEOUT_PROFILES["dev"] == 30.0
+        assert TIMEOUT_PROFILES["staging"] == 60.0
+        assert TIMEOUT_PROFILES["production"] == 90.0
+        assert TIMEOUT_PROFILES["golden_image"] == 120.0
+
+    def test_explicit_timeout_overrides_profile(self):
+        """Explicit GCP_SERVICE_HEALTH_TIMEOUT overrides profile."""
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {
+            "GCP_TIMEOUT_PROFILE": "dev",
+            "GCP_SERVICE_HEALTH_TIMEOUT": "200.0",
+        }):
+            from backend.core.gcp_vm_manager import VMManagerConfig
+            config = VMManagerConfig()
+            assert config.service_health_timeout == 200.0
+
+
 class TestCorrelationIdPropagation:
     def test_ping_health_sends_correlation_header(self):
         """AST check: _ping_health_endpoint must send X-Correlation-ID."""

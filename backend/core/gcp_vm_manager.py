@@ -148,6 +148,16 @@ T = TypeVar('T')
 # automatically recycled (deleted + recreated) to pick up the latest script.
 _STARTUP_SCRIPT_VERSION = "237.0"
 
+# Timeout profiles: environment-appropriate defaults for service_health_timeout.
+# Selected via GCP_TIMEOUT_PROFILE env var; explicit GCP_SERVICE_HEALTH_TIMEOUT
+# always takes precedence.
+TIMEOUT_PROFILES: Dict[str, float] = {
+    "dev": 30.0,
+    "staging": 60.0,
+    "production": 90.0,
+    "golden_image": 120.0,
+}
+
 
 # ============================================================================
 # v109.4: SHUTDOWN DETECTION TO PREVENT INITIALIZATION DURING ATEXIT
@@ -711,8 +721,17 @@ class VMManagerConfig:
         default_factory=lambda: float(os.getenv("GCP_STATIC_VM_HEALTH_TIMEOUT", "300.0"))
     )
     # INV-1: Configurable health check timeout for startup script (bash-side)
+    # Supports tiered profiles via GCP_TIMEOUT_PROFILE; explicit GCP_SERVICE_HEALTH_TIMEOUT overrides.
     service_health_timeout: float = field(
-        default_factory=lambda: float(os.getenv("GCP_SERVICE_HEALTH_TIMEOUT", "90.0"))
+        default_factory=lambda: float(
+            os.getenv(
+                "GCP_SERVICE_HEALTH_TIMEOUT",
+                str(TIMEOUT_PROFILES.get(
+                    os.getenv("GCP_TIMEOUT_PROFILE", "production"),
+                    90.0,
+                ))
+            )
+        )
     )
 
     # Readiness hysteresis: consecutive checks required for state transition
