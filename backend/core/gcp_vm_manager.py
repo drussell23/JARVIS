@@ -197,6 +197,19 @@ def _is_apars_current_session(session_id: str, expected: str) -> bool:
 
 
 # ============================================================================
+# HEALTH VERDICT ENUM
+# ============================================================================
+
+
+class HealthVerdict(Enum):
+    """Health check verdict with explicit partial-degradation semantics."""
+    READY = "ready"
+    ALIVE_NOT_READY = "alive_not_ready"
+    UNREACHABLE = "unreachable"
+    UNHEALTHY = "unhealthy"
+
+
+# ============================================================================
 # CIRCUIT BREAKER FOR FAULT TOLERANCE
 # ============================================================================
 
@@ -3898,13 +3911,13 @@ class GCPVMManager:
 
         # Verify VM is actually ready for inference (not just RUNNING in GCP)
         try:
-            is_ready, health_data = await self._ping_health_endpoint(
+            verdict, health_data = await self._ping_health_endpoint(
                 vm.ip_address, port, timeout=10.0
             )
         except Exception:
             return False
 
-        if not is_ready:
+        if verdict != HealthVerdict.READY:
             return False
 
         # Update health status so the guard at the top of this method
@@ -7519,10 +7532,10 @@ class GCPVMManager:
                                     "JARVIS_PRIME_PORT" if _is_inv else "GCP_BACKEND_PORT",
                                     "8000",
                                 ))
-                                endpoint_ready, _ = await self._ping_health_endpoint(
+                                endpoint_verdict, _ = await self._ping_health_endpoint(
                                     vm.ip_address, _ep_port, timeout=10.0
                                 )
-                                if not endpoint_ready:
+                                if endpoint_verdict != HealthVerdict.READY:
                                     # Track consecutive failures in metadata
                                     _fc = vm.metadata.get("_ep_fail_count", 0) + 1
                                     vm.metadata["_ep_fail_count"] = _fc
@@ -8059,14 +8072,14 @@ class GCPVMManager:
             logger.info(f"☁️ [InvincibleNode] Ensuring VM ready at {static_ip}:{target_port}")
 
             # Step 2: Ping health endpoint
-            is_healthy, health_status = await self._ping_health_endpoint(
+            verdict, health_status = await self._ping_health_endpoint(
                 static_ip, target_port, timeout=10.0
             )
 
             # v235.4: _ping_health_endpoint already checks all readiness signals
             # (ready_for_inference, model_loaded+healthy, APARS, native phase/stage).
             # No need to re-check ready_for_inference here.
-            if is_healthy:
+            if verdict == HealthVerdict.READY:
                 logger.info(f"✅ [InvincibleNode] VM already ready: {static_ip}")
                 return True, static_ip, "ALREADY_READY"
 
@@ -8386,12 +8399,12 @@ class GCPVMManager:
 
     async def _ping_health_endpoint(
         self, ip: str, port: int, timeout: float = 10.0
-    ) -> Tuple[bool, Dict[str, Any]]:
+    ) -> Tuple[HealthVerdict, Dict[str, Any]]:
         """
         Ping the health endpoint to check if VM is ready.
 
         Returns:
-            Tuple of (is_healthy: bool, health_response: dict)
+            Tuple of (verdict: HealthVerdict, health_response: dict)
         """
         import aiohttp
         url = f"http://{ip}:{port}/health"
@@ -8434,12 +8447,13 @@ class GCPVMManager:
                                     # Advisory only — don't block readiness (fail-open)
                             except ImportError:
                                 pass
-                        return is_ready, data
-                    return False, {"status": resp.status}
+                        verdict = HealthVerdict.READY if is_ready else HealthVerdict.ALIVE_NOT_READY
+                        return verdict, data
+                    return HealthVerdict.UNHEALTHY, {"status": resp.status}
         except asyncio.TimeoutError:
-            return False, {"error": "timeout"}
+            return HealthVerdict.UNREACHABLE, {"error": "timeout"}
         except Exception as e:
-            return False, {"error": str(e)}
+            return HealthVerdict.UNREACHABLE, {"error": str(e)}
 
     async def _check_vm_ssh_reachable(self, ip: str) -> bool:
         """v235.0: Quick SSH port check for diagnostic purposes.
@@ -9717,9 +9731,9 @@ fi
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
-            is_ready, health_data = await self._ping_health_endpoint(ip, port, timeout=10.0)
+            verdict, health_data = await self._ping_health_endpoint(ip, port, timeout=10.0)
 
-            if is_ready:
+            if verdict == HealthVerdict.READY:
                 # v220.1: Report 100% on success
                 if progress_callback:
                     try:
@@ -10054,11 +10068,11 @@ fi
         # Perform health check if we have a static IP
         if result["static_ip"]:
             port = int(os.environ.get("JARVIS_PRIME_PORT", "8000"))
-            is_healthy, health_data = await self._ping_health_endpoint(
+            verdict, health_data = await self._ping_health_endpoint(
                 result["static_ip"], port, timeout=10.0
             )
             result["health"] = {
-                "reachable": is_healthy or "error" not in health_data or health_data.get("error") != "timeout",
+                "reachable": verdict != HealthVerdict.UNREACHABLE,
                 "ready_for_inference": health_data.get("ready_for_inference", False),
                 "status": health_data.get("status", "unknown"),
                 "model_loaded": health_data.get("model_loaded", False),
