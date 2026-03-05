@@ -13326,6 +13326,72 @@ class SystemServiceRegistry:
         except Exception:
             return 0.0
 
+    # ── governance helpers ─────────────────────────────────────────────
+
+    def _should_skip_governance(self, desc: ServiceDescriptor) -> Optional[str]:
+        """Return a reason string if *desc* should be skipped due to
+        governance rules (tier kill switch, safe mode, boot policy).
+        Returns ``None`` if the service is allowed to proceed."""
+
+        # Tier kill switch: JARVIS_SERVICE_{TIER}_ENABLED
+        tier_env = f"JARVIS_SERVICE_{desc.tier.upper()}_ENABLED"
+        tier_val = os.getenv(tier_env, "true").lower()
+        if tier_val not in ("true", "1", "yes"):
+            return f"tier kill-switch {tier_env}={tier_val}"
+
+        # Safe mode: only kernel_critical services allowed
+        safe_mode = os.getenv("JARVIS_SAFE_MODE", "false").lower()
+        if safe_mode in ("true", "1", "yes"):
+            if desc.criticality != "kernel_critical":
+                return f"safe-mode active, criticality={desc.criticality}"
+
+        return None
+
+    async def _activate_one(self, desc: ServiceDescriptor) -> bool:
+        """Run the initialize / start sequence for a single service,
+        honouring ``activation_mode`` and recording telemetry.
+
+        Returns True on success, False on failure.
+        """
+        _timeout = desc.init_timeout_s
+        _mem_before = self._current_rss_mb()
+        _t0 = time.monotonic()
+        try:
+            desc.state = "initializing"
+            await asyncio.wait_for(
+                desc.service.initialize(), timeout=_timeout,
+            )
+            desc.initialized = True
+            desc.init_time_ms = (time.monotonic() - _t0) * 1000
+            desc.memory_delta_mb = self._current_rss_mb() - _mem_before
+            self._activation_order.append(desc.name)
+
+            # activation_mode determines whether we also start()
+            if desc.activation_mode == "always_on":
+                await asyncio.wait_for(
+                    desc.service.start(), timeout=_timeout,
+                )
+                desc.state = "active"
+            else:
+                # warm_standby, event_driven, batch_window: init only
+                desc.state = "ready"
+
+            desc.activation_count += 1
+            logger.info(
+                "[SSR] Activated %s (mode=%s, state=%s) in %.0fms (+%.1fMB)",
+                desc.name, desc.activation_mode, desc.state,
+                desc.init_time_ms, desc.memory_delta_mb,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            desc.error = str(e)
+            desc.healthy = False
+            desc.state = "pending"
+            logger.warning("[SSR] Failed to activate %s: %s", desc.name, e)
+            return False
+
     async def activate_phase(
         self,
         phase: int,
@@ -13337,6 +13403,11 @@ class SystemServiceRegistry:
         phase) are validated via the global ``_services`` dict — they will
         not appear in the topological sort but will satisfy dependency
         checks.
+
+        Governance filters applied before activation:
+        • **Boot policy**: ``deferred_after_ready`` services are skipped.
+        • **Tier kill switch**: ``JARVIS_SERVICE_{TIER}_ENABLED=false``.
+        • **Safe mode**: ``JARVIS_SAFE_MODE=true`` skips non-kernel_critical.
         """
         phase_services = [
             s for s in self._services.values()
@@ -13346,6 +13417,18 @@ class SystemServiceRegistry:
         results: Dict[str, bool] = {}
 
         for desc in ordered:
+            # --- boot policy: deferred services skip phase activation ---
+            if desc.boot_policy == "deferred_after_ready":
+                results[desc.name] = False
+                continue
+
+            # --- governance gates (tier kill switch, safe mode) ---
+            skip_reason = self._should_skip_governance(desc)
+            if skip_reason:
+                results[desc.name] = False
+                logger.info("[SSR] Skipping %s: %s", desc.name, skip_reason)
+                continue
+
             # per-service kill switch
             if desc.enabled_env:
                 val = os.getenv(desc.enabled_env, "true").lower()
@@ -13368,31 +13451,79 @@ class SystemServiceRegistry:
                 )
                 continue
 
-            # activate with telemetry (current RSS, not peak)
-            _mem_before = self._current_rss_mb()
-            _t0 = time.monotonic()
-            try:
-                await asyncio.wait_for(
-                    desc.service.initialize(), timeout=timeout_per_service,
-                )
-                desc.initialized = True
-                desc.init_time_ms = (time.monotonic() - _t0) * 1000
-                desc.memory_delta_mb = self._current_rss_mb() - _mem_before
-                self._activation_order.append(desc.name)
-                results[desc.name] = True
-                logger.info(
-                    "[SSR] Activated %s in %.0fms (+%.1fMB)",
-                    desc.name, desc.init_time_ms, desc.memory_delta_mb,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                desc.error = str(e)
-                desc.healthy = False
-                results[desc.name] = False
-                logger.warning("[SSR] Failed to activate %s: %s", desc.name, e)
+            # activate with telemetry
+            results[desc.name] = await self._activate_one(desc)
 
         return results
+
+    async def activate_deferred(self) -> Dict[str, bool]:
+        """Activate all ``deferred_after_ready`` services that haven't
+        been initialized yet.  Called after kernel reaches READY state.
+
+        Applies the same governance filters (tier kill switch, safe mode)
+        as ``activate_phase()``.
+        """
+        deferred = [
+            s for s in self._services.values()
+            if s.boot_policy == "deferred_after_ready" and not s.initialized
+        ]
+        ordered = self._topological_sort(deferred)
+        results: Dict[str, bool] = {}
+
+        for desc in ordered:
+            skip_reason = self._should_skip_governance(desc)
+            if skip_reason:
+                results[desc.name] = False
+                logger.info("[SSR] Skipping deferred %s: %s", desc.name, skip_reason)
+                continue
+
+            if desc.enabled_env:
+                val = os.getenv(desc.enabled_env, "true").lower()
+                if val not in ("true", "1", "yes"):
+                    results[desc.name] = False
+                    continue
+
+            unmet = [
+                d for d in desc.depends_on
+                if d not in self._services or not self._services[d].initialized
+            ]
+            if unmet:
+                desc.error = f"Unmet dependencies: {unmet}"
+                desc.healthy = False
+                results[desc.name] = False
+                continue
+
+            results[desc.name] = await self._activate_one(desc)
+
+        return results
+
+    async def activate_service(self, name: str) -> bool:
+        """Start a specific warm_standby or event_driven service on demand.
+
+        Returns True if the service is now active, False if the service
+        is unknown or not yet initialized.
+        """
+        desc = self._services.get(name)
+        if desc is None:
+            return False
+        if not desc.initialized:
+            return False
+        if desc.state == "active":
+            return True
+
+        try:
+            await desc.service.start()
+            desc.state = "active"
+            desc.activation_count += 1
+            logger.info("[SSR] On-demand start: %s -> active", name)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            desc.error = str(e)
+            desc.healthy = False
+            logger.warning("[SSR] On-demand start failed for %s: %s", name, e)
+            return False
 
     # ── health ──────────────────────────────────────────────────────────
 
@@ -13416,22 +13547,75 @@ class SystemServiceRegistry:
                 results[name] = (False, str(e))
         return results
 
+    async def health_check_all_structured(self) -> Dict[str, "ServiceHealthReport"]:
+        """Run the v2 ``health()`` method on every initialised service.
+
+        Returns a dict mapping service name to ``ServiceHealthReport``.
+        Updates ``desc.healthy``, ``desc.state`` (degraded/active
+        transitions), and ``desc.last_health_check``.
+        """
+        results: Dict[str, ServiceHealthReport] = {}
+        for name in self._activation_order:
+            desc = self._services[name]
+            try:
+                report = await asyncio.wait_for(
+                    desc.service.health(), timeout=desc.liveness_timeout_s,
+                )
+                desc.healthy = report.ready and not report.degraded
+                desc.error = None if desc.healthy else report.message
+                desc.last_health_check = time.monotonic()
+
+                # state transitions based on health report
+                if report.degraded and desc.state == "active":
+                    desc.state = "degraded"
+                elif not report.degraded and report.ready and desc.state == "degraded":
+                    desc.state = "active"
+
+                results[name] = report
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                desc.healthy = False
+                desc.error = str(e)
+                desc.last_health_check = time.monotonic()
+                results[name] = ServiceHealthReport(
+                    alive=False, ready=False, message=str(e),
+                )
+        return results
+
     # ── shutdown ────────────────────────────────────────────────────────
 
     async def shutdown_all(self, timeout_per: float = 5.0) -> None:
-        """Shutdown in reverse activation order."""
+        """Shutdown in reverse activation order.
+
+        Uses the v2 lifecycle: ``drain(deadline_s)`` then ``stop()``.
+        State transitions: current -> draining -> stopped.
+        Falls back to ``cleanup()`` if ``drain``/``stop`` are not
+        overridden (the default implementations delegate to cleanup).
+        """
         for name in reversed(self._activation_order):
             desc = self._services.get(name)
             if desc and desc.initialized:
                 try:
+                    desc.state = "draining"
                     await asyncio.wait_for(
-                        desc.service.cleanup(), timeout=timeout_per,
+                        desc.service.drain(deadline_s=timeout_per),
+                        timeout=timeout_per,
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning("[SSR] Cleanup error for %s: %s", name, e)
+                    logger.warning("[SSR] Drain error for %s: %s", name, e)
+                try:
+                    await asyncio.wait_for(
+                        desc.service.stop(), timeout=timeout_per,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("[SSR] Stop error for %s: %s", name, e)
                 desc.initialized = False
+                desc.state = "stopped"
         self._activation_order.clear()
 
     # ── helpers ─────────────────────────────────────────────────────────

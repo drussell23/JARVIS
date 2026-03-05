@@ -1,8 +1,8 @@
 {
   "version": "151.0",
-  "startup_time": 1772708914.390225,
-  "startup_time_iso": "2026-03-05T03:08:34.390228",
-  "pid": 28489,
+  "startup_time": 1772709464.27675,
+  "startup_time_iso": "2026-03-05T03:17:44.276752",
+  "pid": 73508,
   "python_version": "3.9.6 (default, Dec  2 2025, 07:27:58) \n[Clang 17.0.0 (clang-1700.6.3.2)]",
   "platform": "darwin",
   "initial_environment": {
