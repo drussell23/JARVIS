@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "updated_at": 1772709015.798996,
+  "supervisor_pid": 28489,
+  "idempotency_state": {
+    "jarvis-prime|restart": {
+      "operation_id": "op-1772709015789-60bf8d81",
+      "status": "succeeded",
+      "updated_at": 1772709015.7913878,
+      "attempts": 1,
+      "source_service": "reactor-core",
+      "target_service": "jarvis-prime",
+      "action": "restart",
+      "reason": "process_crash",
+      "note": "restart_attempted",
+      "result": true
+    }
+  },
+  "history": [
+    {
+      "timestamp": 1772709015.7935832,
+      "source_service": "reactor-core",
+      "target_service": "jarvis-prime",
+      "action": "restart",
+      "reason": "process_crash",
+      "applied": true,
+      "note": "restart_attempted"
+    },
+    {
+      "timestamp": 1772709015.798989,
+      "source_service": "reactor-core",
+      "target_service": "jarvis-prime",
+      "action": "restart",
+      "reason": "process_crash",
+      "applied": true,
+      "note": "idempotent_reused_success"
+    }
+  ],
+  "last_applied": {},
+  "degradation_mode": {},
+  "crash_circuit_breakers": {},
+  "observed_snapshot": {
+    "jarvis-prime": {
+      "is_running": false,
+      "status": "failed",
+      "degradation_mode": null,
+      "crash_circuit_breaker_open": false
+    }
+  }
+}
