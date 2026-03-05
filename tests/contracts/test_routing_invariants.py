@@ -38,7 +38,6 @@ class TestNoDirectClientConstruction:
                     )
         return violations
 
-    @pytest.mark.xfail(reason="Phase 3: bypass elimination not yet implemented")
     def test_no_bypass_construction(self):
         """No direct PrimeAPIClient/PrimeCloudRunClient outside factory."""
         violations = []
