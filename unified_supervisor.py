@@ -31362,6 +31362,11 @@ class DistributedLockManager(SystemService):
     """
     Distributed lock manager with fencing tokens.
 
+    WARNING: This is a SIMPLIFIED STUB used only for the supervisor service
+    registry lifecycle (start/stop). The real production DLM is at:
+        backend/core/distributed_lock_manager.py (v3.2, with acquire_unified())
+    All lock acquisition in application code MUST use the real DLM.
+
     Provides coordination primitives for distributed systems:
     - Mutex locks with automatic expiration
     - Fencing tokens for split-brain safety
