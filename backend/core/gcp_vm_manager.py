@@ -146,7 +146,7 @@ T = TypeVar('T')
 # v235.0: Startup script version tag — bumped on every significant script change.
 # Embedded in VM metadata at creation. Running VMs with a stale version are
 # automatically recycled (deleted + recreated) to pick up the latest script.
-_STARTUP_SCRIPT_VERSION = "237.0"
+_STARTUP_SCRIPT_VERSION = "238.0"
 
 # Timeout profiles: environment-appropriate defaults for service_health_timeout.
 # Selected via GCP_TIMEOUT_PROFILE env var; explicit GCP_SERVICE_HEALTH_TIMEOUT

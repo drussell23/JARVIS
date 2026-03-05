@@ -290,8 +290,8 @@ class TestAtomicWritesAndVersion:
         """Startup script version must be >= 237.0 after readiness fixes."""
         from backend.core.gcp_vm_manager import _STARTUP_SCRIPT_VERSION
         version = float(_STARTUP_SCRIPT_VERSION)
-        assert version >= 237.0, \
-            f"Startup script version must be >= 237.0, got {version}"
+        assert version >= 238.0, \
+            f"Startup script version must be >= 238.0, got {version}"
 
 
 class TestAtomicWriteBoundary:
