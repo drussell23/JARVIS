@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from backend.core.heartbeat_writer import HeartbeatWriter, validate_heartbeat
+from backend.core.time_utils import monotonic_s
 
 
 # ======================================================================
@@ -68,21 +69,27 @@ class TestHeartbeatPayload:
 
             assert p1["boot_id"] == p2["boot_id"]
 
-    def test_heartbeat_monotonic_age_increases(self) -> None:
-        """Two writes with a brief sleep: second age > first age."""
+    def test_heartbeat_monotonic_age_measures_inter_write_delta(self) -> None:
+        """monotonic_age_ms measures ms since previous write, not uptime."""
         with tempfile.TemporaryDirectory() as td:
             hb_path = Path(td) / "heartbeat.json"
             writer = HeartbeatWriter(path=hb_path)
 
+            # First write: delta from __init__ → near-zero
             writer.write(phase="loading", loop_iteration=1)
             p1 = json.loads(hb_path.read_text())
 
             time.sleep(0.05)  # 50ms
 
+            # Second write: delta from first write → ~50ms
             writer.write(phase="loading", loop_iteration=2)
             p2 = json.loads(hb_path.read_text())
 
-            assert p2["monotonic_age_ms"] > p1["monotonic_age_ms"]
+            # First write should have a very small delta (init → first write)
+            assert p1["monotonic_age_ms"] < 50
+
+            # Second write should capture the ~50ms sleep
+            assert p2["monotonic_age_ms"] >= 40  # allow some timing slack
 
     def test_heartbeat_atomic_write(self) -> None:
         """100 rapid writes each produce valid JSON with correct iteration."""
@@ -119,7 +126,7 @@ class TestHeartbeatValidation:
         base = {
             "boot_id": "test-boot-id-1234",
             "pid": os.getpid(),
-            "ts_mono": time.monotonic(),
+            "ts_mono": monotonic_s(),
             "monotonic_age_ms": 5000,
             "phase": "ready",
             "loop_iteration": 10,
@@ -145,7 +152,7 @@ class TestHeartbeatValidation:
         payload = {
             "boot_id": boot_id,
             "pid": os.getpid(),
-            "ts_mono": time.monotonic() - 60.0,  # 60 seconds ago
+            "ts_mono": monotonic_s() - 60.0,  # 60 seconds ago
             "monotonic_age_ms": 100,
             "phase": "ready",
             "loop_iteration": 10,

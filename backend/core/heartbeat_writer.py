@@ -14,11 +14,12 @@ from __future__ import annotations
 
 import json
 import os
-import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+from backend.core.time_utils import monotonic_s
 
 
 class HeartbeatWriter:
@@ -29,17 +30,18 @@ class HeartbeatWriter:
             path = Path.home() / ".jarvis" / "heartbeat.json"
         self.path: Path = Path(path)
         self.boot_id: str = str(uuid.uuid4())
-        self._start_mono: float = time.monotonic()
+        self._start_mono: float = monotonic_s()
+        self._last_write_mono: float = self._start_mono
 
     # ------------------------------------------------------------------
     def write(self, phase: str, loop_iteration: int) -> None:
         """Write heartbeat payload atomically via tmp+fsync+replace."""
-        now_mono = time.monotonic()
+        now_mono = monotonic_s()
         payload: Dict[str, Any] = {
             "boot_id": self.boot_id,
             "pid": os.getpid(),
             "ts_mono": now_mono,
-            "monotonic_age_ms": int((now_mono - self._start_mono) * 1000),
+            "monotonic_age_ms": int((now_mono - self._last_write_mono) * 1000),
             "phase": phase,
             "loop_iteration": loop_iteration,
             "written_at_wall": datetime.now().isoformat(timespec="seconds"),
@@ -58,6 +60,7 @@ class HeartbeatWriter:
         finally:
             os.close(fd)
         os.replace(str(tmp), str(self.path))
+        self._last_write_mono = now_mono
 
 
 # ======================================================================
@@ -110,11 +113,10 @@ def validate_heartbeat(
 
     # --- staleness check (monotonic age) ---
     if max_age_s is not None:
-        age_ms = payload.get("monotonic_age_ms")
         ts_mono = payload.get("ts_mono")
         if ts_mono is not None:
             # Compare against current monotonic clock
-            elapsed_since_write = time.monotonic() - ts_mono
+            elapsed_since_write = monotonic_s() - ts_mono
             if elapsed_since_write > max_age_s:
                 return {
                     "valid": False,
