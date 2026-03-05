@@ -405,42 +405,114 @@ HEALTH_SCHEMAS: Dict[str, HealthEndpointSchema] = {
 # VALIDATION FUNCTIONS
 # =========================================================================
 
-def validate_contracts_at_boot() -> List[str]:
+def validate_contracts_at_boot() -> List[ContractViolationRecord]:
     """Validate all cross-repo contracts at startup.
 
-    Returns a list of warning strings. NEVER raises exceptions or blocks
-    startup — contract violations are advisory, not fatal.
-
-    Checks:
-      1. Env vars with unexpected format (type mismatch, pattern violation)
-      2. Alias conflicts (two names for same concept set to different values)
+    Returns structured violation records with severity, reason codes, and origin tracing.
+    Callers decide enforcement based on severity.
     """
-    warnings: List[str] = []
+    import time as _time
+    from datetime import datetime, timezone
+
+    violations: List[ContractViolationRecord] = []
+    now_mono = _time.monotonic()
+    now_utc = datetime.now(timezone.utc).isoformat()
 
     for contract in ENV_CONTRACTS:
-        val = os.environ.get(contract.canonical_name)
-        if val is None:
-            continue  # Not set is fine — many are optional
+        resolution = get_canonical_env(contract.canonical_name)
+        if resolution is None:
+            continue  # Not set, no default — nothing to validate
+
+        val = resolution.value
 
         # Pattern validation
         if contract.pattern and not re.match(contract.pattern, val):
-            warnings.append(
-                f"{contract.canonical_name}={val!r} does not match "
-                f"expected pattern {contract.pattern} "
-                f"({contract.description})"
-            )
+            reason = ViolationReasonCode.PATTERN_MISMATCH
+            if contract.value_type == "int" and val.isdigit():
+                port = int(val)
+                if port < 1 or port > 65535:
+                    reason = ViolationReasonCode.PORT_OUT_OF_RANGE
+            elif contract.value_type == "url":
+                reason = ViolationReasonCode.MALFORMED_URL
+
+            violations.append(ContractViolationRecord(
+                contract_name=contract.canonical_name,
+                base_severity=contract.severity,
+                effective_severity=contract.severity,
+                reason_code=reason,
+                violation=(
+                    f"{contract.canonical_name}={val!r} does not match "
+                    f"expected pattern {contract.pattern} ({contract.description})"
+                ),
+                value_origin=resolution.origin,
+                checked_at_monotonic=now_mono,
+                checked_at_utc=now_utc,
+                phase="precheck",
+            ))
+
+        # Semantic port range check (pattern may pass for values like "99999")
+        if contract.value_type == "int" and "PORT" in contract.canonical_name and val.isdigit():
+            port = int(val)
+            if port < 1 or port > 65535:
+                violations.append(ContractViolationRecord(
+                    contract_name=contract.canonical_name,
+                    base_severity=contract.severity,
+                    effective_severity=contract.severity,
+                    reason_code=ViolationReasonCode.PORT_OUT_OF_RANGE,
+                    violation=(
+                        f"{contract.canonical_name}={val!r} port {port} is outside "
+                        f"valid range 1-65535 ({contract.description})"
+                    ),
+                    value_origin=resolution.origin,
+                    checked_at_monotonic=now_mono,
+                    checked_at_utc=now_utc,
+                    phase="precheck",
+                ))
 
         # Alias conflict detection
         for alias in contract.aliases:
             alias_val = os.environ.get(alias)
             if alias_val is not None and alias_val != val:
-                warnings.append(
-                    f"Alias conflict: {contract.canonical_name}={val!r} "
-                    f"but {alias}={alias_val!r} — these should match "
-                    f"({contract.description})"
-                )
+                violations.append(ContractViolationRecord(
+                    contract_name=contract.canonical_name,
+                    base_severity=contract.severity,
+                    effective_severity=contract.severity,
+                    reason_code=ViolationReasonCode.ALIAS_CONFLICT,
+                    violation=(
+                        f"Alias conflict: {contract.canonical_name}={val!r} "
+                        f"but {alias}={alias_val!r} ({contract.description})"
+                    ),
+                    value_origin=resolution.origin,
+                    checked_at_monotonic=now_mono,
+                    checked_at_utc=now_utc,
+                    phase="precheck",
+                ))
 
-    return warnings
+    # Port collision detection (PRECHECK_BLOCKER)
+    port_contracts = [c for c in ENV_CONTRACTS if c.value_type == "int" and "PORT" in c.canonical_name]
+    port_values: Dict[str, str] = {}  # port_value -> contract_name
+    for pc in port_contracts:
+        res = get_canonical_env(pc.canonical_name)
+        if res is not None and res.value.isdigit():
+            if res.value in port_values:
+                violations.append(ContractViolationRecord(
+                    contract_name=pc.canonical_name,
+                    base_severity=ContractSeverity.PRECHECK_BLOCKER,
+                    effective_severity=ContractSeverity.PRECHECK_BLOCKER,
+                    reason_code=ViolationReasonCode.PORT_CONFLICT,
+                    violation=(
+                        f"Port {res.value} claimed by both {port_values[res.value]} "
+                        f"and {pc.canonical_name}"
+                    ),
+                    value_origin=res.origin,
+                    checked_at_monotonic=now_mono,
+                    checked_at_utc=now_utc,
+                    phase="precheck",
+                ))
+            else:
+                port_values[res.value] = pc.canonical_name
+
+    return violations
 
 
 def validate_health_response(

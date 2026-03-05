@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from backend.core.startup_contracts import (
     ContractSeverity, ViolationReasonCode, EnvContract, ENV_CONTRACTS,
     ContractViolationRecord, StartupContractViolation,
-    EnvResolution, get_canonical_env,
+    EnvResolution, get_canonical_env, validate_contracts_at_boot,
 )
 
 
@@ -268,3 +268,75 @@ class TestEnvResolution:
         r = EnvResolution(value="x", origin="explicit", canonical_name="Y")
         with pytest.raises(AttributeError):
             r.value = "changed"
+
+
+class TestSeverityAwareValidation:
+    """validate_contracts_at_boot must return structured results."""
+
+    def test_pattern_violation_returns_record(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"JARVIS_BACKEND_PORT": "not_a_number"}, clear=False):
+            result = validate_contracts_at_boot()
+            assert len(result) > 0
+            assert isinstance(result[0], ContractViolationRecord)
+            assert result[0].effective_severity == ContractSeverity.PRECHECK_BLOCKER
+
+    def test_port_out_of_range_reason(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"JARVIS_BACKEND_PORT": "99999"}, clear=False):
+            result = validate_contracts_at_boot()
+            port_violations = [r for r in result if r.contract_name == "JARVIS_BACKEND_PORT"]
+            assert len(port_violations) >= 1
+            assert port_violations[0].reason_code == ViolationReasonCode.PORT_OUT_OF_RANGE
+
+    def test_clean_env_no_violations(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True):
+            result = validate_contracts_at_boot()
+            assert len(result) == 0
+
+    def test_alias_conflict_detected(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {
+            "JARVIS_BACKEND_PORT": "8010",
+            "BACKEND_PORT": "9090",
+        }, clear=True):
+            result = validate_contracts_at_boot()
+            alias_violations = [r for r in result
+                                if r.reason_code == ViolationReasonCode.ALIAS_CONFLICT]
+            assert len(alias_violations) >= 1
+
+    def test_port_collision_detected(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {
+            "JARVIS_BACKEND_PORT": "8010",
+            "JARVIS_FRONTEND_PORT": "8010",
+        }, clear=True):
+            result = validate_contracts_at_boot()
+            collisions = [r for r in result
+                          if r.reason_code == ViolationReasonCode.PORT_CONFLICT]
+            assert len(collisions) >= 1
+            assert collisions[0].effective_severity == ContractSeverity.PRECHECK_BLOCKER
+
+    def test_malformed_url_reason(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"JARVIS_PRIME_URL": "not-a-url"}, clear=True):
+            result = validate_contracts_at_boot()
+            url_violations = [r for r in result if r.contract_name == "JARVIS_PRIME_URL"]
+            assert len(url_violations) >= 1
+            assert url_violations[0].reason_code == ViolationReasonCode.MALFORMED_URL
+
+    def test_origin_traced_in_violations(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"JARVIS_PRIME_URL": "not-a-url"}, clear=True):
+            result = validate_contracts_at_boot()
+            url_violations = [r for r in result if r.contract_name == "JARVIS_PRIME_URL"]
+            assert len(url_violations) >= 1
+            assert url_violations[0].value_origin == "explicit"
