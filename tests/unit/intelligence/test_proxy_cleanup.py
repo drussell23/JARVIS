@@ -56,19 +56,25 @@ class TestProxyCleanup:
         assert not pid_path.exists()
 
     def test_stale_pid_with_proxy_process_killed(self):
-        """Stale PID that IS a proxy process should be terminated."""
+        """Stale PID that IS a proxy process should be terminated via SIGTERM."""
         from backend.intelligence.cloud_sql_proxy_manager import CloudSQLProxyManager
         mgr = CloudSQLProxyManager.__new__(CloudSQLProxyManager)
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".pid", delete=False) as f:
-            f.write("99999999")  # Non-existent PID
+            f.write("99999999")
             pid_path = Path(f.name)
 
         mgr.pid_path = pid_path
         mgr._is_cloud_sql_proxy_process = MagicMock(return_value=True)
 
-        # Should handle ProcessLookupError gracefully
-        mgr._cleanup_stale_proxy_sync()
+        mock_proc = MagicMock()
+        mock_proc.uids.return_value = MagicMock(real=os.getuid())  # Same UID
+
+        with patch("psutil.Process", return_value=mock_proc):
+            with patch("os.kill") as mock_kill:
+                mgr._cleanup_stale_proxy_sync()
+                mock_kill.assert_any_call(99999999, signal.SIGTERM)
+
         assert not pid_path.exists()
 
     def test_stale_pid_wrong_uid_not_killed(self):
