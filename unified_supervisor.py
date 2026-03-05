@@ -11562,7 +11562,12 @@ class CostTracker(ResourceManagerBase, SystemService):
         """Load persisted cost state."""
         try:
             if self.state_file.exists():
-                data = json.loads(self.state_file.read_text())
+                try:
+                    raw = await _run_in_supervisor_thread(self.state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self._logger.warning(f"CostTracker._load_state: file read failed: {io_err}")
+                    return
+                data = json.loads(raw)
 
                 # Reset daily cost if new day
                 last_date = data.get("last_date", "")
@@ -11603,7 +11608,11 @@ class CostTracker(ResourceManagerBase, SystemService):
                 "updated_at": time.time(),
             }
 
-            self.state_file.write_text(json.dumps(data, indent=2))
+            payload = json.dumps(data, indent=2)
+            try:
+                await _run_in_supervisor_thread(self.state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self._logger.warning(f"CostTracker._save_state: file write failed: {io_err}")
 
         except Exception as e:
             self._logger.warning(f"Failed to save cost state: {e}")
@@ -14029,7 +14038,12 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
             }
 
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps(state, indent=2))
+            payload = json.dumps(state, indent=2)
+            try:
+                await _run_in_supervisor_thread(self.state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self._logger.warning(f"SpotInstanceResilienceHandler._preserve_state: file write failed: {io_err}")
+                return
             self._logger.info(f"State preserved to {self.state_file}")
 
         except Exception as e:
@@ -14056,7 +14070,12 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
         """Load preserved state from previous session."""
         try:
             if self.state_file.exists():
-                state = json.loads(self.state_file.read_text())
+                try:
+                    raw = await _run_in_supervisor_thread(self.state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self._logger.warning(f"SpotInstanceResilienceHandler.load_preserved_state: file read failed: {io_err}")
+                    return None
+                state = json.loads(raw)
                 return state
         except Exception as e:
             self._logger.error(f"Failed to load preserved state: {e}")
@@ -22567,8 +22586,13 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
             }
 
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps(state, indent=2))
-            self._logger.info(f"💾 State preserved to {self.state_file}")
+            payload = json.dumps(state, indent=2)
+            try:
+                await _run_in_supervisor_thread(self.state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self._logger.warning(f"SpotInstanceResilienceHandler._preserve_state: file write failed: {io_err}")
+                return
+            self._logger.info(f"State preserved to {self.state_file}")
 
         except Exception as e:
             self._logger.error(f"State preservation failed: {e}")
@@ -22615,8 +22639,13 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
         """Load preserved state from previous session."""
         try:
             if self.state_file.exists():
-                state = json.loads(self.state_file.read_text())
-                self._logger.info(f"💾 Loaded preserved state from {self.state_file}")
+                try:
+                    raw = await _run_in_supervisor_thread(self.state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self._logger.warning(f"SpotInstanceResilienceHandler.load_preserved_state: file read failed: {io_err}")
+                    return None
+                state = json.loads(raw)
+                self._logger.info(f"Loaded preserved state from {self.state_file}")
 
                 # Restore preemption history
                 if "preemption_history" in state:
@@ -29981,7 +30010,11 @@ class DistributedStateCoordinator:
         state_file = self._state_dir / f"{self._component_name}.state.json"
         if state_file.exists():
             try:
-                content = state_file.read_text()
+                try:
+                    content = await _run_in_supervisor_thread(state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    _unified_logger.warning(f"[StateCoordinator] _load_state file read failed: {io_err}")
+                    return
                 data = json.loads(content)
                 self._local_state = data.get("namespaces", {})
                 self._vector_clock = data.get("vector_clock", {self._component_name: 0})
@@ -30000,7 +30033,11 @@ class DistributedStateCoordinator:
                 "version": self._version,
                 "timestamp": time.time(),
             }
-            state_file.write_text(json.dumps(data, indent=2))
+            payload = json.dumps(data, indent=2)
+            try:
+                await _run_in_supervisor_thread(state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                _unified_logger.warning(f"[StateCoordinator] _save_state file write failed: {io_err}")
         except Exception as e:
             _unified_logger.warning(f"[StateCoordinator] Failed to save state: {e}")
 
@@ -30247,46 +30284,73 @@ class TrinityOrchestrationEngine:
             "commit_index": self._commit_index,
             "timestamp": time.time(),
         }
-        heartbeat_file.write_text(json.dumps(data))
+        payload = json.dumps(data)
+        try:
+            await _run_in_supervisor_thread(heartbeat_file.write_text, payload, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] Heartbeat write timed out")
 
-    async def _discover_nodes(self) -> List[str]:
-        """Discover other nodes in the cluster."""
-        nodes = []
+    def _sync_discover_nodes(self) -> List[Dict[str, Any]]:
+        """Sync helper: read heartbeat files from disk, return parsed entries."""
+        entries = []
         for heartbeat_file in self._cluster_dir.glob("*.heartbeat"):
             try:
                 content = heartbeat_file.read_text()
                 data = json.loads(content)
-                node_id = data.get("node_id")
-                timestamp = data.get("timestamp", 0)
-
-                # Only include recent nodes
-                if time.time() - timestamp < 10:
-                    nodes.append(node_id)
-                    self._node_last_seen[node_id] = timestamp
-
-                    # Update leader if needed
-                    if data.get("state") == "leader":
-                        self._leader_id = node_id
-                        if node_id != self._node_id:
-                            self._state = self.NodeState.FOLLOWER
-
+                entries.append(data)
             except Exception:
                 pass
+        return entries
+
+    async def _discover_nodes(self) -> List[str]:
+        """Discover other nodes in the cluster."""
+        try:
+            entries = await _run_in_supervisor_thread(self._sync_discover_nodes, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] Node discovery I/O timed out")
+            return list(self._known_nodes - {self._node_id})
+
+        nodes = []
+        for data in entries:
+            node_id = data.get("node_id")
+            timestamp = data.get("timestamp", 0)
+
+            # Only include recent nodes
+            if time.time() - timestamp < 10:
+                nodes.append(node_id)
+                self._node_last_seen[node_id] = timestamp
+
+                # Update leader if needed
+                if data.get("state") == "leader":
+                    self._leader_id = node_id
+                    if node_id != self._node_id:
+                        self._state = self.NodeState.FOLLOWER
 
         self._known_nodes = set(nodes) | {self._node_id}
         return nodes
+
+    @staticmethod
+    def _sync_read_vote_file(vote_file) -> Optional[Dict[str, Any]]:
+        """Sync helper: read and parse a vote file, return parsed data or None."""
+        if vote_file.exists():
+            try:
+                content = vote_file.read_text()
+                return json.loads(content)
+            except Exception:
+                pass
+        return None
 
     async def _request_vote(self, node_id: str) -> bool:
         """Request vote from a node (file-based simulation)."""
         # In file-based coordination, we use a voting file
         vote_file = self._cluster_dir / f"{node_id}.vote"
-        if vote_file.exists():
-            try:
-                content = vote_file.read_text()
-                data = json.loads(content)
-                return data.get("voted_for") == self._node_id
-            except Exception:
-                pass
+        try:
+            data = await _run_in_supervisor_thread(self._sync_read_vote_file, vote_file, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning(f"[OrchestrationEngine] Vote file read timed out for node {node_id}")
+            return False
+        if data is not None:
+            return data.get("voted_for") == self._node_id
         return False
 
     async def submit_command(self, command: Dict[str, Any]) -> bool:
@@ -30321,11 +30385,16 @@ class TrinityOrchestrationEngine:
             return False
 
         forward_file = self._cluster_dir / f"forward_{self._leader_id}_{int(time.time() * 1000)}.json"
-        forward_file.write_text(json.dumps({
+        payload = json.dumps({
             "from": self._node_id,
             "command": command,
             "timestamp": time.time(),
-        }))
+        })
+        try:
+            await _run_in_supervisor_thread(forward_file.write_text, payload, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] Forward-to-leader write timed out")
+            return False
         return True
 
     async def _apply_entry(self, entry: Dict[str, Any]) -> None:
@@ -30384,18 +30453,29 @@ class TrinityOrchestrationEngine:
 
         return forecasts
 
-    async def _load_state(self) -> None:
-        """Load persisted state."""
-        state_file = self._cluster_dir / f"{self._node_id}.state.json"
+    @staticmethod
+    def _sync_load_state_file(state_file) -> Optional[Dict[str, Any]]:
+        """Sync helper: read and parse state file from disk."""
         if state_file.exists():
             try:
                 content = state_file.read_text()
-                data = json.loads(content)
-                self._current_term = data.get("term", 0)
-                self._voted_for = data.get("voted_for")
-                self._commit_index = data.get("commit_index", 0)
-            except Exception as e:
-                _unified_logger.warning(f"[OrchestrationEngine] Failed to load state: {e}")
+                return json.loads(content)
+            except Exception:
+                return None
+        return None
+
+    async def _load_state(self) -> None:
+        """Load persisted state."""
+        state_file = self._cluster_dir / f"{self._node_id}.state.json"
+        try:
+            data = await _run_in_supervisor_thread(self._sync_load_state_file, state_file, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] State load timed out")
+            return
+        if data is not None:
+            self._current_term = data.get("term", 0)
+            self._voted_for = data.get("voted_for")
+            self._commit_index = data.get("commit_index", 0)
 
     async def _save_state(self) -> None:
         """Persist state."""
@@ -30407,7 +30487,11 @@ class TrinityOrchestrationEngine:
             "commit_index": self._commit_index,
             "state": self._state.value,
         }
-        state_file.write_text(json.dumps(data))
+        payload = json.dumps(data)
+        try:
+            await _run_in_supervisor_thread(state_file.write_text, payload, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] State save timed out")
 
     def get_status(self) -> Dict[str, Any]:
         """Get orchestration engine status."""
@@ -32070,6 +32154,24 @@ class DistributedLockManager(SystemService):
 
         return None
 
+    @staticmethod
+    def _sync_check_lock(lock_file) -> Optional[float]:
+        """Sync helper: read lock file. Returns expire_at if held, None if available/absent."""
+        if lock_file.exists():
+            try:
+                lock_data = json.loads(lock_file.read_text())
+                return lock_data.get("expire_at", 0)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return None
+
+    @staticmethod
+    def _sync_write_lock(lock_file, lock_data_json: str) -> None:
+        """Sync helper: atomic temp+rename write for lock file."""
+        temp_file = lock_file.with_suffix(".tmp")
+        temp_file.write_text(lock_data_json)
+        temp_file.rename(lock_file)
+
     async def _try_acquire(
         self,
         resource_id: str,
@@ -32079,22 +32181,21 @@ class DistributedLockManager(SystemService):
         lock_file = self._storage_path / f"{resource_id}.lock"
 
         try:
-            # Check for existing lock
-            if lock_file.exists():
-                try:
-                    lock_data = json.loads(lock_file.read_text())
-                    expire_at = lock_data.get("expire_at", 0)
+            # Check for existing lock (file I/O in thread)
+            try:
+                expire_at = await _run_in_supervisor_thread(self._sync_check_lock, lock_file, timeout=5.0)
+            except asyncio.TimeoutError:
+                _unified_logger.warning(f"[DLM] Lock check timed out for {resource_id}")
+                return None
 
-                    if time.time() < expire_at:
-                        # Lock is held by someone else
-                        return None
+            if expire_at is not None:
+                if time.time() < expire_at:
+                    # Lock is held by someone else
+                    return None
+                # Lock has expired
+                self._stats["locks_expired"] += 1
 
-                    # Lock has expired
-                    self._stats["locks_expired"] += 1
-                except (json.JSONDecodeError, IOError):
-                    pass
-
-            # Create new lock
+            # Create new lock — sequence counter stays in async context (shared state)
             self._sequence_counter += 1
             token = FencingToken(
                 token_id=str(uuid.uuid4()),
@@ -32105,7 +32206,7 @@ class DistributedLockManager(SystemService):
             token.resource_id = resource_id
             token.metadata = metadata or {}
 
-            # Write lock file atomically
+            # Write lock file atomically (file I/O in thread)
             lock_data = {
                 "holder_id": self._node_id,
                 "token": token.to_dict(),
@@ -32113,9 +32214,11 @@ class DistributedLockManager(SystemService):
                 "expire_at": time.time() + self._lock_timeout,
             }
 
-            temp_file = lock_file.with_suffix(".tmp")
-            temp_file.write_text(json.dumps(lock_data))
-            temp_file.rename(lock_file)
+            try:
+                await _run_in_supervisor_thread(self._sync_write_lock, lock_file, json.dumps(lock_data), timeout=5.0)
+            except asyncio.TimeoutError:
+                _unified_logger.warning(f"[DLM] Lock write timed out for {resource_id}")
+                return None
 
             # Track held lock
             self._held_locks[resource_id] = token
@@ -32188,10 +32291,9 @@ class DistributedLockManager(SystemService):
                 _rate_limited_log(self._logger, "warning", "dlm_heartbeat_loop", f"DLM heartbeat error: {e}")
                 await asyncio.sleep(1.0)
 
-    async def _refresh_lock(self, resource_id: str, token: FencingToken) -> bool:
-        """Refresh lock expiration time."""
-        lock_file = self._storage_path / f"{resource_id}.lock"
-
+    @staticmethod
+    def _sync_refresh_lock(lock_file, node_id: str, lock_timeout: float) -> bool:
+        """Sync helper: read+verify+update lock file atomically in thread."""
         try:
             if not lock_file.exists():
                 return False
@@ -32199,16 +32301,26 @@ class DistributedLockManager(SystemService):
             lock_data = json.loads(lock_file.read_text())
 
             # Verify we still hold it
-            if lock_data.get("holder_id") != self._node_id:
+            if lock_data.get("holder_id") != node_id:
                 return False
 
             # Update expiration
-            lock_data["expire_at"] = time.time() + self._lock_timeout
+            lock_data["expire_at"] = time.time() + lock_timeout
             lock_file.write_text(json.dumps(lock_data))
 
             return True
-
         except Exception:
+            return False
+
+    async def _refresh_lock(self, resource_id: str, token: FencingToken) -> bool:
+        """Refresh lock expiration time."""
+        lock_file = self._storage_path / f"{resource_id}.lock"
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_refresh_lock, lock_file, self._node_id, self._lock_timeout, timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            _unified_logger.warning(f"[DLM] Lock refresh timed out for {resource_id}")
             return False
 
     def _detect_deadlock(self, waiting_for: str) -> bool:
@@ -63295,8 +63407,13 @@ class UnifiedTrinityConnector:
                 # Ensure parent directory exists
                 staging.parent.mkdir(parents=True, exist_ok=True)
 
-                # Write staged content
-                staging.write_text(content)
+                # Write staged content via executor to avoid blocking
+                try:
+                    await _run_in_supervisor_thread(staging.write_text, content, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self.logger.error(f"[Trinity.Connector] 2PC staging write failed for {repo}/{file_path}: {io_err}")
+                    prepare_failed = True
+                    break
 
                 prepared.append({
                     "repo": repo,
@@ -66930,8 +67047,12 @@ class JarvisSystemKernel:
                         return False
 
             # Create lock file with timestamp
-            self.BROWSER_LOCK_FILE.write_text(str(time.time()))
-            self.BROWSER_PID_FILE.write_text(str(os.getpid()))
+            try:
+                await _run_in_supervisor_thread(self.BROWSER_LOCK_FILE.write_text, str(time.time()), timeout=5.0)
+                await _run_in_supervisor_thread(self.BROWSER_PID_FILE.write_text, str(os.getpid()), timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self.logger.warning(f"_acquire_browser_lock: file write failed: {io_err}")
+                return False
             self.logger.debug(f"Acquired browser lock (PID {os.getpid()})")
             return True
 
