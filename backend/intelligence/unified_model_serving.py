@@ -2286,6 +2286,12 @@ class ModelRouter:
             for provider in ModelProvider
         }
 
+        # v290.1: Cached capability manifests (populated by contract gate)
+        self._capability_manifests = {}
+
+        # v290.1: Health authority delegation (PrimeRouter tells us IF reachable)
+        self._health_authority = None  # Set via set_health_authority()
+
     def record_provider_result(
         self,
         provider: ModelProvider,
@@ -2417,9 +2423,11 @@ class ModelRouter:
             result.insert(0, request.preferred_provider)
 
         if request.require_vision:
-            # Only providers with vision support
-            vision_providers = {ModelProvider.CLAUDE, ModelProvider.PRIME_CLOUD_RUN}
-            result = [p for p in result if p in vision_providers]
+            # v290.1: Manifest-driven capability check (replaces hardcoded set)
+            result = [
+                p for p in result
+                if self._provider_supports_capability(p, "vision")
+            ]
 
         if request.require_tool_use:
             # Only Claude supports tool use (Prime tool use is experimental)
@@ -2429,7 +2437,51 @@ class ModelRouter:
         if not result and ModelProvider.CLAUDE in available_providers:
             result = [ModelProvider.CLAUDE]
 
+        # v290.1: Shadow routing parity check (transition safety net)
+        if os.environ.get("JARVIS_SHADOW_ROUTING") == "true" and request.require_vision:
+            legacy_vision = {ModelProvider.CLAUDE, ModelProvider.PRIME_CLOUD_RUN}
+            legacy_result = [p for p in preferred if p in available_providers and p in legacy_vision]
+            if set(result) != set(legacy_result):
+                self.logger.warning(
+                    f"Shadow routing parity mismatch: legacy={legacy_result} "
+                    f"new={result} task={request.task_type}"
+                )
+
         return result
+
+    def _provider_supports_capability(self, provider: 'ModelProvider', capability: str) -> bool:
+        """Check if a provider supports a capability via cached manifest.
+
+        Returns True when no manifest exists (bootstrap safety).
+        Circuit breaker handles actual failures at runtime.
+        """
+        if not self._capability_manifests:
+            return True  # No manifests loaded yet — don't exclude
+        manifest = self._capability_manifests.get(provider)
+        if manifest is None:
+            return True  # Unknown = don't exclude, let circuit breaker handle
+        return manifest.supports(capability)
+
+    def set_capability_manifests(self, manifests: dict) -> None:
+        """Set cached capability manifests from contract gate."""
+        self._capability_manifests = manifests
+
+    def set_health_authority(self, prime_router) -> None:
+        """Wire PrimeRouter as health authority (called during startup)."""
+        self._health_authority = prime_router
+        self.logger.info("ModelRouter: health authority wired to PrimeRouter")
+
+    def _is_provider_healthy(self, provider: 'ModelProvider') -> bool:
+        """Query PrimeRouter for provider health.
+
+        Only PRIME_API and PRIME_CLOUD_RUN are routed through PrimeRouter.
+        Other providers are assumed healthy (their own circuit breakers handle failures).
+        """
+        if self._health_authority is None:
+            return True  # No health authority wired yet
+        if provider in (ModelProvider.PRIME_API, ModelProvider.PRIME_CLOUD_RUN):
+            return self._health_authority.is_endpoint_healthy()
+        return True  # CLAUDE, PRIME_LOCAL have their own circuit breakers
 
     def get_provider_stats(self) -> Dict[str, Dict[str, Any]]:
         """Get performance statistics for all providers (v100.2)."""

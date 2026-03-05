@@ -60,7 +60,6 @@ class TestNoDirectClientConstruction:
 class TestCapabilityTaxonomyConsistency:
     """Enforce: no hardcoded capability sets in routing code."""
 
-    @pytest.mark.xfail(reason="Phase 2: hardcoded vision_providers not yet removed")
     def test_no_hardcoded_vision_providers(self):
         """The hardcoded vision_providers set must not exist."""
         serving_path = REPO_ROOT / "backend" / "intelligence" / "unified_model_serving.py"
