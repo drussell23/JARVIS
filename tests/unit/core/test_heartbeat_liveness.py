@@ -128,7 +128,7 @@ class TestHeartbeatValidation:
         base.update(overrides)
         return base
 
-    def test_stale_heartbeat_detected(self) -> None:
+    def test_boot_id_mismatch_detected(self) -> None:
         """boot_id mismatch is detected and reported."""
         payload = self._make_payload(boot_id="wrong-boot-id")
         result = validate_heartbeat(
@@ -136,6 +136,25 @@ class TestHeartbeatValidation:
         )
         assert result["valid"] is False
         assert "boot_id" in result["reason"]
+
+    def test_stale_heartbeat_detected(self) -> None:
+        """Heartbeat with ts_mono too far in the past should be detected as stale."""
+        import uuid
+
+        boot_id = str(uuid.uuid4())
+        payload = {
+            "boot_id": boot_id,
+            "pid": os.getpid(),
+            "ts_mono": time.monotonic() - 60.0,  # 60 seconds ago
+            "monotonic_age_ms": 100,
+            "phase": "ready",
+            "loop_iteration": 10,
+        }
+        result = validate_heartbeat(
+            payload, expected_boot_id=boot_id, max_age_s=30.0
+        )
+        assert result["valid"] is False
+        assert "stale" in result["reason"]
 
     def test_pid_mismatch_detected(self) -> None:
         """A non-existent pid is detected and reported."""
