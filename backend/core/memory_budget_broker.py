@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+from collections import deque
 import logging
 import os
 import threading
@@ -397,7 +398,8 @@ class MemoryBudgetBroker:
         self._phase = StartupPhase.BOOT_CRITICAL
         self._phase_policies = _build_phase_policies()
         self._leases: Dict[str, BudgetGrant] = {}
-        self._event_log: List[Dict[str, Any]] = []
+        self._event_log: deque = deque(maxlen=1000)  # v310.0: ring buffer
+        self._critical_event_log_path = Path.home() / ".jarvis" / "critical_events.jsonl"
         self._lease_file: Path = (
             lease_file if lease_file is not None
             else Path("~/.jarvis/memory/leases.json").expanduser()
@@ -972,7 +974,7 @@ class MemoryBudgetBroker:
     def _emit_event(
         self, event_type: MemoryBudgetEventType, data: Dict[str, Any],
     ) -> None:
-        """Emit a structured event for observability."""
+        """Emit a structured event for observability. Critical events spill to disk."""
         event = {
             "type": event_type.value,
             "timestamp": time.time(),
@@ -982,6 +984,15 @@ class MemoryBudgetBroker:
         }
         self._event_log.append(event)
         logger.debug("Event: %s", event)
+
+        # v310.0: Spill critical events to disk
+        if data.get("severity") == "critical" or event_type.value in ("grant_revoked", "oom_kill"):
+            try:
+                self._critical_event_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(self._critical_event_log_path, "a") as f:
+                    f.write(json.dumps(event) + "\n")
+            except OSError:
+                pass  # Best-effort disk spill
 
 
 # ===================================================================
