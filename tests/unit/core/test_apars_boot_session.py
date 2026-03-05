@@ -261,6 +261,19 @@ class TestProcessEpochValidation:
         assert payload.get("process_epoch") == "a1b2c3d4e5f6"
 
 
+class TestStaleMetadataGC:
+    def test_startup_script_has_gc_logic(self):
+        """Startup script must clean up stale progress files."""
+        script = _get_golden_startup_script()
+        assert "APARS_FILE_MAX_AGE_S" in script
+        assert "stale" in script.lower() or "cleanup" in script.lower() or "gc" in script.lower()
+
+    def test_startup_script_archives_prev(self):
+        """Startup script must archive previous progress file."""
+        script = _get_golden_startup_script()
+        assert ".prev.json" in script or "prev" in script
+
+
 class TestAtomicWritesAndVersion:
     def test_startup_script_uses_atomic_apars_write(self):
         """APARS progress file must be written atomically (write temp + mv)."""

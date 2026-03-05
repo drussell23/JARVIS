@@ -8801,6 +8801,36 @@ log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
 
+# APARS Stale Metadata GC
+APARS_FILE_MAX_AGE_S=${APARS_FILE_MAX_AGE_S:-3600}
+if [ -f "$PROGRESS_FILE" ]; then
+    # Check if stale from previous boot
+    _existing_session=$(python3 -c "
+import json, sys
+try:
+    with open('$PROGRESS_FILE') as f:
+        d = json.load(f)
+    print(d.get('boot_session_id', 'unknown'))
+except: print('unknown')
+" 2>/dev/null)
+    if [ "$_existing_session" != "unknown" ] && [ "$_existing_session" != "$BOOT_SESSION_ID" ]; then
+        log "APARS GC: Removing stale progress file from previous boot (session=$_existing_session)"
+        rm -f "$PROGRESS_FILE"
+    elif [ "$_existing_session" = "$BOOT_SESSION_ID" ]; then
+        # Same boot, different process — archive
+        log "APARS GC: Archiving previous process progress file"
+        mv "$PROGRESS_FILE" "${PROGRESS_FILE%.json}.prev.json" 2>/dev/null || true
+    fi
+    # Age-based cleanup
+    if [ -f "$PROGRESS_FILE" ]; then
+        _file_age=$(( $(date +%s) - $(stat -c %Y "$PROGRESS_FILE" 2>/dev/null || stat -f %m "$PROGRESS_FILE" 2>/dev/null || echo 0) ))
+        if [ "$_file_age" -gt "$APARS_FILE_MAX_AGE_S" ]; then
+            log "APARS GC: Removing aged progress file (${_file_age}s old, max=${APARS_FILE_MAX_AGE_S}s)"
+            rm -f "$PROGRESS_FILE"
+        fi
+    fi
+fi
+
 update_apars() {
     local phase=$1
     local phase_progress=$2
