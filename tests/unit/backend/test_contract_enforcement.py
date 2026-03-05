@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 from backend.core.startup_contracts import (
     ContractSeverity, ViolationReasonCode, EnvContract, ENV_CONTRACTS,
     ContractViolationRecord, StartupContractViolation,
+    EnvResolution, get_canonical_env,
 )
 
 
@@ -190,3 +191,69 @@ class TestContractStateAuthority:
             auth.record(self._make_record(f"C{i}"))
         report = auth.full_report()
         assert len(report["violations"]) == 10
+
+
+class TestEnvResolution:
+    """Default-origin tracing for env var resolution."""
+
+    def test_resolution_fields(self):
+        r = EnvResolution(value="8010", origin="explicit", canonical_name="JARVIS_BACKEND_PORT")
+        assert r.value == "8010"
+        assert r.origin == "explicit"
+        assert r.canonical_name == "JARVIS_BACKEND_PORT"
+
+    def test_explicit_origin(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"JARVIS_BACKEND_PORT": "8010"}, clear=False):
+            result = get_canonical_env("JARVIS_BACKEND_PORT")
+            assert isinstance(result, EnvResolution)
+            assert result.value == "8010"
+            assert result.origin == "explicit"
+
+    def test_alias_origin(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True):
+            os.environ["BACKEND_PORT"] = "9090"
+            result = get_canonical_env("JARVIS_BACKEND_PORT")
+            assert isinstance(result, EnvResolution)
+            assert result.value == "9090"
+            assert result.origin == "alias:BACKEND_PORT"
+
+    def test_default_origin(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True):
+            result = get_canonical_env("JARVIS_BACKEND_PORT")
+            assert isinstance(result, EnvResolution)
+            assert result.value == "8010"
+            assert result.origin == "default"
+
+    def test_unset_no_default_returns_none(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True):
+            result = get_canonical_env("JARVIS_PRIME_URL")
+            assert result is None
+
+    def test_non_contracted_var_explicit(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"MY_CUSTOM_VAR": "hello"}, clear=False):
+            result = get_canonical_env("MY_CUSTOM_VAR")
+            assert isinstance(result, EnvResolution)
+            assert result.value == "hello"
+            assert result.origin == "explicit"
+
+    def test_non_contracted_var_unset(self):
+        import os
+        from unittest.mock import patch
+        with patch.dict(os.environ, {}, clear=True):
+            result = get_canonical_env("TOTALLY_UNKNOWN_VAR")
+            assert result is None
+
+    def test_resolution_is_frozen(self):
+        r = EnvResolution(value="x", origin="explicit", canonical_name="Y")
+        with pytest.raises(AttributeError):
+            r.value = "changed"

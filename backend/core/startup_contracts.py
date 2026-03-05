@@ -491,33 +491,40 @@ def validate_health_response(
     return violations
 
 
-def get_canonical_env(contract_name: str) -> Optional[str]:
-    """Get the value of a contracted env var, checking aliases as fallback.
+@dataclass(frozen=True)
+class EnvResolution:
+    """Result of resolving a contracted env var with origin tracing."""
+    value: str
+    origin: str           # "explicit" | "default" | "alias:{alias_name}" | "derived"
+    canonical_name: str
 
-    This is the migration bridge — consumers can call this instead of
-    os.getenv() directly to get consistent behavior regardless of which
-    legacy env var name was set.
 
-    Args:
-        contract_name: The canonical env var name
+def get_canonical_env(contract_name: str) -> Optional["EnvResolution"]:
+    """Get the value of a contracted env var with origin tracing.
 
-    Returns:
-        The value (from canonical or alias), or None if unset.
+    Returns EnvResolution with value + origin, or None if unset with no default.
+    Callers that only need the value use get_canonical_env(...).value.
     """
     contract = _CONTRACT_MAP.get(contract_name)
     if contract is None:
-        # Not a contracted var — fall through to raw getenv
-        return os.environ.get(contract_name)
+        val = os.environ.get(contract_name)
+        if val is None:
+            return None
+        return EnvResolution(value=val, origin="explicit", canonical_name=contract_name)
 
     # Try canonical first
     val = os.environ.get(contract.canonical_name)
     if val is not None:
-        return val
+        return EnvResolution(value=val, origin="explicit", canonical_name=contract.canonical_name)
 
     # Try aliases in order
     for alias in contract.aliases:
         val = os.environ.get(alias)
         if val is not None:
-            return val
+            return EnvResolution(value=val, origin=f"alias:{alias}", canonical_name=contract.canonical_name)
 
-    return contract.default
+    # Default fallback
+    if contract.default is not None:
+        return EnvResolution(value=contract.default, origin="default", canonical_name=contract.canonical_name)
+
+    return None
