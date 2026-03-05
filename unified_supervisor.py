@@ -10788,8 +10788,10 @@ class GCPInstanceManager(ResourceManagerBase):
         try:
             from backend.core.gcp_lifecycle_bridge import notify_bridge
             notify_bridge("notify_spot_preempted", recovery_attempt=self._recovery_attempts)
-        except Exception:
-            pass
+        except Exception as e:
+            self._logger.warning(
+                f"[KernelTakeover] Failed to notify_spot_preempted: {e}", exc_info=True
+            )
 
         self._logger.warning(
             f"Spot VM preempted! Recovery attempt {self._recovery_attempts}/{self._max_recovery_attempts}"
@@ -34577,7 +34579,7 @@ class AuditEvent:
             f"outcome={self.outcome}"
         )
 
-class AuditTrailRecorder:
+class AuditTrailRecorder(SystemService):
     """
     Compliance-ready audit trail recorder.
 
@@ -34890,6 +34892,41 @@ class AuditTrailRecorder:
             "hash_chain_enabled": self._enable_hash_chain,
             "stats": self._stats.copy(),
         }
+
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        written = self._stats.get("events_written", 0)
+        return (True, f"AuditTrailRecorder: {written} events written, running={self._running}")
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._running,
+            message=f"AuditTrailRecorder: running={self._running}, buffered={len(self._buffer)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        if self._buffer:
+            await self._flush()
+        return True
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AuditTrailRecorder",
+            version="1.0.0",
+            inputs=["supervisor.event.*"],
+            outputs=["audit.entry.created"],
+            side_effects=["writes_audit_trail"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 # =============================================================================
 # ZONE 4.11: WORKFLOW AND TASK ORCHESTRATION
@@ -40947,7 +40984,7 @@ class PolicyEvaluationResult:
     evaluated_at: datetime = field(default_factory=datetime.now)
     context: Dict[str, Any] = field(default_factory=dict)
 
-class SecurityPolicyEngine:
+class SecurityPolicyEngine(SystemService):
     """
     Enterprise security policy enforcement engine.
 
@@ -41320,6 +41357,45 @@ class SecurityPolicyEngine:
         """Get all registered policies."""
         return list(self._policies.values())
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        evals = self._metrics.get("evaluations", 0)
+        violations = self._metrics.get("violations", 0)
+        return (True, f"SecurityPolicyEngine: {evals} evaluations, {violations} violations")
+
+    async def cleanup(self) -> None:
+        self._evaluation_cache.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"SecurityPolicyEngine: initialized={self._initialized}, policies={len(self._policies)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SecurityPolicyEngine",
+            version="1.0.0",
+            inputs=["agent.action", "ipc.command"],
+            outputs=["security.violation", "security.allow"],
+            side_effects=["writes_security_audit"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class ComplianceRequirement:
     """
@@ -41355,7 +41431,7 @@ class ComplianceStatus:
     next_assessment: datetime
     assessor: str = "automated"
 
-class ComplianceAuditor:
+class ComplianceAuditor(SystemService):
     """
     Enterprise compliance auditing and tracking system.
 
@@ -41689,7 +41765,7 @@ class ClassifiedData:
     last_accessed: datetime = field(default_factory=datetime.now)
     access_count: int = 0
 
-class DataClassificationManager:
+class DataClassificationManager(SystemService):
     """
     Enterprise data classification and handling system.
 
