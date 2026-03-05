@@ -340,3 +340,26 @@ class TestSeverityAwareValidation:
             url_violations = [r for r in result if r.contract_name == "JARVIS_PRIME_URL"]
             assert len(url_violations) >= 1
             assert url_violations[0].value_origin == "explicit"
+
+
+class TestPrecheckGateWiring:
+    """Preflight gate must be wired in unified_supervisor.py."""
+
+    def test_supervisor_imports_startup_contract_violation(self):
+        import ast
+        with open("unified_supervisor.py", "r") as f:
+            tree = ast.parse(f.read())
+        found = False
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                if node.module and "startup_contracts" in node.module:
+                    names = [alias.name for alias in node.names]
+                    if "StartupContractViolation" in names:
+                        found = True
+        assert found, "unified_supervisor.py must import StartupContractViolation"
+
+    def test_supervisor_references_precheck_blocker(self):
+        with open("unified_supervisor.py", "r") as f:
+            source = f.read()
+        assert "StartupContractViolation" in source
+        assert "PRECHECK_BLOCKER" in source

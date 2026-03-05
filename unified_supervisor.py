@@ -70675,15 +70675,47 @@ class JarvisSystemKernel:
             except Exception: pass
 
         # =====================================================================
-        # v270.3: CONTRACT VALIDATION (non-blocking, advisory only)
+        # v270.3 / Disease-4: CONTRACT VALIDATION (severity-aware preflight gate)
         # =====================================================================
         try:
-            from backend.core.startup_contracts import validate_contracts_at_boot
-            _contract_warnings = validate_contracts_at_boot()
-            for _cw in _contract_warnings:
-                self.logger.warning("[Contract] %s", _cw)
-            if not _contract_warnings:
-                self.logger.debug("[Contract] All %d env var contracts valid", 16)
+            from backend.core.startup_contracts import (
+                validate_contracts_at_boot,
+                ContractSeverity,
+                ContractStateAuthority,
+                StartupContractViolation,
+                ENV_CONTRACTS,
+            )
+            _contract_violations = validate_contracts_at_boot()
+
+            # Initialize state authority for this boot session
+            if not hasattr(self, '_contract_state_authority'):
+                self._contract_state_authority = ContractStateAuthority()
+
+            _precheck_blockers = []
+            for _cv in _contract_violations:
+                self._contract_state_authority.record(_cv)
+                if _cv.effective_severity == ContractSeverity.PRECHECK_BLOCKER:
+                    self.logger.error(
+                        "[Contract] PRECHECK_BLOCKER: %s (reason=%s, origin=%s)",
+                        _cv.violation, _cv.reason_code.value, _cv.value_origin,
+                    )
+                    _precheck_blockers.append(_cv)
+                elif _cv.effective_severity == ContractSeverity.BOOT_BLOCKER:
+                    self.logger.error("[Contract] BOOT_BLOCKER: %s", _cv.violation)
+                elif _cv.effective_severity == ContractSeverity.BLOCK_BEFORE_READY:
+                    self.logger.warning("[Contract] BLOCK_BEFORE_READY: %s", _cv.violation)
+                elif _cv.effective_severity == ContractSeverity.DEGRADED_ALLOWED:
+                    self.logger.warning("[Contract] DEGRADED: %s", _cv.violation)
+                else:
+                    self.logger.info("[Contract] Advisory: %s", _cv.violation)
+
+            if _precheck_blockers:
+                raise StartupContractViolation(_precheck_blockers)
+
+            if not _contract_violations:
+                self.logger.debug("[Contract] All %d env var contracts valid", len(ENV_CONTRACTS))
+        except StartupContractViolation:
+            raise  # Let it propagate to top-level boot runner
         except ImportError:
             pass  # Module not yet available — non-fatal
         except Exception as _ce:
