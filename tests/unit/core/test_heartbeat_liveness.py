@@ -1,0 +1,156 @@
+"""
+v310.0: Tests for HeartbeatWriter and validate_heartbeat.
+
+All tests use tempfile.TemporaryDirectory for full isolation.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+import time
+from pathlib import Path
+
+import pytest
+
+from backend.core.heartbeat_writer import HeartbeatWriter, validate_heartbeat
+
+
+# ======================================================================
+# TestHeartbeatPayload — verifies the written JSON structure
+# ======================================================================
+
+
+class TestHeartbeatPayload:
+    """Verify heartbeat payload correctness."""
+
+    REQUIRED_FIELDS = {
+        "boot_id",
+        "pid",
+        "ts_mono",
+        "monotonic_age_ms",
+        "phase",
+        "loop_iteration",
+        "written_at_wall",
+    }
+
+    def test_heartbeat_payload_has_required_fields(self) -> None:
+        """Write once, verify all 7 fields are present and correct."""
+        with tempfile.TemporaryDirectory() as td:
+            hb_path = Path(td) / "heartbeat.json"
+            writer = HeartbeatWriter(path=hb_path)
+            writer.write(phase="loading", loop_iteration=42)
+
+            payload = json.loads(hb_path.read_text())
+
+            # All required fields present
+            assert set(payload.keys()) == self.REQUIRED_FIELDS
+
+            # pid matches current process
+            assert payload["pid"] == os.getpid()
+
+            # phase and loop_iteration match inputs
+            assert payload["phase"] == "loading"
+            assert payload["loop_iteration"] == 42
+
+    def test_heartbeat_boot_id_is_stable(self) -> None:
+        """Two writes from the same writer produce identical boot_id."""
+        with tempfile.TemporaryDirectory() as td:
+            hb_path = Path(td) / "heartbeat.json"
+            writer = HeartbeatWriter(path=hb_path)
+
+            writer.write(phase="loading", loop_iteration=1)
+            p1 = json.loads(hb_path.read_text())
+
+            writer.write(phase="ready", loop_iteration=2)
+            p2 = json.loads(hb_path.read_text())
+
+            assert p1["boot_id"] == p2["boot_id"]
+
+    def test_heartbeat_monotonic_age_increases(self) -> None:
+        """Two writes with a brief sleep: second age > first age."""
+        with tempfile.TemporaryDirectory() as td:
+            hb_path = Path(td) / "heartbeat.json"
+            writer = HeartbeatWriter(path=hb_path)
+
+            writer.write(phase="loading", loop_iteration=1)
+            p1 = json.loads(hb_path.read_text())
+
+            time.sleep(0.05)  # 50ms
+
+            writer.write(phase="loading", loop_iteration=2)
+            p2 = json.loads(hb_path.read_text())
+
+            assert p2["monotonic_age_ms"] > p1["monotonic_age_ms"]
+
+    def test_heartbeat_atomic_write(self) -> None:
+        """100 rapid writes each produce valid JSON with correct iteration."""
+        with tempfile.TemporaryDirectory() as td:
+            hb_path = Path(td) / "heartbeat.json"
+            writer = HeartbeatWriter(path=hb_path)
+
+            for i in range(100):
+                writer.write(phase="loading", loop_iteration=i)
+                payload = json.loads(hb_path.read_text())
+                assert payload["loop_iteration"] == i
+
+    def test_heartbeat_tmp_file_cleaned_up(self) -> None:
+        """After write completes, no .tmp file remains in the directory."""
+        with tempfile.TemporaryDirectory() as td:
+            hb_path = Path(td) / "heartbeat.json"
+            writer = HeartbeatWriter(path=hb_path)
+            writer.write(phase="ready", loop_iteration=1)
+
+            remaining = list(Path(td).glob("*.tmp"))
+            assert remaining == [], f"Leftover tmp files: {remaining}"
+
+
+# ======================================================================
+# TestHeartbeatValidation — verifies the validate_heartbeat helper
+# ======================================================================
+
+
+class TestHeartbeatValidation:
+    """Verify validation logic for heartbeat payloads."""
+
+    def _make_payload(self, **overrides) -> dict:
+        """Build a valid payload with optional overrides."""
+        base = {
+            "boot_id": "test-boot-id-1234",
+            "pid": os.getpid(),
+            "ts_mono": time.monotonic(),
+            "monotonic_age_ms": 5000,
+            "phase": "ready",
+            "loop_iteration": 10,
+            "written_at_wall": "2026-03-05T07:15:33",
+        }
+        base.update(overrides)
+        return base
+
+    def test_stale_heartbeat_detected(self) -> None:
+        """boot_id mismatch is detected and reported."""
+        payload = self._make_payload(boot_id="wrong-boot-id")
+        result = validate_heartbeat(
+            payload, expected_boot_id="correct-boot-id"
+        )
+        assert result["valid"] is False
+        assert "boot_id" in result["reason"]
+
+    def test_pid_mismatch_detected(self) -> None:
+        """A non-existent pid is detected and reported."""
+        payload = self._make_payload(pid=99999999)
+        result = validate_heartbeat(payload)
+        assert result["valid"] is False
+        assert "pid" in result["reason"]
+
+    def test_valid_heartbeat_accepted(self) -> None:
+        """Matching boot_id and pid yields valid=True."""
+        boot = "my-boot-id"
+        payload = self._make_payload(boot_id=boot)
+        result = validate_heartbeat(
+            payload,
+            expected_boot_id=boot,
+            expected_pid=os.getpid(),
+        )
+        assert result["valid"] is True

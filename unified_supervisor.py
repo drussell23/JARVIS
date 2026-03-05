@@ -63411,6 +63411,11 @@ class JarvisSystemKernel:
         # v290.1: Cross-repo contract gate status
         self._contract_status: str = "pending"
 
+        # v310.0: File-based heartbeat for liveness detection
+        from backend.core.heartbeat_writer import HeartbeatWriter
+        self._heartbeat_writer = HeartbeatWriter()
+        self._heartbeat_iteration = 0
+
         # v300.0: Phase 2 — Autonomy mode flag.
         # "pending" until contracts checked, "active" on pass, "read_only" on hard failure.
         self._autonomy_mode: str = "pending"
@@ -87167,6 +87172,17 @@ class JarvisSystemKernel:
 
                 # Also update dashboard log (at debug level to avoid spam)
                 add_dashboard_log(f"Heartbeat: {current_phase} @ {progress_to_send}%", "DEBUG")
+
+                # v310.0: File heartbeat for external liveness watchdog
+                self._heartbeat_iteration += 1
+                try:
+                    phase = "ready" if current_phase == "complete" else "loading"
+                    self._heartbeat_writer.write(
+                        phase=phase,
+                        loop_iteration=self._heartbeat_iteration,
+                    )
+                except Exception:
+                    pass  # File heartbeat failures are not critical
 
             except asyncio.CancelledError:
                 self.logger.debug("[Heartbeat] Task cancelled, exiting")
