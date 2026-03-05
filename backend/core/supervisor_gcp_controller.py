@@ -30,6 +30,8 @@ from datetime import datetime
 from enum import Enum, auto
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from backend.core.time_utils import monotonic_s, elapsed_since_s
+
 logger = logging.getLogger(__name__)
 
 # Lifecycle bridge — fire-and-forget notifications to V2 state machine.
@@ -103,12 +105,16 @@ class ActiveVM:
     last_activity: datetime
     components_loaded: List[str]
     trigger_request: VMCreationRequest
-    
+
+    # Monotonic timestamps for duration math
+    created_at_mono: float = 0.0
+    last_activity_mono: float = 0.0
+
     # Runtime stats
     requests_handled: int = 0
     memory_freed_mb: float = 0.0
     estimated_cost: float = 0.0
-    
+
     # Idle detection
     idle_since: Optional[datetime] = None
     idle_warnings: int = 0
@@ -250,7 +256,9 @@ class SupervisorAwareGCPController:
         self._vms_created_today = 0
         self._spend_today = 0.0
         self._last_vm_created: Optional[datetime] = None
+        self._last_vm_created_mono: float = 0.0
         self._last_vm_terminated: Optional[datetime] = None
+        self._last_vm_terminated_mono: float = 0.0
         
         # Effectiveness tracking
         self._effective_vms = 0
@@ -497,7 +505,7 @@ class SupervisorAwareGCPController:
             
             # Check 4: Too soon after last VM?
             if self._last_vm_created:
-                elapsed = (datetime.now() - self._last_vm_created).total_seconds() / 60
+                elapsed = elapsed_since_s(self._last_vm_created_mono) / 60
                 if elapsed < self.config.min_creation_interval_minutes:
                     if urgency not in ("high", "critical"):
                         decision = VMDecision.DENY_COOLDOWN
@@ -635,6 +643,7 @@ class SupervisorAwareGCPController:
             
             # Track the VM
             now = datetime.now()
+            now_mono = monotonic_s()
             active_vm = ActiveVM(
                 instance_id=vm.instance_id,  # v132.1: VMInstance is a dataclass, not dict
                 created_at=now,
@@ -647,6 +656,8 @@ class SupervisorAwareGCPController:
                     requested_by="manual",
                     urgency="medium",
                 ),
+                created_at_mono=now_mono,
+                last_activity_mono=now_mono,
             )
             
             async with self._state_lock:
@@ -654,6 +665,7 @@ class SupervisorAwareGCPController:
                 self._state = VMLifecycleState.RUNNING
                 self._vms_created_today += 1
                 self._last_vm_created = now
+                self._last_vm_created_mono = now_mono
             
             logger.info(f"🚀 VM created: {active_vm.instance_id}")
             
@@ -709,8 +721,8 @@ class SupervisorAwareGCPController:
             if vm_manager:
                 await vm_manager.terminate_vm(vm.instance_id)
             
-            # Calculate and record cost
-            runtime_hours = (datetime.now() - vm.created_at).total_seconds() / 3600
+            # Calculate and record cost (monotonic avoids NTP clock-skew issues)
+            runtime_hours = elapsed_since_s(vm.created_at_mono) / 3600
             self.record_vm_cost(runtime_hours)
             
             async with self._state_lock:
@@ -723,6 +735,7 @@ class SupervisorAwareGCPController:
                 self._active_vm = None
                 self._state = VMLifecycleState.TERMINATED
                 self._last_vm_terminated = datetime.now()
+                self._last_vm_terminated_mono = monotonic_s()
             
             logger.info(
                 f"🛑 VM terminated: {vm.instance_id} "
@@ -752,6 +765,7 @@ class SupervisorAwareGCPController:
         """Record that VM was just used."""
         if self._active_vm:
             self._active_vm.last_activity = datetime.now()
+            self._active_vm.last_activity_mono = monotonic_s()
             self._active_vm.requests_handled += 1
             self._active_vm.idle_since = None
             self._active_vm.idle_warnings = 0
@@ -768,7 +782,7 @@ class SupervisorAwareGCPController:
                     break
                 
                 vm = self._active_vm
-                idle_seconds = (datetime.now() - vm.last_activity).total_seconds()
+                idle_seconds = elapsed_since_s(vm.last_activity_mono)
                 idle_minutes = idle_seconds / 60
                 
                 # Check for idle warning threshold
