@@ -18,5 +18,14 @@
     "JARVIS_GCP_CONTAINER_IMAGE": "us-central1-docker.pkg.dev/jarvis-473803/jarvis/jarvis-gcp-inference:latest",
     "JARVIS_GCP_USE_GOLDEN_IMAGE": "true"
   },
-  "events": []
+  "events": [],
+  "exit_summary": {
+    "exit_time": 1772713585.30226,
+    "exit_time_iso": "2026-03-05T04:26:25.307684",
+    "total_runtime": 12.383011102676392,
+    "total_events": 0,
+    "shutdown_triggered": false,
+    "shutdown_trigger_info": null,
+    "checkpoints": {}
+  }
 }
