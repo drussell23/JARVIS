@@ -159,3 +159,89 @@ class TestVoiceNarratorQueueBounded:
                 )
                 return
         pytest.fail("AsyncVoiceNarrator not found")
+
+
+class TestPhase4Gate:
+    """Gate 4: All resource leak fixes verified in a single parametrized sweep."""
+
+    @pytest.mark.parametrize("check", [
+        "terminal_atexit",
+        "subprocess_cleanup",
+        "chromadb_close",
+        "atomic_persistence",
+        "bounded_collections",
+        "voice_queue_maxsize",
+    ])
+    def test_phase4_gate(self, check):
+        """Phase 4 gate: all resource leak fixes must be in place."""
+        import ast
+
+        with open("unified_supervisor.py", "r") as f:
+            tree = ast.parse(f.read())
+
+        if check == "terminal_atexit":
+            for node in ast.walk(tree):
+                if isinstance(node, ast.FunctionDef) and node.name == "_keyboard_listener":
+                    assert "atexit" in ast.dump(node), "_keyboard_listener must use atexit"
+                    return
+            pytest.fail("_keyboard_listener not found")
+
+        elif check == "subprocess_cleanup":
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                    body = ast.dump(node)
+                    if "memory_pressure" in body and "create_subprocess_exec" in body:
+                        assert "kill" in body, "memory_pressure subprocess needs kill cleanup"
+                        return
+            pytest.fail("memory_pressure method not found")
+
+        elif check == "chromadb_close":
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == "SemanticVoiceCacheManager":
+                    for item in node.body:
+                        if isinstance(item, ast.AsyncFunctionDef) and item.name == "cleanup":
+                            body = ast.dump(item)
+                            assert "reset" in body, "cleanup() must call reset()"
+                            assert "None" in body, "cleanup() must nullify refs"
+                            return
+            pytest.fail("SemanticVoiceCacheManager.cleanup not found")
+
+        elif check == "atomic_persistence":
+            methods_to_check = {
+                "CostTracker": "_save_state",
+                "VMSessionTracker": "_save_registry",
+                "GlobalSessionManager": "_register_global_session",
+            }
+            for cls_name, method_name in methods_to_check.items():
+                for node in ast.walk(tree):
+                    if isinstance(node, ast.ClassDef) and node.name == cls_name:
+                        for item in node.body:
+                            if isinstance(item, (ast.AsyncFunctionDef, ast.FunctionDef)) and item.name == method_name:
+                                body = ast.dump(item)
+                                assert "write_text" not in body, (
+                                    f"{cls_name}.{method_name} still uses write_text"
+                                )
+                                assert "_atomic_write_json" in body, (
+                                    f"{cls_name}.{method_name} must use _atomic_write_json"
+                                )
+
+        elif check == "bounded_collections":
+            targets = {
+                "IntelligentCacheManager": False,
+                "AnimatedProgressBar": False,
+                "RichCliRenderer": False,
+                "SpotInstanceResilienceHandler": False,
+            }
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name in targets:
+                    if "deque" in ast.dump(node):
+                        targets[node.name] = True
+            unbounded = [k for k, v in targets.items() if not v]
+            assert not unbounded, f"Still unbounded: {unbounded}"
+
+        elif check == "voice_queue_maxsize":
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ClassDef) and node.name == "AsyncVoiceNarrator":
+                    assert "maxsize" in ast.dump(node), "AsyncVoiceNarrator must use maxsize"
+                    return
+            pytest.fail("AsyncVoiceNarrator not found")
