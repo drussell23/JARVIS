@@ -100,6 +100,14 @@ def get_or_create_event_loop() -> asyncio.AbstractEventLoop:
     thread_id = threading.get_ident()
 
     with _thread_loop_lock:
+        # Prune entries for dead threads to prevent unbounded growth and TID reuse bugs
+        alive_tids = {t.ident for t in threading.enumerate() if t.ident is not None}
+        dead_tids = [tid for tid in _thread_event_loops if tid not in alive_tids]
+        for tid in dead_tids:
+            old_loop = _thread_event_loops.pop(tid)
+            if not old_loop.is_closed():
+                old_loop.close()
+
         if thread_id in _thread_event_loops:
             loop = _thread_event_loops[thread_id]
             if not loop.is_closed():
