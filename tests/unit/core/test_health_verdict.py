@@ -113,3 +113,18 @@ class TestContractHashCheck:
                 assert "contract_hash" in func_src, \
                     "_ping_health_endpoint must check contract_hash"
                 break
+
+
+class TestCorrelationIdPropagation:
+    def test_ping_health_sends_correlation_header(self):
+        """AST check: _ping_health_endpoint must send X-Correlation-ID."""
+        import ast
+        from pathlib import Path
+        src = Path("backend/core/gcp_vm_manager.py").read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.AsyncFunctionDef) and node.name == "_ping_health_endpoint":
+                func_src = ast.get_source_segment(src, node)
+                assert "X-Correlation-ID" in func_src or "correlation_id" in func_src, \
+                    "_ping_health_endpoint must propagate correlation ID"
+                break

@@ -8424,11 +8424,14 @@ class GCPVMManager:
             Tuple of (verdict: HealthVerdict, health_response: dict)
         """
         import aiohttp
+        import uuid as _uuid
         url = f"http://{ip}:{port}/health"
+        correlation_id = str(_uuid.uuid4())
+        headers = {"X-Correlation-ID": correlation_id}
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout), headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         is_ready = data.get("ready_for_inference", False)
@@ -9266,6 +9269,13 @@ class APARSEnrichmentMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Extract correlation ID from request headers if present
+        correlation_id = None
+        for header_name, header_value in scope.get("headers", []):
+            if header_name == b"x-correlation-id":
+                correlation_id = header_value.decode()
+                break
+
         # Buffer the /health response so we can enrich it
         captured_status = 200
         captured_headers = []
@@ -9288,6 +9298,8 @@ class APARSEnrichmentMiddleware:
                 state = _read_apars()
                 payload = _build_apars_payload(state)
                 if payload:
+                    if correlation_id:
+                        payload["correlation_id"] = correlation_id
                     data["apars"] = payload
                     # INV-1/INV-2: APARS is observational metadata only.
                     # Readiness is determined solely by J-Prime's live response.
