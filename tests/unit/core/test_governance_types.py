@@ -79,3 +79,45 @@ class TestGovernanceDataclasses:
         hp = HealthPolicy()
         assert hp.supports_liveness is True
         assert hp.hysteresis_window == 3
+
+
+class TestComponentDefinitionGovernanceFields:
+    def test_legacy_default(self):
+        from backend.core.component_registry import (
+            ComponentDefinition, Criticality, ProcessType, PromotionLevel,
+        )
+        defn = ComponentDefinition(
+            name="test", criticality=Criticality.OPTIONAL,
+            process_type=ProcessType.IN_PROCESS,
+        )
+        assert defn.promotion_level == PromotionLevel.LEGACY
+        assert defn.activation_mode is None
+        assert defn.constructor_pure is False
+
+    def test_promoted_all_fields(self):
+        from backend.core.component_registry import (
+            ComponentDefinition, Criticality, ProcessType, PromotionLevel,
+            ActivationMode, ReadinessClass, ActivationTier, ResourceBudget,
+            FailurePolicy, RetryStrategy, StateDomain, OwnershipMode,
+            ObservabilityContract, HealthPolicy,
+        )
+        defn = ComponentDefinition(
+            name="test_promoted",
+            criticality=Criticality.REQUIRED,
+            process_type=ProcessType.IN_PROCESS,
+            promotion_level=PromotionLevel.PROMOTED,
+            activation_mode=ActivationMode.ALWAYS_ON,
+            readiness_class=ReadinessClass.BLOCK_READY,
+            activation_tier=ActivationTier.IMMUNE,
+            resource_budget=ResourceBudget(64, 10.0, 4, 30.0),
+            failure_policy_gov=FailurePolicy(
+                RetryStrategy.EXP_BACKOFF, 3, 1.0, 30.0, True, 5, 60.0, True,
+            ),
+            state_domain=StateDomain("test_domain", OwnershipMode.EXCLUSIVE_WRITE),
+            observability_contract=ObservabilityContract(),
+            health_policy=HealthPolicy(),
+            constructor_pure=True,
+            contract_version="1.0.0",
+        )
+        assert defn.promotion_level == PromotionLevel.PROMOTED
+        assert defn.activation_tier == ActivationTier.IMMUNE

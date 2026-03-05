@@ -13,7 +13,7 @@ import os
 import logging
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum
-from typing import Callable, Optional, Union, Dict, List
+from typing import Callable, Optional, Union, Dict, List, Tuple
 from datetime import datetime, timezone
 
 logger = logging.getLogger("jarvis.component_registry")
@@ -197,6 +197,28 @@ class ComponentDefinition:
     # Environment integration
     disable_env_var: Optional[str] = None
     criticality_override_env: Optional[str] = None
+
+    # --- Governance fields (required for PROMOTED, optional for LEGACY) ---
+    promotion_level: PromotionLevel = PromotionLevel.LEGACY
+    activation_mode: Optional[ActivationMode] = None
+    readiness_class: Optional[ReadinessClass] = None
+    activation_tier: Optional[ActivationTier] = None
+    resource_budget: Optional[ResourceBudget] = None
+    failure_policy_gov: Optional[FailurePolicy] = None
+    state_domain: Optional[StateDomain] = None
+    observability_contract: Optional[ObservabilityContract] = None
+    health_policy: Optional[HealthPolicy] = None
+    constructor_pure: bool = False
+    contract_version: Optional[str] = None
+    contract_hash: Optional[str] = None
+
+    # --- Kill-switch hierarchy ---
+    kill_switch_env: Optional[str] = None
+    tier_kill_switch_env: Optional[str] = None
+
+    # --- Cross-tier dependency guard ---
+    max_dependency_tier: Optional[int] = None
+    cross_tier_dependency_allowlist: Tuple[str, ...] = ()
 
     @property
     def effective_criticality(self) -> Criticality:
