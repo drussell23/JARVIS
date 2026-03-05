@@ -153,27 +153,29 @@ class SpaceScreenshotCache:
         
     def _load_patterns(self):
         """Load saved usage patterns"""
+        from backend.vision.intelligence.cache_envelope import load_versioned
+        _USAGE_PATTERNS_VERSION = 1
         pattern_file = self.cache_dir / "usage_patterns.pkl"
-        if pattern_file.exists():
-            try:
-                with open(pattern_file, 'rb') as f:
-                    saved_data = pickle.load(f)
-                    self.usage_patterns = saved_data['patterns']
-                    self.switch_history = saved_data['history']
-                    logger.info(f"Loaded usage patterns for {len(self.usage_patterns)} spaces")
-            except Exception as e:
-                logger.error(f"Failed to load usage patterns: {e}")
+        try:
+            saved_data = load_versioned(pattern_file, expected_version=_USAGE_PATTERNS_VERSION)
+            if saved_data is not None:
+                self.usage_patterns = saved_data['patterns']
+                self.switch_history = saved_data['history']
+                logger.info(f"Loaded usage patterns for {len(self.usage_patterns)} spaces")
+        except Exception as e:
+            logger.error(f"Failed to load usage patterns: {e}")
                 
     def _save_patterns(self):
         """Save usage patterns for persistence"""
+        from backend.vision.intelligence.cache_envelope import save_versioned
+        _USAGE_PATTERNS_VERSION = 1
         pattern_file = self.cache_dir / "usage_patterns.pkl"
         try:
             saved_data = {
                 'patterns': self.usage_patterns,
                 'history': self.switch_history
             }
-            with open(pattern_file, 'wb') as f:
-                pickle.dump(saved_data, f)
+            save_versioned(pattern_file, saved_data, version=_USAGE_PATTERNS_VERSION)
         except Exception as e:
             logger.error(f"Failed to save usage patterns: {e}")
             
@@ -389,21 +391,20 @@ class SpaceScreenshotCache:
         }
         
         try:
-            with open(cache_file, 'wb') as f:
-                pickle.dump(save_data, f)
+            from backend.vision.intelligence.cache_envelope import save_versioned
+            save_versioned(cache_file, save_data, version=1)
         except Exception as e:
             logger.error(f"Failed to save screenshot to disk: {e}")
             
     def _load_screenshot_from_disk(self, space_id: int) -> Optional[CachedScreenshot]:
         """Load screenshot from disk cache"""
+        from backend.vision.intelligence.cache_envelope import load_versioned
         cache_file = self.cache_dir / f"space_{space_id}.pkl"
-        
-        if not cache_file.exists():
-            return None
-            
+
         try:
-            with open(cache_file, 'rb') as f:
-                save_data = pickle.load(f)
+            save_data = load_versioned(cache_file, expected_version=1)
+            if save_data is None:
+                return None
                 
             # Reconstruct PIL Image
             import io

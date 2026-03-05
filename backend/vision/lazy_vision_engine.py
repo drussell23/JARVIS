@@ -318,31 +318,32 @@ class LazyDynamicVisionEngine:
             
     def _load_learned_data(self):
         """Load previously learned patterns and preferences"""
+        from backend.vision.intelligence.cache_envelope import load_versioned
+        _LEARNED_PATTERNS_VERSION = 1
         data_file = Path("backend/data/vision_learned_patterns.pkl")
-        if data_file.exists():
-            try:
-                with open(data_file, 'rb') as f:
-                    data = pickle.load(f)
-                    self.learned_patterns = data.get('patterns', defaultdict(list))
-                    self.pattern_scores = data.get('scores', defaultdict(float))
-                    self.user_preferences = data.get('preferences', defaultdict(float))
+        try:
+            data = load_versioned(data_file, expected_version=_LEARNED_PATTERNS_VERSION)
+            if data is not None:
+                self.learned_patterns = data.get('patterns', defaultdict(list))
+                self.pattern_scores = data.get('scores', defaultdict(float))
+                self.user_preferences = data.get('preferences', defaultdict(float))
                 logger.info("Loaded learned vision patterns")
-            except Exception as e:
-                logger.error(f"Failed to load learned data: {e}")
+        except Exception as e:
+            logger.error(f"Failed to load learned data: {e}")
                 
     async def save_learned_data(self):
         """Save learned patterns and preferences"""
+        from backend.vision.intelligence.cache_envelope import save_versioned
+        _LEARNED_PATTERNS_VERSION = 1
         data_file = Path("backend/data/vision_learned_patterns.pkl")
-        data_file.parent.mkdir(parents=True, exist_ok=True)
-        
+
         data = {
             'patterns': dict(self.learned_patterns),
             'scores': dict(self.pattern_scores),
             'preferences': dict(self.user_preferences)
         }
-        
-        with open(data_file, 'wb') as f:
-            pickle.dump(data, f)
+
+        save_versioned(data_file, data, version=_LEARNED_PATTERNS_VERSION)
             
     async def analyze_command(self, command: str) -> VisionIntent:
         """Analyze vision command using ML to extract intent"""
