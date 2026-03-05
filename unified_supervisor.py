@@ -11643,8 +11643,6 @@ class CostTracker(ResourceManagerBase, SystemService):
     async def _save_state(self) -> None:
         """Persist cost state."""
         try:
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-
             data = {
                 "last_date": time.strftime("%Y-%m-%d"),
                 "last_month": time.strftime("%Y-%m"),
@@ -11655,9 +11653,10 @@ class CostTracker(ResourceManagerBase, SystemService):
                 "updated_at": time.time(),
             }
 
-            payload = json.dumps(data, indent=2)
             try:
-                await _run_in_supervisor_thread(self.state_file.write_text, payload, timeout=5.0)
+                await _run_in_supervisor_thread(
+                    _atomic_write_json, self.state_file, data, timeout=5.0
+                )
             except (asyncio.TimeoutError, Exception) as io_err:
                 self._logger.warning(f"CostTracker._save_state: file write failed: {io_err}")
 
@@ -14885,7 +14884,7 @@ class GlobalSessionManager:
                 "vm_id": None,
                 "status": "active",
             }
-            self.global_tracker_file.write_text(json.dumps(session_info, indent=2))
+            _atomic_write_json(self.global_tracker_file, session_info)
         except Exception as e:
             _unified_logger.warning(f"Failed to register global session: {e}")
 
@@ -14914,7 +14913,7 @@ class GlobalSessionManager:
             self._current_vm = session_data
 
             try:
-                self.session_file.write_text(json.dumps(session_data, indent=2))
+                _atomic_write_json(self.session_file, session_data)
             except Exception as e:
                 _unified_logger.error(f"Failed to write session file: {e}")
                 return False
@@ -15078,9 +15077,8 @@ class GlobalSessionManager:
     async def _save_registry_async(self, registry: Dict[str, Any]):
         """Save VM registry to disk."""
         try:
-            content = json.dumps(registry, indent=2)
             loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, self.vm_registry.write_text, content)
+            await loop.run_in_executor(None, _atomic_write_json, self.vm_registry, registry)
         except Exception as e:
             _unified_logger.error(f"Failed to save VM registry: {e}")
 
@@ -17324,7 +17322,7 @@ class VMSessionTracker:
     def _save_registry(self, registry: Dict[str, Any]) -> None:
         """Save VM registry to disk."""
         try:
-            self.vm_registry.write_text(json.dumps(registry, indent=2))
+            _atomic_write_json(self.vm_registry, registry)
         except Exception as e:
             _unified_logger.error(f"Failed to save VM registry: {e}")
 

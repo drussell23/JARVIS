@@ -82,3 +82,34 @@ class TestTerminalAtexitSafetyNet:
                 )
                 return
         pytest.fail("_keyboard_listener not found")
+
+
+class TestAtomicStatePersistence:
+    """4F: State persistence must use atomic write pattern."""
+
+    @pytest.mark.parametrize("class_name,method_name", [
+        ("CostTracker", "_save_state"),
+        ("VMSessionTracker", "_save_registry"),
+        ("GlobalSessionManager", "_register_global_session"),
+        ("GlobalSessionManager", "_save_registry_async"),
+    ])
+    def test_state_writer_uses_atomic_pattern(self, class_name, method_name):
+        """State write methods must use _atomic_write_json, not raw write_text."""
+        import ast
+
+        with open("unified_supervisor.py", "r") as f:
+            tree = ast.parse(f.read())
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == class_name:
+                for item in node.body:
+                    if isinstance(item, (ast.AsyncFunctionDef, ast.FunctionDef)) and item.name == method_name:
+                        body = ast.dump(item)
+                        assert "write_text" not in body, (
+                            f"{class_name}.{method_name} uses raw write_text — must use _atomic_write_json"
+                        )
+                        assert "_atomic_write_json" in body, (
+                            f"{class_name}.{method_name} must call _atomic_write_json"
+                        )
+                        return
+        pytest.fail(f"{class_name}.{method_name} not found")
