@@ -919,7 +919,8 @@ class MemoryBudgetBroker:
         )
         self._advance_sequence()
         self._latest_snapshot = snapshot
-        for obs in self._pressure_observers:
+        observers = list(self._pressure_observers)  # v310.0: snapshot for safe iteration
+        for obs in observers:
             try:
                 await asyncio.wait_for(
                     obs(tier, snapshot), timeout=_OBSERVER_TIMEOUT_S,
