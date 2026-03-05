@@ -24,27 +24,35 @@ async def test_run_cycle_propagates_deadline_to_extract_features():
 
     runner = EmailTriageRunner.__new__(EmailTriageRunner)
     runner._config = config
-    runner._resolver = MagicMock()
     runner._state_store = None
+    runner._state_store_initialized = True
     runner._label_map = {}
     runner._labels_initialized = True
     runner._fencing_token = 0
     runner._warmed_up = True
     runner._cold_start_done = True
-    runner._outcome_collector = MagicMock()
-    runner._outcome_collector.record = AsyncMock()
+    runner._outcome_collector = None
     runner._weight_adapter = None
+    runner._outbox_replayed = True
+    runner._prior_triaged = {}
 
-    # Mock workspace agent to return one email
+    # Mock workspace agent with _fetch_unread_emails (the actual method run_cycle calls)
     mock_workspace = AsyncMock()
-    mock_workspace.list_emails = AsyncMock(return_value=[
-        {"id": "msg1", "from": "test@example.com", "subject": "Test", "snippet": "hi", "labelIds": []}
-    ])
-    runner._resolver.get = lambda name: {
+    mock_workspace._fetch_unread_emails = AsyncMock(return_value={
+        "emails": [
+            {"id": "msg1", "from": "test@example.com", "subject": "Test", "snippet": "hi", "labelIds": []}
+        ]
+    })
+
+    # Mock resolver with resolve_all as async and get as sync
+    mock_resolver = MagicMock()
+    mock_resolver.resolve_all = AsyncMock()
+    mock_resolver.get = lambda name: {
         "workspace_agent": mock_workspace,
         "router": MagicMock(),
         "notifier": MagicMock(),
     }.get(name)
+    runner._resolver = mock_resolver
 
     deadline = time.monotonic() + 25.0
     captured_deadline = None
@@ -61,14 +69,15 @@ async def test_run_cycle_propagates_deadline_to_extract_features():
             extraction_confidence=0.5, extraction_source="heuristic",
         )
 
-    with patch("autonomy.email_triage.runner.extract_features", side_effect=mock_extract):
-        with patch("autonomy.email_triage.runner.score_email", return_value=MagicMock(tier=3, score=0.5, signals=[])):
-            with patch("autonomy.email_triage.runner.apply_label", new_callable=AsyncMock):
-                try:
-                    await asyncio.wait_for(runner.run_cycle(deadline=deadline), timeout=5.0)
-                except Exception as exc:
-                    print(f"DEBUG: run_cycle raised: {type(exc).__name__}: {exc}")
-                    import traceback; traceback.print_exc()
+    with patch.object(runner, "_ensure_state_store", new_callable=AsyncMock):
+        with patch.object(runner, "_cold_start_recovery", new_callable=AsyncMock):
+            with patch("autonomy.email_triage.runner.extract_features", side_effect=mock_extract):
+                with patch("autonomy.email_triage.runner.score_email", return_value=MagicMock(tier=3, score=0.5, signals=[])):
+                    with patch("autonomy.email_triage.runner.apply_label", new_callable=AsyncMock):
+                        try:
+                            await asyncio.wait_for(runner.run_cycle(deadline=deadline), timeout=5.0)
+                        except Exception:
+                            pass  # May fail on other dependencies, that's fine
 
     assert captured_deadline is not None, "deadline was not propagated to extract_features"
     assert captured_deadline == deadline, f"Expected {deadline}, got {captured_deadline}"
