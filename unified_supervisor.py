@@ -13294,15 +13294,39 @@ class SystemServiceRegistry:
     def __init__(self) -> None:
         self._services: Dict[str, ServiceDescriptor] = {}
         self._activation_order: List[str] = []
+        self._side_effect_owners: Dict[str, str] = {}  # side_effect_name -> service_name
 
     # ── registration ────────────────────────────────────────────────────
 
     def register(self, desc: ServiceDescriptor) -> None:
-        """Register a service. Raises ValueError if adding it would create a dependency cycle."""
+        """Register a service. Raises ValueError if adding it would create a dependency cycle
+        or if its side-effects conflict with an already-registered service."""
         self._services[desc.name] = desc
         try:
             self._check_cycles()
         except ValueError:
+            del self._services[desc.name]
+            raise
+
+        # --- Side-effect ownership validation ---
+        contract = desc.service.capability_contract()
+        new_effects = contract.side_effects if contract.side_effects else []
+        claimed: List[str] = []  # track what we claim so we can roll back
+        try:
+            for effect in new_effects:
+                existing_owner = self._side_effect_owners.get(effect)
+                if existing_owner is not None and existing_owner != desc.name:
+                    raise ValueError(
+                        f"Side-effect ownership conflict: '{effect}' is already owned by "
+                        f"'{existing_owner}', cannot be claimed by '{desc.name}'"
+                    )
+                claimed.append(effect)
+                self._side_effect_owners[effect] = desc.name
+        except ValueError:
+            # Roll back: remove the service and any side-effects we just claimed
+            for eff in claimed:
+                if self._side_effect_owners.get(eff) == desc.name:
+                    del self._side_effect_owners[eff]
             del self._services[desc.name]
             raise
 
