@@ -41287,45 +41287,6 @@ class SecurityPolicyEngine:
         """Get all registered policies."""
         return list(self._policies.values())
 
-    # ── SystemService ABC ──────────────────────────────────────────
-    async def health_check(self) -> Tuple[bool, str]:
-        evals = self._metrics.get("evaluations", 0)
-        violations = self._metrics.get("violations", 0)
-        return (True, f"SecurityPolicyEngine: {evals} evaluations, {violations} violations")
-
-    async def cleanup(self) -> None:
-        self._evaluation_cache.clear()
-
-    async def start(self) -> bool:
-        if not self._initialized:
-            await self.initialize()
-        return True
-
-    async def health(self) -> "ServiceHealthReport":
-        return ServiceHealthReport(
-            alive=True,
-            ready=self._initialized,
-            message=f"SecurityPolicyEngine: initialized={self._initialized}, policies={len(self._policies)}",
-        )
-
-    async def drain(self, deadline_s: float) -> bool:
-        return True
-
-    async def stop(self) -> None:
-        await self.cleanup()
-
-    def capability_contract(self) -> "CapabilityContract":
-        return CapabilityContract(
-            name="SecurityPolicyEngine",
-            version="1.0.0",
-            inputs=["agent.action", "ipc.command"],
-            outputs=["security.violation", "security.allow"],
-            side_effects=["writes_security_audit"],
-        )
-
-    def activation_triggers(self) -> List[str]:
-        return []  # always_on
-
 @dataclass
 class ComplianceRequirement:
     """
@@ -41361,7 +41322,7 @@ class ComplianceStatus:
     next_assessment: datetime
     assessor: str = "automated"
 
-class ComplianceAuditor(SystemService):
+class ComplianceAuditor:
     """
     Enterprise compliance auditing and tracking system.
 
@@ -41662,44 +41623,6 @@ class ComplianceAuditor(SystemService):
         report["summary"]["by_status"] = status_counts
         return report
 
-    # ── SystemService ABC ──────────────────────────────────────────
-    async def health_check(self) -> Tuple[bool, str]:
-        reqs = len(self._requirements)
-        return (True, f"ComplianceAuditor: {reqs} requirements tracked")
-
-    async def cleanup(self) -> None:
-        self._audit_log.clear()
-
-    async def start(self) -> bool:
-        if not self._initialized:
-            await self.initialize()
-        return True
-
-    async def health(self) -> "ServiceHealthReport":
-        return ServiceHealthReport(
-            alive=True,
-            ready=self._initialized,
-            message=f"ComplianceAuditor: initialized={self._initialized}, requirements={len(self._requirements)}",
-        )
-
-    async def drain(self, deadline_s: float) -> bool:
-        return True
-
-    async def stop(self) -> None:
-        await self.cleanup()
-
-    def capability_contract(self) -> "CapabilityContract":
-        return CapabilityContract(
-            name="ComplianceAuditor",
-            version="1.0.0",
-            inputs=["health.report"],
-            outputs=["compliance.violation", "compliance.pass"],
-            side_effects=["writes_compliance_report"],
-        )
-
-    def activation_triggers(self) -> List[str]:
-        return []  # batch_window (always_on for lifecycle purposes)
-
 @dataclass
 class DataClassification:
     """
@@ -41733,7 +41656,7 @@ class ClassifiedData:
     last_accessed: datetime = field(default_factory=datetime.now)
     access_count: int = 0
 
-class DataClassificationManager(SystemService):
+class DataClassificationManager:
     """
     Enterprise data classification and handling system.
 
