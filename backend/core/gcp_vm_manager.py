@@ -181,6 +181,22 @@ def is_gcp_shutdown_requested() -> bool:
 
 
 # ============================================================================
+# v237.0: APARS BOOT SESSION VALIDATION
+# ============================================================================
+
+
+def _is_apars_current_session(session_id: str, expected: str) -> bool:
+    """Check if APARS data belongs to the current boot session.
+
+    Returns True if session matches or is 'unknown' (backward compat).
+    Returns False if session is from a different boot (stale data).
+    """
+    if not session_id or session_id == "unknown":
+        return True  # Backward compat: old scripts don't have session ID
+    return session_id == expected
+
+
+# ============================================================================
 # CIRCUIT BREAKER FOR FAULT TOLERANCE
 # ============================================================================
 
@@ -2557,6 +2573,9 @@ class GCPVMManager:
         self.creating_vms: Dict[str, asyncio.Task] = {}
         self._vm_lock = asyncio.Lock()  # Protect VM state modifications
         self._init_lock = asyncio.Lock()  # Protect initialization
+
+        # v237.0: APARS boot session tracking — discard stale data from previous boots
+        self._current_boot_session_id: Optional[str] = None
 
         # v193.2: Smart VM creation waiting - prevents "blocked: another creation in progress" errors
         # When multiple callers try to create a VM concurrently (e.g., main startup + background retry),
@@ -9669,6 +9688,7 @@ fi
         consecutive_errors = 0  # v235.0: Local variable, reset each polling session
         has_seen_version = False  # v235.3: Track if valid startup_script_version ever received
         has_seen_any_response = False  # v235.3: Track if VM has responded at all
+        self._current_boot_session_id = None  # v237.0: Reset boot session for fresh polling
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
@@ -9694,6 +9714,24 @@ fi
                 has_seen_any_response = True  # v235.3
                 consecutive_errors = 0  # v235.0: Reset on successful response
                 apars = health_data["apars"]
+                # v237.0: Validate boot session — discard stale APARS from previous boots
+                apars_session = apars.get("boot_session_id", "unknown")
+                if self._current_boot_session_id:
+                    if not _is_apars_current_session(apars_session, self._current_boot_session_id):
+                        logger.warning(
+                            f"☁️ [InvincibleNode] Stale APARS data detected "
+                            f"(session={apars_session}, expected={self._current_boot_session_id}). "
+                            f"Ignoring stale progress data."
+                        )
+                        has_real_data = False
+                        # Don't continue — still process health response for other signals
+                else:
+                    # First APARS data — lock onto this boot session
+                    if apars_session != "unknown":
+                        self._current_boot_session_id = apars_session
+                        logger.info(
+                            f"☁️ [InvincibleNode] Locked onto boot session: {apars_session}"
+                        )
                 # v235.2: Detect startup script version mismatches at runtime
                 # Grace period: ignore version mismatch for first 60s of polling.
                 # The progress file (/tmp/jarvis_progress.json) may persist across

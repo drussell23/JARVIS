@@ -118,6 +118,35 @@ class TestAPARSBootSession:
         assert "${BOOT_SESSION_ID}" in progress_json_template
 
 
+class TestAPARSSessionValidation:
+    """Tests for the module-level _is_apars_current_session helper."""
+
+    def test_is_apars_current_session_matching(self):
+        """Matching session IDs should return True."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        assert _is_apars_current_session("session-A", expected="session-A") is True
+
+    def test_is_apars_current_session_mismatched(self):
+        """Different session IDs should return False (stale data)."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        assert _is_apars_current_session("session-B", expected="session-A") is False
+
+    def test_is_apars_current_session_unknown_accepted(self):
+        """'unknown' session ID should be accepted (backward compat)."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        assert _is_apars_current_session("unknown", expected="session-A") is True
+
+    def test_is_apars_current_session_empty_accepted(self):
+        """Empty session ID should be accepted (backward compat)."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        assert _is_apars_current_session("", expected="session-A") is True
+
+    def test_is_apars_current_session_none_accepted(self):
+        """None session ID should be accepted (backward compat)."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        assert _is_apars_current_session(None, expected="session-A") is True
+
+
 class TestConfigurableHealthTimeout:
     def test_startup_script_uses_configurable_health_timeout(self):
         """Startup script must use GCP_SERVICE_HEALTH_TIMEOUT, not hardcoded 30s."""
