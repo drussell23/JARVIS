@@ -124,7 +124,11 @@ class SceneNode:
     properties: Dict[str, Any] = field(default_factory=dict)
     confidence: float = 1.0
     timestamp: datetime = field(default_factory=datetime.now)
-    
+
+    def __post_init__(self):
+        if self.properties is None:
+            self.properties = {}
+
     def get_property(self, key: str, default: Any = None) -> Any:
         """Get a property value, returning default when value is None"""
         value = self.properties.get(key, default)
