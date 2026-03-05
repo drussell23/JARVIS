@@ -11182,6 +11182,51 @@ class SystemService(ABC):
     async def cleanup(self) -> None:
         """Release resources. Called during shutdown."""
 
+    # --- v2 lifecycle (new, with backward-compatible defaults) ---
+
+    async def start(self) -> bool:
+        """Begin active operation. Called after initialize succeeds.
+        Default: returns True (no-op for legacy services)."""
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        """Return structured health report.
+        Default: wraps legacy health_check() into a ServiceHealthReport."""
+        try:
+            ok, msg = await self.health_check()
+            return ServiceHealthReport(alive=True, ready=ok, message=msg)
+        except Exception as exc:
+            return ServiceHealthReport(alive=True, ready=False, message=str(exc))
+
+    async def drain(self, deadline_s: float) -> bool:
+        """Stop accepting new work, flush in-flight ops before deadline.
+        Default: returns True (nothing to drain for legacy services)."""
+        return True
+
+    async def stop(self) -> None:
+        """Release resources. Must be safe to call multiple times.
+        Default: delegates to cleanup()."""
+        await self.cleanup()
+
+    # --- v2 capability declaration (new, with defaults) ---
+
+    def capability_contract(self) -> "CapabilityContract":
+        """Declare inputs, outputs, side effects, idempotency.
+        Default: returns a stub contract with the class name."""
+        return CapabilityContract(
+            name=type(self).__name__,
+            version="0.0.0",
+            inputs=[],
+            outputs=[],
+            side_effects=[],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        """Return list of event topics that should activate this service.
+        Empty list = always_on (activated at boot).
+        Default: returns [] (always_on behavior)."""
+        return []
+
 class CostTracker(ResourceManagerBase, SystemService):
     """
     Enterprise-grade cost tracking for cloud resources.
