@@ -146,7 +146,7 @@ T = TypeVar('T')
 # v235.0: Startup script version tag — bumped on every significant script change.
 # Embedded in VM metadata at creation. Running VMs with a stale version are
 # automatically recycled (deleted + recreated) to pick up the latest script.
-_STARTUP_SCRIPT_VERSION = "236.0"
+_STARTUP_SCRIPT_VERSION = "237.0"
 
 
 # ============================================================================
@@ -8726,7 +8726,8 @@ update_apars() {
     local now=$(date +%s)
     local elapsed=$((now - START_TIME))
 
-    cat > "$PROGRESS_FILE" << EOFPROGRESS
+    local tmp_file="${PROGRESS_FILE}.tmp.$$"
+    cat > "$tmp_file" << EOFPROGRESS
 {
     "phase": ${phase},
     "phase_number": ${phase},
@@ -8748,6 +8749,7 @@ update_apars() {
     "boot_session_id": "${BOOT_SESSION_ID}"
 }
 EOFPROGRESS
+    mv "$tmp_file" "$PROGRESS_FILE"
 }
 
 # SAFE_ENV_LOAD: Load .env in a sandboxed, time-bounded subshell

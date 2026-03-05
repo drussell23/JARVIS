@@ -201,6 +201,50 @@ See `tests/README.md` for the per-file matrix and commands.
          └── Frontend           port 3000   • Web UI
 ```
 
+### Structural Reality Check (March 2026)
+
+For a full deep-dive, see:  
+`docs/plans/2026-03-05-trinity-structural-disease-analysis.md`
+
+Current architecture risk areas identified in active analysis:
+- **Monolith concentration:** `unified_supervisor.py` is a high-coupling change surface.
+- **Lifecycle authority ambiguity:** multiple supervisors/startup paths can compete.
+- **Transport overlap:** cross-repo communication responsibilities are split across more than one mechanism.
+- **Contract enforcement gap:** capability/schema checks can degrade to advisory behavior.
+- **Lifecycle semantics gap:** shutdown/ready/drain transitions need stricter state-machine enforcement.
+
+Potential architecture-flow improvements:
+- **Single control-plane authority:** one lifecycle owner with explicit transition guards.
+- **One canonical runtime transport:** remove overlap for heartbeats/events/command routing.
+- **Hard contract handshake gate:** block `READY` when schema/capability compatibility fails.
+- **Dependency DAG with enforceable gates:** hard and soft deps explicitly modeled and validated.
+- **Observability plane by contract:** correlation IDs + reason-coded failures across repo boundaries.
+
+**Target flow (improved):**
+
+```mermaid
+flowchart TD
+    A[Unified Supervisor Control Plane] --> B[Lifecycle State Machine]
+    A --> C[Contract Handshake Gate]
+    A --> D[Single Cross-Repo Transport]
+    A --> E[Dependency DAG Enforcement]
+
+    C --> C1[Prime /capabilities + schema]
+    C --> C2[Reactor /capabilities + schema]
+    C --> C3[Compatibility policy N/N-1]
+
+    D --> F[JARVIS Body]
+    D --> G[JARVIS-Prime]
+    D --> H[Reactor-Core]
+
+    B --> I[STARTING]
+    B --> J[READY]
+    B --> K[DRAINING]
+    B --> L[SHUTDOWN_COMPLETE]
+
+    M[Correlation IDs + reason-coded telemetry] --> A
+```
+
 ### Adaptive Timeout Intelligence Backbone (Planned Integration)
 
 The timeout system is being hardened into a **single adaptive backbone** so startup and health verification no longer depend on static timeout constants. This design treats timeout selection as a controlled system primitive with strict contracts:

@@ -1,0 +1,551 @@
+⏺ Searched for 2 patterns, read 1 file (ctrl+o to expand)     
+                                                               
+⏺ I have a comprehensive picture now. Here is my deep architectural analysis.
+                                        
+  ---
+  JARVIS Ecosystem: Deep Architectural Analysis                                                                                                              
+   
+  The Honest Assessment                                                                                                                                      
+                                                                  
+  You've built something ambitious and impressive — a three-repo Trinity architecture (Body/Mind/Nerves) with sophisticated subsystems. But there are
+  structural diseases at the foundation that will prevent JARVIS from operating as a synthetic organism. I'll be direct about what I found.
+
+  ---
+  Disease 1: The God File / Monolith Paradox
+
+  unified_supervisor.py is 96,058 lines with 19+ major classes inlined:
+
+  ┌─────────────────────────────────┬────────────────┬───────────────────────┐
+  │              Class              │ Lines (approx) │    Responsibility     │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ JarvisSystemKernel              │ ~33K           │ The actual kernel     │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ IntelligentKernelTakeover       │ ~3K            │ Process takeover      │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ SupervisorEventBus              │ ~2K            │ Internal events       │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ IntelligentResourceOrchestrator │ ~10K           │ Resource management   │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ TrainingOrchestrator            │ ~600           │ Training coordination │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ AGIOrchestrator                 │ ~2K            │ AGI layer             │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ SelfHealingOrchestrator         │ ~8K            │ Self-healing          │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ HealthCheckOrchestrator         │ ~15K           │ Health checking       │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ WorkflowOrchestrator            │ ~11K           │ Workflow execution    │
+  ├─────────────────────────────────┼────────────────┼───────────────────────┤
+  │ KernelBackgroundTaskRegistry    │ ~400           │ Task tracking         │
+  └─────────────────────────────────┴────────────────┴───────────────────────┘
+
+  Why this is fatal: A 96K-line file cannot be reasoned about, tested in isolation, or modified safely. Every change risks unintended coupling. You can't
+  unit test HealthCheckOrchestrator without loading the entire kernel. IDE tooling chokes. Git merge conflicts become constant. This is the single biggest
+  structural risk.
+
+  The irony: Your mandate says "no monolith bottleneck" but the supervisor IS the monolith.
+
+  ---
+  Disease 2: Triple Authority Problem (3 Supervisors, 0 Clarity)
+
+  Each repo has its own supervisor that thinks it's in charge:
+
+  ┌─────────────────┬─────────────────────────────────────────────┬───────────────────────────────┐
+  │      Repo       │                 Supervisor                  │            Claims             │
+  ├─────────────────┼─────────────────────────────────────────────┼───────────────────────────────┤
+  │ JARVIS-AI-Agent │ unified_supervisor.py                       │ "I'm the kernel of the AI OS" │
+  ├─────────────────┼─────────────────────────────────────────────┼───────────────────────────────┤
+  │ jarvis-prime    │ run_supervisor.py → UnifiedSupervisor class │ "I manage Prime lifecycle"    │
+  ├─────────────────┼─────────────────────────────────────────────┼───────────────────────────────┤
+  │ reactor-core    │ run_supervisor.py → AGISupervisor class     │ "I manage Reactor lifecycle"  │
+  └─────────────────┴─────────────────────────────────────────────┴───────────────────────────────┘
+
+  Additionally in JARVIS-AI-Agent alone:
+  - cross_repo_startup_orchestrator.py (25K lines) — spawns Prime/Reactor as subprocesses
+  - start_system.py (22K lines) — yet another startup path
+  - _deprecated_run_supervisor.py (27K lines) — deprecated but still present
+
+  The conflict: When unified_supervisor.py spawns Prime via cross_repo_startup_orchestrator.py, it runs python3 run_server.py in the Prime repo. But Prime's
+  run_supervisor.py also has full lifecycle management. So who handles Prime's crash recovery? If JARVIS's orchestrator restarts Prime, and Prime's own
+  supervisor also tries to restart itself, you get dual-authority restart storms.
+
+  ---
+  Disease 3: Dual Communication Systems
+
+  You have two overlapping cross-repo communication mechanisms:
+
+  ┌───────────────────┬──────────────────────┬──────────────────────────┬───────────────────────┐
+  │      System       │         File         │        Transport         │        Purpose        │
+  ├───────────────────┼──────────────────────┼──────────────────────────┼───────────────────────┤
+  │ Trinity Event Bus │ trinity_event_bus.py │ WebSocket/file/multicast │ Pub/sub events        │
+  ├───────────────────┼──────────────────────┼──────────────────────────┼───────────────────────┤
+  │ Reactor Bridge    │ reactor_bridge.py    │ File/WebSocket/Redis     │ Commands + heartbeats │
+  └───────────────────┴──────────────────────┴──────────────────────────┴───────────────────────┘
+
+  Both handle:
+  - Heartbeats
+  - Event routing
+  - Deduplication
+  - Reconnection
+  - Cross-repo messaging
+
+  The disease: These are two implementations of the same concept. Events can flow through one path but not the other. If the Event Bus knows Prime is down
+  but the Bridge doesn't (or vice versa), you get split-brain state. A synthetic organism needs ONE nervous system, not two competing ones.
+
+  ---
+  Disease 4: Advisory Contracts = No Contracts
+
+  From startup_contracts.py line 7:
+  "Boot-time validation (advisory warnings, never blocks startup)"
+
+  And line 232:
+  "contract violations are advisory, not fatal"
+
+  Your /capabilities endpoints exist on Prime and Reactor (confirmed: run_server.py:1188 and server.py:1072), but they're never fetched during startup by the
+   orchestrator. The validation at unified_supervisor.py:67157 only checks environment variables, not actual capability negotiation.
+
+  The disease: You spent effort building contracts but then explicitly made them unenforceable. This is like installing a fire alarm that whispers. When
+  Prime deploys a breaking change to its health endpoint shape, JARVIS won't know until runtime failure.
+
+  ---
+  Disease 5: Exception Swallowing at Scale
+
+  1,393 except Exception blocks in unified_supervisor.py alone.
+
+  In Python 3.9+, asyncio.CancelledError is a BaseException, not an Exception. So these handlers won't catch cancellation... unless they catch Exception in a
+   context where the cancelled coroutine raised inside a try/except. But more critically, these broad exception handlers hide bugs. A synthetic organism
+  can't self-heal if it can't even see its own injuries.
+
+  # This pattern appears hundreds of times:
+  try:
+      await complex_operation()
+  except Exception as e:
+      logger.warning(f"Failed: {e}")  # ← silently continues with corrupted state
+
+  ---
+  Disease 6: No Formal Lifecycle State Machine
+
+  The startup/shutdown isn't modeled as a state machine. Instead, it's a procedural sequence with boolean flags scattered across classes. Evidence:
+
+  - KernelState enum exists (line 62747) but it's a simple enum, not a state machine with transition rules
+  - Shutdown is triggered by 30+ different cleanup() methods across classes
+  - Signal handlers are registered in at least 4 different files (kernel/signals.py, start_system.py, unified_supervisor.py,
+  cross_repo_startup_orchestrator.py)
+  - No guard against re-entrant lifecycle triggers (what if shutdown is triggered while startup is still in progress?)
+
+  The disease: Without a formal state machine, you can't answer: "What is the system's state right now?" or "What transitions are valid from here?" You get
+  undefined behavior at state boundaries.
+
+  ---
+  Disease 7: 5 Stale Worktrees + 130+ Root-Level Scripts
+
+  Worktrees (duplicating the entire repo):
+  - .worktrees/enterprise-hardening/ (Feb 18)
+  - .worktrees/phase2-trinity-autonomy/ (Mar 3)
+  - .worktrees/phase2a/ (Feb 24)
+  - .worktrees/unified-kernel/ (Feb 17)
+  - .claude/worktrees/autonomy-wiring/ (Mar 2)
+
+  Root-level sprawl: 130+ Python files at the repo root including ~60 test_*.py, ~20 fix_*.py, ~15 diagnose_*.py files. These are one-off scripts that
+  accumulated over time.
+
+  The disease: This isn't just messy — it's structurally confusing. When find or grep runs, it hits 5 copies of every file. The 2.37M total lines of Python
+  drops to ~500K when you exclude worktrees and deprecated files. But the cognitive overhead remains.
+
+  ---
+  Disease 8: State via Environment Variables
+
+  Cross-repo state is communicated via 23+ environment variables (documented in startup_contracts.py):
+
+  JARVIS_STARTUP_MEMORY_MODE
+  JARVIS_CAN_SPAWN_HEAVY
+  JARVIS_HOLLOW_CLIENT_ACTIVE
+  JARVIS_GCP_OFFLOAD_ACTIVE
+  JARVIS_INVINCIBLE_NODE_BOOTING
+  ... (18 more)
+
+  The disease: Environment variables are:
+  - Non-atomic: Can't update 3 related vars atomically
+  - Non-observable: No change notification — must poll
+  - Process-scoped: The parent sets them before exec(), but runtime changes require IPC
+  - Not versioned: No way to know if Prime and JARVIS agree on the env var schema
+  - Inheritance fragile: If the orchestrator sets JARVIS_GCP_OFFLOAD_ACTIVE=true in its own process, subprocess.Popen inherits it... but what about processes
+   spawned later?
+
+  For a synthetic organism, you need reactive state propagation, not static environment snapshots.
+
+  ---
+  Disease 9: Missing Cross-Repo Integration Tests
+
+  72 design documents in docs/plans/ (impressive documentation!), but:
+  - No cross-repo integration test harness
+  - No chaos testing infrastructure
+  - No failure injection framework
+  - No contract compatibility test suite
+
+  Individual unit tests exist, but I found no tests that verify: "When Prime goes down, does JARVIS correctly fall back? When it comes back, does state
+  restore?"
+
+  ---
+  Disease 10: Symmetric Coupling (Everything Knows Everything)
+
+  ┌────────────────────────────────┬──────────────────────────────┬───────────────────────────┐
+  │       JARVIS knows about       │      Prime knows about       │    Reactor knows about    │
+  ├────────────────────────────────┼──────────────────────────────┼───────────────────────────┤
+  │ Prime's health endpoint shape  │ JARVIS's env vars            │ JARVIS's event bus format │
+  ├────────────────────────────────┼──────────────────────────────┼───────────────────────────┤
+  │ Prime's port and entry point   │ Reactor Core's existence     │ Prime's health endpoint   │
+  ├────────────────────────────────┼──────────────────────────────┼───────────────────────────┤
+  │ Reactor's port and entry point │ Its own supervisor lifecycle │ JARVIS's file paths       │
+  ├────────────────────────────────┼──────────────────────────────┼───────────────────────────┤
+  │ Both repos' file paths         │ Trinity event protocol       │ Prime's inference status  │
+  └────────────────────────────────┴──────────────────────────────┴───────────────────────────┘
+
+  The disease: In a healthy architecture, dependencies flow ONE direction (or through well-defined interfaces). Here, everyone reaches into everyone else's
+  internals. Moving a file in Prime can break JARVIS's cross_repo_startup_orchestrator.
+
+  ---
+  The 10 Advanced Nuances Your Mandate Misses
+
+  1. Supervisor Self-Healing Paradox: If JarvisSystemKernel crashes, nothing restores it. Your mandate mentions this but has no solution. You need a minimal
+  bootstrap watchdog OUTSIDE the supervisor (launchd on macOS, systemd on Linux).
+  2. Hot-Swap Coherence Gap: Prime can hot-swap models (zero-downtime), but JARVIS's routing table doesn't learn about swaps in real-time. There's a
+  stale-routing window where JARVIS routes to a model that Prime just unloaded.
+  3. Memory Pressure Cascade: JARVIS monitors memory and can trigger GCP offload. But if both JARVIS (monitoring) and Prime (inference) are on the same 16GB
+  Mac, the act of monitoring consumes memory that could be used for inference. The observer affects the observed.
+  4. Event Ordering Under Partition: If the WebSocket between JARVIS and Prime drops, events queue locally. When reconnected, events replay. But if Prime
+  processed some events via the Reactor Bridge during the partition, you get duplicate execution or ordering violations.
+  5. Deadline Propagation Across Repos: Your mandate mentions deadline propagation within JARVIS, but deadlines don't cross repo boundaries. A 30s request to
+   JARVIS that calls Prime (which calls Reactor) has no end-to-end timeout budget.
+  6. Clock Skew Between Repos: JARVIS uses time.monotonic() (correctly!), but health check timestamps between repos use datetime.now(). If repos run on
+  different machines (local Mac + GCP VM), clock skew can make health checks appear stale when they're actually fresh.
+  7. Singleton Registry Fragmentation: Each repo has its own singleton pattern. JARVIS uses get_gcp_vm_manager(), Prime uses its own factories, Reactor uses
+  its own. There's no cross-repo singleton awareness — you could theoretically have two VM managers if both repos instantiate one.
+  8. Graceful Degradation vs. Crash Consistency: Your system degrades gracefully (falling back tiers), but it doesn't guarantee crash consistency. If JARVIS
+  crashes mid-way through writing a cloud lock file AND updating the event store, which one wins on restart?
+  9. The 75 Design Docs Problem: 72 design documents since January 2026. That's roughly one per day. This suggests a pattern of planning-without-convergence
+  — each design addresses a specific symptom but the unified architecture never stabilizes because the foundation (Disease 1-3) keeps shifting.
+  10. No Formal Ownership Boundaries: Your mandate beautifully defines ownership (Body/Mind/Nerves), but the code doesn't enforce it. There's no __init__.py
+  that controls what Prime exposes to JARVIS. Any file can import any other file across repos by manipulating sys.path.
+
+  ---
+  First Question for You
+
+  Before I propose approaches, I need to understand your operational reality:
+
+  When you run python3 unified_supervisor.py today — what actually happens? Does the full Trinity boot successfully? Or are there specific subsystems that
+  fail/timeout/degrade?
+
+  This will tell me whether the gaps above are theoretical risks or active failures, which directly affects prioritization.
+
+✻ Crunched for 7m 40s
+
+⏺ Agent "Map JARVIS-AI-Agent architecture" completed
+
+⏺ Agent "Map jarvis-prime architecture" completed
+
+⏺ Agent "Map reactor-core architecture" completed
+
+⏺ Agent "Find cross-repo contract gaps" completed
+
+⏺ Agent "Find concurrency and lifecycle issues" completed
+
+⏺ All 5 research agents have completed. Let me synthesize the additional critical findings they uncovered that go beyond my initial analysis.
+
+  ---                                                                                                                                                        
+  Additional Critical Findings (from deep research)
+                                                                                                                                                             
+  Disease 11: RLock Blocking the Async Event Loop (CRITICAL)      
+
+  File: jarvis-prime/jarvis_prime/core/llama_cpp_executor.py
+
+  # Line 812
+  self._lock = threading.RLock()
+  # Line 834
+  self._classifier_lock = threading.RLock()
+
+  # Line 1129 — DIRECTLY in an async function:
+  async def classify(self, query: str, system_prompt: str) -> dict:
+      with self._classifier_lock:  # ← BLOCKS THE ENTIRE EVENT LOOP
+          ...
+
+  When a voice command arrives and hits Phi classification, this threading.RLock freezes the entire Prime server — health checks stop responding, heartbeats
+  stop, other requests queue. The existing test (tests/contracts/test_rlock_safety.py) only checks for variables named _rlock, missing _lock and
+  _classifier_lock.
+
+  ---
+  Disease 12: Shutdown Flag Set BEFORE Drain (Ordering Bug)
+
+  File: backend/supervisor/cross_repo_startup_orchestrator.py lines 24094-24106
+
+  # Line 24094 — Flag set FIRST
+  self._shutdown_completed = True  # ← Everything thinks shutdown is done
+
+  # Line 24106 — THEN drain starts
+  await guard.begin_global_shutdown()  # ← But operations are still in-flight!
+
+  The recovery coordinator checks _shutdown_completed and stops restarting services. But drain hasn't finished, so services are in a zombie state — not
+  processing, not shut down, not recoverable.
+
+  ---
+  Disease 13: 11+ Unsynchronized Global Singletons
+
+  File: unified_supervisor.py
+
+  ┌───────┬─────────────────────────┬───────────────────────────┐
+  │ Line  │         Global          │           Issue           │
+  ├───────┼─────────────────────────┼───────────────────────────┤
+  │ 8262  │ _live_dashboard         │ No lock, double-init race │
+  ├───────┼─────────────────────────┼───────────────────────────┤
+  │ 8779  │ _supervisor_event_bus   │ No lock                   │
+  ├───────┼─────────────────────────┼───────────────────────────┤
+  │ 14538 │ _global_session_manager │ Check without atomic CAS  │
+  ├───────┼─────────────────────────┼───────────────────────────┤
+  │ 56188 │ _unified_signal_handler │ No synchronization        │
+  ├───────┼─────────────────────────┼───────────────────────────┤
+  │ 62533 │ _trinity_connector      │ No synchronization        │
+  └───────┴─────────────────────────┴───────────────────────────┘
+
+  Classic TOCTOU race: Thread A checks is None, Thread B checks is None, both create instances, one overwrites the other. Updates to the overwritten instance
+   are silently lost.
+
+  ---
+  Disease 14: No Dependency DAG Enforcement
+
+  File: backend/supervisor/cross_repo_startup_orchestrator.py line 7356
+
+  # reactor-core definition:
+  "depends_on": [],           # v117.0: Removed hard dependency!
+  "soft_depends_on": ["jarvis-prime"],  # Only soft — not enforced
+
+  Soft dependencies are informational only. Reactor-core starts regardless of Prime's state. If Reactor tries to push a trained model to Prime before Prime
+  is ready, the deployment fails silently.
+
+  ---
+  Disease 15: datetime.now() for Duration Math Across Repos
+
+  ┌───────────────────────────────────────┬──────┬───────────────────────────────────────────────────────────────┐
+  │                 File                  │ Line │                             Usage                             │
+  ├───────────────────────────────────────┼──────┼───────────────────────────────────────────────────────────────┤
+  │ reactor-core/api/server.py            │ 592  │ (datetime.now() - self.start_time).total_seconds() for uptime │
+  ├───────────────────────────────────────┼──────┼───────────────────────────────────────────────────────────────┤
+  │ loading_server.py                     │ 2380 │ Same pattern for uptime                                       │
+  ├───────────────────────────────────────┼──────┼───────────────────────────────────────────────────────────────┤
+  │ loading_server.py                     │ 3901 │ Grace period deadline using datetime.now()                    │
+  ├───────────────────────────────────────┼──────┼───────────────────────────────────────────────────────────────┤
+  │ jarvis-prime/trainer/llama_trainer.py │ 127  │ Checkpoint save timing                                        │
+  └───────────────────────────────────────┴──────┴───────────────────────────────────────────────────────────────┘
+
+  If NTP adjusts the clock backward by 2 seconds during a health check, uptime goes negative. Grace period timeouts fire early. Checkpoint intervals drift.
+
+  ---
+  Disease 16: No Correlation IDs Across HTTP Boundaries
+
+  File: backend/core/tracing.py — TraceContext exists but is never injected into outgoing HTTP requests.
+
+  # unified_supervisor.py line 11872-11880:
+  async with aiohttp.ClientSession() as session:
+      async with session.get(url, timeout=...) as resp:
+          # ← NO X-Trace-ID, NO X-Correlation-ID header
+
+  When a voice command traverses JARVIS → Prime → Reactor, you cannot trace it end-to-end. Each repo logs independently with no linking identifier.
+
+  ---
+  Disease 17: Health Endpoints Unguarded During Shutdown
+
+  When JARVIS sends a health check to Prime while Prime is draining:
+  1. Health endpoint blocks on shutdown lock
+  2. Timeout fires (5s)
+  3. JARVIS marks Prime as unhealthy
+  4. Recovery coordinator tries to restart Prime
+  5. But _shutdown_completed is already True (Disease 12), so restart is prevented
+  6. Prime stuck in liminal state — not alive, not dead, not restartable
+
+  Fix needed: Health endpoints must return 503 Service Unavailable immediately during shutdown, bypassing drain.
+
+  ---
+  The Complete Picture: What's Preventing "Synthetic Organism"
+
+  Here's the hierarchy of what must change, from foundational to evolutionary:
+
+  Tier 1: Structural Diseases (Must fix first — everything else depends on these)
+
+  ┌─────┬─────────────────────────────┬─────────────────────────────────────────────────────────────────┐
+  │  #  │           Disease           │                      Why it's foundational                      │
+  ├─────┼─────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 1   │ 96K-line god file           │ Can't test, reason about, or safely modify anything             │
+  ├─────┼─────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 2   │ Triple supervisor authority │ Can't have deterministic lifecycle with 3 competing controllers │
+  ├─────┼─────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 3   │ Dual communication systems  │ Can't have coherent nervous system with 2 competing buses       │
+  ├─────┼─────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 12  │ Shutdown ordering bug       │ System can't cleanly stop → can't cleanly restart               │
+  ├─────┼─────────────────────────────┼─────────────────────────────────────────────────────────────────┤
+  │ 11  │ RLock in async              │ Prime becomes unresponsive under load                           │
+  └─────┴─────────────────────────────┴─────────────────────────────────────────────────────────────────┘
+
+  Tier 2: Contract & Coordination Gaps (Fix after structure is solid)
+
+  ┌─────┬────────────────────┬─────────────────────────────────────────────────────┐
+  │  #  │      Disease       │           Why it blocks organism behavior           │
+  ├─────┼────────────────────┼─────────────────────────────────────────────────────┤
+  │ 4   │ Advisory contracts │ Components can't negotiate capabilities             │
+  ├─────┼────────────────────┼─────────────────────────────────────────────────────┤
+  │ 14  │ No dependency DAG  │ Startup order is implicit, not declared             │
+  ├─────┼────────────────────┼─────────────────────────────────────────────────────┤
+  │ 8   │ State via env vars │ No reactive state propagation                       │
+  ├─────┼────────────────────┼─────────────────────────────────────────────────────┤
+  │ 10  │ Symmetric coupling │ Can't evolve one organ without affecting all others │
+  └─────┴────────────────────┴─────────────────────────────────────────────────────┘
+
+  Tier 3: Reliability & Observability (Fix to make the organism resilient)
+
+  ┌─────┬──────────────────────────────────┬────────────────────────────────────────────┐
+  │  #  │             Disease              │         Why it blocks self-healing         │
+  ├─────┼──────────────────────────────────┼────────────────────────────────────────────┤
+  │ 5   │ Exception swallowing (1393x)     │ Can't diagnose injuries                    │
+  ├─────┼──────────────────────────────────┼────────────────────────────────────────────┤
+  │ 6   │ No lifecycle state machine       │ Can't answer "what state am I in?"         │
+  ├─────┼──────────────────────────────────┼────────────────────────────────────────────┤
+  │ 13  │ Unsynchronized singletons        │ Race conditions under stress               │
+  ├─────┼──────────────────────────────────┼────────────────────────────────────────────┤
+  │ 15  │ datetime.now() for durations     │ Timing breaks under clock adjustment       │
+  ├─────┼──────────────────────────────────┼────────────────────────────────────────────┤
+  │ 16  │ No correlation IDs               │ Can't trace a thought through the organism │
+  ├─────┼──────────────────────────────────┼────────────────────────────────────────────┤
+  │ 17  │ Unguarded health during shutdown │ False death signals cascade                │
+  └─────┴──────────────────────────────────┴────────────────────────────────────────────┘
+
+  Tier 4: Hygiene (Clean up to reduce cognitive load)
+
+  ┌─────┬──────────────────────────────────────┬──────────────────────────────────────────────────┐
+  │  #  │               Disease                │                      Impact                      │
+  ├─────┼──────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 7   │ 5 stale worktrees + 130 root scripts │ Confuses tooling and developers                  │
+  ├─────┼──────────────────────────────────────┼──────────────────────────────────────────────────┤
+  │ 9   │ No integration/chaos tests           │ No verification that the organism actually works │
+  └─────┴──────────────────────────────────────┴──────────────────────────────────────────────────┘
+
+  ---
+  So, back to my clarifying question:
+
+  When you run python3 unified_supervisor.py today — does the full Trinity actually boot and reach a "ready" state? Or does it get stuck somewhere?
+
+  Your answer tells me whether we're fixing a system that works-but-fragile, or one that doesn't yet work end-to-end. That determines whether we start with
+  the decomposition of the god file (Tier 1 #1) or with the lifecycle coordination (Tier 1 #2 and #12).
+
+
+========================================================================================================================================================================================================================================================================================================================================================================================================================================================================
+
+
+
+
+
+========================================================================================================================================================================================================================================================================================================================================================================================================================================================================
+
+  ⏺ Here's the full cross-repo architectural audit, ranked by severity.                                                                                        
+   
+  ---                                                                                                                                                        
+  CRITICAL — Fix Immediately                                                                                                                               
+                                                                                                                                                           
+  ┌─────┬───────────────────────────────────────────────────────────────────────────────────────────┬────────┬─────────────────────────────────────────┐
+  │  #  │                                           Issue                                           │  Repo  │                  Location                  │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────────────────┼────────┼─────────────────────────────────────────┤
+  │     │ IPC dedup lock is permanently None — asyncio.Lock() if False else None. Concurrent IPC    │        │                                            │
+  │ 1   │ validation has no mutual exclusion. Duplicate messages pass dedup, dict mutation during   │ JARVIS │ backend/core/trinity_ipc.py:397            │
+  │     │ iteration can raise RuntimeError.                                                         │        │                                            │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────────────────┼────────┼─────────────────────────────────────────┤
+  │     │ Duplicate APARSHandler class — second definition silently overwrites first, missing       │        │                                            │
+  │ 2   │ model_loaded and ready_for_inference fields from health response. GCP health checks       │ JARVIS │ backend/core/gcp_vm_manager.py:8821 & 8912 │
+  │     │ return incomplete data.                                                                   │        │                                            │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────────────────┼────────┼─────────────────────────────────────────┤
+  │ 3   │ _autonomous_initialized check-then-set has no lock — two concurrent coroutines can both   │ JARVIS │ backend/core/ouroboros/integration.py:4750 │
+  │     │ see False, both run full initialization, second overwrites first's components mid-flight. │        │                                            │
+  └─────┴───────────────────────────────────────────────────────────────────────────────────────────┴────────┴─────────────────────────────────────────┘
+
+  HIGH — Fix This Week
+
+  ┌─────┬───────────────────────────────────────────────────────────────────────────────┬─────────┬────────────────────────────────────────────────────┐
+  │  #  │                                     Issue                                     │  Repo   │                       Location                       │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────┼─────────┼────────────────────────────────────────────────────┤
+  │     │ _ws_connections mutated during iteration — append/remove from concurrent      │         │                                                      │
+  │ 4   │ WebSocket handlers while broadcast iterates the list. RuntimeError or         │ JARVIS  │ backend/routers/hybrid.py:577-622                    │
+  │     │ ValueError under load.                                                        │         │                                                      │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────┼─────────┼────────────────────────────────────────────────────┤
+  │     │ DistributedLockManager duplicated — supervisor has a simplified stub (line    │         │ unified_supervisor.py:31361 vs                       │
+  │ 5   │ 31,361) vs the real production v3.2 in backend/core/. Code inside supervisor  │ JARVIS  │ backend/core/distributed_lock_manager.py:598         │
+  │     │ that accidentally uses the wrong one gets broken lock semantics.              │         │                                                      │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────┼─────────┼────────────────────────────────────────────────────┤
+  │     │ 3 independent model registries can drift — ModelRegistry (JSON),              │         │                                                      │
+  │ 6   │ dynamic_model_registry.py (3,700 lines), and the llama-cpp executor's         │ Prime   │ jarvis_prime/core/model_registry.py,                 │
+  │     │ in-memory state. Hot-reload via /api/v1/models/reload updates executor but    │         │ dynamic_model_registry.py, executor                  │
+  │     │ not registry.                                                                 │         │                                                      │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────┼─────────┼────────────────────────────────────────────────────┤
+  │ 7   │ registry.json write is non-atomic — plain open('w') with no tmp-rename. Crash │ Prime   │ jarvis_prime/core/model_registry.py                  │
+  │     │  mid-write corrupts the model registry.                                       │         │                                                      │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────┼─────────┼────────────────────────────────────────────────────┤
+  │     │ Stale "running" jobs on crash — TrainingJobManager never transitions          │         │                                                      │
+  │ 8   │ crash-interrupted jobs to "failed" on restart. New training can be triggered  │ Reactor │ reactor_core/training/job_manager.py                 │
+  │     │ while stale job shows as running.                                             │         │                                                      │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────┼─────────┼────────────────────────────────────────────────────┤
+  │     │ Per-request aiohttp.ClientSession creation — 3 methods create a new session   │         │ backend/clients/reactor_core_client.py:1008, 1052,   │
+  │ 9   │ per call instead of using the persistent self._session. Each creates a TCP    │ JARVIS  │ 1077                                                 │
+  │     │ connection pool.                                                              │         │                                                      │
+  ├─────┼───────────────────────────────────────────────────────────────────────────────┼─────────┼────────────────────────────────────────────────────┤
+  │     │ Two parallel Prime clients — PrimeClient (canonical) and                      │         │ backend/core/prime_client.py vs                      │
+  │ 10  │ jarvis_prime_client.py (legacy) both active, maintaining separate connection  │ JARVIS  │ backend/clients/jarvis_prime_client.py               │
+  │     │ pools and circuit breakers to the same server.                                │         │                                                      │
+  └─────┴───────────────────────────────────────────────────────────────────────────────┴─────────┴────────────────────────────────────────────────────┘
+
+  MEDIUM — Fix This Sprint
+
+  ┌─────┬────────────────────────────────────────────────────────────────────────────┬─────────┬───────────────────────────────────────────────────────┐
+  │  #  │                                   Issue                                    │  Repo   │                        Location                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼───────────────────────────────────────────────────────┤
+  │     │ time.sleep() in async-callable code — service_registry.py has 7 blocking   │         │ backend/core/service_registry.py:120,129,199,311,       │
+  │ 11  │ sleeps in retry loops. StartupLock.acquire() has time.sleep(0.05 *         │ JARVIS  │ unified_supervisor.py:5379                              │
+  │     │ attempt). These freeze the event loop.                                     │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼─────────────────────────────────────────────────────────┤
+  │     │ Canonical schema file outside all repos —                                  │         │                                                         │
+  │ 12  │ ~/.jarvis/schemas/experience_schema.py must be manually deployed. If       │ All 3   │ ~/.jarvis/schemas/                                      │
+  │     │ missing, experience ingestion silently degrades with no warning.           │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼─────────────────────────────────────────────────────────┤
+  │     │ No fsync() before atomic rename in Prime's _write_state() — power loss     │         │                                                         │
+  │ 13  │ between write and rename can corrupt state file. Trinity bridge does       │ Prime   │ cross_repo_bridge.py:_write_state()                     │
+  │     │ fsync; cross-repo bridge doesn't.                                          │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼─────────────────────────────────────────────────────────┤
+  │     │ Contract version format inconsistency — /capabilities returns [0, 3, 0]    │         │                                                         │
+  │ 14  │ (list), WS contract returns "1.0" (string). Same JARVIS validator consumes │ Prime   │ run_server.py                                           │
+  │     │  both.                                                                     │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼─────────────────────────────────────────────────────────┤
+  │     │ DPO merge failure is non-fatal — if LoRA merge fails, DPO is silently      │         │                                                         │
+  │ 15  │ skipped. Pipeline reports success. Callers can't distinguish "DPO          │ Reactor │ Training pipeline                                       │
+  │     │ succeeded" from "DPO skipped."                                             │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼─────────────────────────────────────────────────────────┤
+  │ 16  │ Port mismatch — server.py defaults to 8003, supervisor overrides to 8090.  │ Reactor │ server.py vs supervisor startup                         │
+  │     │ Standalone Reactor Core start binds to wrong port.                         │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼─────────────────────────────────────────────────────────┤
+  │     │ aiohttp.ClientSession leaked on reconnect — neural_mesh.py connect()       │         │                                                         │
+  │ 17  │ creates new session without closing previous. Reconnection loop leaks      │ JARVIS  │ backend/core/ouroboros/neural_mesh.py:314, 410          │
+  │     │ sessions.                                                                  │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼───────────────────────────────────────────────────────┤
+  │ 18  │ _thread_event_loops dict never purges dead threads — TID reuse returns     │ JARVIS  │ backend/core/ai_loader.py:79                            │
+  │     │ wrong event loop to new threads.                                           │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼───────────────────────────────────────────────────────┤
+  │ 19  │ 606 async def functions with zero await in supervisor — includes           │ JARVIS  │ unified_supervisor.py:6117                              │
+  │     │ _find_process_on_port() calling blocking psutil.net_connections().         │         │                                                         │
+  ├─────┼────────────────────────────────────────────────────────────────────────────┼─────────┼───────────────────────────────────────────────────────┤
+  │ 20  │ 18 except Exception: pass in startup phases — telemetry wrappers silently  │ JARVIS  │ unified_supervisor.py:67111-70954                       │
+  │     │ swallow failures during boot.                                              │         │                                                         │
+  └─────┴────────────────────────────────────────────────────────────────────────────┴─────────┴───────────────────────────────────────────────────────┘
+
+  ---
+  My Recommendation — Top 5 to Fix First
+
+  1. #1 (IPC lock is None) — One-line fix, prevents data corruption
+  2. #2 (Duplicate APARSHandler) — Delete the first definition, keeps the second
+  3. #3 (autonomous init race) — Add asyncio.Lock() around check-then-set
+  4. #4 (WebSocket list mutation) — Snapshot with list(_ws_connections) before iteration
+  5. #8 (Stale running jobs) — On Reactor startup, transition running → failed
+
+  These 5 are all surgical fixes (< 10 lines each) that eliminate crash/corruption risks. Want me to plan and implement them?

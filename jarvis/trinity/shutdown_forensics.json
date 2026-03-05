@@ -1,8 +1,8 @@
 {
   "version": "151.0",
-  "startup_time": 1772703845.102196,
-  "startup_time_iso": "2026-03-05T01:44:05.102202",
-  "pid": 55389,
+  "startup_time": 1772705161.300339,
+  "startup_time_iso": "2026-03-05T02:06:01.300343",
+  "pid": 53266,
   "python_version": "3.9.6 (default, Dec  2 2025, 07:27:58) \n[Clang 17.0.0 (clang-1700.6.3.2)]",
   "platform": "darwin",
   "initial_environment": {
@@ -18,5 +18,14 @@
     "JARVIS_GCP_CONTAINER_IMAGE": "us-central1-docker.pkg.dev/jarvis-473803/jarvis/jarvis-gcp-inference:latest",
     "JARVIS_GCP_USE_GOLDEN_IMAGE": "true"
   },
-  "events": []
+  "events": [],
+  "exit_summary": {
+    "exit_time": 1772705176.314698,
+    "exit_time_iso": "2026-03-05T02:06:16.316186",
+    "total_runtime": 15.01435899734497,
+    "total_events": 0,
+    "shutdown_triggered": false,
+    "shutdown_trigger_info": null,
+    "checkpoints": {}
+  }
 }
