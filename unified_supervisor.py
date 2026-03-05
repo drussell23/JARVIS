@@ -32603,7 +32603,7 @@ class RetryPolicy:
 
         return False
 
-class ServiceMeshRouter:
+class ServiceMeshRouter(SystemService):
     """
     Service mesh router with intelligent load balancing.
 
@@ -33012,6 +33012,36 @@ class ServiceMeshRouter:
             "services": services,
             "stats": self._stats.copy(),
         }
+
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        healthy_count = sum(
+            1
+            for eps in self._endpoints.values()
+            for ep in eps.values()
+            if ep.healthy
+        )
+        total = sum(len(eps) for eps in self._endpoints.values())
+        return True, f"ok: {healthy_count}/{total} endpoints healthy"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ServiceMeshRouter",
+            version="1.0.0",
+            inputs=["route.request"],
+            outputs=["route.completed"],
+            side_effects=["writes_routing_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 class TelemetryDataPoint:
     """Single telemetry data point."""
@@ -34609,7 +34639,7 @@ class SecretEntry:
             result["value"] = self.value
         return result
 
-class SecretVaultManager:
+class SecretVaultManager(SystemService):
     """
     Secure secret storage with encryption and rotation.
 
@@ -34893,6 +34923,29 @@ class SecretVaultManager:
             "rotation_callbacks": len(self._rotation_callbacks),
             "stats": self._stats.copy(),
         }
+
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._running, f"ok: {len(self._secrets)} secrets stored"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SecretVaultManager",
+            version="1.0.0",
+            inputs=["secret.get", "secret.set"],
+            outputs=["secret.retrieved"],
+            side_effects=["writes_secret_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 class AuditEvent:
     """Represents an audit event for compliance logging."""
@@ -37941,7 +37994,7 @@ class ConnectionPool:
             "stats": self._stats.copy(),
         }
 
-class ConnectionPoolManager:
+class ConnectionPoolManager(SystemService):
     """
     Manages multiple connection pools.
 
@@ -38035,6 +38088,29 @@ class ConnectionPoolManager:
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._running, f"ok: {len(self._pools)} pools managed"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ConnectionPoolManager",
+            version="1.0.0",
+            inputs=["pool.acquire", "pool.release"],
+            outputs=["pool.acquired"],
+            side_effects=["writes_pool_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class HealthCheckType(Enum):
     """Types of health checks."""
     LIVENESS = "liveness"
@@ -38100,7 +38176,7 @@ class HealthCheck:
         self.last_result: Optional[HealthCheckResult] = None
         self.healthy = True
 
-class HealthCheckOrchestrator:
+class HealthCheckOrchestrator(SystemService):
     """
     Comprehensive health checking system.
 
@@ -38345,6 +38421,29 @@ class HealthCheckOrchestrator:
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._checks)} checks registered"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="HealthCheckOrchestrator",
+            version="1.0.0",
+            inputs=["health.check.all"],
+            outputs=["health.report"],
+            side_effects=["writes_health_reports"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class DeploymentPhase(Enum):
     """Deployment phases."""
     PENDING = "pending"
@@ -38423,7 +38522,7 @@ class Deployment:
             "phase_history": self.phase_history,
         }
 
-class DeploymentCoordinator:
+class DeploymentCoordinator(SystemService):
     """
     Deployment lifecycle management.
 
@@ -64407,11 +64506,45 @@ class _ProgressBroadcastWorker(threading.Thread):
         self._conn: Optional[Any] = None  # http.client.HTTPConnection
 
         # Observable state (read by supervisor from the event loop)
-        # These are simple Python objects — atomic under GIL.
+        # v311.0: Protected by _state_lock — += is not atomic (4 bytecodes).
+        self._state_lock = threading.Lock()
         self.consecutive_failures: int = 0
         self.last_error: Optional[str] = None
         self.server_ready: bool = False
         self.total_sent: int = 0
+
+    # -- v311.0: Thread-safe accessor methods for observable state ----------
+
+    def _record_failure(self, error: str) -> None:
+        """Record a send failure. Thread-safe."""
+        with self._state_lock:
+            self.consecutive_failures += 1
+            self.last_error = error
+
+    def _record_success(self) -> None:
+        """Record a successful send. Thread-safe."""
+        with self._state_lock:
+            self.consecutive_failures = 0
+            self.last_error = None
+            self.total_sent += 1
+
+    def _set_server_ready(self, ready: bool) -> None:
+        """Update server readiness. Thread-safe."""
+        with self._state_lock:
+            self.server_ready = ready
+
+    @property
+    def state_snapshot(self) -> Dict[str, Any]:
+        """Thread-safe snapshot of observable state."""
+        with self._state_lock:
+            return {
+                "consecutive_failures": self.consecutive_failures,
+                "last_error": self.last_error,
+                "server_ready": self.server_ready,
+                "total_sent": self.total_sent,
+            }
+
+    # -- End v311.0 accessor methods ---------------------------------------
 
     def enqueue(self, progress_data: Dict[str, Any]) -> None:
         """
@@ -64494,17 +64627,15 @@ class _ProgressBroadcastWorker(threading.Thread):
 
             # Send via persistent HTTP/1.1 connection
             if self._send_http(data, _http, _json):
-                self.consecutive_failures = 0
-                self.last_error = None
-                self.server_ready = True
-                self.total_sent += 1
+                self._record_success()
+                self._set_server_ready(True)
                 self._retry_data = None  # Success — clear retry
             else:
                 # Keep data for retry on next cycle. NOT discarded.
                 # The next enqueue() with newer data will supersede
                 # this via the new_data priority above.
                 self._retry_data = data
-                self.consecutive_failures += 1
+                self._record_failure(self.last_error or "send failed")
                 # Wake ourselves after a short delay to retry
                 # (don't wait for next enqueue or 2s timeout)
                 if not self._stop_requested.is_set():
@@ -64519,7 +64650,7 @@ class _ProgressBroadcastWorker(threading.Thread):
         if final_data is not None:
             for _flush_attempt in range(3):
                 if self._send_http(final_data, _http, _json):
-                    self.total_sent += 1
+                    self._record_success()
                     break
                 import time as _time
                 _time.sleep(0.2)
