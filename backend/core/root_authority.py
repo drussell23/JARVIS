@@ -536,3 +536,49 @@ class RootAuthorityWatcher:
             policy_source="root_authority",
         )
         self._event_sink(event)
+
+
+class EscalationEngine:
+    """Executes the kill escalation ladder: drain -> term -> group_kill.
+
+    Race-safe: re-checks identity before each step.
+    """
+    def __init__(self, timeout_policy: TimeoutPolicy):
+        self._timeout = timeout_policy
+
+    async def escalate(
+        self, subsystem: str, identity: ProcessIdentity,
+        executor: VerdictExecutor, correlation_id: str,
+    ) -> str:
+        """Run escalation ladder. Returns result string."""
+        # Race-safe check
+        current = executor.get_current_identity(subsystem)
+        if current != identity:
+            return "stale_identity"
+
+        # Step 1: Drain
+        result = await executor.execute_drain(
+            subsystem, identity, self._timeout.drain_timeout_s
+        )
+        if result.result == "success":
+            return "drain_success"
+
+        # Step 2: SIGTERM
+        current = executor.get_current_identity(subsystem)
+        if current != identity:
+            return "stale_identity"
+        result = await executor.execute_term(
+            subsystem, identity, self._timeout.term_timeout_s
+        )
+        if result.result == "success":
+            return "term_success"
+
+        # Step 3: Process group kill
+        current = executor.get_current_identity(subsystem)
+        if current != identity:
+            return "stale_identity"
+        result = await executor.execute_group_kill(subsystem, identity)
+        if result.result == "success":
+            return "group_kill_success"
+
+        return "escalation_failed"
