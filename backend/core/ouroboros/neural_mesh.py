@@ -311,6 +311,9 @@ class WebSocketConnection(MeshConnection):
             return False
 
         try:
+            # Close previous session if reconnecting to prevent leak
+            if self._session and not self._session.closed:
+                await self._session.close()
             self._session = aiohttp.ClientSession()
             self._ws = await self._session.ws_connect(
                 self.url,
@@ -407,6 +410,9 @@ class HTTPConnection(MeshConnection):
             return False
 
         try:
+            # Close previous session if reconnecting to prevent leak
+            if self._session and not self._session.closed:
+                await self._session.close()
             self._session = aiohttp.ClientSession()
             # Test connection with a ping
             latency = await self.ping()

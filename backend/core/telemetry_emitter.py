@@ -100,6 +100,14 @@ except ImportError:
             _HAS_CANONICAL_SCHEMA = True
         except ImportError:
             SCHEMA_VERSION = "1.0"
+            import logging as _schema_log
+            _schema_log.getLogger(__name__).warning(
+                "[telemetry] Canonical experience_schema not found in backend/schemas/, "
+                "schemas/, or ~/.jarvis/schemas/. Experience ingestion will use "
+                "degraded format (SCHEMA_VERSION=%s). Deploy experience_schema.py "
+                "to one of these locations to enable full schema validation.",
+                SCHEMA_VERSION,
+            )
 
 logger = logging.getLogger(__name__)
 

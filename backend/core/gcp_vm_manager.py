@@ -146,7 +146,17 @@ T = TypeVar('T')
 # v235.0: Startup script version tag — bumped on every significant script change.
 # Embedded in VM metadata at creation. Running VMs with a stale version are
 # automatically recycled (deleted + recreated) to pick up the latest script.
-_STARTUP_SCRIPT_VERSION = "237.0"
+_STARTUP_SCRIPT_VERSION = "238.0"
+
+# Timeout profiles: environment-appropriate defaults for service_health_timeout.
+# Selected via GCP_TIMEOUT_PROFILE env var; explicit GCP_SERVICE_HEALTH_TIMEOUT
+# always takes precedence.
+TIMEOUT_PROFILES: Dict[str, float] = {
+    "dev": 30.0,
+    "staging": 60.0,
+    "production": 90.0,
+    "golden_image": 120.0,
+}
 
 
 # ============================================================================
@@ -185,15 +195,45 @@ def is_gcp_shutdown_requested() -> bool:
 # ============================================================================
 
 
-def _is_apars_current_session(session_id: str, expected: str) -> bool:
-    """Check if APARS data belongs to the current boot session.
+def _is_apars_current_session(
+    session_id: str,
+    expected: str,
+    process_epoch: Optional[str] = None,
+    expected_epoch: Optional[str] = None,
+) -> bool:
+    """Check if APARS data belongs to current boot session AND process epoch.
 
     Returns True if session matches or is 'unknown' (backward compat).
     Returns False if session is from a different boot (stale data).
+
+    v237.1: Added process_epoch validation. If a process restarts within
+    the same VM boot, the boot_session_id alone won't detect stale APARS
+    data from the crashed process. The process_epoch adds a second
+    dimension of validation — same boot + same epoch = current data.
+    Backward compat: unknown/empty epoch is always accepted.
     """
+    # Boot session check (backward compat: unknown/empty accepted)
     if not session_id or session_id == "unknown":
         return True  # Backward compat: old scripts don't have session ID
-    return session_id == expected
+    if session_id != expected:
+        return False
+    # Process epoch check (backward compat: unknown/empty accepted)
+    if not process_epoch or not expected_epoch:
+        return True
+    return process_epoch == expected_epoch
+
+
+# ============================================================================
+# HEALTH VERDICT ENUM
+# ============================================================================
+
+
+class HealthVerdict(Enum):
+    """Health check verdict with explicit partial-degradation semantics."""
+    READY = "ready"
+    ALIVE_NOT_READY = "alive_not_ready"
+    UNREACHABLE = "unreachable"
+    UNHEALTHY = "unhealthy"
 
 
 # ============================================================================
@@ -681,8 +721,25 @@ class VMManagerConfig:
         default_factory=lambda: float(os.getenv("GCP_STATIC_VM_HEALTH_TIMEOUT", "300.0"))
     )
     # INV-1: Configurable health check timeout for startup script (bash-side)
+    # Supports tiered profiles via GCP_TIMEOUT_PROFILE; explicit GCP_SERVICE_HEALTH_TIMEOUT overrides.
     service_health_timeout: float = field(
-        default_factory=lambda: float(os.getenv("GCP_SERVICE_HEALTH_TIMEOUT", "90.0"))
+        default_factory=lambda: float(
+            os.getenv(
+                "GCP_SERVICE_HEALTH_TIMEOUT",
+                str(TIMEOUT_PROFILES.get(
+                    os.getenv("GCP_TIMEOUT_PROFILE", "production"),
+                    90.0,
+                ))
+            )
+        )
+    )
+
+    # Readiness hysteresis: consecutive checks required for state transition
+    readiness_hysteresis_up: int = field(
+        default_factory=lambda: int(os.getenv("GCP_READINESS_HYSTERESIS_UP", "3"))
+    )
+    readiness_hysteresis_down: int = field(
+        default_factory=lambda: int(os.getenv("GCP_READINESS_HYSTERESIS_DOWN", "2"))
     )
 
     # Health Check Configuration
@@ -3898,13 +3955,13 @@ class GCPVMManager:
 
         # Verify VM is actually ready for inference (not just RUNNING in GCP)
         try:
-            is_ready, health_data = await self._ping_health_endpoint(
+            verdict, health_data = await self._ping_health_endpoint(
                 vm.ip_address, port, timeout=10.0
             )
         except Exception:
             return False
 
-        if not is_ready:
+        if verdict != HealthVerdict.READY:
             return False
 
         # Update health status so the guard at the top of this method
@@ -7519,10 +7576,10 @@ class GCPVMManager:
                                     "JARVIS_PRIME_PORT" if _is_inv else "GCP_BACKEND_PORT",
                                     "8000",
                                 ))
-                                endpoint_ready, _ = await self._ping_health_endpoint(
+                                endpoint_verdict, _ = await self._ping_health_endpoint(
                                     vm.ip_address, _ep_port, timeout=10.0
                                 )
-                                if not endpoint_ready:
+                                if endpoint_verdict != HealthVerdict.READY:
                                     # Track consecutive failures in metadata
                                     _fc = vm.metadata.get("_ep_fail_count", 0) + 1
                                     vm.metadata["_ep_fail_count"] = _fc
@@ -8059,14 +8116,14 @@ class GCPVMManager:
             logger.info(f"☁️ [InvincibleNode] Ensuring VM ready at {static_ip}:{target_port}")
 
             # Step 2: Ping health endpoint
-            is_healthy, health_status = await self._ping_health_endpoint(
+            verdict, health_status = await self._ping_health_endpoint(
                 static_ip, target_port, timeout=10.0
             )
 
             # v235.4: _ping_health_endpoint already checks all readiness signals
             # (ready_for_inference, model_loaded+healthy, APARS, native phase/stage).
             # No need to re-check ready_for_inference here.
-            if is_healthy:
+            if verdict == HealthVerdict.READY:
                 logger.info(f"✅ [InvincibleNode] VM already ready: {static_ip}")
                 return True, static_ip, "ALREADY_READY"
 
@@ -8386,19 +8443,22 @@ class GCPVMManager:
 
     async def _ping_health_endpoint(
         self, ip: str, port: int, timeout: float = 10.0
-    ) -> Tuple[bool, Dict[str, Any]]:
+    ) -> Tuple[HealthVerdict, Dict[str, Any]]:
         """
         Ping the health endpoint to check if VM is ready.
 
         Returns:
-            Tuple of (is_healthy: bool, health_response: dict)
+            Tuple of (verdict: HealthVerdict, health_response: dict)
         """
         import aiohttp
+        import uuid as _uuid
         url = f"http://{ip}:{port}/health"
+        correlation_id = str(_uuid.uuid4())
+        headers = {"X-Correlation-ID": correlation_id}
 
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout), headers=headers) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         is_ready = data.get("ready_for_inference", False)
@@ -8434,12 +8494,27 @@ class GCPVMManager:
                                     # Advisory only — don't block readiness (fail-open)
                             except ImportError:
                                 pass
-                        return is_ready, data
-                    return False, {"status": resp.status}
+                        verdict = HealthVerdict.READY if is_ready else HealthVerdict.ALIVE_NOT_READY
+                        logger.debug(
+                            "[GCPVMManager] Health probe %s → %s",
+                            correlation_id, verdict.value,
+                        )
+                        # Contract hash advisory check
+                        apars_data = data.get("apars", {})
+                        if isinstance(apars_data, dict):
+                            remote_hash = apars_data.get("contract_hash", "")
+                            if remote_hash and hasattr(self, '_expected_contract_hash') and self._expected_contract_hash:
+                                if remote_hash != self._expected_contract_hash:
+                                    logger.warning(
+                                        "[GCPVMManager] Contract hash mismatch: remote=%s, expected=%s",
+                                        remote_hash, self._expected_contract_hash,
+                                    )
+                        return verdict, data
+                    return HealthVerdict.UNHEALTHY, {"status": resp.status}
         except asyncio.TimeoutError:
-            return False, {"error": "timeout"}
+            return HealthVerdict.UNREACHABLE, {"error": "timeout"}
         except Exception as e:
-            return False, {"error": str(e)}
+            return HealthVerdict.UNREACHABLE, {"error": str(e)}
 
     async def _check_vm_ssh_reachable(self, ip: str) -> bool:
         """v235.0: Quick SSH port check for diagnostic purposes.
@@ -8708,12 +8783,53 @@ PROGRESS_FILE="/tmp/jarvis_progress.json"
 JARVIS_DIR="/opt/jarvis-prime"
 START_TIME=$(date +%s)
 BOOT_SESSION_ID=$(uuidgen 2>/dev/null || python3 -c "import uuid; print(uuid.uuid4())" 2>/dev/null || echo "unknown-$$")
+PROCESS_EPOCH=$(python3 -c "import uuid; print(uuid.uuid4().hex[:12])" 2>/dev/null || echo "$$")
+# Compute contract hash from key package versions
+CONTRACT_HASH=$(python3 -c "
+import hashlib, importlib.metadata as m
+pkgs = sorted(['torch', 'transformers', 'llama-cpp-python', 'fastapi', 'uvicorn'])
+versions = []
+for p in pkgs:
+    try: versions.append(f'{p}={m.version(p)}')
+    except: versions.append(f'{p}=unknown')
+print(hashlib.sha256('|'.join(versions).encode()).hexdigest()[:16])
+" 2>/dev/null || echo "unknown")
 STARTUP_SCRIPT_VERSION="__STARTUP_SCRIPT_VERSION__"
 STARTUP_SCRIPT_METADATA_VERSION=""
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
+
+# APARS Stale Metadata GC
+APARS_FILE_MAX_AGE_S=${APARS_FILE_MAX_AGE_S:-3600}
+if [ -f "$PROGRESS_FILE" ]; then
+    # Check if stale from previous boot
+    _existing_session=$(python3 -c "
+import json, sys
+try:
+    with open('$PROGRESS_FILE') as f:
+        d = json.load(f)
+    print(d.get('boot_session_id', 'unknown'))
+except: print('unknown')
+" 2>/dev/null)
+    if [ "$_existing_session" != "unknown" ] && [ "$_existing_session" != "$BOOT_SESSION_ID" ]; then
+        log "APARS GC: Removing stale progress file from previous boot (session=$_existing_session)"
+        rm -f "$PROGRESS_FILE"
+    elif [ "$_existing_session" = "$BOOT_SESSION_ID" ]; then
+        # Same boot, different process — archive
+        log "APARS GC: Archiving previous process progress file"
+        mv "$PROGRESS_FILE" "${PROGRESS_FILE%.json}.prev.json" 2>/dev/null || true
+    fi
+    # Age-based cleanup
+    if [ -f "$PROGRESS_FILE" ]; then
+        _file_age=$(( $(date +%s) - $(stat -c %Y "$PROGRESS_FILE" 2>/dev/null || stat -f %m "$PROGRESS_FILE" 2>/dev/null || echo 0) ))
+        if [ "$_file_age" -gt "$APARS_FILE_MAX_AGE_S" ]; then
+            log "APARS GC: Removing aged progress file (${_file_age}s old, max=${APARS_FILE_MAX_AGE_S}s)"
+            rm -f "$PROGRESS_FILE"
+        fi
+    fi
+fi
 
 update_apars() {
     local phase=$1
@@ -8727,6 +8843,14 @@ update_apars() {
     local elapsed=$((now - START_TIME))
 
     local tmp_file="${PROGRESS_FILE}.tmp.$$"
+
+    # Verify atomic rename safety (same filesystem)
+    local _target_mount=$(df -P "$(dirname "$PROGRESS_FILE")" 2>/dev/null | tail -1 | awk '{print $6}')
+    local _tmp_mount=$(df -P "$(dirname "$tmp_file")" 2>/dev/null | tail -1 | awk '{print $6}')
+    if [ -n "$_target_mount" ] && [ -n "$_tmp_mount" ] && [ "$_target_mount" != "$_tmp_mount" ]; then
+        log "WARNING: APARS temp and target on different mounts ($_tmp_mount vs $_target_mount). Atomic rename may fail."
+    fi
+
     cat > "$tmp_file" << EOFPROGRESS
 {
     "phase": ${phase},
@@ -8746,7 +8870,9 @@ update_apars() {
     "version": "${STARTUP_SCRIPT_VERSION}",
     "startup_script_version": "${STARTUP_SCRIPT_VERSION}",
     "startup_script_metadata_version": "${STARTUP_SCRIPT_METADATA_VERSION}",
-    "boot_session_id": "${BOOT_SESSION_ID}"
+    "boot_session_id": "${BOOT_SESSION_ID}",
+    "process_epoch": "${PROCESS_EPOCH}",
+    "contract_hash": "${CONTRACT_HASH}"
 }
 EOFPROGRESS
     mv "$tmp_file" "$PROGRESS_FILE"
@@ -9193,6 +9319,8 @@ def _build_apars_payload(state):
         "deps_prebaked": state.get("deps_prebaked", True),
         "skipped_phases": state.get("skipped_phases", [2, 3]),
         "boot_session_id": state.get("boot_session_id", "unknown"),
+        "process_epoch": state.get("process_epoch", ""),
+        "contract_hash": state.get("contract_hash", ""),
     }
 
 # ─── ASGI middleware: enrich /health responses with APARS data ───
@@ -9209,6 +9337,13 @@ class APARSEnrichmentMiddleware:
         if scope["type"] != "http" or scope.get("path") != "/health":
             await self.app(scope, receive, send)
             return
+
+        # Extract correlation ID from request headers if present
+        correlation_id = None
+        for header_name, header_value in scope.get("headers", []):
+            if header_name == b"x-correlation-id":
+                correlation_id = header_value.decode()
+                break
 
         # Buffer the /health response so we can enrich it
         captured_status = 200
@@ -9232,6 +9367,8 @@ class APARSEnrichmentMiddleware:
                 state = _read_apars()
                 payload = _build_apars_payload(state)
                 if payload:
+                    if correlation_id:
+                        payload["correlation_id"] = correlation_id
                     data["apars"] = payload
                     # INV-1/INV-2: APARS is observational metadata only.
                     # Readiness is determined solely by J-Prime's live response.
@@ -9714,19 +9851,32 @@ fi
         has_seen_version = False  # v235.3: Track if valid startup_script_version ever received
         has_seen_any_response = False  # v235.3: Track if VM has responded at all
         self._current_boot_session_id = None  # v237.0: Reset boot session for fresh polling
+        self._current_process_epoch = None  # v237.1: Reset process epoch for fresh polling
+        _consecutive_ready = 0
+        _consecutive_not_ready = 0
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
-            is_ready, health_data = await self._ping_health_endpoint(ip, port, timeout=10.0)
+            verdict, health_data = await self._ping_health_endpoint(ip, port, timeout=10.0)
 
-            if is_ready:
-                # v220.1: Report 100% on success
-                if progress_callback:
-                    try:
-                        progress_callback(100, "ready", f"VM ready at {ip}")
-                    except Exception:
-                        pass
-                return True, "ready_for_inference"
+            if verdict == HealthVerdict.READY:
+                _consecutive_ready += 1
+                _consecutive_not_ready = 0
+                if _consecutive_ready >= self.config.readiness_hysteresis_up:
+                    if progress_callback:
+                        try:
+                            progress_callback(100, "ready", f"VM ready at {ip}")
+                        except Exception:
+                            pass
+                    return True, "ready_for_inference"
+                else:
+                    logger.info(
+                        f"☁️ [InvincibleNode] Health READY ({_consecutive_ready}/"
+                        f"{self.config.readiness_hysteresis_up} for hysteresis)"
+                    )
+            else:
+                _consecutive_not_ready += 1
+                _consecutive_ready = 0
 
             # Extract progress info for logging and callback
             progress_pct = 0
@@ -9756,6 +9906,26 @@ fi
                         self._current_boot_session_id = apars_session
                         logger.info(
                             f"☁️ [InvincibleNode] Locked onto boot session: {apars_session}"
+                        )
+                # v237.1: Validate process epoch — detect stale APARS from crashed process
+                # within the same VM boot (boot_session_id matches but process restarted)
+                apars_epoch = apars.get("process_epoch", "")
+                if self._current_process_epoch:
+                    if not _is_apars_current_session(
+                        apars_session, self._current_boot_session_id,
+                        process_epoch=apars_epoch,
+                        expected_epoch=self._current_process_epoch,
+                    ):
+                        logger.warning(
+                            f"☁️ [InvincibleNode] Stale APARS data: "
+                            f"process_epoch={apars_epoch}, expected={self._current_process_epoch}"
+                        )
+                        has_real_data = False
+                else:
+                    if apars_epoch:
+                        self._current_process_epoch = apars_epoch
+                        logger.info(
+                            f"☁️ [InvincibleNode] Locked onto process epoch: {apars_epoch}"
                         )
                 # v235.2: Detect startup script version mismatches at runtime
                 # Grace period: ignore version mismatch for first 60s of polling.
@@ -10054,11 +10224,11 @@ fi
         # Perform health check if we have a static IP
         if result["static_ip"]:
             port = int(os.environ.get("JARVIS_PRIME_PORT", "8000"))
-            is_healthy, health_data = await self._ping_health_endpoint(
+            verdict, health_data = await self._ping_health_endpoint(
                 result["static_ip"], port, timeout=10.0
             )
             result["health"] = {
-                "reachable": is_healthy or "error" not in health_data or health_data.get("error") != "timeout",
+                "reachable": verdict != HealthVerdict.UNREACHABLE,
                 "ready_for_inference": health_data.get("ready_for_inference", False),
                 "status": health_data.get("status", "unknown"),
                 "model_loaded": health_data.get("model_loaded", False),

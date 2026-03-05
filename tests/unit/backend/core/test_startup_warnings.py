@@ -395,7 +395,8 @@ async def test_endpoint_propagated_only_on_router_success():
         metadata={},
     )
 
-    manager._ping_health_endpoint = AsyncMock(return_value=(True, {"status": "ok"}))
+    from backend.core.gcp_vm_manager import HealthVerdict
+    manager._ping_health_endpoint = AsyncMock(return_value=(HealthVerdict.READY, {"status": "ok"}))
 
     # Router FAILS, model serving succeeds
     with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=False):
@@ -432,7 +433,8 @@ async def test_partial_propagation_retries_only_failed_sink():
         metadata={},
     )
 
-    manager._ping_health_endpoint = AsyncMock(return_value=(True, {"status": "ok"}))
+    from backend.core.gcp_vm_manager import HealthVerdict
+    manager._ping_health_endpoint = AsyncMock(return_value=(HealthVerdict.READY, {"status": "ok"}))
 
     # First call: router fails, model serving succeeds
     with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=False) as mock_router:
@@ -478,7 +480,8 @@ async def test_health_status_updated_after_successful_ping():
     )
 
     # Mock health ping to succeed
-    manager._ping_health_endpoint = AsyncMock(return_value=(True, {"status": "ok"}))
+    from backend.core.gcp_vm_manager import HealthVerdict
+    manager._ping_health_endpoint = AsyncMock(return_value=(HealthVerdict.READY, {"status": "ok"}))
 
     # Mock PrimeRouter promotion to succeed (patched at source — lazy imported inside method)
     with patch("backend.core.prime_router.notify_gcp_vm_ready", new_callable=AsyncMock, return_value=True):

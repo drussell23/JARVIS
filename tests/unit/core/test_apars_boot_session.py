@@ -193,6 +193,87 @@ class TestConfigurableHealthTimeout:
                 f"Must not assert ready=false on timeout: {call}"
 
 
+class TestProcessEpochValidation:
+    def test_startup_script_contains_process_epoch(self):
+        """Startup script must generate a PROCESS_EPOCH."""
+        script = _get_golden_startup_script()
+        assert "PROCESS_EPOCH=" in script
+        assert "process_epoch" in script
+
+    def test_update_apars_includes_process_epoch(self):
+        """update_apars JSON template must include process_epoch."""
+        script = _get_golden_startup_script()
+        match = re.search(
+            r'cat > "\$tmp_file" << EOFPROGRESS\n(.*?)\nEOFPROGRESS',
+            script,
+            re.DOTALL,
+        )
+        assert match, "Could not find EOFPROGRESS heredoc"
+        progress_json = match.group(1)
+        assert '"process_epoch"' in progress_json
+        assert "${PROCESS_EPOCH}" in progress_json
+
+    def test_is_apars_current_session_validates_epoch(self):
+        """Mismatched process_epoch within same boot must return False."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        # Same boot, same epoch → True
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch="epoch-1", expected_epoch="epoch-1",
+        ) is True
+        # Same boot, different epoch → False (stale from crashed process)
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch="epoch-2", expected_epoch="epoch-1",
+        ) is False
+        # Different boot → False (regardless of epoch)
+        assert _is_apars_current_session(
+            "boot-B", expected="boot-A",
+            process_epoch="epoch-1", expected_epoch="epoch-1",
+        ) is False
+
+    def test_is_apars_current_session_unknown_epoch_accepted(self):
+        """Unknown/empty process_epoch accepted for backward compat."""
+        from backend.core.gcp_vm_manager import _is_apars_current_session
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch="", expected_epoch="epoch-1",
+        ) is True
+        assert _is_apars_current_session(
+            "boot-A", expected="boot-A",
+            process_epoch=None, expected_epoch="epoch-1",
+        ) is True
+
+    def test_build_apars_payload_includes_process_epoch(self):
+        """APARS payload must include process_epoch from progress file."""
+        script = _get_golden_startup_script()
+        _build_apars_payload = _extract_embedded_build_apars_payload(script)
+        state = {
+            "phase_number": 6,
+            "total_progress": 95,
+            "checkpoint": "verifying_service",
+            "boot_session_id": "abc-123-def",
+            "process_epoch": "a1b2c3d4e5f6",
+            "updated_at": 1000,
+        }
+        payload = _build_apars_payload(state)
+        assert payload is not None
+        assert payload.get("process_epoch") == "a1b2c3d4e5f6"
+
+
+class TestStaleMetadataGC:
+    def test_startup_script_has_gc_logic(self):
+        """Startup script must clean up stale progress files."""
+        script = _get_golden_startup_script()
+        assert "APARS_FILE_MAX_AGE_S" in script
+        assert "stale" in script.lower() or "cleanup" in script.lower() or "gc" in script.lower()
+
+    def test_startup_script_archives_prev(self):
+        """Startup script must archive previous progress file."""
+        script = _get_golden_startup_script()
+        assert ".prev.json" in script or "prev" in script
+
+
 class TestAtomicWritesAndVersion:
     def test_startup_script_uses_atomic_apars_write(self):
         """APARS progress file must be written atomically (write temp + mv)."""
@@ -209,5 +290,22 @@ class TestAtomicWritesAndVersion:
         """Startup script version must be >= 237.0 after readiness fixes."""
         from backend.core.gcp_vm_manager import _STARTUP_SCRIPT_VERSION
         version = float(_STARTUP_SCRIPT_VERSION)
-        assert version >= 237.0, \
-            f"Startup script version must be >= 237.0, got {version}"
+        assert version >= 238.0, \
+            f"Startup script version must be >= 238.0, got {version}"
+
+
+class TestAtomicWriteBoundary:
+    def test_startup_script_checks_filesystem_boundary(self):
+        """Startup script must verify temp and target are on same mount."""
+        script = _get_golden_startup_script()
+        # Extract update_apars function body
+        match = re.search(
+            r'update_apars\(\)\s*\{(.*?)\n\}',
+            script,
+            re.DOTALL,
+        )
+        assert match, "Could not find update_apars function in startup script"
+        func_body = match.group(1)
+        # Must check filesystem/mount for atomicity within update_apars
+        assert "df " in func_body or "same_fs" in func_body or "same_mount" in func_body or "_target_mount" in func_body, \
+            "update_apars must verify temp and target are on same filesystem"

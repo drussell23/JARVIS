@@ -2264,6 +2264,39 @@ def _calculate_effective_startup_timeout(
         "components": components,
     }
 
+
+# =============================================================================
+# SUPERVISOR BLOCKING EXECUTOR & RATE-LIMITED LOGGER
+# =============================================================================
+# Dedicated executor for supervisor blocking ops — bounded to prevent
+# threadpool starvation when 30-40 to_thread calls run concurrently.
+# Rate-limited logger prevents log storms in hot loops.
+# =============================================================================
+
+_SUPERVISOR_BLOCKING_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="supervisor-blocking"
+)
+
+
+def _run_in_supervisor_thread(fn, *args, timeout: float = 10.0):
+    """Run blocking fn in dedicated executor with deadline. Returns awaitable."""
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(_SUPERVISOR_BLOCKING_EXECUTOR, fn, *args)
+    return asyncio.wait_for(fut, timeout=timeout)
+
+
+_RATE_LIMIT_CACHE: Dict[str, float] = {}
+
+
+def _rate_limited_log(logger, level: str, key: str, msg: str, interval: float = 30.0):
+    """Log at most once per interval seconds per key."""
+    now = time.time()
+    last = _RATE_LIMIT_CACHE.get(key, 0.0)
+    if now - last >= interval:
+        _RATE_LIMIT_CACHE[key] = now
+        getattr(logger, level)(msg)
+
+
 # =============================================================================
 # v225.0: PROGRESS-AWARE STARTUP CONTROLLER
 # =============================================================================
@@ -3027,6 +3060,43 @@ def _get_env_float(key: str, default: float) -> float:
     except (ValueError, TypeError):
         return default
 
+# ── v311.0: Organ Persistence Utilities ──────────────────────────────
+# Atomic JSON write/read for organ state persistence.
+# Storage layout: ~/.jarvis/organs/{organ_name}/{filename}.json
+
+_ORGAN_STORAGE_ROOT = Path.home() / ".jarvis" / "organs"
+
+def _atomic_write_json(path: Path, data: Any, *, schema_version: str = "1.0") -> None:
+    """Atomically write JSON data with schema version envelope.
+
+    Uses tempfile + fsync + rename pattern for crash consistency.
+    """
+    envelope = {
+        "_schema_version": schema_version,
+        "_written_at": time.time(),
+        "data": data,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    try:
+        os.write(tmp_fd, json.dumps(envelope, indent=2, default=str).encode("utf-8"))
+        os.fsync(tmp_fd)
+    finally:
+        os.close(tmp_fd)
+    os.rename(tmp_path, str(path))
+
+
+def _load_json_state(path: Path) -> Optional[Dict[str, Any]]:
+    """Load JSON state from organ storage, returning the data dict or None."""
+    try:
+        if not path.exists():
+            return None
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw.get("data", raw)
+    except Exception:
+        return None
+
+
 def _get_env_command(key: str, default: Optional[List[str]] = None) -> List[str]:
     """Parse a shell-style command from environment into argv tokens."""
     if default is None:
@@ -3304,13 +3374,13 @@ def _mcp_memory_percent() -> float:
                 if _total > 0:
                     _used = _total - _snap.physical_free - _snap.physical_inactive
                     return round(max(0.0, min(100.0, (_used / _total) * 100)), 1)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_mem_pct", f"Memory percent error: {e}")
     if PSUTIL_AVAILABLE:
         try:
             return psutil.virtual_memory().percent
-        except Exception:
-            pass
+        except Exception as e:
+            _rate_limited_log(_unified_logger, "debug", "mcp_mem_pct", f"Memory percent error: {e}")
     return 0.0
 
 
@@ -3326,13 +3396,13 @@ def _mcp_available_gb() -> float:
             _snap = _b.latest_snapshot
             if _snap is not None:
                 return round(_snap.usable_bytes / (1024 ** 3), 2)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_avail_gb", f"Available GB error: {e}")
     if PSUTIL_AVAILABLE:
         try:
             return round(psutil.virtual_memory().available / (1024 ** 3), 2)
-        except Exception:
-            pass
+        except Exception as e:
+            _rate_limited_log(_unified_logger, "debug", "mcp_avail_gb", f"Available GB error: {e}")
     return 0.0
 
 
@@ -3345,13 +3415,13 @@ def _mcp_total_gb() -> float:
             _snap = _b.latest_snapshot
             if _snap is not None:
                 return round(_snap.physical_total / (1024 ** 3), 2)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_total_gb", f"Total GB error: {e}")
     if PSUTIL_AVAILABLE:
         try:
             return round(psutil.virtual_memory().total / (1024 ** 3), 2)
-        except Exception:
-            pass
+        except Exception as e:
+            _rate_limited_log(_unified_logger, "debug", "mcp_total_gb", f"Total GB error: {e}")
     return 0.0
 
 
@@ -3364,8 +3434,8 @@ def _mcp_pressure_tier() -> Optional[int]:
             _snap = _b.latest_snapshot
             if _snap is not None:
                 return int(_snap.pressure_tier)
-    except Exception:
-        pass
+    except Exception as e:
+        _rate_limited_log(_unified_logger, "debug", "mcp_pressure", f"Pressure tier error: {e}")
     return None
 
 
@@ -6114,8 +6184,9 @@ class IntelligentKernelTakeover:
 
         return cleaned
 
-    async def _find_process_on_port(self, port: int) -> Optional[int]:
-        """Find process listening on a specific port."""
+    @staticmethod
+    def _sync_find_process_on_port(port: int) -> Optional[int]:
+        """Sync helper: scan net_connections for a listening port. Called via executor."""
         try:
             import psutil
 
@@ -6127,6 +6198,15 @@ class IntelligentKernelTakeover:
         except Exception:
             pass
         return None
+
+    async def _find_process_on_port(self, port: int) -> Optional[int]:
+        """Find process listening on a specific port."""
+        try:
+            return await _run_in_supervisor_thread(
+                lambda: self._sync_find_process_on_port(port), timeout=5.0
+            )
+        except (asyncio.TimeoutError, Exception):
+            return None
 
     def _detect_repo_origin(self, cmdline: str) -> str:
         """Detect which repo a process belongs to based on command line."""
@@ -7684,9 +7764,10 @@ class LiveProgressDashboard:
                 await asyncio.sleep(self.refresh_rate)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
-    
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "render_loop", f"Render loop error: {e}", interval=60.0)
+                await asyncio.sleep(1.0)
+
     def _render(self, final: bool = False) -> None:
         """
         Render the dashboard to terminal.
@@ -10755,8 +10836,10 @@ class GCPInstanceManager(ResourceManagerBase):
         try:
             from backend.core.gcp_lifecycle_bridge import notify_bridge
             notify_bridge("notify_spot_preempted", recovery_attempt=self._recovery_attempts)
-        except Exception:
-            pass
+        except Exception as e:
+            self._logger.warning(
+                f"[KernelTakeover] Failed to notify_spot_preempted: {e}", exc_info=True
+            )
 
         self._logger.warning(
             f"Spot VM preempted! Recovery attempt {self._recovery_attempts}/{self._max_recovery_attempts}"
@@ -11182,6 +11265,51 @@ class SystemService(ABC):
     async def cleanup(self) -> None:
         """Release resources. Called during shutdown."""
 
+    # --- v2 lifecycle (new, with backward-compatible defaults) ---
+
+    async def start(self) -> bool:
+        """Begin active operation. Called after initialize succeeds.
+        Default: returns True (no-op for legacy services)."""
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        """Return structured health report.
+        Default: wraps legacy health_check() into a ServiceHealthReport."""
+        try:
+            ok, msg = await self.health_check()
+            return ServiceHealthReport(alive=True, ready=ok, message=msg)
+        except Exception as exc:
+            return ServiceHealthReport(alive=True, ready=False, message=str(exc))
+
+    async def drain(self, deadline_s: float) -> bool:
+        """Stop accepting new work, flush in-flight ops before deadline.
+        Default: returns True (nothing to drain for legacy services)."""
+        return True
+
+    async def stop(self) -> None:
+        """Release resources. Must be safe to call multiple times.
+        Default: delegates to cleanup()."""
+        await self.cleanup()
+
+    # --- v2 capability declaration (new, with defaults) ---
+
+    def capability_contract(self) -> "CapabilityContract":
+        """Declare inputs, outputs, side effects, idempotency.
+        Default: returns a stub contract with the class name."""
+        return CapabilityContract(
+            name=type(self).__name__,
+            version="0.0.0",
+            inputs=[],
+            outputs=[],
+            side_effects=[],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        """Return list of event topics that should activate this service.
+        Empty list = always_on (activated at boot).
+        Default: returns [] (always_on behavior)."""
+        return []
+
 class CostTracker(ResourceManagerBase, SystemService):
     """
     Enterprise-grade cost tracking for cloud resources.
@@ -11471,7 +11599,12 @@ class CostTracker(ResourceManagerBase, SystemService):
         """Load persisted cost state."""
         try:
             if self.state_file.exists():
-                data = json.loads(self.state_file.read_text())
+                try:
+                    raw = await _run_in_supervisor_thread(self.state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self._logger.warning(f"CostTracker._load_state: file read failed: {io_err}")
+                    return
+                data = json.loads(raw)
 
                 # Reset daily cost if new day
                 last_date = data.get("last_date", "")
@@ -11512,7 +11645,11 @@ class CostTracker(ResourceManagerBase, SystemService):
                 "updated_at": time.time(),
             }
 
-            self.state_file.write_text(json.dumps(data, indent=2))
+            payload = json.dumps(data, indent=2)
+            try:
+                await _run_in_supervisor_thread(self.state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self._logger.warning(f"CostTracker._save_state: file write failed: {io_err}")
 
         except Exception as e:
             self._logger.warning(f"Failed to save cost state: {e}")
@@ -11969,8 +12106,8 @@ class DynamicPortManager(ResourceManagerBase):
 
         return self.selected_port
 
-    async def _find_dynamic_port(self) -> Optional[int]:
-        """Find an available port in the dynamic range."""
+    def _sync_find_dynamic_port(self) -> Optional[int]:
+        """Synchronous port-probing helper (runs in executor thread)."""
         import socket
         import random
 
@@ -11994,6 +12131,15 @@ class DynamicPortManager(ResourceManagerBase):
                 continue
 
         return None
+
+    async def _find_dynamic_port(self) -> Optional[int]:
+        """Find an available port in the dynamic range (offloaded to executor)."""
+        try:
+            return await _run_in_supervisor_thread(self._sync_find_dynamic_port, timeout=15.0)
+        except asyncio.TimeoutError:
+            if hasattr(self, '_logger') and self._logger:
+                self._logger.warning("_find_dynamic_port timed out after 15s, returning None")
+            return None
 
     async def cleanup_stuck_port(self, port: int) -> bool:
         """
@@ -12106,60 +12252,21 @@ class PortAssignment(NamedTuple):
     conflicts_resolved: int
     assignment_method: str  # "explicit", "environment", "dynamic"
 
-async def assign_all_ports(
-    config: Optional["SystemKernelConfig"] = None,
-    port_manager: Optional[DynamicPortManager] = None,
+def _sync_assign_all_ports(
+    backend_port: int,
+    websocket_port: int,
+    loading_port: int,
+    frontend_port: int,
+    default_backend_port: int,
+    default_websocket_port: int,
+    default_loading_port: int,
+    default_frontend_port: int,
+    selected_port: Optional[int],
 ) -> PortAssignment:
-    """
-    Coordinated port assignment for all JARVIS services.
-
-    This function assigns non-overlapping ports for all services in a single
-    atomic operation, preventing race conditions and port conflicts.
-
-    Port Assignment Strategy:
-    1. Check explicit environment variables first
-    2. If not set, use default base ports with conflict resolution
-    3. Ensure minimum 10-port separation between services
-    4. Verify all ports are available before committing
-
-    Args:
-        config: Optional SystemKernelConfig for reading defaults
-        port_manager: Optional DynamicPortManager for availability checking
-
-    Returns:
-        PortAssignment with all assigned ports
-    """
+    """Synchronous port-assignment helper (runs in executor thread)."""
     import socket
 
-    # Default base ports
-    # v233.0: Harmonize with backend/main.py and frontend DynamicConfigService
-    # Both default to 8010 via BACKEND_PORT env var. Previous mismatch (8000 vs 8010)
-    # caused frontend connection failures when Docker occupied 8010.
-    # v270.3: Use canonical config_constants with inline fallback for import safety.
-    try:
-        from backend.core.config_constants import (
-            BACKEND_PORT as _cc_bp, WEBSOCKET_PORT as _cc_wsp,
-            LOADING_SERVER_PORT as _cc_lsp, FRONTEND_PORT as _cc_fp,
-        )
-        DEFAULT_BACKEND_PORT = _cc_bp
-        DEFAULT_WEBSOCKET_PORT = _cc_wsp
-        DEFAULT_LOADING_PORT = _cc_lsp
-        DEFAULT_FRONTEND_PORT = _cc_fp
-    except ImportError:
-        DEFAULT_BACKEND_PORT = int(os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010")))
-        DEFAULT_WEBSOCKET_PORT = 8765
-        DEFAULT_LOADING_PORT = 3001
-        DEFAULT_FRONTEND_PORT = 3000
-
-    # Minimum separation between services
     MIN_PORT_SEPARATION = 10
-
-    # Read from environment or use defaults
-    backend_port = int(os.getenv("JARVIS_BACKEND_PORT", "0"))
-    websocket_port = int(os.getenv("JARVIS_WEBSOCKET_PORT", "0"))
-    loading_port = int(os.getenv("JARVIS_LOADING_PORT", "0"))
-    frontend_port = int(os.getenv("JARVIS_FRONTEND_PORT", "0"))
-
     assignment_method = "explicit"
     conflicts_resolved = 0
 
@@ -12191,10 +12298,10 @@ async def assign_all_ports(
     # Assign backend port
     if backend_port == 0:
         assignment_method = "dynamic"
-        if port_manager and port_manager.selected_port:
-            backend_port = port_manager.selected_port
+        if selected_port:
+            backend_port = selected_port
         else:
-            backend_port = DEFAULT_BACKEND_PORT
+            backend_port = default_backend_port
 
     if not is_port_available(backend_port):
         backend_port = find_available_port(backend_port, assigned_ports)
@@ -12205,7 +12312,7 @@ async def assign_all_ports(
     # Assign websocket port (must be different from backend)
     if websocket_port == 0:
         assignment_method = "dynamic"
-        websocket_port = DEFAULT_WEBSOCKET_PORT
+        websocket_port = default_websocket_port
 
     while websocket_port in assigned_ports or not is_port_available(websocket_port):
         websocket_port = find_available_port(websocket_port + 1, assigned_ports)
@@ -12221,7 +12328,7 @@ async def assign_all_ports(
     # Assign loading server port
     if loading_port == 0:
         assignment_method = "dynamic"
-        loading_port = DEFAULT_LOADING_PORT
+        loading_port = default_loading_port
 
     while loading_port in assigned_ports or not is_port_available(loading_port):
         loading_port = find_available_port(loading_port + 1, assigned_ports)
@@ -12232,7 +12339,7 @@ async def assign_all_ports(
     # Assign frontend port
     if frontend_port == 0:
         assignment_method = "dynamic"
-        frontend_port = DEFAULT_FRONTEND_PORT
+        frontend_port = default_frontend_port
 
     while frontend_port in assigned_ports or not is_port_available(frontend_port):
         frontend_port = find_available_port(frontend_port + 1, assigned_ports)
@@ -12253,6 +12360,79 @@ async def assign_all_ports(
         conflicts_resolved=conflicts_resolved,
         assignment_method=assignment_method,
     )
+
+
+async def assign_all_ports(
+    config: Optional["SystemKernelConfig"] = None,
+    port_manager: Optional[DynamicPortManager] = None,
+) -> PortAssignment:
+    """
+    Coordinated port assignment for all JARVIS services (offloaded to executor).
+
+    This function assigns non-overlapping ports for all services in a single
+    atomic operation, preventing race conditions and port conflicts.
+
+    Port Assignment Strategy:
+    1. Check explicit environment variables first
+    2. If not set, use default base ports with conflict resolution
+    3. Ensure minimum 10-port separation between services
+    4. Verify all ports are available before committing
+
+    Args:
+        config: Optional SystemKernelConfig for reading defaults
+        port_manager: Optional DynamicPortManager for availability checking
+
+    Returns:
+        PortAssignment with all assigned ports
+    """
+    # Default base ports (pure dict lookups, no I/O)
+    # v233.0: Harmonize with backend/main.py and frontend DynamicConfigService
+    # Both default to 8010 via BACKEND_PORT env var. Previous mismatch (8000 vs 8010)
+    # caused frontend connection failures when Docker occupied 8010.
+    # v270.3: Use canonical config_constants with inline fallback for import safety.
+    try:
+        from backend.core.config_constants import (
+            BACKEND_PORT as _cc_bp, WEBSOCKET_PORT as _cc_wsp,
+            LOADING_SERVER_PORT as _cc_lsp, FRONTEND_PORT as _cc_fp,
+        )
+        default_backend_port = _cc_bp
+        default_websocket_port = _cc_wsp
+        default_loading_port = _cc_lsp
+        default_frontend_port = _cc_fp
+    except ImportError:
+        default_backend_port = int(os.getenv("BACKEND_PORT", os.getenv("JARVIS_BACKEND_PORT", "8010")))
+        default_websocket_port = 8765
+        default_loading_port = 3001
+        default_frontend_port = 3000
+
+    # Read from environment or use defaults (pure dict lookups)
+    backend_port = int(os.getenv("JARVIS_BACKEND_PORT", "0"))
+    websocket_port = int(os.getenv("JARVIS_WEBSOCKET_PORT", "0"))
+    loading_port = int(os.getenv("JARVIS_LOADING_PORT", "0"))
+    frontend_port = int(os.getenv("JARVIS_FRONTEND_PORT", "0"))
+
+    selected_port = port_manager.selected_port if port_manager else None
+
+    try:
+        return await _run_in_supervisor_thread(
+            _sync_assign_all_ports,
+            backend_port, websocket_port, loading_port, frontend_port,
+            default_backend_port, default_websocket_port, default_loading_port, default_frontend_port,
+            selected_port,
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        logging.getLogger("jarvis.supervisor").warning(
+            "assign_all_ports timed out after 30s, returning defaults"
+        )
+        return PortAssignment(
+            backend_port=backend_port or default_backend_port,
+            websocket_port=websocket_port or default_websocket_port,
+            loading_server_port=loading_port or default_loading_port,
+            frontend_port=frontend_port or default_frontend_port,
+            conflicts_resolved=0,
+            assignment_method="timeout_fallback",
+        )
 
 # =============================================================================
 # SEMANTIC VOICE CACHE MANAGER
@@ -13144,6 +13324,93 @@ class ServiceDescriptor:
     init_time_ms: float = 0.0
     memory_delta_mb: float = 0.0
 
+    # --- Dependencies extension ---
+    soft_depends_on: List[str] = field(default_factory=list)  # non-blocking deps
+
+    # --- Governance ---
+    tier: str = "optional"                # immune | nervous | metabolic | higher | optional
+    activation_mode: str = "always_on"    # always_on | warm_standby | event_driven | batch_window
+    boot_policy: str = "non_blocking"     # block_ready | non_blocking | deferred_after_ready
+    criticality: str = "optional"         # kernel_critical | control_plane | optional
+
+    # --- Budget policy ---
+    max_memory_mb: float = 50.0
+    max_cpu_percent: float = 10.0
+    max_concurrent_ops: int = 10
+
+    # --- Failure policy ---
+    max_init_retries: int = 2
+    init_timeout_s: float = 30.0
+    circuit_breaker_threshold: int = 5
+    circuit_breaker_recovery_s: float = 60.0
+    quarantine_after_failures: int = 10
+
+    # --- Health semantics ---
+    health_check_interval_s: float = 30.0
+    liveness_timeout_s: float = 10.0
+    readiness_timeout_s: float = 5.0
+
+    # --- Runtime state extensions ---
+    state: str = "pending"                # pending|initializing|ready|active|degraded|draining|stopped|quarantined
+    activation_count: int = 0
+    last_health_check: float = 0.0
+
+
+# =========================================================================
+# GOVERNANCE DATACLASSES (Enterprise Organ Activation Program v1.0)
+# =========================================================================
+
+@dataclass(frozen=True)
+class ServiceHealthReport:
+    """Structured health report from a governed service organ."""
+    alive: bool                          # liveness: process/task exists
+    ready: bool                          # readiness: can accept work
+    degraded: bool = False               # working but impaired
+    draining: bool = False               # finishing but not accepting new work
+    message: str = ""
+    metrics: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CapabilityContract:
+    """Formal declaration of what a service does."""
+    name: str
+    version: str                         # semver
+    inputs: List[str]                    # event topics consumed
+    outputs: List[str]                   # event topics produced
+    side_effects: List[str]              # state mutations this service performs
+    idempotent: bool = True
+    cross_repo: bool = False             # touches Prime or Reactor
+
+
+@dataclass
+class BudgetGate:
+    """Resource conditions that must be met for service activation."""
+    max_memory_percent: float = 85.0
+    max_cpu_percent: float = 80.0
+    min_available_mb: float = 200.0
+
+
+@dataclass
+class BackoffGate:
+    """Exponential backoff after activation failures."""
+    initial_delay_s: float = 5.0
+    max_delay_s: float = 300.0
+    multiplier: float = 2.0
+    jitter: bool = True
+
+
+@dataclass
+class ActivationContract:
+    """When and how an event-driven service activates."""
+    trigger_events: List[str]
+    dependency_gate: List[str]           # services that must be healthy first
+    budget_gate: BudgetGate = field(default_factory=BudgetGate)
+    backoff_gate: BackoffGate = field(default_factory=BackoffGate)
+    max_activations_per_hour: int = 100
+    deactivate_after_idle_s: float = 300.0
+
+
 class SystemServiceRegistry:
     """Manages lifecycle of system services in dependency-ordered waves.
 
@@ -13162,11 +13429,71 @@ class SystemServiceRegistry:
     def __init__(self) -> None:
         self._services: Dict[str, ServiceDescriptor] = {}
         self._activation_order: List[str] = []
+        self._side_effect_owners: Dict[str, str] = {}  # side_effect_name -> service_name
 
     # ── registration ────────────────────────────────────────────────────
 
     def register(self, desc: ServiceDescriptor) -> None:
+        """Register a service. Raises ValueError if adding it would create a dependency cycle
+        or if its side-effects conflict with an already-registered service."""
         self._services[desc.name] = desc
+        try:
+            self._check_cycles()
+        except ValueError:
+            del self._services[desc.name]
+            raise
+
+        # --- Side-effect ownership validation ---
+        contract = desc.service.capability_contract()
+        new_effects = contract.side_effects if contract.side_effects else []
+        claimed: List[str] = []  # track what we claim so we can roll back
+        try:
+            for effect in new_effects:
+                existing_owner = self._side_effect_owners.get(effect)
+                if existing_owner is not None and existing_owner != desc.name:
+                    raise ValueError(
+                        f"Side-effect ownership conflict: '{effect}' is already owned by "
+                        f"'{existing_owner}', cannot be claimed by '{desc.name}'"
+                    )
+                claimed.append(effect)
+                self._side_effect_owners[effect] = desc.name
+        except ValueError:
+            # Roll back: remove the service and any side-effects we just claimed
+            for eff in claimed:
+                if self._side_effect_owners.get(eff) == desc.name:
+                    del self._side_effect_owners[eff]
+            del self._services[desc.name]
+            raise
+
+    def _check_cycles(self) -> None:
+        """Detect dependency cycles across all registered services. Raises ValueError on cycle."""
+        adj: Dict[str, set] = {}
+        for name, desc in self._services.items():
+            deps = set(desc.depends_on)
+            if hasattr(desc, "soft_depends_on"):
+                deps |= set(desc.soft_depends_on)
+            adj[name] = {d for d in deps if d in self._services}
+
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {name: WHITE for name in adj}
+        path: List[str] = []
+
+        def dfs(node: str) -> None:
+            color[node] = GRAY
+            path.append(node)
+            for dep in adj.get(node, set()):
+                if color[dep] == GRAY:
+                    cycle_start = path.index(dep)
+                    cycle = path[cycle_start:] + [dep]
+                    raise ValueError(f"Dependency cycle detected: {' -> '.join(cycle)}")
+                if color[dep] == WHITE:
+                    dfs(dep)
+            path.pop()
+            color[node] = BLACK
+
+        for node in adj:
+            if color[node] == WHITE:
+                dfs(node)
 
     def get(self, name: str) -> Optional[Any]:
         """Return a service instance if it is initialised, else None."""
@@ -13194,6 +13521,72 @@ class SystemServiceRegistry:
         except Exception:
             return 0.0
 
+    # ── governance helpers ─────────────────────────────────────────────
+
+    def _should_skip_governance(self, desc: ServiceDescriptor) -> Optional[str]:
+        """Return a reason string if *desc* should be skipped due to
+        governance rules (tier kill switch, safe mode, boot policy).
+        Returns ``None`` if the service is allowed to proceed."""
+
+        # Tier kill switch: JARVIS_SERVICE_{TIER}_ENABLED
+        tier_env = f"JARVIS_SERVICE_{desc.tier.upper()}_ENABLED"
+        tier_val = os.getenv(tier_env, "true").lower()
+        if tier_val not in ("true", "1", "yes"):
+            return f"tier kill-switch {tier_env}={tier_val}"
+
+        # Safe mode: only kernel_critical services allowed
+        safe_mode = os.getenv("JARVIS_SAFE_MODE", "false").lower()
+        if safe_mode in ("true", "1", "yes"):
+            if desc.criticality != "kernel_critical":
+                return f"safe-mode active, criticality={desc.criticality}"
+
+        return None
+
+    async def _activate_one(self, desc: ServiceDescriptor) -> bool:
+        """Run the initialize / start sequence for a single service,
+        honouring ``activation_mode`` and recording telemetry.
+
+        Returns True on success, False on failure.
+        """
+        _timeout = desc.init_timeout_s
+        _mem_before = self._current_rss_mb()
+        _t0 = time.monotonic()
+        try:
+            desc.state = "initializing"
+            await asyncio.wait_for(
+                desc.service.initialize(), timeout=_timeout,
+            )
+            desc.initialized = True
+            desc.init_time_ms = (time.monotonic() - _t0) * 1000
+            desc.memory_delta_mb = self._current_rss_mb() - _mem_before
+            self._activation_order.append(desc.name)
+
+            # activation_mode determines whether we also start()
+            if desc.activation_mode == "always_on":
+                await asyncio.wait_for(
+                    desc.service.start(), timeout=_timeout,
+                )
+                desc.state = "active"
+            else:
+                # warm_standby, event_driven, batch_window: init only
+                desc.state = "ready"
+
+            desc.activation_count += 1
+            logger.info(
+                "[SSR] Activated %s (mode=%s, state=%s) in %.0fms (+%.1fMB)",
+                desc.name, desc.activation_mode, desc.state,
+                desc.init_time_ms, desc.memory_delta_mb,
+            )
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            desc.error = str(e)
+            desc.healthy = False
+            desc.state = "pending"
+            logger.warning("[SSR] Failed to activate %s: %s", desc.name, e)
+            return False
+
     async def activate_phase(
         self,
         phase: int,
@@ -13205,6 +13598,11 @@ class SystemServiceRegistry:
         phase) are validated via the global ``_services`` dict — they will
         not appear in the topological sort but will satisfy dependency
         checks.
+
+        Governance filters applied before activation:
+        • **Boot policy**: ``deferred_after_ready`` services are skipped.
+        • **Tier kill switch**: ``JARVIS_SERVICE_{TIER}_ENABLED=false``.
+        • **Safe mode**: ``JARVIS_SAFE_MODE=true`` skips non-kernel_critical.
         """
         phase_services = [
             s for s in self._services.values()
@@ -13214,6 +13612,18 @@ class SystemServiceRegistry:
         results: Dict[str, bool] = {}
 
         for desc in ordered:
+            # --- boot policy: deferred services skip phase activation ---
+            if desc.boot_policy == "deferred_after_ready":
+                results[desc.name] = False
+                continue
+
+            # --- governance gates (tier kill switch, safe mode) ---
+            skip_reason = self._should_skip_governance(desc)
+            if skip_reason:
+                results[desc.name] = False
+                logger.info("[SSR] Skipping %s: %s", desc.name, skip_reason)
+                continue
+
             # per-service kill switch
             if desc.enabled_env:
                 val = os.getenv(desc.enabled_env, "true").lower()
@@ -13236,31 +13646,79 @@ class SystemServiceRegistry:
                 )
                 continue
 
-            # activate with telemetry (current RSS, not peak)
-            _mem_before = self._current_rss_mb()
-            _t0 = time.monotonic()
-            try:
-                await asyncio.wait_for(
-                    desc.service.initialize(), timeout=timeout_per_service,
-                )
-                desc.initialized = True
-                desc.init_time_ms = (time.monotonic() - _t0) * 1000
-                desc.memory_delta_mb = self._current_rss_mb() - _mem_before
-                self._activation_order.append(desc.name)
-                results[desc.name] = True
-                logger.info(
-                    "[SSR] Activated %s in %.0fms (+%.1fMB)",
-                    desc.name, desc.init_time_ms, desc.memory_delta_mb,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                desc.error = str(e)
-                desc.healthy = False
-                results[desc.name] = False
-                logger.warning("[SSR] Failed to activate %s: %s", desc.name, e)
+            # activate with telemetry
+            results[desc.name] = await self._activate_one(desc)
 
         return results
+
+    async def activate_deferred(self) -> Dict[str, bool]:
+        """Activate all ``deferred_after_ready`` services that haven't
+        been initialized yet.  Called after kernel reaches READY state.
+
+        Applies the same governance filters (tier kill switch, safe mode)
+        as ``activate_phase()``.
+        """
+        deferred = [
+            s for s in self._services.values()
+            if s.boot_policy == "deferred_after_ready" and not s.initialized
+        ]
+        ordered = self._topological_sort(deferred)
+        results: Dict[str, bool] = {}
+
+        for desc in ordered:
+            skip_reason = self._should_skip_governance(desc)
+            if skip_reason:
+                results[desc.name] = False
+                logger.info("[SSR] Skipping deferred %s: %s", desc.name, skip_reason)
+                continue
+
+            if desc.enabled_env:
+                val = os.getenv(desc.enabled_env, "true").lower()
+                if val not in ("true", "1", "yes"):
+                    results[desc.name] = False
+                    continue
+
+            unmet = [
+                d for d in desc.depends_on
+                if d not in self._services or not self._services[d].initialized
+            ]
+            if unmet:
+                desc.error = f"Unmet dependencies: {unmet}"
+                desc.healthy = False
+                results[desc.name] = False
+                continue
+
+            results[desc.name] = await self._activate_one(desc)
+
+        return results
+
+    async def activate_service(self, name: str) -> bool:
+        """Start a specific warm_standby or event_driven service on demand.
+
+        Returns True if the service is now active, False if the service
+        is unknown or not yet initialized.
+        """
+        desc = self._services.get(name)
+        if desc is None:
+            return False
+        if not desc.initialized:
+            return False
+        if desc.state == "active":
+            return True
+
+        try:
+            await desc.service.start()
+            desc.state = "active"
+            desc.activation_count += 1
+            logger.info("[SSR] On-demand start: %s -> active", name)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            desc.error = str(e)
+            desc.healthy = False
+            logger.warning("[SSR] On-demand start failed for %s: %s", name, e)
+            return False
 
     # ── health ──────────────────────────────────────────────────────────
 
@@ -13284,22 +13742,75 @@ class SystemServiceRegistry:
                 results[name] = (False, str(e))
         return results
 
+    async def health_check_all_structured(self) -> Dict[str, "ServiceHealthReport"]:
+        """Run the v2 ``health()`` method on every initialised service.
+
+        Returns a dict mapping service name to ``ServiceHealthReport``.
+        Updates ``desc.healthy``, ``desc.state`` (degraded/active
+        transitions), and ``desc.last_health_check``.
+        """
+        results: Dict[str, ServiceHealthReport] = {}
+        for name in self._activation_order:
+            desc = self._services[name]
+            try:
+                report = await asyncio.wait_for(
+                    desc.service.health(), timeout=desc.liveness_timeout_s,
+                )
+                desc.healthy = report.ready and not report.degraded
+                desc.error = None if desc.healthy else report.message
+                desc.last_health_check = time.monotonic()
+
+                # state transitions based on health report
+                if report.degraded and desc.state == "active":
+                    desc.state = "degraded"
+                elif not report.degraded and report.ready and desc.state == "degraded":
+                    desc.state = "active"
+
+                results[name] = report
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                desc.healthy = False
+                desc.error = str(e)
+                desc.last_health_check = time.monotonic()
+                results[name] = ServiceHealthReport(
+                    alive=False, ready=False, message=str(e),
+                )
+        return results
+
     # ── shutdown ────────────────────────────────────────────────────────
 
     async def shutdown_all(self, timeout_per: float = 5.0) -> None:
-        """Shutdown in reverse activation order."""
+        """Shutdown in reverse activation order.
+
+        Uses the v2 lifecycle: ``drain(deadline_s)`` then ``stop()``.
+        State transitions: current -> draining -> stopped.
+        Falls back to ``cleanup()`` if ``drain``/``stop`` are not
+        overridden (the default implementations delegate to cleanup).
+        """
         for name in reversed(self._activation_order):
             desc = self._services.get(name)
             if desc and desc.initialized:
                 try:
+                    desc.state = "draining"
                     await asyncio.wait_for(
-                        desc.service.cleanup(), timeout=timeout_per,
+                        desc.service.drain(deadline_s=timeout_per),
+                        timeout=timeout_per,
                     )
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
-                    logger.warning("[SSR] Cleanup error for %s: %s", name, e)
+                    logger.warning("[SSR] Drain error for %s: %s", name, e)
+                try:
+                    await asyncio.wait_for(
+                        desc.service.stop(), timeout=timeout_per,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("[SSR] Stop error for %s: %s", name, e)
                 desc.initialized = False
+                desc.state = "stopped"
         self._activation_order.clear()
 
     # ── helpers ─────────────────────────────────────────────────────────
@@ -13516,8 +14027,10 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
         try:
             from backend.core.gcp_lifecycle_bridge import notify_bridge
             notify_bridge("notify_spot_preempted", source="SpotInstanceResilienceHandler")
-        except Exception:
-            pass
+        except Exception as e:
+            self._logger.warning(
+                f"[SpotResilience] Failed to notify_spot_preempted: {e}", exc_info=True
+            )
         self._logger.warning("⚠️ SPOT PREEMPTION NOTICE - 30 seconds to shutdown!")
 
         self.preemption_count += 1
@@ -13562,7 +14075,12 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
             }
 
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps(state, indent=2))
+            payload = json.dumps(state, indent=2)
+            try:
+                await _run_in_supervisor_thread(self.state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self._logger.warning(f"SpotInstanceResilienceHandler._preserve_state: file write failed: {io_err}")
+                return
             self._logger.info(f"State preserved to {self.state_file}")
 
         except Exception as e:
@@ -13589,7 +14107,12 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
         """Load preserved state from previous session."""
         try:
             if self.state_file.exists():
-                state = json.loads(self.state_file.read_text())
+                try:
+                    raw = await _run_in_supervisor_thread(self.state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self._logger.warning(f"SpotInstanceResilienceHandler.load_preserved_state: file read failed: {io_err}")
+                    return None
+                state = json.loads(raw)
                 return state
         except Exception as e:
             self._logger.error(f"Failed to load preserved state: {e}")
@@ -14198,15 +14721,21 @@ class LazyAsyncLock:
 
     asyncio.Lock() cannot be created outside of an async context in Python 3.9.
     This wrapper delays initialization until first use within an async context.
+
+    v311.0: Added threading.Lock guard to prevent duplicate Lock creation
+    under concurrent access (design doc: 2026-03-05 Phase 2A).
     """
 
     def __init__(self):
         self._lock: Optional[asyncio.Lock] = None
+        self._init_guard = threading.Lock()
 
     def _ensure_lock(self) -> asyncio.Lock:
-        """Ensure lock exists, creating it if needed."""
+        """Ensure lock exists, creating it if needed. Thread-safe."""
         if self._lock is None:
-            self._lock = asyncio.Lock()
+            with self._init_guard:
+                if self._lock is None:
+                    self._lock = asyncio.Lock()
         return self._lock
 
     async def __aenter__(self):
@@ -14634,12 +15163,16 @@ class SupervisorRestartManager:
         self._shutdown_requested = False
 
     async def check_and_restart_all(self) -> List[str]:
-        """Check all cross-repo processes and restart any that have exited."""
+        """Check all cross-repo processes and restart any that have exited.
+
+        v311.0: Split into collect (under lock) + restart (outside lock) to
+        prevent blocking get_status() during backoff sleep.
+        """
         if self._shutdown_requested:
             return []
 
-        restarted = []
-
+        # Phase 1: Collect restart candidates under lock (fast, no I/O)
+        to_restart = []
         async with self._lock:
             for name, managed in list(self.processes.items()):
                 if not managed.enabled or managed.process is None:
@@ -14654,9 +15187,14 @@ class SupervisorRestartManager:
                         self._logger.debug(f"{name} exited normally (code: {proc.returncode})")
                         continue
 
-                    success = await self._handle_unexpected_exit(name, managed)
-                    if success:
-                        restarted.append(name)
+                    to_restart.append((name, managed))
+
+        # Phase 2: Handle restarts outside lock (slow, with backoff + I/O)
+        restarted = []
+        for name, managed in to_restart:
+            success = await self._handle_unexpected_exit(name, managed)
+            if success:
+                restarted.append(name)
 
         return restarted
 
@@ -16026,8 +16564,10 @@ class AsyncVoiceNarrator:
         if self._process and self._process.returncode is None:
             try:
                 self._process.terminate()
-            except Exception:
-                pass
+            except ProcessLookupError:
+                pass  # Process already dead — expected
+            except Exception as e:
+                _unified_logger.debug(f"[Speech] Emergency stop error: {e}")
         self._speaking = False
 
     # =========================================================================
@@ -16465,8 +17005,9 @@ class IntelligentResourceOrchestrator:
             memory_pressure=memory_pressure,
         )
 
-    async def _check_memory_detailed(self) -> Dict[str, Any]:
-        """Get detailed memory analysis."""
+    @staticmethod
+    def _sync_check_memory_detailed() -> Dict[str, Any]:
+        """Sync helper: read psutil virtual_memory. Called via executor."""
         try:
             mem = psutil.virtual_memory()
             pressure = (mem.used / mem.total) * 100 if mem.total > 0 else 0
@@ -16479,6 +17020,21 @@ class IntelligentResourceOrchestrator:
                 "percent_used": mem.percent,
             }
         except Exception:
+            return {
+                "available_gb": 0.0,
+                "total_gb": 0.0,
+                "used_gb": 0.0,
+                "pressure": 100.0,
+                "percent_used": 100.0,
+            }
+
+    async def _check_memory_detailed(self) -> Dict[str, Any]:
+        """Get detailed memory analysis."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_check_memory_detailed, timeout=5.0
+            )
+        except asyncio.TimeoutError:
             return {
                 "available_gb": 0.0,
                 "total_gb": 0.0,
@@ -18323,8 +18879,9 @@ class StabilizedChromeLauncher:
         self._logger.info(f"[StabilizedChrome] Restarting Chrome (attempt {self._restart_count}/{self._max_restarts})")
         return await self.launch_stabilized_chrome(url=url, incognito=incognito, kill_existing=True)
     
-    async def get_chrome_memory_usage(self) -> float:
-        """Get current Chrome memory usage in MB."""
+    @staticmethod
+    def _sync_get_chrome_memory_usage() -> float:
+        """Sync helper: iterate psutil processes for Chrome RSS. Called via executor."""
         try:
             import psutil
             total_mb = 0.0
@@ -18336,6 +18893,15 @@ class StabilizedChromeLauncher:
                     continue
             return total_mb
         except Exception:
+            return 0.0
+
+    async def get_chrome_memory_usage(self) -> float:
+        """Get current Chrome memory usage in MB."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_get_chrome_memory_usage, timeout=5.0
+            )
+        except (asyncio.TimeoutError, Exception):
             return 0.0
     
     async def preemptive_restart_if_needed(self, memory_threshold_mb: float = 4096) -> bool:
@@ -18956,40 +19522,53 @@ class IntelligentChromeIncognitoManager:
         except Exception:
             return []
 
-    async def _check_system_health_for_browser(self) -> Tuple[bool, str]:
-        """
-        v197.2: Pre-flight check before launching browser.
-        
-        Prevents crash code 5 (GPU/OOM) by checking system resources BEFORE
-        attempting to launch Chrome. This is proactive crash prevention.
-        
-        Returns:
-            Tuple of (safe_to_launch, reason_if_not_safe)
-        """
+    @staticmethod
+    def _sync_get_chrome_memory_mb() -> float:
+        """Sync helper: sum Chrome process RSS via psutil. Called via executor."""
         try:
             import psutil
-
-            # v260.1: Check memory pressure via MCP broker first
-            _mem_pct = _mcp_memory_percent()
-            if _mem_pct > 90:
-                return (False, f"Critical memory pressure: {_mem_pct}% used")
-            
-            # Check if Chrome is already consuming excessive resources
-            chrome_memory_mb = 0
+            chrome_memory_mb = 0.0
             for proc in psutil.process_iter(['name', 'memory_info']):
                 try:
                     if 'chrome' in proc.info['name'].lower():
                         chrome_memory_mb += proc.info['memory_info'].rss / (1024 * 1024)
                 except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
                     continue
-            
+            return chrome_memory_mb
+        except Exception:
+            return 0.0
+
+    async def _check_system_health_for_browser(self) -> Tuple[bool, str]:
+        """
+        v197.2: Pre-flight check before launching browser.
+
+        Prevents crash code 5 (GPU/OOM) by checking system resources BEFORE
+        attempting to launch Chrome. This is proactive crash prevention.
+
+        Returns:
+            Tuple of (safe_to_launch, reason_if_not_safe)
+        """
+        try:
+            # v260.1: Check memory pressure via MCP broker first
+            _mem_pct = _mcp_memory_percent()
+            if _mem_pct > 90:
+                return (False, f"Critical memory pressure: {_mem_pct}% used")
+
+            # Check if Chrome is already consuming excessive resources (offloaded)
+            try:
+                chrome_memory_mb = await _run_in_supervisor_thread(
+                    self._sync_get_chrome_memory_mb, timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                chrome_memory_mb = 0.0
+
             # If Chrome is already using > 4GB, warn
             if chrome_memory_mb > 4096:
                 self._logger.warning(
                     f"[Browser] Chrome already using {chrome_memory_mb:.0f}MB RAM. "
                     "Consider closing some tabs to prevent crash."
                 )
-            
+
             # Check crash rate from monitor
             try:
                 crash_monitor = get_browser_crash_monitor()
@@ -18998,11 +19577,9 @@ class IntelligentChromeIncognitoManager:
                     return (False, f"Recent browser instability: {stats['consecutive_failures']} consecutive failures")
             except Exception:
                 pass  # Monitor might not be available
-            
+
             return (True, "")
-            
-        except ImportError:
-            return (True, "")  # psutil not available, proceed anyway
+
         except Exception as e:
             self._logger.debug(f"[Browser] Health check error: {e}")
             return (True, "")  # Non-critical, proceed
@@ -19705,13 +20282,31 @@ class BrowserCrashMonitor:
             return sum(pressures) / len(pressures)
         return None
 
+    @staticmethod
+    def _sync_proactive_health_check() -> Tuple[float, int]:
+        """Sync helper: scan Chrome processes for memory/count. Called via executor."""
+        try:
+            import psutil
+            chrome_memory_mb = 0.0
+            chrome_process_count = 0
+            for proc in psutil.process_iter(['name', 'memory_info']):
+                try:
+                    if 'chrome' in proc.info['name'].lower():
+                        chrome_memory_mb += proc.info['memory_info'].rss / (1024 * 1024)
+                        chrome_process_count += 1
+                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
+                    continue
+            return (chrome_memory_mb, chrome_process_count)
+        except Exception:
+            return (0.0, 0)
+
     async def proactive_health_check(self) -> Dict[str, Any]:
         """
         v197.2: Proactive browser health assessment.
-        
+
         Checks Chrome memory usage and crash patterns to predict
         and prevent crash code 5 (GPU/OOM) before it happens.
-        
+
         Returns:
             Dict with health status and recommended actions
         """
@@ -19723,22 +20318,23 @@ class BrowserCrashMonitor:
             "crash_risk_score": 0.0,
             "recommended_action": None,
         }
-        
+
         try:
-            import psutil
-            
-            # Check Chrome memory usage
-            for proc in psutil.process_iter(['name', 'memory_info']):
-                try:
-                    if 'chrome' in proc.info['name'].lower():
-                        result["chrome_memory_mb"] += proc.info['memory_info'].rss / (1024 * 1024)
-                        result["chrome_process_count"] += 1
-                except (psutil.NoSuchProcess, psutil.AccessDenied, KeyError):
-                    continue
-            
+            # Offload psutil process scan to executor
+            try:
+                chrome_memory_mb, chrome_process_count = await _run_in_supervisor_thread(
+                    self._sync_proactive_health_check, timeout=10.0
+                )
+            except asyncio.TimeoutError:
+                self._logger.warning("[BrowserHealth] Proactive check timed out")
+                return result
+
+            result["chrome_memory_mb"] = chrome_memory_mb
+            result["chrome_process_count"] = chrome_process_count
+
             # Calculate crash risk score (0-1)
             risk_score = 0.0
-            
+
             # Memory contribution to risk
             if result["chrome_memory_mb"] > 6144:
                 risk_score += 0.5  # Very high memory = high risk
@@ -19746,22 +20342,22 @@ class BrowserCrashMonitor:
                 risk_score += 0.3
             elif result["chrome_memory_mb"] > 2048:
                 risk_score += 0.1
-            
+
             # Recent crash history contribution
             crash_rate = self._calculate_crash_rate()
             if crash_rate >= 3:
                 risk_score += 0.4
             elif crash_rate >= 1:
                 risk_score += 0.2
-            
+
             # Consecutive failures contribution
             if self._consecutive_failures >= 2:
                 risk_score += 0.3
             elif self._consecutive_failures >= 1:
                 risk_score += 0.1
-            
+
             result["crash_risk_score"] = min(risk_score, 1.0)
-            
+
             # Determine risk level and action
             if risk_score >= 0.7:
                 result["healthy"] = False
@@ -19782,12 +20378,10 @@ class BrowserCrashMonitor:
             elif risk_score >= 0.2:
                 result["risk_level"] = "medium"
                 result["recommended_action"] = "monitor"
-            
-        except ImportError:
-            pass  # psutil not available
+
         except Exception as e:
             self._logger.debug(f"[BrowserHealth] Check failed: {e}")
-        
+
         return result
 
     async def preemptive_restart_if_needed(self) -> bool:
@@ -20604,8 +21198,16 @@ class ParallelProcessCleaner:
                     proc = psutil.Process(target_pid)
                     os.kill(target_pid, sig)
                     return True
-                except (Exception, ProcessLookupError, OSError):
+                except (ProcessLookupError, psutil.NoSuchProcess):
                     return True  # Process already gone
+                except PermissionError as e:
+                    self.logger.debug(f"[SafeKill] Permission denied killing PID {target_pid}: {e}")
+                    return False
+                except OSError:
+                    return True  # Other OS-level errors (ESRCH, etc.) — treat as gone
+                except Exception as e:
+                    self.logger.debug(f"[SafeKill] Unexpected error killing PID {target_pid}: {e}")
+                    return False
 
             async def _async_wait(proc: Any, timeout: float) -> bool:
                 """
@@ -20775,14 +21377,9 @@ class ParallelProcessCleaner:
 
         return killed_count
 
-    async def _is_supervisor_truly_stale(self, holder_pid: int) -> bool:
-        """
-        v152.0: Determine if a supervisor process is truly stale.
-
-        A supervisor is NOT stale if:
-        1. Readiness state file was updated in the last 120 seconds
-        2. Heartbeat file was updated in the last 60 seconds
-        """
+    @staticmethod
+    def _sync_is_supervisor_truly_stale(holder_pid: int) -> bool:
+        """Synchronous staleness-check helper (runs in executor thread)."""
         now = time.time()
 
         # Check 1: Readiness state file freshness
@@ -20830,6 +21427,26 @@ class ParallelProcessCleaner:
             pass
 
         return True
+
+    async def _is_supervisor_truly_stale(self, holder_pid: int) -> bool:
+        """
+        v152.0: Determine if a supervisor process is truly stale (offloaded to executor).
+
+        A supervisor is NOT stale if:
+        1. Readiness state file was updated in the last 120 seconds
+        2. Heartbeat file was updated in the last 60 seconds
+        """
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_is_supervisor_truly_stale, holder_pid, timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            if hasattr(self, '_logger') and self._logger:
+                self._logger.warning(
+                    "_is_supervisor_truly_stale timed out after 10s for pid=%d, assuming stale",
+                    holder_pid,
+                )
+            return True
 
 # =============================================================================
 # ZOMBIE PROCESS INFO DATACLASS - Extended Process Metadata
@@ -20998,8 +21615,8 @@ class ComprehensiveZombieCleanup:
 
         return True
 
-    async def _discover_all_zombies(self) -> Dict[int, ZombieProcessInfo]:
-        """Discover all zombie processes across repos."""
+    def _sync_discover_all_zombies(self) -> Dict[int, "ZombieProcessInfo"]:
+        """Sync helper: full psutil process scan for zombies. Called via executor."""
         zombies: Dict[int, ZombieProcessInfo] = {}
 
         try:
@@ -21007,22 +21624,22 @@ class ComprehensiveZombieCleanup:
         except ImportError:
             return zombies
 
-        # Scan all processes
-        all_ports = []
-        for ports in self.TRINITY_PORTS.values():
-            all_ports.extend(ports)
+        # Snapshot read-only attrs
+        my_pid = self._my_pid
+        my_parent = self._my_parent
+        repo_patterns = self.REPO_PATTERNS
 
         for proc in psutil.process_iter(['pid', 'cmdline', 'create_time', 'memory_info', 'cpu_percent', 'status']):
             try:
                 pid = proc.info['pid']
-                if pid in (self._my_pid, self._my_parent):
+                if pid in (my_pid, my_parent):
                     continue
 
                 cmdline = " ".join(proc.info.get('cmdline') or []).lower()
 
                 # Check if matches any repo pattern
                 repo_origin = "unknown"
-                for repo, patterns in self.REPO_PATTERNS.items():
+                for repo, patterns in repo_patterns.items():
                     if any(p in cmdline for p in patterns):
                         repo_origin = repo
                         break
@@ -21060,6 +21677,17 @@ class ComprehensiveZombieCleanup:
 
         return zombies
 
+    async def _discover_all_zombies(self) -> Dict[int, ZombieProcessInfo]:
+        """Discover all zombie processes across repos."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_discover_all_zombies, timeout=15.0
+            )
+        except asyncio.TimeoutError:
+            return {}
+        except Exception:
+            return {}
+
     async def _terminate_zombies(self, zombies: Dict[int, ZombieProcessInfo]) -> int:
         """Terminate zombie processes."""
         try:
@@ -21089,25 +21717,26 @@ class ComprehensiveZombieCleanup:
 
         return killed
 
-    async def _free_ports(self) -> int:
-        """Free up Trinity ports."""
+    def _sync_free_ports(self) -> int:
+        """Sync helper: scan net_connections and kill port holders. Called via executor."""
         freed = 0
-
         try:
             import psutil
         except ImportError:
             return freed
 
-        all_ports = []
+        all_ports = set()
         for ports in self.TRINITY_PORTS.values():
-            all_ports.extend(ports)
+            all_ports.update(ports)
+
+        my_pid = self._my_pid
+        my_parent = self._my_parent
 
         try:
             for conn in psutil.net_connections(kind='inet'):
                 if conn.laddr.port in all_ports and conn.pid:
-                    if conn.pid in (self._my_pid, self._my_parent):
+                    if conn.pid in (my_pid, my_parent):
                         continue
-
                     try:
                         os.kill(conn.pid, signal.SIGKILL)
                         freed += 1
@@ -21117,6 +21746,17 @@ class ComprehensiveZombieCleanup:
             pass
 
         return freed
+
+    async def _free_ports(self) -> int:
+        """Free up Trinity ports."""
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_free_ports, timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            return 0
+        except Exception:
+            return 0
 
     def get_stats(self) -> Dict[str, Any]:
         """Get cleanup statistics."""
@@ -21941,8 +22581,10 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
         try:
             from backend.core.gcp_lifecycle_bridge import notify_bridge
             notify_bridge("notify_spot_preempted", source="GCPSpotResilienceManager")
-        except Exception:
-            pass
+        except Exception as e:
+            self._logger.warning(
+                f"[DeprecatedSpotResilience] Failed to notify_spot_preempted: {e}", exc_info=True
+            )
         self._logger.warning(
             "⚠️ SPOT PREEMPTION NOTICE - 30 seconds to shutdown!"
         )
@@ -21996,8 +22638,13 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
             }
 
             self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            self.state_file.write_text(json.dumps(state, indent=2))
-            self._logger.info(f"💾 State preserved to {self.state_file}")
+            payload = json.dumps(state, indent=2)
+            try:
+                await _run_in_supervisor_thread(self.state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self._logger.warning(f"SpotInstanceResilienceHandler._preserve_state: file write failed: {io_err}")
+                return
+            self._logger.info(f"State preserved to {self.state_file}")
 
         except Exception as e:
             self._logger.error(f"State preservation failed: {e}")
@@ -22044,8 +22691,13 @@ class _Deprecated_SpotInstanceResilienceHandler:  # v239.0: superseded by SpotIn
         """Load preserved state from previous session."""
         try:
             if self.state_file.exists():
-                state = json.loads(self.state_file.read_text())
-                self._logger.info(f"💾 Loaded preserved state from {self.state_file}")
+                try:
+                    raw = await _run_in_supervisor_thread(self.state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self._logger.warning(f"SpotInstanceResilienceHandler.load_preserved_state: file read failed: {io_err}")
+                    return None
+                state = json.loads(raw)
+                self._logger.info(f"Loaded preserved state from {self.state_file}")
 
                 # Restore preemption history
                 if "preemption_history" in state:
@@ -24189,9 +24841,11 @@ class HybridIntelligenceCoordinator(IntelligenceManagerBase):
         if pct > 0.0:
             return pct / 100.0
         try:
-            import psutil
-            return psutil.virtual_memory().percent / 100.0
-        except Exception:
+            return await _run_in_supervisor_thread(
+                lambda: __import__('psutil').virtual_memory().percent / 100.0,
+                timeout=5.0,
+            )
+        except (asyncio.TimeoutError, Exception):
             return 0.5
 
     async def _handle_emergency(self, ram_usage: float) -> None:
@@ -28560,14 +29214,12 @@ class ResourceQuotaManager:
     async def _check_processes(self) -> None:
         """Check process count."""
         try:
-            import psutil
-
-            process = psutil.Process()
-            children = process.children(recursive=True)
-            self._usage["child_processes"] = len(children)
-        except ImportError:
-            pass
-        except Exception:
+            count = await _run_in_supervisor_thread(
+                lambda: len(__import__('psutil').Process().children(recursive=True)),
+                timeout=5.0,
+            )
+            self._usage["child_processes"] = count
+        except (asyncio.TimeoutError, Exception):
             pass
 
     def reserve_resources(
@@ -29358,8 +30010,9 @@ class DistributedStateCoordinator:
                 self._stats["sync_cycles"] += 1
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "state_sync_loop", f"State sync error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _sync_with_peers(self) -> None:
         """Sync state with peer components."""
@@ -29409,13 +30062,17 @@ class DistributedStateCoordinator:
         state_file = self._state_dir / f"{self._component_name}.state.json"
         if state_file.exists():
             try:
-                content = state_file.read_text()
+                try:
+                    content = await _run_in_supervisor_thread(state_file.read_text, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    _unified_logger.warning(f"[StateCoordinator] _load_state file read failed: {io_err}")
+                    return
                 data = json.loads(content)
                 self._local_state = data.get("namespaces", {})
                 self._vector_clock = data.get("vector_clock", {self._component_name: 0})
                 self._version = data.get("version", 0)
-            except Exception:
-                pass
+            except Exception as e:
+                _unified_logger.warning(f"[StateCoordinator] Failed to load state: {e}")
 
     async def _save_state(self) -> None:
         """Save state to disk."""
@@ -29428,9 +30085,13 @@ class DistributedStateCoordinator:
                 "version": self._version,
                 "timestamp": time.time(),
             }
-            state_file.write_text(json.dumps(data, indent=2))
-        except Exception:
-            pass
+            payload = json.dumps(data, indent=2)
+            try:
+                await _run_in_supervisor_thread(state_file.write_text, payload, timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                _unified_logger.warning(f"[StateCoordinator] _save_state file write failed: {io_err}")
+        except Exception as e:
+            _unified_logger.warning(f"[StateCoordinator] Failed to save state: {e}")
 
     async def create_snapshot(self) -> str:
         """Create a state snapshot for backup."""
@@ -29614,8 +30275,9 @@ class TrinityOrchestrationEngine:
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "election_loop", f"Election loop error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _start_election(self) -> None:
         """Start a leader election."""
@@ -29660,8 +30322,9 @@ class TrinityOrchestrationEngine:
                 await asyncio.sleep(self._heartbeat_interval)
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "debug", "trinity_heartbeat_loop", f"Heartbeat loop error: {e}")
+                await asyncio.sleep(1.0)
 
     async def _send_heartbeat(self) -> None:
         """Send heartbeat to cluster."""
@@ -29673,46 +30336,73 @@ class TrinityOrchestrationEngine:
             "commit_index": self._commit_index,
             "timestamp": time.time(),
         }
-        heartbeat_file.write_text(json.dumps(data))
+        payload = json.dumps(data)
+        try:
+            await _run_in_supervisor_thread(heartbeat_file.write_text, payload, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] Heartbeat write timed out")
 
-    async def _discover_nodes(self) -> List[str]:
-        """Discover other nodes in the cluster."""
-        nodes = []
+    def _sync_discover_nodes(self) -> List[Dict[str, Any]]:
+        """Sync helper: read heartbeat files from disk, return parsed entries."""
+        entries = []
         for heartbeat_file in self._cluster_dir.glob("*.heartbeat"):
             try:
                 content = heartbeat_file.read_text()
                 data = json.loads(content)
-                node_id = data.get("node_id")
-                timestamp = data.get("timestamp", 0)
-
-                # Only include recent nodes
-                if time.time() - timestamp < 10:
-                    nodes.append(node_id)
-                    self._node_last_seen[node_id] = timestamp
-
-                    # Update leader if needed
-                    if data.get("state") == "leader":
-                        self._leader_id = node_id
-                        if node_id != self._node_id:
-                            self._state = self.NodeState.FOLLOWER
-
+                entries.append(data)
             except Exception:
                 pass
+        return entries
+
+    async def _discover_nodes(self) -> List[str]:
+        """Discover other nodes in the cluster."""
+        try:
+            entries = await _run_in_supervisor_thread(self._sync_discover_nodes, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] Node discovery I/O timed out")
+            return list(self._known_nodes - {self._node_id})
+
+        nodes = []
+        for data in entries:
+            node_id = data.get("node_id")
+            timestamp = data.get("timestamp", 0)
+
+            # Only include recent nodes
+            if time.time() - timestamp < 10:
+                nodes.append(node_id)
+                self._node_last_seen[node_id] = timestamp
+
+                # Update leader if needed
+                if data.get("state") == "leader":
+                    self._leader_id = node_id
+                    if node_id != self._node_id:
+                        self._state = self.NodeState.FOLLOWER
 
         self._known_nodes = set(nodes) | {self._node_id}
         return nodes
+
+    @staticmethod
+    def _sync_read_vote_file(vote_file) -> Optional[Dict[str, Any]]:
+        """Sync helper: read and parse a vote file, return parsed data or None."""
+        if vote_file.exists():
+            try:
+                content = vote_file.read_text()
+                return json.loads(content)
+            except Exception:
+                pass
+        return None
 
     async def _request_vote(self, node_id: str) -> bool:
         """Request vote from a node (file-based simulation)."""
         # In file-based coordination, we use a voting file
         vote_file = self._cluster_dir / f"{node_id}.vote"
-        if vote_file.exists():
-            try:
-                content = vote_file.read_text()
-                data = json.loads(content)
-                return data.get("voted_for") == self._node_id
-            except Exception:
-                pass
+        try:
+            data = await _run_in_supervisor_thread(self._sync_read_vote_file, vote_file, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning(f"[OrchestrationEngine] Vote file read timed out for node {node_id}")
+            return False
+        if data is not None:
+            return data.get("voted_for") == self._node_id
         return False
 
     async def submit_command(self, command: Dict[str, Any]) -> bool:
@@ -29747,11 +30437,16 @@ class TrinityOrchestrationEngine:
             return False
 
         forward_file = self._cluster_dir / f"forward_{self._leader_id}_{int(time.time() * 1000)}.json"
-        forward_file.write_text(json.dumps({
+        payload = json.dumps({
             "from": self._node_id,
             "command": command,
             "timestamp": time.time(),
-        }))
+        })
+        try:
+            await _run_in_supervisor_thread(forward_file.write_text, payload, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] Forward-to-leader write timed out")
+            return False
         return True
 
     async def _apply_entry(self, entry: Dict[str, Any]) -> None:
@@ -29810,18 +30505,29 @@ class TrinityOrchestrationEngine:
 
         return forecasts
 
-    async def _load_state(self) -> None:
-        """Load persisted state."""
-        state_file = self._cluster_dir / f"{self._node_id}.state.json"
+    @staticmethod
+    def _sync_load_state_file(state_file) -> Optional[Dict[str, Any]]:
+        """Sync helper: read and parse state file from disk."""
         if state_file.exists():
             try:
                 content = state_file.read_text()
-                data = json.loads(content)
-                self._current_term = data.get("term", 0)
-                self._voted_for = data.get("voted_for")
-                self._commit_index = data.get("commit_index", 0)
+                return json.loads(content)
             except Exception:
-                pass
+                return None
+        return None
+
+    async def _load_state(self) -> None:
+        """Load persisted state."""
+        state_file = self._cluster_dir / f"{self._node_id}.state.json"
+        try:
+            data = await _run_in_supervisor_thread(self._sync_load_state_file, state_file, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] State load timed out")
+            return
+        if data is not None:
+            self._current_term = data.get("term", 0)
+            self._voted_for = data.get("voted_for")
+            self._commit_index = data.get("commit_index", 0)
 
     async def _save_state(self) -> None:
         """Persist state."""
@@ -29833,7 +30539,11 @@ class TrinityOrchestrationEngine:
             "commit_index": self._commit_index,
             "state": self._state.value,
         }
-        state_file.write_text(json.dumps(data))
+        payload = json.dumps(data)
+        try:
+            await _run_in_supervisor_thread(state_file.write_text, payload, timeout=5.0)
+        except asyncio.TimeoutError:
+            _unified_logger.warning("[OrchestrationEngine] State save timed out")
 
     def get_status(self) -> Dict[str, Any]:
         """Get orchestration engine status."""
@@ -31090,7 +31800,7 @@ class EventSourcingManager(SystemService):
         self._events.clear()
         self._handlers.clear()
 
-class DynamicConfigurationManager:
+class DynamicConfigurationManager(SystemService):
     """
     Dynamic configuration with hot reload and validation.
 
@@ -31233,8 +31943,8 @@ class DynamicConfigurationManager:
                 file_config = json.loads(content)
                 for key, value in file_config.items():
                     self.set(key, value)
-            except Exception:
-                pass
+            except Exception as e:
+                _unified_logger.warning(f"[ConfigManager] Failed to load config: {e}")
 
         # Load from environment
         for key in self._schema.keys():
@@ -31301,6 +32011,33 @@ class DynamicConfigurationManager:
             "last_loaded": self._last_loaded,
             "stats": self._stats,
         }
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Load initial configuration from file."""
+        if self._config_file.exists():
+            await self._load_config()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._schema)} options, {len(self._feature_flags)} flags"
+
+    async def cleanup(self) -> None:
+        self._running = False
+        if self._reload_task and not self._reload_task.done():
+            self._reload_task.cancel()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DynamicConfigurationManager",
+            version="1.0.0",
+            inputs=["config.update"],
+            outputs=["config.changed"],
+            side_effects=["writes_config_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 # =============================================================================
 # ZONE 4.10: DISTRIBUTED SYSTEMS INFRASTRUCTURE
@@ -31496,6 +32233,24 @@ class DistributedLockManager(SystemService):
 
         return None
 
+    @staticmethod
+    def _sync_check_lock(lock_file) -> Optional[float]:
+        """Sync helper: read lock file. Returns expire_at if held, None if available/absent."""
+        if lock_file.exists():
+            try:
+                lock_data = json.loads(lock_file.read_text())
+                return lock_data.get("expire_at", 0)
+            except (json.JSONDecodeError, IOError):
+                pass
+        return None
+
+    @staticmethod
+    def _sync_write_lock(lock_file, lock_data_json: str) -> None:
+        """Sync helper: atomic temp+rename write for lock file."""
+        temp_file = lock_file.with_suffix(".tmp")
+        temp_file.write_text(lock_data_json)
+        temp_file.rename(lock_file)
+
     async def _try_acquire(
         self,
         resource_id: str,
@@ -31505,22 +32260,21 @@ class DistributedLockManager(SystemService):
         lock_file = self._storage_path / f"{resource_id}.lock"
 
         try:
-            # Check for existing lock
-            if lock_file.exists():
-                try:
-                    lock_data = json.loads(lock_file.read_text())
-                    expire_at = lock_data.get("expire_at", 0)
+            # Check for existing lock (file I/O in thread)
+            try:
+                expire_at = await _run_in_supervisor_thread(self._sync_check_lock, lock_file, timeout=5.0)
+            except asyncio.TimeoutError:
+                _unified_logger.warning(f"[DLM] Lock check timed out for {resource_id}")
+                return None
 
-                    if time.time() < expire_at:
-                        # Lock is held by someone else
-                        return None
+            if expire_at is not None:
+                if time.time() < expire_at:
+                    # Lock is held by someone else
+                    return None
+                # Lock has expired
+                self._stats["locks_expired"] += 1
 
-                    # Lock has expired
-                    self._stats["locks_expired"] += 1
-                except (json.JSONDecodeError, IOError):
-                    pass
-
-            # Create new lock
+            # Create new lock — sequence counter stays in async context (shared state)
             self._sequence_counter += 1
             token = FencingToken(
                 token_id=str(uuid.uuid4()),
@@ -31531,7 +32285,7 @@ class DistributedLockManager(SystemService):
             token.resource_id = resource_id
             token.metadata = metadata or {}
 
-            # Write lock file atomically
+            # Write lock file atomically (file I/O in thread)
             lock_data = {
                 "holder_id": self._node_id,
                 "token": token.to_dict(),
@@ -31539,16 +32293,19 @@ class DistributedLockManager(SystemService):
                 "expire_at": time.time() + self._lock_timeout,
             }
 
-            temp_file = lock_file.with_suffix(".tmp")
-            temp_file.write_text(json.dumps(lock_data))
-            temp_file.rename(lock_file)
+            try:
+                await _run_in_supervisor_thread(self._sync_write_lock, lock_file, json.dumps(lock_data), timeout=5.0)
+            except asyncio.TimeoutError:
+                _unified_logger.warning(f"[DLM] Lock write timed out for {resource_id}")
+                return None
 
             # Track held lock
             self._held_locks[resource_id] = token
 
             return token
 
-        except Exception:
+        except Exception as e:
+            _unified_logger.debug(f"[DLM] Lock acquire error: {e}")
             return None
 
     async def release(self, resource_id: str) -> bool:
@@ -31583,7 +32340,8 @@ class DistributedLockManager(SystemService):
 
             return True
 
-        except Exception:
+        except Exception as e:
+            _unified_logger.warning(f"[DLM] Lock release error: {e}")
             return False
 
     async def _notify_waiters(self, resource_id: str) -> None:
@@ -31608,13 +32366,13 @@ class DistributedLockManager(SystemService):
 
             except asyncio.CancelledError:
                 break
-            except Exception:
-                pass
+            except Exception as e:
+                _rate_limited_log(self._logger, "warning", "dlm_heartbeat_loop", f"DLM heartbeat error: {e}")
+                await asyncio.sleep(1.0)
 
-    async def _refresh_lock(self, resource_id: str, token: FencingToken) -> bool:
-        """Refresh lock expiration time."""
-        lock_file = self._storage_path / f"{resource_id}.lock"
-
+    @staticmethod
+    def _sync_refresh_lock(lock_file, node_id: str, lock_timeout: float) -> bool:
+        """Sync helper: read+verify+update lock file atomically in thread."""
         try:
             if not lock_file.exists():
                 return False
@@ -31622,16 +32380,26 @@ class DistributedLockManager(SystemService):
             lock_data = json.loads(lock_file.read_text())
 
             # Verify we still hold it
-            if lock_data.get("holder_id") != self._node_id:
+            if lock_data.get("holder_id") != node_id:
                 return False
 
             # Update expiration
-            lock_data["expire_at"] = time.time() + self._lock_timeout
+            lock_data["expire_at"] = time.time() + lock_timeout
             lock_file.write_text(json.dumps(lock_data))
 
             return True
-
         except Exception:
+            return False
+
+    async def _refresh_lock(self, resource_id: str, token: FencingToken) -> bool:
+        """Refresh lock expiration time."""
+        lock_file = self._storage_path / f"{resource_id}.lock"
+        try:
+            return await _run_in_supervisor_thread(
+                self._sync_refresh_lock, lock_file, self._node_id, self._lock_timeout, timeout=5.0
+            )
+        except asyncio.TimeoutError:
+            _unified_logger.warning(f"[DLM] Lock refresh timed out for {resource_id}")
             return False
 
     def _detect_deadlock(self, waiting_for: str) -> bool:
@@ -31872,7 +32640,7 @@ class RetryPolicy:
 
         return False
 
-class ServiceMeshRouter:
+class ServiceMeshRouter(SystemService):
     """
     Service mesh router with intelligent load balancing.
 
@@ -32281,6 +33049,36 @@ class ServiceMeshRouter:
             "services": services,
             "stats": self._stats.copy(),
         }
+
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        healthy_count = sum(
+            1
+            for eps in self._endpoints.values()
+            for ep in eps.values()
+            if ep.healthy
+        )
+        total = sum(len(eps) for eps in self._endpoints.values())
+        return True, f"ok: {healthy_count}/{total} endpoints healthy"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ServiceMeshRouter",
+            version="1.0.0",
+            inputs=["route.request"],
+            outputs=["route.completed"],
+            side_effects=["writes_routing_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
 
 class TelemetryDataPoint:
     """Single telemetry data point."""
@@ -33122,7 +33920,7 @@ class FeatureGate:
             "enabled_count": self.enabled_count,
         }
 
-class FeatureGateManager:
+class FeatureGateManager(SystemService):
     """
     Feature gate manager for gradual rollouts.
 
@@ -33416,6 +34214,33 @@ class FeatureGateManager:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Initialize feature gate storage."""
+        self._storage_path.mkdir(parents=True, exist_ok=True)
+        await self._load_gates()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._gates)} gates"
+
+    async def cleanup(self) -> None:
+        self._running = False
+        if self._sync_task and not self._sync_task.done():
+            self._sync_task.cancel()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="FeatureGateManager",
+            version="1.0.0",
+            inputs=["feature.toggle"],
+            outputs=["feature.changed"],
+            side_effects=["writes_feature_gates"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class ScalingDecision:
     """Represents an auto-scaling decision."""
 
@@ -33445,7 +34270,7 @@ class ScalingDecision:
             "timestamp": self.timestamp,
         }
 
-class AutoScalingController:
+class AutoScalingController(SystemService):
     """
     Auto-scaling controller for resource management.
 
@@ -33763,6 +34588,29 @@ class AutoScalingController:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {self._current_replicas} replicas"
+
+    async def cleanup(self) -> None:
+        self._decision_history.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AutoScalingController",
+            version="1.0.0",
+            inputs=["scaling.trigger"],
+            outputs=["scaling.completed"],
+            side_effects=["writes_scaling_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["scaling.trigger"]  # event_driven
+
 class SecretEntry:
     """
     Represents a secret entry in the vault.
@@ -33828,7 +34676,7 @@ class SecretEntry:
             result["value"] = self.value
         return result
 
-class SecretVaultManager:
+class SecretVaultManager(SystemService):
     """
     Secure secret storage with encryption and rotation.
 
@@ -34113,6 +34961,29 @@ class SecretVaultManager:
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._running, f"ok: {len(self._secrets)} secrets stored"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SecretVaultManager",
+            version="1.0.0",
+            inputs=["secret.get", "secret.set"],
+            outputs=["secret.retrieved"],
+            side_effects=["writes_secret_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class AuditEvent:
     """Represents an audit event for compliance logging."""
 
@@ -34168,7 +35039,7 @@ class AuditEvent:
             f"outcome={self.outcome}"
         )
 
-class AuditTrailRecorder:
+class AuditTrailRecorder(SystemService):
     """
     Compliance-ready audit trail recorder.
 
@@ -34482,6 +35353,41 @@ class AuditTrailRecorder:
             "stats": self._stats.copy(),
         }
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        written = self._stats.get("events_written", 0)
+        return (True, f"AuditTrailRecorder: {written} events written, running={self._running}")
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._running,
+            message=f"AuditTrailRecorder: running={self._running}, buffered={len(self._buffer)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        if self._buffer:
+            await self._flush()
+        return True
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AuditTrailRecorder",
+            version="1.0.0",
+            inputs=["supervisor.event.*"],
+            outputs=["audit.entry.created"],
+            side_effects=["writes_audit_trail"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 # =============================================================================
 # ZONE 4.11: WORKFLOW AND TASK ORCHESTRATION
 # =============================================================================
@@ -34726,7 +35632,7 @@ class WorkflowInstance:
             },
         }
 
-class WorkflowEngine:
+class WorkflowEngine(SystemService):
     """
     DAG-based workflow execution engine.
 
@@ -35044,6 +35950,31 @@ class WorkflowEngine:
             "total_instances": len(self._instances),
             "stats": self._stats.copy(),
         }
+
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Initialize workflow engine resources."""
+        self._storage_path.mkdir(parents=True, exist_ok=True)
+
+    async def health_check(self) -> Tuple[bool, str]:
+        running = len([i for i in self._instances.values() if i.status == "running"])
+        return True, f"ok: {len(self._definitions)} defs, {running} running"
+
+    async def cleanup(self) -> None:
+        self._running = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="WorkflowEngine",
+            version="1.0.0",
+            inputs=["workflow.submit", "workflow.cancel"],
+            outputs=["workflow.completed", "workflow.failed"],
+            side_effects=["writes_workflow_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # warm_standby
 
 class TaskPriority(Enum):
     """Task priority levels."""
@@ -35604,7 +36535,7 @@ class StateMachineInstance:
             "transition_count": len(self.transition_history),
         }
 
-class StateMachineManager:
+class StateMachineManager(SystemService):
     """
     Finite state machine manager.
 
@@ -35769,6 +36700,29 @@ class StateMachineManager:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._definitions)} defs, {len(self._instances)} instances"
+
+    async def cleanup(self) -> None:
+        self._instances.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="StateMachineManager",
+            version="1.0.0",
+            inputs=["state.transition.request"],
+            outputs=["state.transition.completed"],
+            side_effects=["writes_state_machine_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class BatchItem:
     """Represents an item in a batch operation."""
 
@@ -35784,7 +36738,7 @@ class BatchItem:
         self.error: Optional[str] = None
         self.processed_at: Optional[float] = None
 
-class BatchProcessor:
+class BatchProcessor(SystemService):
     """
     Batch processing system with progress tracking.
 
@@ -35961,6 +36915,30 @@ class BatchProcessor:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        active = len([j for j in self._jobs.values() if j.get("status") == "running"])
+        return True, f"ok: {active} active jobs"
+
+    async def cleanup(self) -> None:
+        self._jobs.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="BatchProcessor",
+            version="1.0.0",
+            inputs=["batch.submit"],
+            outputs=["batch.completed"],
+            side_effects=["writes_batch_results"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["batch.submit"]  # event_driven
+
 class NotificationChannel(Enum):
     """Notification channels."""
     LOG = "log"
@@ -36016,7 +36994,7 @@ class Notification:
             "failed_channels": self.failed_channels,
         }
 
-class NotificationDispatcher:
+class NotificationDispatcher(SystemService):
     """
     Multi-channel notification dispatcher.
 
@@ -36179,6 +37157,29 @@ class NotificationDispatcher:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {self._stats['notifications_sent']} sent"
+
+    async def cleanup(self) -> None:
+        self._history.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="NotificationDispatcher",
+            version="1.0.0",
+            inputs=["notification.send"],
+            outputs=["notification.delivered"],
+            side_effects=["writes_notification_log"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["notification.send"]  # event_driven
+
 class SchemaVersion:
     """Represents a schema version."""
 
@@ -36194,7 +37195,7 @@ class SchemaVersion:
         self.created_at = created_at
         self.description = description
 
-class SchemaRegistry:
+class SchemaRegistry(SystemService):
     """
     Schema registry for data validation.
 
@@ -36379,6 +37380,31 @@ class SchemaRegistry:
             "stats": self._stats.copy(),
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+
+    async def initialize(self) -> None:
+        """Initialize schema storage."""
+        self._storage_path.mkdir(parents=True, exist_ok=True)
+
+    async def health_check(self) -> Tuple[bool, str]:
+        total = sum(len(v) for v in self._schemas.values())
+        return True, f"ok: {len(self._schemas)} schemas, {total} versions"
+
+    async def cleanup(self) -> None:
+        self._schemas.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SchemaRegistry",
+            version="1.0.0",
+            inputs=["schema.register"],
+            outputs=["schema.validated"],
+            side_effects=["writes_schema_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class APIRoute:
     """Represents an API route in the gateway."""
 
@@ -36443,7 +37469,7 @@ class APIRoute:
             "avg_latency_ms": self.total_latency_ms / max(1, self.request_count),
         }
 
-class APIGatewayManager:
+class APIGatewayManager(SystemService):
     """
     API gateway for request routing.
 
@@ -36696,6 +37722,30 @@ class APIGatewayManager:
             "auth_validators": len(self._auth_validators),
             "stats": self._stats.copy(),
         }
+
+    async def initialize(self) -> None:
+        """Initialize APIGatewayManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="APIGatewayManager",
+            version="1.0.0",
+            inputs=['api.route.register', 'api.request'],
+            outputs=['api.response', 'api.route.registered'],
+            side_effects=['routes_api_traffic'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['api.request']
 
 # =============================================================================
 # ZONE 4.12: DEPLOYMENT AND INFRASTRUCTURE ORCHESTRATION
@@ -37005,7 +38055,7 @@ class ConnectionPool:
             "stats": self._stats.copy(),
         }
 
-class ConnectionPoolManager:
+class ConnectionPoolManager(SystemService):
     """
     Manages multiple connection pools.
 
@@ -37099,6 +38149,29 @@ class ConnectionPoolManager:
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._running, f"ok: {len(self._pools)} pools managed"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ConnectionPoolManager",
+            version="1.0.0",
+            inputs=["pool.acquire", "pool.release"],
+            outputs=["pool.acquired"],
+            side_effects=["writes_pool_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class HealthCheckType(Enum):
     """Types of health checks."""
     LIVENESS = "liveness"
@@ -37164,7 +38237,7 @@ class HealthCheck:
         self.last_result: Optional[HealthCheckResult] = None
         self.healthy = True
 
-class HealthCheckOrchestrator:
+class HealthCheckOrchestrator(SystemService):
     """
     Comprehensive health checking system.
 
@@ -37409,6 +38482,29 @@ class HealthCheckOrchestrator:
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        await self.start()
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return True, f"ok: {len(self._checks)} checks registered"
+
+    async def cleanup(self) -> None:
+        await self.stop()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="HealthCheckOrchestrator",
+            version="1.0.0",
+            inputs=["health.check.all"],
+            outputs=["health.report"],
+            side_effects=["writes_health_reports"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 class DeploymentPhase(Enum):
     """Deployment phases."""
     PENDING = "pending"
@@ -37487,7 +38583,7 @@ class Deployment:
             "phase_history": self.phase_history,
         }
 
-class DeploymentCoordinator:
+class DeploymentCoordinator(SystemService):
     """
     Deployment lifecycle management.
 
@@ -37759,6 +38855,33 @@ class DeploymentCoordinator:
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        """Initialize deployment coordinator."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        active = len([d for d in self._deployments.values()
+            if d.phase in (DeploymentPhase.PREPARING, DeploymentPhase.DEPLOYING, DeploymentPhase.VERIFYING)])
+        return True, f"ok: {active} active deployments"
+
+    async def cleanup(self) -> None:
+        """Cleanup deployment coordinator state."""
+        self._deployments.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DeploymentCoordinator",
+            version="1.0.0",
+            inputs=["deploy.request"],
+            outputs=["deploy.completed", "deploy.failed"],
+            side_effects=["writes_deploy_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["deploy.request"]
+
 class BlueGreenState:
     """State for blue-green deployment."""
 
@@ -37772,7 +38895,7 @@ class BlueGreenState:
         self.green_version: Optional[str] = None
         self.last_switch_at: Optional[float] = None
 
-class BlueGreenDeployer:
+class BlueGreenDeployer(SystemService):
     """
     Zero-downtime blue-green deployments.
 
@@ -37941,6 +39064,30 @@ class BlueGreenDeployer:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize BlueGreenDeployer. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="BlueGreenDeployer",
+            version="1.0.0",
+            inputs=['deploy.blue_green', 'deploy.rollback'],
+            outputs=['deploy.switched', 'deploy.rolled_back'],
+            side_effects=['switches_traffic'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['deploy.blue_green']
+
 class CanaryReleaseState:
     """State for canary release."""
 
@@ -37965,7 +39112,7 @@ class CanaryReleaseState:
         self.stable_requests = 0
         self.stable_errors = 0
 
-class CanaryReleaseManager:
+class CanaryReleaseManager(SystemService):
     """
     Progressive canary deployments.
 
@@ -38209,6 +39356,30 @@ class CanaryReleaseManager:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize CanaryReleaseManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CanaryReleaseManager",
+            version="1.0.0",
+            inputs=['deploy.canary.start', 'deploy.canary.abort'],
+            outputs=['deploy.canary.promoted', 'deploy.canary.aborted'],
+            side_effects=['adjusts_traffic_split'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['deploy.canary.start']
+
 class RollbackCheckpoint:
     """Represents a rollback checkpoint."""
 
@@ -38236,7 +39407,7 @@ class RollbackCheckpoint:
             "metadata": self.metadata,
         }
 
-class RollbackCoordinator:
+class RollbackCoordinator(SystemService):
     """
     Automated rollback with checkpoints.
 
@@ -38424,6 +39595,30 @@ class RollbackCoordinator:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize RollbackCoordinator. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RollbackCoordinator",
+            version="1.0.0",
+            inputs=['deploy.rollback.create', 'deploy.rollback.execute'],
+            outputs=['deploy.checkpoint.created', 'deploy.rolled_back'],
+            side_effects=['writes_checkpoint_storage'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['deploy.rollback.execute']
+
 class InfrastructureResource:
     """Represents an infrastructure resource."""
 
@@ -38492,7 +39687,7 @@ class InfrastructureStack:
             },
         }
 
-class InfrastructureProvisionerManager:
+class InfrastructureProvisionerManager(SystemService):
     """
     Infrastructure provisioning management.
 
@@ -38659,6 +39854,30 @@ class InfrastructureProvisionerManager:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize InfrastructureProvisionerManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="InfrastructureProvisionerManager",
+            version="1.0.0",
+            inputs=['infra.provision', 'infra.destroy'],
+            outputs=['infra.provisioned', 'infra.destroyed'],
+            side_effects=['writes_infra_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['infra.provision']
+
 # =============================================================================
 # ZONE 4.13: DATA PIPELINE AND MESSAGING INFRASTRUCTURE
 # =============================================================================
@@ -38769,7 +39988,7 @@ class PipelineRun:
         self.current_stage: Optional[str] = None
         self.errors: List[Dict[str, Any]] = []
 
-class DataPipelineManager:
+class DataPipelineManager(SystemService):
     """
     ETL pipeline orchestration.
 
@@ -38937,6 +40156,30 @@ class DataPipelineManager:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize DataPipelineManager. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataPipelineManager",
+            version="1.0.0",
+            inputs=['pipeline.register', 'pipeline.run'],
+            outputs=['pipeline.completed', 'pipeline.failed'],
+            side_effects=['writes_pipeline_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['pipeline.run']
+
 class StreamEvent:
     """Represents an event in a stream."""
 
@@ -38989,7 +40232,7 @@ class StreamConsumerGroup:
         """Remove a consumer from the group."""
         self.consumers.discard(consumer_id)
 
-class StreamProcessor:
+class StreamProcessor(SystemService):
     """
     Real-time event stream processing.
 
@@ -39226,6 +40469,30 @@ class StreamProcessor:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize StreamProcessor. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="StreamProcessor",
+            version="1.0.0",
+            inputs=['stream.publish', 'stream.subscribe'],
+            outputs=['stream.delivered', 'stream.processed'],
+            side_effects=['writes_stream_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['stream.publish']
+
 class Topic:
     """Represents a pub/sub topic."""
 
@@ -39454,7 +40721,7 @@ class ScheduledJob:
         self.failure_count = 0
         self.last_error: Optional[str] = None
 
-class CronScheduler:
+class CronScheduler(SystemService):
     """
     Cron-style job scheduling.
 
@@ -39683,6 +40950,30 @@ class CronScheduler:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize CronScheduler. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CronScheduler",
+            version="1.0.0",
+            inputs=['cron.schedule', 'cron.trigger'],
+            outputs=['cron.executed', 'cron.scheduled'],
+            side_effects=['executes_scheduled_jobs'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['cron.schedule']
+
 class Webhook:
     """Represents a webhook endpoint."""
 
@@ -39707,7 +40998,7 @@ class Webhook:
         self.last_delivery_at: Optional[float] = None
         self.last_failure_at: Optional[float] = None
 
-class WebhookDispatcher:
+class WebhookDispatcher(SystemService):
     """
     Outgoing webhook management.
 
@@ -39870,6 +41161,30 @@ class WebhookDispatcher:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize WebhookDispatcher. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="WebhookDispatcher",
+            version="1.0.0",
+            inputs=['webhook.register', 'webhook.dispatch'],
+            outputs=['webhook.delivered', 'webhook.registered'],
+            side_effects=['sends_http_requests'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['webhook.dispatch']
+
 class CacheRegion:
     """Represents a cache region for invalidation coordination."""
 
@@ -39884,7 +41199,7 @@ class CacheRegion:
         self.last_invalidation_at: Optional[float] = None
         self.invalidation_count = 0
 
-class CacheInvalidationCoordinator:
+class CacheInvalidationCoordinator(SystemService):
     """
     Distributed cache invalidation.
 
@@ -40068,6 +41383,30 @@ class CacheInvalidationCoordinator:
             "stats": self._stats.copy(),
         }
 
+    async def initialize(self) -> None:
+        """Initialize CacheInvalidationCoordinator. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CacheInvalidationCoordinator",
+            version="1.0.0",
+            inputs=['cache.invalidate', 'cache.register_region'],
+            outputs=['cache.invalidated', 'cache.region_registered'],
+            side_effects=['invalidates_cache_entries'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['cache.invalidate']
+
 class LoadSheddingPolicy:
     """Load shedding policy configuration."""
 
@@ -40083,7 +41422,7 @@ class LoadSheddingPolicy:
         self.action = action
         self.priority_threshold = priority_threshold
 
-class LoadSheddingController:
+class LoadSheddingController(SystemService):
     """
     Graceful degradation under load.
 
@@ -40263,6 +41602,30 @@ class LoadSheddingController:
             "requests_degraded": self._requests_degraded,
             "stats": self._stats.copy(),
         }
+
+    async def initialize(self) -> None:
+        """Initialize LoadSheddingController. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="LoadSheddingController",
+            version="1.0.0",
+            inputs=['loadshed.evaluate', 'loadshed.configure'],
+            outputs=['loadshed.decision', 'loadshed.shed'],
+            side_effects=['rejects_excess_load'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['loadshed.evaluate']
 
 # ╔═══════════════════════════════════════════════════════════════════════════════╗
 # ║                                                                               ║
@@ -40538,7 +41901,7 @@ class PolicyEvaluationResult:
     evaluated_at: datetime = field(default_factory=datetime.now)
     context: Dict[str, Any] = field(default_factory=dict)
 
-class SecurityPolicyEngine:
+class SecurityPolicyEngine(SystemService):
     """
     Enterprise security policy enforcement engine.
 
@@ -40911,6 +42274,45 @@ class SecurityPolicyEngine:
         """Get all registered policies."""
         return list(self._policies.values())
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        evals = self._metrics.get("evaluations", 0)
+        violations = self._metrics.get("violations", 0)
+        return (True, f"SecurityPolicyEngine: {evals} evaluations, {violations} violations")
+
+    async def cleanup(self) -> None:
+        self._evaluation_cache.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"SecurityPolicyEngine: initialized={self._initialized}, policies={len(self._policies)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SecurityPolicyEngine",
+            version="1.0.0",
+            inputs=["agent.action", "ipc.command"],
+            outputs=["security.violation", "security.allow"],
+            side_effects=["writes_security_audit"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class ComplianceRequirement:
     """
@@ -40946,7 +42348,7 @@ class ComplianceStatus:
     next_assessment: datetime
     assessor: str = "automated"
 
-class ComplianceAuditor:
+class ComplianceAuditor(SystemService):
     """
     Enterprise compliance auditing and tracking system.
 
@@ -41247,6 +42649,44 @@ class ComplianceAuditor:
         report["summary"]["by_status"] = status_counts
         return report
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        reqs = len(self._requirements)
+        return (True, f"ComplianceAuditor: {reqs} requirements tracked")
+
+    async def cleanup(self) -> None:
+        self._audit_log.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"ComplianceAuditor: initialized={self._initialized}, requirements={len(self._requirements)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ComplianceAuditor",
+            version="1.0.0",
+            inputs=["health.report"],
+            outputs=["compliance.violation", "compliance.pass"],
+            side_effects=["writes_compliance_report"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # batch_window (always_on for lifecycle purposes)
+
 @dataclass
 class DataClassification:
     """
@@ -41280,7 +42720,7 @@ class ClassifiedData:
     last_accessed: datetime = field(default_factory=datetime.now)
     access_count: int = 0
 
-class DataClassificationManager:
+class DataClassificationManager(SystemService):
     """
     Enterprise data classification and handling system.
 
@@ -41534,6 +42974,45 @@ class DataClassificationManager:
             ):
                 child.classification = parent.classification
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        classified = len(self._classified_data)
+        return (True, f"DataClassificationManager: {classified} items classified")
+
+    async def cleanup(self) -> None:
+        self._classified_data.clear()
+        self._lineage.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"DataClassificationManager: initialized={self._initialized}, classified={len(self._classified_data)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataClassificationManager",
+            version="1.0.0",
+            inputs=["data.ingested"],
+            outputs=["data.classified"],
+            side_effects=["writes_classification_labels"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["data.ingested"]  # event_driven
+
 @dataclass
 class AccessPermission:
     """Defines an access permission."""
@@ -41565,7 +43044,7 @@ class AccessGrant:
     granted_by: str = "system"
     conditions: Dict[str, Any] = field(default_factory=dict)
 
-class AccessControlManager:
+class AccessControlManager(SystemService):
     """
     Enterprise RBAC/ABAC access control system.
 
@@ -41943,6 +43422,45 @@ class AccessControlManager:
 
         return entries[-limit:]
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        roles = len(self._roles)
+        grants = len(self._grants)
+        return (True, f"AccessControlManager: {roles} roles, {grants} grants")
+
+    async def cleanup(self) -> None:
+        self._audit_log.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"AccessControlManager: initialized={self._initialized}, roles={len(self._roles)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AccessControlManager",
+            version="1.0.0",
+            inputs=["cross_repo.request"],
+            outputs=["access.granted", "access.denied"],
+            side_effects=["writes_access_log"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class EncryptionKey:
     """Represents an encryption key."""
@@ -41956,7 +43474,7 @@ class EncryptionKey:
     purpose: str = "general"  # general, data, auth, signing
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class EncryptionServiceManager:
+class EncryptionServiceManager(SystemService):
     """
     Enterprise encryption and key management service.
 
@@ -41981,7 +43499,7 @@ class EncryptionServiceManager:
         self._logger = logging.getLogger("EncryptionServiceManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize encryption service with a master key."""
         try:
             async with self._lock:
@@ -42174,6 +43692,26 @@ class EncryptionServiceManager:
 
         return needs_rotation
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="EncryptionServiceManager",
+            version="1.0.0",
+            inputs=['crypto.encrypt', 'crypto.decrypt', 'crypto.rotate_key'],
+            outputs=['crypto.encrypted', 'crypto.decrypted'],
+            side_effects=['manages_encryption_keys'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['crypto.encrypt']
+
 @dataclass
 class AnomalyScore:
     """Score for an anomaly detection."""
@@ -42184,7 +43722,7 @@ class AnomalyScore:
     is_anomaly: bool
     timestamp: datetime = field(default_factory=datetime.now)
 
-class AnomalyDetector:
+class AnomalyDetector(SystemService):
     """
     Machine learning-based anomaly detection system.
 
@@ -42395,6 +43933,46 @@ class AnomalyDetector:
 
         return entries[-limit:]
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        anomalies = len(self._anomaly_log)
+        baselines = len(self._baselines)
+        return (True, f"AnomalyDetector: {baselines} baselines, {anomalies} anomalies logged")
+
+    async def cleanup(self) -> None:
+        self._anomaly_log.clear()
+        self._history.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"AnomalyDetector: initialized={self._initialized}, baselines={len(self._baselines)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AnomalyDetector",
+            version="1.0.0",
+            inputs=["telemetry.metric"],
+            outputs=["anomaly.detected"],
+            side_effects=["writes_anomaly_scores"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class SecurityIncident:
     """Represents a security incident."""
@@ -42412,7 +43990,7 @@ class SecurityIncident:
     remediation_steps: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class IncidentResponseCoordinator:
+class IncidentResponseCoordinator(SystemService):
     """
     Security incident response coordination system.
 
@@ -42785,6 +44363,46 @@ class IncidentResponseCoordinator:
                     return (resolve_time - incident.detected_at).total_seconds() / 60
         return None
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        open_incidents = sum(
+            1 for i in self._incidents.values() if i.status not in ("resolved", "closed")
+        )
+        return (True, f"IncidentResponseCoordinator: {open_incidents} open incidents")
+
+    async def cleanup(self) -> None:
+        pass  # Incidents are forensic records; do not clear
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"IncidentResponseCoordinator: initialized={self._initialized}, incidents={len(self._incidents)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="IncidentResponseCoordinator",
+            version="1.0.0",
+            inputs=["threat.confirmed"],
+            outputs=["incident.opened", "incident.resolved"],
+            side_effects=["writes_incident_log"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["threat.confirmed"]  # event_driven
+
 @dataclass
 class ThreatIndicator:
     """Represents a threat indicator (IOC)."""
@@ -42800,7 +44418,7 @@ class ThreatIndicator:
     tags: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class ThreatIntelligenceManager:
+class ThreatIntelligenceManager(SystemService):
     """
     Threat intelligence aggregation and correlation system.
 
@@ -43057,6 +44675,45 @@ class ThreatIntelligenceManager:
 
         return rules
 
+    # ── SystemService ABC ──────────────────────────────────────────
+    async def health_check(self) -> Tuple[bool, str]:
+        indicators = len(self._indicators)
+        sources = len(self._sources)
+        return (True, f"ThreatIntelligenceManager: {indicators} indicators, {sources} sources")
+
+    async def cleanup(self) -> None:
+        self._correlations.clear()
+
+    async def start(self) -> bool:
+        if not self._initialized:
+            await self.initialize()
+        return True
+
+    async def health(self) -> "ServiceHealthReport":
+        return ServiceHealthReport(
+            alive=True,
+            ready=self._initialized,
+            message=f"ThreatIntelligenceManager: initialized={self._initialized}, indicators={len(self._indicators)}",
+        )
+
+    async def drain(self, deadline_s: float) -> bool:
+        return True
+
+    async def stop(self) -> None:
+        await self.cleanup()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ThreatIntelligenceManager",
+            version="1.0.0",
+            inputs=["anomaly.detected"],
+            outputs=["threat.confirmed", "threat.dismissed"],
+            side_effects=["writes_threat_indicators"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["anomaly.detected"]  # event_driven
+
 # =============================================================================
 # ZONE 4.15: INTEGRATION AND API MANAGEMENT
 # =============================================================================
@@ -43097,7 +44754,7 @@ class ServiceQuery:
     status: Optional[str] = None
     metadata_filters: Optional[Dict[str, Any]] = None
 
-class ServiceRegistryManager:
+class ServiceRegistryManager(SystemService):
     """
     Service discovery and registration system.
 
@@ -43349,6 +45006,29 @@ class ServiceRegistryManager:
             "by_status": by_status
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._services)} services registered"
+
+    async def cleanup(self) -> None:
+        if self._health_check_task and not self._health_check_task.done():
+            self._health_check_task.cancel()
+        self._services.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ServiceRegistryManager",
+            version="1.0.0",
+            inputs=["service.register"],
+            outputs=["service.discovered"],
+            side_effects=["writes_service_registry_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class ConfigurationEntry:
     """A configuration entry."""
@@ -43371,7 +45051,7 @@ class ConfigurationChangeEvent:
     changed_at: datetime = field(default_factory=datetime.now)
     changed_by: str = "system"
 
-class ConfigurationManager:
+class ConfigurationManager(SystemService):
     """
     Centralized configuration management system.
 
@@ -43399,7 +45079,7 @@ class ConfigurationManager:
         self._logger = logging.getLogger("ConfigurationManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize configuration manager."""
         try:
             async with self._lock:
@@ -43632,6 +45312,26 @@ class ConfigurationManager:
             history = [e for e in history if e.key == key]
         return history[-limit:]
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ConfigurationManager",
+            version="1.0.0",
+            inputs=['config.set', 'config.get', 'config.reload'],
+            outputs=['config.changed', 'config.loaded'],
+            side_effects=['writes_config_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['config.set']
+
 @dataclass
 class DependencyDefinition:
     """Definition of a dependency."""
@@ -43641,7 +45341,7 @@ class DependencyDefinition:
     dependencies: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class DependencyContainer:
+class DependencyContainer(SystemService):
     """
     Dependency injection container.
 
@@ -43666,7 +45366,7 @@ class DependencyContainer:
         self._logger = logging.getLogger("DependencyContainer")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize dependency container."""
         try:
             self._initialized = True
@@ -43793,6 +45493,26 @@ class DependencyContainer:
     def get_registered(self) -> List[str]:
         """Get list of registered dependency names."""
         return list(self._definitions.keys())
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DependencyContainer",
+            version="1.0.0",
+            inputs=['di.register', 'di.resolve'],
+            outputs=['di.resolved', 'di.registered'],
+            side_effects=['manages_singletons'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['di.resolve']
 
 @dataclass
 class Event:
@@ -44066,7 +45786,7 @@ class GraphEdge:
     properties: Dict[str, Any]
     created_at: datetime = field(default_factory=datetime.now)
 
-class GraphDatabaseManager:
+class GraphDatabaseManager(SystemService):
     """
     In-memory graph database manager.
 
@@ -44092,7 +45812,7 @@ class GraphDatabaseManager:
         self._logger = logging.getLogger("GraphDatabaseManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize graph database."""
         try:
             self._initialized = True
@@ -44386,6 +46106,26 @@ class GraphDatabaseManager:
             "edge_types": list(set(e.edge_type for e in self._edges.values()))
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="GraphDatabaseManager",
+            version="1.0.0",
+            inputs=['graph.node.add', 'graph.edge.add', 'graph.query'],
+            outputs=['graph.query.result', 'graph.updated'],
+            side_effects=['writes_graph_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['graph.query']
+
 @dataclass
 class SearchDocument:
     """A document in the search index."""
@@ -44403,7 +46143,7 @@ class SearchResult:
     highlights: List[str]
     document: SearchDocument
 
-class SearchEngineManager:
+class SearchEngineManager(SystemService):
     """
     Full-text search engine manager.
 
@@ -44440,7 +46180,7 @@ class SearchEngineManager:
         self._logger = logging.getLogger("SearchEngineManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize search engine."""
         try:
             self._initialized = True
@@ -44657,6 +46397,26 @@ class SearchEngineManager:
             ) / max(1, len(self._documents))
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SearchEngineManager",
+            version="1.0.0",
+            inputs=['search.index', 'search.query'],
+            outputs=['search.results', 'search.indexed'],
+            side_effects=['writes_search_index'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['search.query']
+
 @dataclass
 class IntegrationMessage:
     """A message on the integration bus."""
@@ -44670,7 +46430,7 @@ class IntegrationMessage:
     correlation_id: Optional[str] = None
     reply_to: Optional[str] = None
 
-class IntegrationBusManager:
+class IntegrationBusManager(SystemService):
     """
     Message-based integration bus.
 
@@ -44699,7 +46459,7 @@ class IntegrationBusManager:
         self._logger = logging.getLogger("IntegrationBusManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize integration bus."""
         try:
             self._initialized = True
@@ -44902,6 +46662,26 @@ class IntegrationBusManager:
         """Get dead letter messages."""
         return list(self._dead_letter)[-limit:]
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="IntegrationBusManager",
+            version="1.0.0",
+            inputs=['bus.publish', 'bus.subscribe'],
+            outputs=['bus.delivered', 'bus.subscribed'],
+            side_effects=['routes_messages'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['bus.publish']
+
 @dataclass
 class APIVersion:
     """An API version definition."""
@@ -44914,7 +46694,7 @@ class APIVersion:
     migration_guide: Optional[str] = None
     changes_from_previous: List[str] = field(default_factory=list)
 
-class APIVersionManager:
+class APIVersionManager(SystemService):
     """
     API versioning and lifecycle management.
 
@@ -44939,7 +46719,7 @@ class APIVersionManager:
         self._logger = logging.getLogger("APIVersionManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize API version manager."""
         try:
             # Register default versions
@@ -45106,6 +46886,26 @@ class APIVersionManager:
             )
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="APIVersionManager",
+            version="1.0.0",
+            inputs=['api.version.register', 'api.version.deprecate'],
+            outputs=['api.version.registered', 'api.version.sunset'],
+            side_effects=['writes_version_registry'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['api.version.register']
+
 # =============================================================================
 # ZONE 4.16: RESOURCE MANAGEMENT AND MULTI-TENANCY
 # =============================================================================
@@ -45142,7 +46942,7 @@ class ResourceUsage:
     last_updated: datetime = field(default_factory=datetime.now)
     history: List[Tuple[datetime, float]] = field(default_factory=list)
 
-class ResourceQuotaManager:
+class ResourceQuotaManager(SystemService):
     """
     Resource quota enforcement system.
 
@@ -45171,7 +46971,7 @@ class ResourceQuotaManager:
         self._logger = logging.getLogger("ResourceQuotaManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize resource quota manager."""
         try:
             async with self._lock:
@@ -45420,6 +47220,28 @@ class ResourceQuotaManager:
         forecast = usage.current_usage + (rate_per_second * hours_ahead * 3600)
         return max(0, forecast)
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._quotas)} quotas configured"
+
+    async def cleanup(self) -> None:
+        self._quotas.clear()
+        self._usage.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourceQuotaManager",
+            version="1.0.0",
+            inputs=["quota.check"],
+            outputs=["quota.result"],
+            side_effects=["writes_quota_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class Tenant:
     """A tenant in the multi-tenant system."""
@@ -45442,7 +47264,7 @@ class TenantContext:
     session_id: Optional[str] = None
     request_id: Optional[str] = None
 
-class TenantManager:
+class TenantManager(SystemService):
     """
     Multi-tenant management system.
 
@@ -45470,7 +47292,7 @@ class TenantManager:
         self._logger = logging.getLogger("TenantManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize tenant manager."""
         try:
             async with self._lock:
@@ -45709,6 +47531,26 @@ class TenantManager:
 
         return tenants
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="TenantManager",
+            version="1.0.0",
+            inputs=['tenant.create', 'tenant.configure'],
+            outputs=['tenant.created', 'tenant.updated'],
+            side_effects=['writes_tenant_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['tenant.create']
+
 @dataclass
 class RateLimitRule:
     """A rate limiting rule."""
@@ -45729,7 +47571,7 @@ class RateLimitState:
     last_update: datetime
     request_count: int = 0
 
-class RateLimiterManager:
+class RateLimiterManager(SystemService):
     """
     Advanced rate limiting system.
 
@@ -45755,7 +47597,7 @@ class RateLimiterManager:
         self._logger = logging.getLogger("RateLimiterManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize rate limiter."""
         try:
             async with self._lock:
@@ -45979,6 +47821,28 @@ class RateLimiterManager:
             "algorithm": self._algorithm
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._rules)} rules active"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._states.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RateLimiterManager",
+            version="1.0.0",
+            inputs=["ratelimit.check"],
+            outputs=["ratelimit.result"],
+            side_effects=["writes_ratelimit_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class CoalescedRequest:
     """A coalesced request waiting for result."""
@@ -45987,7 +47851,7 @@ class CoalescedRequest:
     future: asyncio.Future
     created_at: datetime = field(default_factory=datetime.now)
 
-class RequestCoalescer:
+class RequestCoalescer(SystemService):
     """
     Request coalescing and deduplication system.
 
@@ -46131,6 +47995,30 @@ class RequestCoalescer:
             ) * 100
         }
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {self._metrics['coalesced']} coalesced"
+
+    async def cleanup(self) -> None:
+        for task in self._in_flight.values():
+            task.cancel()
+        self._in_flight.clear()
+        self._pending.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RequestCoalescer",
+            version="1.0.0",
+            inputs=["request.coalesce"],
+            outputs=["request.completed"],
+            side_effects=[],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["request.coalesce"]  # event_driven
+
 @dataclass
 class BackgroundJob:
     """A background job definition."""
@@ -46150,7 +48038,7 @@ class BackgroundJob:
     error: Optional[str] = None
     attempts: int = 0
 
-class BackgroundJobManager:
+class BackgroundJobManager(SystemService):
     """
     Background job processing system.
 
@@ -46384,6 +48272,27 @@ class BackgroundJobManager:
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._logger.info("Background job manager shutdown complete")
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._jobs)} jobs, {self._running_count} running"
+
+    async def cleanup(self) -> None:
+        await self.shutdown()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="BackgroundJobManager",
+            version="1.0.0",
+            inputs=["job.submit"],
+            outputs=["job.completed", "job.failed"],
+            side_effects=["writes_job_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # warm_standby
+
 @dataclass
 class RetryPolicyDef:
     """Retry policy configuration (BPM-style, distinct from ServiceMesh RetryPolicy)."""
@@ -46396,7 +48305,7 @@ class RetryPolicyDef:
     retryable_exceptions: List[type] = field(default_factory=list)
     non_retryable_exceptions: List[type] = field(default_factory=list)
 
-class RetryPolicyManager:
+class RetryPolicyManager(SystemService):
     """
     Configurable retry policy manager.
 
@@ -46418,7 +48327,7 @@ class RetryPolicyManager:
         self._logger = logging.getLogger("RetryPolicyManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize retry policy manager."""
         try:
             # Register default policies
@@ -46548,6 +48457,28 @@ class RetryPolicyManager:
             return self._metrics.get(policy_id, {})
         return dict(self._metrics)
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._policies)} policies registered"
+
+    async def cleanup(self) -> None:
+        self._policies.clear()
+        self._metrics.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RetryPolicyManager",
+            version="1.0.0",
+            inputs=["retry.configure"],
+            outputs=["retry.policy.updated"],
+            side_effects=["writes_retry_policies"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class PooledResource:
     """A resource in the pool."""
@@ -46558,7 +48489,7 @@ class PooledResource:
     use_count: int = 0
     healthy: bool = True
 
-class ResourcePoolManager:
+class ResourcePoolManager(SystemService):
     """
     Generic resource pooling manager.
 
@@ -46600,7 +48531,7 @@ class ResourcePoolManager:
         self._logger = logging.getLogger(f"ResourcePool[{name}]")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize the resource pool."""
         try:
             # Create minimum number of resources
@@ -46768,6 +48699,28 @@ class ResourcePoolManager:
 
         self._logger.info(f"Resource pool '{self.name}' shutdown complete")
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        avail = len(self._pool)
+        total = len(self._all_resources)
+        return self._initialized, f"ok: {avail}/{total} resources available"
+
+    async def cleanup(self) -> None:
+        await self.shutdown()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourcePoolManager",
+            version="1.0.0",
+            inputs=["resource.acquire"],
+            outputs=["resource.acquired"],
+            side_effects=["writes_resource_pool_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class CostEntry:
     """A cost accounting entry."""
@@ -46781,7 +48734,7 @@ class CostEntry:
     timestamp: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class CostAccountingManager:
+class CostAccountingManager(SystemService):
     """
     Resource usage cost tracking system.
 
@@ -46807,7 +48760,7 @@ class CostAccountingManager:
         self._logger = logging.getLogger("CostAccountingManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize cost accounting manager."""
         try:
             # Set default unit costs
@@ -46985,6 +48938,27 @@ class CostAccountingManager:
             "budget_usage_percent": round((total / budget) * 100, 2) if budget != float("inf") else None
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._entries)} cost entries tracked"
+
+    async def cleanup(self) -> None:
+        self._entries.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CostAccountingManager",
+            version="1.0.0",
+            inputs=["cost.record"],
+            outputs=["cost.report"],
+            side_effects=["writes_cost_ledger"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 # =============================================================================
 # ZONE 4.17: MONITORING, TESTING, AND RULES ENGINE
 # =============================================================================
@@ -47033,7 +49007,7 @@ class Alert:
     acknowledged_by: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class AlertingManager:
+class AlertingManager(SystemService):
     """
     Alert management and notification system.
 
@@ -47061,7 +49035,7 @@ class AlertingManager:
         self._logger = logging.getLogger("AlertingManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize alerting manager."""
         try:
             async with self._lock:
@@ -47312,6 +49286,28 @@ class AlertingManager:
             "history_size": len(self._alert_history)
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._active_alerts)} active alerts"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._active_alerts.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AlertingManager",
+            version="1.0.0",
+            inputs=["alert.trigger"],
+            outputs=["alert.fired", "alert.resolved"],
+            side_effects=["writes_alert_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["alert.trigger"]  # event_driven
+
 @dataclass
 class ProfileEntry:
     """A profiling entry."""
@@ -47325,7 +49321,7 @@ class ProfileEntry:
     memory_after: int = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class PerformanceProfiler:
+class PerformanceProfiler(SystemService):
     """
     Code performance profiling system.
 
@@ -47351,7 +49347,7 @@ class PerformanceProfiler:
         self._logger = logging.getLogger("PerformanceProfiler")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize performance profiler."""
         try:
             self._initialized = True
@@ -47491,6 +49487,28 @@ class PerformanceProfiler:
         """Set sampling rate (0.0 to 1.0)."""
         self._sample_rate = max(0.0, min(1.0, rate))
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._profiles)} functions profiled"
+
+    async def cleanup(self) -> None:
+        self._profiles.clear()
+        self._active_profiles.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="PerformanceProfiler",
+            version="1.0.0",
+            inputs=["profile.start"],
+            outputs=["profile.report"],
+            side_effects=["writes_profile_data"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["profile.start"]  # event_driven
+
 @dataclass
 class Experiment:
     """An A/B test experiment."""
@@ -47515,7 +49533,7 @@ class ExperimentAssignment:
     variant: str
     assigned_at: datetime = field(default_factory=datetime.now)
 
-class ABTestingFramework:
+class ABTestingFramework(SystemService):
     """
     A/B testing and experimentation framework.
 
@@ -47541,7 +49559,7 @@ class ABTestingFramework:
         self._logger = logging.getLogger("ABTestingFramework")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize A/B testing framework."""
         try:
             self._initialized = True
@@ -47791,6 +49809,26 @@ class ABTestingFramework:
         experiment.end_date = datetime.now()
         return True
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ABTestingFramework",
+            version="1.0.0",
+            inputs=['experiment.create', 'experiment.assign'],
+            outputs=['experiment.assigned', 'experiment.concluded'],
+            side_effects=['writes_experiment_state'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['experiment.create']
+
 @dataclass
 class FeatureFlag:
     """A feature flag definition."""
@@ -47806,7 +49844,7 @@ class FeatureFlag:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class FeatureFlagManager:
+class FeatureFlagManager(SystemService):
     """
     Feature flag and toggle management.
 
@@ -47831,7 +49869,7 @@ class FeatureFlagManager:
         self._logger = logging.getLogger("FeatureFlagManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize feature flag manager."""
         try:
             self._initialized = True
@@ -48021,6 +50059,26 @@ class FeatureFlagManager:
         """Get all feature flags."""
         return list(self._flags.values())
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="FeatureFlagManager",
+            version="1.0.0",
+            inputs=['flag.create', 'flag.evaluate'],
+            outputs=['flag.evaluated', 'flag.toggled'],
+            side_effects=['writes_flag_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['flag.evaluate']
+
 @dataclass
 class Rule:
     """A business rule definition."""
@@ -48043,7 +50101,7 @@ class RuleResult:
     data_modified: Dict[str, Any]
     execution_time_ms: float
 
-class RulesEngine:
+class RulesEngine(SystemService):
     """
     Business rules execution engine.
 
@@ -48257,6 +50315,28 @@ class RulesEngine:
                 return None
         return current
 
+    # --- SystemService governance (Nervous System – Wave 2) ---
+    # NOTE: initialize() already exists above (returns bool).
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._rules)} rules"
+
+    async def cleanup(self) -> None:
+        self._rules.clear()
+        self._rule_groups.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="RulesEngine",
+            version="1.0.0",
+            inputs=["rule.evaluate"],
+            outputs=["rule.result"],
+            side_effects=[],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # warm_standby
+
 @dataclass
 class ValidationRule:
     """A data validation rule."""
@@ -48280,7 +50360,7 @@ class ValidationResult:
     errors: List[ValidationError]
     validated_data: Dict[str, Any]
 
-class DataValidationManager:
+class DataValidationManager(SystemService):
     """
     Data validation and schema enforcement.
 
@@ -48304,7 +50384,7 @@ class DataValidationManager:
         self._logger = logging.getLogger("DataValidationManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize data validation manager."""
         try:
             self._initialized = True
@@ -48486,6 +50566,26 @@ class DataValidationManager:
                 return None
         return current
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataValidationManager",
+            version="1.0.0",
+            inputs=['validation.validate', 'validation.register_schema'],
+            outputs=['validation.result', 'validation.schema_registered'],
+            side_effects=['writes_schema_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['validation.validate']
+
 @dataclass
 class Template:
     """A template definition."""
@@ -48497,7 +50597,7 @@ class Template:
     updated_at: datetime = field(default_factory=datetime.now)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class TemplateEngine:
+class TemplateEngine(SystemService):
     """
     Dynamic template rendering engine.
 
@@ -48521,7 +50621,7 @@ class TemplateEngine:
         self._logger = logging.getLogger("TemplateEngine")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize template engine."""
         try:
             # Register default filters
@@ -48696,6 +50796,26 @@ class TemplateEngine:
             # Clean up temporary template
             self._templates.pop(temp_id, None)
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="TemplateEngine",
+            version="1.0.0",
+            inputs=['template.register', 'template.render'],
+            outputs=['template.rendered'],
+            side_effects=['caches_templates'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['template.render']
+
 @dataclass
 class ReportSection:
     """A section in a report."""
@@ -48714,7 +50834,7 @@ class Report:
     summary: str
     metadata: Dict[str, Any]
 
-class ReportGenerator:
+class ReportGenerator(SystemService):
     """
     Dynamic report generation system.
 
@@ -48738,7 +50858,7 @@ class ReportGenerator:
         self._logger = logging.getLogger("ReportGenerator")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize report generator."""
         try:
             self._initialized = True
@@ -48979,6 +51099,26 @@ class ReportGenerator:
 
         return None
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ReportGenerator",
+            version="1.0.0",
+            inputs=['report.generate', 'report.schedule'],
+            outputs=['report.generated', 'report.ready'],
+            side_effects=['writes_report_cache'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['report.generate']
+
 # =============================================================================
 # ZONE 4.18: PLUGIN SYSTEM AND EXTENDED SERVICES
 # =============================================================================
@@ -49017,7 +51157,7 @@ class PluginEvent:
     data: Dict[str, Any]
     timestamp: datetime = field(default_factory=datetime.now)
 
-class PluginManager:
+class PluginManager(SystemService):
     """
     Plugin lifecycle and dependency management system.
 
@@ -49044,7 +51184,7 @@ class PluginManager:
         self._logger = logging.getLogger("PluginManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize plugin manager."""
         try:
             self._initialized = True
@@ -49263,6 +51403,26 @@ class PluginManager:
             "event_log_size": len(self._event_log)
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="PluginManager",
+            version="1.0.0",
+            inputs=['plugin.install', 'plugin.enable', 'plugin.disable'],
+            outputs=['plugin.installed', 'plugin.enabled', 'plugin.disabled'],
+            side_effects=['manages_plugin_lifecycle'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['plugin.install']
+
 @dataclass
 class LocaleData:
     """Locale-specific data."""
@@ -49277,7 +51437,7 @@ class LocaleData:
     currency_code: str = "USD"
     currency_symbol: str = "$"
 
-class LocalizationManager:
+class LocalizationManager(SystemService):
     """
     Internationalization (i18n) and localization (l10n) manager.
 
@@ -49303,7 +51463,7 @@ class LocalizationManager:
         self._logger = logging.getLogger("LocalizationManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize localization manager."""
         try:
             # Register default English locale
@@ -49535,6 +51695,26 @@ class LocalizationManager:
             return {locale: self._missing_translations.get(locale, set())}
         return dict(self._missing_translations)
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="LocalizationManager",
+            version="1.0.0",
+            inputs=['i18n.translate', 'i18n.register_locale'],
+            outputs=['i18n.translated', 'i18n.locale_registered'],
+            side_effects=['writes_locale_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['i18n.translate']
+
 @dataclass
 class AuditEntry:
     """An audit trail entry."""
@@ -49551,7 +51731,7 @@ class AuditEntry:
     user_agent: Optional[str] = None
     session_id: Optional[str] = None
 
-class AuditTrailManager:
+class AuditTrailManager(SystemService):
     """
     Enhanced audit trail and activity logging system.
 
@@ -49582,7 +51762,7 @@ class AuditTrailManager:
         self._logger = logging.getLogger("AuditTrailManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize audit trail manager."""
         try:
             self._initialized = True
@@ -49792,6 +51972,26 @@ class AuditTrailManager:
             "top_actors": sorted(actor_counts.items(), key=lambda x: x[1], reverse=True)[:10]
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="AuditTrailManager",
+            version="1.0.0",
+            inputs=['audit.record', 'audit.search'],
+            outputs=['audit.recorded', 'audit.results'],
+            side_effects=['writes_audit_log'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['audit.record']
+
 @dataclass
 class NetworkEndpoint:
     """A network endpoint definition."""
@@ -49805,7 +52005,7 @@ class NetworkEndpoint:
     response_time_ms: float = 0
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class NetworkManager:
+class NetworkManager(SystemService):
     """
     Network connectivity and diagnostics manager.
 
@@ -49831,7 +52031,7 @@ class NetworkManager:
         self._logger = logging.getLogger("NetworkManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize network manager."""
         try:
             self._initialized = True
@@ -49983,6 +52183,29 @@ class NetworkManager:
         """Get all healthy endpoints."""
         return [e for e in self._endpoints.values() if e.healthy]
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        healthy = sum(1 for e in self._endpoints.values() if e.healthy)
+        return self._initialized, f"ok: {healthy}/{len(self._endpoints)} endpoints healthy"
+
+    async def cleanup(self) -> None:
+        self._endpoints.clear()
+        self._dns_cache.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="NetworkManager",
+            version="1.0.0",
+            inputs=["network.check"],
+            outputs=["network.status"],
+            side_effects=["writes_network_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class FileMetadata:
     """Metadata for a file."""
@@ -49996,7 +52219,7 @@ class FileMetadata:
     permissions: str
     checksum: Optional[str] = None
 
-class FileSystemManager:
+class FileSystemManager(SystemService):
     """
     Abstracted file system operations manager.
 
@@ -50023,7 +52246,7 @@ class FileSystemManager:
         self._logger = logging.getLogger("FileSystemManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize file system manager."""
         try:
             self._initialized = True
@@ -50271,6 +52494,35 @@ class FileSystemManager:
             except Exception as e:
                 self._logger.error(f"Watcher callback error: {e}")
 
+    # -- SystemService governance ------------------------------------------
+
+    async def health_check(self) -> Tuple[bool, str]:
+        return self._initialized, f"ok: {len(self._metadata_cache)} cached entries"
+
+    async def cleanup(self) -> None:
+        self._metadata_cache.clear()
+        self._cache_timestamps.clear()
+        for temp_path in list(self._temp_files):
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except Exception:
+                pass
+        self._temp_files.clear()
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="FileSystemManager",
+            version="1.0.0",
+            inputs=["fs.operation"],
+            outputs=["fs.completed"],
+            side_effects=["writes_fs_metadata"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on
+
 @dataclass
 class ExternalService:
     """An external service definition."""
@@ -50287,7 +52539,7 @@ class ExternalService:
     request_count: int = 0
     error_count: int = 0
 
-class ExternalServiceRegistry:
+class ExternalServiceRegistry(SystemService):
     """
     External service integration registry.
 
@@ -50383,7 +52635,7 @@ class ExternalServiceRegistry:
             # Keep backward-compat dict in sync
             self._circuit_breakers[service_id] = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize external service registry."""
         try:
             self._initialized = True
@@ -50591,6 +52843,26 @@ class ExternalServiceRegistry:
             "last_request": service.last_request.isoformat() if service.last_request else None
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ExternalServiceRegistry",
+            version="1.0.0",
+            inputs=['external.register', 'external.call'],
+            outputs=['external.registered', 'external.response'],
+            side_effects=['manages_external_connections'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['external.call']
+
 @dataclass
 class ScheduledEvent:
     """A scheduled calendar event."""
@@ -50601,7 +52873,7 @@ class ScheduledEvent:
     recurrence: Optional[str] = None  # daily, weekly, monthly, yearly
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-class CalendarService:
+class CalendarService(SystemService):
     """
     Date/time and scheduling utilities service.
 
@@ -50625,7 +52897,7 @@ class CalendarService:
         self._logger = logging.getLogger("CalendarService")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize calendar service."""
         try:
             # Add some common US holidays for the current year
@@ -50842,6 +53114,26 @@ class CalendarService:
 
         return occurrences
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CalendarService",
+            version="1.0.0",
+            inputs=['calendar.schedule', 'calendar.query'],
+            outputs=['calendar.scheduled', 'calendar.events'],
+            side_effects=['writes_calendar_store'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['calendar.schedule']
+
 @dataclass
 class Command:
     """A command for the command pattern."""
@@ -50855,7 +53147,7 @@ class Command:
     result: Optional[Any] = None
     undone: bool = False
 
-class CommandPatternManager:
+class CommandPatternManager(SystemService):
     """
     Command pattern implementation for undo/redo support.
 
@@ -50882,7 +53174,7 @@ class CommandPatternManager:
         self._logger = logging.getLogger("CommandPatternManager")
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize command pattern manager."""
         try:
             self._initialized = True
@@ -51044,6 +53336,26 @@ class CommandPatternManager:
             "recording": self._recording_macro is not None
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="CommandPatternManager",
+            version="1.0.0",
+            inputs=['command.execute', 'command.undo'],
+            outputs=['command.executed', 'command.undone'],
+            side_effects=['writes_command_history'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['command.execute']
+
 # =============================================================================
 # ZONE 4.19: ADVANCED ENTERPRISE PATTERNS AND OPERATIONS
 # =============================================================================
@@ -51118,7 +53430,7 @@ class ModelExperiment(NamedTuple):
     logs: List[str]
     tags: List[str]
 
-class MLOpsModelRegistry:
+class MLOpsModelRegistry(SystemService):
     """
     Machine Learning Operations model registry.
 
@@ -51137,13 +53449,70 @@ class MLOpsModelRegistry:
         self._lock = asyncio.Lock()
         self._initialized = False
 
-    async def initialize(self) -> bool:
-        """Initialize the MLOps registry."""
+    async def initialize(self) -> None:
+        """Initialize the MLOps registry and subscribe to model lifecycle events."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "mlops" / "models.json")
+        if _state:
+            async with self._lock:
+                for mid, mdata in _state.get("models", {}).items():
+                    self._models[mid] = mdata if not isinstance(mdata, dict) else mdata
         async with self._lock:
-            if self._initialized:
-                return True
             self._initialized = True
-            return True
+        # Phase B: Subscribe to model lifecycle events from event bus
+        try:
+            from backend.core.trinity_event_bus import get_event_bus
+            _bus = get_event_bus()
+            if hasattr(_bus, 'subscribe'):
+                await _bus.subscribe("model.*", self._on_model_event)
+        except Exception:
+            pass
+
+    async def _on_model_event(self, event: Any) -> None:
+        """Handle model lifecycle events from event bus (Phase B)."""
+        try:
+            data = getattr(event, 'data', {}) if not isinstance(event, dict) else event
+            event_type = data.get("type", "")
+            if event_type == "model.loaded":
+                model_name = data.get("model_name", "unknown")
+                if model_name not in {m.name for m in self._models.values()}:
+                    await self.register_model(name=model_name, framework=data.get("framework", "unknown"))
+        except Exception:
+            pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message). Called periodically by registries."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._models)} models, {len(self._experiments)} experiments"
+
+    async def cleanup(self) -> None:
+        """Release resources and persist state."""
+        # Phase C: Persist state before clearing
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "mlops" / "models.json",
+                {"models": {k: str(v) for k, v in self._models.items()}},
+            )
+        except Exception:
+            pass
+        self._initialized = False
+        async with self._lock:
+            self._models.clear()
+            self._experiments.clear()
+            self._deployments.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="MLOpsModelRegistry",
+            version="1.0.0",
+            inputs=["model.register", "model.deploy", "experiment.start"],
+            outputs=["model.registered", "model.deployed", "experiment.completed"],
+            side_effects=["writes_model_registry"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["model.register", "experiment.start"]
 
     async def register_model(
         self,
@@ -51569,7 +53938,7 @@ class BPMWorkflowInst(NamedTuple):
     variables: Dict[str, Any]
     parent_instance_id: Optional[str]  # For sub-workflows
 
-class WorkflowOrchestrator:
+class WorkflowOrchestrator(SystemService):
     """
     BPMN-like workflow orchestration engine.
 
@@ -51581,6 +53950,9 @@ class WorkflowOrchestrator:
     - Human task integration
     - Sub-workflow support
     - Event triggers and timers
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    Delegates complex DAG execution to WorkflowEngine (Zone 4.15).
     """
 
     def __init__(self) -> None:
@@ -51591,14 +53963,53 @@ class WorkflowOrchestrator:
         self._running = False
         self._executor_task: Optional[asyncio.Task[None]] = None
 
-    async def initialize(self) -> bool:
-        """Initialize the workflow orchestrator."""
+    async def initialize(self) -> None:
+        """Initialize the workflow orchestrator and bridge to WorkflowEngine."""
+        # Phase C: Load persisted definitions
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "workflows" / "definitions.json")
+        if _state:
+            for wid, wdata in _state.get("definitions", {}).items():
+                if wid not in self._definitions:
+                    self._definitions[wid] = wdata if not isinstance(wdata, dict) else wdata
         self._running = True
         self._executor_task = create_safe_task(self._executor_loop())
-        return True
+        # Phase B: Bridge to WorkflowEngine for DAG execution
+        self._workflow_engine: Optional[Any] = None
+        try:
+            self._workflow_engine = WorkflowEngine()
+            await self._workflow_engine.start()
+        except Exception:
+            self._workflow_engine = None
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        engine_status = "connected" if self._workflow_engine else "standalone"
+        return True, f"ok: {len(self._definitions)} workflows, {len(self._instances)} instances, engine={engine_status}"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="WorkflowOrchestrator",
+            version="1.0.0",
+            inputs=["workflow.define", "workflow.start"],
+            outputs=["workflow.completed", "workflow.failed"],
+            side_effects=["writes_workflow_definitions"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["workflow.start"]
 
     async def cleanup(self) -> None:
-        """Cleanup orchestrator resources."""
+        """Cleanup orchestrator resources and persist state."""
+        # Phase C: Persist workflow definitions
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "workflows" / "definitions.json",
+                {"definitions": {k: str(v) for k, v in self._definitions.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._executor_task:
             self._executor_task.cancel()
@@ -52008,7 +54419,7 @@ class Folder(NamedTuple):
     updated_at: float
     owner: str
 
-class DocumentManagementSystem:
+class DocumentManagementSystem(SystemService):
     """
     Enterprise document management system.
 
@@ -52020,21 +54431,33 @@ class DocumentManagementSystem:
     - Full-text search capability
     - Document lifecycle management
     - Audit trail for all operations
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    Constructor purity: storage path resolved in initialize().
     """
 
     def __init__(self, storage_path: Optional[str] = None) -> None:
-        self._storage_path = storage_path or "/tmp/dms_storage"
+        self._storage_path = storage_path  # resolved in initialize()
         self._documents: Dict[str, Document] = {}
         self._folders: Dict[str, Folder] = {}
         self._search_index: Dict[str, Set[str]] = {}  # word -> doc_ids
         self._lock = asyncio.Lock()
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the document management system."""
         async with self._lock:
             if self._initialized:
-                return True
+                return
+
+            # Phase C: Load persisted state
+            _state = _load_json_state(_ORGAN_STORAGE_ROOT / "dms" / "documents.json")
+            if _state:
+                for k, v in _state.get("documents", {}).items():
+                    self._documents[k] = v
+
+            if self._storage_path is None:
+                self._storage_path = str(Path.home() / ".jarvis" / "dms_storage")
 
             # Create root folder
             root_folder = Folder(
@@ -52051,7 +54474,36 @@ class DocumentManagementSystem:
             self._folders["/"] = root_folder
 
             self._initialized = True
-            return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._documents)} docs, {len(self._folders)} folders"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DocumentManagementSystem",
+            version="1.0.0",
+            inputs=["document.create", "document.update"],
+            outputs=["document.created", "document.updated"],
+            side_effects=["writes_document_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["document.create"]
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "dms" / "documents.json",
+                {"documents": {k: str(v) for k, v in self._documents.items()}},
+            )
+        except Exception:
+            pass
+        self._initialized = False
 
     async def create_folder(
         self,
@@ -52480,7 +54932,7 @@ class NotificationPreference(NamedTuple):
     frequency_limit: Dict[str, int]  # notification_type -> max per day
     opt_outs: List[str]  # List of notification types to not receive
 
-class NotificationHub:
+class NotificationHub(SystemService):
     """
     Multi-channel notification delivery system.
 
@@ -52491,6 +54943,8 @@ class NotificationHub:
     - User preference management
     - Delivery tracking and retries
     - Priority-based routing
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self) -> None:
@@ -52505,15 +54959,52 @@ class NotificationHub:
         self._handlers: Dict[str, Callable[..., Awaitable[bool]]] = {}
         self._preferences_loaded = False
 
-    async def initialize(self) -> bool:
-        """Initialize the notification hub."""
+    async def initialize(self) -> None:
+        """Initialize the notification hub and connect to event bus."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "notifications" / "templates.json")
+        if _state:
+            for k, v in _state.get("templates", {}).items():
+                self._templates[k] = v
         self._running = True
         self._delivery_task = create_safe_task(self._delivery_loop())
         await self._load_persisted_preferences()
-        return True
+        # Phase B: Connect to TrinityEventBus for delivery event publishing
+        self._event_bus: Optional[Any] = None
+        try:
+            from backend.core.trinity_event_bus import get_event_bus
+            self._event_bus = get_event_bus()
+        except Exception:
+            pass  # Event bus unavailable — notifications still work locally
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._channels)} channels, {len(self._notifications)} notifications"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="NotificationHub",
+            version="1.0.0",
+            inputs=["notification.send"],
+            outputs=["notification.delivered", "notification.failed"],
+            side_effects=["writes_notification_queue"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["notification.send"]
 
     async def cleanup(self) -> None:
         """Cleanup notification hub resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "notifications" / "templates.json",
+                {"templates": {k: str(v) for k, v in self._templates.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._delivery_task:
             self._delivery_task.cancel()
@@ -52760,6 +55251,22 @@ class NotificationHub:
 
                 self._notifications[notification.notification_id] = updated
 
+            # Phase B: Publish delivery event to TrinityEventBus
+            if self._event_bus and hasattr(self._event_bus, 'publish_raw'):
+                try:
+                    _topic = "notification.delivered" if success else "notification.failed"
+                    await self._event_bus.publish_raw(
+                        topic=_topic,
+                        data={
+                            "notification_id": notification.notification_id,
+                            "channel": channel.channel_type,
+                            "recipient": notification.recipient,
+                            "status": "sent" if success else "failed",
+                        },
+                    )
+                except Exception:
+                    pass  # Best-effort event publishing
+
         except Exception as e:
             async with self._lock:
                 updated = notification._replace(
@@ -52953,7 +55460,7 @@ class SessionStore(NamedTuple):
     config: Dict[str, Any]
     default_ttl: float
 
-class SessionManager:
+class SessionManager(SystemService):
     """
     Distributed session management system.
 
@@ -52964,6 +55471,11 @@ class SessionManager:
     - Multi-device session tracking
     - Concurrent session limits
     - Session hijacking protection
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    v311.0 Phase B: Delegates to GlobalSessionManager as state authority
+    for system-level session tracking. Local sessions are still managed
+    for user-level TTL/expiration concerns.
     """
 
     def __init__(
@@ -52978,12 +55490,36 @@ class SessionManager:
         self._lock = asyncio.Lock()
         self._running = False
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        self._global_mgr: Optional[Any] = None  # resolved in initialize()
 
-    async def initialize(self) -> bool:
-        """Initialize the session manager."""
+    async def initialize(self) -> None:
+        """Initialize the session manager and connect to GlobalSessionManager."""
         self._running = True
         self._cleanup_task = create_safe_task(self._cleanup_loop())
-        return True
+        # Connect to the global session authority
+        try:
+            self._global_mgr = GlobalSessionManager()
+        except Exception:
+            self._global_mgr = None
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        global_id = getattr(self._global_mgr, 'session_id', 'N/A') if self._global_mgr else 'disconnected'
+        return True, f"ok: {len(self._sessions)} local sessions, global={global_id[:8]}"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SessionManager",
+            version="1.0.0",
+            inputs=["session.create", "session.validate"],
+            outputs=["session.created", "session.expired"],
+            side_effects=["writes_session_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on — sessions are core
 
     async def cleanup(self) -> None:
         """Cleanup session manager resources."""
@@ -53301,7 +55837,7 @@ class DataCatalogEntry(NamedTuple):
     quality_score: float
     last_updated: float
 
-class DataLakeManager:
+class DataLakeManager(SystemService):
     """
     Large-scale data lake management system.
 
@@ -53313,24 +55849,59 @@ class DataLakeManager:
     - Data quality monitoring
     - Retention policy enforcement
     - Query optimization hints
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    Constructor purity: storage root resolved in initialize().
     """
 
     def __init__(self, storage_root: Optional[str] = None) -> None:
-        self._storage_root = storage_root or "/tmp/data_lake"
+        self._storage_root = storage_root  # resolved in initialize()
         self._datasets: Dict[str, Dataset] = {}
         self._catalog: Dict[str, DataCatalogEntry] = {}
         self._lock = asyncio.Lock()
         self._running = False
         self._retention_task: Optional[asyncio.Task[None]] = None
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the data lake manager."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "datalake" / "catalog.json")
+        if _state:
+            for k, v in _state.get("catalog", {}).items():
+                self._catalog[k] = v
+        if self._storage_root is None:
+            self._storage_root = str(Path.home() / ".jarvis" / "data_lake")
         self._running = True
         self._retention_task = create_safe_task(self._retention_loop())
-        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._datasets)} datasets, {len(self._catalog)} catalog entries"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataLakeManager",
+            version="1.0.0",
+            inputs=["dataset.register", "partition.add"],
+            outputs=["dataset.registered", "partition.added"],
+            side_effects=["writes_data_lake"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["dataset.register"]
 
     async def cleanup(self) -> None:
         """Cleanup data lake manager resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "datalake" / "catalog.json",
+                {"catalog": {k: str(v) for k, v in self._catalog.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._retention_task:
             self._retention_task.cancel()
@@ -53726,7 +56297,7 @@ class StreamState(NamedTuple):
     values: Dict[str, Any]
     count: int
 
-class StreamingAnalyticsEngine:
+class StreamingAnalyticsEngine(SystemService):
     """
     Real-time streaming analytics engine.
 
@@ -53737,6 +56308,8 @@ class StreamingAnalyticsEngine:
     - Stateful processing
     - Exactly-once semantics
     - Late event handling
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self, max_lateness_seconds: float = 60.0) -> None:
@@ -53750,14 +56323,44 @@ class StreamingAnalyticsEngine:
         self._process_task: Optional[asyncio.Task[None]] = None
         self._output_handlers: Dict[str, Callable[[str, Dict[str, Any]], Awaitable[None]]] = {}
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the streaming engine."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "streaming" / "state.json")
+        if _state:
+            for k, v in _state.get("aggregations", {}).items():
+                self._aggregations[k] = v
         self._running = True
         self._process_task = create_safe_task(self._processing_loop())
-        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._streams)} streams, {len(self._aggregations)} aggregations"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="StreamingAnalyticsEngine",
+            version="1.0.0",
+            inputs=["stream.ingest", "aggregation.register"],
+            outputs=["aggregation.result"],
+            side_effects=["writes_stream_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["stream.ingest"]
 
     async def cleanup(self) -> None:
         """Cleanup streaming engine resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "streaming" / "state.json",
+                {"aggregations": {k: str(v) for k, v in self._aggregations.items()}},
+            )
+        except Exception:
+            pass
         self._running = False
         if self._process_task:
             self._process_task.cancel()
@@ -54066,7 +56669,7 @@ class DataSubjectRequest(NamedTuple):
     notes: str
     data_delivered: Optional[str]
 
-class ConsentManagementSystem:
+class ConsentManagementSystem(SystemService):
     """
     GDPR-compliant consent management system.
 
@@ -54077,6 +56680,8 @@ class ConsentManagementSystem:
     - Consent proof and audit trail
     - Preference center support
     - Third-party consent sharing
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self, dsr_response_days: int = 30) -> None:
@@ -54086,10 +56691,46 @@ class ConsentManagementSystem:
         self._policy_version = "1.0"
         self._dsr_response_days = dsr_response_days
         self._lock = asyncio.Lock()
+        self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the consent management system."""
-        return True
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "consent" / "records.json")
+        if _state:
+            for k, v in _state.get("purposes", {}).items():
+                self._purposes[k] = v
+        self._initialized = True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._purposes)} purposes, {len(self._consents)} consent records"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "consent" / "records.json",
+                {"purposes": {k: str(v) for k, v in self._purposes.items()}, "consents": {k: str(v) for k, v in self._consents.items()}},
+            )
+        except Exception:
+            pass
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ConsentManagementSystem",
+            version="1.0.0",
+            inputs=["consent.record", "consent.withdraw", "dsr.submit"],
+            outputs=["consent.recorded", "dsr.completed"],
+            side_effects=["writes_consent_records"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["consent.record", "dsr.submit"]
 
     async def define_purpose(
         self,
@@ -54456,7 +57097,7 @@ class SignatureVerification(NamedTuple):
     algorithm: str
     reason: str
 
-class DigitalSignatureService:
+class DigitalSignatureService(SystemService):
     """
     Digital signature service for document signing.
 
@@ -54467,6 +57108,8 @@ class DigitalSignatureService:
     - Timestamp authority integration
     - Certificate chain validation
     - Multi-signature support
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self) -> None:
@@ -54496,10 +57139,46 @@ class DigitalSignatureService:
             ),
         }
         self._lock = asyncio.Lock()
+        self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the signature service."""
-        return True
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "signatures" / "keys.json")
+        if _state:
+            for k, v in _state.get("signatures", {}).items():
+                self._signatures[k] = v
+        self._initialized = True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._keys)} keys, {len(self._signatures)} signatures"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "signatures" / "keys.json",
+                {"signatures": {k: str(v) for k, v in self._signatures.items()}},
+            )
+        except Exception:
+            pass
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DigitalSignatureService",
+            version="1.0.0",
+            inputs=["signature.sign", "signature.verify"],
+            outputs=["signature.signed", "signature.verified"],
+            side_effects=["writes_signature_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["signature.sign"]
 
     async def generate_key_pair(
         self,
@@ -55106,7 +57785,7 @@ class TelemetryEvent(NamedTuple):
     severity: str
     source: str
 
-class SystemTelemetryCollector:
+class SystemTelemetryCollector(SystemService):
     """
     Centralized telemetry collection for the kernel.
 
@@ -55128,7 +57807,7 @@ class SystemTelemetryCollector:
         self._collect_task: Optional[asyncio.Task[None]] = None
         self._exporters: List[Callable[[List[TelemetryMetric], List[TelemetryEvent]], Awaitable[None]]] = []
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:  # type: ignore[override]
         """Initialize the telemetry collector."""
         self._running = True
         self._collect_task = create_safe_task(self._collection_loop())
@@ -55365,6 +58044,22 @@ class SystemTelemetryCollector:
             "flush_interval": self._flush_interval,
         }
 
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SystemTelemetryCollector",
+            version="1.0.0",
+            inputs=['telemetry.record', 'telemetry.flush'],
+            outputs=['telemetry.flushed', 'telemetry.metrics'],
+            side_effects=['writes_telemetry_data'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['telemetry.record']
+
 # -----------------------------------------------------------------------------
 # 4.20.3: Graceful Degradation Manager
 # -----------------------------------------------------------------------------
@@ -55386,9 +58081,13 @@ class DegradationState(NamedTuple):
     capacity_limits: Dict[str, float]
     reason: str
 
-class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulDegradationManager at line ~23485
+class LegacyDegradationManager(SystemService):
     """
-    Manages graceful degradation during system stress.
+    Rule-based degradation with configurable level thresholds.
+
+    v311.0: Un-deprecated. Complements the resource-aware GracefulDegradationManager
+    (Zone 4.7) by providing explicit level-forcing for operator-driven scenarios.
+    Upgraded to governed SystemService (Phase A).
 
     Provides:
     - Multi-level degradation modes
@@ -55404,8 +58103,9 @@ class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulD
         self._feature_priorities: Dict[str, int] = {}  # feature -> priority (lower = more critical)
         self._lock = asyncio.Lock()
         self._state_callbacks: List[Callable[[DegradationState], Awaitable[None]]] = []
+        self._initialized = False
 
-        # Initialize default levels
+        # Initialize default levels (pure in-memory, no I/O)
         self._setup_default_levels()
 
     def _setup_default_levels(self) -> None:
@@ -55451,8 +58151,13 @@ class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulD
             description="Emergency mode - only authentication and basic read operations",
         )
 
-    async def initialize(self) -> bool:
-        """Initialize the degradation manager."""
+    async def initialize(self) -> None:
+        """Initialize the degradation manager and register event emission."""
+        # Phase C: Load persisted state
+        _state = _load_json_state(_ORGAN_STORAGE_ROOT / "degradation" / "state.json")
+        if _state:
+            for k, v in _state.get("feature_priorities", {}).items():
+                self._feature_priorities[k] = v
         self._current_state = DegradationState(
             current_level="normal",
             active_since=time.time(),
@@ -55460,7 +58165,64 @@ class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulD
             capacity_limits={},
             reason="System startup",
         )
-        return True
+        self._initialized = True
+        # Phase B: Register event-emitting callback for manual level changes
+        self._event_bus: Optional[Any] = None
+        try:
+            from backend.core.trinity_event_bus import get_event_bus
+            self._event_bus = get_event_bus()
+        except Exception:
+            pass
+        # Auto-register event emission callback
+        self.register_state_callback(self._emit_level_change_event)
+
+    async def _emit_level_change_event(self, state: DegradationState) -> None:
+        """Emit degradation level change to event bus (Phase B)."""
+        if self._event_bus and hasattr(self._event_bus, 'publish_raw'):
+            try:
+                await self._event_bus.publish_raw(
+                    topic="degradation.level_changed",
+                    data={
+                        "current_level": state.current_level,
+                        "disabled_features": state.disabled_features,
+                        "reason": state.reason,
+                        "source": "LegacyDegradationManager",
+                    },
+                )
+            except Exception:
+                pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        level = self._current_state.current_level if self._current_state else "unknown"
+        return True, f"ok: level={level}, {len(self._levels)} levels configured"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        # Phase C: Persist state
+        try:
+            _atomic_write_json(
+                _ORGAN_STORAGE_ROOT / "degradation" / "state.json",
+                {"feature_priorities": self._feature_priorities},
+            )
+        except Exception:
+            pass
+        self._initialized = False
+        self._current_state = None
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="LegacyDegradationManager",
+            version="1.0.0",
+            inputs=["degradation.evaluate", "degradation.force_level"],
+            outputs=["degradation.level_changed"],
+            side_effects=["writes_degradation_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["degradation.evaluate"]
 
     def register_state_callback(
         self,
@@ -55646,7 +58408,7 @@ class CleanupReport(NamedTuple):
     results: List[CleanupResult]
     overall_success: bool
 
-class ResourceCleanupCoordinator:
+class ResourceCleanupCoordinator(SystemService):
     """
     Coordinates graceful cleanup of all kernel resources.
 
@@ -55856,6 +58618,30 @@ class ResourceCleanupCoordinator:
             "last_cleanup_success": self._last_report.overall_success if self._last_report else None,
         }
 
+    async def initialize(self) -> None:
+        """Initialize ResourceCleanupCoordinator. Called once during activation."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        return True, "ok"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        pass
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ResourceCleanupCoordinator",
+            version="1.0.0",
+            inputs=['cleanup.register', 'cleanup.execute'],
+            outputs=['cleanup.completed', 'cleanup.report'],
+            side_effects=['cleans_system_resources'],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ['cleanup.execute']
+
 # =============================================================================
 # =============================================================================
 #
@@ -55978,9 +58764,11 @@ class UnifiedSignalHandler:
         self._first_signal_time: Optional[float] = None
 
     def _get_event(self) -> asyncio.Event:
-        """Return the shutdown event (pre-created in __init__, fallback lazy for Python 3.9)."""
+        """Return the shutdown event. Thread-safe lazy creation for Python 3.9 fallback."""
         if self._shutdown_event is None:
-            self._shutdown_event = asyncio.Event()
+            with self._lock:  # reuse existing self._lock (threading.Lock)
+                if self._shutdown_event is None:
+                    self._shutdown_event = asyncio.Event()
         return self._shutdown_event
 
     def register_callback(self, callback: Callable[[], Coroutine[Any, Any, None]]) -> None:
@@ -62409,8 +65197,13 @@ class UnifiedTrinityConnector:
                 # Ensure parent directory exists
                 staging.parent.mkdir(parents=True, exist_ok=True)
 
-                # Write staged content
-                staging.write_text(content)
+                # Write staged content via executor to avoid blocking
+                try:
+                    await _run_in_supervisor_thread(staging.write_text, content, timeout=5.0)
+                except (asyncio.TimeoutError, Exception) as io_err:
+                    self.logger.error(f"[Trinity.Connector] 2PC staging write failed for {repo}/{file_path}: {io_err}")
+                    prepare_failed = True
+                    break
 
                 prepared.append({
                     "repo": repo,
@@ -62924,6 +65717,8 @@ class KernelBackgroundTaskRegistry:
     - De-duplicates task registration.
     - Rejects late registrations once shutdown begins.
     - Auto-prunes completed tasks to prevent stale-handle buildup.
+
+    v311.0: Added threading.Lock for thread-safe list mutations.
     """
 
     def __init__(
@@ -62935,6 +65730,7 @@ class KernelBackgroundTaskRegistry:
         self._logger = logger
         self._can_accept_new = can_accept_new or (lambda: True)
         self._tasks: List["asyncio.Task[Any]"] = []
+        self._guard = threading.Lock()  # v311.0: thread-safe mutations
 
     @staticmethod
     def _task_name(task: "asyncio.Task[Any]") -> str:
@@ -62944,33 +65740,31 @@ class KernelBackgroundTaskRegistry:
             return "unnamed-task"
 
     def _on_task_done(self, task: "asyncio.Task[Any]") -> None:
-        try:
-            self._tasks.remove(task)
-        except ValueError:
-            pass
+        with self._guard:
+            try:
+                self._tasks.remove(task)
+            except ValueError:
+                pass
 
     def append(self, task: Optional["asyncio.Task[Any]"]) -> bool:
         """Register one background task. Returns True if accepted."""
         if task is None:
             return False
-
         if task.done():
             return False
-
-        if task in self._tasks:
-            return False
-
-        if not self._can_accept_new():
-            if not task.done():
-                task.cancel()
-            if self._logger:
-                self._logger.debug(
-                    "[Kernel] Rejected background task registration during shutdown: %s",
-                    self._task_name(task),
-                )
-            return False
-
-        self._tasks.append(task)
+        with self._guard:
+            if task in self._tasks:
+                return False
+            if not self._can_accept_new():
+                if not task.done():
+                    task.cancel()
+                if self._logger:
+                    self._logger.debug(
+                        "[Kernel] Rejected background task registration during shutdown: %s",
+                        self._task_name(task),
+                    )
+                return False
+            self._tasks.append(task)
         task.add_done_callback(self._on_task_done)
         return True
 
@@ -62983,21 +65777,25 @@ class KernelBackgroundTaskRegistry:
         return accepted
 
     def remove(self, task: "asyncio.Task[Any]") -> None:
-        self._tasks.remove(task)
+        with self._guard:
+            self._tasks.remove(task)
 
     def snapshot(self, *, include_done: bool = True) -> List["asyncio.Task[Any]"]:
-        if include_done:
-            return list(self._tasks)
-        return [task for task in self._tasks if not task.done()]
+        with self._guard:
+            if include_done:
+                return list(self._tasks)
+            return [task for task in self._tasks if not task.done()]
 
     def __iter__(self):
         return iter(self.snapshot(include_done=True))
 
     def __contains__(self, task: object) -> bool:
-        return task in self._tasks
+        with self._guard:
+            return task in self._tasks
 
     def __len__(self) -> int:
-        return len(self._tasks)
+        with self._guard:
+            return len(self._tasks)
 
 
 # ============================================================================
@@ -63095,11 +65893,45 @@ class _ProgressBroadcastWorker(threading.Thread):
         self._conn: Optional[Any] = None  # http.client.HTTPConnection
 
         # Observable state (read by supervisor from the event loop)
-        # These are simple Python objects — atomic under GIL.
+        # v311.0: Protected by _state_lock — += is not atomic (4 bytecodes).
+        self._state_lock = threading.Lock()
         self.consecutive_failures: int = 0
         self.last_error: Optional[str] = None
         self.server_ready: bool = False
         self.total_sent: int = 0
+
+    # -- v311.0: Thread-safe accessor methods for observable state ----------
+
+    def _record_failure(self, error: str) -> None:
+        """Record a send failure. Thread-safe."""
+        with self._state_lock:
+            self.consecutive_failures += 1
+            self.last_error = error
+
+    def _record_success(self) -> None:
+        """Record a successful send. Thread-safe."""
+        with self._state_lock:
+            self.consecutive_failures = 0
+            self.last_error = None
+            self.total_sent += 1
+
+    def _set_server_ready(self, ready: bool) -> None:
+        """Update server readiness. Thread-safe."""
+        with self._state_lock:
+            self.server_ready = ready
+
+    @property
+    def state_snapshot(self) -> Dict[str, Any]:
+        """Thread-safe snapshot of observable state."""
+        with self._state_lock:
+            return {
+                "consecutive_failures": self.consecutive_failures,
+                "last_error": self.last_error,
+                "server_ready": self.server_ready,
+                "total_sent": self.total_sent,
+            }
+
+    # -- End v311.0 accessor methods ---------------------------------------
 
     def enqueue(self, progress_data: Dict[str, Any]) -> None:
         """
@@ -63182,17 +66014,15 @@ class _ProgressBroadcastWorker(threading.Thread):
 
             # Send via persistent HTTP/1.1 connection
             if self._send_http(data, _http, _json):
-                self.consecutive_failures = 0
-                self.last_error = None
-                self.server_ready = True
-                self.total_sent += 1
+                self._record_success()
+                self._set_server_ready(True)
                 self._retry_data = None  # Success — clear retry
             else:
                 # Keep data for retry on next cycle. NOT discarded.
                 # The next enqueue() with newer data will supersede
                 # this via the new_data priority above.
                 self._retry_data = data
-                self.consecutive_failures += 1
+                self._record_failure(self.last_error or "send failed")
                 # Wake ourselves after a short delay to retry
                 # (don't wait for next enqueue or 2s timeout)
                 if not self._stop_requested.is_set():
@@ -63207,7 +66037,7 @@ class _ProgressBroadcastWorker(threading.Thread):
         if final_data is not None:
             for _flush_attempt in range(3):
                 if self._send_http(final_data, _http, _json):
-                    self.total_sent += 1
+                    self._record_success()
                     break
                 import time as _time
                 _time.sleep(0.2)
@@ -63705,7 +66535,7 @@ class JarvisSystemKernel:
     # ── v239.0: System Service Registry wiring ────────────────────────
 
     def _init_service_registry(self) -> None:
-        """Construct (but do NOT initialise) the 10 priority system services."""
+        """Construct (but do NOT initialise) the 30 priority system services."""
         self._service_registry = SystemServiceRegistry()
         _r = self._service_registry.register
 
@@ -63833,7 +66663,619 @@ class JarvisSystemKernel:
             enabled_env="JARVIS_SERVICE_DEGRADATION_ENABLED",
         ))
 
-        logger.info("[Kernel] Service registry: 10 services registered across phases 1-5")
+        # Phase 6 (Immune System) ─ security, anomaly detection, audit, compliance
+        _config = self._config if hasattr(self, "_config") else None
+
+        _r(ServiceDescriptor(
+            name="security_policy",
+            service=SecurityPolicyEngine(config=_config),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_SECURITY_POLICY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="anomaly_detector",
+            service=AnomalyDetector(config=_config),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_ANOMALY_DETECTOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="audit_trail",
+            service=AuditTrailRecorder(),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability"],
+            enabled_env="JARVIS_SERVICE_AUDIT_TRAIL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="access_control",
+            service=AccessControlManager(config=_config),
+            phase=6, tier="immune",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            depends_on=["observability", "security_policy"],
+            enabled_env="JARVIS_SERVICE_ACCESS_CONTROL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="threat_intel",
+            service=ThreatIntelligenceManager(config=_config),
+            phase=6, tier="immune",
+            activation_mode="event_driven",
+            boot_policy="deferred_after_ready",
+            depends_on=["anomaly_detector"],
+            enabled_env="JARVIS_SERVICE_THREAT_INTEL_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="incident_response",
+            service=IncidentResponseCoordinator(config=_config),
+            phase=6, tier="immune",
+            activation_mode="event_driven",
+            boot_policy="deferred_after_ready",
+            depends_on=["threat_intel"],
+            enabled_env="JARVIS_SERVICE_INCIDENT_RESPONSE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="compliance",
+            service=ComplianceAuditor(config=_config),
+            phase=6, tier="immune",
+            activation_mode="batch_window",
+            boot_policy="deferred_after_ready",
+            depends_on=["health_aggregator"],
+            enabled_env="JARVIS_SERVICE_COMPLIANCE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="data_classification",
+            service=DataClassificationManager(config=_config),
+            phase=6, tier="immune",
+            activation_mode="event_driven",
+            boot_policy="deferred_after_ready",
+            depends_on=["event_sourcing"],
+            enabled_env="JARVIS_SERVICE_DATA_CLASSIFICATION_ENABLED",
+        ))
+
+        # Phase 7 (Nervous System) ─ control-plane orchestration
+        _r(ServiceDescriptor(
+            name="workflow_engine",
+            service=WorkflowEngine(),
+            phase=7, tier="nervous",
+            activation_mode="warm_standby",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_WORKFLOW_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="state_machines",
+            service=StateMachineManager(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_STATE_MACHINES_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="config_manager",
+            service=DynamicConfigurationManager(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="block_ready",
+            enabled_env="JARVIS_SERVICE_CONFIG_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="feature_gates",
+            service=FeatureGateManager(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_FEATURE_GATES_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="schema_registry",
+            service=SchemaRegistry(),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="block_ready",
+            enabled_env="JARVIS_SERVICE_SCHEMA_REGISTRY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="service_discovery",
+            service=ServiceRegistryManager(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_DISCOVERY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rules_engine",
+            service=RulesEngine(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_RULES_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="batch_processor",
+            service=BatchProcessor(),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_BATCH_PROCESSOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="notifications",
+            service=NotificationDispatcher(),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_NOTIFICATIONS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="request_coalescer",
+            service=RequestCoalescer(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_REQUEST_COALESCER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="job_manager",
+            service=BackgroundJobManager(config=_config),
+            phase=7, tier="nervous",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_JOB_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="auto_scaler",
+            service=AutoScalingController(),
+            phase=7, tier="nervous",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_AUTO_SCALER_ENABLED",
+        ))
+
+        # Phase 7 (Metabolic System) — resource management / infrastructure
+        _r(ServiceDescriptor(
+            name="service_mesh",
+            service=ServiceMeshRouter(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_SERVICE_MESH_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="connection_pools",
+            service=ConnectionPoolManager(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_CONNECTION_POOLS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_quotas",
+            service=ResourceQuotaManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RESOURCE_QUOTAS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_pools",
+            service=ResourcePoolManager(
+                config=_config,
+                name="default",
+                factory=lambda: asyncio.ensure_future(asyncio.sleep(0, result=object())),
+            ),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RESOURCE_POOLS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cost_accounting",
+            service=CostAccountingManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="optional",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_COST_ACCOUNTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="alerting",
+            service=AlertingManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_ALERTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="performance_profiler",
+            service=PerformanceProfiler(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_PERFORMANCE_PROFILER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rate_limiter",
+            service=RateLimiterManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RATE_LIMITER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="retry_policy",
+            service=RetryPolicyManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_RETRY_POLICY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="secret_vault",
+            service=SecretVaultManager(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_SECRET_VAULT_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="network_manager",
+            service=NetworkManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_NETWORK_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="filesystem_manager",
+            service=FileSystemManager(config=_config),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="infrastructure",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_FILESYSTEM_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="health_check_orchestrator",
+            service=HealthCheckOrchestrator(),
+            phase=7, tier="metabolic",
+            activation_mode="always_on",
+            criticality="control_plane",
+            boot_policy="non_blocking",
+            enabled_env="JARVIS_SERVICE_HEALTH_CHECK_ORCHESTRATOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="deployment_coordinator",
+            service=DeploymentCoordinator(),
+            phase=7, tier="metabolic",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DEPLOYMENT_COORDINATOR_ENABLED",
+        ))
+
+        # Phase 8 (Higher Functions) — enterprise application services
+        _r(ServiceDescriptor(
+            name="blue_green_deployer",
+            service=BlueGreenDeployer(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_BLUE_GREEN_DEPLOYER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="canary_release",
+            service=CanaryReleaseManager(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CANARY_RELEASE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="rollback_coordinator",
+            service=RollbackCoordinator(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_ROLLBACK_COORDINATOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="data_pipeline",
+            service=DataPipelineManager(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DATA_PIPELINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="infra_provisioner",
+            service=InfrastructureProvisionerManager(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_INFRA_PROVISIONER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="api_gateway",
+            service=APIGatewayManager(),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_API_GATEWAY_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="api_versioning",
+            service=APIVersionManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_API_VERSIONING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="graph_database",
+            service=GraphDatabaseManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_GRAPH_DATABASE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="search_engine",
+            service=SearchEngineManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_SEARCH_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="integration_bus",
+            service=IntegrationBusManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_INTEGRATION_BUS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="tenant_manager",
+            service=TenantManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_TENANT_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="encryption_service",
+            service=EncryptionServiceManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_ENCRYPTION_SERVICE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="template_engine",
+            service=TemplateEngine(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_TEMPLATE_ENGINE_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="report_generator",
+            service=ReportGenerator(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_REPORT_GENERATOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="plugin_manager",
+            service=PluginManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_PLUGIN_MANAGER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="localization",
+            service=LocalizationManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_LOCALIZATION_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="ab_testing",
+            service=ABTestingFramework(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_AB_TESTING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="feature_flags",
+            service=FeatureFlagManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_FEATURE_FLAGS_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="external_services",
+            service=ExternalServiceRegistry(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_EXTERNAL_SERVICES_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="calendar_service",
+            service=CalendarService(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CALENDAR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="command_pattern",
+            service=CommandPatternManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_COMMAND_PATTERN_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="config_manager_v2",
+            service=ConfigurationManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CONFIG_MANAGER_V2_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="dependency_container",
+            service=DependencyContainer(config=_config),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DEPENDENCY_CONTAINER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="data_validation",
+            service=DataValidationManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_DATA_VALIDATION_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="audit_trail_v2",
+            service=AuditTrailManager(config=_config),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_AUDIT_TRAIL_V2_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cron_scheduler",
+            service=CronScheduler(),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CRON_SCHEDULER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="webhook_dispatcher",
+            service=WebhookDispatcher(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_WEBHOOK_DISPATCHER_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="cache_invalidation",
+            service=CacheInvalidationCoordinator(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_CACHE_INVALIDATION_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="load_shedding",
+            service=LoadSheddingController(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_LOAD_SHEDDING_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="stream_processor",
+            service=StreamProcessor(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_STREAM_PROCESSOR_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="resource_cleanup",
+            service=ResourceCleanupCoordinator(),
+            phase=8, tier="higher",
+            activation_mode="event_driven",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_RESOURCE_CLEANUP_ENABLED",
+        ))
+        _r(ServiceDescriptor(
+            name="system_telemetry",
+            service=SystemTelemetryCollector(),
+            phase=8, tier="higher",
+            activation_mode="warm_standby",
+            criticality="optional",
+            boot_policy="deferred_after_ready",
+            enabled_env="JARVIS_SERVICE_SYSTEM_TELEMETRY_ENABLED",
+        ))
+
+        logger.info("[Kernel] Service registry: 76 services registered across phases 1-8")
 
     # ── v239.0: helper for health aggregator wiring ─────────────────
 
@@ -64160,8 +67602,10 @@ class JarvisSystemKernel:
                 self._notify_prime_router_of_gcp(node_ip, port),
                 name="notify_prime_router_gcp_up",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_prime_router_gcp_up: {e}", exc_info=True
+            )
 
         # v234.0: Notify UnifiedModelServing of GCP endpoint
         try:
@@ -64169,8 +67613,10 @@ class JarvisSystemKernel:
                 self._notify_model_serving_of_gcp(node_ip, port),
                 name="notify_model_serving_gcp_up",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_model_serving_gcp_up: {e}", exc_info=True
+            )
 
         # v271.1: Schedule deferred validation of propagation success.
         # Runs 5s after propagation to verify PrimeRouter actually accepted
@@ -64655,8 +68101,10 @@ class JarvisSystemKernel:
                 self._notify_prime_router_demote(),
                 name="notify_prime_router_demote",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_prime_router_demote: {e}", exc_info=True
+            )
 
         # v234.0: Notify UnifiedModelServing to demote from GCP
         try:
@@ -64664,8 +68112,10 @@ class JarvisSystemKernel:
                 self._notify_model_serving_demote(),
                 name="notify_model_serving_demote",
             )
-        except Exception:
-            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[InvincibleNode] Failed to notify_model_serving_demote: {e}", exc_info=True
+            )
 
         # v235.1: Clear Trinity GCP ready event so orchestrator knows to re-provision
         try:
@@ -65956,8 +69406,12 @@ class JarvisSystemKernel:
                         return False
 
             # Create lock file with timestamp
-            self.BROWSER_LOCK_FILE.write_text(str(time.time()))
-            self.BROWSER_PID_FILE.write_text(str(os.getpid()))
+            try:
+                await _run_in_supervisor_thread(self.BROWSER_LOCK_FILE.write_text, str(time.time()), timeout=5.0)
+                await _run_in_supervisor_thread(self.BROWSER_PID_FILE.write_text, str(os.getpid()), timeout=5.0)
+            except (asyncio.TimeoutError, Exception) as io_err:
+                self.logger.warning(f"_acquire_browser_lock: file write failed: {io_err}")
+                return False
             self.logger.debug(f"Acquired browser lock (PID {os.getpid()})")
             return True
 
@@ -78087,8 +81541,10 @@ class JarvisSystemKernel:
                         )
                         await _ngcp(self._pending_gcp_endpoint)
                         self._pending_gcp_endpoint = None
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[ModelServing-Recovery] Failed to notify_gcp_endpoint_ready: {e}", exc_info=True
+                        )
                 if self._pending_jprime_api_url:
                     try:
                         from backend.intelligence.unified_model_serving import (
@@ -78096,8 +81552,10 @@ class JarvisSystemKernel:
                         )
                         await _njp(self._pending_jprime_api_url)
                         self._pending_jprime_api_url = None
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        self.logger.warning(
+                            f"[ModelServing-Recovery] Failed to notify_jprime_api_ready: {e}", exc_info=True
+                        )
                 # Wire audio pipeline if AudioBus is ready
                 if self._audio_bus is not None and getattr(self._audio_bus, "is_running", False):
                     try:
@@ -82695,6 +86153,45 @@ class JarvisSystemKernel:
                 except Exception as _ssr_e:
                     self.logger.warning(f"[Kernel] Phase 7 SSR activation error: {_ssr_e}")
 
+            # v311.0: Phase 7 — Enterprise Organ Services
+            # Register all 10 governed enterprise organs with per-service kill switches.
+            # All default to event_driven / deferred_after_ready so they don't block startup.
+            if self._service_registry:
+                _organ_phase = 7
+                _organ_specs = [
+                    ("MLOpsModelRegistry", MLOpsModelRegistry, "JARVIS_MLOPS_ENABLED"),
+                    ("WorkflowOrchestrator", WorkflowOrchestrator, "JARVIS_WORKFLOW_ENABLED"),
+                    ("DocumentManagementSystem", DocumentManagementSystem, "JARVIS_DMS_ENABLED"),
+                    ("NotificationHub", NotificationHub, "JARVIS_NOTIFICATIONS_ENABLED"),
+                    ("SessionManager", SessionManager, "JARVIS_SESSIONS_ENABLED"),
+                    ("DataLakeManager", DataLakeManager, "JARVIS_DATALAKE_ENABLED"),
+                    ("StreamingAnalyticsEngine", StreamingAnalyticsEngine, "JARVIS_STREAMING_ENABLED"),
+                    ("ConsentManagementSystem", ConsentManagementSystem, "JARVIS_CONSENT_ENABLED"),
+                    ("DigitalSignatureService", DigitalSignatureService, "JARVIS_SIGNATURES_ENABLED"),
+                    ("LegacyDegradationManager", LegacyDegradationManager, "JARVIS_LEGACY_DEGRADATION_ENABLED"),
+                ]
+                _organ_registered = 0
+                for _organ_name, _organ_cls, _organ_env in _organ_specs:
+                    try:
+                        self._service_registry.register(ServiceDescriptor(
+                            name=_organ_name,
+                            service=_organ_cls(),
+                            phase=_organ_phase,
+                            tier="higher",
+                            activation_mode="event_driven",
+                            boot_policy="deferred_after_ready",
+                            enabled_env=_organ_env,
+                        ))
+                        _organ_registered += 1
+                    except Exception as _organ_err:
+                        self.logger.debug(f"[Kernel] Skipped organ {_organ_name}: {_organ_err}")
+
+                if _organ_registered > 0:
+                    self.logger.info(
+                        f"[Zone6] Registered {_organ_registered}/{len(_organ_specs)} "
+                        f"enterprise organ services (phase {_organ_phase}, deferred)"
+                    )
+
             return True  # Enterprise services are optional
 
     # =========================================================================
@@ -82727,15 +86224,17 @@ class JarvisSystemKernel:
             }
             self.logger.info(f"[DMS] Kernel status: {kernel_status}")
             
-            # Log memory if available
+            # Log memory if available (offloaded to executor)
             try:
-                import psutil
-                process = psutil.Process()
-                mem = process.memory_info()
-                self.logger.info(f"[DMS] Memory: RSS={mem.rss / 1024 / 1024:.1f}MB, VMS={mem.vms / 1024 / 1024:.1f}MB")
-            except Exception:
+                def _read_mem():
+                    import psutil
+                    m = psutil.Process().memory_info()
+                    return (m.rss, m.vms)
+                rss, vms = await _run_in_supervisor_thread(_read_mem, timeout=5.0)
+                self.logger.info(f"[DMS] Memory: RSS={rss / 1024 / 1024:.1f}MB, VMS={vms / 1024 / 1024:.1f}MB")
+            except (asyncio.TimeoutError, Exception):
                 pass
-            
+
             # Log active background tasks
             active_tasks = [t.get_name() for t in self._background_tasks if not t.done()]
             if active_tasks:

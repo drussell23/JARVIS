@@ -2,7 +2,7 @@ import re
 
 import pytest
 
-from backend.core.gcp_vm_manager import GCPVMManager
+from backend.core.gcp_vm_manager import GCPVMManager, HealthVerdict
 
 
 def _get_golden_startup_script() -> str:
@@ -31,7 +31,7 @@ async def test_poll_health_detects_script_version_mismatch():
     manager = GCPVMManager.__new__(GCPVMManager)
 
     async def _fake_ping(ip, port, timeout=10.0):
-        return False, {
+        return HealthVerdict.ALIVE_NOT_READY, {
             "apars": {
                 "phase_name": "starting",
                 "total_progress": 12,
