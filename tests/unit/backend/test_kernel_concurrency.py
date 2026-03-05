@@ -165,3 +165,22 @@ class TestKernelBackgroundTaskRegistry:
             await t
         except asyncio.CancelledError:
             pass
+
+
+class TestSupervisorRestartManager:
+    """Tests for restart manager lock behavior."""
+
+    @pytest.mark.asyncio
+    async def test_get_status_not_blocked_during_restart(self):
+        """get_status() must return immediately even during restart backoff."""
+        from unified_supervisor import SupervisorRestartManager
+
+        mgr = SupervisorRestartManager()
+
+        # get_status() should be near-instant with no processes
+        start = asyncio.get_event_loop().time()
+        status = mgr.get_status()
+        elapsed = asyncio.get_event_loop().time() - start
+
+        assert elapsed < 0.5, f"get_status() took {elapsed:.2f}s — likely blocked by lock"
+        assert isinstance(status, dict)

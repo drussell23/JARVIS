@@ -15126,12 +15126,16 @@ class SupervisorRestartManager:
         self._shutdown_requested = False
 
     async def check_and_restart_all(self) -> List[str]:
-        """Check all cross-repo processes and restart any that have exited."""
+        """Check all cross-repo processes and restart any that have exited.
+
+        v311.0: Split into collect (under lock) + restart (outside lock) to
+        prevent blocking get_status() during backoff sleep.
+        """
         if self._shutdown_requested:
             return []
 
-        restarted = []
-
+        # Phase 1: Collect restart candidates under lock (fast, no I/O)
+        to_restart = []
         async with self._lock:
             for name, managed in list(self.processes.items()):
                 if not managed.enabled or managed.process is None:
@@ -15146,9 +15150,14 @@ class SupervisorRestartManager:
                         self._logger.debug(f"{name} exited normally (code: {proc.returncode})")
                         continue
 
-                    success = await self._handle_unexpected_exit(name, managed)
-                    if success:
-                        restarted.append(name)
+                    to_restart.append((name, managed))
+
+        # Phase 2: Handle restarts outside lock (slow, with backoff + I/O)
+        restarted = []
+        for name, managed in to_restart:
+            success = await self._handle_unexpected_exit(name, managed)
+            if success:
+                restarted.append(name)
 
         return restarted
 
