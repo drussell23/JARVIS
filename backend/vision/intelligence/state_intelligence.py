@@ -43,6 +43,8 @@ import logging
 from pathlib import Path
 import statistics
 
+from .boundary_adapters import safe_state_key
+
 logger = logging.getLogger(__name__)
 
 
@@ -598,7 +600,8 @@ class StateIntelligence:
         for from_state, transitions in self.transition_matrix.items():
             for to_state, count in transitions.items():
                 total_transitions[from_state] += count
-                if 'error' in to_state.lower() or 'fail' in to_state.lower():
+                to_state_str = safe_state_key(to_state).lower()
+                if 'error' in to_state_str or 'fail' in to_state_str:
                     error_transitions[from_state] += count
         
         for state_id, error_count in error_transitions.items():
@@ -928,9 +931,9 @@ class StateIntelligence:
             return []
         
         error_transitions = [
-            (to_state, count) 
+            (to_state, count)
             for to_state, count in self.transition_matrix[state_id].items()
-            if 'error' in to_state.lower() or 'fail' in to_state.lower()
+            if 'error' in safe_state_key(to_state).lower() or 'fail' in safe_state_key(to_state).lower()
         ]
         
         error_transitions.sort(key=lambda x: x[1], reverse=True)
