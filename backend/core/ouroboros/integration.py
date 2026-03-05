@@ -4749,6 +4749,15 @@ async def shutdown_ouroboros_integration() -> None:
 
 _autonomous_initialized = False
 _autonomous_components: Dict[str, Any] = {}
+_autonomous_init_lock: Optional[asyncio.Lock] = None
+
+
+def _get_autonomous_init_lock() -> asyncio.Lock:
+    """Get or create the autonomous init lock (lazy for event-loop safety)."""
+    global _autonomous_init_lock
+    if _autonomous_init_lock is None:
+        _autonomous_init_lock = asyncio.Lock()
+    return _autonomous_init_lock
 
 
 @dataclass
@@ -6142,100 +6151,102 @@ async def initialize_autonomous_self_programming_full(
     """
     global _autonomous_initialized, _autonomous_components
 
-    if _autonomous_initialized:
-        logger.info("Autonomous self-programming already initialized")
-        return _autonomous_components
+    async with _get_autonomous_init_lock():
+        if _autonomous_initialized:
+            logger.info("Autonomous self-programming already initialized")
+            return _autonomous_components
 
-    logger.info("Initializing autonomous self-programming integration...")
+        logger.info("Initializing autonomous self-programming integration...")
 
-    # Get or create the orchestrator
-    orchestrator = get_agentic_orchestrator()
+        # Get or create the orchestrator
+        orchestrator = get_agentic_orchestrator()
 
-    # Try to import and get the Oracle
-    oracle = None
-    try:
-        from backend.core.ouroboros.oracle import get_oracle
-        oracle = get_oracle()
-        logger.info("  ✅ Oracle connected")
-    except ImportError:
-        logger.warning("  ⚠️ Oracle not available - some features will be limited")
-    except Exception as e:
-        logger.warning(f"  ⚠️ Failed to get Oracle: {e}")
-
-    # Try to get LLM client from integration
-    llm_client = None
-    integration = get_ouroboros_integration()
-    if hasattr(integration, '_llm_client'):
-        llm_client = integration._llm_client
-        logger.info("  ✅ LLM client connected")
-    else:
-        # Try to get from Prime client
+        # Try to import and get the Oracle
+        oracle = None
         try:
-            from backend.core.prime_client import get_prime_client
-            llm_client = await get_prime_client()
-            logger.info("  ✅ Prime client connected as LLM")
+            from backend.core.ouroboros.oracle import get_oracle
+            oracle = get_oracle()
+            logger.info("  ✅ Oracle connected")
+        except ImportError:
+            logger.warning("  ⚠️ Oracle not available - some features will be limited")
+        except Exception as e:
+            logger.warning(f"  ⚠️ Failed to get Oracle: {e}")
+
+        # Try to get LLM client from integration
+        llm_client = None
+        integration = get_ouroboros_integration()
+        if hasattr(integration, '_llm_client'):
+            llm_client = integration._llm_client
+            logger.info("  ✅ LLM client connected")
+        else:
+            # Try to get from Prime client
+            try:
+                from backend.core.prime_client import get_prime_client
+                llm_client = await get_prime_client()
+                logger.info("  ✅ Prime client connected as LLM")
+            except Exception:
+                logger.debug("  ⚠️ No LLM client available")
+
+        # Try to get ChromaDB client
+        chromadb_client = None
+        try:
+            from backend.autonomy.trinity_knowledge_indexer import get_knowledge_indexer
+            indexer = await get_knowledge_indexer()
+            if hasattr(indexer, '_chroma_client'):
+                chromadb_client = indexer._chroma_client
+                logger.info("  ✅ ChromaDB client connected")
         except Exception:
-            logger.debug("  ⚠️ No LLM client available")
+            logger.debug("  ⚠️ ChromaDB not available")
 
-    # Try to get ChromaDB client
-    chromadb_client = None
-    try:
-        from backend.autonomy.trinity_knowledge_indexer import get_knowledge_indexer
-        indexer = await get_knowledge_indexer()
-        if hasattr(indexer, '_chroma_client'):
-            chromadb_client = indexer._chroma_client
-            logger.info("  ✅ ChromaDB client connected")
-    except Exception:
-        logger.debug("  ⚠️ ChromaDB not available")
+        # Use the cross-repo integration for full initialization
+        cross_repo = get_cross_repo_autonomous_integration()
 
-    # Use the cross-repo integration for full initialization
-    cross_repo = get_cross_repo_autonomous_integration()
+        try:
+            _autonomous_components = await cross_repo.initialize(
+                orchestrator=orchestrator,
+                oracle=oracle,
+                llm_client=llm_client,
+                chromadb_client=chromadb_client,
+                start_loops=start_loops,
+            )
 
-    try:
-        _autonomous_components = await cross_repo.initialize(
-            orchestrator=orchestrator,
-            oracle=oracle,
-            llm_client=llm_client,
-            chromadb_client=chromadb_client,
-            start_loops=start_loops,
-        )
+            _autonomous_initialized = True
+            logger.info(f"✅ Autonomous self-programming initialized with {len(_autonomous_components)} components")
 
-        _autonomous_initialized = True
-        logger.info(f"✅ Autonomous self-programming initialized with {len(_autonomous_components)} components")
+            return _autonomous_components
 
-        return _autonomous_components
-
-    except Exception as e:
-        logger.error(f"Failed to initialize autonomous self-programming: {e}")
-        return {}
+        except Exception as e:
+            logger.error(f"Failed to initialize autonomous self-programming: {e}")
+            return {}
 
 
 async def shutdown_autonomous_self_programming_full() -> None:
     """Shutdown all autonomous self-programming components."""
     global _autonomous_initialized, _autonomous_components, _cross_repo_integration
 
-    if not _autonomous_initialized:
-        return
+    async with _get_autonomous_init_lock():
+        if not _autonomous_initialized:
+            return
 
-    try:
-        # Shutdown cross-repo integration (which stops all loops)
-        if _cross_repo_integration:
-            await _cross_repo_integration.shutdown()
-            _cross_repo_integration = None
+        try:
+            # Shutdown cross-repo integration (which stops all loops)
+            if _cross_repo_integration:
+                await _cross_repo_integration.shutdown()
+                _cross_repo_integration = None
 
-        # Also call native shutdown (includes web integration)
-        from backend.core.ouroboros.native_integration import (
-            shutdown_autonomous_self_programming,
-            shutdown_web_integration,
-        )
-        await shutdown_autonomous_self_programming()
-        await shutdown_web_integration()  # v5.0: Web integration shutdown
+            # Also call native shutdown (includes web integration)
+            from backend.core.ouroboros.native_integration import (
+                shutdown_autonomous_self_programming,
+                shutdown_web_integration,
+            )
+            await shutdown_autonomous_self_programming()
+            await shutdown_web_integration()  # v5.0: Web integration shutdown
 
-        _autonomous_initialized = False
-        _autonomous_components = {}
-        logger.info("Autonomous self-programming shutdown complete")
-    except Exception as e:
-        logger.error(f"Error during autonomous shutdown: {e}")
+            _autonomous_initialized = False
+            _autonomous_components = {}
+            logger.info("Autonomous self-programming shutdown complete")
+        except Exception as e:
+            logger.error(f"Error during autonomous shutdown: {e}")
 
 
 async def start_full_jarvis_system(

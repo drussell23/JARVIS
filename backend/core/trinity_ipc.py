@@ -394,7 +394,15 @@ _DEDUP_WINDOW: float = float(os.getenv("TRINITY_IPC_DEDUP_WINDOW", "60.0"))
 
 # Recent message IDs for deduplication (bounded set)
 _seen_msg_ids: Dict[str, float] = {}
-_seen_lock = asyncio.Lock() if False else None  # initialized lazily
+_seen_lock: Optional[asyncio.Lock] = None  # created on first use in running loop
+
+
+def _get_seen_lock() -> asyncio.Lock:
+    """Get or create the dedup lock (lazy init for event-loop safety)."""
+    global _seen_lock
+    if _seen_lock is None:
+        _seen_lock = asyncio.Lock()
+    return _seen_lock
 
 
 def stamp_ipc_message(data: Dict[str, Any]) -> Dict[str, Any]:
