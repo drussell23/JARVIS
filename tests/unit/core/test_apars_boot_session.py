@@ -106,13 +106,13 @@ class TestAPARSBootSession:
     def test_update_apars_bash_function_includes_boot_session_id(self):
         """The update_apars bash function must write boot_session_id to the progress JSON."""
         script = _get_golden_startup_script()
-        # Extract the update_apars function heredoc block
+        # Extract the update_apars heredoc block (writes to tmp_file now)
         match = re.search(
-            r'cat > "\$PROGRESS_FILE" << EOFPROGRESS\n(.*?)\nEOFPROGRESS',
+            r'cat > "\$tmp_file" << EOFPROGRESS\n(.*?)\nEOFPROGRESS',
             script,
             re.DOTALL,
         )
-        assert match, "Could not find PROGRESS_FILE heredoc in startup script"
+        assert match, "Could not find EOFPROGRESS heredoc in startup script"
         progress_json_template = match.group(1)
         assert '"boot_session_id"' in progress_json_template
         assert "${BOOT_SESSION_ID}" in progress_json_template
@@ -191,3 +191,23 @@ class TestConfigurableHealthTimeout:
             # The two args after checkpoint should be null null, not true false
             assert "false" not in parts_after_checkpoint.split('"')[0], \
                 f"Must not assert ready=false on timeout: {call}"
+
+
+class TestAtomicWritesAndVersion:
+    def test_startup_script_uses_atomic_apars_write(self):
+        """APARS progress file must be written atomically (write temp + mv)."""
+        script = _get_golden_startup_script()
+        # The update_apars function must write to temp then mv
+        assert ".tmp." in script, "update_apars must write to temp file"
+        assert 'mv "$tmp_file" "$PROGRESS_FILE"' in script, \
+            "update_apars must atomically rename temp to PROGRESS_FILE"
+        # Must NOT write directly to PROGRESS_FILE
+        assert 'cat > "$PROGRESS_FILE"' not in script, \
+            "Must not write directly to PROGRESS_FILE (use atomic temp+mv)"
+
+    def test_startup_script_version_bumped(self):
+        """Startup script version must be >= 237.0 after readiness fixes."""
+        from backend.core.gcp_vm_manager import _STARTUP_SCRIPT_VERSION
+        version = float(_STARTUP_SCRIPT_VERSION)
+        assert version >= 237.0, \
+            f"Startup script version must be >= 237.0, got {version}"

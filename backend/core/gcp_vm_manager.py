@@ -8941,27 +8941,50 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                 with open(PROGRESS_FILE, "r") as f:
                     state = json.load(f)
             except (FileNotFoundError, json.JSONDecodeError, OSError):
-                state = {"phase": 0, "total_progress": 5, "checkpoint": "golden_booting"}
+                state = {"phase": 0, "total_progress": 5, "checkpoint": "golden_booting",
+                         "model_loaded": False, "ready_for_inference": False}
             elapsed = int(time.time() - start_time)
             ready = state.get("ready_for_inference", False)
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({
-                "status": "starting",
+            response = {
+                "status": "healthy" if ready else "starting",
+                "phase": "ready" if ready else "starting",
+                "mode": "inference" if ready else "golden-startup",
+                "model_loaded": state.get("model_loaded", False),
+                "ready_for_inference": ready,
                 "apars": {
-                    "total_progress": state.get("total_progress", 5),
+                    "version": state.get("startup_script_version", "unknown"),
                     "phase_number": state.get("phase", 0),
                     "phase_name": state.get("checkpoint", "starting"),
                     "phase_progress": state.get("phase_progress", 0),
-                    "eta_seconds": _calc_eta(state, elapsed),
+                    "total_progress": state.get("total_progress", 5),
+                    "checkpoint": state.get("checkpoint", "starting"),
+                    "eta_seconds": _calc_eta(state, elapsed) if not ready else 0,
                     "elapsed_seconds": elapsed,
-                    "deployment_mode": "golden_image",
+                    "error": state.get("error"),
                     "startup_script_version": state.get("startup_script_version", "unknown"),
                     "startup_script_metadata_version": state.get("startup_script_metadata_version", "unknown"),
+                    "deployment_mode": "golden_image",
+                    "deps_prebaked": True,
+                    "skipped_phases": [2, 3]
                 },
-                "ready_for_inference": ready
-            }).encode())
+                "uptime_seconds": elapsed,
+                "version": "v235.0-golden"
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(response).encode())
+        elif self.path == "/health/ready":
+            try:
+                with open(PROGRESS_FILE) as f:
+                    ready = json.load(f).get("ready_for_inference", False)
+            except (FileNotFoundError, json.JSONDecodeError, OSError):
+                ready = False
+            code = 200 if ready else 503
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"ready": ready}).encode())
         else:
             self.send_response(404)
             self.end_headers()
