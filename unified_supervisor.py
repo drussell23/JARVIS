@@ -38794,6 +38794,33 @@ class DeploymentCoordinator(SystemService):
             "stats": self._stats.copy(),
         }
 
+    # -- SystemService governance ------------------------------------------
+
+    async def initialize(self) -> None:
+        """Initialize deployment coordinator."""
+        pass
+
+    async def health_check(self) -> Tuple[bool, str]:
+        active = len([d for d in self._deployments.values()
+            if d.phase in (DeploymentPhase.PREPARING, DeploymentPhase.DEPLOYING, DeploymentPhase.VERIFYING)])
+        return True, f"ok: {active} active deployments"
+
+    async def cleanup(self) -> None:
+        """Cleanup deployment coordinator state."""
+        self._deployments.clear()
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DeploymentCoordinator",
+            version="1.0.0",
+            inputs=["deploy.request"],
+            outputs=["deploy.completed", "deploy.failed"],
+            side_effects=["writes_deploy_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["deploy.request"]
+
 class BlueGreenState:
     """State for blue-green deployment."""
 
@@ -53196,7 +53223,7 @@ class BPMWorkflowInst(NamedTuple):
     variables: Dict[str, Any]
     parent_instance_id: Optional[str]  # For sub-workflows
 
-class WorkflowOrchestrator:
+class WorkflowOrchestrator(SystemService):
     """
     BPMN-like workflow orchestration engine.
 
@@ -53208,6 +53235,9 @@ class WorkflowOrchestrator:
     - Human task integration
     - Sub-workflow support
     - Event triggers and timers
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    Delegates complex DAG execution to WorkflowEngine (Zone 4.15).
     """
 
     def __init__(self) -> None:
@@ -53218,11 +53248,28 @@ class WorkflowOrchestrator:
         self._running = False
         self._executor_task: Optional[asyncio.Task[None]] = None
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the workflow orchestrator."""
         self._running = True
         self._executor_task = create_safe_task(self._executor_loop())
-        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._definitions)} workflows, {len(self._instances)} instances"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="WorkflowOrchestrator",
+            version="1.0.0",
+            inputs=["workflow.define", "workflow.start"],
+            outputs=["workflow.completed", "workflow.failed"],
+            side_effects=["writes_workflow_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["workflow.start"]
 
     async def cleanup(self) -> None:
         """Cleanup orchestrator resources."""
@@ -53635,7 +53682,7 @@ class Folder(NamedTuple):
     updated_at: float
     owner: str
 
-class DocumentManagementSystem:
+class DocumentManagementSystem(SystemService):
     """
     Enterprise document management system.
 
@@ -53647,21 +53694,27 @@ class DocumentManagementSystem:
     - Full-text search capability
     - Document lifecycle management
     - Audit trail for all operations
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    Constructor purity: storage path resolved in initialize().
     """
 
     def __init__(self, storage_path: Optional[str] = None) -> None:
-        self._storage_path = storage_path or "/tmp/dms_storage"
+        self._storage_path = storage_path  # resolved in initialize()
         self._documents: Dict[str, Document] = {}
         self._folders: Dict[str, Folder] = {}
         self._search_index: Dict[str, Set[str]] = {}  # word -> doc_ids
         self._lock = asyncio.Lock()
         self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the document management system."""
         async with self._lock:
             if self._initialized:
-                return True
+                return
+
+            if self._storage_path is None:
+                self._storage_path = str(Path.home() / ".jarvis" / "dms_storage")
 
             # Create root folder
             root_folder = Folder(
@@ -53678,7 +53731,28 @@ class DocumentManagementSystem:
             self._folders["/"] = root_folder
 
             self._initialized = True
-            return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._documents)} docs, {len(self._folders)} folders"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DocumentManagementSystem",
+            version="1.0.0",
+            inputs=["document.create", "document.update"],
+            outputs=["document.created", "document.updated"],
+            side_effects=["writes_document_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["document.create"]
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        self._initialized = False
 
     async def create_folder(
         self,
@@ -54107,7 +54181,7 @@ class NotificationPreference(NamedTuple):
     frequency_limit: Dict[str, int]  # notification_type -> max per day
     opt_outs: List[str]  # List of notification types to not receive
 
-class NotificationHub:
+class NotificationHub(SystemService):
     """
     Multi-channel notification delivery system.
 
@@ -54118,6 +54192,8 @@ class NotificationHub:
     - User preference management
     - Delivery tracking and retries
     - Priority-based routing
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self) -> None:
@@ -54132,12 +54208,29 @@ class NotificationHub:
         self._handlers: Dict[str, Callable[..., Awaitable[bool]]] = {}
         self._preferences_loaded = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the notification hub."""
         self._running = True
         self._delivery_task = create_safe_task(self._delivery_loop())
         await self._load_persisted_preferences()
-        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._channels)} channels, {len(self._notifications)} notifications"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="NotificationHub",
+            version="1.0.0",
+            inputs=["notification.send"],
+            outputs=["notification.delivered", "notification.failed"],
+            side_effects=["writes_notification_queue"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["notification.send"]
 
     async def cleanup(self) -> None:
         """Cleanup notification hub resources."""
@@ -54580,7 +54673,7 @@ class SessionStore(NamedTuple):
     config: Dict[str, Any]
     default_ttl: float
 
-class SessionManager:
+class SessionManager(SystemService):
     """
     Distributed session management system.
 
@@ -54591,6 +54684,9 @@ class SessionManager:
     - Multi-device session tracking
     - Concurrent session limits
     - Session hijacking protection
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    Phase B will delegate to GlobalSessionManager as state authority.
     """
 
     def __init__(
@@ -54606,11 +54702,28 @@ class SessionManager:
         self._running = False
         self._cleanup_task: Optional[asyncio.Task[None]] = None
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the session manager."""
         self._running = True
         self._cleanup_task = create_safe_task(self._cleanup_loop())
-        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._sessions)} active sessions"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="SessionManager",
+            version="1.0.0",
+            inputs=["session.create", "session.validate"],
+            outputs=["session.created", "session.expired"],
+            side_effects=["writes_session_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return []  # always_on — sessions are core
 
     async def cleanup(self) -> None:
         """Cleanup session manager resources."""
@@ -54928,7 +55041,7 @@ class DataCatalogEntry(NamedTuple):
     quality_score: float
     last_updated: float
 
-class DataLakeManager:
+class DataLakeManager(SystemService):
     """
     Large-scale data lake management system.
 
@@ -54940,21 +55053,43 @@ class DataLakeManager:
     - Data quality monitoring
     - Retention policy enforcement
     - Query optimization hints
+
+    v311.0: Upgraded to governed SystemService (Phase A).
+    Constructor purity: storage root resolved in initialize().
     """
 
     def __init__(self, storage_root: Optional[str] = None) -> None:
-        self._storage_root = storage_root or "/tmp/data_lake"
+        self._storage_root = storage_root  # resolved in initialize()
         self._datasets: Dict[str, Dataset] = {}
         self._catalog: Dict[str, DataCatalogEntry] = {}
         self._lock = asyncio.Lock()
         self._running = False
         self._retention_task: Optional[asyncio.Task[None]] = None
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the data lake manager."""
+        if self._storage_root is None:
+            self._storage_root = str(Path.home() / ".jarvis" / "data_lake")
         self._running = True
         self._retention_task = create_safe_task(self._retention_loop())
-        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._datasets)} datasets, {len(self._catalog)} catalog entries"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DataLakeManager",
+            version="1.0.0",
+            inputs=["dataset.register", "partition.add"],
+            outputs=["dataset.registered", "partition.added"],
+            side_effects=["writes_data_lake"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["dataset.register"]
 
     async def cleanup(self) -> None:
         """Cleanup data lake manager resources."""
@@ -55353,7 +55488,7 @@ class StreamState(NamedTuple):
     values: Dict[str, Any]
     count: int
 
-class StreamingAnalyticsEngine:
+class StreamingAnalyticsEngine(SystemService):
     """
     Real-time streaming analytics engine.
 
@@ -55364,6 +55499,8 @@ class StreamingAnalyticsEngine:
     - Stateful processing
     - Exactly-once semantics
     - Late event handling
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self, max_lateness_seconds: float = 60.0) -> None:
@@ -55377,11 +55514,28 @@ class StreamingAnalyticsEngine:
         self._process_task: Optional[asyncio.Task[None]] = None
         self._output_handlers: Dict[str, Callable[[str, Dict[str, Any]], Awaitable[None]]] = {}
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the streaming engine."""
         self._running = True
         self._process_task = create_safe_task(self._processing_loop())
-        return True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._running:
+            return False, "not running"
+        return True, f"ok: {len(self._streams)} streams, {len(self._aggregations)} aggregations"
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="StreamingAnalyticsEngine",
+            version="1.0.0",
+            inputs=["stream.ingest", "aggregation.register"],
+            outputs=["aggregation.result"],
+            side_effects=["writes_stream_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["stream.ingest"]
 
     async def cleanup(self) -> None:
         """Cleanup streaming engine resources."""
@@ -55693,7 +55847,7 @@ class DataSubjectRequest(NamedTuple):
     notes: str
     data_delivered: Optional[str]
 
-class ConsentManagementSystem:
+class ConsentManagementSystem(SystemService):
     """
     GDPR-compliant consent management system.
 
@@ -55704,6 +55858,8 @@ class ConsentManagementSystem:
     - Consent proof and audit trail
     - Preference center support
     - Third-party consent sharing
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self, dsr_response_days: int = 30) -> None:
@@ -55713,10 +55869,33 @@ class ConsentManagementSystem:
         self._policy_version = "1.0"
         self._dsr_response_days = dsr_response_days
         self._lock = asyncio.Lock()
+        self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the consent management system."""
-        return True
+        self._initialized = True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._purposes)} purposes, {len(self._consents)} consent records"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="ConsentManagementSystem",
+            version="1.0.0",
+            inputs=["consent.record", "consent.withdraw", "dsr.submit"],
+            outputs=["consent.recorded", "dsr.completed"],
+            side_effects=["writes_consent_records"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["consent.record", "dsr.submit"]
 
     async def define_purpose(
         self,
@@ -56083,7 +56262,7 @@ class SignatureVerification(NamedTuple):
     algorithm: str
     reason: str
 
-class DigitalSignatureService:
+class DigitalSignatureService(SystemService):
     """
     Digital signature service for document signing.
 
@@ -56094,6 +56273,8 @@ class DigitalSignatureService:
     - Timestamp authority integration
     - Certificate chain validation
     - Multi-signature support
+
+    v311.0: Upgraded to governed SystemService (Phase A).
     """
 
     def __init__(self) -> None:
@@ -56123,10 +56304,33 @@ class DigitalSignatureService:
             ),
         }
         self._lock = asyncio.Lock()
+        self._initialized = False
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the signature service."""
-        return True
+        self._initialized = True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        return True, f"ok: {len(self._keys)} keys, {len(self._signatures)} signatures"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        self._initialized = False
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="DigitalSignatureService",
+            version="1.0.0",
+            inputs=["signature.sign", "signature.verify"],
+            outputs=["signature.signed", "signature.verified"],
+            side_effects=["writes_signature_store"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["signature.sign"]
 
     async def generate_key_pair(
         self,
@@ -57013,9 +57217,13 @@ class DegradationState(NamedTuple):
     capacity_limits: Dict[str, float]
     reason: str
 
-class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulDegradationManager at line ~23485
+class LegacyDegradationManager(SystemService):
     """
-    Manages graceful degradation during system stress.
+    Rule-based degradation with configurable level thresholds.
+
+    v311.0: Un-deprecated. Complements the resource-aware GracefulDegradationManager
+    (Zone 4.7) by providing explicit level-forcing for operator-driven scenarios.
+    Upgraded to governed SystemService (Phase A).
 
     Provides:
     - Multi-level degradation modes
@@ -57031,8 +57239,9 @@ class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulD
         self._feature_priorities: Dict[str, int] = {}  # feature -> priority (lower = more critical)
         self._lock = asyncio.Lock()
         self._state_callbacks: List[Callable[[DegradationState], Awaitable[None]]] = []
+        self._initialized = False
 
-        # Initialize default levels
+        # Initialize default levels (pure in-memory, no I/O)
         self._setup_default_levels()
 
     def _setup_default_levels(self) -> None:
@@ -57078,7 +57287,7 @@ class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulD
             description="Emergency mode - only authentication and basic read operations",
         )
 
-    async def initialize(self) -> bool:
+    async def initialize(self) -> None:
         """Initialize the degradation manager."""
         self._current_state = DegradationState(
             current_level="normal",
@@ -57087,7 +57296,31 @@ class _Deprecated_GracefulDegradationManager:  # v239.0: superseded by GracefulD
             capacity_limits={},
             reason="System startup",
         )
-        return True
+        self._initialized = True
+
+    async def health_check(self) -> Tuple[bool, str]:
+        """Return (healthy, message)."""
+        if not self._initialized:
+            return False, "not initialized"
+        level = self._current_state.current_level if self._current_state else "unknown"
+        return True, f"ok: level={level}, {len(self._levels)} levels configured"
+
+    async def cleanup(self) -> None:
+        """Release resources."""
+        self._initialized = False
+        self._current_state = None
+
+    def capability_contract(self) -> "CapabilityContract":
+        return CapabilityContract(
+            name="LegacyDegradationManager",
+            version="1.0.0",
+            inputs=["degradation.evaluate", "degradation.force_level"],
+            outputs=["degradation.level_changed"],
+            side_effects=["writes_degradation_state"],
+        )
+
+    def activation_triggers(self) -> List[str]:
+        return ["degradation.evaluate"]
 
     def register_state_callback(
         self,
