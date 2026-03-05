@@ -57269,9 +57269,11 @@ class UnifiedSignalHandler:
         self._first_signal_time: Optional[float] = None
 
     def _get_event(self) -> asyncio.Event:
-        """Return the shutdown event (pre-created in __init__, fallback lazy for Python 3.9)."""
+        """Return the shutdown event. Thread-safe lazy creation for Python 3.9 fallback."""
         if self._shutdown_event is None:
-            self._shutdown_event = asyncio.Event()
+            with self._lock:  # reuse existing self._lock (threading.Lock)
+                if self._shutdown_event is None:
+                    self._shutdown_event = asyncio.Event()
         return self._shutdown_event
 
     def register_callback(self, callback: Callable[[], Coroutine[Any, Any, None]]) -> None:

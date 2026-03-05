@@ -69,3 +69,47 @@ class TestLazyAsyncLock:
 
         await asyncio.gather(*[worker() for _ in range(10)])
         assert max_concurrent == 1, f"Critical section violated: max_concurrent={max_concurrent}"
+
+
+class TestUnifiedSignalHandler:
+    """Tests for signal handler thread safety."""
+
+    def test_get_event_returns_same_instance(self):
+        """Two threads racing _get_event() must get the same Event object."""
+        from unified_supervisor import UnifiedSignalHandler
+
+        handler = UnifiedSignalHandler.__new__(UnifiedSignalHandler)
+        handler._shutdown_event = None
+        handler._shutdown_requested = False
+        handler._shutdown_count = 0
+        handler._lock = threading.Lock()
+        handler._shutdown_reason = None
+        handler._loop = None
+        handler._installed = False
+        handler._callbacks = []
+        handler._first_signal_time = None
+
+        results = []
+        barrier = threading.Barrier(2)
+
+        def grab_event():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                barrier.wait()
+                event = handler._get_event()
+                results.append(id(event))
+            finally:
+                loop.close()
+
+        t1 = threading.Thread(target=grab_event)
+        t2 = threading.Thread(target=grab_event)
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+
+        assert len(results) == 2
+        assert results[0] == results[1], (
+            f"Two threads got different Event objects: {results[0]} != {results[1]}"
+        )
