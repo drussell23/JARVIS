@@ -24349,6 +24349,14 @@ echo "=== JARVIS Prime started ==="
         """
         self._verdict_executor_mode = enabled
 
+    def should_delegate_health_decisions(self) -> bool:
+        """Return True if health monitoring decisions should be delegated to root authority."""
+        return self._verdict_executor_mode
+
+    def should_delegate_restart_decisions(self) -> bool:
+        """Return True if restart decisions should be delegated to root authority."""
+        return self._verdict_executor_mode
+
     def get_current_identity(self, subsystem: str) -> "Optional[ProcessIdentity]":
         """Return the current ProcessIdentity for a subsystem, or None."""
         from backend.core.root_authority_types import ProcessIdentity  # noqa: F811
