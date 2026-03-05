@@ -20,5 +20,14 @@
     "JARVIS_BLAS_GUARD_MODE": "safe",
     "PYTHONPATH": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent:/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/backend:"
   },
-  "events": []
+  "events": [],
+  "exit_summary": {
+    "exit_time": 1772709717.3216488,
+    "exit_time_iso": "2026-03-05T03:21:57.325105",
+    "total_runtime": 253.04489874839783,
+    "total_events": 0,
+    "shutdown_triggered": false,
+    "shutdown_trigger_info": null,
+    "checkpoints": {}
+  }
 }
