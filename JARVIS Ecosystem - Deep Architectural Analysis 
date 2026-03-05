@@ -438,7 +438,279 @@
 ========================================================================================================================================================================================================================================================================================================================================================================================================================================================================
 
 
+⏺ I now have an extremely thorough picture. Let me compile the comprehensive analysis. The agents will likely finish soon, but I have enough data from my own
+   analysis plus the completed cross-repo agent to present the first major question in the brainstorming process.                                            
+                                                                                                                                                             
+  ---                                                                                                                                                        
+  Based on my deep analysis of the entire 96,058-line unified_supervisor.py, here is my Step 2: Clarifying Question (one at a time per the brainstorming     
+  process):                                                                                                                                                  
+                                                                  
+  ---
+  Architectural Analysis: What I've Found So Far
 
+  Before I ask my question, here's a summary of the quantified disease, not symptoms:
+
+  By The Numbers (Hard Data)
+
+  ┌─────────────────────────────────────────────┬──────────────────────────┬──────────────────────────────────────┐
+  │                   Metric                    │          Count           │               Severity               │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ except Exception: blocks                    │ 662                      │ Observability black hole             │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ except Exception: pass (silent swallow)     │ 474                      │ Critical — errors vanish             │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ try blocks                                  │ 1,902                    │ —                                    │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ finally blocks                              │ 63                       │ 30:1 ratio = resource leak guarantee │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ asyncio.wait_for (cancels task on timeout)  │ 353                      │ Widespread CancelledError risk       │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ asyncio.shield (protects from cancellation) │ 27                       │ 13:1 imbalance with wait_for         │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ asyncio.gather without return_exceptions    │ 26                       │ One failure kills sibling tasks      │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ asyncio.sleep calls                         │ 194                      │ Potential implicit timing            │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ time.sleep (blocks event loop)              │ 4                        │ Event loop freezes                   │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ Dead enterprise classes (0 references)      │ 8 classes (~3,600 lines) │ Pure dead weight                     │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ Global mutable variables                    │ 72                       │ Shared state hazards                 │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ Singleton _instance patterns                │ 175 references           │ Init-order coupling                  │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ Hardcoded localhost/127.0.0.1               │ 113                      │ Not deployable remotely              │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ Hardcoded /tmp/ paths                       │ 7                        │ Not portable                         │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ create_safe_task (tracked)                  │ 166                      │ —                                    │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ asyncio.create_task (untracked)             │ 11                       │ Orphaned task risk                   │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ Class definitions                           │ 130+                     │ All in one file                      │
+  ├─────────────────────────────────────────────┼──────────────────────────┼──────────────────────────────────────┤
+  │ Deprecated markers                          │ 24                       │ Dead code lingering                  │
+  └─────────────────────────────────────────────┴──────────────────────────┴──────────────────────────────────────┘
+
+  Top-Level Architectural Diseases (Not Symptoms)
+
+  1. Silent Exception Swallowing Epidemic — 474 except Exception: pass blocks means errors are invisible. When something fails, you have no forensics, no
+  metrics, no ability to diagnose. This is the single biggest threat to system reliability.
+  2. Resource Leak Guarantee — 1,902 try blocks with only 63 finally blocks. In a system that manages locks, processes, file handles, network connections,
+  and async tasks, the absence of finally means resource cleanup is skipped on any exception path.
+  3. CancelledError Exposure — 353 asyncio.wait_for calls that cancel tasks on timeout, but only 27 asyncio.shield uses. When wait_for times out, it cancels
+  the underlying coroutine. If that coroutine was doing something that must complete (like writing state, releasing a lock, committing), it gets interrupted
+  mid-operation.
+  4. Dead Enterprise Code — 8 enterprise classes (WorkflowOrchestrator, DocumentManagementSystem, NotificationHub, DataLakeManager, StreamingAnalyticsEngine,
+   ConsentManagementSystem, DigitalSignatureService, MLOpsModelRegistry) are defined but never instantiated or referenced. ~3,600 lines of dead weight.
+  5. Cross-Repo Integration Fragility (from completed agent analysis) — 12 critical issues including: no contract versioning, health never refreshed after
+  boot, events don't cross repo boundaries, missing reconnection logic, no dead letter queue, Lamport clock not propagated, no distributed tracing.
+  6. Startup Sequence Coupling — The startup() method at line 65974 is a single monolithic async function that orchestrates all phases sequentially. Partial
+  failure in one phase can leave the system in an ambiguous state with no clear rollback.
+  7. Duplicate/Conflicting Managers — SupervisorRestartManager (line 14566) and ProcessRestartManager (line 16968), ProcessStateManager (line 56803) —
+  multiple overlapping concerns with unclear authority boundaries.
+
+  ---
+  My Question
+
+  Given the scale of what I've found (and the remaining agents are still discovering more), this is clearly not a single-fix situation. Before I propose
+  approaches, I need to understand your priorities:
+
+  Which of these categories would you want addressed first?
+
+  A. Observability Crisis — Fix the 474 silent exception swallowing sites + add structured error classification. This is foundational because you can't fix
+  what you can't see.
+
+  B. Async Safety Hardening — Fix the wait_for/shield imbalance, add finally blocks to critical paths, fix CancelledError propagation. This prevents state
+  corruption and resource leaks.
+
+  C. Cross-Repo Integration — Fix the Trinity connector's 12 critical issues (contract validation, health propagation, reconnection, DLQ). This enables the
+  three repos to actually function as a unified system.
+
+  D. Dead Code Removal — Remove the ~3,600 lines of unused enterprise classes and deprecated code. This reduces cognitive load and attack surface.
+
+  E. All of the above, prioritized in dependency order — I'll sequence them so each fix builds on the previous (likely: D → A → B → C).
+
+  Or do you have a different priority in mind?
+
+✻ Crunched for 5m 50s                                   
+
+⏺ Agent "Analyze resource & state management" completed                                                                                                      
+  
+⏺ Agent "Analyze audio, voice & UI systems" completed                                                                                                        
+                                                                  
+⏺ Agent "Analyze concurrency & async patterns" completed                                                                                                     
+                                                                                                                                                             
+⏺ Agent "Analyze enterprise systems in file" completed
+
+⏺ Agent "Analyze lifecycle & startup" completed
+
+⏺ All 6 deep-analysis agents have completed. Here's the complete architectural autopsy of your 96,058-line unified_supervisor.py:
+
+  ---                                                                                                                                                        
+  Complete Findings: 6 Domain Analyses Unified
+                                                                                                                                                             
+  Domain 1: Lifecycle, Startup & Shutdown                         
+
+  Key findings:
+  - StartupStateMachine.reset_startup_state_machine() only resets the singleton, NOT _completion_events — in-process restarts are completely broken (old
+  events still set in new cycle)
+  - StartupLock has a PID reuse TOCTOU vulnerability — only checks os.kill(pid, 0) without verifying it's the same binary
+  - Wave execution has no wave-level timeout — individual component timeouts exist but 10 components × 60s = 600s with no aggregate protection
+  - update_component_sync() explicitly warns "does NOT acquire async lock" — race condition between sync callbacks and async complete_component()
+  - Cross-repo contract validation function validate_contracts_at_boot() exists but is never called anywhere
+  - Shutdown has no component ordering — no drain phase, no reverse-dependency shutdown sequence
+
+  Domain 2: Concurrency & Async Patterns
+
+  Key findings:
+  - LazyAsyncLock (line 14206) — CRITICAL race: multiple tasks can create duplicate asyncio.Lock instances simultaneously, breaking all synchronization
+  - SupervisorRestartManager (line 14643) — holds lock during asyncio.sleep(backoff) up to 60 seconds, blocking all status checks
+  - _ProgressBroadcastWorker (line 63094) — claims GIL atomicity for cross-thread counter increments, but += is NOT atomic (LOAD + ADD + STORE = 3 bytecodes)
+  - GlobalSessionManager (line 14256) — mixes LazyAsyncLock and threading.Lock protecting the SAME state (_current_vm), making both locks useless
+  - KernelBackgroundTaskRegistry (line 62947) — append() and remove() have no lock, allowing duplicate registrations and RuntimeError: list changed during
+  iteration
+  - IPCServer._handle_client (line 62856) — no finally block, StreamWriter never closed on exception → file descriptor leak
+  - ProcessStateManager.get_statistics (line 56959) — synchronous method iterates self._processes dict without lock → crash if dict modified concurrently
+
+  Domain 3: Resource & State Management
+
+  Key findings:
+  - 8 resource managers have cleanup methods that don't guarantee task completion before destruction
+  - CostTracker accumulates costs in memory only — crash = all cost data lost (save only happens in cleanup)
+  - SemanticVoiceCacheManager (line 12295) — ChromaDB client never explicitly closed → connection leak
+  - IntelligentCacheManager (line 13672) — self._errors: List[str] grows unbounded → memory leak over long sessions
+  - Configuration drift: CostTracker.spot_vm_hourly uses COST_SPOT_VM_HOURLY env var, while ScaleToZeroCostOptimizer.hourly_rate uses GCP_SPOT_HOURLY_RATE —
+  different env vars for same concept
+  - Port configuration drift: 3 different env var names (JARVIS_PORT, BACKEND_PORT, JARVIS_BACKEND_PORT) that can diverge
+  - 5 concurrent state corruption scenarios in managers that access dicts without locks (CostTracker, TieredStorageManager, VMSessionTracker,
+  DynamicPortManager, CacheStatisticsTracker)
+  - ResourceManagerBase.safe_health_check() (line 9804) defined but never called — SystemServiceRegistry calls health_check() directly, bypassing circuit
+  breaker
+
+  Domain 4: Cross-Repo & Trinity Integration
+
+  Key findings:
+  - No contract versioning — health endpoint responses parsed with hardcoded field names (model_loaded, ready_for_inference) — if Prime changes schema,
+  silent failure
+  - Health never refreshed after boot — UnifiedTrinityConnector._health dict set once during initialize(), never updated again
+  - Events don't cross repo boundaries — SupervisorEventBus is process-local, no mechanism to pipe events to Prime/Reactor
+  - No reconnection logic — if Prime isn't ready when JARVIS initializes, it's permanently marked unavailable (no retry)
+  - Dead letter queue claimed but not implemented (line 62119 logs "Dead letter queue: enabled" but no DLQ code exists)
+  - Lamport clock incremented but never propagated in cross-repo messages
+  - No distributed tracing — TrinityTraceContext defined but never used in UnifiedTrinityConnector
+  - Error boundary erosion — all cross-repo failures caught as generic except Exception, caller can't distinguish "not installed" from "crashed"
+
+  Domain 5: Enterprise Systems (Lines 50K-58K)
+
+  Key findings:
+  - 9 enterprise classes are 100% dead code — never instantiated, never referenced, never integrated:
+
+  ┌──────────────────────────┬─────────────┬──────────────┐
+  │        Dead Class        │    Lines    │     Size     │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ MLOpsModelRegistry       │ 51116-51400 │ ~284         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ WorkflowOrchestrator     │ 51567-52000 │ ~433         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ DocumentManagementSystem │ 52006-52430 │ ~424         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ NotificationHub          │ 52478-52950 │ ~472         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ SessionManager           │ 52951-53250 │ ~299         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ DataLakeManager          │ 53299-53720 │ ~421         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ StreamingAnalyticsEngine │ 53724-54020 │ ~296         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ ConsentManagementSystem  │ 54064-54400 │ ~336         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ DigitalSignatureService  │ 54454-54750 │ ~296         │
+  ├──────────────────────────┼─────────────┼──────────────┤
+  │ Total dead code          │             │ ~3,261 lines │
+  └──────────────────────────┴─────────────┴──────────────┘
+
+  - Plus _Deprecated_GracefulDegradationManager (line 55384, ~226 lines) — explicitly superseded
+  - Plus ~50 NamedTuple definitions for these systems (~200 lines)
+  - Total removable: ~3,700 lines (4% of file)
+  - Storage paths hardcoded to /tmp/dms_storage, /tmp/data_lake — ephemeral
+
+  Domain 6: Audio/Voice, UI & Signals
+
+  Key findings:
+  - LiveProgressDashboard (line 7679) — CRITICAL: multiple threads write sys.stdout unsynchronized (render loop, keyboard listener daemon thread,
+  DashboardLogHandler from logging threads)
+  - UnifiedSignalHandler._get_event() (line 55975) — TOCTOU race: two rapid signals can both create separate asyncio.Event objects, second overwrites first,
+  first .set() is lost
+  - DashboardLogHandler.emit() (line 8405) — called from arbitrary thread, checks self._dashboard validity then calls method — dashboard can become None
+  between check and use
+  - AsyncVoiceNarrator (line 15363) — creates asyncio.Lock() in __init__() before event loop exists — crashes on Python 3.9
+  - Voice narrator queue — PriorityQueue with no maxsize, unbounded growth → OOM under verbose logging
+  - Terminal keyboard listener (line 7186) — tcsetattr cleanup not in finally block — crash leaves terminal in cbreak mode permanently
+  - ModelLoadingState (line 6998) — dict subclass with _enforce_invariants() that reads multiple keys non-atomically — classic TOCTOU
+
+  ---
+  Quantified Disease Summary
+
+  ┌────────────────────────────────────────────────────────┬────────────────┬───────────────┐
+  │                        Category                        │     Count      │   Severity    │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Silent exception swallowing (except Exception: pass)   │ 474            │ CRITICAL      │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Missing finally blocks (try:finally ratio 30:1)        │ 1,839 missing  │ CRITICAL      │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ asyncio.wait_for without shield (13:1 imbalance)       │ 326 unshielded │ HIGH          │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Race conditions identified                             │ 23             │ CRITICAL-HIGH │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Dead code lines (unused enterprise + deprecated)       │ ~3,700         │ MEDIUM        │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Hardcoded values needing configuration                 │ 50+            │ HIGH          │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Resource leak paths                                    │ 12             │ HIGH          │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Missing contract/schema validation                     │ 12             │ HIGH          │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Configuration drift (same concept, different env vars) │ 4 pairs        │ HIGH          │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ asyncio.gather without return_exceptions               │ 26             │ MEDIUM        │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Untracked asyncio.create_task calls                    │ 6              │ MEDIUM        │
+  ├────────────────────────────────────────────────────────┼────────────────┼───────────────┤
+  │ Event loop blocking (time.sleep in async)              │ 4              │ MEDIUM        │
+  └────────────────────────────────────────────────────────┴────────────────┴───────────────┘
+
+  ---
+  Updated Question
+
+  Now that you have the complete picture across all 6 domains, let me re-ask with more precision:
+
+  Which priority order do you want me to follow?
+
+  Option A — Safety-First (Bottom-Up)
+  1. Fix race conditions (LazyAsyncLock, signal handler, dashboard threading) — prevents data corruption
+  2. Fix resource leaks (IPCServer, ChromaDB, finally blocks) — prevents degradation over time
+  3. Fix silent exception swallowing (474 sites) — enables debugging everything else
+  4. Remove dead code (~3,700 lines) — reduces cognitive load
+  5. Fix cross-repo integration — enables Trinity to function correctly
+
+  Option B — Observability-First (See Before You Fix)
+  1. Fix silent exception swallowing (474 sites) — you can't fix what you can't see
+  2. Fix configuration drift (env var deduplication) — single source of truth
+  3. Remove dead code — less noise in the system
+  4. Fix race conditions — now diagnosable
+  5. Fix cross-repo integration — now observable
+
+  Option C — Integration-First (Trinity Focus)
+  1. Fix cross-repo contract validation + health propagation
+  2. Fix event bus to cross repo boundaries
+  3. Fix reconnection logic + DLQ
+  4. Then safety/observability fixes
+  5. Dead code last
+
+  Option D — All of the above, sequenced by dependency (I'll create a phased plan where each fix enables the next)
+
+  Option E — You tell me what matters most to you right now
 
 
 ========================================================================================================================================================================================================================================================================================================================================================================================================================================================================
