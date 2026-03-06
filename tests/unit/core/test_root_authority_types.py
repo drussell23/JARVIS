@@ -514,3 +514,116 @@ class TestSeverityMap:
         assert SEVERITY_MAP[SubsystemState.READY] < SEVERITY_MAP[SubsystemState.DEGRADED]
         assert SEVERITY_MAP[SubsystemState.DEGRADED] < SEVERITY_MAP[SubsystemState.REJECTED]
         assert SEVERITY_MAP[SubsystemState.REJECTED] < SEVERITY_MAP[SubsystemState.CRASHED]
+
+
+import time
+from datetime import datetime, timezone
+
+
+class TestVerdictWarning:
+    def test_creation(self):
+        from backend.core.root_authority_types import VerdictWarning
+        w = VerdictWarning(code="not_installed", detail="Docker not found", origin="docker_daemon")
+        assert w.code == "not_installed"
+        assert w.detail == "Docker not found"
+        assert w.origin == "docker_daemon"
+
+    def test_frozen(self):
+        from backend.core.root_authority_types import VerdictWarning
+        w = VerdictWarning(code="x", detail="y", origin="z")
+        with pytest.raises(AttributeError):
+            w.code = "changed"
+
+
+class TestResourceVerdict:
+    def _make_verdict(self, **overrides):
+        from backend.core.root_authority_types import (
+            ResourceVerdict, SubsystemState, RequiredTier,
+            VerdictReasonCode, RecoveryAction,
+        )
+        defaults = dict(
+            origin="test_manager",
+            correlation_id="corr-001",
+            epoch=1,
+            monotonic_ns=time.monotonic_ns(),
+            wall_utc=datetime.now(timezone.utc).isoformat(),
+            sequence=1,
+            state=SubsystemState.READY,
+            boot_allowed=True,
+            serviceable=True,
+            required_tier=RequiredTier.REQUIRED,
+            reason_code=VerdictReasonCode.HEALTHY,
+            reason_detail="Initialized OK",
+            retryable=False,
+        )
+        defaults.update(overrides)
+        return ResourceVerdict(**defaults)
+
+    def test_healthy_verdict(self):
+        v = self._make_verdict()
+        assert v.state.value == "ready"
+        assert v.boot_allowed is True
+        assert v.serviceable is True
+        assert v.severity == 0
+
+    def test_severity_derived_from_state(self):
+        from backend.core.root_authority_types import SubsystemState
+        v = self._make_verdict(state=SubsystemState.DEGRADED, serviceable=False)
+        assert v.severity == 1
+
+    def test_frozen(self):
+        v = self._make_verdict()
+        with pytest.raises(AttributeError):
+            v.state = "changed"
+
+    def test_default_optional_fields(self):
+        from backend.core.root_authority_types import RecoveryAction
+        v = self._make_verdict()
+        assert v.retry_after_s is None
+        assert v.evidence == {}
+        assert v.recovery_owner is None
+        assert v.next_action == RecoveryAction.NONE
+        assert v.capabilities == ()
+
+    def test_schema_version(self):
+        from backend.core.root_authority_types import ResourceVerdict
+        assert ResourceVerdict.SCHEMA_VERSION == 1
+
+    def test_with_evidence(self):
+        v = self._make_verdict(evidence={"init_time_ms": 150, "error": None})
+        assert v.evidence["init_time_ms"] == 150
+
+    def test_with_capabilities(self):
+        v = self._make_verdict(capabilities=("container_runtime", "image_build"))
+        assert len(v.capabilities) == 2
+        assert "container_runtime" in v.capabilities
+
+    def test_invariant_crashed_not_serviceable(self):
+        from backend.core.root_authority_types import SubsystemState
+        with pytest.raises(ValueError, match="CRASHED.*serviceable"):
+            self._make_verdict(state=SubsystemState.CRASHED, serviceable=True, boot_allowed=False)
+
+    def test_invariant_boot_not_allowed_not_ready(self):
+        from backend.core.root_authority_types import SubsystemState
+        with pytest.raises(ValueError, match="boot_allowed.*READY"):
+            self._make_verdict(state=SubsystemState.READY, boot_allowed=False)
+
+    def test_invariant_required_not_serviceable_not_ready(self):
+        from backend.core.root_authority_types import SubsystemState, RequiredTier
+        with pytest.raises(ValueError, match="REQUIRED.*serviceable.*READY"):
+            self._make_verdict(state=SubsystemState.READY, serviceable=False, required_tier=RequiredTier.REQUIRED)
+
+    def test_valid_degraded_but_serviceable(self):
+        from backend.core.root_authority_types import SubsystemState
+        v = self._make_verdict(state=SubsystemState.DEGRADED, serviceable=True)
+        assert v.severity == 1
+        assert v.serviceable is True
+
+    def test_valid_optional_crashed_boot_allowed(self):
+        from backend.core.root_authority_types import SubsystemState, RequiredTier
+        v = self._make_verdict(
+            state=SubsystemState.CRASHED, boot_allowed=True,
+            serviceable=False, required_tier=RequiredTier.OPTIONAL,
+        )
+        assert v.boot_allowed is True
+        assert v.severity == 3

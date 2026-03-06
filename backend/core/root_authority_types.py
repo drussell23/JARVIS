@@ -122,6 +122,97 @@ SEVERITY_MAP: Mapping[SubsystemState, int] = {
 }
 
 # ---------------------------------------------------------------------------
+# Verdict value objects
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class VerdictWarning:
+    """An advisory warning attached to a ResourceVerdict."""
+
+    code: str
+    detail: str
+    origin: str
+
+
+@dataclass(frozen=True)
+class ResourceVerdict:
+    """Immutable admission decision for a single managed resource.
+
+    Fields are grouped by concern:
+      * Identity   – who/when produced the verdict.
+      * State      – observed lifecycle state.
+      * Admission  – boot / serviceability gates.
+      * Reason     – structured explanation.
+      * Evidence   – opaque bag of supporting data.
+      * Recovery   – recommended next steps.
+      * Capabilities – features the resource advertises.
+
+    ``__post_init__`` enforces three cross-field invariants that must
+    never be violated at construction time.
+    """
+
+    # -- class-level constant (not per-instance) --
+    SCHEMA_VERSION: int = field(init=False, default=1, repr=False, compare=False)
+
+    # -- Identity --
+    origin: str
+    correlation_id: str
+    epoch: int
+    monotonic_ns: int
+    wall_utc: str
+    sequence: int
+
+    # -- State --
+    state: SubsystemState
+
+    # -- Admission --
+    boot_allowed: bool
+    serviceable: bool
+    required_tier: RequiredTier
+
+    # -- Reason --
+    reason_code: VerdictReasonCode
+    reason_detail: str
+    retryable: bool
+    retry_after_s: Optional[float] = None
+
+    # -- Evidence --
+    evidence: Mapping[str, object] = field(default_factory=dict)
+
+    # -- Recovery --
+    recovery_owner: Optional[str] = None
+    next_action: RecoveryAction = RecoveryAction.NONE
+
+    # -- Capabilities --
+    capabilities: Tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        # Invariant 1: CRASHED resources cannot claim serviceability.
+        if self.state is SubsystemState.CRASHED and self.serviceable:
+            raise ValueError("CRASHED verdict cannot be serviceable")
+
+        # Invariant 2: Denying boot while claiming READY is contradictory.
+        if not self.boot_allowed and self.state is SubsystemState.READY:
+            raise ValueError("boot_allowed=False contradicts READY state")
+
+        # Invariant 3: REQUIRED + not serviceable while READY is incoherent.
+        if (
+            self.required_tier is RequiredTier.REQUIRED
+            and not self.serviceable
+            and self.state is SubsystemState.READY
+        ):
+            raise ValueError(
+                "REQUIRED + not serviceable contradicts READY state"
+            )
+
+    @property
+    def severity(self) -> int:
+        """Return the integer severity level for the current state."""
+        return SEVERITY_MAP.get(self.state, 3)
+
+
+# ---------------------------------------------------------------------------
 # Frozen dataclasses (immutable value objects)
 # ---------------------------------------------------------------------------
 
