@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -81,6 +82,7 @@ class ReactiveStateStore:
         self._policy_engine = policy_engine
         self._audit_log = audit_log
         self._entries: Dict[str, StateEntry] = {}
+        self._rejection_counters: Counter = Counter()
         self._watchers = WatcherManager()
         self._lock = threading.Lock()
 
@@ -280,6 +282,10 @@ class ReactiveStateStore:
         with self._lock:
             return dict(self._entries)
 
+    def rejection_stats(self) -> Dict[tuple, int]:
+        """Return rejection counts as {(key, reason_value): count}."""
+        return dict(self._rejection_counters)
+
     # ── Defaults ──────────────────────────────────────────────────────
 
     def initialize_defaults(self) -> None:
@@ -349,6 +355,7 @@ class ReactiveStateStore:
         attempted_version: int,
     ) -> WriteResult:
         """Build a ``WriteResult`` with a ``WriteRejection``.  Logs at debug level."""
+        self._rejection_counters[(key, reason.value)] += 1
         current_entry = self._entries.get(key)
         current_version = current_entry.version if current_entry is not None else 0
 
