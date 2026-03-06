@@ -5204,6 +5204,21 @@ class UnifiedLogger:
                 return f"{message} {args}"
         return message
 
+    # ── logging.Logger protocol compatibility ──────────────────────────
+    # Maps standard logging level integers to internal LogLevel enum so
+    # callers using the dynamic .log(level, msg) interface work correctly.
+    _STD_LEVEL_MAP: Dict[int, "LogLevel"] = {}  # populated after class body
+
+    def log(self, level: int, message: str, *args, **kwargs) -> None:
+        """Generic level-dispatch matching the logging.Logger.log() protocol.
+
+        Accepts standard logging level integers (DEBUG=10, INFO=20,
+        WARNING=30, ERROR=40, CRITICAL=50) and routes to the appropriate
+        internal LogLevel.  Unknown levels fall back to INFO.
+        """
+        mapped = self._STD_LEVEL_MAP.get(level, LogLevel.INFO)
+        self._log(mapped, self._format_msg(message, args), **kwargs)
+
     def debug(self, message: str, *args, **kwargs) -> None:
         """Debug level logging (only in verbose mode)."""
         if self._verbose:
@@ -5271,6 +5286,18 @@ class UnifiedLogger:
 
 # Global logger instance for use throughout the kernel
 _unified_logger = UnifiedLogger()
+
+# Populate the standard-logging level map now that LogLevel is fully defined.
+# This makes UnifiedLogger.log(logging.INFO, msg) work identically to .info(msg).
+UnifiedLogger._STD_LEVEL_MAP = {
+    logging.DEBUG:    LogLevel.DEBUG,
+    logging.INFO:     LogLevel.INFO,
+    logging.WARNING:  LogLevel.WARNING,
+    logging.WARN:     LogLevel.WARNING,
+    logging.ERROR:    LogLevel.ERROR,
+    logging.CRITICAL: LogLevel.CRITICAL,
+    logging.FATAL:    LogLevel.CRITICAL,
+}
 
 # =============================================================================
 # STARTUP LOCK (Singleton Enforcement)
