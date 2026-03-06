@@ -4,8 +4,8 @@ Wires together the journal, schema registry, ownership registry, and watcher
 manager into a single thread-safe store with a CAS + epoch-fenced write
 pipeline.
 
-Write pipeline (steps 1-7 under lock, step 8 outside lock)
------------------------------------------------------------
+Write pipeline (steps 1-7 under lock, steps 8-9 outside lock)
+--------------------------------------------------------------
 1. Schema validation (if schema exists for key).
 2. Apply coercion (e.g. ``map_to`` for unknown enums).
 3. Ownership check (writer must own key's domain).
@@ -14,6 +14,7 @@ Write pipeline (steps 1-7 under lock, step 8 outside lock)
 6. Policy validation (if policy engine configured).
 7. Journal append + in-memory update.
 8. Notify watchers **outside** the lock (deadlock avoidance).
+9. Publish state.changed event (if emitter configured).
 
 Design rules
 ------------
@@ -23,19 +24,22 @@ Design rules
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from backend.core.reactive_state.audit import AuditLog, post_replay_invariant_audit
 from backend.core.reactive_state.journal import AppendOnlyJournal
 from backend.core.reactive_state.ownership import OwnershipRegistry
 from backend.core.reactive_state.policy import PolicyEngine
 from backend.core.reactive_state.schemas import SchemaRegistry
+from backend.core.reactive_state.event_emitter import StateEventEmitter
 from backend.core.reactive_state.types import (
+    JournalEntry,
     StateEntry,
     WriteRejection,
     WriteResult,
@@ -73,6 +77,7 @@ class ReactiveStateStore:
         schema_registry: SchemaRegistry,
         policy_engine: Optional[PolicyEngine] = None,
         audit_log: Optional[AuditLog] = None,
+        event_emitter_factory: Optional[Callable[[AppendOnlyJournal], StateEventEmitter]] = None,
     ) -> None:
         self._journal = AppendOnlyJournal(journal_path)
         self._epoch = epoch
@@ -81,6 +86,8 @@ class ReactiveStateStore:
         self._schemas = schema_registry
         self._policy_engine = policy_engine
         self._audit_log = audit_log
+        self._event_emitter_factory = event_emitter_factory
+        self._event_emitter: Optional[StateEventEmitter] = None
         self._entries: Dict[str, StateEntry] = {}
         self._rejection_counters: Counter = Counter()
         self._watchers = WatcherManager()
@@ -92,6 +99,8 @@ class ReactiveStateStore:
         """Open journal, replay existing entries to rebuild in-memory state."""
         self._journal.open()
         self._replay()
+        if self._event_emitter_factory is not None:
+            self._event_emitter = self._event_emitter_factory(self._journal)
 
     def close(self) -> None:
         """Close the journal and release resources."""
@@ -147,6 +156,7 @@ class ReactiveStateStore:
         # Notification state -- populated under lock, dispatched outside.
         notify_old: Optional[StateEntry] = None
         notify_new: Optional[StateEntry] = None
+        journal_entry: Optional[JournalEntry] = None
 
         with self._lock:
             # Step 1: Schema validation
@@ -197,7 +207,7 @@ class ReactiveStateStore:
             now_mono = time.monotonic()
             now_unix_ms = int(time.time() * 1000)
 
-            self._journal.append(
+            journal_entry = self._journal.append(
                 key=key,
                 value=value,
                 previous_value=previous_value,
@@ -228,6 +238,10 @@ class ReactiveStateStore:
         # Step 8: Notify watchers OUTSIDE the lock.
         if notify_new is not None:
             self._watchers.notify(key, notify_old, notify_new)
+
+        # Step 9: Publish state.changed event (if emitter configured).
+        if notify_new is not None and self._event_emitter is not None and journal_entry is not None:
+            self._publish_event(journal_entry)
 
         return WriteResult(status=WriteStatus.OK, entry=notify_new)
 
@@ -314,6 +328,23 @@ class ReactiveStateStore:
             )
 
     # ── Internal ──────────────────────────────────────────────────────
+
+    def _publish_event(self, entry: JournalEntry) -> None:
+        """Best-effort publish of a state.changed event.
+
+        Runs the async publish in the current event loop if available,
+        otherwise creates a new one.  Failures are logged, not raised.
+        """
+        assert self._event_emitter is not None
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.create_task(self._event_emitter.publish(entry))
+            else:
+                loop.run_until_complete(self._event_emitter.publish(entry))
+        except RuntimeError:
+            # No event loop available -- create one
+            asyncio.run(self._event_emitter.publish(entry))
 
     def _replay(self) -> None:
         """Rebuild in-memory state from journal.  Called by ``open()``.
