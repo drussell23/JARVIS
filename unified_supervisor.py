@@ -74257,6 +74257,10 @@ class JarvisSystemKernel:
                         _agi_os_task,
                         timeout=_agi_os_startup_budget,
                         name="agi_os_startup_budget",
+                        # v282.0: Suppress the generic WARNING — this timeout is
+                        # intentional by design (45s budget, ~225s total phases).
+                        # The caller at line+7 already logs a clear INFO message.
+                        timeout_log_level=logging.DEBUG,
                     )
                 )
             except asyncio.TimeoutError:

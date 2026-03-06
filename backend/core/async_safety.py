@@ -1697,6 +1697,7 @@ async def shielded_wait_for(
     timeout: float,
     *,
     name: str = "shielded_op",
+    timeout_log_level: int = logging.WARNING,
 ):
     """
     Like asyncio.wait_for() but shields the inner task from cancellation.
@@ -1710,6 +1711,11 @@ async def shielded_wait_for(
     - Resource cleanup (must complete even if parent times out)
     - Background tasks that should outlive the waiter
 
+    Args:
+        timeout_log_level: logging level for the timeout message.
+            Use logging.DEBUG when the caller handles the timeout
+            explicitly and the WARNING would be misleading noise.
+
     Raises asyncio.TimeoutError on timeout (inner task keeps running).
     """
     if asyncio.iscoroutine(coro_or_task):
@@ -1719,7 +1725,7 @@ async def shielded_wait_for(
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
     except asyncio.TimeoutError:
-        logger.warning("[AsyncSafety] shielded_wait_for '%s' timed out after %.1fs (task continues)", name, timeout)
+        logger.log(timeout_log_level, "[AsyncSafety] shielded_wait_for '%s' timed out after %.1fs (task continues)", name, timeout)
         raise
 
 

@@ -6660,6 +6660,41 @@ async def health_busy():
 
 
 # ============================================================================
+# Cross-Repo Contract Manifest (v282.0)
+# Published by this JARVIS body so the Supervisor's ContractGate can validate
+# version compatibility and policy-hash drift at startup.
+# ============================================================================
+
+@app.get("/capabilities")
+async def contract_capabilities():
+    """Return the ProviderManifest for cross-repo contract validation.
+
+    The Unified Supervisor probes this endpoint during startup to verify
+    that the running JARVIS body is contract-compatible with the kernel.
+    Returning the canonical manifest here makes the body self-describing
+    and eliminates the HTTP 404 that previously forced a 'degraded' state.
+
+    v282.0: Initial implementation.
+    """
+    import time as _time
+
+    from contracts.contract_version import LOCAL_CONTRACT, compute_policy_hash
+    from contracts.capability_taxonomy import get_active_capabilities
+    from contracts.routing_authority import ROUTING_INVARIANTS
+
+    active_caps = sorted(get_active_capabilities().keys())
+    policy_hash = compute_policy_hash(ROUTING_INVARIANTS)
+
+    return {
+        "provider_id": "jarvis-body",
+        "capabilities": active_caps,
+        "contract_version": list(LOCAL_CONTRACT.current),
+        "policy_hash": policy_hash,
+        "timestamp": _time.time(),
+    }
+
+
+# ============================================================================
 # Contract-Driven System Status (v277.0)
 # Single source of truth for frontend UX decisions.
 # Derives from ReadinessStateManager — no parallel logic.
