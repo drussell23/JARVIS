@@ -1,13 +1,24 @@
-"""Reactive state propagation system -- replaces env-var signalling.
+"""Reactive State Propagation -- Disease 8 cure.
 
-Provides a versioned, journaled, ownership-aware key-value store that
-notifies watchers on change.  Every mutation is recorded in an
-append-only journal with monotonic version numbers.
-
-Design rules
-------------
-* **No** third-party or JARVIS imports -- stdlib only.
-* All data types are frozen dataclasses (immutable value objects).
-* Writers are identified by (writer, session_id) pairs.
-* Every key carries an epoch; epoch bumps invalidate stale writers.
+Replaces 23+ environment variables used for cross-component state
+with a versioned, observable, typed, CAS-protected state store.
 """
+from backend.core.reactive_state.manifest import (
+    build_ownership_registry,
+    build_schema_registry,
+)
+from backend.core.reactive_state.store import ReactiveStateStore
+from backend.core.reactive_state.types import (
+    StateEntry,
+    WriteResult,
+    WriteStatus,
+)
+
+__all__ = [
+    "ReactiveStateStore",
+    "StateEntry",
+    "WriteResult",
+    "WriteStatus",
+    "build_ownership_registry",
+    "build_schema_registry",
+]
