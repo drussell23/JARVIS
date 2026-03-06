@@ -14,6 +14,10 @@ Design rules
 """
 from __future__ import annotations
 
+import logging
+from typing import Any, Awaitable, Callable, Dict
+
+from backend.core.reactive_state.journal import AppendOnlyJournal
 from backend.core.reactive_state.types import JournalEntry
 from backend.core.umf.types import (
     Kind,
@@ -82,3 +86,91 @@ def build_state_changed_event(
         routing_partition_key=entry.key,
         routing_priority=Priority.normal,
     )
+
+
+# -- Emitter -----------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+# Type alias: async publish function that returns True on success
+PublishFn = Callable[[UmfMessage], Awaitable[bool]]
+
+
+class StateEventEmitter:
+    """Bridges the synchronous store write pipeline and async UMF publish.
+
+    After each successful journal append, the store calls
+    ``emitter.publish(journal_entry)`` which:
+    1. Builds a ``state.changed`` UMF message.
+    2. Invokes the async ``publish_fn`` callback.
+    3. On success, advances the durable publish cursor.
+    4. On failure, logs and leaves cursor unchanged (reconciler fills gaps).
+
+    Parameters
+    ----------
+    journal:
+        The journal instance (for cursor advancement).
+    publish_fn:
+        Async callable that publishes a UmfMessage. Returns True on success.
+    instance_id:
+        Instance identifier for the UMF source field.
+    session_id:
+        Session identifier for the UMF source field.
+    """
+
+    def __init__(
+        self,
+        *,
+        journal: AppendOnlyJournal,
+        publish_fn: PublishFn,
+        instance_id: str,
+        session_id: str,
+    ) -> None:
+        self._journal = journal
+        self._publish_fn = publish_fn
+        self._instance_id = instance_id
+        self._session_id = session_id
+        self._published_count: int = 0
+        self._failed_count: int = 0
+
+    async def publish(self, entry: JournalEntry) -> bool:
+        """Build and publish a state.changed event, advancing cursor on success.
+
+        Returns True if publish succeeded, False otherwise.
+        Never raises -- failures are logged and counted.
+        """
+        msg = build_state_changed_event(
+            entry,
+            instance_id=self._instance_id,
+            session_id=self._session_id,
+        )
+        try:
+            ok = await self._publish_fn(msg)
+        except Exception:
+            logger.exception(
+                "Failed to publish state.changed for revision %d key=%r",
+                entry.global_revision,
+                entry.key,
+            )
+            self._failed_count += 1
+            return False
+
+        if ok:
+            self._journal.advance_publish_cursor(entry.global_revision)
+            self._published_count += 1
+            return True
+        else:
+            logger.warning(
+                "Publish returned False for revision %d key=%r",
+                entry.global_revision,
+                entry.key,
+            )
+            self._failed_count += 1
+            return False
+
+    def stats(self) -> Dict[str, int]:
+        """Return publish statistics."""
+        return {
+            "published": self._published_count,
+            "failed": self._failed_count,
+        }
