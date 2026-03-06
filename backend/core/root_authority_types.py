@@ -212,6 +212,176 @@ class ResourceVerdict:
         return SEVERITY_MAP.get(self.state, 3)
 
 
+@dataclass(frozen=True)
+class PhaseVerdict:
+    """Immutable aggregated verdict for an entire boot phase.
+
+    Produced by :func:`aggregate_verdicts` from a collection of per-manager
+    :class:`ResourceVerdict` instances.  The ``state`` reflects the worst
+    required-tier manager; non-required managers contribute only warnings.
+    """
+
+    # -- class-level constant (not per-instance) --
+    SCHEMA_VERSION: int = field(init=False, default=1, repr=False, compare=False)
+
+    # -- Identity --
+    phase_name: str
+    state: SubsystemState
+    boot_allowed: bool
+    serviceable: bool
+    manager_verdicts: Mapping[str, ResourceVerdict]
+    reason_codes: Tuple[VerdictReasonCode, ...]
+    warnings: Tuple[VerdictWarning, ...]
+    epoch: int
+    monotonic_ns: int
+    wall_utc: str
+    correlation_id: str
+
+    @property
+    def severity(self) -> int:
+        """Return the integer severity level for the current state."""
+        return SEVERITY_MAP.get(self.state, 3)
+
+
+def aggregate_verdicts(
+    phase_name: str,
+    verdicts: Mapping[str, ResourceVerdict],
+    epoch: int,
+    correlation_id: str,
+    *,
+    allow_empty_required: bool = False,
+) -> PhaseVerdict:
+    """Aggregate per-manager verdicts into a single :class:`PhaseVerdict`.
+
+    Policy
+    ------
+    * Required managers gate ``boot_allowed`` and ``serviceable``.
+    * Non-required managers with severity > 0 contribute warnings only.
+    * If no required managers exist and *allow_empty_required* is False the
+      function fails closed (REJECTED, boot_allowed=False).
+    * Reason codes are deduplicated and sorted by descending max severity of
+      that code, then by enum value for determinism.
+    * Worst state among required managers is chosen via a deterministic
+      tiebreak: ``(severity, 0 if retryable else 1, monotonic_ns)``.
+    """
+    import time as _time
+    from datetime import datetime as _dt, timezone as _tz
+
+    required: list[ResourceVerdict] = []
+    non_required: list[tuple[str, ResourceVerdict]] = []
+
+    for name, v in verdicts.items():
+        if v.required_tier is RequiredTier.REQUIRED:
+            required.append(v)
+        else:
+            non_required.append((name, v))
+
+    # ------------------------------------------------------------------
+    # Fail-closed when no required managers are present
+    # ------------------------------------------------------------------
+    if not required and not allow_empty_required:
+        # Build warnings from non-required managers with severity > 0
+        warnings: list[VerdictWarning] = []
+        for name, v in non_required:
+            sev = SEVERITY_MAP.get(v.state, 3)
+            if sev > 0:
+                warnings.append(
+                    VerdictWarning(
+                        code=v.reason_code.value,
+                        detail=v.reason_detail,
+                        origin=name,
+                    )
+                )
+        return PhaseVerdict(
+            phase_name=phase_name,
+            state=SubsystemState.REJECTED,
+            boot_allowed=False,
+            serviceable=False,
+            manager_verdicts=verdicts,
+            reason_codes=(),
+            warnings=tuple(warnings),
+            epoch=epoch,
+            monotonic_ns=_time.monotonic_ns(),
+            wall_utc=_dt.now(_tz.utc).isoformat(),
+            correlation_id=correlation_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Compute boot_allowed / serviceable from required verdicts
+    # ------------------------------------------------------------------
+    if required:
+        boot_allowed = all(v.boot_allowed for v in required)
+        serviceable = any(v.serviceable for v in required)
+    else:
+        # allow_empty_required=True path
+        boot_allowed = True
+        serviceable = True
+
+    # ------------------------------------------------------------------
+    # Worst state among required managers (deterministic tiebreak)
+    # ------------------------------------------------------------------
+    if required:
+        worst = max(
+            required,
+            key=lambda v: (
+                SEVERITY_MAP.get(v.state, 3),
+                0 if v.retryable else 1,
+                v.monotonic_ns,
+            ),
+        )
+        worst_state = worst.state
+    else:
+        worst_state = SubsystemState.READY
+
+    # ------------------------------------------------------------------
+    # Collect reason codes from required verdicts with severity > 0
+    # ------------------------------------------------------------------
+    # Map each reason code to the maximum severity it appears with.
+    code_max_severity: dict[VerdictReasonCode, int] = {}
+    for v in required:
+        sev = SEVERITY_MAP.get(v.state, 3)
+        if sev > 0:
+            cur = code_max_severity.get(v.reason_code, -1)
+            if sev > cur:
+                code_max_severity[v.reason_code] = sev
+
+    reason_codes = tuple(
+        sorted(
+            code_max_severity.keys(),
+            key=lambda c: (-code_max_severity[c], c.value),
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Warnings from non-required managers with severity > 0
+    # ------------------------------------------------------------------
+    warnings_list: list[VerdictWarning] = []
+    for name, v in non_required:
+        sev = SEVERITY_MAP.get(v.state, 3)
+        if sev > 0:
+            warnings_list.append(
+                VerdictWarning(
+                    code=v.reason_code.value,
+                    detail=v.reason_detail,
+                    origin=name,
+                )
+            )
+
+    return PhaseVerdict(
+        phase_name=phase_name,
+        state=worst_state,
+        boot_allowed=boot_allowed,
+        serviceable=serviceable,
+        manager_verdicts=verdicts,
+        reason_codes=reason_codes,
+        warnings=tuple(warnings_list),
+        epoch=epoch,
+        monotonic_ns=_time.monotonic_ns(),
+        wall_utc=_dt.now(_tz.utc).isoformat(),
+        correlation_id=correlation_id,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Frozen dataclasses (immutable value objects)
 # ---------------------------------------------------------------------------
