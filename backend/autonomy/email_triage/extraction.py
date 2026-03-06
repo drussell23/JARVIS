@@ -211,6 +211,16 @@ async def extract_features(
             temperature=0.0,
             deadline=deadline,
         )
+        # Guard: degraded responses from protection layer are not JSON
+        if getattr(response, "source", None) == "degraded":
+            v88_error = (response.metadata or {}).get("v88_error", "unknown")
+            logger.info("Extraction skipped — router degraded: %s", v88_error)
+            emit_triage_event(EVENT_EXTRACTION_DEGRADED, {
+                "message_id": email_dict.get("id", ""),
+                "reason": "router_degraded",
+                "details": [v88_error],
+            })
+            return heuristic
         parsed = json.loads(response.content)
 
         # Contract validation (WS3)

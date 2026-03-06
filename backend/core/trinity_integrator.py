@@ -9119,7 +9119,9 @@ class TrinityUltraCoordinator:
             can_execute, reason = await circuit.can_execute()
             if not can_execute:
                 metadata["circuit_state"] = circuit.state
+                metadata["circuit_open"] = True
                 metadata["reason"] = reason
+                metadata["error"] = f"Circuit breaker {circuit.state}: {reason}"
                 return False, None, metadata
 
             # Apply backpressure
@@ -9128,6 +9130,7 @@ class TrinityUltraCoordinator:
             if not acquired:
                 metadata["backpressure_dropped"] = True
                 metadata["delay_ms"] = delay_ms
+                metadata["error"] = f"Backpressure rejected (delay={delay_ms:.0f}ms)"
                 await circuit.record_failure(delay_ms)
                 return False, None, metadata
 
@@ -9166,6 +9169,7 @@ class TrinityUltraCoordinator:
 
                 metadata["latency_ms"] = latency_ms
                 metadata["timeout"] = True
+                metadata["error"] = f"Timeout after {effective_timeout:.1f}s ({latency_ms:.0f}ms elapsed)"
                 return False, None, metadata
 
             except Exception as e:
