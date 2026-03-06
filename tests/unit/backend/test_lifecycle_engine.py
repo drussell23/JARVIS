@@ -201,3 +201,67 @@ class TestLifecycleEngine:
         engine.transition(LifecycleEvent.SHUTDOWN, actor="operator")
         engine.transition(LifecycleEvent.STOPPED, actor="cleanup")
         assert engine.state == KernelState.STOPPED
+
+
+class TestDisease56Gate:
+    """Gate: All Disease 5+6 MVP fixes verified."""
+
+    @pytest.mark.parametrize("check", [
+        "lifecycle_phase_enum",
+        "lifecycle_error_code_enum",
+        "lifecycle_signal_hierarchy",
+        "lifecycle_error_hierarchy",
+        "lifecycle_engine_exists",
+        "transition_table_complete",
+        "signal_authority_exists",
+        "supervisor_uses_engine",
+        "exception_debt_rules_exist",
+    ])
+    def test_disease56_gate(self, check):
+        if check == "lifecycle_phase_enum":
+            from backend.core.lifecycle_exceptions import LifecyclePhase
+            assert len(LifecyclePhase) == 7
+
+        elif check == "lifecycle_error_code_enum":
+            from backend.core.lifecycle_exceptions import LifecycleErrorCode
+            assert len(LifecycleErrorCode) == 8
+
+        elif check == "lifecycle_signal_hierarchy":
+            from backend.core.lifecycle_exceptions import (
+                LifecycleSignal, ShutdownRequested, LifecycleCancelled,
+            )
+            assert issubclass(LifecycleSignal, BaseException)
+            assert not issubclass(LifecycleSignal, Exception)
+
+        elif check == "lifecycle_error_hierarchy":
+            from backend.core.lifecycle_exceptions import (
+                LifecycleError, LifecycleFatalError,
+                LifecycleRecoverableError, DependencyUnavailableError,
+                TransitionRejected,
+            )
+            assert issubclass(LifecycleFatalError, LifecycleError)
+            assert issubclass(DependencyUnavailableError, LifecycleRecoverableError)
+
+        elif check == "lifecycle_engine_exists":
+            from backend.core.kernel_lifecycle_engine import LifecycleEngine
+            engine = LifecycleEngine()
+            assert callable(getattr(engine, "transition", None))
+            assert callable(getattr(engine, "subscribe", None))
+
+        elif check == "transition_table_complete":
+            from backend.core.kernel_lifecycle_engine import VALID_TRANSITIONS, KernelState
+            non_terminal = set(KernelState) - {KernelState.STOPPED, KernelState.FAILED}
+            covered = {k[0] for k in VALID_TRANSITIONS.keys()}
+            assert non_terminal.issubset(covered)
+
+        elif check == "signal_authority_exists":
+            from backend.core.signal_authority import SignalAuthority
+            assert callable(getattr(SignalAuthority, "install", None))
+
+        elif check == "supervisor_uses_engine":
+            source = Path("unified_supervisor.py").read_text()
+            assert "LifecycleEngine" in source
+            assert "LifecycleEvent" in source
+
+        elif check == "exception_debt_rules_exist":
+            assert Path("tests/contracts/test_exception_debt.py").exists()
