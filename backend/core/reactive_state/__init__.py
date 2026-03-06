@@ -4,6 +4,12 @@ Replaces 23+ environment variables used for cross-component state
 with a versioned, observable, typed, CAS-protected state store.
 """
 from backend.core.reactive_state.audit import AuditLog, AuditSeverity
+from backend.core.reactive_state.env_bridge import (
+    BridgeMode,
+    EnvBridge,
+    EnvKeyMapping,
+    ENV_KEY_MAPPINGS,
+)
 from backend.core.reactive_state.event_emitter import (
     PublishReconciler,
     StateEventEmitter,
@@ -24,6 +30,10 @@ from backend.core.reactive_state.types import (
 __all__ = [
     "AuditLog",
     "AuditSeverity",
+    "BridgeMode",
+    "ENV_KEY_MAPPINGS",
+    "EnvBridge",
+    "EnvKeyMapping",
     "PolicyEngine",
     "PublishReconciler",
     "ReactiveStateStore",
