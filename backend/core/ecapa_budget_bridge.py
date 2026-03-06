@@ -246,6 +246,7 @@ class EcapaBudgetBridge:
             self._tokens[token_id] = token
             if category is HeavyTaskCategory.MODEL_LOAD:
                 self._active_model_load_count += 1
+                self._check_invariant()
             self._emit("ecapa_budget.acquire_granted", {
                 "token_id": token_id,
                 "category": category.name,
@@ -279,6 +280,7 @@ class EcapaBudgetBridge:
         self._budget_contexts[token_id] = ctx
         if category is HeavyTaskCategory.MODEL_LOAD:
             self._active_model_load_count += 1
+            self._check_invariant()
         self._emit("ecapa_budget.acquire_granted", {
             "token_id": token_id,
             "category": category.name,
@@ -315,6 +317,11 @@ class EcapaBudgetBridge:
         Raises ``ValueError`` with ``"owner"`` in the message on mismatch.
         Updates ``last_heartbeat_at``.
         """
+        if token.state is not BudgetTokenState.TRANSFERRED:
+            raise ValueError(
+                f"CAS violation: expected TRANSFERRED, got {token.state.value} "
+                f"for token {token.token_id}"
+            )
         if token.owner_session_id != requester_session_id:
             raise ValueError(
                 f"Session owner mismatch: token owned by "

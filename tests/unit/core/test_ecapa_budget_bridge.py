@@ -199,6 +199,15 @@ class TestTokenLifecycle:
         with pytest.raises(ValueError, match="owner"):
             bridge.reuse_token(token, "wrong-session")
 
+    # 4b. reuse from wrong state (ACQUIRED) rejected
+    def test_reuse_from_acquired_rejected(self) -> None:
+        """reuse_token from ACQUIRED raises ValueError mentioning CAS."""
+        bridge = self._make_bridge()
+        token = self._make_token(bridge, session_id="owner-1")
+        # Token is still ACQUIRED — not transferred
+        with pytest.raises(ValueError, match="CAS"):
+            bridge.reuse_token(token, "owner-1")
+
     # 5. heartbeat updates timestamp
     def test_heartbeat_updates_timestamp(self) -> None:
         """heartbeat() updates last_heartbeat_at."""
