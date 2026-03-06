@@ -742,7 +742,12 @@ class MLEngineWrapper(ABC):
         self.name = name
         self.metrics = EngineMetrics(engine_name=name)
         self._engine: Any = None
-        self._lock = asyncio.Lock()
+        # v282.0: LazyAsyncLock provides per-event-loop isolation.
+        # Plain asyncio.Lock() created in __init__ binds to whatever loop
+        # exists at construction time; if the loop is later replaced (common
+        # during startup sequencing), the lock becomes "attached to a different
+        # loop" and every .load() call crashes with RuntimeError.
+        self._lock = LazyAsyncLock()
         self._thread_lock = threading.Lock()
 
         # Thread-safe reference counting for engine access
@@ -2637,7 +2642,7 @@ class MLEngineRegistry:
         return False
 
     async def shutdown(self):
-        """Gracefully shutdown all engines."""
+        """Gracefully shutdown all engines and release shared resources."""
         logger.info("🛑 Shutting down ML Engine Registry...")
         self._shutdown_event.set()
 
@@ -2646,6 +2651,15 @@ class MLEngineRegistry:
                 await engine.unload()
             except Exception as e:
                 logger.error(f"Error unloading {name}: {e}")
+
+        # v282.0: Close persistent aiohttp session to prevent
+        # "Unclosed client session" warnings and file descriptor leaks.
+        if self._cloud_contract_session is not None:
+            try:
+                await self._cloud_contract_session.close()
+            except Exception:
+                pass
+            self._cloud_contract_session = None
 
         logger.info("✅ ML Engine Registry shutdown complete")
 
@@ -3372,7 +3386,39 @@ class MLEngineRegistry:
         # v280.4: Reuse persistent session to avoid per-call DNS+TCP+SSL
         # allocation overhead.  Under memory thrash, session creation
         # triggers page faults that consume the entire timeout budget.
-        if self._cloud_contract_session is None or self._cloud_contract_session.closed:
+        # v282.0: Also check loop affinity.  aiohttp.ClientSession is bound
+        # to the loop that created it.  If the event loop has been replaced
+        # (startup sequencing, test harness, etc.) the cached session is
+        # "attached to a different loop" and every request raises
+        # RuntimeError("Event loop is closed").  Detect this by comparing
+        # the session's loop identity against the current running loop and
+        # recreate the session when they diverge.
+        _need_new_session = (
+            self._cloud_contract_session is None
+            or self._cloud_contract_session.closed
+        )
+        if not _need_new_session:
+            try:
+                running_loop = asyncio.get_running_loop()
+                # aiohttp stores its loop on the connector or internally;
+                # the safest check is connector._loop (set at creation).
+                session_loop = getattr(
+                    getattr(self._cloud_contract_session, 'connector', None),
+                    '_loop', None,
+                )
+                if session_loop is not None and session_loop is not running_loop:
+                    # Session bound to a stale/different loop — close and recreate.
+                    try:
+                        await self._cloud_contract_session.close()
+                    except Exception:
+                        pass
+                    _need_new_session = True
+            except RuntimeError:
+                # No running loop — force new session (will bind to whatever
+                # loop aiohttp discovers).
+                _need_new_session = True
+
+        if _need_new_session:
             connector = aiohttp.TCPConnector(
                 limit=5,
                 ttl_dns_cache=300,
