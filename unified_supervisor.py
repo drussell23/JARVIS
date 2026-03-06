@@ -99647,7 +99647,9 @@ def create_umf_engine(
     """Create a UMF DeliveryEngine if JARVIS_UMF_MODE is set.
 
     Returns None if the env var is unset or 'disabled' (opt-in only).
-    Modes: 'shadow' (log only), 'active' (full authority).
+    Valid modes: 'shadow', 'active'.  Mode differentiation (e.g. log-only
+    vs full authority) is the caller's responsibility; this factory only
+    gates construction.
     """
     mode = os.environ.get("JARVIS_UMF_MODE", "")
     if not mode or mode == "disabled":
