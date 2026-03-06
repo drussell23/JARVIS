@@ -8711,6 +8711,22 @@ class GCPVMManager:
         )
         return False, "golden_image_matches"
 
+    # -----------------------------------------------------------------
+    # Disease 10: Public wrappers for readiness prober
+    # -----------------------------------------------------------------
+
+    async def ping_health(
+        self, host: str, port: int, timeout: float = 10.0
+    ) -> Tuple[HealthVerdict, Dict[str, Any]]:
+        """Public API for Disease 10 readiness prober."""
+        return await self._ping_health_endpoint(host, port, timeout=timeout)
+
+    async def check_lineage(
+        self, instance_name: str, vm_metadata: Optional[Dict[str, str]] = None
+    ) -> Tuple[bool, str]:
+        """Public API for Disease 10 readiness prober."""
+        return await self._check_vm_golden_image_lineage(instance_name, vm_metadata)
+
     async def _delete_instance(self, instance_name: str) -> Tuple[bool, Optional[str]]:
         """
         v229.0: Delete an instance to allow recreation from golden image.

@@ -207,6 +207,10 @@ def _get_env_float(key: str, default: float) -> float:
         return default
 
 
+class MirrorModeError(RuntimeError):
+    """Raised when a mutating method is called in mirror mode."""
+
+
 @dataclass
 class PrimeRouterConfig:
     """Configuration for the Prime router."""
@@ -310,6 +314,9 @@ class PrimeRouter:
         # In-flight flag: prevents concurrent promote/demote while network I/O
         # is in progress outside the lock
         self._transition_in_flight: bool = False
+        # Disease 10: Mirror mode — blocks all mutating methods when active
+        self._mirror_mode: bool = False
+        self._mirror_decisions_issued: int = 0
         # Cloud Run endpoint detection patterns
         self._cloud_run_patterns = (".run.app", ".a.run.app")
 
@@ -388,6 +395,7 @@ class PrimeRouter:
 
     def _decide_route(self) -> RoutingDecision:
         """v280.4: Memory-aware routing — skips local during EMERGENCY thrash."""
+        self._guard_mirror("_decide_route")
         # v280.4: During memory EMERGENCY, do NOT attempt local inference.
         # Local inference allocates memory (KV cache, activations) which
         # triggers more page faults, worsening the crisis in a positive
@@ -475,6 +483,31 @@ class PrimeRouter:
         return True
 
     # -----------------------------------------------------------------
+    # Disease 10: Mirror mode
+    # -----------------------------------------------------------------
+
+    @property
+    def mirror_mode(self) -> bool:
+        return self._mirror_mode
+
+    @property
+    def mirror_decisions_issued(self) -> int:
+        return self._mirror_decisions_issued
+
+    def set_mirror_mode(self, enabled: bool) -> None:
+        self._mirror_mode = enabled
+        if enabled:
+            logger.info("[PrimeRouter] Mirror mode ENABLED — all mutations blocked")
+        else:
+            logger.info("[PrimeRouter] Mirror mode DISABLED")
+
+    def _guard_mirror(self, method_name: str) -> None:
+        if self._mirror_mode:
+            raise MirrorModeError(
+                f"PrimeRouter.{method_name}() blocked: mirror mode active"
+            )
+
+    # -----------------------------------------------------------------
     # v232.0: Late-arriving GCP VM promotion
     # -----------------------------------------------------------------
 
@@ -488,6 +521,7 @@ class PrimeRouter:
 
         Returns True if promotion succeeded (GCP endpoint is healthy).
         """
+        self._guard_mirror("promote_gcp_endpoint")
         # Phase 1: Acquire lock, check state, claim transition
         async with self._lock:
             if self._transition_in_flight:
@@ -607,6 +641,7 @@ class PrimeRouter:
         Called when the GCP VM becomes unhealthy or is terminated.
         Returns True if demotion succeeded.
         """
+        self._guard_mirror("demote_gcp_endpoint")
         # Phase 1: Acquire lock, check state, claim transition
         async with self._lock:
             if self._prime_client is None:

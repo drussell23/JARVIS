@@ -731,6 +731,9 @@ class GCPHybridPrimeRouter:
             "permanent": {"max_retries": 0, "delay": 0.0},
         }
 
+        # Disease 10: Active flag — orchestrator controls when this router is authoritative
+        self._disease10_active: bool = False
+
         # v2.0: VM provisioning with distributed locking
         self._vm_provisioning_enabled = VM_PROVISIONING_ENABLED and self._use_resilience
         self._vm_provisioning_lock: Optional[DistributedLock] = None
@@ -843,6 +846,21 @@ class GCPHybridPrimeRouter:
 
         # v153.0: Recovery Cascade Manager for intelligent GCP failure handling
         self._recovery_cascade = RecoveryCascadeManager(self.logger)
+
+    # -----------------------------------------------------------------
+    # Disease 10: Active flag
+    # -----------------------------------------------------------------
+
+    def set_active(self, active: bool) -> None:
+        """Disease 10: Set whether this router is the active routing authority."""
+        self._disease10_active = active
+        self.logger.info(
+            "[GCPHybridPrimeRouter] Disease 10 active=%s", active
+        )
+
+    @property
+    def is_disease10_active(self) -> bool:
+        return self._disease10_active
 
     # =========================================================================
     # v152.0: AUTHORITATIVE CLOUD STATE METHODS
