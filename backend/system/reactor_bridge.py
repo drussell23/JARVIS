@@ -608,6 +608,9 @@ class ReactorCoreBridge:
 
     async def connect_async(self) -> bool:
         """Connect to Reactor Core using available transports."""
+        from backend.core.umf.legacy_guard import assert_legacy_allowed
+        assert_legacy_allowed("ReactorCoreBridge.connect_async")
+
         if self._connected:
             return True
 
@@ -763,6 +766,9 @@ class ReactorCoreBridge:
         command: TrinityCommand
     ) -> bool:
         """Publish command to all active transports."""
+        from backend.core.umf.legacy_guard import assert_legacy_allowed
+        assert_legacy_allowed("ReactorCoreBridge._publish_to_transports_async")
+
         success = False
 
         for transport in self._transports:
