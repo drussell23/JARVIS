@@ -12,7 +12,6 @@ import pytest
 
 from backend.core.reactive_state.env_bridge import (
     BridgeMode,
-    ENV_KEY_MAPPINGS,
     EnvBridge,
 )
 from backend.core.reactive_state.manifest import build_schema_registry
@@ -145,6 +144,6 @@ class TestBridgeLookups:
             schema_registry=schema_registry,
             initial_mode=BridgeMode.LEGACY,
         )
-        mapping = bridge.get_mapping_by_env_var("JARVIS_GCP_NODE_PORT")
+        mapping = bridge.get_mapping_by_env_var("JARVIS_INVINCIBLE_NODE_PORT")
         assert mapping is not None
         assert mapping.state_key == "gcp.node_port"

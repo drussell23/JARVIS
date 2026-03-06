@@ -28,8 +28,8 @@ import enum
 import logging
 import os
 import threading
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from backend.core.reactive_state.schemas import SchemaRegistry
 from backend.core.reactive_state.types import StateEntry
@@ -279,7 +279,7 @@ class EnvKeyMapping:
 ENV_KEY_MAPPINGS: Tuple[EnvKeyMapping, ...] = (
     # -- lifecycle --
     EnvKeyMapping(
-        env_var="JARVIS_EFFECTIVE_MODE",
+        env_var="JARVIS_STARTUP_EFFECTIVE_MODE",
         state_key="lifecycle.effective_mode",
         coerce_to_env=_enum_to_env,
         coerce_from_env=_enum_from_env,
@@ -292,37 +292,37 @@ ENV_KEY_MAPPINGS: Tuple[EnvKeyMapping, ...] = (
     ),
     # -- memory --
     EnvKeyMapping(
-        env_var="JARVIS_MEMORY_CAN_SPAWN_HEAVY",
+        env_var="JARVIS_CAN_SPAWN_HEAVY",
         state_key="memory.can_spawn_heavy",
         coerce_to_env=_bool_to_env,
         coerce_from_env=_bool_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_MEMORY_AVAILABLE_GB",
+        env_var="JARVIS_HEAVY_ADMISSION_AVAILABLE_GB",
         state_key="memory.available_gb",
         coerce_to_env=_float_to_env,
         coerce_from_env=_float_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_MEMORY_ADMISSION_REASON",
+        env_var="JARVIS_HEAVY_ADMISSION_REASON",
         state_key="memory.admission_reason",
         coerce_to_env=_str_to_env,
         coerce_from_env=_str_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_MEMORY_TIER",
+        env_var="JARVIS_MEASURED_MEMORY_TIER",
         state_key="memory.tier",
         coerce_to_env=_enum_to_env,
         coerce_from_env=_enum_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_MEMORY_STARTUP_MODE",
+        env_var="JARVIS_STARTUP_MODE",
         state_key="memory.startup_mode",
         coerce_to_env=_enum_to_env,
         coerce_from_env=_enum_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_MEMORY_SOURCE",
+        env_var="JARVIS_MEASURED_MEMORY_SOURCE",
         state_key="memory.source",
         coerce_to_env=_str_to_env,
         coerce_from_env=_str_from_env,
@@ -335,19 +335,19 @@ ENV_KEY_MAPPINGS: Tuple[EnvKeyMapping, ...] = (
         coerce_from_env=_bool_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_GCP_NODE_IP",
+        env_var="JARVIS_INVINCIBLE_NODE_IP",
         state_key="gcp.node_ip",
         coerce_to_env=_str_to_env,
         coerce_from_env=_str_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_GCP_NODE_PORT",
+        env_var="JARVIS_INVINCIBLE_NODE_PORT",
         state_key="gcp.node_port",
         coerce_to_env=_int_to_env,
         coerce_from_env=_int_from_env,
     ),
     EnvKeyMapping(
-        env_var="JARVIS_GCP_NODE_BOOTING",
+        env_var="JARVIS_INVINCIBLE_NODE_BOOTING",
         state_key="gcp.node_booting",
         coerce_to_env=_bool_to_env,
         coerce_from_env=_bool_from_env,
@@ -380,7 +380,7 @@ ENV_KEY_MAPPINGS: Tuple[EnvKeyMapping, ...] = (
     ),
     # -- service --
     EnvKeyMapping(
-        env_var="JARVIS_SERVICE_BACKEND_MINIMAL",
+        env_var="JARVIS_BACKEND_MINIMAL",
         state_key="service.backend_minimal",
         coerce_to_env=_bool_to_env,
         coerce_from_env=_bool_from_env,

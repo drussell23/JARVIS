@@ -94,7 +94,7 @@ class TestShadowComparison:
     ) -> None:
         """env='8000', store=8000 -> 0 mismatches."""
         entry = _make_entry("gcp.node_port", 8000)
-        with mock.patch.dict(os.environ, {"JARVIS_GCP_NODE_PORT": "8000"}, clear=False):
+        with mock.patch.dict(os.environ, {"JARVIS_INVINCIBLE_NODE_PORT": "8000"}, clear=False):
             shadow_bridge.shadow_compare(entry, global_revision=3)
         assert parity_logger.total_comparisons == 1
         assert parity_logger.mismatches == 0
@@ -104,7 +104,7 @@ class TestShadowComparison:
     ) -> None:
         """env='7.5', store=7.5 -> 0 mismatches."""
         entry = _make_entry("memory.available_gb", 7.5)
-        with mock.patch.dict(os.environ, {"JARVIS_MEMORY_AVAILABLE_GB": "7.5"}, clear=False):
+        with mock.patch.dict(os.environ, {"JARVIS_HEAVY_ADMISSION_AVAILABLE_GB": "7.5"}, clear=False):
             shadow_bridge.shadow_compare(entry, global_revision=4)
         assert parity_logger.total_comparisons == 1
         assert parity_logger.mismatches == 0
@@ -177,7 +177,7 @@ class TestShadowCompareEnum:
     ) -> None:
         """env='cloud_first', store='cloud_first' -> 0 mismatches."""
         entry = _make_entry("lifecycle.effective_mode", "cloud_first")
-        with mock.patch.dict(os.environ, {"JARVIS_EFFECTIVE_MODE": "cloud_first"}, clear=False):
+        with mock.patch.dict(os.environ, {"JARVIS_STARTUP_EFFECTIVE_MODE": "cloud_first"}, clear=False):
             shadow_bridge.shadow_compare(entry, global_revision=10)
         assert parity_logger.total_comparisons == 1
         assert parity_logger.mismatches == 0
@@ -187,7 +187,7 @@ class TestShadowCompareEnum:
     ) -> None:
         """env='  cloud_first  ', store='cloud_first' -> 0 mismatches."""
         entry = _make_entry("lifecycle.effective_mode", "cloud_first")
-        with mock.patch.dict(os.environ, {"JARVIS_EFFECTIVE_MODE": "  cloud_first  "}, clear=False):
+        with mock.patch.dict(os.environ, {"JARVIS_STARTUP_EFFECTIVE_MODE": "  cloud_first  "}, clear=False):
             shadow_bridge.shadow_compare(entry, global_revision=11)
         assert parity_logger.total_comparisons == 1
         assert parity_logger.mismatches == 0

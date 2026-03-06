@@ -99,7 +99,7 @@ class TestShadowModeEndToEnd:
                 os.environ,
                 {
                     "JARVIS_GCP_OFFLOAD_ACTIVE": "true",
-                    "JARVIS_MEMORY_AVAILABLE_GB": "7.5",
+                    "JARVIS_HEAVY_ADMISSION_AVAILABLE_GB": "7.5",
                 },
             ):
                 # Write gcp.offload_active=True
