@@ -438,6 +438,10 @@ class EnvBridge:
             self._by_state_key[mapping.state_key] = mapping
             self._by_env_var[mapping.env_var] = mapping
 
+        # -- Active-mode env mirroring state (Wave 4) --
+        self._env_lock = threading.Lock()
+        self._last_mirrored_versions: Dict[str, int] = {}
+
     # -- bootstrap ---------------------------------------------------------
 
     @staticmethod
@@ -557,7 +561,7 @@ class EnvBridge:
         5. If ``mapping.sensitive``, use ``"<redacted>"`` for both strings in
            the record (and in any warning log).
         """
-        if self._mode is BridgeMode.LEGACY:
+        if self._mode is not BridgeMode.SHADOW:
             return
 
         mapping = self._by_state_key.get(entry.key)
@@ -623,6 +627,58 @@ class EnvBridge:
                     env_canonical,
                     global_revision,
                 )
+
+    # -- active-mode env mirroring ------------------------------------------------
+
+    def mirror_to_env(self, entry: StateEntry) -> bool:
+        """Mirror a store entry's value to ``os.environ`` as a compatibility write.
+
+        Only operates in ``ACTIVE`` mode.  Unmapped keys are silently skipped.
+        A version guard prevents re-mirroring the same version (loop
+        prevention per design doc Appendix A.7).
+
+        Parameters
+        ----------
+        entry:
+            The ``StateEntry`` whose value should be mirrored.
+
+        Returns
+        -------
+        bool
+            ``True`` if the env var was written, ``False`` if skipped.
+        """
+        if self._mode is not BridgeMode.ACTIVE:
+            return False
+
+        mapping = self._by_state_key.get(entry.key)
+        if mapping is None:
+            return False
+
+        env_value = mapping.coerce_to_env(entry.value)
+
+        with self._env_lock:
+            # Version guard (loop prevention A.7) — inside lock to avoid TOCTOU
+            if self._last_mirrored_versions.get(entry.key) == entry.version:
+                return False
+            os.environ[mapping.env_var] = env_value
+            self._last_mirrored_versions[entry.key] = entry.version
+
+        if mapping.sensitive:
+            logger.debug(
+                "Mirrored %s -> %s = <redacted> (v%d)",
+                entry.key,
+                mapping.env_var,
+                entry.version,
+            )
+        else:
+            logger.debug(
+                "Mirrored %s -> %s = %r (v%d)",
+                entry.key,
+                mapping.env_var,
+                env_value,
+                entry.version,
+            )
+        return True
 
     # -- canonicalization helpers -----------------------------------------------
 
