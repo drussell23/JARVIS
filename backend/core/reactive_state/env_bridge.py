@@ -510,6 +510,32 @@ class EnvBridge:
         """Return the ``EnvKeyMapping`` for *env_var*, or ``None``."""
         return self._by_env_var.get(env_var)
 
+    # -- promotion readiness ---------------------------------------------------
+
+    def is_promotion_ready(self) -> bool:
+        """Return True if parity exceeds threshold with sufficient data.
+
+        Delegates entirely to the underlying ``ShadowParityLogger``.
+        """
+        return self._parity_logger.is_promotion_ready()
+
+    def parity_stats(self) -> Dict[str, Any]:
+        """Return aggregated parity statistics from the shadow logger.
+
+        Returns
+        -------
+        dict
+            Keys: ``total_comparisons``, ``mismatches``, ``parity_ratio``,
+            ``is_promotion_ready``, ``recent_diffs``.
+        """
+        return {
+            "total_comparisons": self._parity_logger.total_comparisons,
+            "mismatches": self._parity_logger.mismatches,
+            "parity_ratio": self._parity_logger.parity_ratio,
+            "is_promotion_ready": self._parity_logger.is_promotion_ready(),
+            "recent_diffs": self._parity_logger.get_recent_diffs(),
+        }
+
     # -- shadow comparison -----------------------------------------------------
 
     def shadow_compare(self, entry: StateEntry, global_revision: int) -> None:
