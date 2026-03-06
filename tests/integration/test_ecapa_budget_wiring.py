@@ -241,3 +241,83 @@ class TestBudgetAwareRecovery:
 
         result = await bridge.acquire_probe_slot(timeout_s=2.0)
         assert result is EcapaBudgetRejection.PHASE_BLOCKED
+
+
+class TestContractMismatch:
+    """CONTRACT_MISMATCH is non-retryable."""
+
+    def test_contract_mismatch_backoff_is_max(self):
+        """CONTRACT_MISMATCH uses maximum delay (non-retryable)."""
+        from backend.voice_unlock.ml_engine_registry import MLEngineRegistry
+
+        delay = MLEngineRegistry._compute_backoff(
+            EcapaBudgetRejection.CONTRACT_MISMATCH,
+            attempt=1,
+            base=5.0,
+            cap=120.0,
+        )
+        assert delay == 120.0  # Cap, no jitter
+
+    def test_thrash_emergency_slow_backoff(self):
+        """THRASH_EMERGENCY uses 15s base with 30% jitter."""
+        from backend.voice_unlock.ml_engine_registry import MLEngineRegistry
+
+        delays = [
+            MLEngineRegistry._compute_backoff(
+                EcapaBudgetRejection.THRASH_EMERGENCY,
+                attempt=1,
+                base=5.0,
+                cap=120.0,
+            )
+            for _ in range(10)
+        ]
+        # All should be roughly around 15s +/- 30%
+        assert all(10.0 <= d <= 20.0 for d in delays)
+
+    def test_normal_rejection_exponential_backoff(self):
+        """Normal rejections use exponential backoff with 20% jitter."""
+        from backend.voice_unlock.ml_engine_registry import MLEngineRegistry
+
+        # Attempt 1: base=5.0
+        d1 = MLEngineRegistry._compute_backoff(
+            EcapaBudgetRejection.BUDGET_TIMEOUT,
+            attempt=1, base=5.0, cap=120.0,
+        )
+        assert 3.0 <= d1 <= 7.0
+
+        # Attempt 3: base * 4 = 20.0
+        d3 = MLEngineRegistry._compute_backoff(
+            EcapaBudgetRejection.BUDGET_TIMEOUT,
+            attempt=3, base=5.0, cap=120.0,
+        )
+        assert 15.0 <= d3 <= 25.0
+
+
+class TestTelemetryCompleteness:
+    """Verify full event trail for startup path."""
+
+    @pytest.mark.asyncio
+    async def test_startup_path_emits_full_trail(self, wired_bridge):
+        """Full startup path emits acquire_attempt, acquire_granted, release."""
+        bridge, policy, bus = wired_bridge
+
+        # Acquire probe
+        probe = await bridge.acquire_probe_slot(timeout_s=2.0)
+        assert isinstance(probe, BudgetToken)
+        bridge.release(probe)
+
+        # Acquire model
+        model = await bridge.acquire_model_slot(timeout_s=2.0)
+        assert isinstance(model, BudgetToken)
+        bridge.transfer_token(model)
+        bridge.reuse_token(model, requester_session_id=bridge._session_id)
+        bridge.release(model)
+
+        event_types = [e.event_type for e in bus.event_history]
+        # Should see: 2x acquire_attempt, 2x acquire_granted, 2x release,
+        #             1x transfer, 1x reuse
+        assert event_types.count("ecapa_budget.acquire_attempt") == 2
+        assert event_types.count("ecapa_budget.acquire_granted") == 2
+        assert event_types.count("ecapa_budget.release") == 2
+        assert "ecapa_budget.transfer" in event_types
+        assert "ecapa_budget.reuse" in event_types
