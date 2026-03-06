@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from backend.core.reactive_state.audit import AuditLog, post_replay_invariant_audit
 from backend.core.reactive_state.journal import AppendOnlyJournal
 from backend.core.reactive_state.ownership import OwnershipRegistry
 from backend.core.reactive_state.policy import PolicyEngine
@@ -70,6 +71,7 @@ class ReactiveStateStore:
         ownership_registry: OwnershipRegistry,
         schema_registry: SchemaRegistry,
         policy_engine: Optional[PolicyEngine] = None,
+        audit_log: Optional[AuditLog] = None,
     ) -> None:
         self._journal = AppendOnlyJournal(journal_path)
         self._epoch = epoch
@@ -77,6 +79,7 @@ class ReactiveStateStore:
         self._ownership = ownership_registry
         self._schemas = schema_registry
         self._policy_engine = policy_engine
+        self._audit_log = audit_log
         self._entries: Dict[str, StateEntry] = {}
         self._watchers = WatcherManager()
         self._lock = threading.Lock()
@@ -91,6 +94,11 @@ class ReactiveStateStore:
     def close(self) -> None:
         """Close the journal and release resources."""
         self._journal.close()
+
+    @property
+    def audit_log(self) -> Optional[AuditLog]:
+        """Return the audit log instance, or ``None`` if not configured."""
+        return self._audit_log
 
     # ── Write ─────────────────────────────────────────────────────────
 
@@ -307,6 +315,10 @@ class ReactiveStateStore:
         Reads all journal entries and reconstructs the latest ``StateEntry``
         for each key.  Replayed entries get ``updated_at_mono=0.0`` since
         the original monotonic timestamps are meaningless after restart.
+
+        After replay, if an ``AuditLog`` is configured and entries were
+        replayed, runs ``post_replay_invariant_audit`` and records any
+        findings into the audit log.
         """
         entries = self._journal.read_since(1)
         for je in entries:
@@ -320,6 +332,14 @@ class ReactiveStateStore:
                 updated_at_mono=0.0,
                 updated_at_unix_ms=je.timestamp_unix_ms,
             )
+
+        # Post-replay invariant audit
+        if self._audit_log is not None and entries:
+            findings = post_replay_invariant_audit(
+                dict(self._entries), self._journal.latest_revision()
+            )
+            for finding in findings:
+                self._audit_log.record_finding(finding)
 
     def _reject(
         self,
