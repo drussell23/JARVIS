@@ -29,11 +29,14 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 from backend.core.reactive_state.schemas import SchemaRegistry
 from backend.core.reactive_state.types import StateEntry
 from backend.core.umf.shadow_parity import ShadowParityLogger
+
+if TYPE_CHECKING:
+    from backend.core.reactive_state.store import ReactiveStateStore
 
 logger = logging.getLogger(__name__)
 
@@ -713,6 +716,49 @@ class EnvBridge:
                 entry.version,
             )
         return True
+
+    # -- subprocess env snapshot ---------------------------------------------------
+
+    def get_subprocess_env(self, store: ReactiveStateStore) -> Dict[str, str]:
+        """Build an env dict from the store snapshot for child process spawning.
+
+        Copies ``os.environ`` (under ``_env_lock``) and, in ``ACTIVE`` mode,
+        overlays all mapped keys whose domains are active with their current
+        store values.  In ``LEGACY`` or ``SHADOW`` mode, returns a plain copy
+        of ``os.environ`` with no store overlay.
+
+        Parameters
+        ----------
+        store:
+            The ``ReactiveStateStore`` to read current values from.
+
+        Returns
+        -------
+        Dict[str, str]
+            A new dict suitable for passing to ``subprocess.Popen(env=...)``.
+        """
+        with self._env_lock:
+            env = os.environ.copy()
+
+        if self._mode is not BridgeMode.ACTIVE:
+            return env
+
+        # Collect state keys for active domains only
+        active_keys = [
+            m.state_key
+            for m in ENV_KEY_MAPPINGS
+            if self.is_domain_active(m.state_key)
+        ]
+        entries = store.read_many(active_keys)
+
+        for mapping in ENV_KEY_MAPPINGS:
+            if not self.is_domain_active(mapping.state_key):
+                continue
+            entry = entries.get(mapping.state_key)
+            if entry is not None:
+                env[mapping.env_var] = mapping.coerce_to_env(entry.value)
+
+        return env
 
     # -- canonicalization helpers -----------------------------------------------
 
