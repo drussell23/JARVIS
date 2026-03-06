@@ -8,7 +8,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 # KernelState lives in unified_supervisor.py which is hard to import.
 # We re-export it from lifecycle_engine for testability.
-from backend.core.lifecycle_engine import (
+from backend.core.kernel_lifecycle_engine import (
     LifecycleEvent, TransitionRecord, VALID_TRANSITIONS, KernelState,
 )
 
@@ -99,7 +99,7 @@ class TestTransitionTable:
         assert non_terminal.issubset(states_in_table)
 
 
-from backend.core.lifecycle_engine import LifecycleEngine
+from backend.core.kernel_lifecycle_engine import LifecycleEngine
 from backend.core.lifecycle_exceptions import (
     LifecycleFatalError, TransitionRejected,
 )
