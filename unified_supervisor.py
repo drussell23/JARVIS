@@ -99666,6 +99666,23 @@ def create_umf_engine(
     )
 
 
+def create_heartbeat_projection(
+    stale_timeout_s: float = 30.0,
+) -> "Optional[object]":
+    """Create a UMF HeartbeatProjection if JARVIS_UMF_MODE is set.
+
+    Returns None if the env var is unset or 'disabled' (opt-in only).
+    The projection derives global health truth from UMF heartbeat messages.
+    """
+    mode = os.environ.get("JARVIS_UMF_MODE", "")
+    if not mode or mode == "disabled":
+        return None
+
+    from backend.core.umf.heartbeat_projection import HeartbeatProjection
+
+    return HeartbeatProjection(stale_timeout_s=stale_timeout_s)
+
+
 def main() -> int:
     """
     Main entry point for JARVIS Unified System Kernel.
