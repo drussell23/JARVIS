@@ -98,6 +98,31 @@ class TestNoDirectStateWriteInEngine:
         )
 
 
+class TestNoSilentPassInShutdown:
+    """Emergency shutdown must not silently swallow exceptions."""
+
+    def test_no_silent_pass_in_shutdown_block(self):
+        """Lines 68400-69100 (emergency shutdown) must not have bare except: pass."""
+        source = Path("unified_supervisor.py").read_text()
+        lines = source.split("\n")
+        violations = []
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if line.startswith("except") and "Exception" in line:
+                j = i + 1
+                while j < len(lines) and not lines[j].strip():
+                    j += 1
+                if j < len(lines) and lines[j].strip() == "pass":
+                    if 68400 <= i + 1 <= 69100:
+                        violations.append(i + 1)
+            i += 1
+        assert len(violations) <= 5, (
+            f"Shutdown zone has {len(violations)} silent 'except Exception: pass' "
+            f"handlers at lines: {violations}. Target: <=5 after MVP."
+        )
+
+
 class TestSupervisorUsesLifecycleEngine:
     """unified_supervisor.py must use LifecycleEngine, not direct state writes."""
 

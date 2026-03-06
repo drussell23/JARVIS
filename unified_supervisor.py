@@ -68530,8 +68530,11 @@ class JarvisSystemKernel:
                     reason=f"startup_exception:{type(e).__name__}",
                     expected=False,
                 )
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Shutdown] emergency shutdown from startup: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
             return 1
 
     async def _emergency_shutdown(self, reason: str = "unspecified", expected: bool = False) -> None:
@@ -68570,13 +68573,19 @@ class JarvisSystemKernel:
         if _TRACE_HOOKS_AVAILABLE and _trace_on_shutdown:
             try:
                 _trace_on_shutdown(reason=reason)
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Shutdown] trace hook (_trace_on_shutdown): %s: %s",
+                    type(_exc).__name__, _exc,
+                )
         if _TRACE_HOOKS_AVAILABLE and _trace_shutdown:
             try:
                 _trace_shutdown()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Shutdown] trace hook (_trace_shutdown): %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
         # v181.0: Write crash marker for next startup
         # v205.0: Use asyncio.to_thread to avoid blocking the event loop
@@ -68613,8 +68622,11 @@ class JarvisSystemKernel:
                     try:
                         for comp_name, comp_info in (self._component_status or {}).items():
                             diag["component_status"][comp_name] = comp_info.get("status", "unknown")
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self.logger.debug(
+                            "[Shutdown] component status capture: %s: %s",
+                            type(_exc).__name__, _exc,
+                        )
                     # Capture Trinity component states
                     try:
                         if self._trinity and hasattr(self._trinity, "_components"):
@@ -68625,8 +68637,11 @@ class JarvisSystemKernel:
                                     "pid": getattr(comp, "pid", None),
                                 }
                             diag["trinity_components"] = trinity_states
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self.logger.debug(
+                            "[Shutdown] Trinity state capture: %s: %s",
+                            type(_exc).__name__, _exc,
+                        )
                     # Capture memory info if psutil available
                     try:
                         import psutil
@@ -68635,8 +68650,11 @@ class JarvisSystemKernel:
                         diag["memory_rss_mb"] = round(mem.rss / (1024 * 1024), 1)
                         diag["memory_vms_mb"] = round(mem.vms / (1024 * 1024), 1)
                         diag["system_memory_pct"] = round(psutil.virtual_memory().percent, 1)
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self.logger.debug(
+                            "[Shutdown] memory info capture: %s: %s",
+                            type(_exc).__name__, _exc,
+                        )
                     try:
                         crash_marker.write_text(json.dumps(diag, indent=2))
                     except Exception:
@@ -68647,8 +68665,11 @@ class JarvisSystemKernel:
                         )
 
                 await asyncio.to_thread(_write_crash_marker)
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.warning(
+                    "[Shutdown] crash marker write: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
         # v260.1: Shutdown DisplayPressureController + release display lease
         # Must happen BEFORE Trinity/broker teardown (controller depends on broker)
@@ -68673,8 +68694,13 @@ class JarvisSystemKernel:
                 _gd_task.cancel()
                 try:
                     await asyncio.wait_for(_gd_task, timeout=2.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Shutdown] ghost display task %s: %s: %s",
+                        _gd_attr, type(_exc).__name__, _exc,
+                    )
                 setattr(self, _gd_attr, None)
 
         # v181.0/v206.0: Stop Trinity components FIRST (prevents orphaned processes)
@@ -68686,8 +68712,11 @@ class JarvisSystemKernel:
                 if STARTUP_TIMEOUTS_AVAILABLE and get_startup_config is not None:
                     try:
                         _cleanup_timeout = get_startup_config().budgets.CLEANUP
-                    except Exception:
-                        pass
+                    except Exception as _exc:
+                        self.logger.debug(
+                            "[Shutdown] cleanup timeout config: %s: %s",
+                            type(_exc).__name__, _exc,
+                        )
                 # tiered_stop() handles SIGTERM -> SIGKILL -> abandon internally
                 # It never raises and completes within timeout
                 await self._trinity.tiered_stop(timeout=_cleanup_timeout)
@@ -68710,10 +68739,16 @@ class JarvisSystemKernel:
                                 ),
                                 timeout=10.0,
                             )
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+                        except Exception as _exc:
+                            self.logger.warning(
+                                "[Shutdown] VM terminate %s: %s: %s",
+                                vm_name, type(_exc).__name__, _exc,
+                            )
+        except Exception as _exc:
+            self.logger.warning(
+                "[Shutdown] VM manager import/lookup: %s: %s",
+                type(_exc).__name__, _exc,
+            )
 
         # v181.0: Cleanup GCP VMs (prevents orphaned Spot VMs)
         try:
@@ -68760,8 +68795,13 @@ class JarvisSystemKernel:
                 _recov_task.cancel()
                 try:
                     await asyncio.wait_for(_recov_task, timeout=2.0)
-                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Shutdown] recovery task %s: %s: %s",
+                        _recov_attr, type(_exc).__name__, _exc,
+                    )
                 setattr(self, _recov_attr, None)
 
         # v237.0/v251.0: Stop AGI OS + Neural Mesh + agents (prevents dangling tasks)
@@ -68783,15 +68823,21 @@ class JarvisSystemKernel:
                         stop_jarvis_neural_mesh(),
                         timeout=fallback_timeout,
                     )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Shutdown] Neural Mesh stop (jarvis): %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
                 try:
                     await asyncio.wait_for(
                         stop_neural_mesh(),
                         timeout=fallback_timeout,
                     )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Shutdown] Neural Mesh stop: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
                 self.logger.info("[Kernel] AGI fallback teardown attempted")
             except Exception as fallback_err:
                 self.logger.debug(f"[Kernel] AGI fallback teardown error: {fallback_err}")
@@ -68854,21 +68900,30 @@ class JarvisSystemKernel:
                 from backend.autonomy.reactor_core_watcher import stop_reactor_core_watcher
                 await asyncio.wait_for(stop_reactor_core_watcher(), timeout=5.0)
                 self.logger.info("[Kernel] Reactor Core watcher stopped")
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Shutdown] Reactor Core watcher stop: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
         if getattr(self, '_reactor_core_active', False):
             try:
                 from backend.autonomy.reactor_core_integration import shutdown_reactor_core
                 await asyncio.wait_for(shutdown_reactor_core(), timeout=5.0)
                 self.logger.info("[Kernel] Reactor Core pipeline stopped")
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Shutdown] Reactor Core shutdown: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
         try:
             await self._stop_voice_sidecar("emergency_shutdown")
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.logger.debug(
+                "[Shutdown] voice sidecar stop: %s: %s",
+                type(_exc).__name__, _exc,
+            )
 
         # Stop backend deterministically (in-process first, then subprocess fallback)
         if self._backend_server or self._backend_server_task:
@@ -68959,8 +69014,11 @@ class JarvisSystemKernel:
         try:
             self._visual_pipeline_initialized = False
             await self._publish_visual_pipeline_state()
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.logger.debug(
+                "[Shutdown] visual pipeline state publish: %s: %s",
+                type(_exc).__name__, _exc,
+            )
 
         # Stop Agent Runtime (checkpoint all active goals)
         if hasattr(self, '_agent_runtime') and self._agent_runtime:
@@ -68998,17 +69056,27 @@ class JarvisSystemKernel:
                 self._ws_router_process.terminate()
                 await asyncio.wait_for(self._ws_router_process.wait(), timeout=5.0)
                 self.logger.info("[Kernel] WebSocket Router stopped")
-            except Exception:
+            except Exception as _exc:
+                self.logger.warning(
+                    "[Shutdown] WebSocket Router terminate: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
                 try:
                     self._ws_router_process.kill()
-                except Exception:
-                    pass
+                except Exception as _exc2:
+                    self.logger.warning(
+                        "[Shutdown] WebSocket Router kill: %s: %s",
+                        type(_exc2).__name__, _exc2,
+                    )
             # Close log file
             if hasattr(self, '_ws_router_log') and self._ws_router_log:
                 try:
                     self._ws_router_log.close()
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Shutdown] WebSocket Router log close: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
 
         # v223.0: Stop Cloud SQL proxy (prevents orphaned proxy processes)
         if hasattr(self, '_cloud_sql_proxy_manager') and self._cloud_sql_proxy_manager:
@@ -69031,8 +69099,11 @@ class JarvisSystemKernel:
             from backend.core.supervisor_singleton import SupervisorHeartbeat
             await asyncio.to_thread(SupervisorHeartbeat.stop)
             self.logger.debug("[Kernel] Supervisor heartbeat stopped")
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.logger.debug(
+                "[Shutdown] supervisor heartbeat stop: %s: %s",
+                type(_exc).__name__, _exc,
+            )
 
         # Release lock (v205.0: use asyncio.to_thread to avoid blocking)
         try:
@@ -69043,8 +69114,11 @@ class JarvisSystemKernel:
         # Best-effort flush of persistent memory in emergency path.
         try:
             await asyncio.wait_for(self._shutdown_persistent_memory_agent(), timeout=3.0)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.logger.debug(
+                "[Shutdown] persistent memory flush: %s: %s",
+                type(_exc).__name__, _exc,
+            )
 
         # v283.0: Explicitly stop singleton health-loop owners before final task drain.
         # This prevents loop-close warnings:
@@ -69052,8 +69126,11 @@ class JarvisSystemKernel:
         # - lingering backend health loops during forced exit paths.
         try:
             await self._stop_orphan_singleton_health_loops(timeout_s=3.0)
-        except Exception:
-            pass
+        except Exception as _exc:
+            self.logger.debug(
+                "[Shutdown] singleton health loop stop: %s: %s",
+                type(_exc).__name__, _exc,
+            )
 
         # v251.0: Deterministic final task drain before loop teardown.
         # This prevents "Task was destroyed but it is pending" and leaked
