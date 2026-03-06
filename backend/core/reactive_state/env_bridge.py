@@ -414,6 +414,7 @@ class EnvBridge:
     """
 
     _ENV_MODE_VAR = "JARVIS_STATE_BRIDGE_MODE"
+    _ACTIVE_DOMAINS_VAR = "JARVIS_STATE_BRIDGE_ACTIVE_DOMAINS"
 
     def __init__(
         self,
@@ -441,6 +442,7 @@ class EnvBridge:
         # -- Active-mode env mirroring state (Wave 4) --
         self._env_lock = threading.Lock()
         self._last_mirrored_versions: Dict[str, int] = {}
+        self._active_domains = EnvBridge._resolve_active_domains()
 
     # -- bootstrap ---------------------------------------------------------
 
@@ -464,6 +466,20 @@ class EnvBridge:
                 raw,
             )
             return BridgeMode.LEGACY
+
+    @staticmethod
+    def _resolve_active_domains() -> Optional[frozenset]:
+        """Parse ``JARVIS_STATE_BRIDGE_ACTIVE_DOMAINS`` from environment.
+
+        Returns ``None`` if absent or empty (all domains active).
+        Returns a ``frozenset`` of domain name strings (e.g. ``{"gcp", "memory"}``)
+        if the env var is set to a comma-separated list.
+        """
+        raw = os.environ.get(EnvBridge._ACTIVE_DOMAINS_VAR, "")
+        if not raw:
+            return None
+        domains = frozenset(d.strip() for d in raw.split(",") if d.strip())
+        return domains if domains else None
 
     # -- properties --------------------------------------------------------
 
@@ -513,6 +529,20 @@ class EnvBridge:
     def get_mapping_by_env_var(self, env_var: str) -> Optional[EnvKeyMapping]:
         """Return the ``EnvKeyMapping`` for *env_var*, or ``None``."""
         return self._by_env_var.get(env_var)
+
+    # -- domain filtering (A.13) -----------------------------------------------
+
+    def is_domain_active(self, state_key: str) -> bool:
+        """Return ``True`` if the key's domain is active for store authority.
+
+        The domain is the first segment of the state key (before the first
+        ``'.'``).  If no active-domains restriction is configured (``None``),
+        all domains are considered active.
+        """
+        if self._active_domains is None:
+            return True
+        domain = state_key.split(".", 1)[0]
+        return domain in self._active_domains
 
     # -- promotion readiness ---------------------------------------------------
 
@@ -652,6 +682,10 @@ class EnvBridge:
 
         mapping = self._by_state_key.get(entry.key)
         if mapping is None:
+            return False
+
+        # Per-domain kill switch (A.13)
+        if not self.is_domain_active(entry.key):
             return False
 
         env_value = mapping.coerce_to_env(entry.value)
