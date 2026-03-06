@@ -186,3 +186,58 @@ class TestCrashRecovery:
         assert isinstance(new_token, BudgetToken)
         bridge.release(new_token)
         await asyncio.sleep(0.05)
+
+
+class TestBudgetAwareRecovery:
+    """Registry recovery path uses bridge instead of blind polling."""
+
+    @pytest.mark.asyncio
+    async def test_recovery_budget_gated_probe(self, wired_bridge):
+        """Recovery acquires probe slot before attempting cloud check."""
+        bridge, policy, bus = wired_bridge
+
+        # Simulate recovery acquiring probe slot
+        probe = await bridge.acquire_probe_slot(timeout_s=5.0)
+        assert isinstance(probe, BudgetToken)
+        assert probe.category is HeavyTaskCategory.ML_INIT
+
+        # Simulate probe failure
+        probe.probe_failure_reason = "cloud_timeout_clean"
+        bridge.release(probe)
+
+        # Acquire model slot for local load
+        model = await bridge.acquire_model_slot(timeout_s=5.0)
+        assert isinstance(model, BudgetToken)
+        assert bridge._active_model_load_count == 1
+
+        # Simulate successful local load
+        bridge.heartbeat(model)
+        bridge.release(model)
+        assert bridge._active_model_load_count == 0
+
+    @pytest.mark.asyncio
+    async def test_recovery_respects_phase_gate(self, wired_bridge):
+        """Recovery cannot probe if phase not reached."""
+        bridge, policy, bus = wired_bridge
+
+        # Create a fresh policy WITHOUT CORE_READY signalled
+        config = BudgetConfig(
+            max_hard_concurrent=1,
+            max_total_concurrent=3,
+            hard_gate_categories=["MODEL_LOAD"],
+            soft_gate_categories=["ML_INIT"],
+            soft_gate_preconditions={
+                "ML_INIT": SoftGatePrecondition(
+                    require_phase="CORE_READY",
+                    require_memory_stable_s=0.0,
+                    memory_slope_threshold_mb_s=999.0,
+                ),
+            },
+            max_wait_s=5.0,
+        )
+        gated_policy = StartupBudgetPolicy(config)
+        bridge._budget_policy = gated_policy
+        # Do NOT signal CORE_READY
+
+        result = await bridge.acquire_probe_slot(timeout_s=2.0)
+        assert result is EcapaBudgetRejection.PHASE_BLOCKED

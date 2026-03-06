@@ -5684,104 +5684,128 @@ class MLEngineRegistry:
         }
 
     def _schedule_deferred_ecapa_recovery(self) -> None:
-        """
-        v271.0→v276.2: Schedule background ECAPA recovery with cloud-first strategy.
+        """v300.0: Schedule budget-aware ECAPA recovery.
 
-        ROOT CAUSE OF RECURRING FAILURE (v271.0):
-            Original implementation ONLY retried local ECAPA loading. When memory
-            emergency blocked local load, recovery waited for memory to stabilize.
-            Meanwhile, the Cloud Run container completed its cold start (10-30s)
-            and was sitting warm and ready — but recovery never tried it.
-
-        THE CURE (v276.2):
-            Recovery now uses _attempt_ecapa_recovery() which tries CLOUD FIRST.
-            By T+30s (first recovery poll), Cloud Run has been warm for 0-20s.
-            The cloud probe succeeds immediately (~100ms) instead of timing out.
-
-            Additionally, MemoryQuantizer recovery callbacks provide event-driven
-            reload (registered in __init__), so recovery doesn't purely rely on
-            this 30s poll loop.
-
-        Strategy per attempt:
-            1. Try cloud (warm by now) → success? done.
-            2. If cloud fails AND memory safe → try local → success? done.
-            3. Both fail → wait for next poll interval.
+        Uses EcapaBudgetBridge for coordinated slot acquisition instead
+        of blind 30s polling. Differentiated backoff per rejection type.
         """
         if self._deferred_ecapa_recovery_task is not None:
             return  # Already scheduled
 
         self._memory_gate_blocked = True
 
-        async def _recovery_loop() -> None:
-            poll_interval = float(os.getenv(
-                "JARVIS_ECAPA_RECOVERY_POLL_INTERVAL", "30.0"
-            ))
-            startup_poll_interval = float(
-                os.getenv("JARVIS_ECAPA_RECOVERY_STARTUP_POLL_INTERVAL", "5.0")
+        async def _budget_aware_recovery_loop() -> None:
+            # Lazy import to avoid circular dependency
+            from backend.core.ecapa_budget_bridge import (
+                EcapaBudgetBridge,
+                EcapaBudgetRejection,
+                BudgetToken,
             )
-            max_attempts = int(os.getenv(
-                "JARVIS_ECAPA_RECOVERY_MAX_ATTEMPTS", "20"
-            ))
+
+            bridge = EcapaBudgetBridge.get_instance()
+            max_attempts = int(os.getenv("JARVIS_ECAPA_RECOVERY_MAX_ATTEMPTS", "20"))
+            base_delay = float(os.getenv("JARVIS_ECAPA_RECOVERY_BASE_DELAY", "5.0"))
+            max_delay = float(os.getenv("JARVIS_ECAPA_RECOVERY_MAX_DELAY", "120.0"))
             attempt = 0
 
             logger.info(
-                f"[v276.2] Deferred ECAPA recovery scheduled — cloud-first strategy "
-                f"(poll every {poll_interval}s, max {max_attempts} attempts)"
+                "[v300.0] Budget-aware ECAPA recovery scheduled "
+                "(max %d attempts, base delay %.1fs)",
+                max_attempts, base_delay,
             )
 
             while attempt < max_attempts:
-                if self._read_supervisor_system_phase() == "startup":
-                    await asyncio.sleep(max(1.0, startup_poll_interval))
-                    continue
+                if self.is_ready:
+                    logger.info("[v300.0] ECAPA already ready — recovery exiting")
+                    self._memory_gate_blocked = False
+                    return
 
-                await asyncio.sleep(poll_interval)
                 attempt += 1
 
-                # Check if someone else already loaded ECAPA (e.g., memory callback)
-                if self.is_ready:
+                # Acquire budget slot before attempting recovery
+                probe_result = await bridge.acquire_probe_slot(timeout_s=5.0)
+                if isinstance(probe_result, EcapaBudgetRejection):
+                    delay = self._compute_backoff(
+                        probe_result, attempt, base_delay, max_delay,
+                    )
                     logger.info(
-                        "[v276.2] ECAPA already ready — deferred recovery exiting"
+                        "[v300.0] Recovery #%d probe denied (%s) — "
+                        "backoff %.1fs",
+                        attempt, probe_result.value, delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                # Probe slot acquired — attempt recovery (cloud-first, then local)
+                success = False
+                try:
+                    success = await self._attempt_ecapa_recovery(
+                        source=f"deferred_budget_{attempt}"
+                    )
+                except Exception as e:
+                    probe_result.probe_failure_reason = str(e)
+                    logger.warning(
+                        "[v300.0] Recovery #%d error: %s",
+                        attempt, e,
+                    )
+                finally:
+                    bridge.release(probe_result)
+
+                if success:
+                    logger.info(
+                        "[v300.0] Recovery #%d succeeded!",
+                        attempt,
                     )
                     self._memory_gate_blocked = False
                     return
 
-                logger.info(
-                    f"[v276.2] Deferred recovery attempt #{attempt}/{max_attempts}"
+                # Recovery failed — backoff before next attempt
+                delay = self._compute_backoff(
+                    EcapaBudgetRejection.BUDGET_TIMEOUT,
+                    attempt, base_delay, max_delay,
                 )
-
-                try:
-                    success = await self._attempt_ecapa_recovery(
-                        source=f"deferred_poll_{attempt}"
-                    )
-                    if success:
-                        logger.info(
-                            f"[v276.2] Deferred ECAPA recovery SUCCESSFUL on "
-                            f"attempt #{attempt} — voice unlock now available!"
-                        )
-                        return
-                except Exception as e:
-                    logger.warning(
-                        f"[v276.2] Deferred ECAPA recovery attempt #{attempt} error: {e}"
-                    )
+                await asyncio.sleep(delay)
 
             logger.error(
-                f"[v276.2] Deferred ECAPA recovery exhausted {max_attempts} attempts "
-                f"over {max_attempts * poll_interval:.0f}s. "
-                "Voice unlock will remain unavailable until restart."
+                "[v300.0] Recovery exhausted %d attempts. "
+                "Voice unlock unavailable until restart.",
+                max_attempts,
             )
             self._memory_gate_blocked = False
 
         try:
             loop = asyncio.get_running_loop()
             self._deferred_ecapa_recovery_task = loop.create_task(
-                _recovery_loop(),
-                name="ecapa-deferred-recovery",
+                _budget_aware_recovery_loop(),
+                name="ecapa-budget-recovery",
             )
         except RuntimeError:
             logger.error(
-                "[v276.2] CRITICAL: No running event loop for deferred recovery. "
-                "ECAPA will remain unavailable until restart."
+                "[v300.0] No running event loop for budget recovery."
             )
+
+    @staticmethod
+    def _compute_backoff(
+        rejection: "EcapaBudgetRejection",
+        attempt: int,
+        base: float,
+        cap: float,
+    ) -> float:
+        """Differentiated backoff per rejection type."""
+        import random
+        from backend.core.ecapa_budget_bridge import EcapaBudgetRejection
+
+        if rejection == EcapaBudgetRejection.THRASH_EMERGENCY:
+            delay = min(15.0 * (2 ** (attempt - 1)), cap)
+            jitter = delay * 0.3 * random.uniform(-1, 1)
+        elif rejection == EcapaBudgetRejection.CONTRACT_MISMATCH:
+            delay = cap  # Non-retryable — wait max
+            jitter = 0.0
+        else:
+            delay = min(base * (2 ** (attempt - 1)), 60.0)
+            jitter = delay * 0.2 * random.uniform(-1, 1)
+
+        return max(1.0, delay + jitter)
 
     async def _fallback_to_cloud(self, reason: str) -> bool:
         """
