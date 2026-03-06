@@ -325,6 +325,74 @@ class PrimeRouter:
         h = host or self._gcp_host or ""
         return any(h.endswith(pat) for pat in self._cloud_run_patterns)
 
+    @staticmethod
+    def _classify_protection_error(metadata: Dict[str, Any]) -> str:
+        """Map protection metadata to a stable degraded error code."""
+        if metadata.get("error_code"):
+            return str(metadata["error_code"])
+        if metadata.get("circuit_open"):
+            return "circuit_open"
+        if metadata.get("backpressure_dropped"):
+            return "backpressure_rejected"
+        if metadata.get("timeout"):
+            return "timeout"
+        return "operation_failed"
+
+    @staticmethod
+    def _build_degraded_metadata(
+        *,
+        error_code: str,
+        error_message: str,
+        origin_layer: str,
+        retryable: bool,
+        trace_id: Optional[str] = None,
+        **extra: Any,
+    ) -> Dict[str, Any]:
+        """Build a normalized degraded metadata envelope with compatibility aliases."""
+        metadata: Dict[str, Any] = {
+            "error_code": error_code,
+            "error_message": error_message,
+            "error": error_message,
+            "reason": error_code,
+            "origin_layer": origin_layer,
+            "retryable": retryable,
+            "v88_error": error_message,
+        }
+        if trace_id:
+            metadata["trace_id"] = trace_id
+        for key, value in extra.items():
+            if value is not None:
+                metadata[key] = value
+        return metadata
+
+    def _build_degraded_response(
+        self,
+        content: str,
+        *,
+        error_code: str,
+        error_message: str,
+        origin_layer: str,
+        retryable: bool,
+        latency_ms: float = 0.0,
+        trace_id: Optional[str] = None,
+        **extra: Any,
+    ) -> RouterResponse:
+        """Build a degraded router response with normalized metadata."""
+        return RouterResponse(
+            content=content,
+            source="degraded",
+            latency_ms=latency_ms,
+            model="none",
+            metadata=self._build_degraded_metadata(
+                error_code=error_code,
+                error_message=error_message,
+                origin_layer=origin_layer,
+                retryable=retryable,
+                trace_id=trace_id,
+                **extra,
+            ),
+        )
+
     def is_endpoint_healthy(self, endpoint_name: str = "prime") -> bool:
         """Read-only health query for ModelRouter delegation.
 
@@ -755,14 +823,18 @@ class PrimeRouter:
                 return result
             elif not success:
                 # Protection failed, return degraded response
-                error_msg = metadata.get("error", "Unknown protection error")
+                error_msg = metadata.get("error_message") or metadata.get("error") or "Unknown protection error"
                 logger.warning(f"[PrimeRouter] v88.0 Protection failed: {error_msg}")
-                return RouterResponse(
+                return self._build_degraded_response(
                     content="I'm experiencing some difficulties. Please try again.",
-                    source="degraded",
-                    latency_ms=0,
-                    model="none",
-                    metadata={"v88_error": error_msg, "circuit_open": metadata.get("circuit_open", False)},
+                    error_code=self._classify_protection_error(metadata),
+                    error_message=error_msg,
+                    origin_layer=metadata.get("origin_layer", "trinity_ultra_coordinator"),
+                    retryable=bool(metadata.get("retryable", True)),
+                    trace_id=metadata.get("trace_id"),
+                    circuit_open=metadata.get("circuit_open"),
+                    failure_class=metadata.get("failure_class"),
+                    reason=metadata.get("reason"),
                 )
 
         # Fallback: direct execution without protection
@@ -859,12 +931,13 @@ class PrimeRouter:
             logger.error(f"[PrimeRouter] Generation failed: {e}")
 
             # Return degraded response on error
-            return RouterResponse(
+            return self._build_degraded_response(
                 content=f"I apologize, but I'm experiencing technical difficulties. Error: {str(e)}",
-                source="degraded",
+                error_code="dependency_unavailable",
+                error_message=str(e),
+                origin_layer="prime_router",
+                retryable=True,
                 latency_ms=(time.time() - start_time) * 1000,
-                model="none",
-                metadata={"error": str(e)},
             )
 
     async def _generate_hybrid(
@@ -1014,12 +1087,12 @@ class PrimeRouter:
 
     def _generate_degraded(self, prompt: str) -> RouterResponse:
         """Return degraded response when no backend available."""
-        return RouterResponse(
+        return self._build_degraded_response(
             content="I apologize, but both local and cloud AI services are currently unavailable. Please try again later.",
-            source="degraded",
-            latency_ms=0,
-            model="none",
-            metadata={"reason": "no_backend_available"},
+            error_code="no_backend_available",
+            error_message="No backend available",
+            origin_layer="prime_router",
+            retryable=True,
         )
 
     async def generate_stream(

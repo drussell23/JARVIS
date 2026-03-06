@@ -9014,8 +9014,9 @@ class TrinityUltraCoordinator:
         self._initialized = False
         self._lock = asyncio.Lock()
 
-        # v242.0: Shielded task registry for cleanup (Gap A)
-        self._shielded_tasks: Dict[str, asyncio.Task] = {}
+        # Track shielded work per protected operation so concurrent requests for
+        # the same component cannot clobber each other.
+        self._shielded_tasks: Dict[str, Tuple[str, asyncio.Task[Any]]] = {}
 
         logger.info(f"[TrinityUltra] v{self.TRINITY_ULTRA_VERSION} coordinator created")
 
@@ -9043,14 +9044,38 @@ class TrinityUltraCoordinator:
             logger.info(f"[TrinityUltra] v{self.TRINITY_ULTRA_VERSION} initialized")
 
     # v242.0: Shielded task management (Gap A + Gap K)
-    def _register_shielded_task(self, component: str, task: asyncio.Task) -> None:
-        """Track shielded task. Cancels previous orphan for same component."""
-        old = self._shielded_tasks.pop(component, None)
-        if old and not old.done():
-            old.cancel()
-        self._shielded_tasks[component] = task
+    def _register_shielded_task(
+        self,
+        operation_id: str,
+        component: str,
+        task: asyncio.Task[Any],
+    ) -> None:
+        """Track shielded task by operation ID."""
+        self._shielded_tasks[operation_id] = (component, task)
 
-    async def _cleanup_shielded_task(self, component: str, task: asyncio.Task, grace_s: float) -> None:
+    def _unregister_shielded_task(
+        self,
+        operation_id: str,
+        task: Optional[asyncio.Task[Any]] = None,
+    ) -> None:
+        """Remove shielded task if the tracked task still matches."""
+        tracked = self._shielded_tasks.get(operation_id)
+        if tracked is None:
+            return
+
+        _, tracked_task = tracked
+        if task is not None and tracked_task is not task:
+            return
+
+        self._shielded_tasks.pop(operation_id, None)
+
+    async def _cleanup_shielded_task(
+        self,
+        operation_id: str,
+        component: str,
+        task: asyncio.Task[Any],
+        grace_s: float,
+    ) -> None:
         """Wait grace period then cancel if still running."""
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout=grace_s)
@@ -9059,26 +9084,58 @@ class TrinityUltraCoordinator:
                 task.cancel()
                 logger.info(f"[UltraCoord] v242.0 Cancelled orphan shielded task for {component}")
         finally:
-            self._shielded_tasks.pop(component, None)
+            self._unregister_shielded_task(operation_id, task)
 
     def cancel_shielded_task(self, component: str) -> bool:
-        """Cancel a specific component's shielded task. Returns True if cancelled."""
-        task = self._shielded_tasks.pop(component, None)
-        if task and not task.done():
-            task.cancel()
-            logger.info(f"[UltraCoord] v242.0 Cancelled shielded task for {component}")
+        """Cancel all shielded tasks for a component. Returns True if any were cancelled."""
+        cancelled = 0
+        for operation_id, (tracked_component, task) in list(self._shielded_tasks.items()):
+            if tracked_component != component:
+                continue
+            self._shielded_tasks.pop(operation_id, None)
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+
+        if cancelled:
+            logger.info(
+                f"[UltraCoord] v242.0 Cancelled {cancelled} shielded task(s) for {component}"
+            )
             return True
         return False
 
     def cancel_all_shielded_tasks(self) -> int:
         """Cancel all orphaned tasks (full shutdown path)."""
         count = 0
-        for comp, task in list(self._shielded_tasks.items()):
+        for _, task in list(self._shielded_tasks.values()):
             if not task.done():
                 task.cancel()
                 count += 1
         self._shielded_tasks.clear()
         return count
+
+    @staticmethod
+    def _set_failure_metadata(
+        metadata: Dict[str, Any],
+        *,
+        error_code: str,
+        error_message: str,
+        failure_class: str,
+        retryable: bool,
+        reason: Optional[str] = None,
+        **extra: Any,
+    ) -> None:
+        """Populate normalized failure metadata for protected operations."""
+        metadata["failure_class"] = failure_class
+        metadata["error_code"] = error_code
+        metadata["error"] = error_message
+        metadata["error_message"] = error_message
+        metadata["origin_layer"] = "trinity_ultra_coordinator"
+        metadata["retryable"] = retryable
+        if reason is not None:
+            metadata["reason"] = reason
+        for key, value in extra.items():
+            metadata[key] = value
 
     async def execute_with_protection(
         self,
@@ -9114,24 +9171,37 @@ class TrinityUltraCoordinator:
         with TraceContextManager.span("jarvis", f"{component}_operation") as trace_ctx:
             metadata["trace_id"] = trace_ctx.trace_id
             metadata["span_id"] = trace_ctx.span_id
+            metadata["operation_id"] = f"{component}:{trace_ctx.span_id}:{uuid.uuid4().hex[:8]}"
 
             # Check circuit breaker
             can_execute, reason = await circuit.can_execute()
             if not can_execute:
                 metadata["circuit_state"] = circuit.state
-                metadata["circuit_open"] = True
-                metadata["reason"] = reason
-                metadata["error"] = f"Circuit breaker {circuit.state}: {reason}"
+                self._set_failure_metadata(
+                    metadata,
+                    error_code="circuit_open",
+                    error_message=f"Circuit breaker {circuit.state}: {reason}",
+                    failure_class="circuit_open",
+                    retryable=True,
+                    reason=reason,
+                    circuit_open=True,
+                )
                 return False, None, metadata
 
             # Apply backpressure
             bp_timeout = timeout or 30.0
             acquired, delay_ms = await self._backpressure.acquire(bp_timeout)
             if not acquired:
-                metadata["backpressure_dropped"] = True
-                metadata["delay_ms"] = delay_ms
-                metadata["error"] = f"Backpressure rejected (delay={delay_ms:.0f}ms)"
-                await circuit.record_failure(delay_ms)
+                self._set_failure_metadata(
+                    metadata,
+                    error_code="backpressure_rejected",
+                    error_message=f"Backpressure rejected (delay={delay_ms:.0f}ms)",
+                    failure_class="overload",
+                    retryable=True,
+                    reason="backpressure_rejected",
+                    backpressure_dropped=True,
+                    delay_ms=delay_ms,
+                )
                 return False, None, metadata
 
             # v241.0: Execute with asyncio.shield() to prevent task cancellation.
@@ -9140,9 +9210,14 @@ class TrinityUltraCoordinator:
             # LLM work in progress when it fires.
             effective_timeout = timeout or 120.0
             start = time.time()
+            task: Optional[asyncio.Task[T]] = None
+            operation_id = metadata["operation_id"]
             try:
-                task = asyncio.ensure_future(operation())
-                self._register_shielded_task(component, task)  # v242.0
+                task = asyncio.create_task(
+                    operation(),
+                    name=f"ultra_{component}_{trace_ctx.span_id}",
+                )
+                self._register_shielded_task(operation_id, component, task)
                 result = await asyncio.wait_for(
                     asyncio.shield(task), timeout=effective_timeout
                 )
@@ -9162,24 +9237,54 @@ class TrinityUltraCoordinator:
                 # in the background. But we treat it as a timeout for the caller.
                 # v242.0: Schedule cleanup with grace period (Gap A)
                 _grace = float(os.getenv("JARVIS_SHIELD_GRACE_S", "10.0"))
-                asyncio.ensure_future(self._cleanup_shielded_task(component, task, _grace))
+                if task is not None:
+                    asyncio.create_task(
+                        self._cleanup_shielded_task(operation_id, component, task, _grace)
+                    )
                 latency_ms = (time.time() - start) * 1000
                 await circuit.record_failure(latency_ms)
                 await self._backpressure.release(latency_ms)
 
-                metadata["latency_ms"] = latency_ms
-                metadata["timeout"] = True
-                metadata["error"] = f"Timeout after {effective_timeout:.1f}s ({latency_ms:.0f}ms elapsed)"
+                self._set_failure_metadata(
+                    metadata,
+                    error_code="timeout",
+                    error_message=(
+                        f"Timeout after {effective_timeout:.1f}s ({latency_ms:.0f}ms elapsed)"
+                    ),
+                    failure_class="timeout",
+                    retryable=True,
+                    reason="timeout",
+                    latency_ms=latency_ms,
+                    timeout=True,
+                )
                 return False, None, metadata
+
+            except asyncio.CancelledError:
+                if task is not None and not task.done():
+                    _grace = float(os.getenv("JARVIS_SHIELD_GRACE_S", "10.0"))
+                    asyncio.create_task(
+                        self._cleanup_shielded_task(operation_id, component, task, _grace)
+                    )
+                raise
 
             except Exception as e:
                 latency_ms = (time.time() - start) * 1000
                 await circuit.record_failure(latency_ms)
                 await self._backpressure.release(latency_ms)
 
-                metadata["latency_ms"] = latency_ms
-                metadata["error"] = str(e)
+                self._set_failure_metadata(
+                    metadata,
+                    error_code="operation_exception",
+                    error_message=str(e),
+                    failure_class="dependency_failure",
+                    retryable=False,
+                    reason="operation_exception",
+                    latency_ms=latency_ms,
+                )
                 return False, None, metadata
+            finally:
+                if task is not None and task.done():
+                    self._unregister_shielded_task(operation_id, task)
 
     def push_event(self, event: Any) -> bool:
         """Push event to high-performance buffer (non-blocking)."""

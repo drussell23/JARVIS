@@ -36,6 +36,26 @@ _VALID_URGENCY_SIGNALS = frozenset({
 _MAX_KEYWORDS = 10
 
 
+def _degraded_details(metadata: Optional[Dict[str, Any]]) -> list[str]:
+    """Extract stable degraded diagnostics with compatibility fallbacks."""
+    meta = metadata or {}
+    details = []
+
+    error_code = meta.get("error_code") or meta.get("reason")
+    error_message = (
+        meta.get("error_message")
+        or meta.get("v88_error")
+        or meta.get("error")
+    )
+
+    if error_code:
+        details.append(str(error_code))
+    if error_message and str(error_message) not in details:
+        details.append(str(error_message))
+
+    return details or ["unknown"]
+
+
 def _validate_extraction_contract(
     data: Dict[str, Any],
 ) -> Tuple[bool, list]:
@@ -213,12 +233,12 @@ async def extract_features(
         )
         # Guard: degraded responses from protection layer are not JSON
         if getattr(response, "source", None) == "degraded":
-            v88_error = (response.metadata or {}).get("v88_error", "unknown")
-            logger.info("Extraction skipped — router degraded: %s", v88_error)
+            details = _degraded_details(getattr(response, "metadata", None))
+            logger.info("Extraction skipped — router degraded: %s", " | ".join(details))
             emit_triage_event(EVENT_EXTRACTION_DEGRADED, {
                 "message_id": email_dict.get("id", ""),
                 "reason": "router_degraded",
-                "details": [v88_error],
+                "details": details,
             })
             return heuristic
         parsed = json.loads(response.content)

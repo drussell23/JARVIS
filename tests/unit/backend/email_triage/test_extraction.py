@@ -3,7 +3,7 @@
 import json
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "backend"))
 
@@ -124,6 +124,44 @@ class TestExtractFeatures:
 
         f = await extract_features(email, mock_router, config=config)
         assert f.extraction_confidence == 0.0
+
+    @pytest.mark.asyncio
+    async def test_degraded_response_uses_normalized_metadata_details(self):
+        email = _sample_email()
+        config = TriageConfig(extraction_enabled=True)
+
+        mock_router = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.source = "degraded"
+        mock_response.metadata = {
+            "error_code": "timeout",
+            "error_message": "Timeout after 1.0s",
+            "origin_layer": "trinity_ultra_coordinator",
+        }
+        mock_router.generate.return_value = mock_response
+
+        with patch("autonomy.email_triage.extraction.emit_triage_event") as mock_emit:
+            f = await extract_features(email, mock_router, config=config)
+
+        assert f.extraction_confidence == 0.0
+        assert mock_emit.call_args[0][1]["details"] == ["timeout", "Timeout after 1.0s"]
+
+    @pytest.mark.asyncio
+    async def test_degraded_response_uses_legacy_reason_fallback(self):
+        email = _sample_email()
+        config = TriageConfig(extraction_enabled=True)
+
+        mock_router = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.source = "degraded"
+        mock_response.metadata = {"reason": "no_backend_available"}
+        mock_router.generate.return_value = mock_response
+
+        with patch("autonomy.email_triage.extraction.emit_triage_event") as mock_emit:
+            f = await extract_features(email, mock_router, config=config)
+
+        assert f.extraction_confidence == 0.0
+        assert mock_emit.call_args[0][1]["details"] == ["no_backend_available"]
 
     @pytest.mark.asyncio
     async def test_extraction_disabled_uses_heuristic(self):
