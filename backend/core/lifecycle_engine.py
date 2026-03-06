@@ -1,455 +1,215 @@
-# backend/core/lifecycle_engine.py
 """
-JARVIS Lifecycle Engine v1.0
-=============================
-Unified DAG-driven lifecycle management for all components — in-process,
-subprocess, and remote.
+Lifecycle Engine (Disease 5+6 MVP)
+===================================
+Guarded state machine with transition table, epoch tracking,
+and centralized state mutation.
 
-Provides:
-  - Component state machine with journaled transitions
-  - Wave-based parallel execution (Kahn's algorithm)
-  - Failure propagation (hard deps skip/drain, soft deps degrade)
-  - Reverse-DAG shutdown with drain contracts
-
-Design doc: docs/plans/2026-02-24-cross-repo-control-plane-design.md
+KernelState is re-exported here for testability (the original
+lives in unified_supervisor.py but is hard to import in tests).
 """
-
-import asyncio
 import logging
+import threading
+import time
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
-from typing import (
-    Awaitable, Callable, Dict, List, Optional, Protocol, Set, Tuple,
-    runtime_checkable,
+from typing import Callable, Dict, List, Optional, Tuple
+
+from backend.core.lifecycle_exceptions import (
+    LifecycleFatalError,
+    LifecyclePhase,
+    LifecycleErrorCode,
+    TransitionRejected,
 )
 
-from backend.core.orchestration_journal import OrchestrationJournal, StaleEpochError
 
-logger = logging.getLogger("jarvis.lifecycle_engine")
-
-
-# ── Enums & Constants ───────────────────────────────────────────────
-
-class ComponentLocality(Enum):
-    IN_PROCESS = "in_process"
-    SUBPROCESS = "subprocess"
-    REMOTE = "remote"
-
-
-VALID_TRANSITIONS: Dict[str, Set[str]] = {
-    "REGISTERED":   {"STARTING"},
-    "STARTING":     {"HANDSHAKING", "FAILED"},
-    "HANDSHAKING":  {"READY", "FAILED"},
-    "READY":        {"DEGRADED", "DRAINING", "FAILED", "LOST"},
-    "DEGRADED":     {"READY", "DRAINING", "FAILED", "LOST"},
-    "DRAINING":     {"STOPPING", "FAILED", "LOST"},
-    "STOPPING":     {"STOPPED", "FAILED"},
-    "FAILED":       {"STARTING"},
-    "LOST":         {"STARTING", "STOPPED"},
-    "STOPPED":      {"STARTING"},
-}
+# Re-export KernelState so tests and other modules can import it
+# without pulling in the 98K-line unified_supervisor.py.
+class KernelState(Enum):
+    """States of the system kernel."""
+    INITIALIZING = "initializing"
+    PREFLIGHT = "preflight"
+    STARTING_RESOURCES = "starting_resources"
+    STARTING_BACKEND = "starting_backend"
+    STARTING_INTELLIGENCE = "starting_intelligence"
+    STARTING_TRINITY = "starting_trinity"
+    RUNNING = "running"
+    SHUTTING_DOWN = "shutting_down"
+    STOPPED = "stopped"
+    FAILED = "failed"
 
 
-# ── Exceptions ──────────────────────────────────────────────────────
+class LifecycleEvent(str, Enum):
+    """Typed events that drive state transitions."""
+    PREFLIGHT_START = "preflight_start"
+    BRINGUP_START = "bringup_start"
+    BACKEND_START = "backend_start"
+    INTEL_START = "intel_start"
+    TRINITY_START = "trinity_start"
+    READY = "ready"
+    SHUTDOWN = "shutdown"
+    STOPPED = "stopped"
+    FATAL = "fatal"
 
-class InvalidTransitionError(Exception):
-    """Raised when a state transition violates the state machine."""
-    pass
-
-
-class CyclicDependencyError(Exception):
-    """Raised when the component dependency graph contains a cycle."""
-    pass
-
-
-# ── Data Model ──────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
-class ComponentDeclaration:
-    """Static declaration of a component in the lifecycle DAG."""
-    name: str
-    locality: ComponentLocality
-    dependencies: Tuple[str, ...] = ()
-    soft_dependencies: Tuple[str, ...] = ()
-    is_critical: bool = False
-    start_timeout_s: float = 60.0
-    handshake_timeout_s: float = 10.0
-    drain_timeout_s: float = 30.0
-    heartbeat_ttl_s: float = 30.0
-    spawn_command: Optional[Tuple[str, ...]] = None
-    endpoint: Optional[str] = None
-    health_path: str = "/health"
-    init_fn: Optional[str] = None
+class TransitionRecord:
+    """Stable schema for transition audit trail."""
+    old_state: str
+    event: str
+    new_state: str
+    epoch: int
+    actor: str
+    at_monotonic: float
+    reason: str
 
 
-@runtime_checkable
-class LocalityDriver(Protocol):
-    """How to start/stop/health-check a component by locality."""
-    async def start(self, component_name: str, config: Optional[dict] = None) -> bool: ...
-    async def stop(self, component_name: str) -> bool: ...
-    async def health_check(self, component_name: str) -> dict: ...
-    async def send_drain(self, component_name: str, timeout_s: float = 30.0) -> bool: ...
+# Transition table: (from_state, event) -> to_state
+VALID_TRANSITIONS: Dict[Tuple[KernelState, LifecycleEvent], KernelState] = {
+    # Forward startup sequence
+    (KernelState.INITIALIZING, LifecycleEvent.PREFLIGHT_START):       KernelState.PREFLIGHT,
+    (KernelState.PREFLIGHT, LifecycleEvent.BRINGUP_START):            KernelState.STARTING_RESOURCES,
+    (KernelState.STARTING_RESOURCES, LifecycleEvent.BACKEND_START):   KernelState.STARTING_BACKEND,
+    (KernelState.STARTING_BACKEND, LifecycleEvent.INTEL_START):       KernelState.STARTING_INTELLIGENCE,
+    (KernelState.STARTING_INTELLIGENCE, LifecycleEvent.TRINITY_START): KernelState.STARTING_TRINITY,
+    (KernelState.STARTING_TRINITY, LifecycleEvent.READY):             KernelState.RUNNING,
 
+    # Shutdown from any active state
+    (KernelState.RUNNING, LifecycleEvent.SHUTDOWN):                   KernelState.SHUTTING_DOWN,
+    (KernelState.PREFLIGHT, LifecycleEvent.SHUTDOWN):                 KernelState.SHUTTING_DOWN,
+    (KernelState.STARTING_RESOURCES, LifecycleEvent.SHUTDOWN):        KernelState.SHUTTING_DOWN,
+    (KernelState.STARTING_BACKEND, LifecycleEvent.SHUTDOWN):          KernelState.SHUTTING_DOWN,
+    (KernelState.STARTING_INTELLIGENCE, LifecycleEvent.SHUTDOWN):     KernelState.SHUTTING_DOWN,
+    (KernelState.STARTING_TRINITY, LifecycleEvent.SHUTDOWN):          KernelState.SHUTTING_DOWN,
 
-# ── Wave Computation ────────────────────────────────────────────────
+    # Idempotent duplicate shutdown
+    (KernelState.SHUTTING_DOWN, LifecycleEvent.SHUTDOWN):             KernelState.SHUTTING_DOWN,
 
-def compute_waves(
-    components: Tuple[ComponentDeclaration, ...],
-) -> List[List[ComponentDeclaration]]:
-    """Compute parallel execution waves via Kahn's topological sort.
+    # Completion
+    (KernelState.SHUTTING_DOWN, LifecycleEvent.STOPPED):              KernelState.STOPPED,
 
-    Only hard dependencies affect ordering. Soft dependencies are ignored.
-    Components in the same wave can start concurrently.
-    """
-    comp_map: Dict[str, ComponentDeclaration] = {c.name: c for c in components}
-    all_names = set(comp_map.keys())
+    # Fatal from any non-terminal state
+    (KernelState.INITIALIZING, LifecycleEvent.FATAL):                 KernelState.FAILED,
+    (KernelState.PREFLIGHT, LifecycleEvent.FATAL):                    KernelState.FAILED,
+    (KernelState.STARTING_RESOURCES, LifecycleEvent.FATAL):           KernelState.FAILED,
+    (KernelState.STARTING_BACKEND, LifecycleEvent.FATAL):             KernelState.FAILED,
+    (KernelState.STARTING_INTELLIGENCE, LifecycleEvent.FATAL):        KernelState.FAILED,
+    (KernelState.STARTING_TRINITY, LifecycleEvent.FATAL):             KernelState.FAILED,
+    (KernelState.RUNNING, LifecycleEvent.FATAL):                      KernelState.FAILED,
+    (KernelState.SHUTTING_DOWN, LifecycleEvent.FATAL):                KernelState.FAILED,
+}
 
-    in_degree: Dict[str, int] = {name: 0 for name in all_names}
-    dependents: Dict[str, List[str]] = {name: [] for name in all_names}
+_logger = logging.getLogger(__name__)
 
-    for c in components:
-        for dep in c.dependencies:
-            if dep in all_names:
-                in_degree[c.name] += 1
-                dependents[dep].append(c.name)
-
-    waves: List[List[ComponentDeclaration]] = []
-    queue = sorted([n for n, d in in_degree.items() if d == 0])
-
-    processed = 0
-    while queue:
-        wave = [comp_map[name] for name in queue]
-        waves.append(wave)
-        processed += len(queue)
-
-        next_queue = []
-        for name in queue:
-            for dep_name in dependents[name]:
-                in_degree[dep_name] -= 1
-                if in_degree[dep_name] == 0:
-                    next_queue.append(dep_name)
-        queue = sorted(next_queue)
-
-    if processed < len(all_names):
-        remaining = [n for n, d in in_degree.items() if d > 0]
-        raise CyclicDependencyError(f"Cycle detected involving: {remaining}")
-
-    return waves
-
-
-def _make_idempotency_key(
-    action: str, target: str, trigger_seq: Optional[int] = None,
-) -> str:
-    """Generate epoch-independent idempotency key."""
-    if trigger_seq is not None:
-        return f"{action}:{target}:triggered_by:{trigger_seq}"
-    import uuid
-    return f"{action}:{target}:{uuid.uuid4().hex}"
-
-
-# ── Lifecycle Engine ────────────────────────────────────────────────
 
 class LifecycleEngine:
-    """Unified lifecycle management for all components.
+    """Single authority for all state transitions.
 
-    Usage:
-        engine = LifecycleEngine(journal, SYSTEM_COMPONENTS)
-        engine.register_locality_driver(ComponentLocality.IN_PROCESS, driver)
-        await engine.start_all()
-        await engine.shutdown_all("user_request")
+    Thread-safe for mutation via threading.Lock().
+    Async callers use request_transition() which delegates.
+    Signal-thread callers use loop.call_soon_threadsafe().
     """
 
-    def __init__(
-        self,
-        journal: OrchestrationJournal,
-        components: Tuple[ComponentDeclaration, ...],
-    ):
-        self._journal = journal
-        self._components = {c.name: c for c in components}
-        self._statuses: Dict[str, str] = {c.name: "REGISTERED" for c in components}
-        self._drivers: Dict[ComponentLocality, LocalityDriver] = {}
-        self._drain_hooks: Dict[str, Callable] = {}
-        self._event_callbacks: List[Callable] = []
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._state = KernelState.INITIALIZING
+        self._epoch = 0
+        self._history: deque = deque(maxlen=100)
+        self._listeners: List[Callable] = []
 
-    # ── Status ──────────────────────────────────────────────────
+    def transition(self, event: LifecycleEvent, *,
+                   actor: str = "", reason: str = "") -> KernelState:
+        """Attempt a guarded state transition. Thread-safe.
 
-    def get_status(self, component: str) -> str:
-        return self._statuses.get(component, "REGISTERED")
-
-    def get_all_statuses(self) -> Dict[str, str]:
-        return dict(self._statuses)
-
-    def get_declaration(self, component: str) -> Optional[ComponentDeclaration]:
-        return self._components.get(component)
-
-    # ── Registration ────────────────────────────────────────────
-
-    def register_locality_driver(
-        self, locality: ComponentLocality, driver: LocalityDriver,
-    ) -> None:
-        self._drivers[locality] = driver
-
-    def register_drain_hook(
-        self, component: str, hook: Callable[[], Awaitable[None]],
-    ) -> None:
-        self._drain_hooks[component] = hook
-
-    def on_transition(self, callback: Callable) -> None:
-        """Register callback for state transitions."""
-        self._event_callbacks.append(callback)
-
-    # ── State Transitions ───────────────────────────────────────
-
-    async def transition_component(
-        self,
-        component: str,
-        new_status: str,
-        *,
-        reason: str,
-        trigger_seq: Optional[int] = None,
-    ) -> int:
-        """Transition a component with journal + validation."""
-        current = self._statuses.get(component, "REGISTERED")
-
-        allowed = VALID_TRANSITIONS.get(current, set())
-        if new_status not in allowed:
-            raise InvalidTransitionError(
-                f"{component}: {current} -> {new_status} not valid "
-                f"(allowed: {allowed})"
-            )
-
-        idemp_key = _make_idempotency_key(
-            f"transition_{new_status}", component, trigger_seq,
-        )
-
-        seq = self._journal.fenced_write(
-            "state_transition", component,
-            idempotency_key=idemp_key,
-            payload={"from": current, "to": new_status, "reason": reason},
-        )
-
-        self._statuses[component] = new_status
-
-        self._journal.update_component_state(
-            component, new_status, seq,
-        )
-
-        for cb in self._event_callbacks:
-            try:
-                cb(component, current, new_status, reason)
-            except Exception as e:
-                logger.warning("[Engine] Transition callback error: %s", e)
-
-        return seq
-
-    # ── Failure Propagation ─────────────────────────────────────
-
-    async def propagate_failure(
-        self,
-        failed_component: str,
-        failure_type: str,
-    ) -> None:
-        """Propagate failure to dependents."""
-        for name, comp in self._components.items():
-            current = self._statuses.get(name, "REGISTERED")
-
-            if failed_component in comp.dependencies:
-                # Hard dependency
-                if failure_type == "failed":
-                    if current == "REGISTERED":
-                        # REGISTERED -> FAILED not direct; go through STARTING first
-                        await self.transition_component(
-                            name, "STARTING",
-                            reason=f"hard_dep_{failed_component}_cascade",
-                        )
-                        await self.transition_component(
-                            name, "FAILED",
-                            reason=f"hard_dep_{failed_component}_{failure_type}",
-                        )
-                    elif current == "STARTING":
-                        await self.transition_component(
-                            name, "FAILED",
-                            reason=f"hard_dep_{failed_component}_{failure_type}",
-                        )
-                elif failure_type == "lost":
-                    if current in ("READY", "DEGRADED"):
-                        await self.transition_component(
-                            name, "DRAINING",
-                            reason=f"hard_dep_{failed_component}_lost",
-                        )
-
-            elif failed_component in comp.soft_dependencies:
-                # Soft dependency
-                if current == "READY":
-                    await self.transition_component(
-                        name, "DEGRADED",
-                        reason=f"soft_dep_{failed_component}_{failure_type}",
+        Returns new state on success.
+        Raises TransitionRejected for expected races (terminal state).
+        Raises LifecycleFatalError for true invariant violations.
+        """
+        with self._lock:
+            key = (self._state, event)
+            if key not in VALID_TRANSITIONS:
+                if self._state in (KernelState.STOPPED, KernelState.FAILED):
+                    raise TransitionRejected(
+                        f"Transition rejected: {self._state.value} is terminal",
+                        error_code=LifecycleErrorCode.TRANSITION_INVALID,
+                        state_at_raise=self._state.value,
+                        phase=self._state_to_phase(),
+                        epoch=self._epoch,
                     )
-
-    # ── Wave Execution ──────────────────────────────────────────
-
-    async def start_all(self) -> bool:
-        """Start all components in wave order. Returns True if no critical failure."""
-        waves = compute_waves(tuple(self._components.values()))
-
-        for wave_idx, wave in enumerate(waves):
-            logger.info("[Engine] Starting wave %d: %s",
-                        wave_idx, [c.name for c in wave])
-
-            tasks = []
-            for comp in wave:
-                # Check hard deps
-                deps_ok = all(
-                    self._statuses.get(d) == "READY"
-                    for d in comp.dependencies
+                raise LifecycleFatalError(
+                    f"Invalid transition: {self._state.value} + {event.value}",
+                    error_code=LifecycleErrorCode.TRANSITION_INVALID,
+                    state_at_raise=self._state.value,
+                    phase=self._state_to_phase(),
+                    epoch=self._epoch,
                 )
-                if not deps_ok:
-                    failed_deps = [
-                        d for d in comp.dependencies
-                        if self._statuses.get(d) != "READY"
-                    ]
-                    await self.transition_component(
-                        comp.name, "STARTING", reason="wave_start",
-                    )
-                    await self.transition_component(
-                        comp.name, "FAILED",
-                        reason=f"dependency_not_ready: {failed_deps}",
-                    )
-                    continue
+            old = self._state
+            new = VALID_TRANSITIONS[key]
+            is_noop = (old == new)
+            self._state = new
 
-                tasks.append(self._start_single(comp))
+            # Epoch increments on lifecycle session start
+            if event == LifecycleEvent.PREFLIGHT_START:
+                self._epoch += 1
 
-            await asyncio.gather(*tasks, return_exceptions=True)
+            self._history.append(TransitionRecord(
+                old_state=old.value, event=event.value,
+                new_state=new.value, epoch=self._epoch,
+                actor=actor, at_monotonic=time.monotonic(),
+                reason=reason,
+            ))
 
-            # Check for critical failures in this wave
-            for comp in wave:
-                if comp.is_critical and self._statuses.get(comp.name) == "FAILED":
-                    logger.error("[Engine] Critical component %s failed. Aborting.", comp.name)
-                    return False
+        if not is_noop:
+            self._notify_listeners(old, event, new)
+        return new
 
-        return True
+    async def request_transition(self, event: LifecycleEvent,
+                                  actor: str = "", reason: str = "") -> KernelState:
+        """Async-friendly transition wrapper."""
+        return self.transition(event, actor=actor, reason=reason)
 
-    async def _start_single(self, comp: ComponentDeclaration) -> None:
-        """Start a single component through the lifecycle."""
-        try:
-            await self.transition_component(comp.name, "STARTING", reason="wave_start")
+    @property
+    def epoch(self) -> int:
+        with self._lock:
+            return self._epoch
 
-            driver = self._drivers.get(comp.locality)
-            if driver:
-                await asyncio.wait_for(
-                    driver.start(comp.name),
-                    timeout=comp.start_timeout_s,
-                )
+    @property
+    def state(self) -> KernelState:
+        with self._lock:
+            return self._state
 
-            # Transition to HANDSHAKING (handshake manager will handle the rest)
-            await self.transition_component(
-                comp.name, "HANDSHAKING", reason="start_complete",
-            )
-        except asyncio.TimeoutError:
-            await self.transition_component(
-                comp.name, "FAILED",
-                reason=f"start_timeout_{comp.start_timeout_s}s",
-            )
-        except Exception as e:
-            await self.transition_component(
-                comp.name, "FAILED", reason=f"start_error: {e}",
-            )
+    @property
+    def history(self) -> List[TransitionRecord]:
+        with self._lock:
+            return list(self._history)
 
-    # ── Shutdown ────────────────────────────────────────────────
+    def subscribe(self, listener: Callable) -> None:
+        """Subscribe to transition events."""
+        self._listeners.append(listener)
 
-    async def shutdown_all(self, reason: str) -> None:
-        """Graceful shutdown in reverse dependency order with drain."""
-        shutdown_seq = self._journal.fenced_write(
-            "shutdown_initiated", "control_plane",
-            payload={"reason": reason},
-        )
-
-        waves = compute_waves(tuple(self._components.values()))
-        reverse_waves = list(reversed(waves))
-
-        for wave_idx, wave in enumerate(reverse_waves):
-            active = [
-                c for c in wave
-                if self._statuses.get(c.name)
-                in ("READY", "DEGRADED", "STARTING", "HANDSHAKING")
-            ]
-            if not active:
-                continue
-
-            # Phase 1: DRAINING
-            drain_tasks = []
-            for comp in active:
-                drain_tasks.append(
-                    self._drain_single(comp, shutdown_seq)
-                )
-            await asyncio.gather(*drain_tasks, return_exceptions=True)
-
-            # Phase 2: STOPPING
-            stop_tasks = []
-            for comp in active:
-                stop_tasks.append(
-                    self._stop_single(comp, shutdown_seq)
-                )
-            await asyncio.gather(*stop_tasks, return_exceptions=True)
-
-    async def _drain_single(
-        self, comp: ComponentDeclaration, trigger_seq: int,
-    ) -> None:
-        current = self._statuses.get(comp.name, "REGISTERED")
-        if current not in VALID_TRANSITIONS or "DRAINING" not in VALID_TRANSITIONS.get(current, set()):
-            return
-
-        await self.transition_component(
-            comp.name, "DRAINING",
-            reason="shutdown_requested",
-            trigger_seq=trigger_seq,
-        )
-
-        drain_hook = self._drain_hooks.get(comp.name)
-        if drain_hook:
+    def _notify_listeners(self, old: KernelState, event: LifecycleEvent,
+                          new: KernelState) -> None:
+        """Notify listeners. Failures are isolated."""
+        for listener in self._listeners:
             try:
-                await asyncio.wait_for(drain_hook(), timeout=comp.drain_timeout_s)
-            except asyncio.TimeoutError:
-                logger.warning("[Engine] %s drain timed out", comp.name)
+                listener(old, event, new)
             except Exception as e:
-                logger.warning("[Engine] %s drain error: %s", comp.name, e)
-
-    async def _stop_single(
-        self, comp: ComponentDeclaration, trigger_seq: int,
-    ) -> None:
-        current = self._statuses.get(comp.name, "REGISTERED")
-        if current not in VALID_TRANSITIONS or "STOPPING" not in VALID_TRANSITIONS.get(current, set()):
-            return
-
-        await self.transition_component(
-            comp.name, "STOPPING",
-            reason="drain_complete",
-            trigger_seq=trigger_seq,
-        )
-
-        driver = self._drivers.get(comp.locality)
-        if driver:
-            try:
-                await asyncio.wait_for(driver.stop(comp.name), timeout=10.0)
-            except Exception as e:
-                logger.warning("[Engine] %s stop error: %s", comp.name, e)
-
-        await self.transition_component(
-            comp.name, "STOPPED",
-            reason="terminated",
-            trigger_seq=trigger_seq,
-        )
-
-    # ── Recovery ────────────────────────────────────────────────
-
-    async def recover_from_journal(self) -> None:
-        """Rebuild state from journal and reconcile with reality."""
-        states = self._journal.get_all_component_states()
-
-        for name, state in states.items():
-            if name in self._statuses:
-                self._statuses[name] = state["status"]
-                logger.info(
-                    "[Engine] Recovered %s -> %s from journal",
-                    name, state["status"],
+                _logger.warning(
+                    "[LifecycleEngine] Listener %s failed: %s",
+                    getattr(listener, '__name__', repr(listener)), e,
                 )
+
+    def _state_to_phase(self) -> LifecyclePhase:
+        _MAP = {
+            KernelState.INITIALIZING: LifecyclePhase.PRECHECK,
+            KernelState.PREFLIGHT: LifecyclePhase.PRECHECK,
+            KernelState.STARTING_RESOURCES: LifecyclePhase.BRINGUP,
+            KernelState.STARTING_BACKEND: LifecyclePhase.BRINGUP,
+            KernelState.STARTING_INTELLIGENCE: LifecyclePhase.BRINGUP,
+            KernelState.STARTING_TRINITY: LifecyclePhase.BRINGUP,
+            KernelState.RUNNING: LifecyclePhase.RUNNING,
+            KernelState.SHUTTING_DOWN: LifecyclePhase.STOPPING,
+            KernelState.STOPPED: LifecyclePhase.STOPPED,
+            KernelState.FAILED: LifecyclePhase.STOPPED,
+        }
+        return _MAP.get(self._state, LifecyclePhase.RUNNING)
