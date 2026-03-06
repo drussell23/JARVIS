@@ -75033,16 +75033,22 @@ class JarvisSystemKernel:
             try:
                 dashboard = get_live_dashboard()
                 dashboard.stop()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Startup] dashboard update: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
             # Voice narrator error announcement
             if self._narrator:
                 try:
                     _err_msg = f"{type(e).__name__}: {e!r}" if not str(e) else str(e)
                     await self._narrator.narrate_error(_err_msg, critical=True)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] voice narrator: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
             issue_collector.print_health_report()
             if self.config.debug:
                 issue_collector.print_tracebacks()
@@ -75181,8 +75187,11 @@ class JarvisSystemKernel:
                 _tk_cpu = _tk_ps.cpu_percent(interval=None)
                 if _tk_cpu > 90.0:
                     _takeover_timeout *= 1.0 + (_tk_cpu - 90.0) / 10.0 * 2.0
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Startup] config read: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
             takeover = IntelligentKernelTakeover(
                 startup_lock=self._startup_lock,
                 logger=self.logger,
@@ -75308,8 +75317,11 @@ class JarvisSystemKernel:
             if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                 try:
                     log_startup_checkpoint("lock_acquired")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] diagnostic checkpoint: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
 
             # Initialize managers
             self._readiness_manager = ProgressiveReadinessManager(self.config, self.logger)
@@ -75440,8 +75452,11 @@ class JarvisSystemKernel:
             if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                 try:
                     log_startup_checkpoint("preflight_complete")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] diagnostic checkpoint: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
 
             # v210.0: Single point for preflight completion
             # preflight is marked complete ONLY here, at the end of the preflight phase
@@ -75472,8 +75487,11 @@ class JarvisSystemKernel:
                                     name=_comp_name,
                                     health_check_fn=lambda cn=_comp_name: self._component_health_check(cn),
                                 )
-                            except Exception:
-                                pass
+                            except Exception as _exc:
+                                self.logger.debug(
+                                    "[Startup] health subsystem registration: %s: %s",
+                                    type(_exc).__name__, _exc,
+                                )
                 except Exception as _ssr_e:
                     self.logger.warning(f"[Kernel] Phase 1 SSR activation error: {_ssr_e}")
 
@@ -75684,8 +75702,11 @@ class JarvisSystemKernel:
                         await asyncio.wait_for(proc.wait(), timeout=5.0)
                     except asyncio.TimeoutError:
                         proc.kill()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.warning(
+                    "[Startup] cleanup: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
         if self.config.voice_sidecar_enabled:
             self._update_component_status(
@@ -75782,8 +75803,11 @@ class JarvisSystemKernel:
             if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                 try:
                     log_startup_checkpoint("resources_start")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] diagnostic checkpoint: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
 
             # =====================================================================
             # v207.0: STARTUP RESILIENCE COORDINATOR
