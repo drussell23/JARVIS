@@ -5,6 +5,7 @@
     "github@claude-plugins-official": false,
     "figma@claude-plugins-official": true,
     "greptile@claude-plugins-official": true,
-    "superpowers@claude-plugins-official": true
+    "superpowers@claude-plugins-official": true,
+    "security-guidance@claude-plugins-official": true
   }
 }
