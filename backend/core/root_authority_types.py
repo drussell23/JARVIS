@@ -17,7 +17,7 @@ import json
 import random
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Module-level constants
@@ -65,6 +65,61 @@ _TERMINAL_STATES = frozenset({
     SubsystemState.CRASHED,
     SubsystemState.REJECTED,
 })
+
+
+class RequiredTier(Enum):
+    """How critical a resource is to system operation."""
+
+    REQUIRED = "required"
+    ENHANCEMENT = "enhancement"
+    OPTIONAL = "optional"
+
+
+class RecoveryAction(Enum):
+    """Actions the verdict system may recommend for a failed resource."""
+
+    NONE = "none"
+    RETRY = "retry"
+    ROUTE_TO_GCP = "route_to_gcp"
+    ROUTE_TO_LOCAL = "route_to_local"
+    MANUAL = "manual"
+    RESTART_MANAGER = "restart_manager"
+    DEFERRED_RECOVERY = "deferred_recovery"
+
+
+class VerdictReasonCode(Enum):
+    """Controlled vocabulary for resource verdict reasons."""
+
+    HEALTHY = "healthy"
+    DISABLED_BY_CONFIG = "disabled_by_config"
+    NOT_INSTALLED = "not_installed"
+    MEMORY_ADMISSION_CLOUD_FIRST = "memory_admission_cloud_first"
+    MEMORY_ADMISSION_CLOUD_ONLY = "memory_admission_cloud_only"
+    PREFLIGHT_TIMEOUT = "preflight_timeout"
+    INIT_TIMEOUT = "init_timeout"
+    INIT_EXCEPTION = "init_exception"
+    INIT_RETURNED_FALSE = "init_returned_false"
+    PORT_CONFLICT = "port_conflict"
+    GCP_CLIENT_UNAVAILABLE = "gcp_client_unavailable"
+    CIRCUIT_BREAKER_OPEN = "circuit_breaker_open"
+    DEPENDENCY_MISSING = "dependency_missing"
+    STALE_EPOCH = "stale_epoch"
+    UNKNOWN = "unknown"
+
+
+# Severity lattice: maps each SubsystemState to an integer severity level.
+# 0 = healthy, 1 = degraded, 2 = stopped/rejected, 3 = crashed.
+SEVERITY_MAP: Mapping[SubsystemState, int] = {
+    SubsystemState.READY: 0,
+    SubsystemState.ALIVE: 0,
+    SubsystemState.STARTING: 0,
+    SubsystemState.HANDSHAKE: 0,
+    SubsystemState.DEGRADED: 1,
+    SubsystemState.DRAINING: 1,
+    SubsystemState.STOPPED: 2,
+    SubsystemState.REJECTED: 2,
+    SubsystemState.CRASHED: 3,
+}
 
 # ---------------------------------------------------------------------------
 # Frozen dataclasses (immutable value objects)

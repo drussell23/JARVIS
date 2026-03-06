@@ -437,3 +437,80 @@ class TestUtilityFunctions:
         id1 = compute_incident_id("sub", ident, "RC", t1)
         id2 = compute_incident_id("sub", ident, "RC", t2)
         assert id1 != id2
+
+
+class TestRequiredTier:
+    def test_enum_values(self):
+        from backend.core.root_authority_types import RequiredTier
+        assert RequiredTier.REQUIRED.value == "required"
+        assert RequiredTier.ENHANCEMENT.value == "enhancement"
+        assert RequiredTier.OPTIONAL.value == "optional"
+
+    def test_enum_count(self):
+        from backend.core.root_authority_types import RequiredTier
+        assert len(RequiredTier) == 3
+
+
+class TestRecoveryAction:
+    def test_enum_values(self):
+        from backend.core.root_authority_types import RecoveryAction
+        assert RecoveryAction.NONE.value == "none"
+        assert RecoveryAction.RETRY.value == "retry"
+        assert RecoveryAction.ROUTE_TO_GCP.value == "route_to_gcp"
+        assert RecoveryAction.ROUTE_TO_LOCAL.value == "route_to_local"
+        assert RecoveryAction.MANUAL.value == "manual"
+        assert RecoveryAction.RESTART_MANAGER.value == "restart_manager"
+        assert RecoveryAction.DEFERRED_RECOVERY.value == "deferred_recovery"
+
+    def test_enum_count(self):
+        from backend.core.root_authority_types import RecoveryAction
+        assert len(RecoveryAction) == 7
+
+
+class TestVerdictReasonCode:
+    def test_controlled_vocabulary(self):
+        from backend.core.root_authority_types import VerdictReasonCode
+        assert VerdictReasonCode.HEALTHY.value == "healthy"
+        assert VerdictReasonCode.DISABLED_BY_CONFIG.value == "disabled_by_config"
+        assert VerdictReasonCode.NOT_INSTALLED.value == "not_installed"
+        assert VerdictReasonCode.MEMORY_ADMISSION_CLOUD_FIRST.value == "memory_admission_cloud_first"
+        assert VerdictReasonCode.MEMORY_ADMISSION_CLOUD_ONLY.value == "memory_admission_cloud_only"
+        assert VerdictReasonCode.PREFLIGHT_TIMEOUT.value == "preflight_timeout"
+        assert VerdictReasonCode.INIT_TIMEOUT.value == "init_timeout"
+        assert VerdictReasonCode.INIT_EXCEPTION.value == "init_exception"
+        assert VerdictReasonCode.INIT_RETURNED_FALSE.value == "init_returned_false"
+        assert VerdictReasonCode.PORT_CONFLICT.value == "port_conflict"
+        assert VerdictReasonCode.GCP_CLIENT_UNAVAILABLE.value == "gcp_client_unavailable"
+        assert VerdictReasonCode.CIRCUIT_BREAKER_OPEN.value == "circuit_breaker_open"
+        assert VerdictReasonCode.DEPENDENCY_MISSING.value == "dependency_missing"
+        assert VerdictReasonCode.STALE_EPOCH.value == "stale_epoch"
+        assert VerdictReasonCode.UNKNOWN.value == "unknown"
+
+    def test_enum_count(self):
+        from backend.core.root_authority_types import VerdictReasonCode
+        assert len(VerdictReasonCode) == 15
+
+
+class TestSeverityMap:
+    def test_ready_is_zero(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.READY] == 0
+
+    def test_degraded_is_one(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.DEGRADED] == 1
+
+    def test_crashed_is_three(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.CRASHED] == 3
+
+    def test_all_states_have_severity(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        for state in SubsystemState:
+            assert state in SEVERITY_MAP, f"{state} missing from SEVERITY_MAP"
+
+    def test_lattice_ordering(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.READY] < SEVERITY_MAP[SubsystemState.DEGRADED]
+        assert SEVERITY_MAP[SubsystemState.DEGRADED] < SEVERITY_MAP[SubsystemState.REJECTED]
+        assert SEVERITY_MAP[SubsystemState.REJECTED] < SEVERITY_MAP[SubsystemState.CRASHED]
