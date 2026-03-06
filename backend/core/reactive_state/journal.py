@@ -95,6 +95,31 @@ _SELECT_MAX_REVISION = """\
 SELECT MAX(global_revision) FROM state_journal
 """
 
+_CREATE_CURSOR_TABLE = """\
+CREATE TABLE IF NOT EXISTS publish_cursor (
+    id              INTEGER PRIMARY KEY CHECK (id = 1),
+    last_published  INTEGER NOT NULL DEFAULT 0
+)
+"""
+
+_UPSERT_CURSOR = """\
+INSERT INTO publish_cursor (id, last_published) VALUES (1, ?)
+ON CONFLICT(id) DO UPDATE SET last_published = excluded.last_published
+"""
+
+_SELECT_CURSOR = """\
+SELECT last_published FROM publish_cursor WHERE id = 1
+"""
+
+_SELECT_UNPUBLISHED = """\
+SELECT global_revision, key, value, previous_value, version, epoch,
+       writer, writer_session_id, origin, consistency_group,
+       timestamp_unix_ms, checksum
+FROM state_journal
+WHERE global_revision > ?
+ORDER BY global_revision
+"""
+
 
 # ── Checksum ───────────────────────────────────────────────────────────
 
@@ -166,6 +191,7 @@ class AppendOnlyJournal:
         self._conn.execute(_CREATE_TABLE)
         self._conn.execute(_CREATE_INDEX_KEY)
         self._conn.execute(_CREATE_INDEX_EPOCH)
+        self._conn.execute(_CREATE_CURSOR_TABLE)
         self._conn.commit()
 
         # Resume: pick up where the last session left off.
@@ -344,6 +370,36 @@ class AppendOnlyJournal:
                     f"(expected {expected})"
                 )
         return gaps
+
+    def get_publish_cursor(self) -> int:
+        """Return the last published revision, or 0 if none published yet."""
+        assert self._conn is not None, "Journal not opened"
+        cur = self._conn.execute(_SELECT_CURSOR)
+        row = cur.fetchone()
+        return row[0] if row is not None else 0
+
+    def advance_publish_cursor(self, revision: int) -> None:
+        """Advance the publish cursor to *revision*.
+
+        Raises ``ValueError`` if *revision* is less than the current cursor
+        (cursor is monotonic-only).
+        """
+        assert self._conn is not None, "Journal not opened"
+        with self._lock:
+            current = self.get_publish_cursor()
+            if revision < current:
+                raise ValueError(
+                    f"Publish cursor is monotonic: cannot move from {current} to {revision}"
+                )
+            self._conn.execute(_UPSERT_CURSOR, (revision,))
+            self._conn.commit()
+
+    def read_unpublished(self) -> List[JournalEntry]:
+        """Return all journal entries with revision > publish cursor."""
+        assert self._conn is not None, "Journal not opened"
+        cursor = self.get_publish_cursor()
+        cur = self._conn.execute(_SELECT_UNPUBLISHED, (cursor,))
+        return [self._row_to_entry(row) for row in cur.fetchall()]
 
     # ── internals ─────────────────────────────────────────────────────
 
