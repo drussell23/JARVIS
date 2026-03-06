@@ -174,3 +174,63 @@ class StateEventEmitter:
             "published": self._published_count,
             "failed": self._failed_count,
         }
+
+
+# -- Reconciler --------------------------------------------------------------
+
+
+class PublishReconciler:
+    """Background reconciler that replays unpublished journal entries.
+
+    On crash recovery, the publish cursor may lag behind the journal's
+    latest revision.  The reconciler reads ``journal.read_unpublished()``
+    and publishes each entry via the ``StateEventEmitter``, stopping
+    on first failure so the cursor reflects exactly what was delivered.
+
+    Parameters
+    ----------
+    journal:
+        The journal instance (for reading unpublished entries).
+    emitter:
+        The event emitter (for publishing and cursor advancement).
+    """
+
+    def __init__(
+        self,
+        *,
+        journal: AppendOnlyJournal,
+        emitter: StateEventEmitter,
+    ) -> None:
+        self._journal = journal
+        self._emitter = emitter
+        self._reconciled_count: int = 0
+        self._reconcile_runs: int = 0
+
+    async def reconcile_once(self) -> int:
+        """Publish all unpublished entries, stopping on first failure.
+
+        Returns the number of entries successfully published in this run.
+        """
+        unpublished = self._journal.read_unpublished()
+        published_this_run = 0
+
+        for entry in unpublished:
+            ok = await self._emitter.publish(entry)
+            if not ok:
+                logger.warning(
+                    "Reconciler stopping at revision %d after publish failure",
+                    entry.global_revision,
+                )
+                break
+            published_this_run += 1
+
+        self._reconciled_count += published_this_run
+        self._reconcile_runs += 1
+        return published_this_run
+
+    def stats(self) -> Dict[str, int]:
+        """Return reconciler statistics."""
+        return {
+            "reconciled": self._reconciled_count,
+            "reconcile_runs": self._reconcile_runs,
+        }
