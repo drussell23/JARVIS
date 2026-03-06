@@ -358,6 +358,8 @@ class StartupOrchestrator:
             self._fsm.rollback(cause)
             if self._hybrid_router is not None:
                 self._hybrid_router.set_active(False)
+            if self._prime_router is not None and hasattr(self._prime_router, "set_mirror_mode"):
+                self._prime_router.set_mirror_mode(False)
 
         await self._emit(
             event_type="lease_loss",

@@ -25,7 +25,7 @@ class AlwaysPassProber:
         return HandshakeResult(step=HandshakeStep.WARM_MODEL, passed=True)
 
 
-class TestScenarioA_LeassLossDuringBoot:
+class TestScenarioA_LeaseLossDuringBoot:
     """Lease revoked while still in BOOT_POLICY_ACTIVE."""
 
     async def test_lease_loss_during_boot(self):
@@ -45,7 +45,7 @@ class TestScenarioA_LeassLossDuringBoot:
         assert decision != BootRoutingDecision.GCP_PRIME
 
 
-class TestScenarioB_LeassLossPostHandoff:
+class TestScenarioB_LeaseLossPostHandoff:
     """Lease revoked after handoff to HYBRID_ACTIVE."""
 
     async def test_lease_loss_post_handoff(self):
