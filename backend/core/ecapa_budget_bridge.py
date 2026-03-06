@@ -24,6 +24,7 @@ from backend.core.startup_budget_policy import (
     StartupBudgetPolicy,
 )
 from backend.core.startup_concurrency_budget import HeavyTaskCategory
+from backend.core.startup_telemetry import StartupEventBus
 
 __all__ = [
     "BudgetTokenState",
@@ -124,6 +125,7 @@ class EcapaBudgetBridge:
         self._session_id: str = str(uuid.uuid4())
         self._budget_policy: Optional[StartupBudgetPolicy] = None
         self._budget_contexts: dict[str, Any] = {}  # token_id -> context manager
+        self._event_bus: Optional[StartupEventBus] = None
 
     @classmethod
     def get_instance(cls) -> EcapaBudgetBridge:
@@ -143,6 +145,34 @@ class EcapaBudgetBridge:
     def set_budget_policy(self, policy: StartupBudgetPolicy) -> None:
         """Inject the :class:`StartupBudgetPolicy` used for slot acquisition."""
         self._budget_policy = policy
+
+    # -- Telemetry event bus ------------------------------------------------
+
+    def set_event_bus(self, bus: StartupEventBus) -> None:
+        """Inject the telemetry event bus."""
+        self._event_bus = bus
+
+    def _emit(self, event_type: str, detail: dict) -> None:
+        """Best-effort telemetry event emission.
+
+        Appends to bus history synchronously for immediate visibility.
+        Consumer notification happens when the bus's async ``emit()`` is
+        used by the integration layer (Tasks 5–6).
+
+        NOTE: Accesses ``_event_bus._history`` directly because ``emit()``
+        is async and this method is called from synchronous code paths.
+        """
+        if self._event_bus is None:
+            return
+        try:
+            event = self._event_bus.create_event(
+                event_type=event_type,
+                detail=detail,
+                phase="ecapa_budget",
+            )
+            self._event_bus._history.append(event)
+        except Exception:
+            _log.debug("Telemetry emit failed for %s", event_type, exc_info=True)
 
     # -- Budget slot acquisition --------------------------------------------
 
@@ -192,6 +222,12 @@ class EcapaBudgetBridge:
         token_id = str(uuid.uuid4())
         now = time.monotonic()
 
+        self._emit("ecapa_budget.acquire_attempt", {
+            "category": category.name,
+            "name": name,
+            "timeout_s": timeout_s,
+        })
+
         if self._budget_policy is None:
             # Degraded mode — no policy, create ungated token
             _log.warning(
@@ -210,6 +246,10 @@ class EcapaBudgetBridge:
             self._tokens[token_id] = token
             if category is HeavyTaskCategory.MODEL_LOAD:
                 self._active_model_load_count += 1
+            self._emit("ecapa_budget.acquire_granted", {
+                "token_id": token_id,
+                "category": category.name,
+            })
             return token
 
         # Delegate to policy
@@ -217,8 +257,14 @@ class EcapaBudgetBridge:
         try:
             await ctx.__aenter__()
         except PreconditionNotMetError:
+            self._emit("ecapa_budget.acquire_denied", {
+                "reason": "phase_blocked",
+            })
             return EcapaBudgetRejection.PHASE_BLOCKED
         except BudgetAcquisitionError:
+            self._emit("ecapa_budget.acquire_denied", {
+                "reason": "budget_timeout",
+            })
             return EcapaBudgetRejection.BUDGET_TIMEOUT
 
         # Success — create and track token
@@ -233,6 +279,10 @@ class EcapaBudgetBridge:
         self._budget_contexts[token_id] = ctx
         if category is HeavyTaskCategory.MODEL_LOAD:
             self._active_model_load_count += 1
+        self._emit("ecapa_budget.acquire_granted", {
+            "token_id": token_id,
+            "category": category.name,
+        })
         return token
 
     # -- Token lifecycle methods --------------------------------------------
@@ -250,6 +300,10 @@ class EcapaBudgetBridge:
             )
         token.state = BudgetTokenState.TRANSFERRED
         token.transferred_at = time.monotonic()
+        self._emit("ecapa_budget.transfer", {
+            "token_id": token.token_id,
+            "category": token.category.name,
+        })
         return token
 
     def reuse_token(
@@ -269,6 +323,10 @@ class EcapaBudgetBridge:
             )
         token.state = BudgetTokenState.REUSED
         token.last_heartbeat_at = time.monotonic()
+        self._emit("ecapa_budget.reuse", {
+            "token_id": token.token_id,
+            "requester_session_id": requester_session_id,
+        })
         return token
 
     def heartbeat(self, token: BudgetToken) -> None:
@@ -285,6 +343,10 @@ class EcapaBudgetBridge:
             return
         token.state = BudgetTokenState.RELEASED
         token.released_at = time.monotonic()
+        self._emit("ecapa_budget.release", {
+            "token_id": token.token_id,
+            "category": token.category.name,
+        })
         if token.category is HeavyTaskCategory.MODEL_LOAD:
             self._active_model_load_count = max(
                 0, self._active_model_load_count - 1
@@ -343,6 +405,10 @@ class EcapaBudgetBridge:
                     self._active_model_load_count = max(
                         0, self._active_model_load_count - 1
                     )
+                self._emit("ecapa_budget.expire_cleanup", {
+                    "token_id": token.token_id,
+                    "category": token.category.name,
+                })
                 expired_count += 1
 
         return expired_count
@@ -356,6 +422,9 @@ class EcapaBudgetBridge:
         """
         if self._active_model_load_count > 1:
             self._frozen = True
+            self._emit("ecapa_budget.invariant_violation", {
+                "count": self._active_model_load_count,
+            })
             _log.critical(
                 "ECAPA budget invariant violated: "
                 "_active_model_load_count=%d (>1). Bridge frozen.",

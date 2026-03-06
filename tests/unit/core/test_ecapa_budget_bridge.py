@@ -21,6 +21,26 @@ from backend.core.ecapa_budget_bridge import (
 from backend.core.startup_budget_policy import StartupBudgetPolicy
 from backend.core.startup_concurrency_budget import HeavyTaskCategory
 from backend.core.startup_config import BudgetConfig, SoftGatePrecondition
+from backend.core.startup_telemetry import StartupEventBus
+
+
+@pytest.fixture
+def budget_policy() -> StartupBudgetPolicy:
+    config = BudgetConfig(
+        max_hard_concurrent=1,
+        max_total_concurrent=3,
+        hard_gate_categories=["MODEL_LOAD", "REACTOR_LAUNCH", "SUBPROCESS_SPAWN"],
+        soft_gate_categories=["ML_INIT", "GCP_PROVISION"],
+        soft_gate_preconditions={
+            "ML_INIT": SoftGatePrecondition(
+                require_phase="CORE_READY",
+                require_memory_stable_s=0.0,
+                memory_slope_threshold_mb_s=999.0,
+            ),
+        },
+        max_wait_s=5.0,
+    )
+    return StartupBudgetPolicy(config)
 
 
 class TestCoreTypes:
@@ -283,24 +303,6 @@ class TestBudgetSlotAcquisition:
         bridge._init_internal()
         return bridge
 
-    @pytest.fixture
-    def budget_policy(self) -> StartupBudgetPolicy:
-        config = BudgetConfig(
-            max_hard_concurrent=1,
-            max_total_concurrent=3,
-            hard_gate_categories=["MODEL_LOAD", "REACTOR_LAUNCH", "SUBPROCESS_SPAWN"],
-            soft_gate_categories=["ML_INIT", "GCP_PROVISION"],
-            soft_gate_preconditions={
-                "ML_INIT": SoftGatePrecondition(
-                    require_phase="CORE_READY",
-                    require_memory_stable_s=0.0,
-                    memory_slope_threshold_mb_s=999.0,
-                ),
-            },
-            max_wait_s=5.0,
-        )
-        return StartupBudgetPolicy(config)
-
     # 1. acquire probe slot success
     @pytest.mark.asyncio
     async def test_acquire_probe_slot_success(
@@ -398,3 +400,84 @@ class TestBudgetSlotAcquisition:
 
         bridge.release(third)
         await asyncio.sleep(0.05)
+
+
+class TestTelemetryEmission:
+    """Every bridge action emits a canonical event to the bus."""
+
+    @pytest.mark.asyncio
+    async def test_acquire_emits_events(self, budget_policy):
+        """acquire_probe_slot emits acquire_attempt + acquire_granted."""
+        bus = StartupEventBus(trace_id="test-trace")
+        bridge = EcapaBudgetBridge.__new__(EcapaBudgetBridge)
+        bridge._init_internal()
+        bridge._budget_policy = budget_policy
+        bridge._event_bus = bus
+        budget_policy.signal_phase_reached("CORE_READY")
+
+        token = await bridge.acquire_probe_slot(timeout_s=2.0)
+        assert isinstance(token, BudgetToken)
+
+        event_types = [e.event_type for e in bus.event_history]
+        assert "ecapa_budget.acquire_attempt" in event_types
+        assert "ecapa_budget.acquire_granted" in event_types
+
+        bridge.release(token)
+
+    @pytest.mark.asyncio
+    async def test_denied_emits_denied_event(self, budget_policy):
+        """Denied acquisition emits acquire_attempt + acquire_denied."""
+        bus = StartupEventBus(trace_id="test-trace")
+        bridge = EcapaBudgetBridge.__new__(EcapaBudgetBridge)
+        bridge._init_internal()
+        bridge._budget_policy = budget_policy
+        bridge._event_bus = bus
+        # Do NOT signal CORE_READY — probe will be phase-blocked
+
+        result = await bridge.acquire_probe_slot(timeout_s=2.0)
+        assert result is EcapaBudgetRejection.PHASE_BLOCKED
+
+        event_types = [e.event_type for e in bus.event_history]
+        assert "ecapa_budget.acquire_attempt" in event_types
+        assert "ecapa_budget.acquire_denied" in event_types
+        # Check denial detail contains reason
+        denied_events = [e for e in bus.event_history if e.event_type == "ecapa_budget.acquire_denied"]
+        assert denied_events[0].detail["reason"] == "phase_blocked"
+
+    @pytest.mark.asyncio
+    async def test_release_emits_event(self, budget_policy):
+        """release() emits ecapa_budget.release event."""
+        bus = StartupEventBus(trace_id="test-trace")
+        bridge = EcapaBudgetBridge.__new__(EcapaBudgetBridge)
+        bridge._init_internal()
+        bridge._budget_policy = budget_policy
+        bridge._event_bus = bus
+        budget_policy.signal_phase_reached("CORE_READY")
+
+        token = await bridge.acquire_probe_slot(timeout_s=2.0)
+        assert isinstance(token, BudgetToken)
+        bridge.release(token)
+
+        event_types = [e.event_type for e in bus.event_history]
+        assert "ecapa_budget.release" in event_types
+
+    def test_transfer_emits_event(self):
+        """transfer_token emits ecapa_budget.transfer event."""
+        bus = StartupEventBus(trace_id="test-trace")
+        bridge = EcapaBudgetBridge.__new__(EcapaBudgetBridge)
+        bridge._init_internal()
+        bridge._event_bus = bus
+
+        token = BudgetToken(
+            token_id="tel-test",
+            owner_session_id="s1",
+            state=BudgetTokenState.ACQUIRED,
+            category=HeavyTaskCategory.MODEL_LOAD,
+            acquired_at=time.monotonic(),
+        )
+        bridge._tokens[token.token_id] = token
+        bridge._active_model_load_count = 1
+        bridge.transfer_token(token)
+
+        event_types = [e.event_type for e in bus.event_history]
+        assert "ecapa_budget.transfer" in event_types
