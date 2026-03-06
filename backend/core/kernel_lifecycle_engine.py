@@ -74,7 +74,8 @@ VALID_TRANSITIONS: Dict[Tuple[KernelState, LifecycleEvent], KernelState] = {
     (KernelState.STARTING_INTELLIGENCE, LifecycleEvent.TRINITY_START): KernelState.STARTING_TRINITY,
     (KernelState.STARTING_TRINITY, LifecycleEvent.READY):             KernelState.RUNNING,
 
-    # Shutdown from any active state
+    # Shutdown from any active state (including INITIALIZING for emergency paths)
+    (KernelState.INITIALIZING, LifecycleEvent.SHUTDOWN):              KernelState.SHUTTING_DOWN,
     (KernelState.RUNNING, LifecycleEvent.SHUTDOWN):                   KernelState.SHUTTING_DOWN,
     (KernelState.PREFLIGHT, LifecycleEvent.SHUTDOWN):                 KernelState.SHUTTING_DOWN,
     (KernelState.STARTING_RESOURCES, LifecycleEvent.SHUTDOWN):        KernelState.SHUTTING_DOWN,

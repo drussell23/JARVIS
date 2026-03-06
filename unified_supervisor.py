@@ -66236,7 +66236,12 @@ class JarvisSystemKernel:
         self.config = config or SystemKernelConfig()
         self.logger = UnifiedLogger()
         self._force = force
-        self._state = KernelState.INITIALIZING
+        from backend.core.kernel_lifecycle_engine import LifecycleEngine, LifecycleEvent
+        from backend.core.lifecycle_exceptions import TransitionRejected
+        self._lifecycle_engine = LifecycleEngine()
+        self._state = self._lifecycle_engine.state  # backward compat: KernelState.INITIALIZING
+        self._LifecycleEvent = LifecycleEvent  # store ref for use in methods
+        self._TransitionRejected = TransitionRejected  # store ref for use in methods
         self._started_at: Optional[float] = None
         self._initialized = True
 
@@ -68548,7 +68553,14 @@ class JarvisSystemKernel:
         self.logger.warning(
             f"[Kernel] ⚠️ Emergency shutdown initiated (reason={reason}, expected={expected})"
         )
-        self._state = KernelState.SHUTTING_DOWN
+        try:
+            self._state = self._lifecycle_engine.transition(
+                self._LifecycleEvent.SHUTDOWN,
+                actor="supervisor",
+                reason=f"emergency:{reason}",
+            )
+        except self._TransitionRejected:
+            self.logger.info("[Lifecycle] Transition to SHUTTING_DOWN rejected (already in progress)")
         self._begin_shutdown(f"emergency:{reason}")
 
         # v258.4: Publish shutdown phase to Trinity IPC for cross-repo consumers.
@@ -69241,7 +69253,14 @@ class JarvisSystemKernel:
         except Exception as _pr_err:
             self.logger.debug(f"[Kernel] v266.2: ProgressReporter close error: {_pr_err}")
 
-        self._state = KernelState.STOPPED
+        try:
+            self._state = self._lifecycle_engine.transition(
+                self._LifecycleEvent.STOPPED,
+                actor="supervisor",
+                reason="emergency shutdown complete",
+            )
+        except self._TransitionRejected:
+            self.logger.info("[Lifecycle] Transition to STOPPED rejected (already in progress)")
         self.logger.warning("[Kernel] ⚠️ Emergency shutdown complete")
 
     async def _stop_orphan_singleton_health_loops(self, timeout_s: float = 3.0) -> None:
@@ -69810,7 +69829,14 @@ class JarvisSystemKernel:
                         _trace_boot_failed(error=f"progress_controller_timeout: {e}", phase=_timeout_phase)
                 except Exception:
                     pass
-            self._state = KernelState.FAILED
+            try:
+                self._state = self._lifecycle_engine.transition(
+                    self._LifecycleEvent.FATAL,
+                    actor="supervisor",
+                    reason="startup timeout",
+                )
+            except self._TransitionRejected:
+                self.logger.info("[Lifecycle] Transition to FAILED rejected (already in progress)")
             return 1
 
     # v228.1: ASCII art logo (compact, no FIGlet dependency)
@@ -74652,7 +74678,11 @@ class JarvisSystemKernel:
                     # Fall through to default (True) - don't block startup due to predicate errors
 
             # Mark as running with appropriate readiness tier
-            self._state = KernelState.RUNNING
+            self._state = self._lifecycle_engine.transition(
+                self._LifecycleEvent.READY,
+                actor="supervisor",
+                reason="all phases complete",
+            )
 
             if readiness_is_fully_ready:
                 # All critical components healthy - mark FULLY_READY
@@ -74961,7 +74991,14 @@ class JarvisSystemKernel:
                         )
                 except Exception:
                     pass
-            self._state = KernelState.FAILED
+            try:
+                self._state = self._lifecycle_engine.transition(
+                    self._LifecycleEvent.FATAL,
+                    actor="supervisor",
+                    reason="startup exception",
+                )
+            except self._TransitionRejected:
+                self.logger.info("[Lifecycle] Transition to FAILED rejected (already in progress)")
             return 1
 
     async def _phase_preflight(self) -> bool:
@@ -74979,7 +75016,11 @@ class JarvisSystemKernel:
         - Initialize IPC server
         - Install signal handlers
         """
-        self._state = KernelState.PREFLIGHT
+        self._state = self._lifecycle_engine.transition(
+            self._LifecycleEvent.PREFLIGHT_START,
+            actor="supervisor",
+            reason="boot",
+        )
 
         with self.logger.section_start(LogSection.BOOT, "Zone 5.1 | Phase 1: Preflight"):
             # =====================================================================
@@ -75596,7 +75637,11 @@ class JarvisSystemKernel:
         - Dynamic port allocation
         - Storage tiers
         """
-        self._state = KernelState.STARTING_RESOURCES
+        self._state = self._lifecycle_engine.transition(
+            self._LifecycleEvent.BRINGUP_START,
+            actor="supervisor",
+            reason="resources",
+        )
         self._update_component_status("resources", "running", "Initializing resource managers")
 
         # v183.0: Resource initialization timeout - increased from 60s to 300s
@@ -76720,7 +76765,11 @@ class JarvisSystemKernel:
         The readiness predicate checks _component_status["backend"], so we MUST
         update it here after health check passes.
         """
-        self._state = KernelState.STARTING_BACKEND
+        self._state = self._lifecycle_engine.transition(
+            self._LifecycleEvent.BACKEND_START,
+            actor="supervisor",
+            reason="backend",
+        )
 
         # v270.1: Phase 3 memory gate — delegates to centralized _reevaluate_mode_at_boundary.
         # Phase-specific post-action: set BACKEND_MINIMAL when critically low.
@@ -77740,7 +77789,11 @@ class JarvisSystemKernel:
             self.logger.info("[Kernel] Intelligence phase skipped — kernel shutting down")
             return False
 
-        self._state = KernelState.STARTING_INTELLIGENCE
+        self._state = self._lifecycle_engine.transition(
+            self._LifecycleEvent.INTEL_START,
+            actor="supervisor",
+            reason="intelligence",
+        )
         self._update_component_status("intelligence", "running", "Initializing intelligence layer")
 
         with self.logger.section_start(LogSection.INTELLIGENCE, "Zone 4 | Phase 4: Intelligence"):
@@ -83187,7 +83240,11 @@ class JarvisSystemKernel:
         - J-Prime (local LLM inference or Hollow Client routing to GCP)
         - Reactor-Core (training pipeline)
         """
-        self._state = KernelState.STARTING_TRINITY
+        self._state = self._lifecycle_engine.transition(
+            self._LifecycleEvent.TRINITY_START,
+            actor="supervisor",
+            reason="trinity",
+        )
 
         # v266.0: Single authoritative Trinity phase deadline.
         # All sub-waits in this phase are capped by remaining budget so we do not
@@ -86453,10 +86510,17 @@ class JarvisSystemKernel:
             
             # Trigger shutdown
             self._shutdown_event.set()
-            
+
             # Update state
-            self._state = KernelState.FAILED
-            
+            try:
+                self._state = self._lifecycle_engine.transition(
+                    self._LifecycleEvent.FATAL,
+                    actor="supervisor",
+                    reason="DMS rollback failure",
+                )
+            except self._TransitionRejected:
+                self.logger.info("[Lifecycle] Transition to FAILED rejected (already in progress)")
+
         except Exception as e:
             self.logger.error(f"[DMS] Rollback callback error: {e}")
 
@@ -90901,7 +90965,14 @@ class JarvisSystemKernel:
         Returns:
             Exit code
         """
-        self._state = KernelState.SHUTTING_DOWN
+        try:
+            self._state = self._lifecycle_engine.transition(
+                self._LifecycleEvent.SHUTDOWN,
+                actor="supervisor",
+                reason="graceful cleanup",
+            )
+        except self._TransitionRejected:
+            self.logger.info("[Lifecycle] Transition to SHUTTING_DOWN rejected (already in progress)")
         self._begin_shutdown("cleanup")
         self.logger.info("[Kernel] Initiating shutdown...")
 
@@ -91306,7 +91377,14 @@ class JarvisSystemKernel:
             except Exception:
                 pass
 
-            self._state = KernelState.STOPPED
+            try:
+                self._state = self._lifecycle_engine.transition(
+                    self._LifecycleEvent.STOPPED,
+                    actor="supervisor",
+                    reason="shutdown complete",
+                )
+            except self._TransitionRejected:
+                self.logger.info("[Lifecycle] Transition to STOPPED rejected (already in progress)")
             self.logger.success("[Kernel] Shutdown complete")
 
             # v249.0: Emit shutdown complete + stop event bus and renderer

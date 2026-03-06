@@ -98,6 +98,22 @@ class TestNoDirectStateWriteInEngine:
         )
 
 
+class TestSupervisorUsesLifecycleEngine:
+    """unified_supervisor.py must use LifecycleEngine, not direct state writes."""
+
+    def test_supervisor_imports_lifecycle_engine(self):
+        source = Path("unified_supervisor.py").read_text()
+        assert "LifecycleEngine" in source, (
+            "unified_supervisor.py must import and use LifecycleEngine"
+        )
+
+    def test_supervisor_imports_lifecycle_event(self):
+        source = Path("unified_supervisor.py").read_text()
+        assert "LifecycleEvent" in source, (
+            "unified_supervisor.py must use typed LifecycleEvent enum"
+        )
+
+
 class TestExceptionTaxonomyComplete:
     """All required exception classes exist with correct hierarchy."""
 
