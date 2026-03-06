@@ -1,10 +1,11 @@
 """Unit tests for ECAPA budget bridge core types, enums, and token lifecycle.
 
-Disease 10 — ECAPA Budget Wiring, Tasks 1 & 2.
+Disease 10 — ECAPA Budget Wiring, Tasks 1–3.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
 
@@ -17,7 +18,9 @@ from backend.core.ecapa_budget_bridge import (
     EcapaBudgetRejection,
     ECAPA_CATEGORY_MAP,
 )
+from backend.core.startup_budget_policy import StartupBudgetPolicy
 from backend.core.startup_concurrency_budget import HeavyTaskCategory
+from backend.core.startup_config import BudgetConfig, SoftGatePrecondition
 
 
 class TestCoreTypes:
@@ -270,3 +273,128 @@ class TestTokenLifecycle:
         assert bridge._active_model_load_count == 0
         bridge.release(token)
         assert bridge._active_model_load_count == 0
+
+
+class TestBudgetSlotAcquisition:
+    """Budget slot acquisition tests for EcapaBudgetBridge (Task 3)."""
+
+    def _make_bridge(self) -> EcapaBudgetBridge:
+        bridge = EcapaBudgetBridge.__new__(EcapaBudgetBridge)
+        bridge._init_internal()
+        return bridge
+
+    @pytest.fixture
+    def budget_policy(self) -> StartupBudgetPolicy:
+        config = BudgetConfig(
+            max_hard_concurrent=1,
+            max_total_concurrent=3,
+            hard_gate_categories=["MODEL_LOAD", "REACTOR_LAUNCH", "SUBPROCESS_SPAWN"],
+            soft_gate_categories=["ML_INIT", "GCP_PROVISION"],
+            soft_gate_preconditions={
+                "ML_INIT": SoftGatePrecondition(
+                    require_phase="CORE_READY",
+                    require_memory_stable_s=0.0,
+                    memory_slope_threshold_mb_s=999.0,
+                ),
+            },
+            max_wait_s=5.0,
+        )
+        return StartupBudgetPolicy(config)
+
+    # 1. acquire probe slot success
+    @pytest.mark.asyncio
+    async def test_acquire_probe_slot_success(
+        self, budget_policy: StartupBudgetPolicy
+    ) -> None:
+        """Signal CORE_READY, acquire probe succeeds, token is ML_INIT, release works."""
+        bridge = self._make_bridge()
+        bridge.set_budget_policy(budget_policy)
+        budget_policy.signal_phase_reached("CORE_READY")
+
+        result = await bridge.acquire_probe_slot(timeout_s=2.0)
+        assert isinstance(result, BudgetToken)
+        assert result.category is HeavyTaskCategory.ML_INIT
+        assert result.state is BudgetTokenState.ACQUIRED
+        assert result.token_id in bridge._tokens
+
+        # Release and verify cleanup
+        bridge.release(result)
+        assert result.state is BudgetTokenState.RELEASED
+        # Allow the fire-and-forget __aexit__ task to run
+        await asyncio.sleep(0.05)
+
+    # 2. acquire probe slot phase blocked
+    @pytest.mark.asyncio
+    async def test_acquire_probe_slot_phase_blocked(
+        self, budget_policy: StartupBudgetPolicy
+    ) -> None:
+        """Do NOT signal CORE_READY, acquire returns PHASE_BLOCKED."""
+        bridge = self._make_bridge()
+        bridge.set_budget_policy(budget_policy)
+        # Deliberately NOT signalling CORE_READY
+
+        result = await bridge.acquire_probe_slot(timeout_s=2.0)
+        assert isinstance(result, EcapaBudgetRejection)
+        assert result is EcapaBudgetRejection.PHASE_BLOCKED
+
+    # 3. acquire model slot success
+    @pytest.mark.asyncio
+    async def test_acquire_model_slot_success(
+        self, budget_policy: StartupBudgetPolicy
+    ) -> None:
+        """Acquire MODEL_LOAD succeeds, count=1, release brings it to 0."""
+        bridge = self._make_bridge()
+        bridge.set_budget_policy(budget_policy)
+
+        result = await bridge.acquire_model_slot(timeout_s=2.0)
+        assert isinstance(result, BudgetToken)
+        assert result.category is HeavyTaskCategory.MODEL_LOAD
+        assert bridge._active_model_load_count == 1
+
+        bridge.release(result)
+        assert bridge._active_model_load_count == 0
+        await asyncio.sleep(0.05)
+
+    # 4. acquire model slot frozen rejected
+    @pytest.mark.asyncio
+    async def test_acquire_model_slot_frozen_rejected(
+        self, budget_policy: StartupBudgetPolicy
+    ) -> None:
+        """Set _frozen=True, acquire returns SLOT_UNAVAILABLE."""
+        bridge = self._make_bridge()
+        bridge.set_budget_policy(budget_policy)
+        bridge._frozen = True
+
+        result = await bridge.acquire_model_slot(timeout_s=2.0)
+        assert isinstance(result, EcapaBudgetRejection)
+        assert result is EcapaBudgetRejection.SLOT_UNAVAILABLE
+
+    # 5. acquire model slot timeout
+    @pytest.mark.asyncio
+    async def test_acquire_model_slot_timeout(
+        self, budget_policy: StartupBudgetPolicy
+    ) -> None:
+        """Hold first MODEL_LOAD slot, second times out, release first, third succeeds."""
+        bridge = self._make_bridge()
+        bridge.set_budget_policy(budget_policy)
+
+        # Acquire the first MODEL_LOAD slot (hard-gate: max 1 concurrent)
+        first = await bridge.acquire_model_slot(timeout_s=2.0)
+        assert isinstance(first, BudgetToken)
+
+        # Second acquire should time out (only 1 hard slot available)
+        second = await bridge.acquire_model_slot(timeout_s=0.5)
+        assert isinstance(second, EcapaBudgetRejection)
+        assert second is EcapaBudgetRejection.BUDGET_TIMEOUT
+
+        # Release the first slot
+        bridge.release(first)
+        await asyncio.sleep(0.05)
+
+        # Third acquire should succeed now
+        third = await bridge.acquire_model_slot(timeout_s=2.0)
+        assert isinstance(third, BudgetToken)
+        assert third.category is HeavyTaskCategory.MODEL_LOAD
+
+        bridge.release(third)
+        await asyncio.sleep(0.05)

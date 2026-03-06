@@ -1,21 +1,28 @@
 """ECAPA Budget Bridge — core types and singleton bridge for Disease 10.
 
-Disease 10 — ECAPA Budget Wiring, Tasks 1 & 2.
+Disease 10 — ECAPA Budget Wiring, Tasks 1–3.
 
 Provides the foundational enums, category mapping, ``BudgetToken`` dataclass,
 and the ``EcapaBudgetBridge`` singleton that manages the full token lifecycle
-(acquire → transfer → reuse → release/expire).
+(acquire → transfer → reuse → release/expire), with budget slot acquisition
+delegating to ``StartupBudgetPolicy``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import enum
 import logging
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional, Union
 
+from backend.core.startup_budget_policy import (
+    BudgetAcquisitionError,
+    PreconditionNotMetError,
+    StartupBudgetPolicy,
+)
 from backend.core.startup_concurrency_budget import HeavyTaskCategory
 
 __all__ = [
@@ -115,6 +122,8 @@ class EcapaBudgetBridge:
         self._active_model_load_count: int = 0
         self._frozen: bool = False
         self._session_id: str = str(uuid.uuid4())
+        self._budget_policy: Optional[StartupBudgetPolicy] = None
+        self._budget_contexts: dict[str, Any] = {}  # token_id -> context manager
 
     @classmethod
     def get_instance(cls) -> EcapaBudgetBridge:
@@ -128,6 +137,103 @@ class EcapaBudgetBridge:
     def reset_instance(cls) -> None:
         """Reset the singleton — for testing only."""
         cls._instance = None
+
+    # -- Budget policy injection --------------------------------------------
+
+    def set_budget_policy(self, policy: StartupBudgetPolicy) -> None:
+        """Inject the :class:`StartupBudgetPolicy` used for slot acquisition."""
+        self._budget_policy = policy
+
+    # -- Budget slot acquisition --------------------------------------------
+
+    async def acquire_probe_slot(
+        self, timeout_s: float = 10.0
+    ) -> Union[BudgetToken, EcapaBudgetRejection]:
+        """Acquire a budget slot for an ECAPA probe (ML_INIT category).
+
+        Returns a :class:`BudgetToken` on success, or an
+        :class:`EcapaBudgetRejection` explaining why acquisition was rejected.
+        """
+        if self._frozen:
+            return EcapaBudgetRejection.SLOT_UNAVAILABLE
+        return await self._acquire_slot(
+            category=ECAPA_CATEGORY_MAP["probe"],
+            name="ecapa-probe",
+            timeout_s=timeout_s,
+        )
+
+    async def acquire_model_slot(
+        self, timeout_s: float = 30.0
+    ) -> Union[BudgetToken, EcapaBudgetRejection]:
+        """Acquire a budget slot for an ECAPA model load (MODEL_LOAD category).
+
+        Returns a :class:`BudgetToken` on success, or an
+        :class:`EcapaBudgetRejection` explaining why acquisition was rejected.
+        """
+        if self._frozen:
+            return EcapaBudgetRejection.SLOT_UNAVAILABLE
+        return await self._acquire_slot(
+            category=ECAPA_CATEGORY_MAP["model_load"],
+            name="ecapa-model-load",
+            timeout_s=timeout_s,
+        )
+
+    async def _acquire_slot(
+        self,
+        category: HeavyTaskCategory,
+        name: str,
+        timeout_s: float,
+    ) -> Union[BudgetToken, EcapaBudgetRejection]:
+        """Internal: acquire a budget slot, delegating to the policy if available.
+
+        If no budget policy is set, creates an ungated token (degraded mode).
+        On policy errors, maps exceptions to :class:`EcapaBudgetRejection` values.
+        """
+        token_id = str(uuid.uuid4())
+        now = time.monotonic()
+
+        if self._budget_policy is None:
+            # Degraded mode — no policy, create ungated token
+            _log.warning(
+                "No budget policy set — creating ungated token %s [%s:%s]",
+                token_id,
+                category.name,
+                name,
+            )
+            token = BudgetToken(
+                token_id=token_id,
+                owner_session_id=self._session_id,
+                state=BudgetTokenState.ACQUIRED,
+                category=category,
+                acquired_at=now,
+            )
+            self._tokens[token_id] = token
+            if category is HeavyTaskCategory.MODEL_LOAD:
+                self._active_model_load_count += 1
+            return token
+
+        # Delegate to policy
+        ctx = self._budget_policy.acquire(category, name, timeout=timeout_s)
+        try:
+            await ctx.__aenter__()
+        except PreconditionNotMetError:
+            return EcapaBudgetRejection.PHASE_BLOCKED
+        except BudgetAcquisitionError:
+            return EcapaBudgetRejection.BUDGET_TIMEOUT
+
+        # Success — create and track token
+        token = BudgetToken(
+            token_id=token_id,
+            owner_session_id=self._session_id,
+            state=BudgetTokenState.ACQUIRED,
+            category=category,
+            acquired_at=now,
+        )
+        self._tokens[token_id] = token
+        self._budget_contexts[token_id] = ctx
+        if category is HeavyTaskCategory.MODEL_LOAD:
+            self._active_model_load_count += 1
+        return token
 
     # -- Token lifecycle methods --------------------------------------------
 
@@ -170,7 +276,11 @@ class EcapaBudgetBridge:
         token.last_heartbeat_at = time.monotonic()
 
     def release(self, token: BudgetToken) -> None:
-        """Release a token.  Idempotent — no-op if already RELEASED or EXPIRED."""
+        """Release a token.  Idempotent — no-op if already RELEASED or EXPIRED.
+
+        If a budget context is associated with this token, schedules its
+        ``__aexit__`` as a fire-and-forget task on the running event loop.
+        """
         if token.state in (BudgetTokenState.RELEASED, BudgetTokenState.EXPIRED):
             return
         token.state = BudgetTokenState.RELEASED
@@ -179,6 +289,19 @@ class EcapaBudgetBridge:
             self._active_model_load_count = max(
                 0, self._active_model_load_count - 1
             )
+
+        # Clean up the budget context manager (async __aexit__)
+        ctx = self._budget_contexts.pop(token.token_id, None)
+        if ctx is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(ctx.__aexit__(None, None, None))
+            except RuntimeError:
+                _log.warning(
+                    "No running event loop — cannot schedule budget context "
+                    "cleanup for token %s",
+                    token.token_id,
+                )
 
     def cleanup_expired(
         self,
