@@ -218,6 +218,8 @@ class StartupOrchestrator:
         """Acquire the GCP readiness lease via 3-step handshake.
 
         On success, signals the routing policy that GCP is ready.
+        On failure, signals the routing policy that the handshake failed
+        and emits a ``lease_probe`` event with failure classification.
         """
         success = await self._lease.acquire(
             host,
@@ -227,6 +229,21 @@ class StartupOrchestrator:
 
         if success:
             self._routing_policy.signal_gcp_ready(host, port)
+        else:
+            failure_class = self._lease.last_failure_class
+            self._routing_policy.signal_gcp_handshake_failed(
+                f"lease acquisition failed: {failure_class.value if failure_class else 'unknown'}"
+            )
+            await self._emit(
+                event_type="lease_probe",
+                detail={
+                    "action": "acquire",
+                    "success": False,
+                    "host": host,
+                    "port": port,
+                    "failure_class": failure_class.value if failure_class else None,
+                },
+            )
 
         await self._emit(
             event_type="gcp_lease",
@@ -249,6 +266,10 @@ class StartupOrchestrator:
     def routing_decide(self) -> Tuple[BootRoutingDecision, FallbackReason]:
         """Compute the current boot routing decision."""
         return self._routing_policy.decide()
+
+    def signal_local_model_loaded(self) -> None:
+        """Signal that a local model has been loaded (for routing fallback)."""
+        self._routing_policy.signal_local_model_loaded()
 
     # -- Hybrid router ---------------------------------------------------------
 
