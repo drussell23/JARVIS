@@ -4,15 +4,16 @@ Wires together the journal, schema registry, ownership registry, and watcher
 manager into a single thread-safe store with a CAS + epoch-fenced write
 pipeline.
 
-Write pipeline (steps 1-6 under lock, step 7 outside lock)
+Write pipeline (steps 1-7 under lock, step 8 outside lock)
 -----------------------------------------------------------
 1. Schema validation (if schema exists for key).
 2. Apply coercion (e.g. ``map_to`` for unknown enums).
 3. Ownership check (writer must own key's domain).
 4. Epoch fencing (writer_epoch must be >= store epoch).
 5. CAS check (expected_version must match current version; 0 = new key).
-6. Journal append + in-memory update.
-7. Notify watchers **outside** the lock (deadlock avoidance).
+6. Policy validation (if policy engine configured).
+7. Journal append + in-memory update.
+8. Notify watchers **outside** the lock (deadlock avoidance).
 
 Design rules
 ------------
@@ -30,6 +31,7 @@ from typing import Any, Dict, List, Optional
 
 from backend.core.reactive_state.journal import AppendOnlyJournal
 from backend.core.reactive_state.ownership import OwnershipRegistry
+from backend.core.reactive_state.policy import PolicyEngine
 from backend.core.reactive_state.schemas import SchemaRegistry
 from backend.core.reactive_state.types import (
     StateEntry,
@@ -67,12 +69,14 @@ class ReactiveStateStore:
         session_id: str,
         ownership_registry: OwnershipRegistry,
         schema_registry: SchemaRegistry,
+        policy_engine: Optional[PolicyEngine] = None,
     ) -> None:
         self._journal = AppendOnlyJournal(journal_path)
         self._epoch = epoch
         self._session_id = session_id
         self._ownership = ownership_registry
         self._schemas = schema_registry
+        self._policy_engine = policy_engine
         self._entries: Dict[str, StateEntry] = {}
         self._watchers = WatcherManager()
         self._lock = threading.Lock()
@@ -103,7 +107,7 @@ class ReactiveStateStore:
     ) -> WriteResult:
         """Execute the full write pipeline.
 
-        Steps 1-6 run under ``self._lock``.  Step 7 (watcher notification)
+        Steps 1-7 run under ``self._lock``.  Step 8 (watcher notification)
         runs outside the lock to avoid deadlock.
 
         Parameters
@@ -168,7 +172,16 @@ class ReactiveStateStore:
                     key, writer, WriteStatus.VERSION_CONFLICT, expected_version
                 )
 
-            # Step 6: Journal append + in-memory update
+            # Step 6: Policy validation (if engine configured)
+            if self._policy_engine is not None:
+                snapshot = dict(self._entries)  # read-only copy
+                policy_result = self._policy_engine.evaluate(key, value, snapshot)
+                if not policy_result.allowed:
+                    return self._reject(
+                        key, writer, WriteStatus.POLICY_REJECTED, expected_version
+                    )
+
+            # Step 7: Journal append + in-memory update
             new_version = current_version + 1
             previous_value = current_entry.value if current_entry is not None else None
             now_mono = time.monotonic()
@@ -202,7 +215,7 @@ class ReactiveStateStore:
             notify_old = current_entry
             notify_new = new_entry
 
-        # Step 7: Notify watchers OUTSIDE the lock.
+        # Step 8: Notify watchers OUTSIDE the lock.
         if notify_new is not None:
             self._watchers.notify(key, notify_old, notify_new)
 
