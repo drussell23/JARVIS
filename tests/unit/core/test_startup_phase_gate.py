@@ -110,6 +110,19 @@ class TestGateCoordinatorBasic:
         assert result.detail == "timeout reaching GCP"
         assert coordinator.status(StartupPhase.PREWARM_GCP) == GateStatus.FAILED
 
+    def test_resolve_after_fail_is_rejected(self, coordinator: PhaseGateCoordinator):
+        """Once a gate is in a terminal state, further mutations are no-ops."""
+        coordinator.fail(
+            StartupPhase.PREWARM_GCP,
+            reason=GateFailureReason.NETWORK_ERROR,
+            detail="net fail",
+        )
+        # Attempting to resolve a FAILED gate should return the original FAILED status.
+        result = coordinator.resolve(StartupPhase.PREWARM_GCP, detail="retry")
+        assert result.status == GateStatus.FAILED
+        assert result.failure_reason == GateFailureReason.NETWORK_ERROR
+        assert coordinator.status(StartupPhase.PREWARM_GCP) == GateStatus.FAILED
+
 
 # ---------------------------------------------------------------------------
 # TestGateCoordinatorAsync
@@ -129,7 +142,7 @@ class TestGateCoordinatorAsync:
             await asyncio.sleep(0.05)
             coordinator.resolve(StartupPhase.PREWARM_GCP, detail="async")
 
-        asyncio.get_event_loop().create_task(_resolve_later())
+        asyncio.create_task(_resolve_later())
         result = await coordinator.wait_for(StartupPhase.PREWARM_GCP, timeout=2.0)
         assert result.status == GateStatus.PASSED
         assert result.detail == "async"

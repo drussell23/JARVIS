@@ -286,6 +286,17 @@ class PhaseGateCoordinator:
         detail: str = "",
     ) -> GateResult:
         """Atomically mutate gate state, signal waiters, and record an event."""
+        current = self._statuses[phase]
+        if current != GateStatus.PENDING:
+            logger.warning(
+                "Phase %s already in terminal state %s; ignoring transition to %s",
+                phase.value, current.value, status.value,
+            )
+            return GateResult(
+                phase=phase, status=current,
+                failure_reason=self._failure_reasons[phase],
+                detail=self._details[phase],
+            )
         now = time.monotonic()
         self._statuses[phase] = status
         self._timestamps[phase] = now
