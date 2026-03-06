@@ -387,5 +387,125 @@ ENV_KEY_MAPPINGS: Tuple[EnvKeyMapping, ...] = (
     ),
 )
 
-# ── EnvBridge class (Task 3) ─────────────────────────────────────────
-# Placeholder section -- will be filled by Wave 3 Task 3.
+# ── EnvBridge class ──────────────────────────────────────────────────
+
+
+class EnvBridge:
+    """Transparent bridge between ``os.environ`` and the reactive state store.
+
+    Routes reads and writes according to the current ``BridgeMode``:
+
+    * **legacy** -- all traffic through ``os.environ``.
+    * **shadow** -- reads from ``os.environ``, compared against store;
+      writes to both; mismatches logged via ``ShadowParityLogger``.
+    * **active** -- reads/writes go to the reactive store only.
+
+    Parameters
+    ----------
+    schema_registry:
+        The ``SchemaRegistry`` used for key validation and coercion.
+    initial_mode:
+        If provided, the bridge starts in this mode directly.
+        If ``None``, the mode is resolved from the
+        ``JARVIS_STATE_BRIDGE_MODE`` environment variable.
+    parity_logger:
+        A ``ShadowParityLogger`` for recording shadow-mode mismatches.
+        If ``None``, a default instance is created.
+    """
+
+    _ENV_MODE_VAR = "JARVIS_STATE_BRIDGE_MODE"
+
+    def __init__(
+        self,
+        *,
+        schema_registry: SchemaRegistry,
+        initial_mode: Optional[BridgeMode] = None,
+        parity_logger: Optional[ShadowParityLogger] = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._schema_registry = schema_registry
+        self._parity_logger = parity_logger if parity_logger is not None else ShadowParityLogger()
+
+        if initial_mode is not None:
+            self._mode = initial_mode
+        else:
+            self._mode = EnvBridge._resolve_bootstrap_mode()
+
+        # Build O(1) lookup dicts from the global mapping table.
+        self._by_state_key: Dict[str, EnvKeyMapping] = {}
+        self._by_env_var: Dict[str, EnvKeyMapping] = {}
+        for mapping in ENV_KEY_MAPPINGS:
+            self._by_state_key[mapping.state_key] = mapping
+            self._by_env_var[mapping.env_var] = mapping
+
+    # -- bootstrap ---------------------------------------------------------
+
+    @staticmethod
+    def _resolve_bootstrap_mode() -> BridgeMode:
+        """Resolve the initial bridge mode from the environment.
+
+        Reads ``JARVIS_STATE_BRIDGE_MODE``.  Returns the corresponding
+        ``BridgeMode`` if valid, otherwise falls back to ``BridgeMode.LEGACY``
+        (logging an error for non-empty invalid values).
+        """
+        raw = os.environ.get(EnvBridge._ENV_MODE_VAR, "")
+        if not raw:
+            return BridgeMode.LEGACY
+        try:
+            return BridgeMode(raw)
+        except ValueError:
+            logger.error(
+                "Invalid %s value %r -- falling back to legacy",
+                EnvBridge._ENV_MODE_VAR,
+                raw,
+            )
+            return BridgeMode.LEGACY
+
+    # -- properties --------------------------------------------------------
+
+    @property
+    def mode(self) -> BridgeMode:
+        """The current operating mode of this bridge."""
+        return self._mode
+
+    @property
+    def parity_logger(self) -> ShadowParityLogger:
+        """The shadow-parity logger used by this bridge."""
+        return self._parity_logger
+
+    # -- mode transitions --------------------------------------------------
+
+    def transition_to(self, target: BridgeMode) -> None:
+        """Transition to *target* mode.
+
+        Only forward single-step transitions are allowed
+        (``legacy -> shadow -> active``).
+
+        Raises
+        ------
+        ValueError
+            If the requested transition is not permitted.
+        """
+        with self._lock:
+            if not self._mode.can_transition_to(target):
+                raise ValueError(
+                    f"Cannot transition from {self._mode.value!r} "
+                    f"to {target.value!r} -- only forward single-step "
+                    f"transitions are allowed"
+                )
+            logger.info(
+                "EnvBridge mode transition: %s -> %s",
+                self._mode.value,
+                target.value,
+            )
+            self._mode = target
+
+    # -- lookups -----------------------------------------------------------
+
+    def get_mapping_by_state_key(self, state_key: str) -> Optional[EnvKeyMapping]:
+        """Return the ``EnvKeyMapping`` for *state_key*, or ``None``."""
+        return self._by_state_key.get(state_key)
+
+    def get_mapping_by_env_var(self, env_var: str) -> Optional[EnvKeyMapping]:
+        """Return the ``EnvKeyMapping`` for *env_var*, or ``None``."""
+        return self._by_env_var.get(env_var)
