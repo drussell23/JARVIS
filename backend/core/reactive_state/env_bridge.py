@@ -509,3 +509,126 @@ class EnvBridge:
     def get_mapping_by_env_var(self, env_var: str) -> Optional[EnvKeyMapping]:
         """Return the ``EnvKeyMapping`` for *env_var*, or ``None``."""
         return self._by_env_var.get(env_var)
+
+    # -- shadow comparison -----------------------------------------------------
+
+    def shadow_compare(self, entry: StateEntry, global_revision: int) -> None:
+        """Compare *entry* against the corresponding env var, recording parity.
+
+        In ``LEGACY`` mode this is a no-op.  For unmapped keys (not in the
+        ``ENV_KEY_MAPPINGS`` table) the call is silently ignored.
+
+        For mapped keys the comparison works as follows:
+
+        1. Canonicalize the store value via ``_canonicalize(key, entry.value)``.
+        2. Read the env var.  If absent, use the **schema default** as the
+           canonical env value (Appendix A.5).  If present, coerce through
+           ``mapping.coerce_from_env`` then canonicalize.
+        3. Compare via ``_values_equal``.
+        4. Record via ``ShadowParityLogger.record()``.  For matching values
+           both ``legacy_result`` and ``umf_result`` are the same string so
+           that ``_total`` increments but ``_mismatches_count`` does not.
+        5. If ``mapping.sensitive``, use ``"<redacted>"`` for both strings in
+           the record (and in any warning log).
+        """
+        if self._mode is BridgeMode.LEGACY:
+            return
+
+        mapping = self._by_state_key.get(entry.key)
+        if mapping is None:
+            return
+
+        # -- canonicalize store value --
+        store_canonical = self._canonicalize(entry.key, entry.value)
+
+        # -- canonicalize env value --
+        env_raw = os.environ.get(mapping.env_var)
+        if env_raw is None:
+            # Absent env var -> use schema default
+            schema = self._schema_registry.get(entry.key)
+            if schema is not None:
+                env_canonical = self._canonicalize(entry.key, schema.default)
+            else:
+                env_canonical = None
+        else:
+            env_canonical = self._canonicalize(
+                entry.key, mapping.coerce_from_env(env_raw),
+            )
+
+        # -- compare --
+        match = self._values_equal(store_canonical, env_canonical)
+
+        # -- build record strings --
+        if mapping.sensitive:
+            store_str = "<redacted>"
+            env_str = "<redacted>"
+        else:
+            store_str = str(store_canonical)
+            env_str = str(env_canonical)
+
+        # For matching comparisons, pass identical strings so _total
+        # increments but _mismatches_count does not.
+        if match:
+            self._parity_logger.record(
+                trace_id=f"shadow.{global_revision}",
+                category=entry.key,
+                legacy_result=env_str,
+                umf_result=env_str,
+            )
+        else:
+            self._parity_logger.record(
+                trace_id=f"shadow.{global_revision}",
+                category=entry.key,
+                legacy_result=env_str,
+                umf_result=store_str,
+            )
+            # Extra warning with key context (redacted if sensitive)
+            if mapping.sensitive:
+                logger.warning(
+                    "Shadow parity mismatch key=%s store=<redacted> env=<redacted> rev=%d",
+                    entry.key,
+                    global_revision,
+                )
+            else:
+                logger.warning(
+                    "Shadow parity mismatch key=%s store=%s env=%s rev=%d",
+                    entry.key,
+                    store_canonical,
+                    env_canonical,
+                    global_revision,
+                )
+
+    # -- canonicalization helpers -----------------------------------------------
+
+    _CANONICAL_DISPATCH: Dict[str, Callable[[Any], Any]] = {
+        "bool": canonical_bool,
+        "int": canonical_int,
+        "float": canonical_float,
+        "str": canonical_str,
+        "enum": canonical_enum,
+    }
+
+    def _canonicalize(self, key: str, value: Any) -> Any:
+        """Canonicalize *value* according to the schema for *key*.
+
+        Dispatches to the appropriate ``canonical_*`` function based on the
+        schema's ``value_type``.  If no schema is registered, returns *value*
+        unchanged.
+        """
+        schema = self._schema_registry.get(key)
+        if schema is None:
+            return value
+        coercer = self._CANONICAL_DISPATCH.get(schema.value_type)
+        if coercer is None:
+            return value
+        return coercer(value)
+
+    @staticmethod
+    def _values_equal(a: Any, b: Any) -> bool:
+        """Compare two canonicalized values for equality.
+
+        For two floats, uses a tolerance of ``1e-9``.  Otherwise uses ``==``.
+        """
+        if isinstance(a, float) and isinstance(b, float):
+            return abs(a - b) < 1e-9
+        return a == b
