@@ -159,3 +159,33 @@ class TestExceptionTaxonomyComplete:
         assert issubclass(LifecycleRecoverableError, LifecycleError)
         assert issubclass(DependencyUnavailableError, LifecycleRecoverableError)
         assert issubclass(TransitionRejected, LifecycleError)
+
+
+class TestNoSilentPassInStartup:
+    """Startup phase transitions must not silently swallow exceptions."""
+
+    def test_no_silent_pass_near_state_transitions(self):
+        """Within 30 lines of any state transition, no silent except: pass."""
+        source = Path("unified_supervisor.py").read_text()
+        lines = source.split("\n")
+        transition_lines = []
+        for i, line in enumerate(lines):
+            if "LifecycleEvent." in line and "transition(" in line:
+                transition_lines.append(i)
+        violations = []
+        for tl in transition_lines:
+            window_start = max(0, tl - 30)
+            window_end = min(len(lines), tl + 30)
+            for i in range(window_start, window_end):
+                stripped = lines[i].strip()
+                if stripped.startswith("except") and "Exception" in stripped:
+                    j = i + 1
+                    while j < len(lines) and not lines[j].strip():
+                        j += 1
+                    if j < len(lines) and lines[j].strip() == "pass":
+                        violations.append(i + 1)
+        violations = sorted(set(violations))
+        assert len(violations) <= 3, (
+            f"Found {len(violations)} silent handlers near state transitions: "
+            f"lines {violations}. Target: <=3."
+        )

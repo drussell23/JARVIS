@@ -74851,8 +74851,11 @@ class JarvisSystemKernel:
             # true "complete" is set just before return 0 (after all finalization).
             try:
                 await self._stop_startup_progress_heartbeat(timeout=2.0)
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Startup] progress reporter stop: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
             # v270.1: The primary 100% broadcast now happens INSIDE
             # _phase_frontend_transition, before the loading server is stopped.
@@ -74874,8 +74877,11 @@ class JarvisSystemKernel:
             try:
                 dashboard = get_live_dashboard()
                 dashboard.stop()
-            except Exception:
-                pass
+            except Exception as _exc:
+                self.logger.debug(
+                    "[Startup] dashboard update: %s: %s",
+                    type(_exc).__name__, _exc,
+                )
 
             # =====================================================================
             # v213.0: ENTERPRISE COMPLETION BANNER (with ACCURATE readiness tier)
@@ -74918,8 +74924,11 @@ class JarvisSystemKernel:
             if _TRACE_HOOKS_AVAILABLE and _trace_boot_complete:
                 try:
                     _trace_boot_complete(duration_s=startup_duration)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] trace hook: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
 
             # =====================================================================
             # v180.0: DIAGNOSTIC CHECKPOINT - Startup complete
@@ -74927,8 +74936,11 @@ class JarvisSystemKernel:
             if DIAGNOSTICS_AVAILABLE and log_startup_checkpoint:
                 try:
                     log_startup_checkpoint("startup_complete")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] diagnostic checkpoint: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
 
             self._mark_startup_activity("completion_hooks")  # v278.1
             # v284.0: Completion hooks run as a background task so they never
@@ -75015,8 +75027,11 @@ class JarvisSystemKernel:
                         success=True,
                         duration_s=time.time() - _t0_fn,
                     )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] trace hook: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
 
             return 0
 
@@ -75056,8 +75071,11 @@ class JarvisSystemKernel:
             if _txn:
                 try:
                     await _txn.abort_with_cleanup(f"exception:{type(e).__name__}")
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.warning(
+                        "[Startup] cleanup: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
             # v278.0: Trace failure path — unhandled exception
             if _TRACE_HOOKS_AVAILABLE:
                 try:
@@ -75072,8 +75090,11 @@ class JarvisSystemKernel:
                             phase=_exc_phase,
                             metadata={"traceback": traceback.format_exc()[-500:]},
                         )
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    self.logger.debug(
+                        "[Startup] trace hook: %s: %s",
+                        type(_exc).__name__, _exc,
+                    )
             try:
                 self._state = self._lifecycle_engine.transition(
                     self._LifecycleEvent.FATAL,
