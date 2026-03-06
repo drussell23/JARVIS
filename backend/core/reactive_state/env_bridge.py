@@ -157,8 +157,235 @@ def canonical_enum(value: Any) -> Optional[str]:
     return str(value).strip()
 
 
-# ── EnvKeyMapping (Task 2) ───────────────────────────────────────────
-# Placeholder section -- will be filled by Wave 3 Task 2.
+# ── Coerce-to-env helpers (private) ──────────────────────────────────
+
+
+def _bool_to_env(value: Any) -> str:
+    """Convert a store bool to env string: True->"true", False->"false", None->""."""
+    if value is None:
+        return ""
+    return "true" if value else "false"
+
+
+def _int_to_env(value: Any) -> str:
+    """Convert a store int to env string. None->""."""
+    if value is None:
+        return ""
+    return str(int(value))
+
+
+def _float_to_env(value: Any) -> str:
+    """Convert a store float to env string. None->""."""
+    if value is None:
+        return ""
+    return str(float(value))
+
+
+def _str_to_env(value: Any) -> str:
+    """Convert a store value to env string. None->""."""
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _enum_to_env(value: Any) -> str:
+    """Convert an enum-like store value to env string. None->""."""
+    if value is None:
+        return ""
+    return str(value)
+
+
+# ── Coerce-from-env helpers (private) ────────────────────────────────
+
+
+def _bool_from_env(value: str) -> bool:
+    """Convert an env string to bool, defaulting to False."""
+    result = canonical_bool(value)
+    if result is None:
+        return False
+    return result
+
+
+def _int_from_env(value: str) -> int:
+    """Convert an env string to int via canonical_int.
+
+    Returns 0 for empty/invalid strings (non-nullable int keys).
+    """
+    result = canonical_int(value)
+    if result is None:
+        return 0
+    return result
+
+
+def _nullable_int_from_env(value: str) -> Optional[int]:
+    """Convert an env string to Optional[int] via canonical_int.
+
+    Returns None for empty strings (nullable int keys).
+    """
+    return canonical_int(value)
+
+
+def _float_from_env(value: str) -> Optional[float]:
+    """Convert an env string to float via canonical_float.
+
+    Returns 0.0 for empty/invalid strings.
+    """
+    result = canonical_float(value)
+    if result is None:
+        return 0.0
+    return result
+
+
+def _str_from_env(value: str) -> str:
+    """Passthrough -- env strings are already strings."""
+    return value
+
+
+def _enum_from_env(value: str) -> str:
+    """Strip whitespace from an env string for enum-like values."""
+    return value.strip()
+
+
+# ── EnvKeyMapping dataclass ──────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class EnvKeyMapping:
+    """Per-key metadata for bridging between ``os.environ`` and the reactive store.
+
+    Attributes
+    ----------
+    env_var:
+        The environment variable name, e.g. ``"JARVIS_GCP_OFFLOAD_ACTIVE"``.
+    state_key:
+        The reactive store key path, e.g. ``"gcp.offload_active"``.
+    coerce_to_env:
+        Callable that converts a store value to an env-var string.
+    coerce_from_env:
+        Callable that converts an env-var string back to a store value.
+    sensitive:
+        If ``True``, values are redacted in logs.
+    """
+
+    env_var: str
+    state_key: str
+    coerce_to_env: Callable[[Any], str]
+    coerce_from_env: Callable[[str], Any]
+    sensitive: bool = False
+
+
+# ── ENV_KEY_MAPPINGS table ───────────────────────────────────────────
+
+ENV_KEY_MAPPINGS: Tuple[EnvKeyMapping, ...] = (
+    # -- lifecycle --
+    EnvKeyMapping(
+        env_var="JARVIS_EFFECTIVE_MODE",
+        state_key="lifecycle.effective_mode",
+        coerce_to_env=_enum_to_env,
+        coerce_from_env=_enum_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_STARTUP_COMPLETE",
+        state_key="lifecycle.startup_complete",
+        coerce_to_env=_bool_to_env,
+        coerce_from_env=_bool_from_env,
+    ),
+    # -- memory --
+    EnvKeyMapping(
+        env_var="JARVIS_MEMORY_CAN_SPAWN_HEAVY",
+        state_key="memory.can_spawn_heavy",
+        coerce_to_env=_bool_to_env,
+        coerce_from_env=_bool_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_MEMORY_AVAILABLE_GB",
+        state_key="memory.available_gb",
+        coerce_to_env=_float_to_env,
+        coerce_from_env=_float_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_MEMORY_ADMISSION_REASON",
+        state_key="memory.admission_reason",
+        coerce_to_env=_str_to_env,
+        coerce_from_env=_str_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_MEMORY_TIER",
+        state_key="memory.tier",
+        coerce_to_env=_enum_to_env,
+        coerce_from_env=_enum_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_MEMORY_STARTUP_MODE",
+        state_key="memory.startup_mode",
+        coerce_to_env=_enum_to_env,
+        coerce_from_env=_enum_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_MEMORY_SOURCE",
+        state_key="memory.source",
+        coerce_to_env=_str_to_env,
+        coerce_from_env=_str_from_env,
+    ),
+    # -- gcp --
+    EnvKeyMapping(
+        env_var="JARVIS_GCP_OFFLOAD_ACTIVE",
+        state_key="gcp.offload_active",
+        coerce_to_env=_bool_to_env,
+        coerce_from_env=_bool_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_GCP_NODE_IP",
+        state_key="gcp.node_ip",
+        coerce_to_env=_str_to_env,
+        coerce_from_env=_str_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_GCP_NODE_PORT",
+        state_key="gcp.node_port",
+        coerce_to_env=_int_to_env,
+        coerce_from_env=_int_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_GCP_NODE_BOOTING",
+        state_key="gcp.node_booting",
+        coerce_to_env=_bool_to_env,
+        coerce_from_env=_bool_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_GCP_PRIME_ENDPOINT",
+        state_key="gcp.prime_endpoint",
+        coerce_to_env=_str_to_env,
+        coerce_from_env=_str_from_env,
+    ),
+    # -- hollow --
+    EnvKeyMapping(
+        env_var="JARVIS_HOLLOW_CLIENT_ACTIVE",
+        state_key="hollow.client_active",
+        coerce_to_env=_bool_to_env,
+        coerce_from_env=_bool_from_env,
+    ),
+    # -- prime --
+    EnvKeyMapping(
+        env_var="JARVIS_PRIME_EARLY_PID",
+        state_key="prime.early_pid",
+        coerce_to_env=_int_to_env,
+        coerce_from_env=_nullable_int_from_env,
+    ),
+    EnvKeyMapping(
+        env_var="JARVIS_PRIME_EARLY_PORT",
+        state_key="prime.early_port",
+        coerce_to_env=_int_to_env,
+        coerce_from_env=_nullable_int_from_env,
+    ),
+    # -- service --
+    EnvKeyMapping(
+        env_var="JARVIS_SERVICE_BACKEND_MINIMAL",
+        state_key="service.backend_minimal",
+        coerce_to_env=_bool_to_env,
+        coerce_from_env=_bool_from_env,
+    ),
+)
 
 # ── EnvBridge class (Task 3) ─────────────────────────────────────────
 # Placeholder section -- will be filled by Wave 3 Task 3.
