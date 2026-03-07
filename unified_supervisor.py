@@ -74123,6 +74123,99 @@ class JarvisSystemKernel:
                     )
                 except asyncio.CancelledError:
                     raise
+
+                # v301.1: Post-timeout autonomy reconciliation.
+                # When the outer timeout fires, _phase_trinity() is cancelled
+                # mid-flight — the boot-time autonomy contract check at line
+                # ~85584 never runs, leaving autonomy_contracts stuck at
+                # "pending" and jarvis_prime/reactor_core stuck at "running".
+                # Probe live health here so the dashboard shows truth, not
+                # stale pre-timeout state.
+                if not _trinity_phase_ok:
+                    try:
+                        from backend.supervisor.cross_repo_startup_orchestrator import (
+                            check_autonomy_contracts,
+                        )
+                        _fb_pass, _fb_status, _fb_checks = await asyncio.wait_for(
+                            check_autonomy_contracts(),
+                            timeout=10.0,
+                        )
+                        self._autonomy_checks = _fb_checks
+                        _fb_reason = _fb_checks.get(
+                            "reason", "active" if _fb_pass else "timeout",
+                        )
+
+                        # Bridge per-service reachability to component statuses
+                        for _fb_svc, _fb_reach in (
+                            ("jarvis_prime", "prime_reachable"),
+                            ("reactor_core", "reactor_reachable"),
+                        ):
+                            _fb_svc_status = (
+                                self._component_status.get(_fb_svc, {})
+                                .get("status", "pending")
+                            )
+                            _fb_enabled = _fb_checks.get(
+                                f"{_fb_reach.split('_')[0]}_enabled", True,
+                            )
+                            if _fb_checks.get(_fb_reach) and _fb_svc_status in (
+                                "degraded", "running", "pending",
+                            ):
+                                self._update_component_status(
+                                    _fb_svc, "complete",
+                                    f"{_fb_svc.replace('_', '-')} healthy "
+                                    f"(post-timeout live probe)",
+                                )
+                            elif (
+                                not _fb_checks.get(_fb_reach)
+                                and _fb_enabled
+                                and _fb_svc_status in ("running", "pending")
+                            ):
+                                self._update_component_status(
+                                    _fb_svc, "degraded",
+                                    f"{_fb_svc.replace('_', '-')} unreachable "
+                                    f"after Trinity timeout",
+                                )
+
+                        if _fb_pass:
+                            self._autonomy_mode = "active"
+                            self._autonomy_reason = "active"
+                            self._update_component_status(
+                                "autonomy_contracts", "complete",
+                                "Autonomy contracts validated (post-timeout probe)",
+                            )
+                        elif _fb_reason.startswith("pending"):
+                            self._autonomy_mode = "pending"
+                            self._autonomy_reason = _fb_reason
+                            self._update_component_status(
+                                "autonomy_contracts", "degraded",
+                                f"Services still starting after Trinity timeout "
+                                f"({_fb_reason}) — runtime monitor will re-check",
+                            )
+                        else:
+                            self._autonomy_mode = "read_only"
+                            self._autonomy_reason = _fb_reason
+                            self._update_component_status(
+                                "autonomy_contracts", "degraded",
+                                f"Contract mismatch after Trinity timeout ({_fb_reason})",
+                            )
+                        self.logger.info(
+                            "[Kernel] Post-timeout autonomy probe: pass=%s, "
+                            "reason=%s, checks=%s",
+                            _fb_pass, _fb_reason, _fb_checks,
+                        )
+                    except Exception as _fb_err:
+                        self._autonomy_mode = "pending"
+                        self._autonomy_reason = "pending_services"
+                        self._update_component_status(
+                            "autonomy_contracts", "degraded",
+                            f"Post-timeout probe failed: {_fb_err} — "
+                            "runtime monitor will re-check",
+                        )
+                        self.logger.warning(
+                            "[Kernel] Post-timeout autonomy probe failed: %s",
+                            _fb_err,
+                        )
+
                 if _ssm:
                     if _trinity_phase_ok:
                         await _ssm.complete_component("trinity")
@@ -90653,7 +90746,11 @@ class JarvisSystemKernel:
                                         "Checks: %s", _new_reason, _a_checks,
                                     )
                         except Exception as _auto_err:
-                            self.logger.debug(
+                            # v301.1: Log at WARNING so failures are visible.
+                            # Previous DEBUG level silently swallowed import
+                            # errors, aiohttp issues, etc. — making it
+                            # impossible to diagnose persistent ⚠️ warnings.
+                            self.logger.warning(
                                 "[Autonomy] Runtime monitor error: %s", _auto_err,
                             )
                         finally:

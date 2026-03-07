@@ -398,3 +398,204 @@ class TestContractCheckIntegration:
             and checks.get("reactor_reachable", False)
         )
         assert all_pass is True
+
+
+# ---------------------------------------------------------------------------
+# Fix 3: Post-timeout probe recovers component statuses
+# ---------------------------------------------------------------------------
+
+class TestPostTimeoutProbe:
+    """Verify the post-Trinity-timeout autonomy probe fixes stuck statuses."""
+
+    def _make_supervisor(self):
+        """Build a minimal mock supervisor with component_status dict."""
+        sup = MagicMock()
+        sup._component_status = {
+            "jarvis_prime": {"status": "running", "message": "Starting J-Prime..."},
+            "reactor_core": {"status": "running", "message": "Starting Reactor-Core..."},
+            "autonomy_contracts": {"status": "pending", "message": "Waiting for Trinity"},
+            "trinity": {"status": "error", "message": "Outer timeout"},
+        }
+        sup._autonomy_mode = "pending"
+        sup._autonomy_reason = "pending_services"
+        sup._autonomy_checks = {}
+        sup.logger = MagicMock()
+
+        updates = []
+
+        def mock_update(component, status, message="", **extra):
+            sup._component_status[component] = {
+                "status": status,
+                "message": message,
+            }
+            updates.append((component, status, message))
+
+        sup._update_component_status = mock_update
+        sup._updates = updates
+        return sup
+
+    def _apply_post_timeout_probe(self, sup, fb_pass, fb_checks):
+        """Simulate the post-timeout probe logic (mirrors unified_supervisor.py)."""
+        sup._autonomy_checks = fb_checks
+        fb_reason = fb_checks.get(
+            "reason", "active" if fb_pass else "timeout",
+        )
+
+        # Bridge per-service reachability
+        for fb_svc, fb_reach in (
+            ("jarvis_prime", "prime_reachable"),
+            ("reactor_core", "reactor_reachable"),
+        ):
+            fb_svc_status = (
+                sup._component_status.get(fb_svc, {})
+                .get("status", "pending")
+            )
+            fb_enabled = fb_checks.get(
+                f"{fb_reach.split('_')[0]}_enabled", True,
+            )
+            if fb_checks.get(fb_reach) and fb_svc_status in (
+                "degraded", "running", "pending",
+            ):
+                sup._update_component_status(
+                    fb_svc, "complete",
+                    f"{fb_svc.replace('_', '-')} healthy "
+                    f"(post-timeout live probe)",
+                )
+            elif (
+                not fb_checks.get(fb_reach)
+                and fb_enabled
+                and fb_svc_status in ("running", "pending")
+            ):
+                sup._update_component_status(
+                    fb_svc, "degraded",
+                    f"{fb_svc.replace('_', '-')} unreachable "
+                    f"after Trinity timeout",
+                )
+
+        if fb_pass:
+            sup._autonomy_mode = "active"
+            sup._autonomy_reason = "active"
+            sup._update_component_status(
+                "autonomy_contracts", "complete",
+                "Autonomy contracts validated (post-timeout probe)",
+            )
+        elif fb_reason.startswith("pending"):
+            sup._autonomy_mode = "pending"
+            sup._autonomy_reason = fb_reason
+            sup._update_component_status(
+                "autonomy_contracts", "degraded",
+                f"Services still starting after Trinity timeout ({fb_reason})",
+            )
+        else:
+            sup._autonomy_mode = "read_only"
+            sup._autonomy_reason = fb_reason
+            sup._update_component_status(
+                "autonomy_contracts", "degraded",
+                f"Contract mismatch after Trinity timeout ({fb_reason})",
+            )
+
+    def test_post_timeout_both_reachable(self):
+        """After timeout, if both services are healthy, all recover."""
+        sup = self._make_supervisor()
+        checks = {
+            "prime_reachable": True,
+            "reactor_reachable": True,
+            "prime_compatible": True,
+            "reactor_compatible": True,
+            "prime_enabled": True,
+            "reactor_enabled": True,
+            "reason": "active",
+            "pending": [],
+        }
+        self._apply_post_timeout_probe(sup, True, checks)
+
+        assert sup._component_status["jarvis_prime"]["status"] == "complete"
+        assert sup._component_status["reactor_core"]["status"] == "complete"
+        assert sup._component_status["autonomy_contracts"]["status"] == "complete"
+        assert sup._autonomy_mode == "active"
+
+    def test_post_timeout_reactor_unreachable(self):
+        """After timeout, unreachable reactor goes degraded, not stuck at running."""
+        sup = self._make_supervisor()
+        checks = {
+            "prime_reachable": True,
+            "reactor_reachable": False,
+            "prime_compatible": True,
+            "reactor_compatible": False,
+            "prime_enabled": True,
+            "reactor_enabled": True,
+            "reason": "pending_services",
+            "pending": ["reactor"],
+        }
+        self._apply_post_timeout_probe(sup, False, checks)
+
+        assert sup._component_status["jarvis_prime"]["status"] == "complete"
+        assert sup._component_status["reactor_core"]["status"] == "degraded"
+        assert sup._component_status["autonomy_contracts"]["status"] == "degraded"
+        assert sup._autonomy_mode == "pending"
+
+    def test_post_timeout_services_stuck_at_running_get_resolved(self):
+        """Key scenario: components stuck at 'running' get properly resolved."""
+        sup = self._make_supervisor()
+        # Both stuck at "running" from pre-timeout spawn intent
+        assert sup._component_status["jarvis_prime"]["status"] == "running"
+        assert sup._component_status["reactor_core"]["status"] == "running"
+
+        # Post-timeout probe finds both reachable
+        checks = {
+            "prime_reachable": True,
+            "reactor_reachable": True,
+            "prime_compatible": True,
+            "reactor_compatible": True,
+            "prime_enabled": True,
+            "reactor_enabled": True,
+            "reason": "active",
+            "pending": [],
+        }
+        self._apply_post_timeout_probe(sup, True, checks)
+
+        # Must NOT still be "running"
+        assert sup._component_status["jarvis_prime"]["status"] == "complete"
+        assert sup._component_status["reactor_core"]["status"] == "complete"
+
+    def test_post_timeout_disabled_reactor_passes(self):
+        """Disabled reactor shouldn't block post-timeout probe."""
+        sup = self._make_supervisor()
+        checks = {
+            "prime_reachable": True,
+            "reactor_reachable": True,  # vacuously true
+            "prime_compatible": True,
+            "reactor_compatible": True,
+            "prime_enabled": True,
+            "reactor_enabled": False,
+            "reason": "active",
+            "pending": [],
+        }
+        self._apply_post_timeout_probe(sup, True, checks)
+
+        assert sup._component_status["jarvis_prime"]["status"] == "complete"
+        # Reactor was "running" and reachable (vacuously) → "complete"
+        assert sup._component_status["reactor_core"]["status"] == "complete"
+        assert sup._autonomy_mode == "active"
+
+    def test_post_timeout_schema_mismatch(self):
+        """Schema mismatch → read_only mode, proper degraded status."""
+        sup = self._make_supervisor()
+        checks = {
+            "prime_reachable": True,
+            "reactor_reachable": True,
+            "prime_compatible": True,
+            "reactor_compatible": False,  # schema mismatch
+            "prime_enabled": True,
+            "reactor_enabled": True,
+            "reason": "schema_mismatch",
+            "pending": [],
+        }
+        self._apply_post_timeout_probe(sup, False, checks)
+
+        assert sup._component_status["jarvis_prime"]["status"] == "complete"
+        # Reactor IS reachable, so it recovers from "running" to "complete"
+        assert sup._component_status["reactor_core"]["status"] == "complete"
+        # But autonomy_contracts is degraded due to schema mismatch
+        assert sup._component_status["autonomy_contracts"]["status"] == "degraded"
+        assert sup._autonomy_mode == "read_only"
