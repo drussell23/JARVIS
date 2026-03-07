@@ -9902,6 +9902,14 @@ fi
         """
         start_time = time.time()
         last_status = "starting"
+        # v290.1: Bound verification to startup script timeout + grace.
+        # The startup script's health check runs for GCP_SERVICE_HEALTH_TIMEOUT
+        # (default 90s). After that, APARS will report service_start_timeout.
+        # Instead of using the full config timeout (300s), cap at
+        # script_timeout + grace to avoid 210s of useless polling.
+        _script_health_timeout = float(os.getenv(
+            "GCP_SERVICE_HEALTH_TIMEOUT", "90"
+        ))
         consecutive_errors = 0  # v235.0: Local variable, reset each polling session
         has_seen_version = False  # v235.3: Track if valid startup_script_version ever received
         has_seen_any_response = False  # v235.3: Track if VM has responded at all
@@ -9914,6 +9922,17 @@ fi
         _apars_grace_seconds = float(os.getenv(
             "JARVIS_GCP_APARS_GRACE_SECONDS", "30"
         ))
+        _bounded_timeout = min(
+            timeout,
+            _script_health_timeout + _apars_grace_seconds,
+        )
+        if _bounded_timeout < timeout:
+            logger.info(
+                f"☁️ [InvincibleNode] Verification timeout bounded to "
+                f"{_bounded_timeout:.0f}s (script={_script_health_timeout:.0f}s "
+                f"+ grace={_apars_grace_seconds:.0f}s, config={timeout:.0f}s)"
+            )
+            timeout = _bounded_timeout
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
