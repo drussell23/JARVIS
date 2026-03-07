@@ -68970,9 +68970,10 @@ class JarvisSystemKernel:
                 self.logger.warning(f"[Kernel] Trinity tiered_stop unexpected error: {e}")
 
         # v266.0: Emergency VM STOP — preserve disk/IP for fast restart
+        # v286.0: get_gcp_vm_manager_safe() is async — must await it
         try:
             from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe, VMAction
-            vm_manager = get_gcp_vm_manager_safe()
+            vm_manager = await get_gcp_vm_manager_safe()
             if vm_manager:
                 for vm_name, vm_info in list(vm_manager.managed_vms.items()):
                     if hasattr(vm_info, 'state') and vm_info.state.value in ("running", "staging"):
@@ -73472,6 +73473,12 @@ class JarvisSystemKernel:
                     )
                     self._background_tasks.append(self._ecapa_verification_task)
 
+            # v286.0: Advance stage past intelligence — prevents post-phase
+            # _mark_startup_activity calls from keeping the intelligence activity
+            # marker fresh, which suppresses ProgressController stall detection.
+            self._current_startup_phase = "post_intelligence"
+            self._current_progress = 57
+
             # =====================================================================
             # UNIFIED AGENT RUNTIME INITIALIZATION
             # =====================================================================
@@ -73479,7 +73486,7 @@ class JarvisSystemKernel:
             # is ready. Non-fatal — degraded mode without autonomous goal pursuit.
             # =====================================================================
             # v265.0: Add timeout — previously bare await could hang indefinitely
-            self._mark_startup_activity("agent_runtime_init", stage="intelligence")
+            self._mark_startup_activity("agent_runtime_init", stage="post_intelligence")
             _agent_runtime_timeout = _get_env_float("JARVIS_AGENT_RUNTIME_TIMEOUT", 30.0)
             # v265.4: CPU-aware timeout — extend under pressure
             try:
@@ -73525,7 +73532,7 @@ class JarvisSystemKernel:
             # (Intelligence) so the LLM client is available.
             # Uses audio_pipeline_bootstrap for clean composition.
             # =====================================================================
-            self._mark_startup_activity("audio_pipeline_wiring", stage="intelligence")
+            self._mark_startup_activity("audio_pipeline_wiring", stage="post_intelligence")
             if self._audio_bus_enabled:
                 if self._audio_bus is None:
                     self.logger.warning(
@@ -91738,10 +91745,11 @@ class JarvisSystemKernel:
             # =====================================================================
             # Stop (not delete) all tracked running VMs so they preserve disk/IP
             # for fast ~30s restart, while eliminating 24/7 compute charges.
+            # v286.0: get_gcp_vm_manager_safe() is async — must await it
             # =====================================================================
             try:
                 from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe, VMAction
-                vm_manager = get_gcp_vm_manager_safe()
+                vm_manager = await get_gcp_vm_manager_safe()
                 if vm_manager:
                     for vm_name, vm_info in list(vm_manager.managed_vms.items()):
                         if hasattr(vm_info, 'state') and vm_info.state.value in ("running", "staging", "provisioning"):
