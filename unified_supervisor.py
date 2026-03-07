@@ -90837,6 +90837,19 @@ class JarvisSystemKernel:
             )
             if watchdog_stage:
                 self._startup_watchdog.update_phase(watchdog_stage, progress)
+                # v291.1: Bridge broadcast heartbeats to activity markers.
+                # When progress VALUE caps (e.g., 57% during intelligence),
+                # watchdog_recent_progress goes False because the value hasn't
+                # changed. But the heartbeat IS still firing — the system is
+                # alive. Without this bridge, both watchdog_recent_progress AND
+                # stage_activity_recent go stale simultaneously, causing
+                # reasons=none -> FALSE TRUE STALL.
+                # By refreshing the activity marker on every resolved broadcast,
+                # stage_activity_recent stays True as long as the heartbeat fires.
+                self._mark_startup_activity(
+                    source=f"broadcast:{stage}",
+                    stage=watchdog_stage,
+                )
 
         # Skip transport if no loading server configured or not running
         if self.config.loading_server_port == 0:
