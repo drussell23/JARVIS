@@ -25,6 +25,14 @@ Phase 2 Components:
     - DegradationController: 4-mode autonomy state machine
     - RoutingPolicy: Deterministic task routing with cost guardrails
     - MultiFileChangeEngine: Atomic multi-file operations with rollback
+
+Phase 3 Components:
+    - EventBridge: Governance-to-CrossRepo event mapping (fault-isolated)
+    - BlastRadiusAdapter: Oracle integration for auto-populating blast radius
+    - LearningBridge: Operation feedback to LearningMemory with op_id correlation
+    - RuntimeContractChecker: N/N-1 schema validation at runtime
+    - CanaryController: Per-domain-slice promotion with rollout criteria
+    - CLICommands: Importable break-glass functions for supervisor CLI
 """
 
 from backend.core.ouroboros.governance.operation_id import (
@@ -110,4 +118,34 @@ from backend.core.ouroboros.governance.multi_file_engine import (
     MultiFileChangeEngine,
     MultiFileChangeRequest,
     MultiFileChangeResult,
+)
+from backend.core.ouroboros.governance.event_bridge import (
+    EventBridge,
+    GovernanceEventMapper,
+)
+from backend.core.ouroboros.governance.blast_radius_adapter import (
+    BlastRadiusAdapter,
+    BlastRadiusResult,
+)
+from backend.core.ouroboros.governance.learning_bridge import (
+    LearningBridge,
+    OperationOutcome,
+)
+from backend.core.ouroboros.governance.runtime_contracts import (
+    RuntimeContractChecker,
+    ContractCheckResult,
+    ContractViolation,
+)
+from backend.core.ouroboros.governance.canary_controller import (
+    CanaryController,
+    DomainSlice,
+    SliceMetrics,
+    PromotionResult,
+    CanaryState,
+)
+from backend.core.ouroboros.governance.cli_commands import (
+    issue_break_glass,
+    list_active_tokens,
+    revoke_break_glass,
+    get_audit_report,
 )
