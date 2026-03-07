@@ -2799,18 +2799,20 @@ class UnifiedAgentRuntime:
                 _thrash = getattr(_mq, 'thrash_state', 'healthy')
                 if _thrash in ('thrashing', 'emergency'):
                     self._triage_pressure_skip_count += 1
-                    # Disable local extraction — PrimeRouter will route
-                    # to GCP_PRIME automatically via _decide_route()
+                    # Disable local extraction and reduce concurrency —
+                    # PrimeRouter will route to GCP_PRIME via _decide_route()
                     os.environ['EMAIL_TRIAGE_EXTRACTION_ENABLED'] = 'false'
+                    os.environ['EMAIL_TRIAGE_EXTRACTION_CONCURRENCY'] = '1'
                     logger.info(
-                        "[AgentRuntime] Memory pressure (%s): disabling local "
-                        "extraction, routing to GCP. consecutive=%d",
+                        "[AgentRuntime] Memory pressure (%s): routing to GCP "
+                        "with reduced concurrency. consecutive=%d",
                         _thrash, self._triage_pressure_skip_count,
                     )
                 else:
                     if self._triage_pressure_skip_count > 0:
                         # Pressure resolved — re-enable local extraction
                         os.environ.pop('EMAIL_TRIAGE_EXTRACTION_ENABLED', None)
+                        os.environ.pop('EMAIL_TRIAGE_EXTRACTION_CONCURRENCY', None)
                         logger.info(
                             "[AgentRuntime] Memory pressure resolved after %d cycles",
                             self._triage_pressure_skip_count,
