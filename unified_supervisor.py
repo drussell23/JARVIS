@@ -73514,14 +73514,29 @@ class JarvisSystemKernel:
 
             # =====================================================================
             # ExperienceQueueProcessor — drains training data to reactor-core
+            # v286.0: Wrapped in timeout — SQLite init can hang under disk
+            # pressure or lock contention, blocking the main startup path
+            # indefinitely and causing a TRUE STALL at 57%.
             # =====================================================================
+            _exp_proc_timeout = _get_env_float("JARVIS_EXP_PROC_TIMEOUT", 15.0)
             try:
-                from backend.core.experience_queue import get_experience_processor as _get_exp_proc
-                _exp_processor = await _get_exp_proc()
-                await _exp_processor.start()
-                if _exp_processor._task:
-                    self._background_tasks.append(_exp_processor._task)
-                self.logger.info("[Kernel] ExperienceQueueProcessor registered as background task")
+                async def _init_exp_processor():
+                    from backend.core.experience_queue import get_experience_processor as _get_exp_proc
+                    _exp_processor = await _get_exp_proc()
+                    await _exp_processor.start()
+                    if _exp_processor._task:
+                        self._background_tasks.append(_exp_processor._task)
+                    self.logger.info("[Kernel] ExperienceQueueProcessor registered as background task")
+
+                await asyncio.wait_for(_init_exp_processor(), timeout=_exp_proc_timeout)
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "[Kernel] ExperienceQueueProcessor init timed out (%.0fs) — "
+                    "training drain deferred to first triage cycle",
+                    _exp_proc_timeout,
+                )
+            except asyncio.CancelledError:
+                raise
             except Exception as _exp_err:
                 self.logger.warning("[Kernel] ExperienceQueueProcessor start failed (non-fatal): %s", _exp_err)
 
@@ -73559,6 +73574,7 @@ class JarvisSystemKernel:
             # v258.3 (Gap GCP-2): Re-evaluate startup mode after Intelligence phase.
             # At this point, backend is loaded + intelligence systems initialized.
             # Memory may have changed significantly from the pre-Phase-0 measurement.
+            self._mark_startup_activity("mode_reevaluation", stage="post_intelligence")
             try:
                 await asyncio.wait_for(_reevaluate_startup_mode("post-intelligence"), timeout=5.0)
             except asyncio.TimeoutError:
