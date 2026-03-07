@@ -9764,6 +9764,19 @@ class AnimatedProgressBar:
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 
 # =============================================================================
+# v290.0: Verdict bridge types – lazy import for ResourceManagerBase
+# =============================================================================
+try:
+    from backend.core.root_authority_types import (
+        SubsystemState as _VerdictState,
+        RequiredTier, VerdictReasonCode, RecoveryAction,
+        ResourceVerdict, SEVERITY_MAP,
+    )
+    _VERDICT_TYPES_AVAILABLE = True
+except ImportError:
+    _VERDICT_TYPES_AVAILABLE = False
+
+# =============================================================================
 # RESOURCE MANAGER BASE CLASS
 # =============================================================================
 class ResourceManagerBase(ABC):
@@ -9802,6 +9815,13 @@ class ResourceManagerBase(ABC):
         # v188.0: Progress callback for DMS stall prevention
         # Signature: async (manager_name: str, status: str, message: str, pct: float) -> None
         self._progress_callback: Optional[Callable[[str, str, str, float], Awaitable[None]]] = None
+
+        # v290.0: Verdict bridge fields
+        self._required_tier = RequiredTier.REQUIRED if _VERDICT_TYPES_AVAILABLE else None
+        self._capabilities: Tuple[str, ...] = ()
+        self._verdict_sequence: int = 0
+        self._boot_epoch: int = 0
+        self._correlation_id: str = ""
     
     def set_progress_callback(
         self,
@@ -9893,12 +9913,98 @@ class ResourceManagerBase(ABC):
             "circuit_breaker_state": self._circuit_breaker.state.value,
         }
 
-    async def safe_initialize(self) -> bool:
-        """
-        Initialize with circuit breaker protection and timing.
+    async def safe_initialize(self):
+        """Initialize with circuit breaker protection, return typed verdict.
 
-        Returns:
-            True if initialization succeeded, False otherwise.
+        v290.0: Returns ResourceVerdict instead of bool when verdict types
+        are available.  Still sets _ready/_health_status for backward compat.
+        """
+        if not _VERDICT_TYPES_AVAILABLE:
+            # Fallback: original bool behaviour
+            return await self._safe_initialize_bool()
+
+        start = time.time()
+        try:
+            result = await self._circuit_breaker.execute(self.initialize())
+            self._init_time = time.time() - start
+
+            # Bridge: custom verdict from subclass
+            _get_verdict = getattr(self, "get_init_verdict", None)
+            if callable(_get_verdict):
+                verdict = _get_verdict(result)
+                self._ready = verdict.serviceable
+                self._health_status = verdict.state.value
+                if verdict.severity == 0:
+                    self._logger.success(
+                        f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                    )
+                else:
+                    self._logger.warning(f"{self.name}: {verdict.reason_detail}")
+                return verdict
+
+            # Infer verdict from bool
+            if result:
+                self._ready = True
+                self._health_status = "healthy"
+                self._logger.success(
+                    f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                )
+                return self._build_verdict(
+                    state=_VerdictState.READY,
+                    reason_code=VerdictReasonCode.HEALTHY,
+                    reason_detail=(
+                        f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                    ),
+                    boot_allowed=True,
+                    serviceable=True,
+                    evidence={"init_time_ms": int(self._init_time * 1000)},
+                )
+            else:
+                self._error = self._error or "Initialization returned False"
+                self._health_status = "unhealthy"
+                self._logger.warning(f"{self.name} initialization failed")
+                _is_required = self._required_tier == RequiredTier.REQUIRED
+                return self._build_verdict(
+                    state=(
+                        _VerdictState.CRASHED if _is_required
+                        else _VerdictState.DEGRADED
+                    ),
+                    reason_code=VerdictReasonCode.INIT_RETURNED_FALSE,
+                    reason_detail=self._error,
+                    boot_allowed=not _is_required,
+                    serviceable=False,
+                    retryable=True,
+                    next_action=RecoveryAction.RETRY,
+                    evidence={
+                        "init_time_ms": int(self._init_time * 1000),
+                        "error": self._error,
+                    },
+                )
+        except Exception as e:
+            self._init_time = time.time() - start
+            self._error = str(e)
+            self._health_status = "error"
+            self._logger.error(f"{self.name} initialization error: {e}")
+            _is_required = self._required_tier == RequiredTier.REQUIRED
+            return self._build_verdict(
+                state=_VerdictState.CRASHED,
+                reason_code=VerdictReasonCode.INIT_EXCEPTION,
+                reason_detail=str(e),
+                boot_allowed=not _is_required,
+                serviceable=False,
+                retryable=True,
+                retry_after_s=30.0,
+                next_action=RecoveryAction.RETRY,
+                evidence={
+                    "exception": type(e).__name__,
+                    "init_time_ms": int(self._init_time * 1000),
+                },
+            )
+
+    async def _safe_initialize_bool(self) -> bool:
+        """Original bool-returning safe_initialize for fallback.
+
+        v290.0: Used when verdict types are not importable.
         """
         start = time.time()
         try:
@@ -9907,7 +10013,9 @@ class ResourceManagerBase(ABC):
             if result:
                 self._ready = True
                 self._health_status = "healthy"
-                self._logger.success(f"{self.name} initialized in {self._init_time*1000:.0f}ms")
+                self._logger.success(
+                    f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                )
             else:
                 self._error = "Initialization returned False"
                 self._health_status = "unhealthy"
@@ -9938,6 +10046,54 @@ class ResourceManagerBase(ABC):
             self._ready = False
             self._health_status = "error"
             return False, f"Health check error: {e}"
+
+    # -----------------------------------------------------------------
+    # v290.0: Verdict bridge
+    # -----------------------------------------------------------------
+
+    def _build_verdict(
+        self,
+        state,  # _VerdictState (SubsystemState)
+        reason_code,  # VerdictReasonCode
+        reason_detail: str,
+        *,
+        boot_allowed: bool = True,
+        serviceable: bool = False,
+        retryable: bool = False,
+        retry_after_s=None,
+        evidence=None,
+        recovery_owner=None,
+        next_action=None,
+    ):
+        """Build a ResourceVerdict from this manager's current context.
+
+        v290.0: Bridge helper used by safe_initialize() and future
+        health-check verdicts.
+        """
+        if not _VERDICT_TYPES_AVAILABLE:
+            raise RuntimeError("Verdict types not available")
+        from datetime import timezone
+        self._verdict_sequence += 1
+        return ResourceVerdict(
+            origin=self.name,
+            correlation_id=self._correlation_id,
+            epoch=self._boot_epoch,
+            monotonic_ns=time.monotonic_ns(),
+            wall_utc=datetime.now(timezone.utc).isoformat(),
+            sequence=self._verdict_sequence,
+            state=state,
+            boot_allowed=boot_allowed,
+            serviceable=serviceable,
+            required_tier=self._required_tier,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+            retryable=retryable,
+            retry_after_s=retry_after_s,
+            evidence=evidence or {},
+            recovery_owner=recovery_owner,
+            next_action=next_action or RecoveryAction.NONE,
+            capabilities=self._capabilities,
+        )
 
 # =============================================================================
 # DOCKER DAEMON STATUS ENUM
@@ -10017,6 +10173,9 @@ class DockerDaemonManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("DockerDaemonManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.ENHANCEMENT
+            self._capabilities = ("container_runtime",)
 
         # Platform detection
         self.platform = platform.system().lower()
@@ -10590,6 +10749,9 @@ class GCPInstanceManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("GCPInstanceManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.ENHANCEMENT
+            self._capabilities = ("cloud_compute", "cloud_offload")
 
         # Configuration from environment
         self.enabled = os.getenv("GCP_ENABLED", "false").lower() == "true"
@@ -11373,6 +11535,9 @@ class CostTracker(ResourceManagerBase, SystemService):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("CostTracker", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("cost_tracking",)
 
         # Configuration from environment
         self.enabled = os.getenv("COST_TRACKING_ENABLED", "true").lower() == "true"
@@ -11920,6 +12085,8 @@ class DynamicPortManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("DynamicPortManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._capabilities = ("port_allocation",)
 
         # Configuration from environment
         # v233.1: Harmonize port default with backend/main.py and frontend (8010).
@@ -12496,6 +12663,9 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("SemanticVoiceCacheManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("voice_cache",)
 
         # Configuration from environment
         self.enabled = os.getenv("VOICE_CACHE_ENABLED", "true").lower() == "true"
@@ -12834,6 +13004,9 @@ class TieredStorageManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("TieredStorageManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("tiered_storage",)
 
         # Configuration from environment
         self.enabled = os.getenv("TIERED_STORAGE_ENABLED", "true").lower() == "true"
@@ -13087,9 +13260,12 @@ class ResourceManagerRegistry:
         self._managers: Dict[str, ResourceManagerBase] = {}
         self._logger = UnifiedLogger()
         self._initialized = False
-        
+
         # v188.0: Progress callback for DMS stall prevention
         self._progress_callback = progress_callback
+
+        # v290.0: Preserve raw ResourceVerdict objects from each manager init
+        self._last_verdicts: Dict[str, Any] = {}
 
     def register(self, manager: ResourceManagerBase) -> None:
         """Register a resource manager."""
@@ -13102,6 +13278,10 @@ class ResourceManagerRegistry:
     def get_manager(self, name: str) -> Optional[ResourceManagerBase]:
         """Get a resource manager by name (alias for get)."""
         return self.get(name)
+
+    def get_last_verdicts(self) -> Dict[str, Any]:
+        """Return the last ResourceVerdict for each manager (if available)."""
+        return dict(self._last_verdicts)
 
     async def initialize_all(
         self,
@@ -13170,7 +13350,7 @@ class ResourceManagerRegistry:
         async def _initialize_manager(
             name: str,
             manager: ResourceManagerBase,
-        ) -> bool:
+        ):
             if manager_timeout is None:
                 return await manager.safe_initialize()
             try:
@@ -13187,6 +13367,20 @@ class ResourceManagerRegistry:
                 self._logger.warning(
                     f"Manager {name} timed out after {manager_timeout:.1f}s"
                 )
+                if _VERDICT_TYPES_AVAILABLE and hasattr(manager, '_build_verdict'):
+                    _timeout_verdict = manager._build_verdict(
+                        state=_VerdictState.CRASHED,
+                        reason_code=VerdictReasonCode.INIT_TIMEOUT,
+                        reason_detail=f"Initialization timed out after {manager_timeout:.1f}s",
+                        boot_allowed=manager._required_tier != RequiredTier.REQUIRED,
+                        serviceable=False,
+                        retryable=True,
+                        retry_after_s=manager_timeout,
+                        next_action=RecoveryAction.RETRY,
+                        evidence={"timeout_s": manager_timeout},
+                    )
+                    self._last_verdicts[name] = _timeout_verdict
+                    return _timeout_verdict
                 return False
 
         if parallel:
@@ -13245,7 +13439,12 @@ class ResourceManagerRegistry:
                     name = pending_tasks.pop(task)
                     try:
                         result = task.result()
-                        result_bool = bool(result)
+                        # v290.0: result may be ResourceVerdict or bool
+                        if _VERDICT_TYPES_AVAILABLE and hasattr(result, 'serviceable'):
+                            result_bool = result.serviceable
+                            self._last_verdicts[name] = result
+                        else:
+                            result_bool = bool(result)
                         results[name] = result_bool
                         status = "complete" if result_bool else "failed"
                     except asyncio.CancelledError:
@@ -13285,7 +13484,12 @@ class ResourceManagerRegistry:
                     manager_start_times[name] = time.monotonic()
                     self._logger.info(f"[ResourceRegistry] Starting {name}...")
                     result = await _initialize_manager(name, manager)
-                    result_bool = bool(result)
+                    # v290.0: result may be ResourceVerdict or bool
+                    if _VERDICT_TYPES_AVAILABLE and hasattr(result, 'serviceable'):
+                        result_bool = result.serviceable
+                        self._last_verdicts[name] = result
+                    else:
+                        result_bool = bool(result)
                     results[name] = result_bool
                     status = "complete" if result_bool else "failed"
                 except Exception as e:
@@ -13942,6 +14146,9 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("SpotInstanceResilienceHandler", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("spot_resilience",)
 
         # Configuration from environment
         self.enabled = os.getenv("SPOT_RESILIENCE_ENABLED", "true").lower() == "true"
@@ -14204,6 +14411,9 @@ class IntelligentCacheManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("IntelligentCacheManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.ENHANCEMENT
+            self._capabilities = ("module_cache",)
 
         # Configuration from environment
         self.enabled = os.getenv("CACHE_MANAGER_ENABLED", "true").lower() == "true"
@@ -66277,6 +66487,13 @@ class JarvisSystemKernel:
         self._ipc_server = IPCServer(self.config, self.logger)
         self._signal_handler = get_unified_signal_handler()
 
+        # v290.0: Verdict authority -- single source of truth for component status
+        try:
+            from backend.core.verdict_authority import VerdictAuthority
+            self._verdict_authority: Optional[Any] = VerdictAuthority()
+        except ImportError:
+            self._verdict_authority = None
+
         # Managers (initialized during startup)
         self._resource_registry: Optional[ResourceManagerRegistry] = None
         self._intelligence_registry: Optional[IntelligenceRegistry] = None
@@ -72753,7 +72970,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "running"},
                         "intelligence": {"status": "pending"},
                         "trinity": {"status": "pending"},
@@ -72872,7 +73091,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "running"},
                         "trinity": {"status": "pending"},
@@ -73051,7 +73272,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "running"},
@@ -73478,7 +73701,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -73819,7 +74044,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "trinity": {"status": "complete"},
@@ -74031,7 +74258,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74161,7 +74390,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74329,7 +74560,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74441,7 +74674,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74653,7 +74888,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "trinity": {"status": "complete"},
@@ -76252,6 +76489,30 @@ class JarvisSystemKernel:
                     await asyncio.wait_for(heartbeat_task, timeout=1.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+
+            # v290.0: Submit resource verdicts to authority and aggregate
+            if self._verdict_authority is not None and _VERDICT_TYPES_AVAILABLE:
+                try:
+                    _verdicts = self._resource_registry.get_last_verdicts()
+                    if _verdicts:
+                        _epoch = self._verdict_authority.current_epoch
+                        for vname, verdict in _verdicts.items():
+                            await self._verdict_authority.submit_verdict(vname, verdict)
+                        from backend.core.root_authority_types import aggregate_verdicts
+                        _phase_verdict = aggregate_verdicts(
+                            "resources", _verdicts,
+                            epoch=_epoch,
+                            correlation_id="resource-phase",
+                        )
+                        await self._verdict_authority.submit_phase_verdict(_phase_verdict)
+                        self.logger.info(
+                            "[Kernel] Resources phase verdict: state=%s boot_allowed=%s serviceable=%s",
+                            _phase_verdict.state.value,
+                            _phase_verdict.boot_allowed,
+                            _phase_verdict.serviceable,
+                        )
+                except Exception as va_err:
+                    self.logger.warning("[Kernel] VerdictAuthority submission error: %s", va_err)
 
             # =====================================================================
             # v211.0: TRULY NON-BLOCKING INVINCIBLE NODE WAKE-UP

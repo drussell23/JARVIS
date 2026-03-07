@@ -437,3 +437,367 @@ class TestUtilityFunctions:
         id1 = compute_incident_id("sub", ident, "RC", t1)
         id2 = compute_incident_id("sub", ident, "RC", t2)
         assert id1 != id2
+
+
+class TestRequiredTier:
+    def test_enum_values(self):
+        from backend.core.root_authority_types import RequiredTier
+        assert RequiredTier.REQUIRED.value == "required"
+        assert RequiredTier.ENHANCEMENT.value == "enhancement"
+        assert RequiredTier.OPTIONAL.value == "optional"
+
+    def test_enum_count(self):
+        from backend.core.root_authority_types import RequiredTier
+        assert len(RequiredTier) == 3
+
+
+class TestRecoveryAction:
+    def test_enum_values(self):
+        from backend.core.root_authority_types import RecoveryAction
+        assert RecoveryAction.NONE.value == "none"
+        assert RecoveryAction.RETRY.value == "retry"
+        assert RecoveryAction.ROUTE_TO_GCP.value == "route_to_gcp"
+        assert RecoveryAction.ROUTE_TO_LOCAL.value == "route_to_local"
+        assert RecoveryAction.MANUAL.value == "manual"
+        assert RecoveryAction.RESTART_MANAGER.value == "restart_manager"
+        assert RecoveryAction.DEFERRED_RECOVERY.value == "deferred_recovery"
+
+    def test_enum_count(self):
+        from backend.core.root_authority_types import RecoveryAction
+        assert len(RecoveryAction) == 7
+
+
+class TestVerdictReasonCode:
+    def test_controlled_vocabulary(self):
+        from backend.core.root_authority_types import VerdictReasonCode
+        assert VerdictReasonCode.HEALTHY.value == "healthy"
+        assert VerdictReasonCode.DISABLED_BY_CONFIG.value == "disabled_by_config"
+        assert VerdictReasonCode.NOT_INSTALLED.value == "not_installed"
+        assert VerdictReasonCode.MEMORY_ADMISSION_CLOUD_FIRST.value == "memory_admission_cloud_first"
+        assert VerdictReasonCode.MEMORY_ADMISSION_CLOUD_ONLY.value == "memory_admission_cloud_only"
+        assert VerdictReasonCode.PREFLIGHT_TIMEOUT.value == "preflight_timeout"
+        assert VerdictReasonCode.INIT_TIMEOUT.value == "init_timeout"
+        assert VerdictReasonCode.INIT_EXCEPTION.value == "init_exception"
+        assert VerdictReasonCode.INIT_RETURNED_FALSE.value == "init_returned_false"
+        assert VerdictReasonCode.PORT_CONFLICT.value == "port_conflict"
+        assert VerdictReasonCode.GCP_CLIENT_UNAVAILABLE.value == "gcp_client_unavailable"
+        assert VerdictReasonCode.CIRCUIT_BREAKER_OPEN.value == "circuit_breaker_open"
+        assert VerdictReasonCode.DEPENDENCY_MISSING.value == "dependency_missing"
+        assert VerdictReasonCode.STALE_EPOCH.value == "stale_epoch"
+        assert VerdictReasonCode.UNKNOWN.value == "unknown"
+
+    def test_enum_count(self):
+        from backend.core.root_authority_types import VerdictReasonCode
+        assert len(VerdictReasonCode) == 15
+
+
+class TestSeverityMap:
+    def test_ready_is_zero(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.READY] == 0
+
+    def test_degraded_is_one(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.DEGRADED] == 1
+
+    def test_crashed_is_three(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.CRASHED] == 3
+
+    def test_all_states_have_severity(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        for state in SubsystemState:
+            assert state in SEVERITY_MAP, f"{state} missing from SEVERITY_MAP"
+
+    def test_lattice_ordering(self):
+        from backend.core.root_authority_types import SubsystemState, SEVERITY_MAP
+        assert SEVERITY_MAP[SubsystemState.READY] < SEVERITY_MAP[SubsystemState.DEGRADED]
+        assert SEVERITY_MAP[SubsystemState.DEGRADED] < SEVERITY_MAP[SubsystemState.REJECTED]
+        assert SEVERITY_MAP[SubsystemState.REJECTED] < SEVERITY_MAP[SubsystemState.CRASHED]
+
+
+import time
+from datetime import datetime, timezone
+
+
+class TestVerdictWarning:
+    def test_creation(self):
+        from backend.core.root_authority_types import VerdictWarning
+        w = VerdictWarning(code="not_installed", detail="Docker not found", origin="docker_daemon")
+        assert w.code == "not_installed"
+        assert w.detail == "Docker not found"
+        assert w.origin == "docker_daemon"
+
+    def test_frozen(self):
+        from backend.core.root_authority_types import VerdictWarning
+        w = VerdictWarning(code="x", detail="y", origin="z")
+        with pytest.raises(AttributeError):
+            w.code = "changed"
+
+
+class TestResourceVerdict:
+    def _make_verdict(self, **overrides):
+        from backend.core.root_authority_types import (
+            ResourceVerdict, SubsystemState, RequiredTier,
+            VerdictReasonCode, RecoveryAction,
+        )
+        defaults = dict(
+            origin="test_manager",
+            correlation_id="corr-001",
+            epoch=1,
+            monotonic_ns=time.monotonic_ns(),
+            wall_utc=datetime.now(timezone.utc).isoformat(),
+            sequence=1,
+            state=SubsystemState.READY,
+            boot_allowed=True,
+            serviceable=True,
+            required_tier=RequiredTier.REQUIRED,
+            reason_code=VerdictReasonCode.HEALTHY,
+            reason_detail="Initialized OK",
+            retryable=False,
+        )
+        defaults.update(overrides)
+        return ResourceVerdict(**defaults)
+
+    def test_healthy_verdict(self):
+        v = self._make_verdict()
+        assert v.state.value == "ready"
+        assert v.boot_allowed is True
+        assert v.serviceable is True
+        assert v.severity == 0
+
+    def test_severity_derived_from_state(self):
+        from backend.core.root_authority_types import SubsystemState
+        v = self._make_verdict(state=SubsystemState.DEGRADED, serviceable=False)
+        assert v.severity == 1
+
+    def test_frozen(self):
+        v = self._make_verdict()
+        with pytest.raises(AttributeError):
+            v.state = "changed"
+
+    def test_default_optional_fields(self):
+        from backend.core.root_authority_types import RecoveryAction
+        v = self._make_verdict()
+        assert v.retry_after_s is None
+        assert v.evidence == {}
+        assert v.recovery_owner is None
+        assert v.next_action == RecoveryAction.NONE
+        assert v.capabilities == ()
+
+    def test_schema_version(self):
+        from backend.core.root_authority_types import ResourceVerdict
+        assert ResourceVerdict.SCHEMA_VERSION == 1
+
+    def test_with_evidence(self):
+        v = self._make_verdict(evidence={"init_time_ms": 150, "error": None})
+        assert v.evidence["init_time_ms"] == 150
+
+    def test_with_capabilities(self):
+        v = self._make_verdict(capabilities=("container_runtime", "image_build"))
+        assert len(v.capabilities) == 2
+        assert "container_runtime" in v.capabilities
+
+    def test_invariant_crashed_not_serviceable(self):
+        from backend.core.root_authority_types import SubsystemState
+        with pytest.raises(ValueError, match="CRASHED.*serviceable"):
+            self._make_verdict(state=SubsystemState.CRASHED, serviceable=True, boot_allowed=False)
+
+    def test_invariant_boot_not_allowed_not_ready(self):
+        from backend.core.root_authority_types import SubsystemState
+        with pytest.raises(ValueError, match="boot_allowed.*READY"):
+            self._make_verdict(state=SubsystemState.READY, boot_allowed=False)
+
+    def test_invariant_required_not_serviceable_not_ready(self):
+        from backend.core.root_authority_types import SubsystemState, RequiredTier
+        with pytest.raises(ValueError, match="REQUIRED.*serviceable.*READY"):
+            self._make_verdict(state=SubsystemState.READY, serviceable=False, required_tier=RequiredTier.REQUIRED)
+
+    def test_valid_degraded_but_serviceable(self):
+        from backend.core.root_authority_types import SubsystemState
+        v = self._make_verdict(state=SubsystemState.DEGRADED, serviceable=True)
+        assert v.severity == 1
+        assert v.serviceable is True
+
+    def test_valid_optional_crashed_boot_allowed(self):
+        from backend.core.root_authority_types import SubsystemState, RequiredTier
+        v = self._make_verdict(
+            state=SubsystemState.CRASHED, boot_allowed=True,
+            serviceable=False, required_tier=RequiredTier.OPTIONAL,
+        )
+        assert v.boot_allowed is True
+        assert v.severity == 3
+
+
+class TestPhaseVerdict:
+    def test_schema_version(self):
+        from backend.core.root_authority_types import PhaseVerdict
+        assert PhaseVerdict.SCHEMA_VERSION == 1
+
+    def test_severity_derived(self):
+        from backend.core.root_authority_types import PhaseVerdict, SubsystemState
+        pv = PhaseVerdict(
+            phase_name="resources", state=SubsystemState.DEGRADED,
+            boot_allowed=True, serviceable=True,
+            manager_verdicts={}, reason_codes=(), warnings=(),
+            epoch=1, monotonic_ns=time.monotonic_ns(),
+            wall_utc=datetime.now(timezone.utc).isoformat(),
+            correlation_id="corr-001",
+        )
+        assert pv.severity == 1
+
+    def test_frozen(self):
+        from backend.core.root_authority_types import PhaseVerdict, SubsystemState
+        pv = PhaseVerdict(
+            phase_name="resources", state=SubsystemState.READY,
+            boot_allowed=True, serviceable=True,
+            manager_verdicts={}, reason_codes=(), warnings=(),
+            epoch=1, monotonic_ns=time.monotonic_ns(),
+            wall_utc=datetime.now(timezone.utc).isoformat(),
+            correlation_id="corr-001",
+        )
+        with pytest.raises(AttributeError):
+            pv.state = SubsystemState.CRASHED
+
+
+class TestAggregateVerdicts:
+    def _verdict(self, origin, state, required_tier, boot_allowed=True,
+                 serviceable=True, reason_code=None, retryable=False, seq=1):
+        from backend.core.root_authority_types import (
+            ResourceVerdict, SubsystemState, RequiredTier, VerdictReasonCode,
+        )
+        if reason_code is None:
+            reason_code = VerdictReasonCode.HEALTHY if state == SubsystemState.READY else VerdictReasonCode.UNKNOWN
+        return ResourceVerdict(
+            origin=origin, correlation_id="corr-agg", epoch=1,
+            monotonic_ns=time.monotonic_ns(),
+            wall_utc=datetime.now(timezone.utc).isoformat(),
+            sequence=seq, state=state, boot_allowed=boot_allowed,
+            serviceable=serviceable, required_tier=required_tier,
+            reason_code=reason_code, reason_detail=f"{origin} verdict",
+            retryable=retryable,
+        )
+
+    def test_all_healthy_required(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts,
+        )
+        verdicts = {
+            "docker": self._verdict("docker", SubsystemState.READY, RequiredTier.REQUIRED),
+            "ports": self._verdict("ports", SubsystemState.READY, RequiredTier.REQUIRED),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.state == SubsystemState.READY
+        assert pv.boot_allowed is True
+        assert pv.serviceable is True
+        assert len(pv.reason_codes) == 0
+        assert len(pv.warnings) == 0
+
+    def test_one_required_degraded(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts, VerdictReasonCode,
+        )
+        verdicts = {
+            "docker": self._verdict("docker", SubsystemState.DEGRADED, RequiredTier.REQUIRED,
+                                     serviceable=True, reason_code=VerdictReasonCode.NOT_INSTALLED),
+            "ports": self._verdict("ports", SubsystemState.READY, RequiredTier.REQUIRED),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.state == SubsystemState.DEGRADED
+        assert pv.boot_allowed is True
+        assert pv.serviceable is True
+
+    def test_required_crashed_blocks_boot(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts, VerdictReasonCode,
+        )
+        verdicts = {
+            "ports": self._verdict("ports", SubsystemState.CRASHED, RequiredTier.REQUIRED,
+                                    boot_allowed=False, serviceable=False,
+                                    reason_code=VerdictReasonCode.PORT_CONFLICT),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.state == SubsystemState.CRASHED
+        assert pv.boot_allowed is False
+        assert pv.serviceable is False
+
+    def test_optional_crashed_does_not_block_boot(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts, VerdictReasonCode,
+        )
+        verdicts = {
+            "ports": self._verdict("ports", SubsystemState.READY, RequiredTier.REQUIRED),
+            "cache": self._verdict("cache", SubsystemState.CRASHED, RequiredTier.OPTIONAL,
+                                    boot_allowed=True, serviceable=False,
+                                    reason_code=VerdictReasonCode.DEPENDENCY_MISSING),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.state == SubsystemState.READY
+        assert pv.boot_allowed is True
+        assert len(pv.warnings) == 1
+        assert pv.warnings[0].origin == "cache"
+
+    def test_enhancement_degraded_adds_warning(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts, VerdictReasonCode,
+        )
+        verdicts = {
+            "ports": self._verdict("ports", SubsystemState.READY, RequiredTier.REQUIRED),
+            "docker": self._verdict("docker", SubsystemState.DEGRADED, RequiredTier.ENHANCEMENT,
+                                     serviceable=False, reason_code=VerdictReasonCode.NOT_INSTALLED),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.state == SubsystemState.READY
+        assert pv.boot_allowed is True
+        assert len(pv.warnings) == 1
+
+    def test_empty_required_fails_closed(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts,
+        )
+        verdicts = {
+            "cache": self._verdict("cache", SubsystemState.READY, RequiredTier.OPTIONAL),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.state == SubsystemState.REJECTED
+        assert pv.boot_allowed is False
+
+    def test_empty_required_allowed_when_explicit(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts,
+        )
+        verdicts = {
+            "cache": self._verdict("cache", SubsystemState.READY, RequiredTier.OPTIONAL),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1",
+                                allow_empty_required=True)
+        assert pv.boot_allowed is True
+
+    def test_reason_codes_sorted_by_severity(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts, VerdictReasonCode,
+        )
+        verdicts = {
+            "a": self._verdict("a", SubsystemState.DEGRADED, RequiredTier.REQUIRED,
+                                serviceable=True, reason_code=VerdictReasonCode.NOT_INSTALLED),
+            "b": self._verdict("b", SubsystemState.CRASHED, RequiredTier.REQUIRED,
+                                boot_allowed=False, serviceable=False,
+                                reason_code=VerdictReasonCode.INIT_EXCEPTION),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.reason_codes[0] == VerdictReasonCode.INIT_EXCEPTION
+
+    def test_deterministic_tiebreak_non_retryable_wins(self):
+        from backend.core.root_authority_types import (
+            SubsystemState, RequiredTier, aggregate_verdicts, VerdictReasonCode,
+        )
+        verdicts = {
+            "a": self._verdict("a", SubsystemState.DEGRADED, RequiredTier.REQUIRED,
+                                serviceable=True, retryable=True,
+                                reason_code=VerdictReasonCode.INIT_TIMEOUT),
+            "b": self._verdict("b", SubsystemState.DEGRADED, RequiredTier.REQUIRED,
+                                serviceable=True, retryable=False,
+                                reason_code=VerdictReasonCode.CIRCUIT_BREAKER_OPEN),
+        }
+        pv = aggregate_verdicts("resources", verdicts, epoch=1, correlation_id="c1")
+        assert pv.state == SubsystemState.DEGRADED
