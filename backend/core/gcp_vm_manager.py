@@ -148,6 +148,14 @@ T = TypeVar('T')
 # automatically recycled (deleted + recreated) to pick up the latest script.
 _STARTUP_SCRIPT_VERSION = "238.0"
 
+# v290.1: APARS checkpoints that indicate the startup script has given up.
+# When detected, the polling loop applies a grace period before returning
+# failure instead of looping for the full 300s timeout.
+_APARS_TERMINAL_CHECKPOINTS: frozenset = frozenset({
+    "service_start_timeout",
+    "service_health_check_failed",
+})
+
 # Timeout profiles: environment-appropriate defaults for service_health_timeout.
 # Selected via GCP_TIMEOUT_PROFILE env var; explicit GCP_SERVICE_HEALTH_TIMEOUT
 # always takes precedence.
@@ -9901,6 +9909,11 @@ fi
         self._current_process_epoch = None  # v237.1: Reset process epoch for fresh polling
         _consecutive_ready = 0
         _consecutive_not_ready = 0
+        # v290.1: APARS terminal detection with grace period
+        _apars_terminal_detected_at: Optional[float] = None
+        _apars_grace_seconds = float(os.getenv(
+            "JARVIS_GCP_APARS_GRACE_SECONDS", "30"
+        ))
 
         while (time.time() - start_time) < timeout:
             elapsed = time.time() - start_time
@@ -10029,6 +10042,40 @@ fi
                 detail = f"{phase_name}{mode_tag} ({progress_pct}%, ETA {eta}s)"
                 last_status = f"phase={phase_name}, progress={progress_pct}%, eta={eta}s, mode={deploy_mode}"
                 logger.debug(f"☁️ [InvincibleNode] Health poll: {last_status}")
+
+                # v290.1: Detect startup script failure signal.
+                # When the startup script's own health check fails (after ~90s),
+                # it sets checkpoint="service_start_timeout". Instead of polling
+                # for 210 more seconds, apply a grace period then exit.
+                _apars_checkpoint = apars.get("checkpoint", "")
+                if _apars_checkpoint in _APARS_TERMINAL_CHECKPOINTS:
+                    if _apars_terminal_detected_at is None:
+                        _apars_terminal_detected_at = time.time()
+                        logger.warning(
+                            f"☁️ [InvincibleNode] Startup script reports failure: "
+                            f"checkpoint={_apars_checkpoint}, "
+                            f"error={apars.get('error', 'none')}. "
+                            f"Applying {_apars_grace_seconds}s grace period "
+                            f"before exit."
+                        )
+                    elif (time.time() - _apars_terminal_detected_at) > _apars_grace_seconds:
+                        logger.warning(
+                            f"☁️ [InvincibleNode] Grace period expired "
+                            f"({_apars_grace_seconds}s after startup script "
+                            f"failure). Returning APARS_TERMINAL."
+                        )
+                        if progress_callback:
+                            try:
+                                progress_callback(
+                                    progress_pct, "terminal",
+                                    f"Startup script failed: {_apars_checkpoint}"
+                                )
+                            except Exception:
+                                pass
+                        return False, (
+                            f"APARS_TERMINAL: {_apars_checkpoint} "
+                            f"(grace={_apars_grace_seconds}s expired)"
+                        )
             elif health_data.get("model_loaded") or health_data.get("status") == "healthy":
                 # v235.2: J-Prime is running, model loaded or healthy — this is
                 # meaningful progress data even without APARS. Set has_real_data
