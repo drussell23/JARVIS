@@ -462,39 +462,47 @@ class PrimeRouter:
         return self._cloud_client
 
     def _decide_route(self) -> RoutingDecision:
-        """v280.4: Memory-aware routing — skips local during EMERGENCY thrash."""
+        """v290.0: GCP-first routing policy.
+
+        Decision order:
+        1. GCP_PRIME (always first when promoted + circuit healthy)
+        2. CLOUD_CLAUDE (paid fallback, always reliable)
+        3. LOCAL_PRIME / HYBRID (last resort, only if no remote option)
+        4. DEGRADED (nothing available)
+
+        Memory emergency additionally blocks local inference to prevent
+        thrash amplification.
+        """
         self._guard_mirror("_decide_route")
-        # v280.4: During memory EMERGENCY, do NOT attempt local inference.
-        # Local inference allocates memory (KV cache, activations) which
-        # triggers more page faults, worsening the crisis in a positive
-        # feedback loop.  Route to GCP_PRIME if promoted, else CLOUD_CLAUDE.
-        if self._is_memory_emergency():
-            if self._gcp_promoted:
-                return RoutingDecision.GCP_PRIME
-            if self._config.enable_cloud_fallback:
-                return RoutingDecision.CLOUD_CLAUDE
+
+        is_emergency = self._is_memory_emergency()
+
+        # -- Priority 1: GCP J-Prime (always first when available) --
+        if self._gcp_promoted and self._local_circuit.can_execute():
+            return RoutingDecision.GCP_PRIME
+
+        # -- Priority 2: Cloud Claude (reliable paid fallback) --
+        if self._config.enable_cloud_fallback:
+            return RoutingDecision.CLOUD_CLAUDE
+
+        # -- Priority 3: Local Prime (last resort, blocked during emergency) --
+        if is_emergency:
+            # Local inference worsens memory thrash -- skip entirely
             return RoutingDecision.DEGRADED
 
         prime_available = (
-            self._prime_client is not None and
-            self._prime_client.is_available
+            self._prime_client is not None
+            and self._prime_client.is_available
         )
-
-        # v242.0: Check local circuit breaker before routing to hybrid/local
         local_circuit_ok = self._local_circuit.can_execute()
 
-        if not prime_available or not local_circuit_ok:
-            if self._config.enable_cloud_fallback:
-                return RoutingDecision.CLOUD_CLAUDE
-            return RoutingDecision.DEGRADED
+        if prime_available and local_circuit_ok:
+            if self._config.prefer_local:
+                return RoutingDecision.HYBRID
+            return RoutingDecision.LOCAL_PRIME
 
-        # v242.0: GCP-promoted goes directly to GCP_PRIME (no HYBRID probe)
-        if self._gcp_promoted:
-            return RoutingDecision.GCP_PRIME
-
-        if self._config.prefer_local:
-            return RoutingDecision.HYBRID
-        return RoutingDecision.LOCAL_PRIME
+        # -- Priority 4: Nothing available --
+        return RoutingDecision.DEGRADED
 
     # -----------------------------------------------------------------
     # v280.4: Memory-aware routing gate
