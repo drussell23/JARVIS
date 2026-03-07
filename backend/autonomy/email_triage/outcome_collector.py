@@ -161,6 +161,7 @@ class OutcomeCollector:
         await enqueue_experience(
             experience_type=ExperienceType.BEHAVIORAL_EVENT,
             data={
+                "brain_id": "email_triage",
                 "source": "email_triage",
                 "outcome": record["outcome"],
                 "confidence": record["confidence"],
