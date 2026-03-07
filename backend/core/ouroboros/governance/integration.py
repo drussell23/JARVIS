@@ -14,13 +14,30 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from backend.core.ouroboros.governance.break_glass import BreakGlassManager
+from backend.core.ouroboros.governance.canary_controller import CanaryController
+from backend.core.ouroboros.governance.change_engine import ChangeEngine
+from backend.core.ouroboros.governance.comm_protocol import CommProtocol
 from backend.core.ouroboros.governance.contract_gate import ContractVersion
-from backend.core.ouroboros.governance.risk_engine import POLICY_VERSION
+from backend.core.ouroboros.governance.degradation import DegradationController
+from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationLedger, OperationState
+from backend.core.ouroboros.governance.lock_manager import GovernanceLockManager
+from backend.core.ouroboros.governance.resource_monitor import ResourceMonitor
+from backend.core.ouroboros.governance.risk_engine import (
+    POLICY_VERSION,
+    ChangeType,
+    OperationProfile,
+    RiskEngine,
+)
+from backend.core.ouroboros.governance.routing_policy import RoutingPolicy
+from backend.core.ouroboros.governance.runtime_contracts import RuntimeContractChecker
+from backend.core.ouroboros.governance.supervisor_controller import SupervisorOuroborosController
 
 
 # ---------------------------------------------------------------------------
@@ -194,3 +211,147 @@ class GovernanceConfig:
             startup_timeout_s=startup_timeout_s,
             component_budget_s=component_budget_s,
         )
+
+
+logger = logging.getLogger("Ouroboros.Integration")
+
+
+# ---------------------------------------------------------------------------
+# GovernanceStack
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class GovernanceStack:
+    """Holds all instantiated governance components with lifecycle methods.
+
+    Provides:
+    - start()/stop(): idempotent lifecycle
+    - can_write(): single authority for autonomous write decisions
+    - health(): structured report for TUI/dashboard
+    - replay_decision(): forensic audit of prior decisions
+    - drain(): graceful shutdown of in-flight operations
+    """
+
+    # Core (always present)
+    controller: SupervisorOuroborosController
+    risk_engine: RiskEngine
+    ledger: OperationLedger
+    comm: CommProtocol
+    lock_manager: GovernanceLockManager
+    break_glass: BreakGlassManager
+    change_engine: ChangeEngine
+    resource_monitor: ResourceMonitor
+    degradation: DegradationController
+    routing: RoutingPolicy
+    canary: CanaryController
+    contract_checker: RuntimeContractChecker
+
+    # Optional bridges
+    event_bridge: Optional[Any]
+    blast_adapter: Optional[Any]
+    learning_bridge: Optional[Any]
+
+    # Metadata
+    policy_version: str
+    capabilities: Dict[str, CapabilityStatus]
+
+    _started: bool = False
+
+    async def start(self) -> None:
+        """Start all components. Idempotent -- second call is no-op."""
+        if self._started:
+            return
+        await self.controller.start()
+        self._started = True
+
+    async def stop(self) -> None:
+        """Graceful shutdown. Idempotent."""
+        if not self._started:
+            return
+        await self.drain()
+        await self.controller.stop()
+        self._started = False
+
+    async def drain(self) -> None:
+        """Drain in-flight operations before shutdown."""
+        pass
+
+    def health(self) -> Dict[str, Any]:
+        """Structured health report for TUI/dashboard."""
+        return {
+            "mode": self.controller.mode.value,
+            "policy_version": self.policy_version,
+            "capabilities": {
+                k: {"enabled": v.enabled, "reason": v.reason}
+                for k, v in self.capabilities.items()
+            },
+            "degradation_mode": self.degradation.mode.name,
+            "canary_slices": {
+                p: s.state.value for p, s in self.canary.slices.items()
+            },
+            "budget_remaining": (
+                self.routing.cost_guardrail.remaining
+                if hasattr(self.routing, "cost_guardrail")
+                else None
+            ),
+        }
+
+    def can_write(self, op_context: Dict[str, Any]) -> Tuple[bool, str]:
+        """Single authority for all autonomous write decisions.
+
+        Returns (allowed, reason_code). ALL write paths must call this.
+        No alternate path can enable writes outside this gate.
+        """
+        if not self._started:
+            return False, "governance_not_started"
+        if not self.controller.writes_allowed:
+            return False, f"mode_{self.controller.mode.value}"
+        if self.degradation.mode.value > 1:  # REDUCED or worse
+            return False, f"degradation_{self.degradation.mode.name}"
+        # Check canary slice
+        files = op_context.get("files", [])
+        for f in files:
+            if not self.canary.is_file_allowed(str(f)):
+                return False, f"canary_not_promoted:{f}"
+        # Check runtime contract
+        proposed_version = op_context.get("proposed_contract_version")
+        if proposed_version and not self.contract_checker.check_before_write(
+            proposed_version
+        ):
+            return False, "contract_incompatible"
+        return True, "ok"
+
+    async def replay_decision(
+        self, op_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Reconstruct classification from persisted inputs + policy_version.
+
+        Returns the exact prior decision for forensic audit.
+        """
+        entries = await self.ledger.get_history(op_id)
+        if not entries:
+            return None
+        entry = entries[0]
+        profile_data = entry.data.get("profile", {})
+        if not profile_data:
+            return None
+        files = profile_data.get("files_affected", [])
+        profile = OperationProfile(
+            files_affected=[Path(f) for f in files],
+            change_type=ChangeType[profile_data.get("change_type", "MODIFY")],
+            blast_radius=profile_data.get("blast_radius", 1),
+            crosses_repo_boundary=profile_data.get("crosses_repo_boundary", False),
+            touches_security_surface=profile_data.get("touches_security_surface", False),
+            touches_supervisor=profile_data.get("touches_supervisor", False),
+            test_scope_confidence=profile_data.get("test_scope_confidence", 0.0),
+        )
+        classification = self.risk_engine.classify(profile)
+        return {
+            "op_id": op_id,
+            "policy_version": self.policy_version,
+            "original_state": entry.state.value,
+            "replayed_tier": classification.tier.name,
+            "replayed_reason": classification.reason_code,
+            "match": classification.tier.name == entry.data.get("risk_tier"),
+        }

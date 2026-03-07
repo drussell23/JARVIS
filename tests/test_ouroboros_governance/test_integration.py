@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -190,3 +191,212 @@ class TestGovernanceConfig:
         assert config.contract_version.major == 2
         assert config.contract_version.minor == 1
         assert config.contract_version.patch == 0
+
+
+# -- GovernanceStack ---------------------------------------------------------
+
+
+def _make_mock_stack_components():
+    """Create mock governance components for testing GovernanceStack."""
+    controller = MagicMock()
+    controller.start = AsyncMock()
+    controller.stop = AsyncMock()
+    controller.mode = MagicMock()
+    controller.mode.value = "sandbox"
+    controller.writes_allowed = True
+
+    risk_engine = MagicMock()
+    ledger = MagicMock()
+    ledger.get_history = AsyncMock(return_value=[])
+
+    comm = MagicMock()
+    lock_manager = MagicMock()
+    break_glass = MagicMock()
+    change_engine = MagicMock()
+    resource_monitor = MagicMock()
+
+    degradation = MagicMock()
+    degradation.mode = MagicMock()
+    degradation.mode.value = 0  # FULL_AUTONOMY
+    degradation.mode.name = "FULL_AUTONOMY"
+
+    routing = MagicMock()
+    routing.cost_guardrail = MagicMock()
+    routing.cost_guardrail.remaining = 10.0
+
+    canary = MagicMock()
+    canary.slices = {}
+    canary.is_file_allowed = MagicMock(return_value=True)
+
+    contract_checker = MagicMock()
+    contract_checker.check_before_write = MagicMock(return_value=True)
+
+    return {
+        "controller": controller,
+        "risk_engine": risk_engine,
+        "ledger": ledger,
+        "comm": comm,
+        "lock_manager": lock_manager,
+        "break_glass": break_glass,
+        "change_engine": change_engine,
+        "resource_monitor": resource_monitor,
+        "degradation": degradation,
+        "routing": routing,
+        "canary": canary,
+        "contract_checker": contract_checker,
+        "event_bridge": None,
+        "blast_adapter": None,
+        "learning_bridge": None,
+        "policy_version": "v0.1.0",
+        "capabilities": {},
+    }
+
+
+class TestGovernanceStack:
+    """GovernanceStack lifecycle, write gate, and health."""
+
+    def _make_stack(self, **overrides):
+        from backend.core.ouroboros.governance.integration import GovernanceStack
+
+        components = _make_mock_stack_components()
+        components.update(overrides)
+        return GovernanceStack(**components)
+
+    @pytest.mark.asyncio
+    async def test_start_idempotent(self):
+        stack = self._make_stack()
+        await stack.start()
+        await stack.start()  # second call is no-op
+        stack.controller.start.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_idempotent(self):
+        stack = self._make_stack()
+        await stack.start()
+        await stack.stop()
+        await stack.stop()  # second call is no-op
+        stack.controller.stop.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_stop_without_start_is_noop(self):
+        stack = self._make_stack()
+        await stack.stop()  # no error
+        stack.controller.stop.assert_not_awaited()
+
+    def test_health_returns_structured_dict(self):
+        stack = self._make_stack()
+        stack._started = True
+        health = stack.health()
+        assert "mode" in health
+        assert "policy_version" in health
+        assert "capabilities" in health
+        assert "degradation_mode" in health
+        assert "canary_slices" in health
+
+    def test_can_write_before_start_denied(self):
+        stack = self._make_stack()
+        allowed, reason = stack.can_write({"files": []})
+        assert allowed is False
+        assert reason == "governance_not_started"
+
+    @pytest.mark.asyncio
+    async def test_can_write_when_writes_allowed(self):
+        stack = self._make_stack()
+        await stack.start()
+        allowed, reason = stack.can_write({"files": ["foo.py"]})
+        assert allowed is True
+        assert reason == "ok"
+
+    @pytest.mark.asyncio
+    async def test_can_write_denied_by_controller(self):
+        stack = self._make_stack()
+        stack.controller.writes_allowed = False
+        await stack.start()
+        allowed, reason = stack.can_write({"files": []})
+        assert allowed is False
+        assert "mode_" in reason
+
+    @pytest.mark.asyncio
+    async def test_can_write_denied_by_degradation(self):
+        stack = self._make_stack()
+        stack.degradation.mode.value = 2  # READ_ONLY_PLANNING
+        stack.degradation.mode.name = "READ_ONLY_PLANNING"
+        await stack.start()
+        allowed, reason = stack.can_write({"files": []})
+        assert allowed is False
+        assert "degradation_" in reason
+
+    @pytest.mark.asyncio
+    async def test_can_write_denied_by_canary(self):
+        stack = self._make_stack()
+        stack.canary.is_file_allowed = MagicMock(return_value=False)
+        await stack.start()
+        allowed, reason = stack.can_write({"files": ["blocked.py"]})
+        assert allowed is False
+        assert "canary_not_promoted" in reason
+
+    @pytest.mark.asyncio
+    async def test_can_write_denied_by_contract(self):
+        from backend.core.ouroboros.governance.contract_gate import ContractVersion
+
+        stack = self._make_stack()
+        stack.contract_checker.check_before_write = MagicMock(return_value=False)
+        await stack.start()
+        allowed, reason = stack.can_write({
+            "files": [],
+            "proposed_contract_version": ContractVersion(3, 0, 0),
+        })
+        assert allowed is False
+        assert reason == "contract_incompatible"
+
+    @pytest.mark.asyncio
+    async def test_replay_decision_no_entry(self):
+        stack = self._make_stack()
+        stack.ledger.get_history = AsyncMock(return_value=[])
+        result = await stack.replay_decision("nonexistent-op-id")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_replay_decision_with_entry(self):
+        from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
+        from backend.core.ouroboros.governance.risk_engine import (
+            RiskClassification,
+            RiskTier,
+        )
+
+        entry = LedgerEntry(
+            op_id="test-op-1",
+            state=OperationState.PLANNED,
+            data={
+                "profile": {
+                    "files_affected": ["test.py"],
+                    "change_type": "MODIFY",
+                    "blast_radius": 1,
+                    "crosses_repo_boundary": False,
+                    "touches_security_surface": False,
+                    "touches_supervisor": False,
+                    "test_scope_confidence": 0.9,
+                },
+                "risk_tier": "SAFE_AUTO",
+            },
+        )
+        stack = self._make_stack()
+        stack.ledger.get_history = AsyncMock(return_value=[entry])
+        stack.risk_engine.classify = MagicMock(
+            return_value=RiskClassification(
+                tier=RiskTier.SAFE_AUTO,
+                reason_code="safe_single_file",
+                policy_version="v0.1.0",
+            )
+        )
+
+        result = await stack.replay_decision("test-op-1")
+        assert result is not None
+        assert result["op_id"] == "test-op-1"
+        assert result["replayed_tier"] == "SAFE_AUTO"
+        assert result["match"] is True
+
+    @pytest.mark.asyncio
+    async def test_drain_is_callable(self):
+        stack = self._make_stack()
+        await stack.drain()  # should not raise
