@@ -664,12 +664,12 @@ class CrossRepoStateInitializer:
             if has_dlm and self._lock_manager is not None:
                 async with self._lock_manager.acquire(
                     "vbia_events",
-                    timeout=max(0.5, _get_env_float("JARVIS_VBIA_EVENTS_LOCK_TIMEOUT", 2.0)),
+                    timeout=max(0.5, _get_env_float("JARVIS_VBIA_EVENTS_LOCK_TIMEOUT", 5.0)),
                     ttl=max(5.0, _get_env_float("JARVIS_CROSS_REPO_LOCK_TTL", 20.0)),
                     enable_keepalive=False,
                 ) as acquired:
                     if not acquired:
-                        logger.warning("Could not acquire vbia_events lock, skipping emit")
+                        logger.debug("Could not acquire vbia_events lock, skipping emit")
                         return
                     events = await self._read_json_file(events_file, default=[])
                     events.append(asdict(event))

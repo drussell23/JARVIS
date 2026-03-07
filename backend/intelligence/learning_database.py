@@ -9315,7 +9315,12 @@ async def get_learning_database(
             fast_mode = True
 
     # ── v265.1: Configurable init timeout safety net ──────────────────
-    _init_timeout = float(os.environ.get("JARVIS_LEARNING_DB_INIT_TIMEOUT", "15.0"))
+    # v286.0: Increased default from 15s to 30s. During startup, the
+    # thread pool executor is saturated with model loading I/O (mmap
+    # pageins, SQLite from multiple subsystems). 15s wasn't enough for
+    # run_in_executor(sqlite3.connect) to get scheduled, causing a
+    # guaranteed timeout + retry cycle on every boot.
+    _init_timeout = float(os.environ.get("JARVIS_LEARNING_DB_INIT_TIMEOUT", "30.0"))
 
     async with _db_lock:
         # Fast path: already initialized and healthy
