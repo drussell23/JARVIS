@@ -767,9 +767,18 @@ class PrimeClient:
                 # before completing hot-swap. Fail-open: allows on error.
                 try:
                     from backend.core.protocol_version_gate import validate_health_before_swap
+                    # v303.0: Normalize known boolean fields before schema
+                    # validation.  The GCP progress file can contain null for
+                    # ready_for_inference/model_loaded when update_apars() is
+                    # called without explicit args.  Coerce None → False so
+                    # the schema check passes instead of rejecting NoneType.
+                    _health = getattr(self, "_last_health_data", {}) or {}
+                    for _bf in ("ready_for_inference", "model_loaded"):
+                        if _bf in _health and not isinstance(_health[_bf], bool):
+                            _health[_bf] = bool(_health[_bf]) if _health[_bf] is not None else False
                     _vok, _vreason = validate_health_before_swap(
                         "prime:/health",
-                        getattr(self, "_last_health_data", {}) or {},
+                        _health,
                     )
                     if not _vok:
                         logger.warning(

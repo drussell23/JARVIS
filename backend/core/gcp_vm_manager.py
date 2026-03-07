@@ -8893,8 +8893,8 @@ update_apars() {
     local phase_progress=$2
     local total_progress=$3
     local checkpoint=$4
-    local model_loaded=${5:-null}
-    local ready=${6:-null}
+    local model_loaded=${5:-false}
+    local ready=${6:-false}
     local error=${7:-null}
     local now=$(date +%s)
     local elapsed=$((now - START_TIME))
@@ -9037,12 +9037,17 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                          "model_loaded": False, "ready_for_inference": False}
 
             elapsed = int(time.time() - start_time)
-            ready = state.get("ready_for_inference", False)
+            # v303.0: Coerce to bool — progress file can have null
+            # when update_apars() omits model_loaded/ready args.
+            _raw_ready = state.get("ready_for_inference", False)
+            ready = bool(_raw_ready) if _raw_ready is not None else False
+            _raw_ml = state.get("model_loaded", False)
+            model_loaded = bool(_raw_ml) if _raw_ml is not None else False
             response = {
                 "status": "healthy" if ready else "starting",
                 "phase": "ready" if ready else "starting",
                 "mode": "inference" if ready else "golden-startup",
-                "model_loaded": state.get("model_loaded", False),
+                "model_loaded": model_loaded,
                 "ready_for_inference": ready,
                 "apars": {
                     "version": state.get("startup_script_version", "unknown"),
@@ -9070,7 +9075,8 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/health/ready":
             try:
                 with open(PROGRESS_FILE) as f:
-                    ready = json.load(f).get("ready_for_inference", False)
+                    _rval = json.load(f).get("ready_for_inference", False)
+                ready = bool(_rval) if _rval is not None else False
             except (FileNotFoundError, json.JSONDecodeError, OSError):
                 ready = False
             code = 200 if ready else 503
@@ -9127,12 +9133,17 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
                 state = {"phase": 0, "total_progress": 5, "checkpoint": "golden_booting",
                          "model_loaded": False, "ready_for_inference": False}
             elapsed = int(time.time() - start_time)
-            ready = state.get("ready_for_inference", False)
+            # v303.0: Coerce to bool — progress file can have null
+            # when update_apars() omits model_loaded/ready args.
+            _raw_ready = state.get("ready_for_inference", False)
+            ready = bool(_raw_ready) if _raw_ready is not None else False
+            _raw_ml = state.get("model_loaded", False)
+            model_loaded = bool(_raw_ml) if _raw_ml is not None else False
             response = {
                 "status": "healthy" if ready else "starting",
                 "phase": "ready" if ready else "starting",
                 "mode": "inference" if ready else "golden-startup",
-                "model_loaded": state.get("model_loaded", False),
+                "model_loaded": model_loaded,
                 "ready_for_inference": ready,
                 "apars": {
                     "version": state.get("startup_script_version", "unknown"),
@@ -9160,7 +9171,8 @@ class APARSHandler(http.server.BaseHTTPRequestHandler):
         elif self.path == "/health/ready":
             try:
                 with open(PROGRESS_FILE) as f:
-                    ready = json.load(f).get("ready_for_inference", False)
+                    _rval = json.load(f).get("ready_for_inference", False)
+                ready = bool(_rval) if _rval is not None else False
             except (FileNotFoundError, json.JSONDecodeError, OSError):
                 ready = False
             code = 200 if ready else 503
