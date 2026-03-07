@@ -112,7 +112,7 @@ class TriageConfig:
 
     # Adaptive scoring / Reactor-Core (WS5)
     adaptive_scoring_enabled: bool = False
-    outcome_collection_enabled: bool = False
+    outcome_collection_enabled: bool = True
     min_outcomes_for_adaptation: int = 50  # high-confidence only
     weight_bounds_pct: float = 20.0  # max ±20% drift from defaults
     shadow_cycles: int = 5  # shadow before activating adapted weights
@@ -163,7 +163,7 @@ class TriageConfig:
             snapshot_retention_count=_env_int("EMAIL_TRIAGE_SNAPSHOT_RETENTION", 10),
             # Adaptive scoring / Reactor-Core (WS5)
             adaptive_scoring_enabled=_env_bool("EMAIL_TRIAGE_ADAPTIVE_SCORING", False),
-            outcome_collection_enabled=_env_bool("EMAIL_TRIAGE_OUTCOME_COLLECTION", False),
+            outcome_collection_enabled=_env_bool("EMAIL_TRIAGE_OUTCOME_COLLECTION", True),
             min_outcomes_for_adaptation=_env_int("EMAIL_TRIAGE_MIN_OUTCOMES", 50),
             weight_bounds_pct=_env_float("EMAIL_TRIAGE_WEIGHT_BOUNDS_PCT", 20.0),
             shadow_cycles=_env_int("EMAIL_TRIAGE_SHADOW_CYCLES", 5),
