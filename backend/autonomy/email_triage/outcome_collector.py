@@ -188,6 +188,27 @@ class OutcomeCollector:
         """Clear recorded outcomes (after processing)."""
         self._recorded_outcomes.clear()
 
+    @staticmethod
+    def _classify_outcome(original: set, current: set) -> Optional[str]:
+        """Classify outcome from label delta.
+
+        Priority order:
+          1. replied  — SENT label added (user replied to the thread)
+          2. deleted  — TRASH label present (user trashed the email)
+          3. archived — INBOX removed without trashing (user archived)
+          4. relabeled — any other label change (user re-categorized)
+          5. None     — no change detected
+        """
+        if "SENT" in current and "SENT" not in original:
+            return "replied"
+        if "TRASH" in current:
+            return "deleted"
+        if "INBOX" in original and "INBOX" not in current:
+            return "archived"
+        if current != original:
+            return "relabeled"
+        return None
+
     async def check_outcomes_for_cycle(
         self,
         workspace_agent: Any,
@@ -209,27 +230,42 @@ class OutcomeCollector:
         if workspace_agent is None or not prior_triaged:
             return []
 
+        if not hasattr(workspace_agent, "get_message_labels"):
+            return []
+
         captured: List[Dict[str, Any]] = []
 
-        # In production, this would poll Gmail for label changes via
-        # workspace_agent._gmail_service.users().messages().get().
-        # For now, this is a structured placeholder that captures the
-        # architecture without depending on live Gmail API.
-        #
-        # Future implementation:
-        # for msg_id, triaged in prior_triaged.items():
-        #     current_labels = await self._get_current_labels(workspace_agent, msg_id)
-        #     original_labels = set(triaged.features.label_ids)
-        #     if "SENT" in current_labels - original_labels:
-        #         outcome = "replied"
-        #     elif "TRASH" in current_labels:
-        #         outcome = "deleted"
-        #     elif current_labels != original_labels:
-        #         outcome = "relabeled"
-        #     elif "INBOX" not in current_labels and "INBOX" in original_labels:
-        #         outcome = "archived"
-        #     else:
-        #         continue
-        #     await self.record_outcome(...)
+        for msg_id, triaged in prior_triaged.items():
+            try:
+                current_labels = await workspace_agent.get_message_labels(msg_id)
+            except Exception as exc:
+                logger.debug(
+                    "Failed to fetch labels for %s: %s", msg_id, exc,
+                )
+                continue
+
+            original_labels = set(triaged.features.label_ids)
+            current_labels = set(current_labels)
+
+            outcome = self._classify_outcome(original_labels, current_labels)
+            if outcome is None:
+                continue
+
+            metadata = {
+                "original_labels": sorted(original_labels),
+                "current_labels": sorted(current_labels),
+            }
+
+            await self.record_outcome(
+                message_id=msg_id,
+                outcome=outcome,
+                sender_domain=triaged.features.sender_domain,
+                tier=triaged.scoring.tier,
+                score=triaged.scoring.score,
+                metadata=metadata,
+            )
+
+            # The last recorded outcome is the one we just appended
+            captured.append(self._recorded_outcomes[-1])
 
         return captured
