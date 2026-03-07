@@ -14,3 +14,38 @@ Components:
     - CommProtocol: Mandatory 5-phase communication emitter
     - OperationLedger: Append-only operation state log
 """
+
+from backend.core.ouroboros.governance.operation_id import (
+    generate_operation_id,
+    OperationMetadata,
+)
+from backend.core.ouroboros.governance.risk_engine import (
+    RiskEngine,
+    RiskTier,
+    RiskClassification,
+    OperationProfile,
+    ChangeType,
+    HardInvariantViolation,
+    POLICY_VERSION,
+)
+from backend.core.ouroboros.governance.ledger import (
+    OperationLedger,
+    LedgerEntry,
+    OperationState,
+)
+from backend.core.ouroboros.governance.comm_protocol import (
+    CommProtocol,
+    CommMessage,
+    MessageType,
+    LogTransport,
+)
+from backend.core.ouroboros.governance.supervisor_controller import (
+    SupervisorOuroborosController,
+    AutonomyMode,
+)
+from backend.core.ouroboros.governance.contract_gate import (
+    ContractGate,
+    ContractVersion,
+    CompatibilityResult,
+    BootCheckResult,
+)
