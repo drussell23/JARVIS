@@ -147,7 +147,8 @@ class OutcomeCollector:
     async def _enqueue_to_reactor_core(self, record: Dict[str, Any]) -> None:
         """Best-effort enqueue to the Reactor-Core ExperienceDataQueue.
 
-        Imports lazily to avoid hard dependency on core.experience_queue.
+        Includes brain_id for multi-brain governance scoping and
+        content_hash for idempotent deduplication.
         """
         try:
             from core.experience_queue import (
@@ -158,6 +159,11 @@ class OutcomeCollector:
         except ImportError:
             return  # ExperienceQueue not available
 
+        import hashlib
+        # Deterministic hash for dedup across overlapping polling windows
+        hash_input = f"{record.get('message_id', '')}:{record['outcome']}:{record.get('tier', '')}"
+        content_hash = hashlib.md5(hash_input.encode()).hexdigest()
+
         await enqueue_experience(
             experience_type=ExperienceType.BEHAVIORAL_EVENT,
             data={
@@ -167,8 +173,10 @@ class OutcomeCollector:
                 "confidence": record["confidence"],
                 "tier": record["tier"],
                 "sender_domain": record["sender_domain"],
+                "message_id": record.get("message_id", ""),
             },
             priority=ExperiencePriority.NORMAL,
+            metadata={"content_hash": content_hash},
         )
 
     def get_adaptation_outcomes(self) -> List[Dict[str, Any]]:
