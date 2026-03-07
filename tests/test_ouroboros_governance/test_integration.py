@@ -222,7 +222,8 @@ def _make_mock_stack_components():
 
     routing = MagicMock()
     routing.cost_guardrail = MagicMock()
-    routing.cost_guardrail.remaining = 10.0
+    routing.cost_guardrail.over_budget = False
+    routing.cost_guardrail.daily_usage = 0.0
 
     canary = MagicMock()
     canary.slices = {}
@@ -707,10 +708,7 @@ class TestEndToEnd:
         await stack.start()
         assert stack._started is True
 
-        # Health — patch CostGuardrail.remaining (not yet implemented on the real class)
-        guardrail = stack.routing.cost_guardrail
-        if not hasattr(guardrail, "remaining"):
-            guardrail.remaining = guardrail._daily_cap - guardrail._usage_today
+        # Health
         health = stack.health()
         assert "mode" in health
         assert "policy_version" in health

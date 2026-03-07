@@ -294,8 +294,13 @@ class GovernanceStack:
             "canary_slices": {
                 p: s.state.value for p, s in self.canary.slices.items()
             },
-            "budget_remaining": (
-                self.routing.cost_guardrail.remaining
+            "budget_over": (
+                self.routing.cost_guardrail.over_budget
+                if hasattr(self.routing, "cost_guardrail")
+                else None
+            ),
+            "budget_daily_usage": (
+                self.routing.cost_guardrail.daily_usage
                 if hasattr(self.routing, "cost_guardrail")
                 else None
             ),
