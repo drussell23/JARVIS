@@ -44,6 +44,11 @@ from backend.autonomy.agent_runtime_models import (
     _env_int,
 )
 
+try:
+    from core.experience_queue import get_experience_processor
+except ImportError:
+    get_experience_processor = None
+
 logger = logging.getLogger("jarvis.agent_runtime")
 
 
@@ -459,6 +464,10 @@ class UnifiedAgentRuntime:
         self._triage_pressure_skip_count: int = 0
         # v284.0: Log triage-disabled once, not every cycle
         self._triage_disabled_logged: bool = False
+
+        # ExperienceQueueProcessor — drains training data to reactor-core.
+        self._experience_processor = None
+        self._experience_processor_started: bool = False
 
     # ─────────────────────────────────────────────────────────
     # Lifecycle
@@ -2751,6 +2760,30 @@ class UnifiedAgentRuntime:
             logger.debug("[AgentRuntime] Sub-threshold intervention failed: %s", e)
 
     # ─────────────────────────────────────────────────────────
+    # ExperienceQueueProcessor lifecycle
+    # ─────────────────────────────────────────────────────────
+
+    async def _start_experience_processor(self) -> None:
+        """Start the ExperienceQueueProcessor for reactor-core drain.
+
+        Non-fatal: if init fails, runtime continues without training drain.
+        Idempotent: safe to call multiple times.
+        """
+        if self._experience_processor_started:
+            return
+        if get_experience_processor is None:
+            return
+
+        try:
+            processor = await get_experience_processor()
+            await processor.start()
+            self._experience_processor = processor
+            self._experience_processor_started = True
+            logger.info("[AgentRuntime] ExperienceQueueProcessor started")
+        except Exception as e:
+            logger.warning("[AgentRuntime] ExperienceQueueProcessor start failed (non-fatal): %s", e)
+
+    # ─────────────────────────────────────────────────────────
     # Email Triage Integration
     # ─────────────────────────────────────────────────────────
 
@@ -2892,6 +2925,9 @@ class UnifiedAgentRuntime:
                         report.snapshot_committed,
                         fencing_token,
                     )
+                    # After first successful triage, start experience drain.
+                    if not self._experience_processor_started:
+                        await self._start_experience_processor()
         except asyncio.TimeoutError:
             logger.warning("[AgentRuntime] Email triage cycle timed out")
         except Exception as e:
