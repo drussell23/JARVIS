@@ -477,3 +477,143 @@ class TestCreateGovernanceStack:
         for name, status in stack.capabilities.items():
             assert isinstance(status.reason, str)
             assert len(status.reason) > 0
+
+
+# -- register_governance_argparse --------------------------------------------
+
+
+class TestRegisterGovernanceArgparse:
+    """Argparse registration adds governance flags."""
+
+    def test_adds_skip_governance(self):
+        from backend.core.ouroboros.governance.integration import register_governance_argparse
+
+        parser = argparse.ArgumentParser()
+        group = parser.add_argument_group("Security")
+        register_governance_argparse(group)
+        args = parser.parse_args(["--skip-governance"])
+        assert args.skip_governance is True
+
+    def test_adds_governance_mode(self):
+        from backend.core.ouroboros.governance.integration import register_governance_argparse
+
+        parser = argparse.ArgumentParser()
+        group = parser.add_argument_group("Security")
+        register_governance_argparse(group)
+        args = parser.parse_args(["--governance-mode", "governed"])
+        assert args.governance_mode == "governed"
+
+    def test_default_governance_mode_is_sandbox(self):
+        from backend.core.ouroboros.governance.integration import register_governance_argparse
+
+        parser = argparse.ArgumentParser()
+        group = parser.add_argument_group("Security")
+        register_governance_argparse(group)
+        args = parser.parse_args([])
+        assert args.governance_mode == "sandbox"
+
+    def test_adds_break_glass_flags(self):
+        from backend.core.ouroboros.governance.integration import register_governance_argparse
+
+        parser = argparse.ArgumentParser()
+        group = parser.add_argument_group("Security")
+        register_governance_argparse(group)
+        args = parser.parse_args(["--break-glass", "list"])
+        assert args.break_glass_action == "list"
+
+    def test_break_glass_with_op_id(self):
+        from backend.core.ouroboros.governance.integration import register_governance_argparse
+
+        parser = argparse.ArgumentParser()
+        group = parser.add_argument_group("Security")
+        register_governance_argparse(group)
+        args = parser.parse_args([
+            "--break-glass", "issue",
+            "--break-glass-op-id", "op-123",
+            "--break-glass-reason", "emergency fix",
+        ])
+        assert args.break_glass_action == "issue"
+        assert args.break_glass_op_id == "op-123"
+        assert args.break_glass_reason == "emergency fix"
+
+
+# -- handle_break_glass_command ----------------------------------------------
+
+
+class TestHandleBreakGlassCommand:
+    """Break-glass CLI dispatch handles all cases."""
+
+    @pytest.mark.asyncio
+    async def test_list_with_no_stack(self):
+        from backend.core.ouroboros.governance.integration import handle_break_glass_command
+
+        args = argparse.Namespace(break_glass_action="list")
+        exit_code = await handle_break_glass_command(args, stack=None)
+        assert exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_audit_with_no_stack(self):
+        from backend.core.ouroboros.governance.integration import handle_break_glass_command
+
+        args = argparse.Namespace(break_glass_action="audit")
+        exit_code = await handle_break_glass_command(args, stack=None)
+        assert exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_issue_with_no_stack(self):
+        from backend.core.ouroboros.governance.integration import handle_break_glass_command
+
+        args = argparse.Namespace(
+            break_glass_action="issue",
+            break_glass_op_id="op-1",
+            break_glass_reason="test",
+            break_glass_ttl=300,
+        )
+        exit_code = await handle_break_glass_command(args, stack=None)
+        assert exit_code == 1
+
+    @pytest.mark.asyncio
+    async def test_issue_with_stack(self):
+        from backend.core.ouroboros.governance.integration import handle_break_glass_command
+
+        mock_token = MagicMock()
+        mock_token.token_id = "t1"
+
+        mock_stack = MagicMock()
+        mock_stack.break_glass = MagicMock()
+
+        args = argparse.Namespace(
+            break_glass_action="issue",
+            break_glass_op_id="op-1",
+            break_glass_reason="emergency",
+            break_glass_ttl=300,
+        )
+
+        with pytest.MonkeyPatch.context() as mp:
+            mock_issue = AsyncMock(return_value=mock_token)
+            mp.setattr(
+                "backend.core.ouroboros.governance.cli_commands.issue_break_glass",
+                mock_issue,
+            )
+            exit_code = await handle_break_glass_command(args, mock_stack)
+        assert exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_revoke_with_no_stack(self):
+        from backend.core.ouroboros.governance.integration import handle_break_glass_command
+
+        args = argparse.Namespace(
+            break_glass_action="revoke",
+            break_glass_op_id="op-1",
+            break_glass_reason="done",
+        )
+        exit_code = await handle_break_glass_command(args, stack=None)
+        assert exit_code == 1
+
+    @pytest.mark.asyncio
+    async def test_unknown_action(self):
+        from backend.core.ouroboros.governance.integration import handle_break_glass_command
+
+        args = argparse.Namespace(break_glass_action="unknown_action")
+        exit_code = await handle_break_glass_command(args, stack=None)
+        assert exit_code == 1

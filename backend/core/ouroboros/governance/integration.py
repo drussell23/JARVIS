@@ -11,6 +11,7 @@ CONSTRAINT: No side effects on import.
 
 from __future__ import annotations
 
+import argparse as _argparse
 import enum
 import hashlib
 import json
@@ -479,3 +480,121 @@ async def create_governance_stack(
         raise GovernanceInitError(
             "governance_init_error", str(exc)
         ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Argparse Registration
+# ---------------------------------------------------------------------------
+
+
+def register_governance_argparse(security_group: _argparse._ActionsContainer) -> None:
+    """Add governance flags to existing security argument group."""
+    security_group.add_argument(
+        "--skip-governance",
+        action="store_true",
+        help="Force READ_ONLY_PLANNING governance mode (kill switch)",
+    )
+    security_group.add_argument(
+        "--governance-mode",
+        choices=["sandbox", "governed", "safe"],
+        default="sandbox",
+        dest="governance_mode",
+        help="Governance mode (default: sandbox)",
+    )
+    security_group.add_argument(
+        "--break-glass",
+        choices=["issue", "list", "revoke", "audit"],
+        default=None,
+        dest="break_glass_action",
+        help="Break-glass subcommand",
+    )
+    security_group.add_argument(
+        "--break-glass-op-id",
+        default=None,
+        dest="break_glass_op_id",
+        help="Operation ID for break-glass issue/revoke",
+    )
+    security_group.add_argument(
+        "--break-glass-reason",
+        default=None,
+        dest="break_glass_reason",
+        help="Reason string for break-glass issue/revoke",
+    )
+    security_group.add_argument(
+        "--break-glass-ttl",
+        type=int,
+        default=300,
+        dest="break_glass_ttl",
+        help="Break-glass token TTL in seconds (default 300)",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Break-Glass CLI Handler
+# ---------------------------------------------------------------------------
+
+
+async def handle_break_glass_command(
+    args: _argparse.Namespace,
+    stack: Optional["GovernanceStack"],
+) -> int:
+    """Dispatch break-glass CLI operations.
+
+    Works even when stack is None (degraded mode):
+    - list/audit: return empty with warning
+    - issue/revoke: return error with reason
+
+    Returns exit code (0 success, 1 error).
+    """
+    action = getattr(args, "break_glass_action", None)
+
+    if action == "list":
+        if stack is None:
+            print("[Governance] No governance stack -- no active tokens.")
+            return 0
+        from backend.core.ouroboros.governance.cli_commands import list_active_tokens
+        tokens = list_active_tokens(stack.break_glass)
+        if not tokens:
+            print("[Governance] No active break-glass tokens.")
+        else:
+            for t in tokens:
+                print(f"  {t}")
+        return 0
+
+    if action == "audit":
+        if stack is None:
+            print("[Governance] No governance stack -- no audit data.")
+            return 0
+        from backend.core.ouroboros.governance.cli_commands import get_audit_report
+        report = get_audit_report(stack.break_glass)
+        for entry in report:
+            print(f"  {entry}")
+        return 0
+
+    if action == "issue":
+        if stack is None:
+            print("[Governance] ERROR: Cannot issue break-glass token -- no governance stack.")
+            return 1
+        from backend.core.ouroboros.governance.cli_commands import issue_break_glass
+        op_id = getattr(args, "break_glass_op_id", None)
+        reason = getattr(args, "break_glass_reason", None)
+        ttl = getattr(args, "break_glass_ttl", 300)
+        token = await issue_break_glass(
+            stack.break_glass, op_id=op_id, reason=reason, ttl=ttl
+        )
+        print(f"[Governance] Break-glass token issued: {token.token_id}")
+        return 0
+
+    if action == "revoke":
+        if stack is None:
+            print("[Governance] ERROR: Cannot revoke -- no governance stack.")
+            return 1
+        from backend.core.ouroboros.governance.cli_commands import revoke_break_glass
+        op_id = getattr(args, "break_glass_op_id", None)
+        reason = getattr(args, "break_glass_reason", "manual_revoke")
+        await revoke_break_glass(stack.break_glass, op_id=op_id, reason=reason)
+        print(f"[Governance] Break-glass token revoked for {op_id}.")
+        return 0
+
+    print(f"[Governance] Unknown break-glass action: {action}")
+    return 1
