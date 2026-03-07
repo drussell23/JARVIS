@@ -16,11 +16,15 @@ import pytest
 
 def _build_runtime():
     """Build a minimal UnifiedAgentRuntime for testing _maybe_run_email_triage."""
+    import asyncio
     from autonomy.agent_runtime import UnifiedAgentRuntime
     rt = UnifiedAgentRuntime.__new__(UnifiedAgentRuntime)
     rt._last_email_triage_run = 0.0
     rt._triage_disabled_logged = False
     rt._triage_pressure_skip_count = 0
+    rt._experience_processor = None
+    rt._experience_processor_started = False
+    rt._triage_lock = asyncio.Lock()
     return rt
 
 

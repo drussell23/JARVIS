@@ -92468,9 +92468,12 @@ class JarvisSystemKernel:
         local_hash = compute_policy_hash(ROUTING_INVARIANTS)
 
         # 1. Check Prime capability manifest
+        # v286.0: GCP golden image serves inference (/v1/chat/completions, /health)
+        # but not the full J-Prime API (/capabilities). Try /capabilities first
+        # (local Prime), fall back to /health (GCP inference node). Both prove
+        # the endpoint is alive and serving; /capabilities also validates schema.
         try:
             prime_url = None
-            # Get Prime endpoint from env (single source of truth set by _propagate_invincible_node_url)
             prime_url = (
                 os.environ.get("PRIME_API_URL")
                 or os.environ.get("JARVIS_PRIME_URL")
@@ -92479,20 +92482,45 @@ class JarvisSystemKernel:
             if prime_url:
                 import aiohttp
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        f"{prime_url}/capabilities",
-                        timeout=aiohttp.ClientTimeout(total=10),
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            manifest = ProviderManifest.from_dict(data)
-                            compat, reason = LOCAL_CONTRACT.is_compatible(manifest.contract_version)
-                            if not compat:
-                                results["prime"] = ("fail", reason)
+                    # Try /capabilities first (full J-Prime API)
+                    try:
+                        async with session.get(
+                            f"{prime_url}/capabilities",
+                            timeout=aiohttp.ClientTimeout(total=10),
+                        ) as resp:
+                            if resp.status == 200:
+                                data = await resp.json()
+                                manifest = ProviderManifest.from_dict(data)
+                                compat, reason = LOCAL_CONTRACT.is_compatible(manifest.contract_version)
+                                if not compat:
+                                    results["prime"] = ("fail", reason)
+                                else:
+                                    results["prime"] = ("pass", f"compatible (hash={local_hash[:8]})")
+                            elif resp.status == 404:
+                                # GCP inference node — try /health instead
+                                async with session.get(
+                                    f"{prime_url}/health",
+                                    timeout=aiohttp.ClientTimeout(total=10),
+                                ) as health_resp:
+                                    if health_resp.status == 200:
+                                        results["prime"] = ("pass", "gcp_inference_healthy")
+                                    else:
+                                        results["prime"] = ("degraded", f"health_{health_resp.status}")
                             else:
-                                results["prime"] = ("pass", f"compatible (hash={local_hash[:8]})")
-                        else:
-                            results["prime"] = ("degraded", f"http_{resp.status}")
+                                results["prime"] = ("degraded", f"http_{resp.status}")
+                    except aiohttp.ClientError:
+                        # Connection failed on /capabilities — try /health
+                        try:
+                            async with session.get(
+                                f"{prime_url}/health",
+                                timeout=aiohttp.ClientTimeout(total=5),
+                            ) as health_resp:
+                                if health_resp.status == 200:
+                                    results["prime"] = ("pass", "gcp_inference_healthy")
+                                else:
+                                    results["prime"] = ("degraded", f"health_{health_resp.status}")
+                        except Exception:
+                            results["prime"] = ("degraded", "unreachable")
             else:
                 results["prime"] = ("degraded", "no_endpoint")
         except Exception as e:

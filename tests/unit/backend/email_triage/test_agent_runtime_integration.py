@@ -58,6 +58,27 @@ def _dlm_patch(acquired=True, fencing_token=42):
     )
 
 
+def _make_bare_runtime(**overrides):
+    """Create a bare UnifiedAgentRuntime with all required triage attributes.
+
+    Uses object.__new__() to skip __init__, then sets the minimum attributes
+    that _maybe_run_email_triage() accesses. Centralises attribute setup so
+    new attrs (like _triage_lock) only need adding in one place.
+    """
+    from autonomy.agent_runtime import UnifiedAgentRuntime
+
+    rt = object.__new__(UnifiedAgentRuntime)
+    rt._last_email_triage_run = 0.0
+    rt._triage_disabled_logged = False
+    rt._triage_pressure_skip_count = 0
+    rt._experience_processor = None
+    rt._experience_processor_started = False
+    rt._triage_lock = asyncio.Lock()
+    for k, v in overrides.items():
+        setattr(rt, k, v)
+    return rt
+
+
 class TestAgentRuntimeTriageWiring:
     """_maybe_run_email_triage captures and logs the cycle report."""
 
@@ -70,8 +91,7 @@ class TestAgentRuntimeTriageWiring:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}):
             with patch(
@@ -92,8 +112,7 @@ class TestAgentRuntimeTriageWiring:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}):
             with patch(
@@ -104,11 +123,17 @@ class TestAgentRuntimeTriageWiring:
                     with patch("autonomy.agent_runtime.logger") as mock_logger:
                         await UnifiedAgentRuntime._maybe_run_email_triage(runtime)
 
-                        # Should have logged the report summary
+                        # Should have logged the report summary (may not be
+                        # the last info call due to ExperienceQueueProcessor)
                         mock_logger.info.assert_called()
-                        call_args = mock_logger.info.call_args
-                        log_msg = call_args[0][0]
-                        assert "Email triage" in log_msg
+                        triage_logged = any(
+                            "Email triage" in str(c)
+                            for c in mock_logger.info.call_args_list
+                        )
+                        assert triage_logged, (
+                            "Expected 'Email triage' in info logs, got: "
+                            + str([str(c) for c in mock_logger.info.call_args_list])
+                        )
 
     @pytest.mark.asyncio
     async def test_skipped_report_not_logged(self):
@@ -119,8 +144,7 @@ class TestAgentRuntimeTriageWiring:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}):
             with patch(
@@ -143,8 +167,7 @@ class TestAgentRuntimeTriageWiring:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
         runtime._triage_disabled_logged = False
         runtime._triage_pressure_skip_count = 0
         runtime._experience_processor = None
@@ -168,8 +191,7 @@ class TestAgentRuntimeTriageWiring:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = time.monotonic()  # Just ran
+        runtime = _make_bare_runtime(_last_email_triage_run=time.monotonic())
 
         with patch.dict(os.environ, {
             "EMAIL_TRIAGE_ENABLED": "true",
@@ -191,8 +213,7 @@ class TestAgentRuntimeTriageWiring:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}):
             with patch(
@@ -213,8 +234,7 @@ class TestAgentRuntimeTriageWiring:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}):
             with patch(
@@ -238,8 +258,7 @@ class TestSingleLeaderGuard:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}):
             with patch(
@@ -259,8 +278,7 @@ class TestSingleLeaderGuard:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}):
             with patch(
@@ -281,8 +299,7 @@ class TestSingleLeaderGuard:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         captured_kwargs = {}
         mock_mgr = MagicMock()
@@ -321,8 +338,7 @@ class TestSingleLeaderGuard:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {
             "EMAIL_TRIAGE_ENABLED": "true",
@@ -351,8 +367,7 @@ class TestSingleLeaderGuard:
 
         from autonomy.agent_runtime import UnifiedAgentRuntime
 
-        runtime = object.__new__(UnifiedAgentRuntime)
-        runtime._last_email_triage_run = 0.0
+        runtime = _make_bare_runtime()
 
         with patch.dict(os.environ, {
             "EMAIL_TRIAGE_ENABLED": "true",
