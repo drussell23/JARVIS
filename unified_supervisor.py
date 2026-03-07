@@ -73475,6 +73475,19 @@ class JarvisSystemKernel:
                 self.logger.warning(f"[Kernel] Agent runtime init error: {_art_err}")
 
             # =====================================================================
+            # ExperienceQueueProcessor — drains training data to reactor-core
+            # =====================================================================
+            try:
+                from backend.core.experience_queue import get_experience_processor as _get_exp_proc
+                _exp_processor = await _get_exp_proc()
+                await _exp_processor.start()
+                if _exp_processor._task:
+                    self._background_tasks.append(_exp_processor._task)
+                self.logger.info("[Kernel] ExperienceQueueProcessor registered as background task")
+            except Exception as _exp_err:
+                self.logger.warning("[Kernel] ExperienceQueueProcessor start failed (non-fatal): %s", _exp_err)
+
+            # =====================================================================
             # v238.1: CONVERSATION PIPELINE WIRING (via Bootstrap)
             # =====================================================================
             # Wire real-time voice conversation components AFTER Phase 4
