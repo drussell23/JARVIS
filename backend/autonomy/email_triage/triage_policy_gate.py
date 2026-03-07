@@ -11,7 +11,6 @@ from typing import Any
 
 from core.contracts.decision_envelope import DecisionEnvelope
 from core.contracts.policy_gate import PolicyVerdict, VerdictAction
-from core.contracts.policy_context import PolicyContext
 from autonomy.email_triage.config import TriageConfig
 from autonomy.email_triage.policy import NotificationPolicy
 from autonomy.email_triage.schemas import (

@@ -84,6 +84,9 @@ class TriageConfig:
     adaptive_admission: bool = True  # auto-shrink batch to fit budget
     latency_ema_alpha: float = 0.3  # EMA smoothing for p95 tracking
 
+    # Phase B: Action commit ledger
+    ledger_lease_duration_s: float = 60.0  # cycle_timeout + buffer
+
     # Dependency resolution
     dep_backoff_base_s: float = 5.0
     dep_backoff_max_s: float = 300.0
@@ -142,6 +145,8 @@ class TriageConfig:
             extraction_fixed_overhead_s=_env_float("EMAIL_TRIAGE_FIXED_OVERHEAD_S", 10.0),
             adaptive_admission=_env_bool("EMAIL_TRIAGE_ADAPTIVE_ADMISSION", True),
             latency_ema_alpha=_env_float("EMAIL_TRIAGE_LATENCY_EMA_ALPHA", 0.3),
+            # Phase B: Action commit ledger
+            ledger_lease_duration_s=_env_float("EMAIL_TRIAGE_LEDGER_LEASE_S", 60.0),
             dep_backoff_base_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_BASE_S", 5.0),
             dep_backoff_max_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_MAX_S", 300.0),
             staleness_window_s=_env_float("EMAIL_TRIAGE_STALENESS_WINDOW_S", 120.0),
