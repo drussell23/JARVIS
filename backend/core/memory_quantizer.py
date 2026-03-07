@@ -80,9 +80,6 @@ THRASH_PANIC_CORROBORATION_EMA_RATIO = float(
 )
 THRASH_EXIT_RATIO = float(os.getenv("THRASH_EXIT_RATIO", "0.7"))
 THRASH_PAGEIN_EMERGENCY_EXIT = THRASH_PAGEIN_EMERGENCY * THRASH_EXIT_RATIO
-# v286.0: Startup grace — model loading always causes transient pagein spikes.
-# Suppress thrash WARNING during initial boot window; EMERGENCY still fires.
-THRASH_STARTUP_GRACE_S = float(os.getenv("THRASH_STARTUP_GRACE_S", "120"))
 
 
 # ============================================================================
@@ -454,7 +451,6 @@ class MemoryQuantizer:
         self._pagein_rate: float = 0.0  # pageins/sec
         self._pagein_rate_ema: float = 0.0
         self._thrash_state: str = "healthy"  # healthy, thrashing, emergency
-        self._init_monotonic: float = time.monotonic()  # v286.0: startup grace
         self._thrash_warning_since: float = 0.0
         self._thrash_emergency_since: float = 0.0
         self._thrash_recovery_since: float = 0.0
@@ -1318,13 +1314,13 @@ class MemoryQuantizer:
         now = time.time()
         old_state = self._thrash_state
 
-        # v286.0: During startup grace window, only escalate to emergency
-        # (genuine crisis). Suppress thrashing transitions because model
-        # loading inherently causes high pagein rates that resolve once
-        # mmap'd pages are warm.
-        _in_startup_grace = (
-            time.monotonic() - self._init_monotonic < THRASH_STARTUP_GRACE_S
-        )
+        # v286.0: During cloud-first/cloud-only startup modes, the system
+        # is actively shedding local compute to GCP. Transient pagein spikes
+        # in the WARNING band are expected as remaining local components
+        # initialize — suppress thrashing transitions but allow emergency.
+        _in_cloud_offload_mode = os.environ.get(
+            "JARVIS_STARTUP_MEMORY_MODE", "local_full",
+        ).strip().lower() in ("cloud_first", "cloud_only")
 
         panic_threshold = THRASH_PAGEIN_EMERGENCY * max(1.0, THRASH_PAGEIN_PANIC_MULTIPLIER)
         panic_candidate = raw_rate >= panic_threshold
@@ -1380,10 +1376,10 @@ class MemoryQuantizer:
                 self._thrash_warning_since = now
             self._thrash_recovery_since = 0.0
             if now - self._thrash_warning_since >= THRASH_SUSTAINED_SECONDS:
-                # v286.0: Suppress thrashing during startup grace — model mmap
-                # loading produces pagein spikes in the WARNING band that are
-                # transient and self-resolving. Only emergency breaks through.
-                if _in_startup_grace and old_state == "healthy":
+                # v286.0: In cloud offload mode, WARNING-band pageins are expected
+                # as GCP takes over inference. Suppress thrashing (not emergency)
+                # to avoid cascading load-shedding reactions on the local node.
+                if _in_cloud_offload_mode and old_state == "healthy":
                     return
                 new_state = "thrashing"
             elif old_state in {"thrashing", "emergency"}:

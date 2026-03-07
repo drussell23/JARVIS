@@ -9271,19 +9271,26 @@ async def get_learning_database(
     """
     global _db_instance
 
-    # ── v265.1→v283.3: Gate-aware fast_mode promotion ─────────────────
-    # v283.3: Added UNKNOWN and CHECKING to the promotion set.
-    #
-    # Root cause: Memory agent boots in Phase 4 (Intelligence) but Cloud SQL
-    # proxy doesn't initialize until Phase 6 (Enterprise Services).  At Phase 4
-    # the gate state is still UNKNOWN — the v265.1 check only caught UNAVAILABLE
-    # and DEGRADED_SQLITE, so the code attempted standard Cloud SQL init, hung
-    # waiting for a proxy that doesn't exist yet, and timed out every time.
-    #
-    # Fix: If Cloud SQL readiness is anything other than READY, use SQLite-first.
-    # The background upgrade task in fast_mode will retry Cloud SQL later when
-    # the proxy becomes available.  This eliminates the lifecycle ordering
-    # violation without reordering startup phases.
+    # ── v265.1→v286.0: Gate-aware + mode-aware fast_mode promotion ────
+    # v283.3: Added UNKNOWN and CHECKING to the gate promotion set.
+    # v286.0: Added JARVIS_STARTUP_MEMORY_MODE check. In cloud_first or
+    # cloud_only modes, the system is actively shedding local compute to
+    # GCP. Attempting standard Cloud SQL init under memory pressure causes
+    # thread pool starvation (executor saturated with model mmap I/O),
+    # guaranteeing a 15s timeout + retry cycle on every boot. Force
+    # fast_mode immediately so SQLite-first path runs without blocking.
+    if not fast_mode:
+        _startup_mode = os.environ.get(
+            "JARVIS_STARTUP_MEMORY_MODE", "local_full",
+        ).strip().lower()
+        if _startup_mode in ("cloud_first", "cloud_only"):
+            logger.info(
+                "[LearningDB v286.0] Startup mode=%s — forcing fast_mode "
+                "(SQLite-first, Cloud SQL deferred to background)",
+                _startup_mode,
+            )
+            fast_mode = True
+
     if not fast_mode:
         try:
             try:
@@ -9315,12 +9322,7 @@ async def get_learning_database(
             fast_mode = True
 
     # ── v265.1: Configurable init timeout safety net ──────────────────
-    # v286.0: Increased default from 15s to 30s. During startup, the
-    # thread pool executor is saturated with model loading I/O (mmap
-    # pageins, SQLite from multiple subsystems). 15s wasn't enough for
-    # run_in_executor(sqlite3.connect) to get scheduled, causing a
-    # guaranteed timeout + retry cycle on every boot.
-    _init_timeout = float(os.environ.get("JARVIS_LEARNING_DB_INIT_TIMEOUT", "30.0"))
+    _init_timeout = float(os.environ.get("JARVIS_LEARNING_DB_INIT_TIMEOUT", "15.0"))
 
     async with _db_lock:
         # Fast path: already initialized and healthy

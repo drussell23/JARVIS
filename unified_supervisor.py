@@ -73345,15 +73345,20 @@ class JarvisSystemKernel:
                                 "skipping DB-dependent steps (fail-safe)"
                             )
 
-                        # v279.0: Cloud-first gate — when VBI_CLOUD_FIRST is
-                        # active and cloud ECAPA is reachable, skip local ECAPA
-                        # loading entirely at startup. Loading PyTorch + SpeechBrain
-                        # (~700MB) causes transient pagein storms on 16GB systems
-                        # with heavy baseline memory usage (IDE, browser, Docker).
-                        # Local ECAPA is loaded on-demand if cloud becomes unreachable.
-                        _cloud_first = os.getenv(
-                            "JARVIS_VBI_CLOUD_FIRST", "false",
-                        ).lower() in ("1", "true", "yes")
+                        # v279.0 + v286.0: Cloud-first gate — skip local ECAPA
+                        # loading when the system is in cloud mode. Previously
+                        # only checked JARVIS_VBI_CLOUD_FIRST (a separate env var),
+                        # ignoring the unified JARVIS_STARTUP_MEMORY_MODE decision.
+                        # Now respects both: explicit VBI_CLOUD_FIRST OR the
+                        # resource orchestrator's cloud_first/cloud_only decision.
+                        _startup_mem_mode = os.getenv(
+                            "JARVIS_STARTUP_MEMORY_MODE", "local_full",
+                        ).strip().lower()
+                        _cloud_first = (
+                            os.getenv("JARVIS_VBI_CLOUD_FIRST", "false").lower()
+                            in ("1", "true", "yes")
+                            or _startup_mem_mode in ("cloud_first", "cloud_only")
+                        )
                         if _cloud_first:
                             _cloud_reachable = False
                             try:
