@@ -73310,7 +73310,6 @@ class JarvisSystemKernel:
                         # dead connections and keep has_active_subsystem=True for
                         # up to 300s (phase hold hard cap).
                         _skip_db_steps = False
-                        _ecapa_cloudsql_terminal = False
                         try:
                             from intelligence.cloud_sql_connection_manager import (
                                 get_readiness_gate as _ecapa_get_gate,
@@ -73321,7 +73320,6 @@ class JarvisSystemKernel:
                                 _skip_db_steps = True
                                 _gate_state = _ecapa_gate.state.value if hasattr(_ecapa_gate.state, 'value') else str(_ecapa_gate.state)
                                 if _ecapa_gate.state in (_ecapaRS.UNAVAILABLE, _ecapaRS.DEGRADED_SQLITE):
-                                    _ecapa_cloudsql_terminal = True
                                     self.logger.info(
                                         f"[Kernel] ECAPA: Cloud SQL {_gate_state} — "
                                         "skipping DB-dependent steps (terminal, "

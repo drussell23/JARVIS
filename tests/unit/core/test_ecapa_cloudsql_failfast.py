@@ -2,12 +2,10 @@
 
 import os
 import sys
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock
 from enum import Enum
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "backend"))
-
-import pytest
 
 
 class MockReadinessState(Enum):
