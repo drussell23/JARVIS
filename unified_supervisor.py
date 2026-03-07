@@ -76475,13 +76475,13 @@ class JarvisSystemKernel:
                 try:
                     _verdicts = self._resource_registry.get_last_verdicts()
                     if _verdicts:
-                        epoch = self._verdict_authority.begin_epoch()
+                        _epoch = self._verdict_authority.current_epoch
                         for vname, verdict in _verdicts.items():
                             await self._verdict_authority.submit_verdict(vname, verdict)
                         from backend.core.root_authority_types import aggregate_verdicts
                         _phase_verdict = aggregate_verdicts(
                             "resources", _verdicts,
-                            epoch=epoch,
+                            epoch=_epoch,
                             correlation_id="resource-phase",
                         )
                         await self._verdict_authority.submit_phase_verdict(_phase_verdict)

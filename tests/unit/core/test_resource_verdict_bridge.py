@@ -402,7 +402,8 @@ class TestVerdictAuthorityWiring:
         assert epoch == 1
         assert va.current_epoch == 1
 
-    def test_submit_and_read(self):
+    @pytest.mark.asyncio
+    async def test_submit_and_read(self):
         """Submit a verdict and verify it can be read back."""
         from backend.core.verdict_authority import VerdictAuthority
         va = VerdictAuthority()
@@ -415,11 +416,7 @@ class TestVerdictAuthorityWiring:
             boot_allowed=True,
             serviceable=True,
         )
-        loop = asyncio.new_event_loop()
-        try:
-            accepted = loop.run_until_complete(va.submit_verdict("test", verdict))
-        finally:
-            loop.close()
+        accepted = await va.submit_verdict("test", verdict)
         assert accepted is True
         stored = va.get_component_status("test")
         assert stored is verdict
@@ -440,19 +437,14 @@ class TestResourceRegistryLastVerdicts:
         v1["injected"] = "bad"
         assert registry.get_last_verdicts() == {}
 
-    def test_parallel_init_stores_verdicts(self):
+    @pytest.mark.asyncio
+    async def test_parallel_init_stores_verdicts(self):
         """Parallel initialization stores ResourceVerdict objects."""
         from unified_supervisor import ResourceManagerRegistry
         registry = ResourceManagerRegistry()
         mgr = _make_manager("ParVerdictMgr")
         registry.register(mgr)
-        loop = asyncio.new_event_loop()
-        try:
-            results = loop.run_until_complete(
-                registry.initialize_all(parallel=True)
-            )
-        finally:
-            loop.close()
+        results = await registry.initialize_all(parallel=True)
         assert "parverdictmgr" in results
         verdicts = registry.get_last_verdicts()
         assert len(verdicts) >= 1
@@ -460,38 +452,29 @@ class TestResourceRegistryLastVerdicts:
         assert hasattr(v, 'serviceable')
         assert isinstance(v, ResourceVerdict)
 
-    def test_sequential_init_stores_verdicts(self):
+    @pytest.mark.asyncio
+    async def test_sequential_init_stores_verdicts(self):
         """Sequential initialization stores ResourceVerdict objects."""
         from unified_supervisor import ResourceManagerRegistry
         registry = ResourceManagerRegistry()
         mgr = _make_manager("SeqVerdictMgr")
         registry.register(mgr)
-        loop = asyncio.new_event_loop()
-        try:
-            results = loop.run_until_complete(
-                registry.initialize_all(parallel=False)
-            )
-        finally:
-            loop.close()
+        results = await registry.initialize_all(parallel=False)
+        assert "seqverdictmgr" in results
         verdicts = registry.get_last_verdicts()
         assert len(verdicts) >= 1
         v = verdicts["seqverdictmgr"]
         assert isinstance(v, ResourceVerdict)
         assert v.state is SubsystemState.READY
 
-    def test_failed_init_stores_verdict(self):
+    @pytest.mark.asyncio
+    async def test_failed_init_stores_verdict(self):
         """Failed initialization stores verdict with serviceable=False."""
         from unified_supervisor import ResourceManagerRegistry
         registry = ResourceManagerRegistry()
         mgr = _make_manager("FailVerdictMgr", init_return=False)
         registry.register(mgr)
-        loop = asyncio.new_event_loop()
-        try:
-            results = loop.run_until_complete(
-                registry.initialize_all(parallel=False)
-            )
-        finally:
-            loop.close()
+        await registry.initialize_all(parallel=False)
         verdicts = registry.get_last_verdicts()
         assert len(verdicts) >= 1
         v = verdicts["failverdictmgr"]
