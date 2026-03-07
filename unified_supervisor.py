@@ -9764,6 +9764,19 @@ class AnimatedProgressBar:
 # ╚═══════════════════════════════════════════════════════════════════════════════╝
 
 # =============================================================================
+# v290.0: Verdict bridge types – lazy import for ResourceManagerBase
+# =============================================================================
+try:
+    from backend.core.root_authority_types import (
+        SubsystemState as _VerdictState,
+        RequiredTier, VerdictReasonCode, RecoveryAction,
+        ResourceVerdict, SEVERITY_MAP,
+    )
+    _VERDICT_TYPES_AVAILABLE = True
+except ImportError:
+    _VERDICT_TYPES_AVAILABLE = False
+
+# =============================================================================
 # RESOURCE MANAGER BASE CLASS
 # =============================================================================
 class ResourceManagerBase(ABC):
@@ -9802,6 +9815,13 @@ class ResourceManagerBase(ABC):
         # v188.0: Progress callback for DMS stall prevention
         # Signature: async (manager_name: str, status: str, message: str, pct: float) -> None
         self._progress_callback: Optional[Callable[[str, str, str, float], Awaitable[None]]] = None
+
+        # v290.0: Verdict bridge fields
+        self._required_tier = RequiredTier.REQUIRED if _VERDICT_TYPES_AVAILABLE else None
+        self._capabilities: Tuple[str, ...] = ()
+        self._verdict_sequence: int = 0
+        self._boot_epoch: int = 0
+        self._correlation_id: str = ""
     
     def set_progress_callback(
         self,
@@ -9893,12 +9913,98 @@ class ResourceManagerBase(ABC):
             "circuit_breaker_state": self._circuit_breaker.state.value,
         }
 
-    async def safe_initialize(self) -> bool:
-        """
-        Initialize with circuit breaker protection and timing.
+    async def safe_initialize(self):
+        """Initialize with circuit breaker protection, return typed verdict.
 
-        Returns:
-            True if initialization succeeded, False otherwise.
+        v290.0: Returns ResourceVerdict instead of bool when verdict types
+        are available.  Still sets _ready/_health_status for backward compat.
+        """
+        if not _VERDICT_TYPES_AVAILABLE:
+            # Fallback: original bool behaviour
+            return await self._safe_initialize_bool()
+
+        start = time.time()
+        try:
+            result = await self._circuit_breaker.execute(self.initialize())
+            self._init_time = time.time() - start
+
+            # Bridge: custom verdict from subclass
+            _get_verdict = getattr(self, "get_init_verdict", None)
+            if callable(_get_verdict):
+                verdict = _get_verdict(result)
+                self._ready = verdict.serviceable
+                self._health_status = verdict.state.value
+                if verdict.severity == 0:
+                    self._logger.success(
+                        f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                    )
+                else:
+                    self._logger.warning(f"{self.name}: {verdict.reason_detail}")
+                return verdict
+
+            # Infer verdict from bool
+            if result:
+                self._ready = True
+                self._health_status = "healthy"
+                self._logger.success(
+                    f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                )
+                return self._build_verdict(
+                    state=_VerdictState.READY,
+                    reason_code=VerdictReasonCode.HEALTHY,
+                    reason_detail=(
+                        f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                    ),
+                    boot_allowed=True,
+                    serviceable=True,
+                    evidence={"init_time_ms": int(self._init_time * 1000)},
+                )
+            else:
+                self._error = self._error or "Initialization returned False"
+                self._health_status = "unhealthy"
+                self._logger.warning(f"{self.name} initialization failed")
+                _is_required = self._required_tier == RequiredTier.REQUIRED
+                return self._build_verdict(
+                    state=(
+                        _VerdictState.CRASHED if _is_required
+                        else _VerdictState.DEGRADED
+                    ),
+                    reason_code=VerdictReasonCode.INIT_RETURNED_FALSE,
+                    reason_detail=self._error,
+                    boot_allowed=not _is_required,
+                    serviceable=False,
+                    retryable=True,
+                    next_action=RecoveryAction.RETRY,
+                    evidence={
+                        "init_time_ms": int(self._init_time * 1000),
+                        "error": self._error,
+                    },
+                )
+        except Exception as e:
+            self._init_time = time.time() - start
+            self._error = str(e)
+            self._health_status = "error"
+            self._logger.error(f"{self.name} initialization error: {e}")
+            _is_required = self._required_tier == RequiredTier.REQUIRED
+            return self._build_verdict(
+                state=_VerdictState.CRASHED,
+                reason_code=VerdictReasonCode.INIT_EXCEPTION,
+                reason_detail=str(e),
+                boot_allowed=not _is_required,
+                serviceable=False,
+                retryable=True,
+                retry_after_s=30.0,
+                next_action=RecoveryAction.RETRY,
+                evidence={
+                    "exception": type(e).__name__,
+                    "init_time_ms": int(self._init_time * 1000),
+                },
+            )
+
+    async def _safe_initialize_bool(self) -> bool:
+        """Original bool-returning safe_initialize for fallback.
+
+        v290.0: Used when verdict types are not importable.
         """
         start = time.time()
         try:
@@ -9907,7 +10013,9 @@ class ResourceManagerBase(ABC):
             if result:
                 self._ready = True
                 self._health_status = "healthy"
-                self._logger.success(f"{self.name} initialized in {self._init_time*1000:.0f}ms")
+                self._logger.success(
+                    f"{self.name} initialized in {self._init_time*1000:.0f}ms"
+                )
             else:
                 self._error = "Initialization returned False"
                 self._health_status = "unhealthy"
@@ -9938,6 +10046,54 @@ class ResourceManagerBase(ABC):
             self._ready = False
             self._health_status = "error"
             return False, f"Health check error: {e}"
+
+    # -----------------------------------------------------------------
+    # v290.0: Verdict bridge
+    # -----------------------------------------------------------------
+
+    def _build_verdict(
+        self,
+        state,  # _VerdictState (SubsystemState)
+        reason_code,  # VerdictReasonCode
+        reason_detail: str,
+        *,
+        boot_allowed: bool = True,
+        serviceable: bool = False,
+        retryable: bool = False,
+        retry_after_s=None,
+        evidence=None,
+        recovery_owner=None,
+        next_action=None,
+    ):
+        """Build a ResourceVerdict from this manager's current context.
+
+        v290.0: Bridge helper used by safe_initialize() and future
+        health-check verdicts.
+        """
+        if not _VERDICT_TYPES_AVAILABLE:
+            raise RuntimeError("Verdict types not available")
+        from datetime import timezone
+        self._verdict_sequence += 1
+        return ResourceVerdict(
+            origin=self.name,
+            correlation_id=self._correlation_id,
+            epoch=self._boot_epoch,
+            monotonic_ns=time.monotonic_ns(),
+            wall_utc=datetime.now(timezone.utc).isoformat(),
+            sequence=self._verdict_sequence,
+            state=state,
+            boot_allowed=boot_allowed,
+            serviceable=serviceable,
+            required_tier=self._required_tier,
+            reason_code=reason_code,
+            reason_detail=reason_detail,
+            retryable=retryable,
+            retry_after_s=retry_after_s,
+            evidence=evidence or {},
+            recovery_owner=recovery_owner,
+            next_action=next_action or RecoveryAction.NONE,
+            capabilities=self._capabilities,
+        )
 
 # =============================================================================
 # DOCKER DAEMON STATUS ENUM
@@ -13170,7 +13326,7 @@ class ResourceManagerRegistry:
         async def _initialize_manager(
             name: str,
             manager: ResourceManagerBase,
-        ) -> bool:
+        ):
             if manager_timeout is None:
                 return await manager.safe_initialize()
             try:
@@ -13187,6 +13343,18 @@ class ResourceManagerRegistry:
                 self._logger.warning(
                     f"Manager {name} timed out after {manager_timeout:.1f}s"
                 )
+                if _VERDICT_TYPES_AVAILABLE and hasattr(manager, '_build_verdict'):
+                    return manager._build_verdict(
+                        state=_VerdictState.CRASHED,
+                        reason_code=VerdictReasonCode.INIT_TIMEOUT,
+                        reason_detail=f"Initialization timed out after {manager_timeout:.1f}s",
+                        boot_allowed=manager._required_tier != RequiredTier.REQUIRED,
+                        serviceable=False,
+                        retryable=True,
+                        retry_after_s=manager_timeout,
+                        next_action=RecoveryAction.RETRY,
+                        evidence={"timeout_s": manager_timeout},
+                    )
                 return False
 
         if parallel:
@@ -13245,7 +13413,11 @@ class ResourceManagerRegistry:
                     name = pending_tasks.pop(task)
                     try:
                         result = task.result()
-                        result_bool = bool(result)
+                        # v290.0: result may be ResourceVerdict or bool
+                        if _VERDICT_TYPES_AVAILABLE and hasattr(result, 'serviceable'):
+                            result_bool = result.serviceable
+                        else:
+                            result_bool = bool(result)
                         results[name] = result_bool
                         status = "complete" if result_bool else "failed"
                     except asyncio.CancelledError:
@@ -13285,7 +13457,11 @@ class ResourceManagerRegistry:
                     manager_start_times[name] = time.monotonic()
                     self._logger.info(f"[ResourceRegistry] Starting {name}...")
                     result = await _initialize_manager(name, manager)
-                    result_bool = bool(result)
+                    # v290.0: result may be ResourceVerdict or bool
+                    if _VERDICT_TYPES_AVAILABLE and hasattr(result, 'serviceable'):
+                        result_bool = result.serviceable
+                    else:
+                        result_bool = bool(result)
                     results[name] = result_bool
                     status = "complete" if result_bool else "failed"
                 except Exception as e:
