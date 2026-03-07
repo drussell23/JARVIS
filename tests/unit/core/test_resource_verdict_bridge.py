@@ -332,3 +332,47 @@ class TestVerdictBridgeFields:
 
         mgr = FreshManager("fresh")
         assert mgr._required_tier is RequiredTier.REQUIRED
+
+
+# ===================================================================
+# Task 7: Manager RequiredTier declarations
+# ===================================================================
+
+class TestManagerTierDeclarations:
+    """Verify each manager's __init__ source declares the correct RequiredTier."""
+
+    def test_docker_daemon_enhancement(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.DockerDaemonManager.__init__)
+        assert "RequiredTier.ENHANCEMENT" in src
+
+    def test_gcp_instance_enhancement(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.GCPInstanceManager.__init__)
+        assert "RequiredTier.ENHANCEMENT" in src
+
+    def test_dynamic_port_required(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.DynamicPortManager.__init__)
+        # DynamicPortManager keeps default REQUIRED, so it only sets capabilities
+        assert "port_allocation" in src
+
+    def test_voice_cache_optional(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.SemanticVoiceCacheManager.__init__)
+        assert "RequiredTier.OPTIONAL" in src
+
+    def test_tiered_storage_optional(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.TieredStorageManager.__init__)
+        assert "RequiredTier.OPTIONAL" in src
+
+    def test_spot_resilience_optional(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.SpotInstanceResilienceHandler.__init__)
+        assert "RequiredTier.OPTIONAL" in src
+
+    def test_cache_manager_enhancement(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.IntelligentCacheManager.__init__)
+        assert "RequiredTier.ENHANCEMENT" in src
