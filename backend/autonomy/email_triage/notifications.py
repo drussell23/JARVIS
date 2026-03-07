@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from autonomy.email_triage.config import TriageConfig
 from autonomy.email_triage.events import (
@@ -474,3 +474,36 @@ async def replay_outbox(
 
     emit_triage_event(EVENT_OUTBOX_REPLAYED, stats)
     return stats
+
+
+# ---------------------------------------------------------------------------
+# Training capture notification (user-facing)
+# ---------------------------------------------------------------------------
+
+
+def build_training_capture_message(
+    outcomes: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Build a user-facing message about training data captured.
+
+    Returns None if no outcomes to report.
+    """
+    if not outcomes:
+        return None
+
+    high = sum(1 for o in outcomes if o.get("confidence") == "high")
+    medium = sum(1 for o in outcomes if o.get("confidence") == "medium")
+    total = len(outcomes)
+
+    parts = []
+    if high:
+        parts.append(f"{high} high-confidence")
+    if medium:
+        parts.append(f"{medium} medium-confidence")
+
+    confidence_desc = " and ".join(parts) if parts else f"{total}"
+
+    return (
+        f"Sir, I captured {total} email outcomes for training — "
+        f"{confidence_desc}. Your preferences are being learned."
+    )
