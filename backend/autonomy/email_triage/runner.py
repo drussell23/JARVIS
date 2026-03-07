@@ -144,6 +144,17 @@ class EmailTriageRunner:
         self._warmed_up = True
 
         await self._resolver.resolve_all()
+        # v291.2: Pre-warm OAuth token so the first cycle doesn't pay the
+        # 8s token refresh cost inside the 10s fetch budget.  warm_up()
+        # runs under its own 45s budget, so this cost is absorbed here.
+        try:
+            _ws_agent = self._resolver.get("workspace_agent")
+            if _ws_agent:
+                _client = getattr(_ws_agent, "_client", None)
+                if _client and hasattr(_client, "_ensure_authenticated"):
+                    await _client._ensure_authenticated()
+        except Exception as _auth_err:
+            logger.debug("Pre-warm auth failed (non-fatal): %s", _auth_err)
         await self._ensure_state_store()
         await self._cold_start_recovery()
         # Phase B: Initialize action commit ledger
@@ -499,8 +510,9 @@ class EmailTriageRunner:
 
         # Fetch unread emails — bounded
         try:
+            _fetch_deadline = time.monotonic() + min(10.0, _remaining())
             emails = await asyncio.wait_for(
-                self._fetch_unread(),
+                self._fetch_unread(deadline=_fetch_deadline),
                 timeout=min(10.0, _remaining()),
             )
             emails_fetched = len(emails)
@@ -1032,13 +1044,20 @@ class EmailTriageRunner:
 
         return report
 
-    async def _fetch_unread(self) -> List[Dict[str, Any]]:
+    async def _fetch_unread(self, *, deadline: Optional[float] = None) -> List[Dict[str, Any]]:
         """Fetch unread emails via workspace agent."""
         agent = self._resolver.get("workspace_agent")
         if agent:
-            result = await agent._fetch_unread_emails({
+            payload: Dict[str, Any] = {
                 "limit": self._config.max_emails_per_cycle,
-            })
+            }
+            # v291.2: Propagate deadline so the workspace agent → Google client
+            # chain uses budget-aware timeouts instead of the fixed 15s default.
+            # Without this, a 10s fetch timeout wraps a 15s internal timeout,
+            # meaning the outer timeout always fires first (wasting the signal).
+            if deadline is not None:
+                payload["deadline_monotonic"] = deadline
+            result = await agent._fetch_unread_emails(payload)
             return result.get("emails", [])
         # v284.0: Log when workspace agent is not resolved with dep health
         logger.warning(

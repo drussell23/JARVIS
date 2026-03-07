@@ -2186,6 +2186,24 @@ class GoogleWorkspaceClient:
         if not self._creds:
             return False
 
+        # v291.2: Short-circuit redundant token checks — if we validated
+        # within the last 30s and the auth state is healthy, skip the
+        # expensive scope validation + network refresh check.  This prevents
+        # the double-validation penalty when _ensure_authenticated() calls
+        # us and then _execute_with_retry() calls us again 0-100ms later.
+        import time as _time
+        _now_mono = _time.monotonic()
+        if (
+            self._last_token_check > 0
+            and (_now_mono - self._last_token_check) < 30.0
+            and self._auth_state not in {
+                AuthState.NEEDS_REAUTH,
+                AuthState.NEEDS_REAUTH_GUIDED,
+                AuthState.DEGRADED_VISUAL,
+            }
+        ):
+            return True
+
         # Check token expiry
         try:
             scopes_valid, scope_reason = self._validate_current_credentials_scopes()
@@ -2197,8 +2215,12 @@ class GoogleWorkspaceClient:
 
             if self._credentials_need_refresh():
                 logger.info("[GoogleWorkspaceClient] Token expired, refreshing...")
-                return await self._refresh_token()
+                refreshed = await self._refresh_token()
+                if refreshed:
+                    self._last_token_check = _now_mono
+                return refreshed
 
+            self._last_token_check = _now_mono
             return True
 
         except Exception as e:
@@ -3051,13 +3073,18 @@ class GoogleWorkspaceClient:
         Returns:
             Dictionary with email list and metadata
         """
-        if not await self._ensure_authenticated():
-            return self._build_email_auth_error_response()
-
+        # v291.2: Check cache BEFORE auth — cache is a local dict lookup
+        # (instant), but _ensure_authenticated() may trigger a network token
+        # refresh (up to 8s).  If we have a valid cached result, skip auth
+        # entirely.  This prevents the common case where auth cost consumes
+        # most of the 10s fetch budget before the API call even starts.
         cache_key = f"unread:{label}:{limit}"
         cached = self._get_cached(cache_key)
         if cached:
             return cached
+
+        if not await self._ensure_authenticated():
+            return self._build_email_auth_error_response()
 
         # v280.5: Budget-aware timeout — cap to remaining deadline budget
         import time as _time

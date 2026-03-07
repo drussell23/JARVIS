@@ -464,6 +464,9 @@ class UnifiedAgentRuntime:
         self._triage_pressure_skip_count: int = 0
         # v284.0: Log triage-disabled once, not every cycle
         self._triage_disabled_logged: bool = False
+        # v291.2: Serialize triage execution — prevents double-execution when
+        # two coroutines read _last_email_triage_run before either writes it.
+        self._triage_lock = asyncio.Lock()
 
         # ExperienceQueueProcessor — drains training data to reactor-core.
         self._experience_processor = None
@@ -2811,12 +2814,19 @@ class UnifiedAgentRuntime:
                 self._triage_disabled_logged = True
             return
 
-        now = time.monotonic()
-        interval = _env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0)
-        if self._last_email_triage_run > 0.0 and now - self._last_email_triage_run < interval:
-            return
+        # v291.2: Serialize cooldown check + timestamp update under a lock.
+        # Without this, two concurrent housekeeping loops can both read
+        # _last_email_triage_run before either writes it, causing double
+        # execution of the same triage cycle.
+        if self._triage_lock.locked():
+            return  # Another cycle is already running — skip without blocking
+        async with self._triage_lock:
+            now = time.monotonic()
+            interval = _env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0)
+            if self._last_email_triage_run > 0.0 and now - self._last_email_triage_run < interval:
+                return
 
-        self._last_email_triage_run = now
+            self._last_email_triage_run = now
 
         # ── Memory pressure routing gate ──────────────────────────
         # Under memory pressure, PrimeRouter._decide_route() already
@@ -2954,7 +2964,8 @@ class UnifiedAgentRuntime:
                     if not self._experience_processor_started:
                         await self._start_experience_processor()
         except asyncio.TimeoutError:
-            _elapsed = time.monotonic() - now if now else 0
+            # v291.2: Use _last_email_triage_run (set under lock) as cycle start
+            _elapsed = time.monotonic() - self._last_email_triage_run if self._last_email_triage_run else 0
             logger.warning(
                 "[AgentRuntime] Email triage cycle timed out after %.1fs "
                 "(timeout=%.0fs, warmed=%s)",
