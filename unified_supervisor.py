@@ -20115,14 +20115,26 @@ class IntelligentChromeIncognitoManager:
         window_index: int,
         url: str,
         timeout: float = 15.0,
+        *,
+        _retry: bool = True,
     ) -> bool:
-        """Redirect an existing incognito window to a URL."""
+        """Redirect an existing incognito window to a URL.
+
+        v291.2: Retry with fresh window scan on failure.
+        If window_index is stale (window closed between scan and redirect),
+        re-scan for incognito windows and retry once with a valid index.
+        Also escapes URL for safe AppleScript string embedding.
+        """
         if sys.platform != 'darwin':
             return False
 
+        # Escape URL for AppleScript string embedding — prevents injection
+        # if URL contains quotes or backslashes.
+        safe_url = url.replace('\\', '\\\\').replace('"', '\\"')
+
         applescript = f'''
         tell application "Google Chrome"
-            set URL of active tab of window {window_index} to "{url}"
+            set URL of active tab of window {window_index} to "{safe_url}"
             set active tab index of window {window_index} to 1
             activate
         end tell
@@ -20135,12 +20147,36 @@ class IntelligentChromeIncognitoManager:
                 op_name="redirect_incognito_window",
             )
             if ok:
-                self._logger.info(f"🔄 Redirected incognito window {window_index} to {url}")
+                self._logger.info(f"Redirected incognito window {window_index} to {url}")
                 return True
-            else:
-                self._logger.warning(f"Redirect failed: {err}")
-                return False
+
+            # v291.2: On failure, retry once with a fresh window scan.
+            # The most common failure is a stale window_index (window closed
+            # between scan and redirect).
+            if _retry:
+                self._logger.debug(
+                    f"Redirect failed (window {window_index}), retrying with fresh scan..."
+                )
+                fresh_window = await self._quick_find_any_incognito_window()
+                if fresh_window and fresh_window != window_index:
+                    return await self._redirect_incognito_window(
+                        fresh_window, url, timeout=timeout, _retry=False,
+                    )
+            self._logger.warning(f"Redirect failed: {err}")
+            return False
         except Exception as e:
+            if _retry:
+                self._logger.debug(
+                    f"Redirect error (window {window_index}: {e}), retrying with fresh scan..."
+                )
+                try:
+                    fresh_window = await self._quick_find_any_incognito_window()
+                    if fresh_window and fresh_window != window_index:
+                        return await self._redirect_incognito_window(
+                            fresh_window, url, timeout=timeout, _retry=False,
+                        )
+                except Exception:
+                    pass
             self._logger.warning(f"Error redirecting window: {e}")
             return False
 

@@ -25109,6 +25109,17 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
     if not checks.get("reactor_reachable", False):
         _unreachable.append("reactor")
 
+    # v291.2: Services reachable but missing schema field → still initializing.
+    # Treat as "pending" not "schema_mismatch" — the health endpoint may return
+    # 200 before all response fields are populated.  This prevents a permanent
+    # ⚠️ warning when a service is healthy but predates the schema field or is
+    # mid-initialization.
+    _schema_missing = []
+    if checks.get("prime_reachable") and prime_schema is None:
+        _schema_missing.append("prime")
+    if checks.get("reactor_reachable") and reactor_schema is None:
+        _schema_missing.append("reactor")
+
     if all_pass:
         checks["reason"] = "active"
         checks["pending"] = []
@@ -25116,6 +25127,11 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
         # Services not yet responding — likely still starting
         checks["reason"] = "pending_services"
         checks["pending"] = _unreachable
+    elif _schema_missing:
+        # Reachable but schema field not yet in health response — still
+        # initializing or needs the autonomy_schema_version field added.
+        checks["reason"] = "pending_schema"
+        checks["pending"] = _schema_missing
     elif not checks.get("body_journal", False):
         checks["reason"] = "pending_lease"
         checks["pending"] = ["journal"]
