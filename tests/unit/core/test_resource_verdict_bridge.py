@@ -492,3 +492,22 @@ class TestResourceRegistryLastVerdicts:
             assert v.serviceable is False
 
         asyncio.run(_run())
+
+
+# ===================================================================
+# Task 9: No hardcoded "resources": {"status": "complete"}
+# ===================================================================
+
+class TestNoHardcodedResourceComplete:
+    """Verify the codebase has no hardcoded resources-complete overwrites."""
+
+    def test_no_hardcoded_resources_complete(self):
+        import re
+        with open("unified_supervisor.py", "r") as f:
+            content = f.read()
+        # Find all instances of "resources": {"status": "complete"}
+        matches = re.findall(r'"resources":\s*\{"status":\s*"complete"\}', content)
+        assert len(matches) == 0, (
+            f"Found {len(matches)} hardcoded 'resources: complete' literals. "
+            "These must read from VerdictAuthority instead."
+        )

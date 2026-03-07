@@ -72970,7 +72970,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "running"},
                         "intelligence": {"status": "pending"},
                         "trinity": {"status": "pending"},
@@ -73089,7 +73091,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "running"},
                         "trinity": {"status": "pending"},
@@ -73268,7 +73272,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "running"},
@@ -73695,7 +73701,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74036,7 +74044,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "trinity": {"status": "complete"},
@@ -74248,7 +74258,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74378,7 +74390,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74546,7 +74560,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74658,7 +74674,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "two_tier": {"status": "complete"},
@@ -74870,7 +74888,9 @@ class JarvisSystemKernel:
                     "components": {
                         "loading_server": {"status": "complete"},
                         "preflight": {"status": "complete"},
-                        "resources": {"status": "complete"},
+                        "resources": (self._verdict_authority.get_phase_display("resources")
+                                      if hasattr(self, '_verdict_authority') and self._verdict_authority
+                                      else {"status": "complete"}),
                         "backend": {"status": "complete"},
                         "intelligence": {"status": "complete"},
                         "trinity": {"status": "complete"},
