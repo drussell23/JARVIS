@@ -72574,6 +72574,11 @@ class JarvisSystemKernel:
                                 source="apars",
                                 deployment_mode=_mode,
                             )
+                            # v290.1: Register GCP verification as startup activity
+                            try:
+                                self._mark_startup_activity("gcp_verification")
+                            except Exception:
+                                pass
 
                         _port = int(os.getenv(
                             "TRINITY_JPRIME_PORT",
@@ -76418,7 +76423,14 @@ class JarvisSystemKernel:
                                     source="apars",  # v229.0: Critical — marks as real data
                                     deployment_mode=_mode if _mode else None,
                                 )
-                            
+                                # v290.1: Register GCP verification as startup activity so
+                                # ProgressController can see it. Without this, GCP polling
+                                # is invisible to active_subsystem_reasons -> false TRUE STALL.
+                                try:
+                                    self._mark_startup_activity("gcp_verification")
+                                except Exception:
+                                    pass
+
                             success, ip, status = await manager.ensure_static_vm_ready(
                                 port=self.config.invincible_node_port,
                                 timeout=self.config.invincible_node_health_timeout,
