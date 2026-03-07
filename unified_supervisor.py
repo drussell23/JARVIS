@@ -13260,9 +13260,12 @@ class ResourceManagerRegistry:
         self._managers: Dict[str, ResourceManagerBase] = {}
         self._logger = UnifiedLogger()
         self._initialized = False
-        
+
         # v188.0: Progress callback for DMS stall prevention
         self._progress_callback = progress_callback
+
+        # v290.0: Preserve raw ResourceVerdict objects from each manager init
+        self._last_verdicts: Dict[str, Any] = {}
 
     def register(self, manager: ResourceManagerBase) -> None:
         """Register a resource manager."""
@@ -13275,6 +13278,10 @@ class ResourceManagerRegistry:
     def get_manager(self, name: str) -> Optional[ResourceManagerBase]:
         """Get a resource manager by name (alias for get)."""
         return self.get(name)
+
+    def get_last_verdicts(self) -> Dict[str, Any]:
+        """Return the last ResourceVerdict for each manager (if available)."""
+        return dict(self._last_verdicts)
 
     async def initialize_all(
         self,
@@ -13361,7 +13368,7 @@ class ResourceManagerRegistry:
                     f"Manager {name} timed out after {manager_timeout:.1f}s"
                 )
                 if _VERDICT_TYPES_AVAILABLE and hasattr(manager, '_build_verdict'):
-                    return manager._build_verdict(
+                    _timeout_verdict = manager._build_verdict(
                         state=_VerdictState.CRASHED,
                         reason_code=VerdictReasonCode.INIT_TIMEOUT,
                         reason_detail=f"Initialization timed out after {manager_timeout:.1f}s",
@@ -13372,6 +13379,8 @@ class ResourceManagerRegistry:
                         next_action=RecoveryAction.RETRY,
                         evidence={"timeout_s": manager_timeout},
                     )
+                    self._last_verdicts[name] = _timeout_verdict
+                    return _timeout_verdict
                 return False
 
         if parallel:
@@ -13433,6 +13442,7 @@ class ResourceManagerRegistry:
                         # v290.0: result may be ResourceVerdict or bool
                         if _VERDICT_TYPES_AVAILABLE and hasattr(result, 'serviceable'):
                             result_bool = result.serviceable
+                            self._last_verdicts[name] = result
                         else:
                             result_bool = bool(result)
                         results[name] = result_bool
@@ -13477,6 +13487,7 @@ class ResourceManagerRegistry:
                     # v290.0: result may be ResourceVerdict or bool
                     if _VERDICT_TYPES_AVAILABLE and hasattr(result, 'serviceable'):
                         result_bool = result.serviceable
+                        self._last_verdicts[name] = result
                     else:
                         result_bool = bool(result)
                     results[name] = result_bool
@@ -66476,6 +66487,13 @@ class JarvisSystemKernel:
         self._ipc_server = IPCServer(self.config, self.logger)
         self._signal_handler = get_unified_signal_handler()
 
+        # v290.0: Verdict authority -- single source of truth for component status
+        try:
+            from backend.core.verdict_authority import VerdictAuthority
+            self._verdict_authority: Optional[Any] = VerdictAuthority()
+        except ImportError:
+            self._verdict_authority = None
+
         # Managers (initialized during startup)
         self._resource_registry: Optional[ResourceManagerRegistry] = None
         self._intelligence_registry: Optional[IntelligenceRegistry] = None
@@ -76451,6 +76469,30 @@ class JarvisSystemKernel:
                     await asyncio.wait_for(heartbeat_task, timeout=1.0)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
+
+            # v290.0: Submit resource verdicts to authority and aggregate
+            if self._verdict_authority is not None and _VERDICT_TYPES_AVAILABLE:
+                try:
+                    _verdicts = self._resource_registry.get_last_verdicts()
+                    if _verdicts:
+                        epoch = self._verdict_authority.begin_epoch()
+                        for vname, verdict in _verdicts.items():
+                            await self._verdict_authority.submit_verdict(vname, verdict)
+                        from backend.core.root_authority_types import aggregate_verdicts
+                        _phase_verdict = aggregate_verdicts(
+                            "resources", _verdicts,
+                            epoch=epoch,
+                            correlation_id="resource-phase",
+                        )
+                        await self._verdict_authority.submit_phase_verdict(_phase_verdict)
+                        self.logger.info(
+                            "[Kernel] Resources phase verdict: state=%s boot_allowed=%s serviceable=%s",
+                            _phase_verdict.state.value,
+                            _phase_verdict.boot_allowed,
+                            _phase_verdict.serviceable,
+                        )
+                except Exception as va_err:
+                    self.logger.warning("[Kernel] VerdictAuthority submission error: %s", va_err)
 
             # =====================================================================
             # v211.0: TRULY NON-BLOCKING INVINCIBLE NODE WAKE-UP

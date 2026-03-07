@@ -381,3 +381,119 @@ class TestManagerTierDeclarations:
         import inspect, unified_supervisor as us
         src = inspect.getsource(us.IntelligentCacheManager.__init__)
         assert "RequiredTier.ENHANCEMENT" in src
+
+
+# ===================================================================
+# Task 8: VerdictAuthority wiring
+# ===================================================================
+
+class TestVerdictAuthorityWiring:
+    """Test that VerdictAuthority can be imported and used."""
+
+    def test_verdict_authority_importable(self):
+        from backend.core.verdict_authority import VerdictAuthority
+        va = VerdictAuthority()
+        assert va.current_epoch == 0
+
+    def test_begin_epoch(self):
+        from backend.core.verdict_authority import VerdictAuthority
+        va = VerdictAuthority()
+        epoch = va.begin_epoch()
+        assert epoch == 1
+        assert va.current_epoch == 1
+
+    def test_submit_and_read(self):
+        """Submit a verdict and verify it can be read back."""
+        from backend.core.verdict_authority import VerdictAuthority
+        va = VerdictAuthority()
+        va.begin_epoch()
+        mgr = _make_manager("TestSubmit")
+        verdict = mgr._build_verdict(
+            state=SubsystemState.READY,
+            reason_code=VerdictReasonCode.HEALTHY,
+            reason_detail="ok",
+            boot_allowed=True,
+            serviceable=True,
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            accepted = loop.run_until_complete(va.submit_verdict("test", verdict))
+        finally:
+            loop.close()
+        assert accepted is True
+        stored = va.get_component_status("test")
+        assert stored is verdict
+
+
+class TestResourceRegistryLastVerdicts:
+    """Test that ResourceManagerRegistry stores and exposes verdicts."""
+
+    def test_last_verdicts_initially_empty(self):
+        from unified_supervisor import ResourceManagerRegistry
+        registry = ResourceManagerRegistry()
+        assert registry.get_last_verdicts() == {}
+
+    def test_get_last_verdicts_returns_copy(self):
+        from unified_supervisor import ResourceManagerRegistry
+        registry = ResourceManagerRegistry()
+        v1 = registry.get_last_verdicts()
+        v1["injected"] = "bad"
+        assert registry.get_last_verdicts() == {}
+
+    def test_parallel_init_stores_verdicts(self):
+        """Parallel initialization stores ResourceVerdict objects."""
+        from unified_supervisor import ResourceManagerRegistry
+        registry = ResourceManagerRegistry()
+        mgr = _make_manager("ParVerdictMgr")
+        registry.register(mgr)
+        loop = asyncio.new_event_loop()
+        try:
+            results = loop.run_until_complete(
+                registry.initialize_all(parallel=True)
+            )
+        finally:
+            loop.close()
+        assert "parverdictmgr" in results
+        verdicts = registry.get_last_verdicts()
+        assert len(verdicts) >= 1
+        v = verdicts["parverdictmgr"]
+        assert hasattr(v, 'serviceable')
+        assert isinstance(v, ResourceVerdict)
+
+    def test_sequential_init_stores_verdicts(self):
+        """Sequential initialization stores ResourceVerdict objects."""
+        from unified_supervisor import ResourceManagerRegistry
+        registry = ResourceManagerRegistry()
+        mgr = _make_manager("SeqVerdictMgr")
+        registry.register(mgr)
+        loop = asyncio.new_event_loop()
+        try:
+            results = loop.run_until_complete(
+                registry.initialize_all(parallel=False)
+            )
+        finally:
+            loop.close()
+        verdicts = registry.get_last_verdicts()
+        assert len(verdicts) >= 1
+        v = verdicts["seqverdictmgr"]
+        assert isinstance(v, ResourceVerdict)
+        assert v.state is SubsystemState.READY
+
+    def test_failed_init_stores_verdict(self):
+        """Failed initialization stores verdict with serviceable=False."""
+        from unified_supervisor import ResourceManagerRegistry
+        registry = ResourceManagerRegistry()
+        mgr = _make_manager("FailVerdictMgr", init_return=False)
+        registry.register(mgr)
+        loop = asyncio.new_event_loop()
+        try:
+            results = loop.run_until_complete(
+                registry.initialize_all(parallel=False)
+            )
+        finally:
+            loop.close()
+        verdicts = registry.get_last_verdicts()
+        assert len(verdicts) >= 1
+        v = verdicts["failverdictmgr"]
+        assert isinstance(v, ResourceVerdict)
+        assert v.serviceable is False
