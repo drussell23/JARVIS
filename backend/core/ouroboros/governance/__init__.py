@@ -33,6 +33,14 @@ Phase 3 Components:
     - RuntimeContractChecker: N/N-1 schema validation at runtime
     - CanaryController: Per-domain-slice promotion with rollout criteria
     - CLICommands: Importable break-glass functions for supervisor CLI
+
+Integration Components:
+    - GovernanceMode: Operating mode enum (PENDING/SANDBOX/READ_ONLY_PLANNING/GOVERNED/EMERGENCY_STOP)
+    - GovernanceConfig: Frozen configuration with policy hashes
+    - GovernanceStack: Component holder with lifecycle, write gate, and replay
+    - create_governance_stack: Factory with timeout and partial-init rollback
+    - register_governance_argparse: CLI flag registration
+    - handle_break_glass_command: Break-glass CLI dispatch
 """
 
 from backend.core.ouroboros.governance.operation_id import (
@@ -148,4 +156,14 @@ from backend.core.ouroboros.governance.cli_commands import (
     list_active_tokens,
     revoke_break_glass,
     get_audit_report,
+)
+from backend.core.ouroboros.governance.integration import (
+    GovernanceMode,
+    CapabilityStatus,
+    GovernanceInitError,
+    GovernanceConfig,
+    GovernanceStack,
+    create_governance_stack,
+    register_governance_argparse,
+    handle_break_glass_command,
 )

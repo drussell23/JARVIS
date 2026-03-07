@@ -617,3 +617,42 @@ class TestHandleBreakGlassCommand:
         args = argparse.Namespace(break_glass_action="unknown_action")
         exit_code = await handle_break_glass_command(args, stack=None)
         assert exit_code == 1
+
+
+# -- Package exports ---------------------------------------------------------
+
+
+class TestPackageExports:
+    """Integration module exports must be accessible from the package."""
+
+    def test_governance_mode_importable(self):
+        from backend.core.ouroboros.governance import GovernanceMode
+        assert GovernanceMode.SANDBOX.value == "sandbox"
+
+    def test_governance_config_importable(self):
+        from backend.core.ouroboros.governance import GovernanceConfig
+        assert GovernanceConfig is not None
+
+    def test_governance_stack_importable(self):
+        from backend.core.ouroboros.governance import GovernanceStack
+        assert GovernanceStack is not None
+
+    def test_governance_init_error_importable(self):
+        from backend.core.ouroboros.governance import GovernanceInitError
+        assert GovernanceInitError is not None
+
+    def test_capability_status_importable(self):
+        from backend.core.ouroboros.governance import CapabilityStatus
+        assert CapabilityStatus is not None
+
+    def test_create_governance_stack_importable(self):
+        from backend.core.ouroboros.governance import create_governance_stack
+        assert callable(create_governance_stack)
+
+    def test_register_governance_argparse_importable(self):
+        from backend.core.ouroboros.governance import register_governance_argparse
+        assert callable(register_governance_argparse)
+
+    def test_handle_break_glass_command_importable(self):
+        from backend.core.ouroboros.governance import handle_break_glass_command
+        assert callable(handle_break_glass_command)
