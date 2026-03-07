@@ -400,3 +400,80 @@ class TestGovernanceStack:
     async def test_drain_is_callable(self):
         stack = self._make_stack()
         await stack.drain()  # should not raise
+
+
+# -- create_governance_stack -------------------------------------------------
+
+
+class TestCreateGovernanceStack:
+    """Factory function tests."""
+
+    def _make_config(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import GovernanceConfig
+
+        args = argparse.Namespace(skip_governance=False, governance_mode="sandbox")
+        base = GovernanceConfig.from_env_and_args(args)
+        return GovernanceConfig(
+            ledger_dir=tmp_path / "ledger",
+            policy_version=base.policy_version,
+            policy_hash=base.policy_hash,
+            contract_version=base.contract_version,
+            contract_hash=base.contract_hash,
+            config_digest=base.config_digest,
+            initial_mode=base.initial_mode,
+            skip_governance=base.skip_governance,
+            canary_slices=base.canary_slices,
+            gcp_daily_budget=base.gcp_daily_budget,
+            startup_timeout_s=base.startup_timeout_s,
+            component_budget_s=base.component_budget_s,
+        )
+
+    @pytest.mark.asyncio
+    async def test_creates_stack_successfully(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import (
+            GovernanceStack,
+            create_governance_stack,
+        )
+
+        config = self._make_config(tmp_path)
+        stack = await create_governance_stack(config)
+        assert isinstance(stack, GovernanceStack)
+        assert stack.policy_version == "v0.1.0"
+
+    @pytest.mark.asyncio
+    async def test_optional_bridges_missing(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import create_governance_stack
+
+        config = self._make_config(tmp_path)
+        stack = await create_governance_stack(config)
+        assert stack.event_bridge is None
+        assert stack.blast_adapter is None
+        assert stack.learning_bridge is None
+        assert stack.capabilities["event_bridge"].enabled is False
+        assert stack.capabilities["event_bridge"].reason == "dep_missing"
+
+    @pytest.mark.asyncio
+    async def test_optional_bridges_present(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import create_governance_stack
+
+        config = self._make_config(tmp_path)
+        stack = await create_governance_stack(
+            config,
+            event_bus=MagicMock(),
+            oracle=MagicMock(),
+            learning_memory=MagicMock(),
+        )
+        assert stack.event_bridge is not None
+        assert stack.blast_adapter is not None
+        assert stack.learning_bridge is not None
+        assert stack.capabilities["event_bridge"].enabled is True
+
+    @pytest.mark.asyncio
+    async def test_capabilities_reason_map(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import create_governance_stack
+
+        config = self._make_config(tmp_path)
+        stack = await create_governance_stack(config)
+        for name, status in stack.capabilities.items():
+            assert isinstance(status.reason, str)
+            assert len(status.reason) > 0

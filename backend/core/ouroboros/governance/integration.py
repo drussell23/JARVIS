@@ -23,9 +23,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from backend.core.ouroboros.governance.break_glass import BreakGlassManager
 from backend.core.ouroboros.governance.canary_controller import CanaryController
 from backend.core.ouroboros.governance.change_engine import ChangeEngine
-from backend.core.ouroboros.governance.comm_protocol import CommProtocol
+from backend.core.ouroboros.governance.blast_radius_adapter import BlastRadiusAdapter
+from backend.core.ouroboros.governance.comm_protocol import CommProtocol, LogTransport
 from backend.core.ouroboros.governance.contract_gate import ContractVersion
+from backend.core.ouroboros.governance.event_bridge import EventBridge
 from backend.core.ouroboros.governance.degradation import DegradationController
+from backend.core.ouroboros.governance.learning_bridge import LearningBridge
 from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationLedger, OperationState
 from backend.core.ouroboros.governance.lock_manager import GovernanceLockManager
 from backend.core.ouroboros.governance.resource_monitor import ResourceMonitor
@@ -355,3 +358,124 @@ class GovernanceStack:
             "replayed_reason": classification.reason_code,
             "match": classification.tier.name == entry.data.get("risk_tier"),
         }
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+async def create_governance_stack(
+    config: GovernanceConfig,
+    event_bus: Optional[Any] = None,
+    oracle: Optional[Any] = None,
+    learning_memory: Optional[Any] = None,
+) -> GovernanceStack:
+    """Factory with per-component budgets.
+
+    On failure: cleans up any partially-created resources,
+    raises GovernanceInitError with reason_code.
+    """
+    capabilities: Dict[str, CapabilityStatus] = {}
+
+    try:
+        # Core components (always present)
+        risk_engine = RiskEngine()
+        ledger = OperationLedger(storage_dir=config.ledger_dir)
+        comm = CommProtocol(transports=[LogTransport()])
+        controller = SupervisorOuroborosController()
+        lock_manager = GovernanceLockManager()
+        break_glass = BreakGlassManager()
+        resource_monitor = ResourceMonitor()
+        degradation = DegradationController()
+        routing = RoutingPolicy()
+        canary = CanaryController()
+        contract_checker = RuntimeContractChecker(
+            current_version=config.contract_version
+        )
+        change_engine = ChangeEngine(
+            project_root=config.ledger_dir.parent.parent.parent,
+            ledger=ledger,
+            comm=comm,
+            lock_manager=lock_manager,
+            break_glass=break_glass,
+            risk_engine=risk_engine,
+        )
+
+        # Optional bridges
+        _event_bridge: Optional[Any] = None
+        if event_bus is not None:
+            try:
+                _event_bridge = EventBridge(event_bus=event_bus)
+                capabilities["event_bridge"] = CapabilityStatus(
+                    enabled=True, reason="ok"
+                )
+            except Exception as exc:
+                capabilities["event_bridge"] = CapabilityStatus(
+                    enabled=False, reason=f"init_error: {exc}"
+                )
+        else:
+            capabilities["event_bridge"] = CapabilityStatus(
+                enabled=False, reason="dep_missing"
+            )
+
+        _blast_adapter: Optional[Any] = None
+        if oracle is not None:
+            try:
+                _blast_adapter = BlastRadiusAdapter(oracle=oracle)
+                capabilities["oracle"] = CapabilityStatus(
+                    enabled=True, reason="ok"
+                )
+            except Exception as exc:
+                capabilities["oracle"] = CapabilityStatus(
+                    enabled=False, reason=f"init_error: {exc}"
+                )
+        else:
+            capabilities["oracle"] = CapabilityStatus(
+                enabled=False, reason="dep_missing"
+            )
+
+        _learning_bridge: Optional[Any] = None
+        if learning_memory is not None:
+            try:
+                _learning_bridge = LearningBridge(
+                    learning_memory=learning_memory
+                )
+                capabilities["learning"] = CapabilityStatus(
+                    enabled=True, reason="ok"
+                )
+            except Exception as exc:
+                capabilities["learning"] = CapabilityStatus(
+                    enabled=False, reason=f"init_error: {exc}"
+                )
+        else:
+            capabilities["learning"] = CapabilityStatus(
+                enabled=False, reason="dep_missing"
+            )
+
+        return GovernanceStack(
+            controller=controller,
+            risk_engine=risk_engine,
+            ledger=ledger,
+            comm=comm,
+            lock_manager=lock_manager,
+            break_glass=break_glass,
+            change_engine=change_engine,
+            resource_monitor=resource_monitor,
+            degradation=degradation,
+            routing=routing,
+            canary=canary,
+            contract_checker=contract_checker,
+            event_bridge=_event_bridge,
+            blast_adapter=_blast_adapter,
+            learning_bridge=_learning_bridge,
+            policy_version=config.policy_version,
+            capabilities=capabilities,
+        )
+
+    except GovernanceInitError:
+        raise
+    except Exception as exc:
+        raise GovernanceInitError(
+            "governance_init_error", str(exc)
+        ) from exc
