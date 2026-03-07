@@ -161,7 +161,23 @@ class EmailTriageRunner:
             except Exception as e:
                 logger.warning("Action commit ledger init failed: %s", e)
                 self._commit_ledger = None
-        logger.info("[EmailTriageRunner] Warm-up complete")
+        # Boot-time readiness check: verify critical dependencies
+        # resolved and log contract versions for diagnostics.
+        router = self._resolver.get("router")
+        if router is None:
+            logger.warning("[EmailTriageRunner] Router not available — "
+                          "extraction will use heuristic fallback only")
+        if self._commit_ledger is None and self._config.state_persistence_enabled:
+            logger.error("[EmailTriageRunner] Ledger unavailable with persistence "
+                        "enabled — autonomous actions will be BLOCKED (fail-closed)")
+        logger.info(
+            "[EmailTriageRunner] Warm-up complete "
+            "(envelope_schema=%d, ledger=%s, router=%s, health_monitor=%s)",
+            1,  # DecisionEnvelope schema v1
+            "ready" if self._commit_ledger else "UNAVAILABLE",
+            "ready" if router else "MISSING",
+            "ready",
+        )
 
     def set_fencing_token(self, token: int) -> None:
         """Set the current fencing token from the DLM (WS2)."""
@@ -649,14 +665,22 @@ class EmailTriageRunner:
                 )
 
                 commit_id = None
+
                 if self._commit_ledger:
                     # Duplicate check
                     if await self._commit_ledger.is_duplicate(idem_key):
                         errors.append(f"duplicate:{features.message_id}")
                         emails_processed += 1
                         continue
+                elif self._config.state_persistence_enabled:
+                    # FAIL-CLOSED: Persistence is enabled but ledger
+                    # failed to initialize — block autonomous writes.
+                    errors.append(f"no_ledger:{features.message_id}:actions_blocked")
+                    emails_processed += 1
+                    continue
 
-                    # Reserve (MANDATORY for write actions — fail-closed)
+                # Reserve + pre-exec (when ledger is available — fail-closed)
+                if self._commit_ledger:
                     try:
                         commit_id = await self._commit_ledger.reserve(
                             envelope=scoring_envelope,
@@ -841,6 +865,9 @@ class EmailTriageRunner:
             "extraction_p95_ema_ms": round(self._extraction_p95_ema_ms, 1),
         })
 
+        # Phase B: Capture pre-cycle health status for observability
+        pre_health = self._health_monitor.check_health()
+
         report = TriageCycleReport(
             cycle_id=cycle_id,
             started_at=started_at,
@@ -855,6 +882,9 @@ class EmailTriageRunner:
             extraction_p95_ms=self._extraction_p95_ema_ms,
             admitted_count=admitted_count,
             budget_computed_s=budget_required_s,
+            health_healthy=pre_health.healthy,
+            health_recommendation=pre_health.recommendation.value if pre_health.recommendation else None,
+            health_anomalies=pre_health.anomalies,
         )
 
         # Phase B: Record cycle in behavioral health monitor

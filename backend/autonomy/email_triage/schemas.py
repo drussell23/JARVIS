@@ -109,3 +109,8 @@ class TriageCycleReport:
     extraction_p95_ms: float = 0.0
     admitted_count: int = 0  # emails admitted after adaptive gate
     budget_computed_s: float = 0.0  # computed required timeout
+
+    # Phase B: Behavioral health status
+    health_healthy: bool = True
+    health_recommendation: Optional[str] = None
+    health_anomalies: Tuple[str, ...] = ()

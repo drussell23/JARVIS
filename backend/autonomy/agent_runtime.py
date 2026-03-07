@@ -2785,11 +2785,13 @@ class UnifiedAgentRuntime:
 
         self._last_email_triage_run = now
 
-        # ── Memory pressure admission gate ──────────────────────────
-        # Hard gate: refuse to launch triage when system is thrashing or
-        # in emergency. Prevents the feedback loop where email triage
-        # inference triggers mmap page faults → thrash detection → model
-        # swap → inference stalls → triage timeout → retry → repeat.
+        # ── Memory pressure routing gate ──────────────────────────
+        # Under memory pressure, local inference would trigger mmap
+        # page faults → thrash → timeout loops.  Instead of skipping
+        # the cycle entirely (which makes JARVIS deaf to email), we
+        # disable local extraction and let PrimeRouter route inference
+        # to GCP.  The cycle still runs — only the inference backend
+        # changes.
         try:
             from core.memory_quantizer import get_memory_quantizer_instance
             _mq = get_memory_quantizer_instance()
@@ -2797,28 +2799,22 @@ class UnifiedAgentRuntime:
                 _thrash = getattr(_mq, 'thrash_state', 'healthy')
                 if _thrash in ('thrashing', 'emergency'):
                     self._triage_pressure_skip_count += 1
-                    # Exponential backoff with jitter: 60s, 120s, 240s... cap 600s
-                    import random
-                    _base_interval = interval
-                    _exp = min(self._triage_pressure_skip_count - 1, 4)
-                    _backoff = min(600.0, _base_interval * (2 ** _exp))
-                    _backoff *= (0.8 + 0.4 * random.random())  # ±20% jitter
-                    self._last_email_triage_run = now - interval + _backoff
+                    # Disable local extraction — PrimeRouter will route
+                    # to GCP_PRIME automatically via _decide_route()
+                    os.environ['EMAIL_TRIAGE_EXTRACTION_ENABLED'] = 'false'
                     logger.info(
-                        "[AgentRuntime] Email triage deferred: memory_state=%s, "
-                        "consecutive_skips=%d, next_attempt_in=%.0fs",
-                        _thrash, self._triage_pressure_skip_count, _backoff,
+                        "[AgentRuntime] Memory pressure (%s): disabling local "
+                        "extraction, routing to GCP. consecutive=%d",
+                        _thrash, self._triage_pressure_skip_count,
                     )
-                    # Drift guard: auto-disable extraction after 5 consecutive blocks
-                    if self._triage_pressure_skip_count >= 5:
-                        os.environ.setdefault('EMAIL_TRIAGE_EXTRACTION_ENABLED', 'false')
-                        logger.warning(
-                            "[AgentRuntime] Drift guard: extraction auto-disabled after %d "
-                            "consecutive memory pressure blocks",
+                else:
+                    if self._triage_pressure_skip_count > 0:
+                        # Pressure resolved — re-enable local extraction
+                        os.environ.pop('EMAIL_TRIAGE_EXTRACTION_ENABLED', None)
+                        logger.info(
+                            "[AgentRuntime] Memory pressure resolved after %d cycles",
                             self._triage_pressure_skip_count,
                         )
-                    return
-                else:
                     self._triage_pressure_skip_count = 0
         except Exception:
             pass  # Gate import failure = proceed (fail-open on gate itself)
@@ -2902,7 +2898,8 @@ class UnifiedAgentRuntime:
                     logger.info(
                         "[AgentRuntime] Email triage: %d fetched, %d/%d admitted, "
                         "tiers=%s, notifications=%d, errors=%d, committed=%s, "
-                        "fencing_token=%d, p95=%.0fms, budget=%.0fs, timeout=%.0fs",
+                        "fencing_token=%d, p95=%.0fms, budget=%.0fs, timeout=%.0fs, "
+                        "health=%s",
                         report.emails_fetched,
                         report.emails_processed,
                         getattr(report, "admitted_count", report.emails_processed),
@@ -2914,6 +2911,8 @@ class UnifiedAgentRuntime:
                         getattr(report, "extraction_p95_ms", 0.0),
                         getattr(report, "budget_computed_s", 0.0),
                         timeout,
+                        "OK" if getattr(report, "health_healthy", True) else
+                        getattr(report, "health_recommendation", "DEGRADED"),
                     )
         except asyncio.TimeoutError:
             logger.warning("[AgentRuntime] Email triage cycle timed out")

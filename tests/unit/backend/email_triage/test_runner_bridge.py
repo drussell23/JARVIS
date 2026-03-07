@@ -264,3 +264,62 @@ class TestLedgerIntegration:
         label_mock.assert_not_called()
         assert any("ledger_reserve" in e for e in report.errors)
         await ledger.stop()
+
+
+class TestLedgerNoneFailClosed:
+    @pytest.mark.asyncio
+    async def test_no_ledger_with_persistence_enabled_blocks_actions(self):
+        """When persistence is enabled but ledger is None (init failed),
+        actions must be blocked (fail-closed)."""
+        config = TriageConfig(enabled=True, max_emails_per_cycle=1,
+                              state_persistence_enabled=True)
+        runner = _make_runner(config)
+        # Ledger is None by default in _make_runner
+        assert runner._commit_ledger is None
+
+        mock_ws = runner._resolver.get("workspace_agent")
+        mock_ws._fetch_unread_emails = AsyncMock(return_value={
+            "emails": [
+                {"id": "msg-1", "from": "a@test.com", "subject": "Test", "snippet": "hi", "labelIds": []},
+            ]
+        })
+
+        label_mock = AsyncMock()
+        with patch("autonomy.email_triage.runner.extract_features") as mock_extract:
+            mock_extract.return_value = _fake_features("msg-1")
+            with patch("autonomy.email_triage.runner.score_email") as mock_score:
+                mock_score.return_value = _fake_scoring()
+                with patch.object(runner, "_apply_label", label_mock):
+                    report = await runner.run_cycle()
+
+        # Action blocked — label never called
+        label_mock.assert_not_called()
+        assert any("no_ledger" in e for e in report.errors)
+
+    @pytest.mark.asyncio
+    async def test_no_ledger_with_persistence_disabled_allows_actions(self):
+        """When persistence is explicitly disabled, actions proceed
+        without a ledger (user opted out)."""
+        config = TriageConfig(enabled=True, max_emails_per_cycle=1,
+                              state_persistence_enabled=False)
+        runner = _make_runner(config)
+        assert runner._commit_ledger is None
+
+        mock_ws = runner._resolver.get("workspace_agent")
+        mock_ws._fetch_unread_emails = AsyncMock(return_value={
+            "emails": [
+                {"id": "msg-1", "from": "a@test.com", "subject": "Test", "snippet": "hi", "labelIds": []},
+            ]
+        })
+
+        label_mock = AsyncMock()
+        with patch("autonomy.email_triage.runner.extract_features") as mock_extract:
+            mock_extract.return_value = _fake_features("msg-1")
+            with patch("autonomy.email_triage.runner.score_email") as mock_score:
+                mock_score.return_value = _fake_scoring()
+                with patch.object(runner, "_apply_label", label_mock):
+                    report = await runner.run_cycle()
+
+        # Action allowed — label was called
+        label_mock.assert_called_once()
+        assert not any("no_ledger" in e for e in report.errors)
