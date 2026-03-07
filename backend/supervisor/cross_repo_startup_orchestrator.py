@@ -25058,11 +25058,20 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
     checks["body_journal"] = body_has_journal
 
     # Prime health probe (skip if disabled)
+    # v302.0: Resolve actual Prime endpoint.  When Invincible Node (GCP VM)
+    # is active, JARVIS_PRIME_URL points at the remote VM — NOT localhost.
+    # Using localhost unconditionally caused permanent prime_reachable=False
+    # → autonomy_contracts stuck at "degraded".
     prime_schema = None
     if _prime_enabled:
         checks["prime_reachable"] = False
         try:
-            url = f"http://localhost:{config.jarvis_prime_default_port}/health"
+            _prime_base = (
+                os.environ.get("JARVIS_PRIME_URL", "").strip().rstrip("/")
+                or os.environ.get("GCP_PRIME_ENDPOINT", "").strip().rstrip("/")
+                or f"http://localhost:{config.jarvis_prime_default_port}"
+            )
+            url = f"{_prime_base}/health"
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     url, timeout=aiohttp.ClientTimeout(total=5.0)
@@ -25098,6 +25107,20 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
         checks["reactor_reachable"] = True  # disabled → vacuously reachable
         reactor_schema = body_schema  # match body schema → compatible
     checks["reactor_schema"] = reactor_schema
+
+    # v302.0: If a service is reachable but doesn't expose
+    # autonomy_schema_version, assume it predates the field and is
+    # compatible with body_schema.  This prevents a permanent "pending_schema"
+    # when GCP Prime (or any legacy service) is healthy and serving but
+    # was deployed before autonomy_schema_version was added to /health.
+    if prime_schema is None and checks.get("prime_reachable"):
+        prime_schema = body_schema
+        checks["prime_schema"] = prime_schema
+        checks["prime_schema_assumed"] = True
+    if reactor_schema is None and checks.get("reactor_reachable"):
+        reactor_schema = body_schema
+        checks["reactor_schema"] = reactor_schema
+        checks["reactor_schema_assumed"] = True
 
     # Compatibility matrix evaluation
     compat = AUTONOMY_SCHEMA_COMPATIBILITY.get(body_schema, {})
