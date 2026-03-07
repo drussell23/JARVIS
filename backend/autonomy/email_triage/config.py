@@ -75,6 +75,10 @@ class TriageConfig:
     # Runner
     poll_interval_s: float = 60.0
     max_emails_per_cycle: int = 25
+    # v286.0: Base cycle timeout. When JARVIS_STARTUP_MEMORY_MODE is
+    # cloud_first/cloud_only, GCP inference round-trips are 11-14s per
+    # email. 30s was impossibly tight for 25 emails even at concurrency 5.
+    # The from_env() factory auto-expands this based on startup mode.
     cycle_timeout_s: float = 30.0
 
     # C2: Throughput hardening
@@ -122,6 +126,17 @@ class TriageConfig:
     @classmethod
     def from_env(cls) -> TriageConfig:
         """Build config from environment variables."""
+        # v286.0: Mode-aware cycle timeout. When GCP handles inference
+        # (cloud_first/cloud_only), round-trip latency is 11-14s per email.
+        # 30s is impossibly tight for 25 emails. Auto-expand to 120s and
+        # increase concurrency to 5 in cloud mode.
+        _startup_mode = os.environ.get(
+            "JARVIS_STARTUP_MEMORY_MODE", "local_full",
+        ).strip().lower()
+        _is_cloud_mode = _startup_mode in ("cloud_first", "cloud_only")
+        _default_timeout = 120.0 if _is_cloud_mode else 30.0
+        _default_concurrency = 5 if _is_cloud_mode else 3
+
         return cls(
             enabled=_env_bool("EMAIL_TRIAGE_ENABLED", False),
             notify_tier1=_env_bool("EMAIL_TRIAGE_NOTIFY_TIER1", True),
@@ -138,9 +153,9 @@ class TriageConfig:
             summary_interval_s=_env_int("EMAIL_TRIAGE_SUMMARY_INTERVAL_S", 1800),
             poll_interval_s=_env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0),
             max_emails_per_cycle=_env_int("EMAIL_TRIAGE_MAX_PER_CYCLE", 25),
-            cycle_timeout_s=_env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0),
+            cycle_timeout_s=_env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", _default_timeout),
             # C2: Throughput hardening
-            extraction_concurrency=_env_int("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY", 3),
+            extraction_concurrency=_env_int("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY", _default_concurrency),
             extraction_per_email_timeout_s=_env_float("EMAIL_TRIAGE_EXTRACTION_TIMEOUT_S", 20.0),
             extraction_fixed_overhead_s=_env_float("EMAIL_TRIAGE_FIXED_OVERHEAD_S", 10.0),
             adaptive_admission=_env_bool("EMAIL_TRIAGE_ADAPTIVE_ADMISSION", True),

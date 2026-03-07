@@ -831,6 +831,24 @@ class TelemetryEmitter:
                             if resp.status == 200:
                                 sent = True
                                 break
+                            elif resp.status == 404:
+                                # v286.0: Reactor-Core not running or endpoint
+                                # not registered. Log once at WARNING, then
+                                # DEBUG. Trip circuit breaker to stop retrying.
+                                if not getattr(self, '_reactor_404_logged', False):
+                                    logger.warning(
+                                        "[Telemetry] Reactor-Core endpoint not found (404) — "
+                                        "is Reactor-Core running? Suppressing further 404 warnings."
+                                    )
+                                    self._reactor_404_logged = True
+                                else:
+                                    logger.debug("[Telemetry] Reactor-Core 404 (suppressed)")
+                                await self._circuit.record_failure()
+                                return EmissionResult(
+                                    success=False,
+                                    events_failed=len(events),
+                                    error="Reactor-Core endpoint not found (404)",
+                                )
                             else:
                                 text = await resp.text()
                                 logger.warning(f"[Telemetry] Reactor-Core returned {resp.status}: {text[:200]}")
@@ -839,6 +857,19 @@ class TelemetryEmitter:
                         if resp.status_code == 200:
                             sent = True
                             break
+                        elif resp.status_code == 404:
+                            if not getattr(self, '_reactor_404_logged', False):
+                                logger.warning(
+                                    "[Telemetry] Reactor-Core endpoint not found (404) — "
+                                    "is Reactor-Core running? Suppressing further 404 warnings."
+                                )
+                                self._reactor_404_logged = True
+                            await self._circuit.record_failure()
+                            return EmissionResult(
+                                success=False,
+                                events_failed=len(events),
+                                error="Reactor-Core endpoint not found (404)",
+                            )
                         else:
                             logger.warning(f"[Telemetry] Reactor-Core returned {resp.status_code}")
                 except Exception as e:
