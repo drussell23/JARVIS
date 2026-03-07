@@ -72591,6 +72591,7 @@ class JarvisSystemKernel:
                             port=_port,
                             timeout=_timeout,
                             progress_callback=_proactive_progress_cb,
+                            activity_callback=lambda: self._mark_startup_activity("gcp_verification"),
                         )
 
                         if success and ip:
@@ -76435,6 +76436,7 @@ class JarvisSystemKernel:
                                 port=self.config.invincible_node_port,
                                 timeout=self.config.invincible_node_health_timeout,
                                 progress_callback=_gcp_progress_callback,  # v220.1: Real-time updates
+                                activity_callback=lambda: self._mark_startup_activity("gcp_verification"),
                             )
                             
                             if success:
@@ -78894,6 +78896,7 @@ class JarvisSystemKernel:
             return True
 
         self._update_component_status("two_tier_security", "running", "Initializing integration components...")
+        self._mark_startup_activity("two_tier_init", stage="two_tier")
         await self._broadcast_progress(55, "integration_init", "Initializing integration components...")
 
         with self.logger.section_start(LogSection.BOOT, "Zone 4.5 | Integration Components"):
@@ -79099,6 +79102,9 @@ class JarvisSystemKernel:
                             # Only write if actually advancing
                             if _micro_progress > _current:
                                 self._current_startup_progress = _micro_progress
+                            # v291.0: Register activity so ProgressController knows
+                            # Two-Tier is alive even after progress value caps at 59.
+                            self._mark_startup_activity("two_tier_gather_heartbeat", stage="two_tier")
 
                 _heartbeat_task = create_safe_task(
                     _progress_heartbeat(),

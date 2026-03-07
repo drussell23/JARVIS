@@ -8058,6 +8058,7 @@ class GCPVMManager:
         port: Optional[int] = None,
         timeout: Optional[float] = None,
         progress_callback: Optional[Callable[[int, str, str], None]] = None,
+        activity_callback: Optional[Callable[[], None]] = None,
     ) -> Tuple[bool, Optional[str], str]:
         """
         Ensure the static/persistent VM (Invincible Node) is ready for requests.
@@ -8304,7 +8305,8 @@ class GCPVMManager:
         try:
             poll_success, final_status = await self._poll_health_until_ready(
                 static_ip, target_port, max_timeout, poll_interval,
-                progress_callback=progress_callback  # v220.1: Pass through for real-time updates
+                progress_callback=progress_callback,  # v220.1: Pass through for real-time updates
+                activity_callback=activity_callback,  # v291.0: Unconditional activity heartbeat
             )
         finally:
             # v235.0: Clear startup grace (both success and failure paths)
@@ -9884,11 +9886,13 @@ fi
     async def _poll_health_until_ready(
         self, ip: str, port: int, timeout: float, poll_interval: float,
         progress_callback: Optional[Callable[[int, str, str], None]] = None,
+        activity_callback: Optional[Callable[[], None]] = None,
     ) -> Tuple[bool, str]:
         """
         Poll the health endpoint until the VM reports ready_for_inference=true.
-        
+
         v220.1: Added progress_callback for real-time dashboard updates.
+        v291.0: Added activity_callback for unconditional activity registration.
 
         Args:
             ip: IP address to poll
@@ -9896,6 +9900,7 @@ fi
             timeout: Max timeout in seconds
             poll_interval: Seconds between polls
             progress_callback: Optional callback(progress_pct, phase, detail) for real-time updates
+            activity_callback: Optional callback() called every poll iteration regardless of APARS data
 
         Returns:
             Tuple of (success: bool, final_status: str)
@@ -10245,6 +10250,16 @@ fi
                     progress_callback(progress_pct, phase_name, detail)
                 except Exception:
                     pass  # Don't let callback errors break polling
+
+            # v291.0: Unconditional activity registration — fires every poll
+            # iteration regardless of APARS data availability. Without this,
+            # GCP polling is invisible to ProgressController when VM is
+            # unreachable or sends non-APARS responses, causing false stalls.
+            if activity_callback:
+                try:
+                    activity_callback()
+                except Exception:
+                    pass
 
             await asyncio.sleep(poll_interval)
 
