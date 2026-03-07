@@ -402,24 +402,27 @@ class TestVerdictAuthorityWiring:
         assert epoch == 1
         assert va.current_epoch == 1
 
-    @pytest.mark.asyncio
-    async def test_submit_and_read(self):
+    def test_submit_and_read(self):
         """Submit a verdict and verify it can be read back."""
         from backend.core.verdict_authority import VerdictAuthority
-        va = VerdictAuthority()
-        va.begin_epoch()
-        mgr = _make_manager("TestSubmit")
-        verdict = mgr._build_verdict(
-            state=SubsystemState.READY,
-            reason_code=VerdictReasonCode.HEALTHY,
-            reason_detail="ok",
-            boot_allowed=True,
-            serviceable=True,
-        )
-        accepted = await va.submit_verdict("test", verdict)
-        assert accepted is True
-        stored = va.get_component_status("test")
-        assert stored is verdict
+
+        async def _run():
+            va = VerdictAuthority()
+            va.begin_epoch()
+            mgr = _make_manager("TestSubmit")
+            verdict = mgr._build_verdict(
+                state=SubsystemState.READY,
+                reason_code=VerdictReasonCode.HEALTHY,
+                reason_detail="ok",
+                boot_allowed=True,
+                serviceable=True,
+            )
+            accepted = await va.submit_verdict("test", verdict)
+            assert accepted is True
+            stored = va.get_component_status("test")
+            assert stored is verdict
+
+        asyncio.run(_run())
 
 
 class TestResourceRegistryLastVerdicts:
@@ -437,46 +440,55 @@ class TestResourceRegistryLastVerdicts:
         v1["injected"] = "bad"
         assert registry.get_last_verdicts() == {}
 
-    @pytest.mark.asyncio
-    async def test_parallel_init_stores_verdicts(self):
+    def test_parallel_init_stores_verdicts(self):
         """Parallel initialization stores ResourceVerdict objects."""
         from unified_supervisor import ResourceManagerRegistry
-        registry = ResourceManagerRegistry()
-        mgr = _make_manager("ParVerdictMgr")
-        registry.register(mgr)
-        results = await registry.initialize_all(parallel=True)
-        assert "parverdictmgr" in results
-        verdicts = registry.get_last_verdicts()
-        assert len(verdicts) >= 1
-        v = verdicts["parverdictmgr"]
-        assert hasattr(v, 'serviceable')
-        assert isinstance(v, ResourceVerdict)
 
-    @pytest.mark.asyncio
-    async def test_sequential_init_stores_verdicts(self):
+        async def _run():
+            registry = ResourceManagerRegistry()
+            mgr = _make_manager("ParVerdictMgr")
+            registry.register(mgr)
+            results = await registry.initialize_all(parallel=True)
+            assert "parverdictmgr" in results
+            verdicts = registry.get_last_verdicts()
+            assert len(verdicts) >= 1
+            v = verdicts["parverdictmgr"]
+            assert hasattr(v, 'serviceable')
+            assert isinstance(v, ResourceVerdict)
+
+        asyncio.run(_run())
+
+    def test_sequential_init_stores_verdicts(self):
         """Sequential initialization stores ResourceVerdict objects."""
         from unified_supervisor import ResourceManagerRegistry
-        registry = ResourceManagerRegistry()
-        mgr = _make_manager("SeqVerdictMgr")
-        registry.register(mgr)
-        results = await registry.initialize_all(parallel=False)
-        assert "seqverdictmgr" in results
-        verdicts = registry.get_last_verdicts()
-        assert len(verdicts) >= 1
-        v = verdicts["seqverdictmgr"]
-        assert isinstance(v, ResourceVerdict)
-        assert v.state is SubsystemState.READY
 
-    @pytest.mark.asyncio
-    async def test_failed_init_stores_verdict(self):
+        async def _run():
+            registry = ResourceManagerRegistry()
+            mgr = _make_manager("SeqVerdictMgr")
+            registry.register(mgr)
+            results = await registry.initialize_all(parallel=False)
+            assert "seqverdictmgr" in results
+            verdicts = registry.get_last_verdicts()
+            assert len(verdicts) >= 1
+            v = verdicts["seqverdictmgr"]
+            assert isinstance(v, ResourceVerdict)
+            assert v.state is SubsystemState.READY
+
+        asyncio.run(_run())
+
+    def test_failed_init_stores_verdict(self):
         """Failed initialization stores verdict with serviceable=False."""
         from unified_supervisor import ResourceManagerRegistry
-        registry = ResourceManagerRegistry()
-        mgr = _make_manager("FailVerdictMgr", init_return=False)
-        registry.register(mgr)
-        await registry.initialize_all(parallel=False)
-        verdicts = registry.get_last_verdicts()
-        assert len(verdicts) >= 1
-        v = verdicts["failverdictmgr"]
-        assert isinstance(v, ResourceVerdict)
-        assert v.serviceable is False
+
+        async def _run():
+            registry = ResourceManagerRegistry()
+            mgr = _make_manager("FailVerdictMgr", init_return=False)
+            registry.register(mgr)
+            await registry.initialize_all(parallel=False)
+            verdicts = registry.get_last_verdicts()
+            assert len(verdicts) >= 1
+            v = verdicts["failverdictmgr"]
+            assert isinstance(v, ResourceVerdict)
+            assert v.serviceable is False
+
+        asyncio.run(_run())
