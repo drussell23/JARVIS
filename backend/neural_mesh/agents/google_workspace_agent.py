@@ -3128,6 +3128,35 @@ class GoogleWorkspaceClient:
             "total_unread": results.get('resultSizeEstimate', 0),
         }
 
+    def _get_message_labels_sync(self, message_id: str) -> Set[str]:
+        """Synchronous Gmail API call to get label IDs for a single message.
+
+        Uses format='minimal' for smallest possible response payload —
+        only returns id, threadId, and labelIds.
+        """
+        msg = self._gmail_service.users().messages().get(
+            userId='me',
+            id=message_id,
+            format='minimal',
+        ).execute()
+        return set(msg.get('labelIds', []))
+
+    async def get_message_labels(self, message_id: str) -> Set[str]:
+        """Get current label IDs for a Gmail message.
+
+        Routes through _execute_with_retry for circuit breaker + auth refresh.
+        Returns empty set on any error (fail-open for outcome detection).
+        """
+        try:
+            return await self._execute_with_retry(
+                lambda: self._get_message_labels_sync(message_id),
+                api_name="gmail",
+                timeout=10.0,
+            )
+        except Exception as e:
+            logger.debug("[Gmail] get_message_labels(%s) failed: %s", message_id, e)
+            return set()
+
     async def search_emails(
         self,
         query: str,
