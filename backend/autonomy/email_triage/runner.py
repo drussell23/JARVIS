@@ -502,11 +502,30 @@ class EmailTriageRunner:
         # Outcome collection for prior cycle (WS5)
         if self._outcome_collector and self._prior_triaged:
             try:
-                await self._outcome_collector.check_outcomes_for_cycle(
+                captured = await self._outcome_collector.check_outcomes_for_cycle(
                     workspace_agent, self._prior_triaged,
                 )
             except Exception as e:
                 logger.debug("Outcome collection failed: %s", e)
+                captured = []
+
+            # Post-commit notification: outcomes already durably enqueued
+            if captured:
+                from autonomy.email_triage.notifications import build_training_capture_message
+                msg = build_training_capture_message(captured)
+                if msg:
+                    notifier = self._resolver.get("notifier")
+                    if notifier:
+                        try:
+                            from autonomy.email_triage.notifications import _invoke_notifier
+                            await _invoke_notifier(
+                                notifier,
+                                message=msg,
+                                urgency=1,  # LOW
+                                title="Training Data Captured",
+                            )
+                        except Exception as e:
+                            logger.debug("Training notification failed: %s", e)
 
         # Compute adaptive weights for this cycle (WS5)
         adaptive_weights = None
