@@ -23,7 +23,7 @@ all queued messages.
 from __future__ import annotations
 
 import logging
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Dict, List
 
 from backend.core.ouroboros.governance.comm_protocol import CommMessage
 

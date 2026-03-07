@@ -1,8 +1,7 @@
 """Tests for the TUI transport layer."""
 
-import asyncio
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from backend.core.ouroboros.governance.tui_transport import (
     TUITransport,
