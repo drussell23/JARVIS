@@ -984,18 +984,23 @@ class ExperienceQueueProcessor:
 
 _queue_instance: Optional[ExperienceDataQueue] = None
 _processor_instance: Optional[ExperienceQueueProcessor] = None
-_instance_lock: Optional[asyncio.Lock] = None  # v90.0: Lazy lock initialization
+# v286.0: Separate locks for queue and processor to prevent deadlock.
+# Previously both used a shared _instance_lock. get_experience_processor()
+# acquired the lock then called get_experience_queue() which tried to
+# acquire the SAME lock — asyncio.Lock is not re-entrant, so this
+# deadlocked every time both singletons were uninitialized.
+_queue_lock: Optional[asyncio.Lock] = None
+_processor_lock: Optional[asyncio.Lock] = None
 
 
 async def get_experience_queue() -> ExperienceDataQueue:
     """Get the singleton experience queue."""
-    global _queue_instance, _instance_lock
+    global _queue_instance, _queue_lock
 
-    # v90.0: Lazy lock creation to avoid "no event loop" errors at module load
-    if _instance_lock is None:
-        _instance_lock = asyncio.Lock()
+    if _queue_lock is None:
+        _queue_lock = asyncio.Lock()
 
-    async with _instance_lock:
+    async with _queue_lock:
         if _queue_instance is None:
             _queue_instance = ExperienceDataQueue()
             await _queue_instance.initialize()
@@ -1006,15 +1011,17 @@ async def get_experience_processor(
     reactor_client: Optional[Any] = None,
 ) -> ExperienceQueueProcessor:
     """Get the singleton experience processor."""
-    global _processor_instance, _instance_lock
+    global _processor_instance, _processor_lock
 
-    # v90.0: Lazy lock creation to avoid "no event loop" errors at module load
-    if _instance_lock is None:
-        _instance_lock = asyncio.Lock()
+    if _processor_lock is None:
+        _processor_lock = asyncio.Lock()
 
-    async with _instance_lock:
+    # v286.0: Resolve queue OUTSIDE the processor lock to avoid deadlock.
+    # get_experience_queue() has its own lock (_queue_lock).
+    queue = await get_experience_queue()
+
+    async with _processor_lock:
         if _processor_instance is None:
-            queue = await get_experience_queue()
             _processor_instance = ExperienceQueueProcessor(
                 queue=queue,
                 reactor_client=reactor_client,
