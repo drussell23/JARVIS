@@ -2838,7 +2838,26 @@ class UnifiedAgentRuntime:
                 warmup_budget = _env_float("EMAIL_TRIAGE_WARMUP_TIMEOUT_S", 45.0)
                 await asyncio.wait_for(runner.warm_up(), timeout=warmup_budget)
 
-            timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
+            # C2: Compute cycle timeout from latency invariant.
+            # If the runner has observed extraction latency, use it to
+            # compute a budget that can actually accommodate the workload.
+            # Floor at the configured timeout so we never shrink below it.
+            base_timeout = _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0)
+            try:
+                p95_ema = float(getattr(runner, '_extraction_p95_ema_ms', 0.0) or 0.0)
+            except (TypeError, ValueError):
+                p95_ema = 0.0
+            if p95_ema > 0:
+                from autonomy.email_triage.config import get_triage_config
+                _tc = get_triage_config()
+                concurrency = max(1, _tc.extraction_concurrency)
+                max_emails = _tc.max_emails_per_cycle
+                overhead = _tc.extraction_fixed_overhead_s
+                import math as _math
+                computed = _math.ceil(max_emails / concurrency) * (p95_ema / 1000.0) + overhead
+                timeout = max(base_timeout, computed)
+            else:
+                timeout = base_timeout
             lock_ttl = timeout + 10.0
 
             lock_manager = await get_lock_manager()
@@ -2881,16 +2900,20 @@ class UnifiedAgentRuntime:
                     report = await asyncio.wait_for(runner.run_cycle(deadline=_deadline), timeout=timeout)
                 if report and not report.skipped:
                     logger.info(
-                        "[AgentRuntime] Email triage: %d fetched, %d processed, "
+                        "[AgentRuntime] Email triage: %d fetched, %d/%d admitted, "
                         "tiers=%s, notifications=%d, errors=%d, committed=%s, "
-                        "fencing_token=%d",
+                        "fencing_token=%d, p95=%.0fms, budget=%.0fs, timeout=%.0fs",
                         report.emails_fetched,
                         report.emails_processed,
+                        getattr(report, "admitted_count", report.emails_processed),
                         report.tier_counts,
                         report.notifications_sent,
                         len(report.errors),
                         report.snapshot_committed,
                         fencing_token,
+                        getattr(report, "extraction_p95_ms", 0.0),
+                        getattr(report, "budget_computed_s", 0.0),
+                        timeout,
                     )
         except asyncio.TimeoutError:
             logger.warning("[AgentRuntime] Email triage cycle timed out")

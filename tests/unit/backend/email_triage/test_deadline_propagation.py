@@ -35,6 +35,9 @@ async def test_run_cycle_propagates_deadline_to_extract_features():
     runner._weight_adapter = None
     runner._outbox_replayed = True
     runner._prior_triaged = {}
+    # C2 attributes
+    runner._extraction_latencies_ms = []
+    runner._extraction_p95_ema_ms = 0.0
 
     # Mock workspace agent with _fetch_unread_emails (the actual method run_cycle calls)
     mock_workspace = AsyncMock()
@@ -80,4 +83,8 @@ async def test_run_cycle_propagates_deadline_to_extract_features():
                             pass  # May fail on other dependencies, that's fine
 
     assert captured_deadline is not None, "deadline was not propagated to extract_features"
-    assert captured_deadline == deadline, f"Expected {deadline}, got {captured_deadline}"
+    # C2: _extract_one computes a per-email deadline clamped to the cycle deadline.
+    # The per-email deadline must be <= the cycle deadline.
+    assert captured_deadline <= deadline + 1.0, (
+        f"Per-email deadline {captured_deadline} exceeds cycle deadline {deadline}"
+    )

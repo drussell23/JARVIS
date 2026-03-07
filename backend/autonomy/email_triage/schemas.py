@@ -103,3 +103,9 @@ class TriageCycleReport:
     degraded: bool = False
     degraded_reason: Optional[str] = None
     snapshot_committed: bool = True
+
+    # C2: Stage-level latency histograms
+    stage_latencies_ms: Optional[Dict[str, float]] = None  # fetch, extract, score, label, notify
+    extraction_p95_ms: float = 0.0
+    admitted_count: int = 0  # emails admitted after adaptive gate
+    budget_computed_s: float = 0.0  # computed required timeout

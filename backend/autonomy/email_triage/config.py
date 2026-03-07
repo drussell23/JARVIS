@@ -77,6 +77,13 @@ class TriageConfig:
     max_emails_per_cycle: int = 25
     cycle_timeout_s: float = 30.0
 
+    # C2: Throughput hardening
+    extraction_concurrency: int = 3  # parallel extraction tasks
+    extraction_per_email_timeout_s: float = 20.0  # per-email deadline
+    extraction_fixed_overhead_s: float = 10.0  # fetch + label + notify budget
+    adaptive_admission: bool = True  # auto-shrink batch to fit budget
+    latency_ema_alpha: float = 0.3  # EMA smoothing for p95 tracking
+
     # Dependency resolution
     dep_backoff_base_s: float = 5.0
     dep_backoff_max_s: float = 300.0
@@ -129,6 +136,12 @@ class TriageConfig:
             poll_interval_s=_env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0),
             max_emails_per_cycle=_env_int("EMAIL_TRIAGE_MAX_PER_CYCLE", 25),
             cycle_timeout_s=_env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0),
+            # C2: Throughput hardening
+            extraction_concurrency=_env_int("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY", 3),
+            extraction_per_email_timeout_s=_env_float("EMAIL_TRIAGE_EXTRACTION_TIMEOUT_S", 20.0),
+            extraction_fixed_overhead_s=_env_float("EMAIL_TRIAGE_FIXED_OVERHEAD_S", 10.0),
+            adaptive_admission=_env_bool("EMAIL_TRIAGE_ADAPTIVE_ADMISSION", True),
+            latency_ema_alpha=_env_float("EMAIL_TRIAGE_LATENCY_EMA_ALPHA", 0.3),
             dep_backoff_base_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_BASE_S", 5.0),
             dep_backoff_max_s=_env_float("EMAIL_TRIAGE_DEP_BACKOFF_MAX_S", 300.0),
             staleness_window_s=_env_float("EMAIL_TRIAGE_STALENESS_WINDOW_S", 120.0),

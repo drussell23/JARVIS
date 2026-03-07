@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import replace
-from typing import Any, ClassVar, Dict, List, Optional
+from typing import Any, ClassVar, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from autonomy.email_triage.config import TriageConfig, get_triage_config
@@ -85,6 +86,9 @@ class EmailTriageRunner:
         self._prior_triaged: Dict[str, TriagedEmail] = {}
         # v283.0: Warm-up tracking
         self._warmed_up = False
+        # C2: Extraction latency tracking for adaptive admission
+        self._extraction_latencies_ms: List[float] = []
+        self._extraction_p95_ema_ms: float = 0.0
         if self._config.outcome_collection_enabled:
             self._outcome_collector = OutcomeCollector(self._config, state_store)
         if self._config.adaptive_scoring_enabled:
@@ -128,6 +132,124 @@ class EmailTriageRunner:
     def set_fencing_token(self, token: int) -> None:
         """Set the current fencing token from the DLM (WS2)."""
         self._current_fencing_token = token
+
+    # ── C2: Throughput hardening ──────────────────────────────
+
+    def _record_extraction_latency(self, latency_ms: float) -> None:
+        """Record a single extraction latency and update the EMA p95 estimate."""
+        self._extraction_latencies_ms.append(latency_ms)
+        # Keep last 100 observations for percentile computation
+        if len(self._extraction_latencies_ms) > 100:
+            self._extraction_latencies_ms = self._extraction_latencies_ms[-100:]
+        # Compute actual p95 from recent observations
+        sorted_lats = sorted(self._extraction_latencies_ms)
+        idx = max(0, int(len(sorted_lats) * 0.95) - 1)
+        observed_p95 = sorted_lats[idx]
+        # EMA smooth to dampen outliers
+        alpha = self._config.latency_ema_alpha
+        if self._extraction_p95_ema_ms <= 0:
+            self._extraction_p95_ema_ms = observed_p95
+        else:
+            self._extraction_p95_ema_ms = alpha * observed_p95 + (1 - alpha) * self._extraction_p95_ema_ms
+
+    def _compute_budget(self, email_count: int) -> Tuple[int, float]:
+        """Compute how many emails fit within the cycle budget.
+
+        Returns (admitted_count, required_timeout_s).
+
+        Formula:
+            required = ceil(admitted / concurrency) * p95_latency + overhead
+
+        If adaptive_admission is enabled and required > cycle_timeout,
+        admitted_count is shrunk to fit.
+        """
+        concurrency = max(1, self._config.extraction_concurrency)
+        overhead = self._config.extraction_fixed_overhead_s
+        # Use observed p95 or per-email timeout as estimate
+        p95_s = (self._extraction_p95_ema_ms / 1000.0) if self._extraction_p95_ema_ms > 0 else self._config.extraction_per_email_timeout_s
+        budget = self._config.cycle_timeout_s
+
+        if not self._config.adaptive_admission:
+            admitted = min(email_count, self._config.max_emails_per_cycle)
+            required = math.ceil(admitted / concurrency) * p95_s + overhead
+            return admitted, required
+
+        # Binary search: largest admitted that fits budget
+        max_admit = min(email_count, self._config.max_emails_per_cycle)
+        for admitted in range(max_admit, 0, -1):
+            required = math.ceil(admitted / concurrency) * p95_s + overhead
+            if required <= budget:
+                return admitted, required
+
+        # Even 1 email doesn't fit — admit 1 anyway but log the overrun
+        required = math.ceil(1 / concurrency) * p95_s + overhead
+        return min(1, email_count), required
+
+    @staticmethod
+    def _urgency_sort_key(email: Dict[str, Any]) -> int:
+        """Sort key for urgent-first extraction ordering.
+
+        Lower value = higher priority (processed first).
+        """
+        subject = (email.get("subject") or "").lower()
+        snippet = (email.get("snippet") or "").lower()
+        labels = email.get("labels") or []
+        text = f"{subject} {snippet}"
+
+        score = 100  # default: low priority
+        if "IMPORTANT" in labels:
+            score -= 20
+        urgent_terms = ("urgent", "critical", "asap", "emergency", "deadline",
+                        "action required", "time-sensitive", "due today")
+        for term in urgent_terms:
+            if term in text:
+                score -= 30
+                break
+        noise_labels = ("CATEGORY_PROMOTIONS", "CATEGORY_SOCIAL", "CATEGORY_FORUMS")
+        if any(nl in labels for nl in noise_labels):
+            score += 30
+        return score
+
+    async def _extract_one(
+        self,
+        email: Dict[str, Any],
+        router: Any,
+        deadline: float,
+        sem: asyncio.Semaphore,
+    ) -> Tuple[Dict[str, Any], Any, float]:
+        """Extract features for one email, bounded by semaphore and per-email timeout.
+
+        Returns (email, features_or_None, latency_ms).
+        """
+        per_email_timeout = self._config.extraction_per_email_timeout_s
+        # Clamp to remaining deadline
+        remaining = max(1.0, deadline - time.monotonic())
+        effective_timeout = min(per_email_timeout, remaining)
+
+        async with sem:
+            start = time.monotonic()
+            try:
+                features = await asyncio.wait_for(
+                    extract_features(
+                        email, router,
+                        deadline=time.monotonic() + effective_timeout,
+                        config=self._config,
+                    ),
+                    timeout=effective_timeout,
+                )
+                latency_ms = (time.monotonic() - start) * 1000
+                return email, features, latency_ms
+            except asyncio.TimeoutError:
+                latency_ms = (time.monotonic() - start) * 1000
+                logger.warning(
+                    "Extraction timeout for %s (%.0fms > %.0fs limit)",
+                    email.get("id", "?"), latency_ms, effective_timeout,
+                )
+                return email, None, latency_ms
+            except Exception as e:
+                latency_ms = (time.monotonic() - start) * 1000
+                logger.warning("Extraction failed for %s: %s", email.get("id", "?"), e)
+                return email, None, latency_ms
 
     async def _ensure_state_store(self) -> None:
         """Lazily initialize and open the state store if persistence is enabled."""
@@ -330,17 +452,61 @@ class EmailTriageRunner:
             self._weight_adapter.advance_shadow_cycle()
             adaptive_weights = self._weight_adapter.get_weights_for_scoring()
 
-        # Process each email
+        # ── C2: Urgent-first ordering ──────────────────────────
+        sorted_emails = sorted(emails, key=self._urgency_sort_key)
+
+        # ── C2: Adaptive admission ─────────────────────────────
+        admitted_count, budget_required_s = self._compute_budget(len(sorted_emails))
+        admitted_emails = sorted_emails[:admitted_count]
+        if len(sorted_emails) > admitted_count:
+            logger.info(
+                "Adaptive admission: %d/%d emails admitted (p95=%.0fms, budget=%.0fs, required=%.0fs)",
+                admitted_count, len(sorted_emails),
+                self._extraction_p95_ema_ms, self._config.cycle_timeout_s, budget_required_s,
+            )
+
+        # ── C2: Concurrent extraction with bounded concurrency ─
+        stage_start = time.monotonic()
+        router = self._resolver.get("router")
+        sem = asyncio.Semaphore(max(1, self._config.extraction_concurrency))
+        extraction_deadline = deadline or (time.monotonic() + self._config.cycle_timeout_s)
+
+        extraction_tasks = [
+            self._extract_one(email, router, extraction_deadline, sem)
+            for email in admitted_emails
+        ]
+        extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+        extract_elapsed_ms = (time.monotonic() - stage_start) * 1000
+
+        # Record per-email latencies for adaptive admission
+        extraction_latencies: List[float] = []
+        for result in extraction_results:
+            if isinstance(result, tuple) and len(result) == 3:
+                _, _, lat_ms = result
+                if lat_ms > 0:
+                    extraction_latencies.append(lat_ms)
+                    self._record_extraction_latency(lat_ms)
+
+        # ── Process extraction results: score, label, notify ───
+        stage_score_start = time.monotonic()
         new_triaged: Dict[str, TriagedEmail] = {}
         immediate_emails: List[TriagedEmail] = []
-        for email in emails[: self._config.max_emails_per_cycle]:
-            try:
-                # Extract features
-                features = await extract_features(
-                    email, self._resolver.get("router"),
-                    deadline=deadline, config=self._config,
-                )
 
+        for result in extraction_results:
+            if isinstance(result, BaseException):
+                errors.append(f"extract_gather: {result}")
+                emails_processed += 1
+                continue
+
+            email, features, _lat_ms = result
+
+            if features is None:
+                # Extraction failed/timed out — use heuristic fallback
+                from autonomy.email_triage.extraction import _heuristic_features
+                features = _heuristic_features(email)
+                errors.append(f"extract_fallback:{email.get('id', '?')}")
+
+            try:
                 # Get sender reputation bonus (WS5)
                 rep_bonus = 0.0
                 if self._weight_adapter and self._state_store:
@@ -400,13 +566,15 @@ class EmailTriageRunner:
 
             except Exception as e:
                 errors.append(f"process:{email.get('id', '?')}: {e}")
-                emails_processed += 1  # Count as processed (attempted)
+                emails_processed += 1
                 emit_triage_event(EVENT_TRIAGE_ERROR, {
                     "cycle_id": cycle_id,
                     "error_type": "process_failed",
                     "message_id": email.get("id", ""),
                     "message": str(e),
                 })
+
+        score_elapsed_ms = (time.monotonic() - stage_score_start) * 1000
 
         # Deliver notifications (side-effect: failure never changes triage outcome)
         notifier = self._resolver.get("notifier")
@@ -470,14 +638,33 @@ class EmailTriageRunner:
                 self._policy.flush_summary()
 
         completed_at = time.time()
+        total_duration_ms = (completed_at - started_at) * 1000
+        fetch_elapsed_ms = (stage_start - started_at) * 1000  # fetch was before extraction
+
+        # C2: Stage-level latency histograms
+        stage_latencies = {
+            "fetch_ms": round(fetch_elapsed_ms, 1),
+            "extract_ms": round(extract_elapsed_ms, 1),
+            "score_label_ms": round(score_elapsed_ms, 1),
+            "total_ms": round(total_duration_ms, 1),
+        }
+        if extraction_latencies:
+            sorted_lats = sorted(extraction_latencies)
+            stage_latencies["extract_p50_ms"] = round(sorted_lats[len(sorted_lats) // 2], 1)
+            stage_latencies["extract_p95_ms"] = round(sorted_lats[max(0, int(len(sorted_lats) * 0.95) - 1)], 1)
+            stage_latencies["extract_max_ms"] = round(sorted_lats[-1], 1)
+
         emit_triage_event(EVENT_CYCLE_COMPLETED, {
             "cycle_id": cycle_id,
-            "duration_ms": int((completed_at - started_at) * 1000),
+            "duration_ms": int(total_duration_ms),
             "emails_fetched": emails_fetched,
             "emails_processed": emails_processed,
+            "admitted": admitted_count,
             "tier_counts": tier_counts,
             "notifications_sent": notifications_sent,
             "errors": len(errors),
+            "stage_latencies": stage_latencies,
+            "extraction_p95_ema_ms": round(self._extraction_p95_ema_ms, 1),
         })
 
         report = TriageCycleReport(
@@ -490,6 +677,10 @@ class EmailTriageRunner:
             notifications_sent=notifications_sent,
             notifications_suppressed=notifications_suppressed,
             errors=errors,
+            stage_latencies_ms=stage_latencies,
+            extraction_p95_ms=self._extraction_p95_ema_ms,
+            admitted_count=admitted_count,
+            budget_computed_s=budget_required_s,
         )
 
         # Commit policy gate — preserve prior snapshot on degraded cycles

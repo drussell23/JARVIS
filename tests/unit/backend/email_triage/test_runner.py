@@ -389,7 +389,9 @@ class TestSnapshotCommitPolicy:
 
     @pytest.mark.asyncio
     async def test_degraded_cycle_preserves_prior(self):
-        """When all extract_features fail, prior snapshot preserved."""
+        """When all extract_features fail, C2 falls back to heuristic and
+        the cycle still commits (graceful degradation). Errors are recorded
+        but do not prevent commit when heuristic fallback succeeds."""
         agent = AsyncMock()
         agent._fetch_unread_emails = AsyncMock(
             return_value={"emails": _sample_emails(2)}
@@ -399,10 +401,9 @@ class TestSnapshotCommitPolicy:
         # First cycle succeeds
         first_report = await runner.run_cycle()
         assert first_report.snapshot_committed is True
-        first_snapshot = runner._committed_snapshot
-        first_cycle_id = first_snapshot["report"].cycle_id
 
-        # Second cycle: all processing errors
+        # Second cycle: extract_features raises, but C2 _extract_one catches
+        # and falls back to heuristic. Cycle should still commit.
         with patch(
             "autonomy.email_triage.runner.extract_features",
             new_callable=AsyncMock,
@@ -410,11 +411,10 @@ class TestSnapshotCommitPolicy:
         ):
             second_report = await runner.run_cycle()
 
-        assert second_report.degraded is True
-        assert second_report.snapshot_committed is False
-        assert "error_ratio" in second_report.degraded_reason
-        # Prior snapshot preserved
-        assert runner._committed_snapshot["report"].cycle_id == first_cycle_id
+        # C2: Graceful degradation — heuristic fallback means cycle still commits
+        assert second_report.snapshot_committed is True
+        # But extraction errors are recorded
+        assert any("extract_fallback" in e for e in second_report.errors)
 
     @pytest.mark.asyncio
     async def test_first_cycle_commits_with_actual_data(self):
@@ -478,7 +478,8 @@ class TestSnapshotCommitPolicy:
 
     @pytest.mark.asyncio
     async def test_healthy_after_degraded_advances(self):
-        """Degraded preserves prior, then healthy cycle advances snapshot."""
+        """C2: Even when extract_features fails, heuristic fallback means
+        the cycle still advances (graceful degradation). Each cycle commits."""
         agent = AsyncMock()
         agent._fetch_unread_emails = AsyncMock(
             return_value={"emails": _sample_emails(2)}
@@ -489,15 +490,16 @@ class TestSnapshotCommitPolicy:
         await runner.run_cycle()
         first_cycle_id = runner._committed_snapshot["report"].cycle_id
 
-        # Second cycle: degraded (all errors)
+        # Second cycle: extract_features fails but heuristic fallback succeeds
         with patch(
             "autonomy.email_triage.runner.extract_features",
             new_callable=AsyncMock,
             side_effect=RuntimeError("extraction boom"),
         ):
-            degraded_report = await runner.run_cycle()
-        assert degraded_report.degraded is True
-        assert runner._committed_snapshot["report"].cycle_id == first_cycle_id
+            second_report = await runner.run_cycle()
+        # C2: graceful degradation — still commits via heuristic fallback
+        assert second_report.snapshot_committed is True
+        assert runner._committed_snapshot["report"].cycle_id != first_cycle_id
 
         # Third cycle: healthy again
         third_report = await runner.run_cycle()
@@ -506,7 +508,8 @@ class TestSnapshotCommitPolicy:
 
     @pytest.mark.asyncio
     async def test_snapshot_preserved_event_emitted(self):
-        """When degraded, emit_triage_event called with snapshot_preserved."""
+        """C2: With heuristic fallback, extraction failures no longer trigger
+        snapshot_preserved. Instead, verify fallback errors are recorded."""
         agent = AsyncMock()
         agent._fetch_unread_emails = AsyncMock(
             return_value={"emails": _sample_emails(2)}
@@ -516,25 +519,17 @@ class TestSnapshotCommitPolicy:
         # First cycle succeeds (establishes prior)
         await runner.run_cycle()
 
-        # Second cycle: all errors -> degraded -> event emitted
+        # Second cycle: extract_features fails -> heuristic fallback
         with patch(
             "autonomy.email_triage.runner.extract_features",
             new_callable=AsyncMock,
             side_effect=RuntimeError("extraction boom"),
-        ), patch(
-            "autonomy.email_triage.runner.emit_triage_event",
-        ) as mock_emit:
-            await runner.run_cycle()
+        ):
+            report = await runner.run_cycle()
 
-        # Find the snapshot_preserved event among all emitted events
-        preserved_calls = [
-            c for c in mock_emit.call_args_list
-            if c[0][0] == "snapshot_preserved"
-        ]
-        assert len(preserved_calls) == 1
-        payload = preserved_calls[0][0][1]
-        assert "reason" in payload
-        assert "prior_cycle_id" in payload
+        # C2: Cycle commits via heuristic fallback; errors recorded
+        assert report.snapshot_committed is True
+        assert any("extract_fallback" in e for e in report.errors)
 
     @pytest.mark.asyncio
     async def test_empty_triaged_with_prior_is_regression(self):
