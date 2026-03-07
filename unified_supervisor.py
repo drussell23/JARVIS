@@ -90575,6 +90575,41 @@ class JarvisSystemKernel:
                                 "reason", "active" if _a_pass else "schema_mismatch"
                             )
 
+                            # v301.0: Bridge per-service reachability to component
+                            # statuses.  The autonomy monitor already probes Prime
+                            # and Reactor health — reuse those results so the
+                            # dashboard reflects actual service state, not stale
+                            # boot-time reconciliation.
+                            for _svc_key, _reach_key in (
+                                ("jarvis_prime", "prime_reachable"),
+                                ("reactor_core", "reactor_reachable"),
+                            ):
+                                _svc_status = (
+                                    self._component_status.get(_svc_key, {})
+                                    .get("status", "pending")
+                                )
+                                _svc_enabled = _a_checks.get(
+                                    f"{_reach_key.split('_')[0]}_enabled", True,
+                                )
+                                if _a_checks.get(_reach_key) and _svc_status in (
+                                    "degraded", "running", "pending",
+                                ):
+                                    self._update_component_status(
+                                        _svc_key, "complete",
+                                        f"{_svc_key.replace('_', '-')} healthy "
+                                        f"(recovered via runtime monitor)",
+                                    )
+                                elif (
+                                    not _a_checks.get(_reach_key)
+                                    and _svc_enabled
+                                    and _svc_status == "complete"
+                                ):
+                                    self._update_component_status(
+                                        _svc_key, "degraded",
+                                        f"{_svc_key.replace('_', '-')} unreachable "
+                                        f"(runtime health probe failed)",
+                                    )
+
                             if _a_pass and _prev_mode != "active":
                                 self._autonomy_mode = "active"
                                 self._autonomy_reason = "active"

@@ -25018,6 +25018,14 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
     config = OrchestratorConfig()
     checks: Dict[str, Any] = {}
 
+    # v301.0: Service enablement — skip checks for disabled services.
+    # A disabled service is treated as compatible + reachable so it
+    # doesn't block the autonomy gate for services that ARE running.
+    _prime_enabled = config.jarvis_prime_enabled
+    _reactor_enabled = config.reactor_core_enabled
+    checks["prime_enabled"] = _prime_enabled
+    checks["reactor_enabled"] = _reactor_enabled
+
     # Body checks (local — no network)
     body_schema = "1.0"
     checks["body_schema"] = body_schema
@@ -25049,38 +25057,46 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
     checks["body_policy"] = body_has_policy
     checks["body_journal"] = body_has_journal
 
-    # Prime health probe
+    # Prime health probe (skip if disabled)
     prime_schema = None
-    checks["prime_reachable"] = False
-    try:
-        url = f"http://localhost:{config.jarvis_prime_default_port}/health"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=5.0)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    checks["prime_reachable"] = True
-                    prime_schema = data.get("autonomy_schema_version")
-    except Exception:
-        pass
+    if _prime_enabled:
+        checks["prime_reachable"] = False
+        try:
+            url = f"http://localhost:{config.jarvis_prime_default_port}/health"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=5.0)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        checks["prime_reachable"] = True
+                        prime_schema = data.get("autonomy_schema_version")
+        except Exception:
+            pass
+    else:
+        checks["prime_reachable"] = True  # disabled → vacuously reachable
+        prime_schema = body_schema  # match body schema → compatible
     checks["prime_schema"] = prime_schema
 
-    # Reactor health probe
+    # Reactor health probe (skip if disabled)
     reactor_schema = None
-    checks["reactor_reachable"] = False
-    try:
-        url = f"http://localhost:{config.reactor_core_default_port}/health"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url, timeout=aiohttp.ClientTimeout(total=5.0)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    checks["reactor_reachable"] = True
-                    reactor_schema = data.get("autonomy_schema_version")
-    except Exception:
-        pass
+    if _reactor_enabled:
+        checks["reactor_reachable"] = False
+        try:
+            url = f"http://localhost:{config.reactor_core_default_port}/health"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(
+                    url, timeout=aiohttp.ClientTimeout(total=5.0)
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        checks["reactor_reachable"] = True
+                        reactor_schema = data.get("autonomy_schema_version")
+        except Exception:
+            pass
+    else:
+        checks["reactor_reachable"] = True  # disabled → vacuously reachable
+        reactor_schema = body_schema  # match body schema → compatible
     checks["reactor_schema"] = reactor_schema
 
     # Compatibility matrix evaluation
@@ -25102,11 +25118,11 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
         and checks.get("reactor_reachable", False)
     )
 
-    # Determine reason code
+    # Determine reason code (only track enabled services)
     _unreachable = []
-    if not checks.get("prime_reachable", False):
+    if _prime_enabled and not checks.get("prime_reachable", False):
         _unreachable.append("prime")
-    if not checks.get("reactor_reachable", False):
+    if _reactor_enabled and not checks.get("reactor_reachable", False):
         _unreachable.append("reactor")
 
     # v291.2: Services reachable but missing schema field → still initializing.
@@ -25115,9 +25131,9 @@ async def check_autonomy_contracts() -> Tuple[bool, str, Dict[str, Any]]:
     # ⚠️ warning when a service is healthy but predates the schema field or is
     # mid-initialization.
     _schema_missing = []
-    if checks.get("prime_reachable") and prime_schema is None:
+    if _prime_enabled and checks.get("prime_reachable") and prime_schema is None:
         _schema_missing.append("prime")
-    if checks.get("reactor_reachable") and reactor_schema is None:
+    if _reactor_enabled and checks.get("reactor_reachable") and reactor_schema is None:
         _schema_missing.append("reactor")
 
     if all_pass:
