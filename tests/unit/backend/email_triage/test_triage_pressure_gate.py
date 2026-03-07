@@ -1,7 +1,8 @@
 """Tests for memory pressure routing gate in _maybe_run_email_triage.
 
-Under memory pressure, the gate disables local extraction and lets
-PrimeRouter route inference to GCP.  It does NOT skip the cycle.
+Under memory pressure, PrimeRouter routes inference to GCP_PRIME.
+Extraction stays ENABLED so the router gets called.  Concurrency
+and timeout are bumped to handle GCP latency.
 """
 
 import os
@@ -25,7 +26,7 @@ def _build_runtime():
 
 @pytest.mark.asyncio
 async def test_triage_routes_to_gcp_when_thrashing():
-    """Under thrashing, local extraction is disabled but cycle proceeds."""
+    """Under thrashing, concurrency/timeout bump but extraction stays on."""
     rt = _build_runtime()
 
     mock_mq = MagicMock()
@@ -36,15 +37,19 @@ async def test_triage_routes_to_gcp_when_thrashing():
     mock_runner_cls = MagicMock()
     mock_runner_cls.get_instance.return_value = mock_runner
 
-    extraction_was_disabled = {}
+    captured_env = {}
 
     original_get_instance = mock_runner_cls.get_instance
     def capture_env(*a, **kw):
-        extraction_was_disabled["value"] = os.environ.get("EMAIL_TRIAGE_EXTRACTION_ENABLED")
+        captured_env["concurrency"] = os.environ.get("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY")
+        captured_env["timeout"] = os.environ.get("EMAIL_TRIAGE_CYCLE_TIMEOUT_S")
+        captured_env["extraction"] = os.environ.get("EMAIL_TRIAGE_EXTRACTION_ENABLED")
         return original_get_instance(*a, **kw)
     mock_runner_cls.get_instance.side_effect = capture_env
 
     with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}, clear=False):
+        os.environ.pop("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY", None)
+        os.environ.pop("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", None)
         os.environ.pop("EMAIL_TRIAGE_EXTRACTION_ENABLED", None)
         with patch(
             "core.memory_quantizer.get_memory_quantizer_instance",
@@ -57,14 +62,17 @@ async def test_triage_routes_to_gcp_when_thrashing():
                 await rt._maybe_run_email_triage()
 
     assert rt._triage_pressure_skip_count == 1
-    # Extraction was disabled when runner was reached
-    assert extraction_was_disabled.get("value") == "false"
+    # Extraction NOT disabled (must stay on for PrimeRouter to be called)
+    assert captured_env.get("extraction") is None
+    # Concurrency bumped, timeout extended
+    assert captured_env.get("concurrency") == "5"
+    assert captured_env.get("timeout") == "120.0"
     mock_runner_cls.get_instance.assert_called()
 
 
 @pytest.mark.asyncio
 async def test_triage_routes_to_gcp_when_emergency():
-    """Under emergency, local extraction is disabled but cycle proceeds."""
+    """Under emergency, same GCP routing behavior as thrashing."""
     rt = _build_runtime()
 
     mock_mq = MagicMock()
@@ -75,16 +83,18 @@ async def test_triage_routes_to_gcp_when_emergency():
     mock_runner_cls = MagicMock()
     mock_runner_cls.get_instance.return_value = mock_runner
 
-    extraction_was_disabled = {}
+    captured_env = {}
 
     original_get_instance = mock_runner_cls.get_instance
     def capture_env(*a, **kw):
-        extraction_was_disabled["value"] = os.environ.get("EMAIL_TRIAGE_EXTRACTION_ENABLED")
+        captured_env["concurrency"] = os.environ.get("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY")
+        captured_env["timeout"] = os.environ.get("EMAIL_TRIAGE_CYCLE_TIMEOUT_S")
         return original_get_instance(*a, **kw)
     mock_runner_cls.get_instance.side_effect = capture_env
 
     with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "true"}, clear=False):
-        os.environ.pop("EMAIL_TRIAGE_EXTRACTION_ENABLED", None)
+        os.environ.pop("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY", None)
+        os.environ.pop("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", None)
         with patch(
             "core.memory_quantizer.get_memory_quantizer_instance",
             return_value=mock_mq,
@@ -96,7 +106,8 @@ async def test_triage_routes_to_gcp_when_emergency():
                 await rt._maybe_run_email_triage()
 
     assert rt._triage_pressure_skip_count == 1
-    assert extraction_was_disabled.get("value") == "false"
+    assert captured_env.get("concurrency") == "5"
+    assert captured_env.get("timeout") == "120.0"
 
 
 @pytest.mark.asyncio
@@ -128,8 +139,8 @@ async def test_triage_proceeds_when_healthy():
 
 
 @pytest.mark.asyncio
-async def test_extraction_reenabled_after_pressure_resolves():
-    """When memory returns to healthy, extraction env var is removed."""
+async def test_defaults_restored_after_pressure_resolves():
+    """When memory returns to healthy, concurrency/timeout env vars are removed."""
     rt = _build_runtime()
     rt._triage_pressure_skip_count = 3
 
@@ -141,17 +152,19 @@ async def test_extraction_reenabled_after_pressure_resolves():
     mock_runner_cls = MagicMock()
     mock_runner_cls.get_instance.return_value = mock_runner
 
-    extraction_after_gate = {}
+    captured_env = {}
 
     original_get_instance = mock_runner_cls.get_instance
     def capture_env(*a, **kw):
-        extraction_after_gate["value"] = os.environ.get("EMAIL_TRIAGE_EXTRACTION_ENABLED")
+        captured_env["concurrency"] = os.environ.get("EMAIL_TRIAGE_EXTRACTION_CONCURRENCY")
+        captured_env["timeout"] = os.environ.get("EMAIL_TRIAGE_CYCLE_TIMEOUT_S")
         return original_get_instance(*a, **kw)
     mock_runner_cls.get_instance.side_effect = capture_env
 
     with patch.dict(os.environ, {
         "EMAIL_TRIAGE_ENABLED": "true",
-        "EMAIL_TRIAGE_EXTRACTION_ENABLED": "false",
+        "EMAIL_TRIAGE_EXTRACTION_CONCURRENCY": "5",
+        "EMAIL_TRIAGE_CYCLE_TIMEOUT_S": "120.0",
     }, clear=False):
         with patch(
             "core.memory_quantizer.get_memory_quantizer_instance",
@@ -164,8 +177,9 @@ async def test_extraction_reenabled_after_pressure_resolves():
                 await rt._maybe_run_email_triage()
 
     assert rt._triage_pressure_skip_count == 0
-    # Extraction re-enabled (env var removed by gate)
-    assert extraction_after_gate.get("value") is None
+    # Env vars removed (fall back to config defaults)
+    assert captured_env.get("concurrency") is None
+    assert captured_env.get("timeout") is None
 
 
 @pytest.mark.asyncio

@@ -2786,12 +2786,11 @@ class UnifiedAgentRuntime:
         self._last_email_triage_run = now
 
         # ── Memory pressure routing gate ──────────────────────────
-        # Under memory pressure, local inference would trigger mmap
-        # page faults → thrash → timeout loops.  Instead of skipping
-        # the cycle entirely (which makes JARVIS deaf to email), we
-        # disable local extraction and let PrimeRouter route inference
-        # to GCP.  The cycle still runs — only the inference backend
-        # changes.
+        # Under memory pressure, PrimeRouter._decide_route() already
+        # routes to GCP_PRIME.  We keep extraction ENABLED so the
+        # router actually gets called (extraction_enabled=false would
+        # skip the LLM entirely, defeating GCP routing).  We bump
+        # concurrency and timeout to handle GCP round-trip latency.
         try:
             from core.memory_quantizer import get_memory_quantizer_instance
             _mq = get_memory_quantizer_instance()
@@ -2799,20 +2798,22 @@ class UnifiedAgentRuntime:
                 _thrash = getattr(_mq, 'thrash_state', 'healthy')
                 if _thrash in ('thrashing', 'emergency'):
                     self._triage_pressure_skip_count += 1
-                    # Disable local extraction and reduce concurrency —
-                    # PrimeRouter will route to GCP_PRIME via _decide_route()
-                    os.environ['EMAIL_TRIAGE_EXTRACTION_ENABLED'] = 'false'
-                    os.environ['EMAIL_TRIAGE_EXTRACTION_CONCURRENCY'] = '1'
+                    # Keep extraction ON — PrimeRouter will route to
+                    # GCP_PRIME automatically.  Increase concurrency
+                    # and timeout to accommodate GCP latency.
+                    os.environ['EMAIL_TRIAGE_EXTRACTION_CONCURRENCY'] = '5'
+                    os.environ['EMAIL_TRIAGE_CYCLE_TIMEOUT_S'] = '120.0'
                     logger.info(
                         "[AgentRuntime] Memory pressure (%s): routing to GCP "
-                        "with reduced concurrency. consecutive=%d",
+                        "via PrimeRouter, concurrency=5, timeout=120s. "
+                        "consecutive=%d",
                         _thrash, self._triage_pressure_skip_count,
                     )
                 else:
                     if self._triage_pressure_skip_count > 0:
-                        # Pressure resolved — re-enable local extraction
-                        os.environ.pop('EMAIL_TRIAGE_EXTRACTION_ENABLED', None)
+                        # Pressure resolved — restore defaults
                         os.environ.pop('EMAIL_TRIAGE_EXTRACTION_CONCURRENCY', None)
+                        os.environ.pop('EMAIL_TRIAGE_CYCLE_TIMEOUT_S', None)
                         logger.info(
                             "[AgentRuntime] Memory pressure resolved after %d cycles",
                             self._triage_pressure_skip_count,
