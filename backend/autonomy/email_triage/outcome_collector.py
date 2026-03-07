@@ -222,6 +222,8 @@ class OutcomeCollector:
         self,
         workspace_agent: Any,
         prior_triaged: Dict[str, TriagedEmail],
+        *,
+        deadline: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """Poll Gmail for label/status changes on previously triaged emails.
 
@@ -229,9 +231,14 @@ class OutcomeCollector:
         This is a best-effort heuristic — real Gmail API limitations mean
         some outcomes (especially "opened") are low-confidence.
 
+        v291.1: Concurrent label fetches with deadline awareness. Previously
+        iterated sequentially (10s timeout × N emails = guaranteed cycle
+        timeout with 3+ prior emails).
+
         Args:
             workspace_agent: The GoogleWorkspaceAgent for API calls.
             prior_triaged: Dict of message_id -> TriagedEmail from prior cycle(s).
+            deadline: Monotonic deadline — stop processing after this.
 
         Returns:
             List of outcome records captured this check.
@@ -242,19 +249,48 @@ class OutcomeCollector:
         if not hasattr(workspace_agent, "get_message_labels"):
             return []
 
-        captured: List[Dict[str, Any]] = []
+        # Budget: cap outcome collection at 10s or remaining deadline
+        import asyncio
+        import time as _time
 
+        if deadline is not None:
+            remaining = max(0.5, deadline - _time.monotonic())
+            outcome_budget = min(10.0, remaining * 0.3)  # At most 30% of remaining budget
+        else:
+            outcome_budget = 10.0
+
+        # Concurrent label fetches (bounded)
+        sem = asyncio.Semaphore(3)
+        label_results: Dict[str, set] = {}
+
+        async def _fetch_labels(msg_id: str) -> None:
+            async with sem:
+                try:
+                    labels = await workspace_agent.get_message_labels(msg_id)
+                    label_results[msg_id] = set(labels)
+                except Exception as exc:
+                    logger.debug("Failed to fetch labels for %s: %s", msg_id, exc)
+
+        tasks = [_fetch_labels(mid) for mid in prior_triaged]
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=outcome_budget,
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                "Outcome collection timed out after %.1fs (%d/%d fetched)",
+                outcome_budget, len(label_results), len(prior_triaged),
+            )
+
+        # Process whatever we got
+        captured: List[Dict[str, Any]] = []
         for msg_id, triaged in prior_triaged.items():
-            try:
-                current_labels = await workspace_agent.get_message_labels(msg_id)
-            except Exception as exc:
-                logger.debug(
-                    "Failed to fetch labels for %s: %s", msg_id, exc,
-                )
+            current_labels = label_results.get(msg_id)
+            if current_labels is None:
                 continue
 
             original_labels = set(triaged.features.label_ids)
-            current_labels = set(current_labels)
 
             outcome = self._classify_outcome(original_labels, current_labels)
             if outcome is None:
@@ -274,7 +310,6 @@ class OutcomeCollector:
                 metadata=metadata,
             )
 
-            # The last recorded outcome is the one we just appended
             captured.append(self._recorded_outcomes[-1])
 
         return captured

@@ -2954,7 +2954,14 @@ class UnifiedAgentRuntime:
                     if not self._experience_processor_started:
                         await self._start_experience_processor()
         except asyncio.TimeoutError:
-            logger.warning("[AgentRuntime] Email triage cycle timed out")
+            _elapsed = time.monotonic() - now if now else 0
+            logger.warning(
+                "[AgentRuntime] Email triage cycle timed out after %.1fs "
+                "(timeout=%.0fs, warmed=%s)",
+                _elapsed,
+                _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0),
+                getattr(runner, '_warmed_up', '?') if 'runner' in dir() else '?',
+            )
         except Exception as e:
             # Fail-closed: DLM unavailable or any error -> skip triage, don't run unguarded
             # Override with EMAIL_TRIAGE_DLM_FAIL_OPEN=true for availability-first mode

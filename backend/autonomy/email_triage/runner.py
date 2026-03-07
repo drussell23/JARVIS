@@ -460,25 +460,55 @@ class EmailTriageRunner:
         _health_report = self._health_monitor.check_health()
         _health_max_emails = _health_report.recommended_max_emails
 
-        # Resolve dependencies (lazy, with backoff)
-        await self._resolver.resolve_all()
+        # v291.1: Budget-aware operations — each stage gets a bounded
+        # slice of the deadline to prevent any single operation from
+        # consuming the entire cycle budget.
+        def _remaining() -> float:
+            """Seconds remaining until deadline."""
+            if deadline is None:
+                return 30.0
+            return max(0.0, deadline - time.monotonic())
 
-        # Ensure labels exist
+        # Resolve dependencies (lazy, with backoff) — bounded
+        try:
+            await asyncio.wait_for(
+                self._resolver.resolve_all(),
+                timeout=min(5.0, _remaining()),
+            )
+        except asyncio.TimeoutError:
+            logger.warning("Dependency resolution timed out (%.1fs remaining)", _remaining())
+            errors.append("dep_resolution_timeout")
+
+        # Ensure labels exist — bounded
         workspace_agent = self._resolver.get("workspace_agent")
         if not self._labels_initialized and workspace_agent:
             try:
                 gmail_svc = getattr(workspace_agent, "_gmail_service", None)
                 if gmail_svc:
-                    self._label_map = await ensure_labels_exist(gmail_svc, self._config)
+                    self._label_map = await asyncio.wait_for(
+                        ensure_labels_exist(gmail_svc, self._config),
+                        timeout=min(5.0, _remaining()),
+                    )
                     self._labels_initialized = True
+            except asyncio.TimeoutError:
+                logger.warning("Label init timed out")
+                errors.append("label_init_timeout")
             except Exception as e:
                 logger.warning("Label init failed: %s", e)
                 errors.append(f"label_init: {e}")
 
-        # Fetch unread emails
+        # Fetch unread emails — bounded
         try:
-            emails = await self._fetch_unread()
+            emails = await asyncio.wait_for(
+                self._fetch_unread(),
+                timeout=min(10.0, _remaining()),
+            )
             emails_fetched = len(emails)
+        except asyncio.TimeoutError:
+            logger.warning("Email fetch timed out (%.1fs remaining)", _remaining())
+            errors.append("fetch_timeout")
+            emails = []
+            emails_fetched = 0
         except Exception as e:
             logger.warning("Email fetch failed: %s", e)
             errors.append(f"fetch: {e}")
@@ -499,11 +529,12 @@ class EmailTriageRunner:
                 errors=errors,
             )
 
-        # Outcome collection for prior cycle (WS5)
+        # Outcome collection for prior cycle (WS5) — deadline-aware
         if self._outcome_collector and self._prior_triaged:
             try:
                 captured = await self._outcome_collector.check_outcomes_for_cycle(
                     workspace_agent, self._prior_triaged,
+                    deadline=deadline,
                 )
             except Exception as e:
                 logger.debug("Outcome collection failed: %s", e)
@@ -537,7 +568,12 @@ class EmailTriageRunner:
                 self._outcome_collector.clear()
 
             try:
-                await self._weight_adapter.compute_adapted_weights(self._state_store)
+                await asyncio.wait_for(
+                    self._weight_adapter.compute_adapted_weights(self._state_store),
+                    timeout=min(3.0, _remaining()),
+                )
+            except asyncio.TimeoutError:
+                logger.debug("Weight adaptation timed out")
             except Exception as e:
                 logger.debug("Weight adaptation failed: %s", e)
 
@@ -569,7 +605,10 @@ class EmailTriageRunner:
         stage_start = time.monotonic()
         router = self._resolver.get("router")
         sem = asyncio.Semaphore(max(1, self._config.extraction_concurrency))
-        extraction_deadline = deadline or (time.monotonic() + self._config.cycle_timeout_s)
+        # v291.1: Use remaining deadline, not the original cycle timeout.
+        # Prior operations (resolve, fetch, outcome collection) may have
+        # consumed significant budget — extraction gets what's left.
+        extraction_deadline = deadline or (time.monotonic() + _remaining())
 
         extraction_tasks = [
             self._extract_one(email, router, extraction_deadline, sem)
