@@ -73295,26 +73295,50 @@ class JarvisSystemKernel:
                 async def _run_ecapa_verification_bg() -> None:
                     """ECAPA verification with CPU backpressure gate."""
                     _ecapa_bg_timeout = _get_env_float("JARVIS_ECAPA_BG_TIMEOUT", 90.0)
+                    # v290.0: Bounded startup budget — if ECAPA can't complete
+                    # within budget, terminate cleanly instead of holding
+                    # has_active_subsystem=True for the full 300s hard cap.
+                    _ecapa_startup_budget = _get_env_float(
+                        "JARVIS_ECAPA_STARTUP_BUDGET", 45.0
+                    )
 
                     try:
-                        # v3.0: Check Cloud SQL gate — if UNAVAILABLE, skip
-                        # DB-dependent steps (SpeakerVerificationService uses
-                        # learning_database which hangs on dead Cloud SQL).
+                        # v290.0: Check Cloud SQL gate — require READY to proceed
+                        # with DB-dependent steps. Any non-READY state (UNKNOWN,
+                        # CHECKING, UNAVAILABLE, DEGRADED_SQLITE) means CloudSQL
+                        # hasn't succeeded this boot — proceeding would hang on
+                        # dead connections and keep has_active_subsystem=True for
+                        # up to 300s (phase hold hard cap).
                         _skip_db_steps = False
+                        _ecapa_cloudsql_terminal = False
                         try:
                             from intelligence.cloud_sql_connection_manager import (
                                 get_readiness_gate as _ecapa_get_gate,
                                 ReadinessState as _ecapaRS,
                             )
                             _ecapa_gate = _ecapa_get_gate()
-                            if _ecapa_gate.state == _ecapaRS.UNAVAILABLE:
+                            if _ecapa_gate.state != _ecapaRS.READY:
                                 _skip_db_steps = True
-                                self.logger.info(
-                                    "[Kernel] ECAPA: Cloud SQL UNAVAILABLE — "
-                                    "skipping DB-dependent verification steps"
-                                )
+                                _gate_state = _ecapa_gate.state.value if hasattr(_ecapa_gate.state, 'value') else str(_ecapa_gate.state)
+                                if _ecapa_gate.state in (_ecapaRS.UNAVAILABLE, _ecapaRS.DEGRADED_SQLITE):
+                                    _ecapa_cloudsql_terminal = True
+                                    self.logger.info(
+                                        f"[Kernel] ECAPA: Cloud SQL {_gate_state} — "
+                                        "skipping DB-dependent steps (terminal, "
+                                        "will not retry this boot)"
+                                    )
+                                else:
+                                    self.logger.info(
+                                        f"[Kernel] ECAPA: Cloud SQL {_gate_state} "
+                                        "(not READY) — skipping DB-dependent "
+                                        "verification steps"
+                                    )
                         except (ImportError, Exception):
-                            pass
+                            _skip_db_steps = True  # Fail-safe: no gate module = no DB
+                            self.logger.debug(
+                                "[Kernel] ECAPA: Cloud SQL gate unavailable — "
+                                "skipping DB-dependent steps (fail-safe)"
+                            )
 
                         # v279.0: Cloud-first gate — when VBI_CLOUD_FIRST is
                         # active and cloud ECAPA is reachable, skip local ECAPA
@@ -73414,7 +73438,9 @@ class JarvisSystemKernel:
                         except Exception:
                             pass  # Metrics unavailable, proceed immediately
 
-                        _ecapa_deadline = time.monotonic() + _ecapa_bg_timeout
+                        _ecapa_deadline = time.monotonic() + min(
+                            _ecapa_bg_timeout, _ecapa_startup_budget
+                        )
                         ecapa_verify = await self._verify_ecapa_pipeline(
                             skip_db_dependent=_skip_db_steps,
                             deadline=_ecapa_deadline,
