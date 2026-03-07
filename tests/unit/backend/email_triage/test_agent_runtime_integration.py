@@ -145,6 +145,10 @@ class TestAgentRuntimeTriageWiring:
 
         runtime = object.__new__(UnifiedAgentRuntime)
         runtime._last_email_triage_run = 0.0
+        runtime._triage_disabled_logged = False
+        runtime._triage_pressure_skip_count = 0
+        runtime._experience_processor = None
+        runtime._experience_processor_started = False
 
         with patch.dict(os.environ, {"EMAIL_TRIAGE_ENABLED": "false"}):
             with patch(
