@@ -3,7 +3,6 @@
 import os
 import sys
 import time
-from enum import Enum
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "backend"))
 
