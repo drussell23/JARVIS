@@ -40,6 +40,19 @@ from autonomy.email_triage.state_store import TriageStateStore
 from autonomy.email_triage.outcome_collector import OutcomeCollector
 from autonomy.email_triage.weight_adapter import WeightAdapter
 
+# Phase B: Decision-action bridge contracts
+from core.contracts.decision_envelope import (
+    DecisionType, DecisionSource, OriginComponent,
+    EnvelopeFactory, IdempotencyKey,
+)
+from core.contracts.action_commit_ledger import ActionCommitLedger
+from core.contracts.policy_context import PolicyContext
+from core.contracts.policy_gate import VerdictAction
+from autonomy.contracts.behavioral_health import (
+    BehavioralHealthMonitor, ThrottleRecommendation,
+)
+from autonomy.email_triage.triage_policy_gate import TriagePolicyGate
+
 logger = logging.getLogger("jarvis.email_triage.runner")
 
 
@@ -89,6 +102,12 @@ class EmailTriageRunner:
         # C2: Extraction latency tracking for adaptive admission
         self._extraction_latencies_ms: List[float] = []
         self._extraction_p95_ema_ms: float = 0.0
+        # Phase B: Decision-action bridge
+        self._envelope_factory = EnvelopeFactory()
+        self._health_monitor = BehavioralHealthMonitor()
+        self._commit_ledger: Optional[ActionCommitLedger] = None
+        self._policy_gate = TriagePolicyGate(self._policy, self._config)
+        self._runner_id = f"runner-{uuid4().hex[:8]}"
         if self._config.outcome_collection_enabled:
             self._outcome_collector = OutcomeCollector(self._config, state_store)
         if self._config.adaptive_scoring_enabled:
@@ -127,6 +146,21 @@ class EmailTriageRunner:
         await self._resolver.resolve_all()
         await self._ensure_state_store()
         await self._cold_start_recovery()
+        # Phase B: Initialize action commit ledger
+        if self._config.state_persistence_enabled:
+            try:
+                from pathlib import Path
+                parent = Path(self._config.state_db_path).parent if self._config.state_db_path else Path.home() / ".jarvis"
+                parent.mkdir(parents=True, exist_ok=True)
+                ledger_path = parent / "action_commits.db"
+                self._commit_ledger = ActionCommitLedger(ledger_path)
+                await self._commit_ledger.start()
+                expired = await self._commit_ledger.expire_stale()
+                if expired > 0:
+                    logger.info("Expired %d stale ledger reservations from prior session", expired)
+            except Exception as e:
+                logger.warning("Action commit ledger init failed: %s", e)
+                self._commit_ledger = None
         logger.info("[EmailTriageRunner] Warm-up complete")
 
     def set_fencing_token(self, token: int) -> None:
@@ -386,6 +420,30 @@ class EmailTriageRunner:
 
         emit_triage_event(EVENT_CYCLE_STARTED, {"cycle_id": cycle_id})
 
+        # Phase B: Behavioral health throttle check
+        rec, throttle_reason = self._health_monitor.should_throttle()
+        if rec == ThrottleRecommendation.CIRCUIT_BREAK:
+            return TriageCycleReport(
+                cycle_id=cycle_id, started_at=started_at,
+                completed_at=time.time(), emails_fetched=0,
+                emails_processed=0, tier_counts={},
+                notifications_sent=0, notifications_suppressed=0,
+                errors=[], skipped=True,
+                skip_reason=f"circuit_break:{throttle_reason}",
+            )
+        if rec == ThrottleRecommendation.PAUSE_CYCLE:
+            return TriageCycleReport(
+                cycle_id=cycle_id, started_at=started_at,
+                completed_at=time.time(), emails_fetched=0,
+                emails_processed=0, tier_counts={},
+                notifications_sent=0, notifications_suppressed=0,
+                errors=[], skipped=True,
+                skip_reason=f"pause:{throttle_reason}",
+            )
+        # REDUCE_BATCH: get recommended max for admission gate
+        _health_report = self._health_monitor.check_health()
+        _health_max_emails = _health_report.recommended_max_emails
+
         # Resolve dependencies (lazy, with backoff)
         await self._resolver.resolve_all()
 
@@ -458,6 +516,13 @@ class EmailTriageRunner:
         # ── C2: Adaptive admission ─────────────────────────────
         admitted_count, budget_required_s = self._compute_budget(len(sorted_emails))
         admitted_emails = sorted_emails[:admitted_count]
+        # Phase B: Apply backpressure from health monitor
+        if _health_max_emails is not None:
+            effective_max = max(1, min(admitted_count, _health_max_emails))
+            if effective_max < admitted_count:
+                logger.info("Health backpressure: reducing batch %d -> %d", admitted_count, effective_max)
+                admitted_count = effective_max
+                admitted_emails = sorted_emails[:admitted_count]
         if len(sorted_emails) > admitted_count:
             logger.info(
                 "Adaptive admission: %d/%d emails admitted (p95=%.0fms, budget=%.0fs, required=%.0fs)",
@@ -492,6 +557,8 @@ class EmailTriageRunner:
         new_triaged: Dict[str, TriagedEmail] = {}
         immediate_emails: List[TriagedEmail] = []
 
+        cycle_envelopes: list = []  # Phase B: collect envelopes for health monitor
+
         for result in extraction_results:
             if isinstance(result, BaseException):
                 errors.append(f"extract_gather: {result}")
@@ -507,6 +574,23 @@ class EmailTriageRunner:
                 errors.append(f"extract_fallback:{email.get('id', '?')}")
 
             try:
+                # === ENVELOPE: Extraction ===
+                source_enum = _map_extraction_source(features.extraction_source)
+                extraction_envelope = self._envelope_factory.create(
+                    trace_id=cycle_id,
+                    decision_type=DecisionType.EXTRACTION,
+                    source=source_enum,
+                    origin_component=OriginComponent.EMAIL_TRIAGE_EXTRACTION,
+                    payload={
+                        "message_id": features.message_id,
+                        "extraction_source": features.extraction_source,
+                        "extraction_confidence": features.extraction_confidence,
+                    },
+                    confidence=features.extraction_confidence,
+                    config_version=self._triage_schema_version,
+                )
+                cycle_envelopes.append(extraction_envelope)
+
                 # Get sender reputation bonus (WS5)
                 rep_bonus = 0.0
                 if self._weight_adapter and self._state_store:
@@ -524,25 +608,115 @@ class EmailTriageRunner:
                     sender_reputation_bonus=rep_bonus,
                 )
 
-                # Apply label
+                # === ENVELOPE: Scoring ===
+                scoring_envelope = self._envelope_factory.create(
+                    trace_id=cycle_id,
+                    decision_type=DecisionType.SCORING,
+                    source=DecisionSource.HEURISTIC,
+                    origin_component=OriginComponent.EMAIL_TRIAGE_SCORING,
+                    payload={
+                        "message_id": features.message_id,
+                        "score": scoring.score,
+                        "tier": scoring.tier,
+                    },
+                    confidence=1.0,
+                    config_version=self._config.scoring_version,
+                    parent_envelope_id=extraction_envelope.envelope_id,
+                )
+                cycle_envelopes.append(scoring_envelope)
+
+                # === POLICY GATE (replaces direct decide_action) ===
+                policy_context = PolicyContext(
+                    tier=scoring.tier, score=scoring.score,
+                    message_id=features.message_id,
+                    sender_domain=features.sender_domain,
+                    is_reply=features.is_reply,
+                    has_attachment=features.has_attachment,
+                    label_ids=features.label_ids,
+                    cycle_id=cycle_id,
+                    fencing_token=self._current_fencing_token,
+                    config_version=self._config.scoring_version,
+                )
+                verdict = await self._policy_gate.evaluate(scoring_envelope, policy_context)
+
+                # Derive action from verdict (backwards compat with existing flow)
+                action = verdict.reason  # TriagePolicyGate puts action name in reason
+
+                # === LEDGER: Reserve -> Pre-exec -> Execute -> Commit/Abort ===
+                idem_key = IdempotencyKey.build(
+                    DecisionType.ACTION, features.message_id,
+                    "triage", self._config.scoring_version,
+                )
+
+                commit_id = None
+                if self._commit_ledger:
+                    # Duplicate check
+                    if await self._commit_ledger.is_duplicate(idem_key):
+                        errors.append(f"duplicate:{features.message_id}")
+                        emails_processed += 1
+                        continue
+
+                    # Reserve (MANDATORY for write actions — fail-closed)
+                    try:
+                        commit_id = await self._commit_ledger.reserve(
+                            envelope=scoring_envelope,
+                            action="triage",
+                            target_id=features.message_id,
+                            fencing_token=self._current_fencing_token,
+                            lock_owner=self._runner_id,
+                            session_id=cycle_id,
+                            idempotency_key=idem_key,
+                            lease_duration_s=self._config.ledger_lease_duration_s,
+                        )
+                    except Exception as e:
+                        # FAIL CLOSED: deny action on reserve failure
+                        errors.append(f"ledger_reserve:{features.message_id}:{e}")
+                        emails_processed += 1
+                        continue
+
+                    # Pre-exec invariant check
+                    ok, inv_reason = await self._commit_ledger.check_pre_exec_invariants(
+                        commit_id, self._current_fencing_token,
+                    )
+                    if not ok:
+                        await self._commit_ledger.abort(commit_id, inv_reason or "invariant_failed")
+                        errors.append(f"pre_exec:{features.message_id}:{inv_reason}")
+                        emails_processed += 1
+                        continue
+
+                # === EXECUTE: Label (existing logic) ===
+                action_succeeded = True
                 try:
                     await self._apply_label(
                         email.get("id", ""),
                         scoring.tier_label,
                     )
                 except Exception as label_err:
+                    action_succeeded = False
                     errors.append(f"label:{email.get('id', '?')}: {label_err}")
 
-                # Decide notification
+                # === LEDGER: Commit or Abort ===
+                if commit_id and self._commit_ledger:
+                    try:
+                        if action_succeeded:
+                            await self._commit_ledger.commit(
+                                commit_id, outcome="success",
+                                metadata={"tier": scoring.tier, "action": action},
+                            )
+                        else:
+                            await self._commit_ledger.abort(commit_id, "action_failed")
+                    except Exception as e:
+                        logger.warning("Ledger commit/abort failed for %s: %s",
+                                      features.message_id, e)
+
+                # Decide notification (using verdict action)
                 triaged = TriagedEmail(
                     features=features,
                     scoring=scoring,
                     notification_action="",
                     processed_at=time.time(),
                 )
-                action, explanation = self._policy.decide_action(triaged)
                 triaged.notification_action = action
-                triaged.policy_explanation = explanation
                 new_triaged[features.message_id] = triaged
 
                 # Track stats
@@ -682,6 +856,16 @@ class EmailTriageRunner:
             admitted_count=admitted_count,
             budget_computed_s=budget_required_s,
         )
+
+        # Phase B: Record cycle in behavioral health monitor
+        self._health_monitor.record_cycle(report, cycle_envelopes)
+
+        # Phase B: Expire stale ledger reservations
+        if self._commit_ledger:
+            try:
+                await self._commit_ledger.expire_stale()
+            except Exception:
+                pass
 
         # Commit policy gate — preserve prior snapshot on degraded cycles
         should_commit, commit_reason = self._should_commit_snapshot(report, new_triaged)
@@ -892,3 +1076,13 @@ class EmailTriageRunner:
         if snapshot is None:
             return None
         return snapshot.get("triaged_emails", {}).get(message_id)
+
+
+def _map_extraction_source(source_str: str) -> DecisionSource:
+    """Map extraction source string to DecisionSource enum."""
+    _SOURCE_MAP = {
+        "heuristic": DecisionSource.HEURISTIC,
+        "jprime_v1": DecisionSource.JPRIME_V1,
+        "jprime_degraded_fallback": DecisionSource.JPRIME_DEGRADED,
+    }
+    return _SOURCE_MAP.get(source_str, DecisionSource.HEURISTIC)

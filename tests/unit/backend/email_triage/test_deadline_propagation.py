@@ -38,6 +38,26 @@ async def test_run_cycle_propagates_deadline_to_extract_features():
     # C2 attributes
     runner._extraction_latencies_ms = []
     runner._extraction_p95_ema_ms = 0.0
+    # Phase B attributes
+    runner._current_fencing_token = 0
+    runner._last_committed_fencing_token = 0
+    runner._triage_schema_version = "1.0"
+    runner._committed_snapshot = None
+    runner._report_lock = asyncio.Lock()
+    runner._last_report = None
+    runner._last_report_at = 0.0
+    runner._triaged_emails = {}
+    runner._cold_start_recovered = False
+    from autonomy.email_triage.policy import NotificationPolicy
+    from autonomy.email_triage.triage_policy_gate import TriagePolicyGate
+    from autonomy.contracts.behavioral_health import BehavioralHealthMonitor
+    from core.contracts.decision_envelope import EnvelopeFactory
+    runner._policy = NotificationPolicy(config)
+    runner._envelope_factory = EnvelopeFactory()
+    runner._health_monitor = BehavioralHealthMonitor()
+    runner._commit_ledger = None
+    runner._policy_gate = TriagePolicyGate(runner._policy, config)
+    runner._runner_id = "runner-test"
 
     # Mock workspace agent with _fetch_unread_emails (the actual method run_cycle calls)
     mock_workspace = AsyncMock()
@@ -75,7 +95,7 @@ async def test_run_cycle_propagates_deadline_to_extract_features():
     with patch.object(runner, "_ensure_state_store", new_callable=AsyncMock):
         with patch.object(runner, "_cold_start_recovery", new_callable=AsyncMock):
             with patch("autonomy.email_triage.runner.extract_features", side_effect=mock_extract):
-                with patch("autonomy.email_triage.runner.score_email", return_value=MagicMock(tier=3, score=0.5, signals=[])):
+                with patch("autonomy.email_triage.runner.score_email", return_value=MagicMock(tier=3, score=50, tier_label="jarvis/tier3_review", breakdown={}, idempotency_key="test:v1", signals=[])):
                     with patch("autonomy.email_triage.runner.apply_label", new_callable=AsyncMock):
                         try:
                             await asyncio.wait_for(runner.run_cycle(deadline=deadline), timeout=5.0)
