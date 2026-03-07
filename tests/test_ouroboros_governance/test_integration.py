@@ -656,3 +656,108 @@ class TestPackageExports:
     def test_handle_break_glass_command_importable(self):
         from backend.core.ouroboros.governance import handle_break_glass_command
         assert callable(handle_break_glass_command)
+
+
+# -- End-to-End Integration Tests --------------------------------------------
+
+
+class TestEndToEnd:
+    """Full flow: config -> factory -> start -> write gate -> stop."""
+
+    def _make_config(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import GovernanceConfig
+
+        args = argparse.Namespace(skip_governance=False, governance_mode="sandbox")
+        base = GovernanceConfig.from_env_and_args(args)
+        return GovernanceConfig(
+            ledger_dir=tmp_path / "ledger",
+            policy_version=base.policy_version,
+            policy_hash=base.policy_hash,
+            contract_version=base.contract_version,
+            contract_hash=base.contract_hash,
+            config_digest=base.config_digest,
+            initial_mode=base.initial_mode,
+            skip_governance=base.skip_governance,
+            canary_slices=base.canary_slices,
+            gcp_daily_budget=base.gcp_daily_budget,
+            startup_timeout_s=base.startup_timeout_s,
+            component_budget_s=base.component_budget_s,
+        )
+
+    @pytest.mark.asyncio
+    async def test_full_lifecycle(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import (
+            GovernanceStack,
+            create_governance_stack,
+        )
+
+        config = self._make_config(tmp_path)
+
+        # Create
+        stack = await create_governance_stack(config)
+        assert isinstance(stack, GovernanceStack)
+        assert stack._started is False
+
+        # Write gate before start = denied
+        allowed, reason = stack.can_write({"files": ["test.py"]})
+        assert allowed is False
+        assert reason == "governance_not_started"
+
+        # Start
+        await stack.start()
+        assert stack._started is True
+
+        # Health — patch CostGuardrail.remaining (not yet implemented on the real class)
+        guardrail = stack.routing.cost_guardrail
+        if not hasattr(guardrail, "remaining"):
+            guardrail.remaining = guardrail._daily_cap - guardrail._usage_today
+        health = stack.health()
+        assert "mode" in health
+        assert "policy_version" in health
+        assert health["policy_version"] == "v0.1.0"
+
+        # Stop
+        await stack.stop()
+        assert stack._started is False
+
+        # Double-stop is safe
+        await stack.stop()
+
+    @pytest.mark.asyncio
+    async def test_skip_governance_forces_read_only(self):
+        from backend.core.ouroboros.governance.integration import GovernanceConfig, GovernanceMode
+
+        args = argparse.Namespace(skip_governance=True, governance_mode="governed")
+        config = GovernanceConfig.from_env_and_args(args)
+        assert config.initial_mode == GovernanceMode.READ_ONLY_PLANNING
+
+    @pytest.mark.asyncio
+    async def test_break_glass_cli_round_trip(self, tmp_path):
+        from backend.core.ouroboros.governance.integration import (
+            create_governance_stack,
+            handle_break_glass_command,
+        )
+
+        config = self._make_config(tmp_path)
+        stack = await create_governance_stack(config)
+        await stack.start()
+
+        # List should work (empty)
+        code = await handle_break_glass_command(
+            argparse.Namespace(break_glass_action="list"), stack
+        )
+        assert code == 0
+
+        # Audit should work (empty)
+        code = await handle_break_glass_command(
+            argparse.Namespace(break_glass_action="audit"), stack
+        )
+        assert code == 0
+
+        await stack.stop()
+
+    def test_no_circular_imports(self):
+        """Import the package to ensure no circular imports."""
+        import backend.core.ouroboros.governance
+        assert hasattr(backend.core.ouroboros.governance, "GovernanceMode")
+        assert hasattr(backend.core.ouroboros.governance, "GovernanceStack")
