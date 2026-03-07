@@ -351,6 +351,11 @@ class TestManagerTierDeclarations:
         src = inspect.getsource(us.GCPInstanceManager.__init__)
         assert "RequiredTier.ENHANCEMENT" in src
 
+    def test_cost_tracker_optional(self):
+        import inspect, unified_supervisor as us
+        src = inspect.getsource(us.CostTracker.__init__)
+        assert "RequiredTier.OPTIONAL" in src
+
     def test_dynamic_port_required(self):
         import inspect, unified_supervisor as us
         src = inspect.getsource(us.DynamicPortManager.__init__)

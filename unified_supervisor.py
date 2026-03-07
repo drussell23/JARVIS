@@ -10173,6 +10173,9 @@ class DockerDaemonManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("DockerDaemonManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.ENHANCEMENT
+            self._capabilities = ("container_runtime",)
 
         # Platform detection
         self.platform = platform.system().lower()
@@ -10746,6 +10749,9 @@ class GCPInstanceManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("GCPInstanceManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.ENHANCEMENT
+            self._capabilities = ("cloud_compute", "cloud_offload")
 
         # Configuration from environment
         self.enabled = os.getenv("GCP_ENABLED", "false").lower() == "true"
@@ -11529,6 +11535,9 @@ class CostTracker(ResourceManagerBase, SystemService):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("CostTracker", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("cost_tracking",)
 
         # Configuration from environment
         self.enabled = os.getenv("COST_TRACKING_ENABLED", "true").lower() == "true"
@@ -12076,6 +12085,8 @@ class DynamicPortManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("DynamicPortManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._capabilities = ("port_allocation",)
 
         # Configuration from environment
         # v233.1: Harmonize port default with backend/main.py and frontend (8010).
@@ -12652,6 +12663,9 @@ class SemanticVoiceCacheManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("SemanticVoiceCacheManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("voice_cache",)
 
         # Configuration from environment
         self.enabled = os.getenv("VOICE_CACHE_ENABLED", "true").lower() == "true"
@@ -12990,6 +13004,9 @@ class TieredStorageManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("TieredStorageManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("tiered_storage",)
 
         # Configuration from environment
         self.enabled = os.getenv("TIERED_STORAGE_ENABLED", "true").lower() == "true"
@@ -14118,6 +14135,9 @@ class SpotInstanceResilienceHandler(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("SpotInstanceResilienceHandler", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.OPTIONAL
+            self._capabilities = ("spot_resilience",)
 
         # Configuration from environment
         self.enabled = os.getenv("SPOT_RESILIENCE_ENABLED", "true").lower() == "true"
@@ -14380,6 +14400,9 @@ class IntelligentCacheManager(ResourceManagerBase):
 
     def __init__(self, config: Optional[SystemKernelConfig] = None):
         super().__init__("IntelligentCacheManager", config)
+        if _VERDICT_TYPES_AVAILABLE:
+            self._required_tier = RequiredTier.ENHANCEMENT
+            self._capabilities = ("module_cache",)
 
         # Configuration from environment
         self.enabled = os.getenv("CACHE_MANAGER_ENABLED", "true").lower() == "true"
