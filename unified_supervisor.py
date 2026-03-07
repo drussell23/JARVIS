@@ -73479,6 +73479,7 @@ class JarvisSystemKernel:
             # is ready. Non-fatal — degraded mode without autonomous goal pursuit.
             # =====================================================================
             # v265.0: Add timeout — previously bare await could hang indefinitely
+            self._mark_startup_activity("agent_runtime_init", stage="intelligence")
             _agent_runtime_timeout = _get_env_float("JARVIS_AGENT_RUNTIME_TIMEOUT", 30.0)
             # v265.4: CPU-aware timeout — extend under pressure
             try:
@@ -73524,6 +73525,7 @@ class JarvisSystemKernel:
             # (Intelligence) so the LLM client is available.
             # Uses audio_pipeline_bootstrap for clean composition.
             # =====================================================================
+            self._mark_startup_activity("audio_pipeline_wiring", stage="intelligence")
             if self._audio_bus_enabled:
                 if self._audio_bus is None:
                     self.logger.warning(
@@ -78260,6 +78262,7 @@ class JarvisSystemKernel:
             reason="intelligence",
         )
         self._update_component_status("intelligence", "running", "Initializing intelligence layer")
+        self._mark_startup_activity("intelligence_init", stage="intelligence")
 
         with self.logger.section_start(LogSection.INTELLIGENCE, "Zone 4 | Phase 4: Intelligence"):
             try:
@@ -78316,6 +78319,7 @@ class JarvisSystemKernel:
                 await self._broadcast_progress(54, "intelligence_memory", "Persistent memory initialized")
 
                 # v234.0: Initialize UnifiedModelServing (3-tier inference routing)
+                self._mark_startup_activity("model_serving_init", stage="intelligence")
                 try:
                     from backend.intelligence.unified_model_serving import (
                         get_model_serving,
@@ -90707,16 +90711,26 @@ class JarvisSystemKernel:
         if stage.startswith("visual_pipeline"):
             return "visual_pipeline"
 
+        # v291.0: Fall back to _current_startup_phase for ALL broadcasts
+        # during startup, not just heartbeats. Sub-step broadcasts like
+        # "event_infrastructure", "integration_init", "intelligence_managers"
+        # are NOT in the canonical map but ARE real startup work that must
+        # update the watchdog. Without this fallback, the watchdog's progress
+        # value freezes at the initial update_phase() call, and after
+        # stall_threshold seconds -> FALSE TRUE STALL with reasons=none.
+        # This was a CLASS of bug affecting every phase that used sub-step
+        # stage names in _broadcast_progress().
+        current_phase = getattr(self, "_current_startup_phase", "")
+        resolved = canonical.get(current_phase)
+        if resolved:
+            return resolved
+
+        # v270.3: Defense-in-depth — when _current_startup_phase is a
+        # post-startup phase like "complete" or "ready" (not in canonical),
+        # return the DMS's own current phase so heartbeats continue resetting
+        # _last_progress_time. Without this, heartbeats silently stop
+        # feeding the DMS, causing false stall detection.
         if is_heartbeat:
-            heartbeat_phase = getattr(self, "_current_startup_phase", "")
-            resolved = canonical.get(heartbeat_phase)
-            if resolved:
-                return resolved
-            # v270.3: Defense-in-depth — when _current_startup_phase is a
-            # post-startup phase like "complete" or "ready" (not in canonical),
-            # return the DMS's own current phase so heartbeats continue resetting
-            # _last_progress_time. Without this, heartbeats silently stop
-            # feeding the DMS, causing false stall detection.
             if self._startup_watchdog and hasattr(self._startup_watchdog, '_current_phase'):
                 return self._startup_watchdog._current_phase or None
 
