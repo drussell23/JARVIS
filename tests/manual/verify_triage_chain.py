@@ -14,25 +14,24 @@ import time
 # Ensure backend is on path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "backend"))
 
-# Load .env if present
-_env_path = os.path.join(os.path.dirname(__file__), "..", "..", ".env")
-if os.path.exists(_env_path):
-    with open(_env_path) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
-
-# Also load backend/.env
-_backend_env = os.path.join(os.path.dirname(__file__), "..", "..", "backend", ".env")
-if os.path.exists(_backend_env):
-    with open(_backend_env) as f:
-        for line in f:
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                os.environ.setdefault(k.strip(), v.strip())
+# Load .env files — force-override for API keys so the correct
+# project key is used (not Claude Code's session key).
+for _env_path in [
+    os.path.join(os.path.dirname(__file__), "..", "..", ".env"),
+    os.path.join(os.path.dirname(__file__), "..", "..", "backend", ".env"),
+]:
+    if os.path.exists(_env_path):
+        with open(_env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    k, v = k.strip(), v.strip()
+                    # Force-set API keys, setdefault for everything else
+                    if "API_KEY" in k or "TOKEN" in k or "PASSWORD" in k:
+                        os.environ[k] = v
+                    else:
+                        os.environ.setdefault(k, v)
 
 
 def _status(label, ok, detail=""):
