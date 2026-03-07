@@ -19,6 +19,12 @@ Phase 1 Components:
     - BreakGlassManager: Time-limited tokens for BLOCKED operation promotion
     - ChangeEngine: 8-phase transactional change pipeline with rollback
     - TUITransport: Fault-isolated TUI transport for CommProtocol
+
+Phase 2 Components:
+    - ResourceMonitor: Multi-signal pressure collection (RAM/CPU/IO/latency)
+    - DegradationController: 4-mode autonomy state machine
+    - RoutingPolicy: Deterministic task routing with cost guardrails
+    - MultiFileChangeEngine: Atomic multi-file operations with rollback
 """
 
 from backend.core.ouroboros.governance.operation_id import (
@@ -81,4 +87,27 @@ from backend.core.ouroboros.governance.change_engine import (
 from backend.core.ouroboros.governance.tui_transport import (
     TUITransport,
     TUIMessageFormatter,
+)
+from backend.core.ouroboros.governance.resource_monitor import (
+    ResourceMonitor,
+    ResourceSnapshot,
+    PressureLevel,
+    PRESSURE_THRESHOLDS,
+)
+from backend.core.ouroboros.governance.degradation import (
+    DegradationController,
+    DegradationMode,
+    DegradationReason,
+    ModeTransition,
+)
+from backend.core.ouroboros.governance.routing_policy import (
+    RoutingPolicy,
+    RoutingDecision,
+    TaskCategory,
+    CostGuardrail,
+)
+from backend.core.ouroboros.governance.multi_file_engine import (
+    MultiFileChangeEngine,
+    MultiFileChangeRequest,
+    MultiFileChangeResult,
 )
