@@ -70892,9 +70892,15 @@ class JarvisSystemKernel:
             # so it doesn't re-measure (race condition between two psutil calls).
             _set_startup_env("JARVIS_MEASURED_AVAILABLE_GB", f"{_rs.memory_available_gb:.2f}", "resource_orchestrator:measured", caller="_startup_impl:phase_resources")
             if _rs.is_cloud_mode:
+                # v286.0: Cloud mode is the correct operating state when
+                # available memory is below the local-full threshold. The
+                # GCP hybrid architecture handles inference offloading by
+                # design — this is not degradation, it's intelligent routing.
+                # Marking it "degraded" caused a persistent ⚠️ Resources
+                # warning in the status bar even when the system was healthy.
                 self._update_component_status(
-                    "resources", "degraded",
-                    detail=f"Cloud mode active (memory pressure): {_rs.memory_available_gb:.1f}GB",
+                    "resources", "running",
+                    detail=f"Cloud mode active: {_rs.memory_available_gb:.1f}GB local, GCP handles inference",
                 )
             for _rec in _rs.recommendations:
                 _unified_logger.info("[ResourceOrchestrator] %s", _rec)
