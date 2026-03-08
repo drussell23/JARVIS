@@ -338,3 +338,98 @@ class TestPrimeProvider:
         client._check_health = AsyncMock(side_effect=ConnectionError("unreachable"))
         provider = PrimeProvider(client)
         assert await provider.health_probe() is False
+
+
+# ---------------------------------------------------------------------------
+# Test ClaudeProvider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestClaudeProvider:
+    """Tests for ClaudeProvider adapter."""
+
+    async def test_satisfies_candidate_provider_protocol(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(api_key="test-key")
+        assert isinstance(provider, CandidateProvider)
+
+    async def test_provider_name(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(api_key="test-key")
+        assert provider.provider_name == "claude-api"
+
+    async def test_generate_success(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        valid_response = json.dumps({
+            "candidates": [
+                {"file": "tests/test_foo.py", "content": "def test_foo():\n    assert True\n"}
+            ],
+            "model_id": "claude-sonnet",
+        })
+        mock_message = MagicMock()
+        mock_message.content = [MagicMock(text=valid_response)]
+        mock_message.usage = MagicMock(input_tokens=100, output_tokens=200)
+        mock_message.model = "claude-sonnet-4-20250514"
+
+        provider = ClaudeProvider(api_key="test-key")
+        mock_client = AsyncMock()
+        mock_client.messages = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_message)
+        provider._client = mock_client
+
+        ctx = _make_context()
+        deadline = datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        result = await provider.generate(ctx, deadline)
+        assert len(result.candidates) == 1
+        assert result.provider_name == "claude-api"
+
+    async def test_budget_exhausted_raises(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(
+            api_key="test-key",
+            max_cost_per_op=0.50,
+            daily_budget=0.001,
+        )
+        provider._daily_spend = 0.01
+        ctx = _make_context()
+        deadline = datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        with pytest.raises(RuntimeError, match="claude_budget_exhausted"):
+            await provider.generate(ctx, deadline)
+
+    async def test_cost_tracking_accumulates(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(api_key="test-key", daily_budget=100.0)
+        assert provider._daily_spend == 0.0
+        provider._record_cost(0.05)
+        assert provider._daily_spend == 0.05
+        provider._record_cost(0.03)
+        assert provider._daily_spend == 0.08
+
+    async def test_daily_budget_resets(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(api_key="test-key", daily_budget=10.0)
+        provider._daily_spend = 5.0
+        provider._budget_reset_date = datetime(2026, 3, 6, tzinfo=timezone.utc).date()
+        provider._maybe_reset_daily_budget()
+        assert provider._daily_spend == 0.0
+
+    async def test_health_probe_returns_true_with_valid_key(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(api_key="test-key")
+        mock_client = AsyncMock()
+        mock_message = MagicMock()
+        mock_message.content = [MagicMock(text="ok")]
+        mock_client.messages = AsyncMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_message)
+        provider._client = mock_client
+        assert await provider.health_probe() is True
+
+    async def test_health_probe_returns_false_on_error(self) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(api_key="test-key")
+        mock_client = AsyncMock()
+        mock_client.messages = AsyncMock()
+        mock_client.messages.create = AsyncMock(side_effect=Exception("auth failed"))
+        provider._client = mock_client
+        assert await provider.health_probe() is False

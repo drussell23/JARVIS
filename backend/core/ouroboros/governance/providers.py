@@ -277,3 +277,160 @@ class PrimeProvider:
         except Exception:
             logger.debug("[PrimeProvider] Health probe failed", exc_info=True)
             return False
+
+
+# ---------------------------------------------------------------------------
+# ClaudeProvider
+# ---------------------------------------------------------------------------
+
+# Cost estimation constants (per 1M tokens, approximate)
+_CLAUDE_INPUT_COST_PER_M = 3.00   # Sonnet pricing
+_CLAUDE_OUTPUT_COST_PER_M = 15.00
+
+
+class ClaudeProvider:
+    """CandidateProvider adapter wrapping the Anthropic Claude API.
+
+    Cost-gated: each call checks accumulated daily spend against
+    ``daily_budget`` before proceeding. Budget resets at midnight UTC.
+
+    Parameters
+    ----------
+    api_key:
+        Anthropic API key.
+    model:
+        Model identifier (default: claude-sonnet-4-20250514).
+    max_tokens:
+        Maximum output tokens per generation.
+    max_cost_per_op:
+        Maximum estimated cost per single operation.
+    daily_budget:
+        Maximum daily spend in USD.
+    """
+
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "claude-sonnet-4-20250514",
+        max_tokens: int = 8192,
+        max_cost_per_op: float = 0.50,
+        daily_budget: float = 10.00,
+    ) -> None:
+        self._api_key = api_key
+        self._model = model
+        self._max_tokens = max_tokens
+        self._max_cost_per_op = max_cost_per_op
+        self._daily_budget = daily_budget
+        self._daily_spend: float = 0.0
+        self._budget_reset_date = datetime.now(tz=timezone.utc).date()
+        self._client: Any = None  # Lazy init
+
+    @property
+    def provider_name(self) -> str:
+        return "claude-api"
+
+    def _ensure_client(self) -> Any:
+        """Lazily initialize the Anthropic client."""
+        if self._client is None:
+            try:
+                import anthropic
+                self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
+            except ImportError:
+                raise RuntimeError(
+                    "claude_api_unavailable:anthropic_not_installed"
+                )
+        return self._client
+
+    def _maybe_reset_daily_budget(self) -> None:
+        """Reset daily spend if the day has changed."""
+        today = datetime.now(tz=timezone.utc).date()
+        if today > self._budget_reset_date:
+            self._daily_spend = 0.0
+            self._budget_reset_date = today
+
+    def _record_cost(self, cost: float) -> None:
+        """Record cost from a generation call."""
+        self._daily_spend += cost
+
+    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Estimate cost in USD from token counts."""
+        input_cost = (input_tokens / 1_000_000) * _CLAUDE_INPUT_COST_PER_M
+        output_cost = (output_tokens / 1_000_000) * _CLAUDE_OUTPUT_COST_PER_M
+        return input_cost + output_cost
+
+    async def generate(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> GenerationResult:
+        """Generate code candidates via Claude API.
+
+        Checks budget before calling, estimates cost after, and records
+        spend for daily tracking.
+
+        Raises
+        ------
+        RuntimeError
+            ``claude_budget_exhausted`` if daily budget exceeded.
+            ``claude-api_schema_invalid:...`` on schema validation failure.
+        """
+        self._maybe_reset_daily_budget()
+
+        if self._daily_spend >= self._daily_budget:
+            raise RuntimeError("claude_budget_exhausted")
+
+        client = self._ensure_client()
+        prompt = _build_codegen_prompt(context)
+        start = time.monotonic()
+
+        message = await client.messages.create(
+            model=self._model,
+            max_tokens=self._max_tokens,
+            system=_CODEGEN_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+
+        duration = time.monotonic() - start
+        raw_content = message.content[0].text
+
+        # Track cost
+        input_tokens = getattr(message.usage, "input_tokens", 0)
+        output_tokens = getattr(message.usage, "output_tokens", 0)
+        cost = self._estimate_cost(input_tokens, output_tokens)
+        self._record_cost(cost)
+
+        result = _parse_generation_response(
+            raw_content,
+            self.provider_name,
+            duration,
+        )
+
+        logger.info(
+            "[ClaudeProvider] Generated %d candidates in %.1fs, "
+            "model=%s, tokens=%d+%d, cost=$%.4f, daily_spend=$%.4f/$%.2f",
+            len(result.candidates),
+            duration,
+            getattr(message, "model", self._model),
+            input_tokens,
+            output_tokens,
+            cost,
+            self._daily_spend,
+            self._daily_budget,
+        )
+
+        return result
+
+    async def health_probe(self) -> bool:
+        """Lightweight API ping. Returns True if API responds."""
+        try:
+            client = self._ensure_client()
+            await client.messages.create(
+                model=self._model,
+                max_tokens=1,
+                messages=[{"role": "user", "content": "ping"}],
+            )
+            return True
+        except Exception:
+            logger.debug("[ClaudeProvider] Health probe failed", exc_info=True)
+            return False
