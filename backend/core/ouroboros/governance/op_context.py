@@ -86,6 +86,7 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
     },
     OperationPhase.GENERATE_RETRY: {
         OperationPhase.VALIDATE,
+        OperationPhase.GENERATE_RETRY,
         OperationPhase.CANCELLED,
     },
     OperationPhase.VALIDATE: {

@@ -91,6 +91,7 @@ class TestOperationPhase:
     def test_generate_retry_transitions(self) -> None:
         assert PHASE_TRANSITIONS[OperationPhase.GENERATE_RETRY] == {
             OperationPhase.VALIDATE,
+            OperationPhase.GENERATE_RETRY,
             OperationPhase.CANCELLED,
         }
 

@@ -30,7 +30,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 from backend.core.ouroboros.governance.approval_provider import (
     ApprovalResult,
