@@ -279,3 +279,28 @@ class OperationLedger:
         if not history:
             return None
         return history[-1].state
+
+    def get_latest_state_sync(self, op_id: str) -> Optional[OperationState]:
+        """Synchronous version of get_latest_state for use in lock-protected paths.
+
+        Reads the JSONL file directly without async. Safe to call from sync code
+        (e.g., approval store decide() in the same flock scope).
+        """
+        path = self._op_file(op_id)
+        if not path.exists():
+            return None
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        last_state: Optional[OperationState] = None
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                entry = _dict_to_entry(json.loads(stripped))
+                last_state = entry.state
+            except Exception:
+                continue
+        return last_state

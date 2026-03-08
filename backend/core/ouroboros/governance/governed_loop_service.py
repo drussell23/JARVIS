@@ -32,6 +32,7 @@ from backend.core.ouroboros.governance.candidate_generator import (
     CandidateGenerator,
     FailbackState,
 )
+from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
 from backend.core.ouroboros.governance.op_context import (
     OperationContext,
     OperationPhase,
@@ -213,6 +214,7 @@ class GovernedLoopService:
         self._state = ServiceState.STARTING
         try:
             await self._build_components()
+            await self._reconcile_on_boot()  # boot reconciliation
             self._register_canary_slices()
             self._attach_to_stack()
             self._started_at = time.monotonic()
@@ -479,6 +481,156 @@ class GovernedLoopService:
         self._stack.orchestrator = None
         self._stack.generator = None
         self._stack.approval_provider = None
+
+    async def _reconcile_on_boot(self) -> None:
+        """Scan ledger for orphaned APPLIED ops and reconcile.
+
+        For each op with latest_state == APPLIED:
+          - Check recovery_attempted marker (skip if present — idempotent)
+          - Check file hash against expected post_apply_hash in ledger data
+          - If hash matches: attempt rollback via RollbackArtifact
+          - If hash drifted: emit manual_intervention_required, no rollback
+
+        Also expires stale PENDING approvals and cancels stale PLANNED ops.
+        """
+        if self._stack is None:
+            return
+
+        ledger = self._stack.ledger
+        storage_dir = ledger._storage_dir
+
+        TERMINAL = {
+            OperationState.ROLLED_BACK, OperationState.FAILED,
+            OperationState.BLOCKED,
+        }
+
+        # Scan all JSONL files in ledger storage
+        for jsonl_file in storage_dir.glob("*.jsonl"):
+            op_id = jsonl_file.stem  # sanitized op_id
+            try:
+                history = await ledger.get_history(op_id)
+            except Exception:
+                continue
+
+            if not history:
+                continue
+
+            latest = history[-1]
+
+            # ── Stale PLANNED cancellation ──────────────────────────────────
+            if latest.state == OperationState.PLANNED:
+                import time as _time
+                stored_ts = latest.data.get("timestamp", 0.0)
+                now_ts = _time.time()
+                grace_s = getattr(self._config, "cold_start_grace_s", 300.0)
+                skew_tol = 60.0
+                age = now_ts - stored_ts
+                if 0 < age < 604800 and age > grace_s + skew_tol:
+                    await ledger.append(LedgerEntry(
+                        op_id=op_id, state=OperationState.FAILED,
+                        data={"reason": "stale_planned_on_boot", "age_s": age},
+                    ))
+                continue
+
+            # ── Orphaned APPLIED reconciliation ─────────────────────────────
+            if latest.state != OperationState.APPLIED:
+                continue
+
+            # Idempotency: skip if already attempted recovery
+            if latest.data.get("recovery_attempted"):
+                continue
+
+            # Write recovery marker BEFORE doing any work
+            import uuid as _uuid
+            recovery_id = _uuid.uuid4().hex
+            await ledger.append(LedgerEntry(
+                op_id=op_id, state=OperationState.APPLIED,
+                data={
+                    **latest.data,
+                    "recovery_attempted": True,
+                    "recovery_attempt_id": recovery_id,
+                },
+            ))
+
+            # Hash-guarded rollback
+            target_path_str = latest.data.get("target_file")
+            expected_hash = latest.data.get("post_apply_hash")
+            rollback_data = latest.data.get("rollback_artifact")
+
+            if not target_path_str or not expected_hash:
+                # Insufficient provenance — cannot rollback, escalate
+                await ledger.append(LedgerEntry(
+                    op_id=op_id, state=OperationState.FAILED,
+                    data={"reason": "boot_recovery_missing_provenance",
+                          "recovery_attempt_id": recovery_id},
+                ))
+                await self._stack.comm.emit_decision(
+                    op_id=op_id, outcome="manual_intervention_required",
+                    reason_code="boot_recovery_missing_provenance",
+                )
+                continue
+
+            import hashlib as _hashlib
+            target = Path(target_path_str)
+            if not target.exists():
+                await ledger.append(LedgerEntry(
+                    op_id=op_id, state=OperationState.FAILED,
+                    data={"reason": "boot_recovery_file_missing",
+                          "recovery_attempt_id": recovery_id},
+                ))
+                continue
+
+            current_hash = _hashlib.sha256(target.read_bytes()).hexdigest()
+            if current_hash != expected_hash:
+                # File drifted — human or other op touched it, do NOT overwrite
+                await ledger.append(LedgerEntry(
+                    op_id=op_id, state=OperationState.FAILED,
+                    data={"reason": "boot_recovery_hash_mismatch",
+                          "current_hash": current_hash,
+                          "expected_hash": expected_hash,
+                          "recovery_attempt_id": recovery_id},
+                ))
+                await self._stack.comm.emit_decision(
+                    op_id=op_id, outcome="manual_intervention_required",
+                    reason_code="boot_recovery_hash_mismatch",
+                )
+                continue
+
+            # Hash matches — attempt rollback
+            try:
+                if rollback_data:
+                    from backend.core.ouroboros.governance.change_engine import RollbackArtifact
+                    artifact = RollbackArtifact(**rollback_data)
+                    artifact.apply(target)
+                await ledger.append(LedgerEntry(
+                    op_id=op_id, state=OperationState.ROLLED_BACK,
+                    data={"reason": "boot_recovery", "recovery_attempt_id": recovery_id},
+                ))
+                logger.info("[GovernedLoop] Boot recovery: rolled back op=%s", op_id)
+            except Exception as exc:
+                await ledger.append(LedgerEntry(
+                    op_id=op_id, state=OperationState.FAILED,
+                    data={"reason": "boot_recovery_failed", "error": str(exc),
+                          "recovery_attempt_id": recovery_id},
+                ))
+                await self._stack.comm.emit_decision(
+                    op_id=op_id, outcome="manual_intervention_required",
+                    reason_code="boot_recovery_failed",
+                )
+
+        # Expire stale approvals — batch notify (no per-op comm storm)
+        approval_store = getattr(self._stack, "approval_store", None)
+        if approval_store is not None:
+            ttl = getattr(self._config, "approval_ttl_s", 1800.0)
+            expired = approval_store.expire_stale(timeout_seconds=ttl)
+            if expired:
+                await self._stack.comm.emit_decision(
+                    op_id="boot_reconciliation",
+                    outcome="approvals_expired_on_boot",
+                    reason_code=f"expired_count={len(expired)}",
+                    diff_summary=", ".join(expired[:10]),
+                )
+                logger.info("[GovernedLoop] Boot: expired %d stale approvals", len(expired))
 
     async def _teardown_partial(self) -> None:
         """Clean up partially constructed components on startup failure."""
