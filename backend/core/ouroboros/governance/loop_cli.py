@@ -101,6 +101,11 @@ async def handle_approve(
 ) -> Any:
     """Approve a pending governed operation.
 
+    .. note:: Phase 1 limitation
+       This requires an in-process reference to the running
+       GovernedLoopService.  Cross-process approve/reject (separate
+       CLI invocation) requires an IPC mechanism (Phase 2).
+
     Parameters
     ----------
     service:
