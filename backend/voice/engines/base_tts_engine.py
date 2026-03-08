@@ -46,6 +46,7 @@ class TTSEngine(Enum):
     ELEVENLABS = "elevenlabs"  # ElevenLabs (premium, online)
     MACOS = "macos"  # macOS native (local, fast)
     PIPER = "piper"  # Piper TTS (local, neural, streaming)
+    VOICEAI = "voiceai"  # Voice.ai WebSocket streaming (R&D spike)
 
 
 @dataclass

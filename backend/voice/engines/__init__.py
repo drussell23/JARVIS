@@ -18,6 +18,9 @@ __all__ = [
     "WhisperGCPEngine",
     "get_unified_tts_engine",
     "get_tts_engine",
+    # R&D — Voice.ai WebSocket streaming provider (sandbox only)
+    "VoiceAIProvider",
+    "build_voiceai_provider",
 ]
 
 
@@ -30,3 +33,15 @@ def get_unified_tts_engine():
 def get_tts_engine():
     """Alias for get_unified_tts_engine."""
     return get_unified_tts_engine()
+
+
+def VoiceAIProvider():
+    """Lazy re-export — avoids loading aiohttp at import time."""
+    from .voiceai_tts_engine import VoiceAIProvider as _V
+    return _V
+
+
+def build_voiceai_provider():
+    """Lazy re-export — construct a VoiceAIProvider from environment."""
+    from .voiceai_tts_engine import build_voiceai_provider as _b
+    return _b()
