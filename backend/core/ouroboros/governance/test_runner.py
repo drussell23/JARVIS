@@ -194,7 +194,25 @@ class TestRunner:
             Aggregated result.  ``flake_suspected`` is True when the first
             run fails but the retry passes.
         """
-        paths = [str(p) for p in test_files]
+        safe_files: list[str] = []
+        for tf in test_files:
+            if _is_safe_path(tf, self._repo_root):
+                safe_files.append(str(tf))
+            else:
+                logger.warning("Skipping test path outside repo root: %s", tf)
+
+        if not safe_files:
+            return TestResult(
+                passed=True,
+                total=0,
+                failed=0,
+                failed_tests=(),
+                duration_seconds=0.0,
+                stdout="no safe test files to run",
+                flake_suspected=False,
+            )
+
+        paths = safe_files
         cwd = sandbox_dir
 
         first = await self._run_pytest(paths, cwd=cwd)
@@ -276,15 +294,16 @@ class TestRunner:
             self._cleanup_report(report_path)
 
         elapsed = time.monotonic() - start
-        stdout_text = result["stdout"]
+        stdout_text: str = str(result.get("stdout", ""))
+        returncode = result.get("returncode")
+        report_data = result.get("report_data")
 
         # Try to parse JSON report
-        report_data = result.get("report_data")
         if report_data is not None:
             return self._parse_json_report(report_data, elapsed, stdout_text)
 
         # Fallback: exit-code heuristic
-        return self._fallback_parse(result["returncode"], elapsed, stdout_text)
+        return self._fallback_parse(returncode, elapsed, stdout_text)
 
     async def _exec_with_timeout(
         self,

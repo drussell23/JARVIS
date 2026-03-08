@@ -14,17 +14,10 @@ Validates that TestRunner correctly:
 """
 from __future__ import annotations
 
-import asyncio
-import os
-import stat
 import tempfile
 from pathlib import Path
-from typing import Tuple
-
-import pytest
 
 from backend.core.ouroboros.governance.test_runner import (
-    TestResult,
     TestRunner,
     _is_safe_path,
 )
@@ -263,8 +256,9 @@ class TestSymlinkPathRejected:
             outside_file = Path(outside_dir) / "evil.py"
             outside_file.write_text("# evil file\n")
 
-            # Create a symlink inside /tmp pointing to the outside file
-            link_path = Path(tempfile.mktemp(suffix=".py", prefix="symlink_"))
+            # Create a symlink inside a temp directory pointing to the outside file
+            link_dir = tempfile.mkdtemp(prefix="symlink_dir_")
+            link_path = Path(link_dir) / "symlink_test.py"
             try:
                 link_path.symlink_to(outside_file)
 
@@ -287,6 +281,7 @@ class TestSymlinkPathRejected:
             finally:
                 if link_path.is_symlink() or link_path.exists():
                     link_path.unlink()
+                Path(link_dir).rmdir()
 
 
 # ---------------------------------------------------------------------------
