@@ -257,3 +257,19 @@ from backend.core.ouroboros.governance.multi_repo import (
     BlastRadiusReport,
     RepoPipelineManager,
 )
+
+# --- Selective Autonomy (Layer 4) ---
+from backend.core.ouroboros.governance.autonomy import (
+    AutonomyTier,
+    TIER_ORDER,
+    CognitiveLoad,
+    WorkContext,
+    CAISnapshot,
+    UAESnapshot,
+    SAISnapshot,
+    GraduationMetrics,
+    SignalAutonomyConfig,
+    AutonomyGate,
+    TrustGraduator,
+    AutonomyState,
+)
