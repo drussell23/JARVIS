@@ -8,23 +8,16 @@ and DECISION always reaches LogTransport regardless of flood volume.
 Reserved-slot backpressure can be deferred to a follow-up if current transport
 volume remains acceptable.
 """
-import asyncio
 from backend.core.ouroboros.governance.comm_protocol import CommProtocol, LogTransport, MessageType
 
 
-def test_decision_always_delivered_despite_full_queue():
+async def test_decision_always_delivered_despite_full_queue():
     """DECISION must be deliverable even when non-reserved queue is full."""
     transport = LogTransport()
     comm = CommProtocol(transports=[transport])
-
-    async def flood_and_deliver():
-        # Flood with heartbeats (low priority, fill non-reserved slots)
-        for i in range(200):
-            await comm.emit_heartbeat(op_id=f"op-flood-{i}", phase="sandbox", progress_pct=0.0)
-        # DECISION must still get through
-        await comm.emit_decision(op_id="op-crit", outcome="approved", reason_code="ok")
-
-    asyncio.get_event_loop().run_until_complete(flood_and_deliver())
+    for i in range(200):
+        await comm.emit_heartbeat(op_id=f"op-flood-{i}", phase="sandbox", progress_pct=0.0)
+    await comm.emit_decision(op_id="op-crit", outcome="approved", reason_code="ok")
     decision_msgs = [m for m in transport.messages if m.msg_type == MessageType.DECISION]
     assert len(decision_msgs) >= 1
     assert decision_msgs[0].op_id == "op-crit"
