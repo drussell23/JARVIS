@@ -201,3 +201,15 @@ from backend.core.ouroboros.governance.shadow_harness import (
     OutputComparator,
     CompareMode,
 )
+
+# Governed Loop Service
+from backend.core.ouroboros.governance.governed_loop_service import (
+    GovernedLoopConfig,
+    GovernedLoopService,
+    OperationResult,
+    ServiceState,
+)
+from backend.core.ouroboros.governance.providers import (
+    ClaudeProvider,
+    PrimeProvider,
+)

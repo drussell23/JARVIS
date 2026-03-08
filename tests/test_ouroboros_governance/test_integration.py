@@ -988,3 +988,37 @@ class TestGovernedPipelineEndToEnd:
         assert result.phase == OperationPhase.COMPLETE
         approval_mock.request.assert_awaited_once()
         approval_mock.await_decision.assert_awaited_once()
+
+
+class TestGovernedLoopServiceField:
+    """Verify GovernanceStack has governed_loop_service field."""
+
+    def test_stack_has_governed_loop_service_field(self) -> None:
+        """GovernanceStack must have an optional governed_loop_service field."""
+        import dataclasses
+        from backend.core.ouroboros.governance.integration import GovernanceStack
+
+        field_names = {f.name for f in dataclasses.fields(GovernanceStack)}
+        assert "governed_loop_service" in field_names
+
+
+class TestGovernedLoopServiceExports:
+    """Verify governed loop service types are exported from __init__."""
+
+    def test_import_governed_loop_service(self) -> None:
+        from backend.core.ouroboros.governance import GovernedLoopService
+
+    def test_import_governed_loop_config(self) -> None:
+        from backend.core.ouroboros.governance import GovernedLoopConfig
+
+    def test_import_operation_result(self) -> None:
+        from backend.core.ouroboros.governance import OperationResult
+
+    def test_import_service_state(self) -> None:
+        from backend.core.ouroboros.governance import ServiceState
+
+    def test_import_prime_provider(self) -> None:
+        from backend.core.ouroboros.governance import PrimeProvider
+
+    def test_import_claude_provider(self) -> None:
+        from backend.core.ouroboros.governance import ClaudeProvider

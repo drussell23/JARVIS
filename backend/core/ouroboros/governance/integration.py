@@ -265,6 +265,7 @@ class GovernanceStack:
     generator: Optional[Any] = None
     approval_provider: Optional[Any] = None
     shadow_harness: Optional[Any] = None
+    governed_loop_service: Optional[Any] = None
 
     _started: bool = False
 
