@@ -93,11 +93,13 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
         OperationPhase.GATE,
         OperationPhase.VALIDATE_RETRY,
         OperationPhase.CANCELLED,
+        OperationPhase.POSTMORTEM,   # infra failures during validation
     },
     OperationPhase.VALIDATE_RETRY: {
         OperationPhase.GATE,
         OperationPhase.VALIDATE_RETRY,
         OperationPhase.CANCELLED,
+        OperationPhase.POSTMORTEM,   # infra failures during retry
     },
     OperationPhase.GATE: {
         OperationPhase.APPROVE,
@@ -177,6 +179,10 @@ class ValidationResult:
     best_candidate: Optional[Dict[str, Any]]
     validation_duration_s: float
     error: Optional[str]
+    # Phase 2A: compact provenance fields (full output goes to ledger, not here)
+    failure_class: Optional[str] = None          # "test" | "build" | "infra" | "budget" | None
+    short_summary: str = ""                      # ≤300 chars human-readable summary
+    adapter_names_run: Tuple[str, ...] = ()      # e.g. ("python",) or ("python", "cpp")
 
 
 @dataclass(frozen=True)
@@ -324,6 +330,7 @@ class OperationContext:
     validation: Optional[ValidationResult] = None
     policy_version: str = ""
     side_effects_blocked: bool = True
+    pipeline_deadline: Optional[datetime] = None  # stamped once at submit(); phases compute remaining budget
 
     # ------------------------------------------------------------------
     # Factory
@@ -337,6 +344,7 @@ class OperationContext:
         description: str,
         op_id: Optional[str] = None,
         policy_version: str = "",
+        pipeline_deadline: Optional[datetime] = None,
         _timestamp: Optional[datetime] = None,
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
@@ -379,6 +387,7 @@ class OperationContext:
             "validation": None,
             "policy_version": policy_version,
             "side_effects_blocked": True,
+            "pipeline_deadline": pipeline_deadline,
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -399,6 +408,7 @@ class OperationContext:
             validation=None,
             policy_version=policy_version,
             side_effects_blocked=True,
+            pipeline_deadline=pipeline_deadline,
         )
 
     # ------------------------------------------------------------------
