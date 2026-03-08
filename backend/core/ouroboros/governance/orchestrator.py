@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from backend.core.ouroboros.governance.test_runner import BlockedPathError
 from backend.core.ouroboros.governance.approval_provider import (
     ApprovalResult,
     ApprovalStatus,
@@ -604,6 +605,17 @@ class GovernedOrchestrator:
                     sandbox_dir=sandbox,
                     timeout_budget_s=remaining_s,
                     op_id=ctx.op_id,
+                )
+            except BlockedPathError as exc:
+                # Security gate rejection — treat as a build failure (CANCELLED), not infra (POSTMORTEM)
+                return ValidationResult(
+                    passed=False,
+                    best_candidate=None,
+                    validation_duration_s=time.monotonic() - t0,
+                    error=str(exc),
+                    failure_class="build",
+                    short_summary=f"BlockedPathError: {str(exc)[:280]}",
+                    adapter_names_run=(),
                 )
             except Exception as exc:
                 return ValidationResult(
