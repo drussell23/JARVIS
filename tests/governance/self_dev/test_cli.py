@@ -54,7 +54,7 @@ def test_approve_calls_provider():
     mock_service._approval_provider.approve = AsyncMock(
         return_value=MagicMock(status=MagicMock(name="APPROVED"))
     )
-    result = asyncio.get_event_loop().run_until_complete(
+    asyncio.get_event_loop().run_until_complete(
         handle_approve(service=mock_service, op_id="op-123")
     )
     mock_service._approval_provider.approve.assert_called_once()
