@@ -6,9 +6,6 @@ hourly/daily operation caps to prevent runaway autonomous actions.
 """
 from __future__ import annotations
 
-import time
-from unittest.mock import patch
-
 import pytest
 
 from backend.core.ouroboros.governance.intent.rate_limiter import (

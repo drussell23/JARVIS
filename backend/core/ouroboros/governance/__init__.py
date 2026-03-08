@@ -218,3 +218,16 @@ from backend.core.ouroboros.governance.loop_cli import (
     handle_approve,
     handle_reject,
 )
+
+# --- Intent Engine (Layer 1) ---
+from backend.core.ouroboros.governance.intent import (
+    IntentSignal,
+    DedupTracker,
+    RateLimiter,
+    RateLimiterConfig,
+    TestWatcher,
+    TestFailure,
+    ErrorInterceptor,
+    IntentEngine,
+    IntentEngineConfig,
+)
