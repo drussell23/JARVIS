@@ -221,6 +221,62 @@ logger = logging.getLogger("Ouroboros.Integration")
 
 
 # ---------------------------------------------------------------------------
+# Transport factory (B-compatible seam: accepts config now, uses env/defaults)
+# ---------------------------------------------------------------------------
+
+
+def _build_comm_protocol(
+    config: Optional["GovernanceConfig"] = None,
+    extra_transports: Optional[List[Any]] = None,
+) -> "CommProtocol":
+    """Build the CommProtocol with full transport stack.
+
+    Transport ordering (fixed, never changed):
+      1. LogTransport  — always present, always first
+      2. TUITransport  — if tui_transport module is importable
+      3. VoiceNarrator — if safe_say is available in the system
+      4. OpsLogger     — always added (writes to ~/.jarvis/ops/)
+
+    B-compatible seam: config parameter accepted now (unused until GovernanceConfig
+    grows transport-enable flags). Call sites are already config-injectable.
+    """
+    from backend.core.ouroboros.governance.comm_protocol import CommProtocol, LogTransport
+
+    transports: List[Any] = [LogTransport()]
+
+    # TUITransport — safe to add; queues if no callback registered
+    try:
+        from backend.core.ouroboros.governance.tui_transport import TUITransport
+        transports.append(TUITransport())
+        logger.debug("[Integration] TUITransport added to CommProtocol")
+    except Exception as exc:
+        logger.warning("[Integration] TUITransport skipped: %s", exc)
+
+    # VoiceNarrator — requires safe_say; skip gracefully if unavailable
+    try:
+        from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+        from backend.audio import safe_say  # type: ignore[import]
+        transports.append(VoiceNarrator(say_fn=safe_say, debounce_s=60.0, source="ouroboros"))
+        logger.debug("[Integration] VoiceNarrator added to CommProtocol")
+    except Exception as exc:
+        logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
+
+    # OpsLogger — always add; uses env var JARVIS_OPS_LOG_DIR or default
+    try:
+        from backend.core.ouroboros.governance.comms.ops_logger import OpsLogger
+        transports.append(OpsLogger())
+        logger.debug("[Integration] OpsLogger added to CommProtocol")
+    except Exception as exc:
+        logger.warning("[Integration] OpsLogger skipped: %s", exc)
+
+    # Extra transports (for testing / future extension)
+    if extra_transports:
+        transports.extend(extra_transports)
+
+    return CommProtocol(transports=transports)
+
+
+# ---------------------------------------------------------------------------
 # GovernanceStack
 # ---------------------------------------------------------------------------
 
@@ -395,7 +451,7 @@ async def create_governance_stack(
         # Core components (always present)
         risk_engine = RiskEngine()
         ledger = OperationLedger(storage_dir=config.ledger_dir)
-        comm = CommProtocol(transports=[LogTransport()])
+        comm = _build_comm_protocol(config=config)
         controller = SupervisorOuroborosController()
         lock_manager = GovernanceLockManager()
         break_glass = BreakGlassManager()
