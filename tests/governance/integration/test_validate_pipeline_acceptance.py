@@ -1,7 +1,8 @@
 """
 Acceptance tests for Phase 2A: VALIDATE gates APPLY via TestRunner.
 
-Covers all 6 acceptance criteria from the design doc.
+Covers AC1–AC3, AC5, AC5b, AC6 from the Phase 2A design doc.
+(AC4 BlockedPathError/symlink rejection is deferred to a later task.)
 """
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -184,9 +185,9 @@ async def test_ac2_apply_unreachable_on_test_failure():
 
 
 async def test_ac2_apply_unreachable_on_budget_exhaustion():
-    """AC2: budget exhausted (remaining_s <= 0) → CANCELLED, never APPLY."""
+    """AC2: budget exhausted (remaining_s <= 0) → CANCELLED before runner is called, never APPLY."""
     runner = MagicMock()
-    runner.run = AsyncMock(return_value=_multi(passed=True))
+    runner.run = AsyncMock()  # never reached — budget check fires first
     orch, _ = _make_orch(runner)
 
     # Use an already-expired deadline so the budget check fires immediately
@@ -199,6 +200,7 @@ async def test_ac2_apply_unreachable_on_budget_exhaustion():
 
     assert terminal.phase != OperationPhase.APPLY
     assert terminal.phase == OperationPhase.CANCELLED
+    runner.run.assert_not_called()
 
 
 # ── AC3: op_id continuity ────────────────────────────────────────────────
