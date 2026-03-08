@@ -176,7 +176,7 @@ class PythonAdapter:
         test_files: Tuple[Path, ...],
         sandbox_dir: Optional[Path],
         timeout_budget_s: float,
-        op_id: str,
+        _op_id: str,
     ) -> AdapterResult:
         """Run pytest and wrap result in AdapterResult."""
         t0 = time.monotonic()
