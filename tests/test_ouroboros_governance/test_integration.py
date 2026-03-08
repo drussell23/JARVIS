@@ -839,3 +839,152 @@ class TestGovernedLoopExports:
             OutputComparator,
             CompareMode,
         )
+
+
+# -- Governed Pipeline End-to-End Tests -------------------------------------
+
+
+class TestGovernedPipelineEndToEnd:
+    """End-to-end test of the governed self-programming pipeline."""
+
+    @pytest.mark.asyncio
+    async def test_full_pipeline_sandbox_mode(self, tmp_path):
+        """Create context -> run through orchestrator -> verify COMPLETE."""
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext,
+            OperationPhase,
+            GenerationResult,
+        )
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+        from backend.core.ouroboros.governance.risk_engine import (
+            RiskClassification,
+            RiskTier,
+        )
+        from backend.core.ouroboros.governance.ledger import LedgerEntry
+        from unittest.mock import AsyncMock, MagicMock
+
+        # Mock stack
+        stack = MagicMock()
+        stack.can_write.return_value = (True, "ok")
+        stack.risk_engine.classify.return_value = RiskClassification(
+            tier=RiskTier.SAFE_AUTO, reason_code="default_safe",
+        )
+        stack.ledger = AsyncMock()
+        stack.ledger.append = AsyncMock(return_value=True)
+        stack.comm = AsyncMock()
+        stack.change_engine = AsyncMock()
+        stack.change_engine.execute = AsyncMock(return_value=MagicMock(
+            success=True, rolled_back=False, op_id="op-e2e-001",
+        ))
+
+        # Mock generator
+        gen_mock = AsyncMock()
+        gen_mock.generate = AsyncMock(return_value=GenerationResult(
+            candidates=({"code": "x = 1", "description": "test"},),
+            provider_name="local",
+            generation_duration_s=0.1,
+        ))
+
+        orch = GovernedOrchestrator(
+            stack=stack,
+            generator=gen_mock,
+            approval_provider=None,
+            config=OrchestratorConfig(project_root=tmp_path),
+        )
+
+        ctx = OperationContext.create(
+            op_id="op-e2e-001",
+            target_files=("backend/core/ouroboros/governance/foo.py",),
+            description="End-to-end test",
+        )
+
+        result = await orch.run(ctx)
+
+        # Verify terminal state
+        assert result.phase == OperationPhase.COMPLETE
+        # Verify hash chain advanced
+        assert result.context_hash != ctx.context_hash
+        assert result.previous_hash is not None
+        # Verify ledger was called (at least once for VERIFY/APPLIED)
+        assert stack.ledger.append.await_count >= 1
+        # Verify generator was called
+        gen_mock.generate.assert_awaited_once()
+        # Verify change_engine was called
+        stack.change_engine.execute.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_full_pipeline_approval_required(self, tmp_path):
+        """APPROVAL_REQUIRED op -> approve -> COMPLETE."""
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext,
+            OperationPhase,
+            GenerationResult,
+        )
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+        from backend.core.ouroboros.governance.risk_engine import (
+            RiskClassification,
+            RiskTier,
+        )
+        from backend.core.ouroboros.governance.approval_provider import (
+            ApprovalResult,
+            ApprovalStatus,
+            CLIApprovalProvider,
+        )
+        from unittest.mock import AsyncMock, MagicMock
+        from datetime import datetime, timezone
+
+        stack = MagicMock()
+        stack.can_write.return_value = (True, "ok")
+        stack.risk_engine.classify.return_value = RiskClassification(
+            tier=RiskTier.APPROVAL_REQUIRED, reason_code="crosses_repo_boundary",
+        )
+        stack.ledger = AsyncMock()
+        stack.ledger.append = AsyncMock(return_value=True)
+        stack.comm = AsyncMock()
+        stack.change_engine = AsyncMock()
+        stack.change_engine.execute = AsyncMock(return_value=MagicMock(
+            success=True, rolled_back=False, op_id="op-e2e-002",
+        ))
+
+        gen_mock = AsyncMock()
+        gen_mock.generate = AsyncMock(return_value=GenerationResult(
+            candidates=({"code": "y = 2", "description": "test"},),
+            provider_name="local",
+            generation_duration_s=0.1,
+        ))
+
+        # Use a mock approval that auto-approves
+        approval_mock = AsyncMock()
+        approval_mock.request = AsyncMock(return_value="op-e2e-002")
+        approval_mock.await_decision = AsyncMock(return_value=ApprovalResult(
+            status=ApprovalStatus.APPROVED,
+            approver="derek",
+            reason=None,
+            decided_at=datetime.now(timezone.utc),
+            request_id="op-e2e-002",
+        ))
+
+        orch = GovernedOrchestrator(
+            stack=stack,
+            generator=gen_mock,
+            approval_provider=approval_mock,
+            config=OrchestratorConfig(project_root=tmp_path),
+        )
+
+        ctx = OperationContext.create(
+            op_id="op-e2e-002",
+            target_files=("backend/core/ouroboros/governance/bar.py",),
+            description="Approval required e2e test",
+        )
+
+        result = await orch.run(ctx)
+
+        assert result.phase == OperationPhase.COMPLETE
+        approval_mock.request.assert_awaited_once()
+        approval_mock.await_decision.assert_awaited_once()
