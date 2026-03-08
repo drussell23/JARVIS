@@ -207,6 +207,7 @@ from backend.core.ouroboros.governance.governed_loop_service import (
     GovernedLoopConfig,
     GovernedLoopService,
     OperationResult,
+    ReadyToCommitPayload,
     ServiceState,
 )
 from backend.core.ouroboros.governance.providers import (
@@ -217,6 +218,7 @@ from backend.core.ouroboros.governance.loop_cli import (
     handle_self_modify,
     handle_approve,
     handle_reject,
+    handle_status,
 )
 
 # --- Intent Engine (Layer 1) ---
