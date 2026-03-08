@@ -243,3 +243,17 @@ from backend.core.ouroboros.governance.comms import (
     PipelineStatus,
     CompletionSummary,
 )
+
+# --- Multi-Repo Coordinator (Layer 2) ---
+from backend.core.ouroboros.governance.multi_repo import (
+    RepoConfig,
+    RepoRegistry,
+    FileMatch,
+    ContextBuilder,
+    ContextFile,
+    CrossRepoContext,
+    CrossRepoBlastRadius,
+    AffectedFile,
+    BlastRadiusReport,
+    RepoPipelineManager,
+)
