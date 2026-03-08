@@ -27,6 +27,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -248,22 +250,82 @@ class GovernedOrchestrator:
 
         # ---- Phase 4: VALIDATE ----
         best_candidate: Optional[Dict[str, Any]] = None
+        best_validation: Optional[ValidationResult] = None
         validate_retries_remaining = self._config.max_validate_retries
 
-        for attempt in range(1 + self._config.max_validate_retries):
-            best_candidate = self._validate_candidates(generation)
+        for _attempt in range(1 + self._config.max_validate_retries):
+            # Compute remaining budget from pipeline_deadline
+            if ctx.pipeline_deadline is not None:
+                remaining_s = (
+                    ctx.pipeline_deadline - datetime.now(tz=timezone.utc)
+                ).total_seconds()
+            else:
+                remaining_s = self._config.generation_timeout_s  # fallback
 
-            if best_candidate is not None:
-                break
-
-            validate_retries_remaining -= 1
-            if validate_retries_remaining < 0:
-                # All validation retries exhausted
+            if remaining_s <= 0.0:
                 ctx = ctx.advance(OperationPhase.CANCELLED)
                 await self._record_ledger(
                     ctx,
                     OperationState.FAILED,
-                    {"reason": "validation_failed"},
+                    {"reason": "validation_budget_exhausted"},
+                )
+                return ctx
+
+            # Try each candidate; pick first that passes
+            for candidate in generation.candidates:
+                validation = await self._run_validation(ctx, candidate, remaining_s)
+
+                if validation.passed:
+                    best_candidate = candidate
+                    best_validation = validation
+                    break
+
+                # Infra failure: non-retryable — escalate immediately
+                if validation.failure_class == "infra":
+                    ctx = ctx.advance(OperationPhase.POSTMORTEM, validation=validation)
+                    await self._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {
+                            "reason": "validation_infra_failure",
+                            "failure_class": "infra",
+                            "adapter_names_run": list(validation.adapter_names_run),
+                            "validation_duration_s": validation.validation_duration_s,
+                            "short_summary": validation.short_summary,
+                        },
+                    )
+                    return ctx
+
+                # Budget failure: non-retryable
+                if validation.failure_class == "budget":
+                    ctx = ctx.advance(OperationPhase.CANCELLED, validation=validation)
+                    await self._record_ledger(
+                        ctx,
+                        OperationState.FAILED,
+                        {"reason": "validation_budget_exhausted"},
+                    )
+                    return ctx
+
+                # test/build failure: track for ledger; try next candidate
+                best_validation = validation
+
+            if best_candidate is not None:
+                break  # at least one candidate passed
+
+            # All candidates failed this attempt
+            validate_retries_remaining -= 1
+            if validate_retries_remaining < 0:
+                ctx = ctx.advance(OperationPhase.CANCELLED)
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {
+                        "reason": "validation_test_failure",
+                        "failure_class": best_validation.failure_class if best_validation else "test",
+                        "adapter_names_run": list(best_validation.adapter_names_run) if best_validation else [],
+                        "validation_duration_s": best_validation.validation_duration_s if best_validation else 0.0,
+                        "short_summary": best_validation.short_summary if best_validation else "",
+                    },
                 )
                 return ctx
 
@@ -271,15 +333,10 @@ class GovernedOrchestrator:
             ctx = ctx.advance(OperationPhase.VALIDATE_RETRY)
 
         assert best_candidate is not None  # guaranteed by loop logic
+        assert best_validation is not None
 
-        # Store validation result in context
-        validation = ValidationResult(
-            passed=True,
-            best_candidate=best_candidate,
-            validation_duration_s=0.0,
-            error=None,
-        )
-        ctx = ctx.advance(OperationPhase.GATE, validation=validation)
+        # Store compact validation result in context; full output is in ledger
+        ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
 
         # ---- Phase 5: GATE ----
         allowed, reason = self._stack.can_write(
@@ -433,34 +490,151 @@ class GovernedOrchestrator:
             is_core_orchestration_path=is_core,
         )
 
-    def _validate_candidates(
-        self, generation: GenerationResult
-    ) -> Optional[Dict[str, Any]]:
-        """AST-parse each candidate; return the first passing one.
+    @staticmethod
+    def _ast_preflight(content: str) -> Optional[str]:
+        """Return a short error string if content fails ast.parse, else None.
 
         Parameters
         ----------
-        generation:
-            The generation result containing candidate dicts.
+        content:
+            Python source code to parse.
 
         Returns
         -------
-        Optional[Dict[str, Any]]
-            The first candidate whose ``content`` field passes ``ast.parse``,
-            or ``None`` if all candidates fail.
+        Optional[str]
+            ``None`` if the content parses cleanly, or a human-readable error
+            string (e.g. ``"SyntaxError: invalid syntax (<unknown>, line 1)"``).
         """
-        for candidate in generation.candidates:
-            content = candidate.get("content", "")
-            try:
-                ast.parse(content)
-                return candidate
-            except SyntaxError:
-                logger.debug(
-                    "Candidate failed AST validation: %s",
-                    candidate.get("file", "<unknown>"),
+        try:
+            ast.parse(content)
+            return None
+        except SyntaxError as exc:
+            return f"SyntaxError: {exc}"
+
+    async def _run_validation(
+        self,
+        ctx: OperationContext,
+        candidate: Dict[str, Any],
+        remaining_s: float,
+    ) -> ValidationResult:
+        """Run the full validation pipeline for a single candidate.
+
+        Steps:
+          1. AST preflight (fast, no subprocess)
+          2. Budget guard (remaining_s <= 0 → budget failure)
+          3. Write candidate to temp sandbox dir
+          4. validation_runner.run() with op_id continuity
+          5. Map MultiAdapterResult → compact ValidationResult
+
+        The full adapter stdout/stderr is recorded in the ledger separately;
+        ValidationResult holds only a ≤300-char summary.
+
+        Parameters
+        ----------
+        ctx:
+            Current operation context (used for op_id tracing).
+        candidate:
+            Candidate dict with ``file`` and ``content`` keys.
+        remaining_s:
+            Remaining pipeline budget in seconds.
+
+        Returns
+        -------
+        ValidationResult
+            Compact, immutable result suitable for embedding in the context.
+        """
+        content = candidate.get("content", "")
+        target_file_str = candidate.get(
+            "file",
+            str(ctx.target_files[0]) if ctx.target_files else "unknown.py",
+        )
+
+        # Step 1: AST preflight — fast gate, no subprocess
+        syntax_error = self._ast_preflight(content)
+        if syntax_error:
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=0.0,
+                error=syntax_error,
+                failure_class="test",
+                short_summary=syntax_error[:300],
+                adapter_names_run=(),
+            )
+
+        # Step 2: Budget guard
+        if remaining_s <= 0.0:
+            return ValidationResult(
+                passed=False,
+                best_candidate=None,
+                validation_duration_s=0.0,
+                error="pipeline budget exhausted before validation",
+                failure_class="budget",
+                short_summary="Budget exhausted",
+                adapter_names_run=(),
+            )
+
+        # Step 3: Write to temp sandbox
+        multi = None
+        t0 = time.monotonic()
+        target_path = Path(target_file_str)
+        target_name = target_path.name
+
+        with tempfile.TemporaryDirectory(prefix="ouroboros_validate_") as sandbox_str:
+            sandbox = Path(sandbox_str)
+            sandbox_file = sandbox / target_name
+            sandbox_file.write_text(content, encoding="utf-8")
+
+            # Step 4a: No runner — fall back to AST-only pass (safe when no DI)
+            if self._validation_runner is None:
+                return ValidationResult(
+                    passed=True,
+                    best_candidate=candidate,
+                    validation_duration_s=time.monotonic() - t0,
+                    error=None,
+                    failure_class=None,
+                    short_summary="no validation_runner; AST-only gate passed",
+                    adapter_names_run=(),
                 )
-                continue
-        return None
+
+            # Step 4b: Run LanguageRouter (or any duck-typed runner)
+            try:
+                multi = await self._validation_runner.run(
+                    changed_files=(sandbox_file,),
+                    sandbox_dir=sandbox,
+                    timeout_budget_s=remaining_s,
+                    op_id=ctx.op_id,
+                )
+            except Exception as exc:
+                return ValidationResult(
+                    passed=False,
+                    best_candidate=None,
+                    validation_duration_s=time.monotonic() - t0,
+                    error=str(exc),
+                    failure_class="infra",
+                    short_summary=f"runner exception: {str(exc)[:200]}",
+                    adapter_names_run=(),
+                )
+
+        # Step 5: Map to compact ValidationResult (sandbox dir is now cleaned up)
+        assert multi is not None
+        duration = time.monotonic() - t0
+        adapter_names = tuple(r.adapter for r in multi.adapter_results)
+        summary_parts = []
+        for r in multi.adapter_results:
+            tail = (r.test_result.stdout or "")[-150:] if r.test_result else ""
+            summary_parts.append(f"[{r.adapter}:{'PASS' if r.passed else 'FAIL'}] {tail}")
+        short_summary = " | ".join(summary_parts)[:300]
+
+        return ValidationResult(
+            passed=multi.passed,
+            best_candidate=candidate if multi.passed else None,
+            validation_duration_s=duration,
+            error=None if multi.passed else f"validation failed: {multi.failure_class}",
+            failure_class=None if multi.passed else multi.failure_class,
+            short_summary=short_summary,
+            adapter_names_run=adapter_names,
+        )
 
     def _build_change_request(
         self, ctx: OperationContext, candidate: Dict[str, Any]
