@@ -565,12 +565,9 @@ class TestApprovalNotifications:
         result = await orch.run(ctx)
 
         assert result.phase is OperationPhase.COMPLETE
-        # Verify comm was called with approval notification
-        stack.comm.emit_heartbeat.assert_called()
-        # At least one call should have phase="APPROVE"
-        approve_calls = [
-            call for call in stack.comm.emit_heartbeat.call_args_list
-            if call.kwargs.get("phase") == "APPROVE"
-            or (len(call.args) >= 2 and call.args[1] == "APPROVE")
-        ]
-        assert len(approve_calls) >= 1
+        # Verify comm was called with approval notification (lowercase convention)
+        stack.comm.emit_heartbeat.assert_any_call(
+            op_id="op-test-001",
+            phase="approve",
+            progress_pct=0.0,
+        )

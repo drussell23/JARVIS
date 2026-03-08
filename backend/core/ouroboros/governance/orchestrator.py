@@ -315,11 +315,13 @@ class GovernedOrchestrator:
             try:
                 await self._stack.comm.emit_heartbeat(
                     op_id=ctx.op_id,
-                    phase="APPROVE",
+                    phase="approve",
                     progress_pct=0.0,
                 )
             except Exception:
-                pass  # Comm failures never block pipeline
+                logger.debug(
+                    "Comm heartbeat failed for op=%s", ctx.op_id, exc_info=True
+                )
 
             request_id = await self._approval_provider.request(ctx)
             decision: ApprovalResult = await self._approval_provider.await_decision(
