@@ -91,9 +91,15 @@ class TrustGraduator:
         return None
 
     def promote(self, trigger_source: str, repo: str, canary_slice: str, new_tier: AutonomyTier) -> SignalAutonomyConfig:
-        """Apply a promotion. Returns updated config."""
+        """Apply a promotion. Raises ValueError if new_tier is not higher."""
         key = (trigger_source, repo, canary_slice)
         config = self._configs[key]
+        current_idx = TIER_ORDER.index(config.current_tier)
+        new_idx = TIER_ORDER.index(new_tier)
+        if new_idx <= current_idx:
+            raise ValueError(
+                f"Cannot promote {key} from {config.current_tier.value} to {new_tier.value}"
+            )
         updated = replace(config, current_tier=new_tier)
         self._configs[key] = updated
         logger.info("Trust graduation: %s %s -> %s", key, config.current_tier.value, new_tier.value)

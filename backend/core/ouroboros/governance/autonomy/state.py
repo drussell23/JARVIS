@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -57,7 +58,13 @@ class AutonomyState:
                 ],
                 "require_user_active": config.require_user_active,
             })
-        self._path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        # Atomic write: write to temp file then rename
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self._path.parent, delete=False, suffix=".tmp",
+        ) as f:
+            f.write(json.dumps(data, indent=2))
+            tmp = Path(f.name)
+        tmp.rename(self._path)
         logger.debug("Autonomy state saved: %d configs to %s", len(data), self._path)
 
     def load(self) -> Tuple[SignalAutonomyConfig, ...]:
