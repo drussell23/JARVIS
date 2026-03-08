@@ -130,6 +130,7 @@ def _normalize(path: Path, repo_root: Path) -> str:
         )
 
 
+# used by LanguageRouter (Task 3)
 def _route(changed_files: Tuple[Path, ...], repo_root: Path) -> FrozenSet[str]:
     """Return union of required adapters across all changed files.
 

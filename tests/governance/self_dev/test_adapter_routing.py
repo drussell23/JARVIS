@@ -1,5 +1,4 @@
 """Tests for declarative adapter routing table."""
-import re
 from pathlib import Path
 import pytest
 from backend.core.ouroboros.governance.test_runner import (
