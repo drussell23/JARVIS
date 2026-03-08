@@ -295,12 +295,13 @@ class TestRunner:
 
         elapsed = time.monotonic() - start
         stdout_text: str = str(result.get("stdout", ""))
-        returncode = result.get("returncode")
-        report_data = result.get("report_data")
+        raw_returncode = result.get("returncode")
+        returncode: Optional[int] = int(raw_returncode) if isinstance(raw_returncode, (int, float, str)) else None
+        raw_report = result.get("report_data")
 
         # Try to parse JSON report
-        if report_data is not None:
-            return self._parse_json_report(report_data, elapsed, stdout_text)
+        if isinstance(raw_report, dict):
+            return self._parse_json_report(raw_report, elapsed, stdout_text)
 
         # Fallback: exit-code heuristic
         return self._fallback_parse(returncode, elapsed, stdout_text)
