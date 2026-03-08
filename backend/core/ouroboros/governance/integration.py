@@ -260,6 +260,12 @@ class GovernanceStack:
     policy_version: str
     capabilities: Dict[str, CapabilityStatus]
 
+    # Governed loop components (optional — present when orchestrator is wired)
+    orchestrator: Optional[Any] = None
+    generator: Optional[Any] = None
+    approval_provider: Optional[Any] = None
+    shadow_harness: Optional[Any] = None
+
     _started: bool = False
 
     async def start(self) -> None:

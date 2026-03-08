@@ -759,3 +759,83 @@ class TestEndToEnd:
         import backend.core.ouroboros.governance
         assert hasattr(backend.core.ouroboros.governance, "GovernanceMode")
         assert hasattr(backend.core.ouroboros.governance, "GovernanceStack")
+
+
+# -- GovernanceStack Orchestrator Wiring ------------------------------------
+
+
+class TestGovernanceStackOrchestratorWiring:
+    """Test that GovernanceStack exposes orchestrator component fields."""
+
+    def test_stack_has_orchestrator_field(self):
+        import dataclasses
+        from backend.core.ouroboros.governance.integration import GovernanceStack
+        field_names = {f.name for f in dataclasses.fields(GovernanceStack)}
+        assert "orchestrator" in field_names
+
+    def test_stack_has_generator_field(self):
+        import dataclasses
+        from backend.core.ouroboros.governance.integration import GovernanceStack
+        field_names = {f.name for f in dataclasses.fields(GovernanceStack)}
+        assert "generator" in field_names
+
+    def test_stack_has_approval_provider_field(self):
+        import dataclasses
+        from backend.core.ouroboros.governance.integration import GovernanceStack
+        field_names = {f.name for f in dataclasses.fields(GovernanceStack)}
+        assert "approval_provider" in field_names
+
+    def test_stack_has_shadow_harness_field(self):
+        import dataclasses
+        from backend.core.ouroboros.governance.integration import GovernanceStack
+        field_names = {f.name for f in dataclasses.fields(GovernanceStack)}
+        assert "shadow_harness" in field_names
+
+
+# -- Governed Loop Exports --------------------------------------------------
+
+
+class TestGovernedLoopExports:
+    """Test that all governed loop types are re-exported from __init__.py."""
+
+    def test_op_context_exports(self):
+        from backend.core.ouroboros.governance import (
+            OperationPhase,
+            OperationContext,
+            GenerationResult,
+            ValidationResult,
+            PHASE_TRANSITIONS,
+            TERMINAL_PHASES,
+        )
+
+    def test_orchestrator_exports(self):
+        from backend.core.ouroboros.governance import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+
+    def test_candidate_generator_exports(self):
+        from backend.core.ouroboros.governance import (
+            CandidateGenerator,
+            CandidateProvider,
+            FailbackState,
+            FailbackStateMachine,
+        )
+
+    def test_approval_provider_exports(self):
+        from backend.core.ouroboros.governance import (
+            ApprovalProvider,
+            ApprovalStatus,
+            ApprovalResult,
+            CLIApprovalProvider,
+        )
+
+    def test_shadow_harness_exports(self):
+        from backend.core.ouroboros.governance import (
+            ShadowHarness,
+            ShadowResult,
+            ShadowModeViolation,
+            SideEffectFirewall,
+            OutputComparator,
+            CompareMode,
+        )

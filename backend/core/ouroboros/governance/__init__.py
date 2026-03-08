@@ -167,3 +167,37 @@ from backend.core.ouroboros.governance.integration import (
     register_governance_argparse,
     handle_break_glass_command,
 )
+
+# Governed Loop
+from backend.core.ouroboros.governance.op_context import (
+    OperationPhase,
+    OperationContext,
+    GenerationResult,
+    ValidationResult,
+    PHASE_TRANSITIONS,
+    TERMINAL_PHASES,
+)
+from backend.core.ouroboros.governance.orchestrator import (
+    GovernedOrchestrator,
+    OrchestratorConfig,
+)
+from backend.core.ouroboros.governance.candidate_generator import (
+    CandidateGenerator,
+    CandidateProvider,
+    FailbackState,
+    FailbackStateMachine,
+)
+from backend.core.ouroboros.governance.approval_provider import (
+    ApprovalProvider,
+    ApprovalStatus,
+    ApprovalResult,
+    CLIApprovalProvider,
+)
+from backend.core.ouroboros.governance.shadow_harness import (
+    ShadowHarness,
+    ShadowResult,
+    ShadowModeViolation,
+    SideEffectFirewall,
+    OutputComparator,
+    CompareMode,
+)
