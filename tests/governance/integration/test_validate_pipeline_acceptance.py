@@ -87,7 +87,7 @@ def _make_orch(runner: MagicMock) -> tuple[GovernedOrchestrator, MagicMock]:
     mock_generator = MagicMock()
     mock_generator.generate = AsyncMock(
         return_value=MagicMock(
-            candidates=({"file": "backend/core/foo.py", "content": "x = 1\n"},),
+            candidates=({"file_path": "backend/core/foo.py", "full_content": "x = 1\n"},),
             provider_name="test",
             generation_duration_s=0.1,
         )
@@ -151,7 +151,7 @@ async def test_ac1_testrunner_not_called_on_syntax_error():
     mock_generator = MagicMock()
     mock_generator.generate = AsyncMock(
         return_value=MagicMock(
-            candidates=({"file": "backend/core/foo.py", "content": "def broken(:\n    pass"},),
+            candidates=({"file_path": "backend/core/foo.py", "full_content": "def broken(:\n    pass"},),
             provider_name="test",
             generation_duration_s=0.1,
         )

@@ -274,7 +274,21 @@ class GovernedOrchestrator:
 
             # Try each candidate; pick first that passes
             for candidate in generation.candidates:
+                _t_validate_start = time.monotonic()
                 validation = await self._run_validation(ctx, candidate, remaining_s)
+                _validate_duration_s = time.monotonic() - _t_validate_start
+
+                # Per-candidate ledger entry — always, pass or fail
+                await self._record_ledger(ctx, OperationState.GATING, {
+                    "event": "candidate_validated",
+                    "candidate_id": candidate.get("candidate_id", "unknown"),
+                    "candidate_hash": candidate.get("candidate_hash", ""),
+                    "validation_outcome": "pass" if validation.passed else "fail",
+                    "failure_class": validation.failure_class,
+                    "duration_s": round(_validate_duration_s, 3),
+                    "provider": generation.provider_name,
+                    "model": getattr(generation, "model_id", ""),
+                })
 
                 if validation.passed:
                     best_candidate = candidate
@@ -321,7 +335,10 @@ class GovernedOrchestrator:
                     ctx,
                     OperationState.FAILED,
                     {
-                        "reason": "validation_test_failure",
+                        "reason_code": "no_candidate_valid",
+                        "candidates_tried": [
+                            c.get("candidate_id", "?") for c in generation.candidates
+                        ],
                         "failure_class": best_validation.failure_class if best_validation else "test",
                         "adapter_names_run": list(best_validation.adapter_names_run) if best_validation else [],
                         "validation_duration_s": best_validation.validation_duration_s if best_validation else 0.0,
@@ -544,9 +561,9 @@ class GovernedOrchestrator:
         ValidationResult
             Compact, immutable result suitable for embedding in the context.
         """
-        content = candidate.get("content", "")
+        content = candidate.get("full_content", "")
         target_file_str = candidate.get(
-            "file",
+            "file_path",
             str(ctx.target_files[0]) if ctx.target_files else "unknown.py",
         )
 

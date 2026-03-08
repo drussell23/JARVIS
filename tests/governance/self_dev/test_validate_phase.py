@@ -72,7 +72,7 @@ def _make_orch(validation_runner=None, max_retries=0):
     mock_stack.comm.emit_heartbeat = AsyncMock()
     mock_gen = MagicMock()
     mock_gen.generate = AsyncMock(return_value=MagicMock(
-        candidates=({"file": "backend/core/foo.py", "content": "x = 1\n"},),
+        candidates=({"file_path": "backend/core/foo.py", "full_content": "x = 1\n"},),
         provider_name="test",
         generation_duration_s=0.1,
     ))
@@ -102,7 +102,7 @@ async def test_run_validation_syntax_error_no_subprocess():
     runner.run = AsyncMock()
     orch = _make_orch(validation_runner=runner)
 
-    candidate = {"file": "backend/core/foo.py", "content": "def broken(:\n    pass"}
+    candidate = {"file_path": "backend/core/foo.py", "full_content": "def broken(:\n    pass"}
     result = await orch._run_validation(_ctx(), candidate, remaining_s=60.0)
 
     assert result.passed is False
@@ -117,7 +117,7 @@ async def test_run_validation_budget_exhausted():
     runner.run = AsyncMock()
     orch = _make_orch(validation_runner=runner)
 
-    candidate = {"file": "backend/core/foo.py", "content": "x = 1\n"}
+    candidate = {"file_path": "backend/core/foo.py", "full_content": "x = 1\n"}
     result = await orch._run_validation(_ctx(), candidate, remaining_s=0.0)
 
     assert result.passed is False
@@ -133,7 +133,7 @@ async def test_run_validation_passes_op_id_to_runner():
     orch = _make_orch(validation_runner=runner)
 
     ctx = _ctx()
-    candidate = {"file": "backend/core/foo.py", "content": "x = 1\n"}
+    candidate = {"file_path": "backend/core/foo.py", "full_content": "x = 1\n"}
     await orch._run_validation(ctx, candidate, remaining_s=60.0)
 
     call_kwargs = runner.run.call_args
@@ -149,7 +149,7 @@ async def test_run_validation_maps_pass_result():
     runner.run = AsyncMock(return_value=multi)
     orch = _make_orch(validation_runner=runner)
 
-    result = await orch._run_validation(_ctx(), {"file": "backend/core/foo.py", "content": "x = 1\n"}, remaining_s=60.0)
+    result = await orch._run_validation(_ctx(), {"file_path": "backend/core/foo.py", "full_content": "x = 1\n"}, remaining_s=60.0)
 
     assert result.passed is True
     assert result.failure_class is None
@@ -163,7 +163,7 @@ async def test_run_validation_maps_infra_failure():
     runner.run = AsyncMock(return_value=multi)
     orch = _make_orch(validation_runner=runner)
 
-    result = await orch._run_validation(_ctx(), {"file": "backend/core/foo.py", "content": "x = 1\n"}, remaining_s=60.0)
+    result = await orch._run_validation(_ctx(), {"file_path": "backend/core/foo.py", "full_content": "x = 1\n"}, remaining_s=60.0)
 
     assert result.passed is False
     assert result.failure_class == "infra"
