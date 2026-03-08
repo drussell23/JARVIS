@@ -3,6 +3,7 @@
 import pytest
 import time
 from datetime import datetime, timezone, timedelta
+from typing import Optional
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,7 +37,7 @@ def _make_test_result(passed: bool, stdout: str = "") -> TestResult:
     )
 
 
-def _make_adapter_result(adapter: str, passed: bool, failure_class=None) -> AdapterResult:
+def _make_adapter_result(adapter: str, passed: bool, failure_class: str = "none") -> AdapterResult:
     return AdapterResult(
         adapter=adapter,
         passed=passed,
@@ -46,9 +47,10 @@ def _make_adapter_result(adapter: str, passed: bool, failure_class=None) -> Adap
     )
 
 
-def _make_multi(passed: bool, failure_class=None, adapters=("python",)) -> MultiAdapterResult:
+def _make_multi(passed: bool, failure_class: Optional[str] = None, adapters=("python",)) -> MultiAdapterResult:
+    adapter_fc = failure_class if failure_class is not None else "none"
     adapter_results = tuple(
-        _make_adapter_result(a, passed, failure_class) for a in adapters
+        _make_adapter_result(a, passed, adapter_fc) for a in adapters
     )
     dominant = next((r for r in adapter_results if not r.passed), None)
     return MultiAdapterResult(
@@ -94,7 +96,6 @@ def _ctx(deadline_s: float = 300.0):
 
 # ── _run_validation unit tests ────────────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_run_validation_syntax_error_no_subprocess():
     """Candidate with SyntaxError -> ValidationResult.passed=False, runner NOT called."""
     runner = MagicMock()
@@ -110,7 +111,6 @@ async def test_run_validation_syntax_error_no_subprocess():
     runner.run.assert_not_called()
 
 
-@pytest.mark.asyncio
 async def test_run_validation_budget_exhausted():
     """remaining_s <= 0 -> ValidationResult with failure_class='budget', runner NOT called."""
     runner = MagicMock()
@@ -125,7 +125,6 @@ async def test_run_validation_budget_exhausted():
     runner.run.assert_not_called()
 
 
-@pytest.mark.asyncio
 async def test_run_validation_passes_op_id_to_runner():
     """_run_validation passes ctx.op_id as op_id kwarg to validation_runner.run()."""
     multi = _make_multi(passed=True)
@@ -143,7 +142,6 @@ async def test_run_validation_passes_op_id_to_runner():
     assert passed_op_id == ctx.op_id
 
 
-@pytest.mark.asyncio
 async def test_run_validation_maps_pass_result():
     """MultiAdapterResult.passed=True -> ValidationResult.passed=True."""
     multi = _make_multi(passed=True, adapters=("python",))
@@ -158,7 +156,6 @@ async def test_run_validation_maps_pass_result():
     assert "python" in result.adapter_names_run
 
 
-@pytest.mark.asyncio
 async def test_run_validation_maps_infra_failure():
     """MultiAdapterResult.failure_class='infra' -> ValidationResult.failure_class='infra'."""
     multi = _make_multi(passed=False, failure_class="infra")
@@ -174,7 +171,6 @@ async def test_run_validation_maps_infra_failure():
 
 # ── VALIDATE phase integration tests ─────────────────────────────────────
 
-@pytest.mark.asyncio
 async def test_validate_infra_failure_reaches_postmortem():
     """VALIDATE: infra failure -> terminal phase = POSTMORTEM."""
     runner = MagicMock()
@@ -184,7 +180,6 @@ async def test_validate_infra_failure_reaches_postmortem():
     assert terminal_ctx.phase == OperationPhase.POSTMORTEM
 
 
-@pytest.mark.asyncio
 async def test_validate_test_failure_reaches_cancelled():
     """VALIDATE: test failure -> terminal phase = CANCELLED."""
     runner = MagicMock()
@@ -194,7 +189,6 @@ async def test_validate_test_failure_reaches_cancelled():
     assert terminal_ctx.phase == OperationPhase.CANCELLED
 
 
-@pytest.mark.asyncio
 async def test_validate_pass_advances_past_validate():
     """VALIDATE: pass -> context.validation.passed=True; pipeline advances past VALIDATE."""
     runner = MagicMock()

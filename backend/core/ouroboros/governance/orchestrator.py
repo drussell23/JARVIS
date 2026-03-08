@@ -260,7 +260,7 @@ class GovernedOrchestrator:
                     ctx.pipeline_deadline - datetime.now(tz=timezone.utc)
                 ).total_seconds()
             else:
-                remaining_s = self._config.generation_timeout_s  # fallback
+                remaining_s = self._config.validation_timeout_s  # fallback
 
             if remaining_s <= 0.0:
                 ctx = ctx.advance(OperationPhase.CANCELLED)
