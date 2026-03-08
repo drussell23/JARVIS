@@ -213,3 +213,8 @@ from backend.core.ouroboros.governance.providers import (
     ClaudeProvider,
     PrimeProvider,
 )
+from backend.core.ouroboros.governance.loop_cli import (
+    handle_self_modify,
+    handle_approve,
+    handle_reject,
+)
