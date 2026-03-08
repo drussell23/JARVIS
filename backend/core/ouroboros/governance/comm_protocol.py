@@ -26,6 +26,7 @@ from __future__ import annotations
 import enum
 import logging
 import time
+import uuid as _uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -79,6 +80,7 @@ class CommMessage:
     causal_parent_seq: Optional[int]
     payload: Dict[str, Any]
     timestamp: float = field(default_factory=time.time)
+    idempotency_key: str = ""  # set by CommProtocol._emit; format: op_id:boot_id:phase:seq
 
 
 # ---------------------------------------------------------------------------
@@ -126,6 +128,7 @@ class CommProtocol:
     def __init__(self, transports: Optional[List[Any]] = None) -> None:
         self._transports: List[Any] = transports if transports is not None else [LogTransport()]
         self._seq_counters: Dict[str, int] = {}
+        self._boot_id: str = _uuid.uuid4().hex[:12]  # stable per instance, resets per restart
 
     # -- Sequence helpers ---------------------------------------------------
 
@@ -155,7 +158,16 @@ class CommProtocol:
 
         A failing transport logs a warning but never prevents delivery to
         the remaining transports.
+
+        Before delivery the message is stamped with an idempotency key of
+        the form ``op_id:boot_id:phase:seq``.  The ``boot_id`` is stable for
+        the lifetime of this :class:`CommProtocol` instance and resets on
+        every process restart, making the combined key globally unique and
+        safe for deduplication in downstream consumers.
         """
+        msg.idempotency_key = (
+            f"{msg.op_id}:{self._boot_id}:{msg.msg_type.value.lower()}:{msg.seq}"
+        )
         for transport in self._transports:
             try:
                 await transport.send(msg)
