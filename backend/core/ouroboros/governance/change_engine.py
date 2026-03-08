@@ -136,6 +136,7 @@ class ChangeRequest:
     profile: OperationProfile
     verify_fn: Optional[Any] = None
     break_glass_op_id: Optional[str] = None
+    op_id: Optional[str] = None
 
 
 @dataclass
@@ -219,7 +220,7 @@ class ChangeEngine:
         ChangeResult
             Result with success status, phase reached, and optional error.
         """
-        op_id = generate_operation_id(repo_origin="jarvis")
+        op_id = request.op_id or generate_operation_id(repo_origin="jarvis")
 
         try:
             # Phase 1: PLAN -- classify risk, record in ledger
