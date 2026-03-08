@@ -145,6 +145,57 @@ def _route(changed_files: Tuple[Path, ...], repo_root: Path) -> FrozenSet[str]:
 
 
 # ---------------------------------------------------------------------------
+# PythonAdapter — implements LanguageAdapter protocol for pytest
+# ---------------------------------------------------------------------------
+
+
+class PythonAdapter:
+    """Runs pytest as a subprocess. Implements the LanguageAdapter protocol.
+
+    Delegates resolve() to TestRunner.resolve_affected_tests() and
+    run() to TestRunner.run() to avoid duplicating subprocess logic.
+    """
+
+    name = "python"
+
+    def __init__(self, repo_root: Path, timeout: float = 120.0) -> None:
+        self._repo_root = repo_root
+        self._timeout = timeout
+
+    async def resolve(
+        self,
+        changed_files: Tuple[Path, ...],
+        repo_root: Path,
+    ) -> Tuple[Path, ...]:
+        """Delegate to TestRunner.resolve_affected_tests()."""
+        runner = TestRunner(repo_root=repo_root, timeout=self._timeout)
+        return await runner.resolve_affected_tests(changed_files)
+
+    async def run(
+        self,
+        test_files: Tuple[Path, ...],
+        sandbox_dir: Optional[Path],
+        timeout_budget_s: float,
+        op_id: str,
+    ) -> AdapterResult:
+        """Run pytest and wrap result in AdapterResult."""
+        t0 = time.monotonic()
+        runner = TestRunner(
+            repo_root=self._repo_root,
+            timeout=min(timeout_budget_s, self._timeout),
+        )
+        test_result = await runner.run(test_files=test_files, sandbox_dir=sandbox_dir)
+        elapsed = time.monotonic() - t0
+        return AdapterResult(
+            adapter="python",
+            passed=test_result.passed,
+            failure_class="none" if test_result.passed else "test",
+            test_result=test_result,
+            duration_s=elapsed,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
