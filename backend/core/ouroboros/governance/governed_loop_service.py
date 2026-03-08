@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -43,6 +44,48 @@ from backend.core.ouroboros.governance.orchestrator import (
 )
 
 logger = logging.getLogger("Ouroboros.GovernedLoop")
+
+# ---------------------------------------------------------------------------
+# Module-level constants
+# ---------------------------------------------------------------------------
+
+MIN_GENERATION_BUDGET_S: float = float(
+    os.getenv("JARVIS_MIN_GENERATION_BUDGET_S", "30.0")
+)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+async def _record_ledger(
+    ctx: "OperationContext",
+    ledger: Any,
+    state: "OperationState",
+    data: Dict[str, Any],
+) -> None:
+    """Append a ledger entry, logging errors without raising.
+
+    Standalone helper used by GovernedLoopService._preflight_check() so that
+    ledger writes can happen before the orchestrator is involved.
+    """
+    from backend.core.ouroboros.governance.ledger import LedgerEntry
+
+    entry = LedgerEntry(
+        op_id=ctx.op_id,
+        state=state,
+        data=data,
+    )
+    try:
+        await ledger.append(entry)
+    except Exception as exc:
+        logger.error(
+            "Ledger append failed: op_id=%s state=%s error=%s",
+            entry.op_id,
+            entry.state.value,
+            exc,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +240,7 @@ class GovernedLoopService:
         self._generator: Optional[CandidateGenerator] = None
         self._approval_provider: Optional[CLIApprovalProvider] = None
         self._health_probe_task: Optional[asyncio.Task] = None
+        self._ledger: Any = None  # set in _build_components from stack.ledger
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
@@ -340,6 +384,22 @@ class GovernedLoopService:
             ctx = ctx.with_pipeline_deadline(
                 datetime.now(tz=timezone.utc) + timedelta(seconds=self._config.pipeline_timeout_s)
             )
+
+            # Connectivity preflight (spends from deadline budget)
+            if self._generator is not None and self._ledger is not None:
+                early_exit = await self._preflight_check(ctx)
+                if early_exit is not None:
+                    duration = time.monotonic() - start_time
+                    result = OperationResult(
+                        op_id=ctx.op_id,
+                        terminal_phase=early_exit.phase,
+                        total_duration_s=duration,
+                        reason_code=early_exit.phase.name.lower(),
+                        trigger_source=trigger_source,
+                    )
+                    self._completed_ops[dedupe_key] = result
+                    return result
+
             terminal_ctx = await self._orchestrator.run(ctx)
 
             duration = time.monotonic() - start_time
@@ -389,11 +449,113 @@ class GovernedLoopService:
         }
 
     # ------------------------------------------------------------------
+    # Private: Preflight
+    # ------------------------------------------------------------------
+
+    async def _preflight_check(
+        self,
+        ctx: OperationContext,
+    ) -> Optional[OperationContext]:
+        """Run connectivity preflight after deadline is stamped.
+
+        Called from submit() immediately after pipeline_deadline is set on ctx.
+        Checks remaining budget and probes the primary provider.
+
+        Returns:
+            None                 — preflight passed; caller should proceed.
+            OperationContext     — early-exit ctx (CANCELLED); caller returns it.
+        """
+        now = datetime.now(tz=timezone.utc)
+        remaining_s = (
+            (ctx.pipeline_deadline - now).total_seconds()
+            if ctx.pipeline_deadline
+            else 0.0
+        )
+
+        # Budget pre-check: cancel immediately if not enough time remains
+        if remaining_s < MIN_GENERATION_BUDGET_S:
+            cancelled = ctx.advance(OperationPhase.CANCELLED)
+            await _record_ledger(
+                cancelled,
+                self._ledger,
+                OperationState.FAILED,
+                {"reason_code": "budget_exhausted_pre_generation", "remaining_s": remaining_s},
+            )
+            logger.warning(
+                "[GovernedLoop] Preflight: budget exhausted before generation "
+                "(remaining=%.1fs, min=%.1fs); op_id=%s",
+                remaining_s,
+                MIN_GENERATION_BUDGET_S,
+                ctx.op_id,
+            )
+            return cancelled
+
+        # Connectivity preflight: probe primary provider
+        # Access via getattr to support both real CandidateGenerator (_primary)
+        # and test mocks (primary).
+        probe_timeout = min(5.0, remaining_s * 0.05)
+        try:
+            provider = getattr(
+                self._generator, "primary",
+                getattr(self._generator, "_primary", None),
+            )
+            if provider is None:
+                raise RuntimeError("no_primary_provider")
+            primary_ok = await provider.health_probe(timeout=probe_timeout)
+        except Exception:
+            logger.debug(
+                "[GovernedLoop] Preflight: primary probe raised exception",
+                exc_info=True,
+            )
+            primary_ok = False
+
+        if primary_ok:
+            # Primary healthy — proceed normally
+            return None
+
+        # Primary unavailable: decide based on FSM state
+        fsm_state_name = getattr(
+            getattr(self._generator, "_fsm_state", None), "name", ""
+        )
+
+        if fsm_state_name == "QUEUE_ONLY":
+            # No fallback available — cancel
+            cancelled = ctx.advance(OperationPhase.CANCELLED)
+            await _record_ledger(
+                cancelled,
+                self._ledger,
+                OperationState.FAILED,
+                {"reason_code": "provider_unavailable"},
+            )
+            logger.warning(
+                "[GovernedLoop] Preflight: QUEUE_ONLY + primary unhealthy → CANCELLED; op_id=%s",
+                ctx.op_id,
+            )
+            return cancelled
+
+        # Fallback is active — log informational entry and continue
+        await _record_ledger(
+            ctx,
+            self._ledger,
+            OperationState.BLOCKED,
+            {"reason_code": "primary_unavailable_fallback_active"},
+        )
+        logger.info(
+            "[GovernedLoop] Preflight: primary unavailable, fallback active; op_id=%s",
+            ctx.op_id,
+        )
+        return None
+
+    # ------------------------------------------------------------------
     # Private: Component Construction
     # ------------------------------------------------------------------
 
     async def _build_components(self) -> None:
         """Build providers, generator, approval provider, and orchestrator."""
+        # Wire ledger from stack so _preflight_check can append without orchestrator
+        if self._stack is not None:
+            self._ledger = getattr(self._stack, "ledger", None)
+
         primary = None
         fallback = None
 
