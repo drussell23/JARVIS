@@ -473,26 +473,22 @@ class LanguageRouter:
 
     def __init__(
         self,
-        python_adapter: PythonAdapter,
-        cpp_adapter: Optional[CppAdapter] = None,
+        repo_root: Path,
+        adapters: Dict[str, Any],
     ) -> None:
-        self._adapters: Dict[str, Any] = {"python": python_adapter}
-        if cpp_adapter is not None:
-            self._adapters["cpp"] = cpp_adapter
+        self._repo_root = repo_root
+        self._adapters: Dict[str, Any] = adapters
 
     async def run(
         self,
         changed_files: Tuple[Path, ...],
-        repo_root: Path,
         sandbox_dir: Optional[Path],
         timeout_budget_s: float,
         op_id: str,
     ) -> MultiAdapterResult:
         """Run all required adapters and merge results into MultiAdapterResult."""
-        t0 = time.monotonic()
-
         # Raises BlockedPathError if any file is outside repo_root
-        required_names = _route(changed_files, repo_root)
+        required_names = _route(changed_files, self._repo_root)
 
         results: List[AdapterResult] = []
         for name in sorted(required_names):  # sorted for determinism
@@ -503,8 +499,9 @@ class LanguageRouter:
                 )
                 continue
 
-            test_files = await adapter.resolve(changed_files, repo_root)
-            remaining = timeout_budget_s - (time.monotonic() - t0)
+            test_files = await adapter.resolve(changed_files, self._repo_root)
+            elapsed_so_far = sum(r.duration_s for r in results)
+            remaining = timeout_budget_s - elapsed_so_far
             if remaining <= 0:
                 results.append(AdapterResult(
                     adapter=name, passed=False, failure_class="infra",
@@ -528,7 +525,7 @@ class LanguageRouter:
             passed=all_passed,
             adapter_results=tuple(results),
             dominant_failure=dominant,
-            total_duration_s=time.monotonic() - t0,
+            total_duration_s=sum(r.duration_s for r in results),
         )
 
 
