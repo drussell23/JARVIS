@@ -353,6 +353,31 @@ class GovernedOrchestrator:
         assert best_candidate is not None  # guaranteed by loop logic
         assert best_validation is not None
 
+        # Source-drift check: file must not have changed since generation
+        drift_hash = self._check_source_drift(best_candidate, self._config.project_root)
+        if drift_hash is not None:
+            ctx = ctx.advance(OperationPhase.CANCELLED)
+            await self._record_ledger(ctx, OperationState.FAILED, {
+                "reason_code": "source_drift_detected",
+                "file_path": best_candidate.get("file_path"),
+                "expected_source_hash": best_candidate.get("source_hash"),
+                "actual_source_hash": drift_hash,
+            })
+            return ctx
+
+        # Winner traceability ledger entry
+        await self._record_ledger(ctx, OperationState.GATING, {
+            "event": "validation_complete",
+            "winning_candidate_id": best_candidate.get("candidate_id"),
+            "winning_candidate_hash": best_candidate.get("candidate_hash"),
+            "winning_file_path": best_candidate.get("file_path"),
+            "source_hash": best_candidate.get("source_hash"),
+            "source_path": best_candidate.get("source_path"),
+            "provider": generation.provider_name,
+            "model": getattr(generation, "model_id", ""),
+            "total_candidates_tried": len(generation.candidates),
+        })
+
         # Store compact validation result in context; full output is in ledger
         ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
 
@@ -529,6 +554,43 @@ class GovernedOrchestrator:
         except SyntaxError as exc:
             return f"SyntaxError: {exc}"
 
+    @staticmethod
+    def _check_source_drift(
+        candidate: Dict[str, Any],
+        project_root: Path,
+    ) -> Optional[str]:
+        """Return None if source unchanged; return current hash if drift detected.
+
+        Compares candidate["source_hash"] (hash at generation time) against the
+        current file content hash.  Returns None if no source_hash recorded
+        (skip check) or file not found (let APPLY handle).
+
+        Parameters
+        ----------
+        candidate:
+            Candidate dict containing ``source_hash`` (hash at generation time)
+            and ``file_path`` (relative path from project root).
+        project_root:
+            Root directory of the project being modified.
+
+        Returns
+        -------
+        Optional[str]
+            ``None`` if no drift (source unchanged or check skipped), or the
+            current file's SHA-256 hex digest if drift was detected.
+        """
+        import hashlib as _hl
+        source_hash = candidate.get("source_hash", "")
+        if not source_hash:
+            return None  # nothing to compare — skip
+        file_path = project_root / candidate.get("file_path", "")
+        try:
+            current_content = file_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None  # file not found — let APPLY handle
+        current_hash = _hl.sha256(current_content.encode()).hexdigest()
+        return current_hash if current_hash != source_hash else None
+
     async def _run_validation(
         self,
         ctx: OperationContext,
@@ -678,9 +740,9 @@ class GovernedOrchestrator:
             The validated candidate dict with ``file`` and ``content`` keys.
         """
         target_file = Path(
-            candidate.get("file", str(ctx.target_files[0] if ctx.target_files else "unknown.py"))
+            candidate.get("file_path", str(ctx.target_files[0] if ctx.target_files else "unknown.py"))
         )
-        proposed_content = candidate.get("content", "")
+        proposed_content = candidate.get("full_content", "")
 
         profile = self._build_profile(ctx)
 
