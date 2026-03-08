@@ -157,6 +157,7 @@ class GenerationResult:
     candidates: Tuple[Dict[str, Any], ...]
     provider_name: str
     generation_duration_s: float
+    model_id: str = ""  # provider model identifier; empty = not reported
 
 
 @dataclass(frozen=True)
