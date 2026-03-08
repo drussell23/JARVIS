@@ -240,34 +240,35 @@ def _build_comm_protocol(
     B-compatible seam: config parameter accepted now (unused until GovernanceConfig
     grows transport-enable flags). Call sites are already config-injectable.
     """
-    from backend.core.ouroboros.governance.comm_protocol import CommProtocol, LogTransport
-
     transports: List[Any] = [LogTransport()]
 
     # TUITransport — safe to add; queues if no callback registered
     try:
         from backend.core.ouroboros.governance.tui_transport import TUITransport
+    except ImportError:
+        logger.warning("[Integration] TUITransport skipped: module not available")
+    else:
         transports.append(TUITransport())
         logger.debug("[Integration] TUITransport added to CommProtocol")
-    except Exception as exc:
-        logger.warning("[Integration] TUITransport skipped: %s", exc)
 
     # VoiceNarrator — requires safe_say; skip gracefully if unavailable
     try:
         from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
         from backend.audio import safe_say  # type: ignore[import]
+    except ImportError as exc:
+        logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
+    else:
         transports.append(VoiceNarrator(say_fn=safe_say, debounce_s=60.0, source="ouroboros"))
         logger.debug("[Integration] VoiceNarrator added to CommProtocol")
-    except Exception as exc:
-        logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
 
     # OpsLogger — always add; uses env var JARVIS_OPS_LOG_DIR or default
     try:
         from backend.core.ouroboros.governance.comms.ops_logger import OpsLogger
+    except ImportError:
+        logger.warning("[Integration] OpsLogger skipped: module not available")
+    else:
         transports.append(OpsLogger())
         logger.debug("[Integration] OpsLogger added to CommProtocol")
-    except Exception as exc:
-        logger.warning("[Integration] OpsLogger skipped: %s", exc)
 
     # Extra transports (for testing / future extension)
     if extra_transports:

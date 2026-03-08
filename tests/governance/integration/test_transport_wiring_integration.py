@@ -1,4 +1,5 @@
 """Test that _build_comm_protocol wires all transports in fixed order."""
+import pytest
 from unittest.mock import AsyncMock, MagicMock
 
 from backend.core.ouroboros.governance.integration import _build_comm_protocol
@@ -16,6 +17,7 @@ def test_log_transport_always_present_and_first():
     assert isinstance(comm._transports[0], LogTransport)
 
 
+@pytest.mark.asyncio
 async def test_failing_extra_transport_does_not_block_log():
     """If an extra transport fails, LogTransport still receives message."""
     bad = MagicMock()
@@ -25,3 +27,4 @@ async def test_failing_extra_transport_does_not_block_log():
     await comm.emit_intent(op_id="op-1", goal="g", target_files=[], risk_tier="SAFE_AUTO", blast_radius=1)
     log_transport = comm._transports[0]
     assert len(log_transport.messages) == 1
+    bad.send.assert_called_once()
