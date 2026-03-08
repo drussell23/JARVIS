@@ -542,3 +542,35 @@ class TestOrchestratorTerminalInvariant:
             OperationPhase.CANCELLED,
             OperationPhase.POSTMORTEM,
         ), f"Expected terminal state, got {result.phase}"
+
+
+@pytest.mark.asyncio
+class TestApprovalNotifications:
+    """Tests that APPROVAL_REQUIRED ops emit comm messages."""
+
+    async def test_approval_required_emits_heartbeat(self) -> None:
+        """APPROVAL_REQUIRED -> comm.emit_heartbeat called with APPROVE phase."""
+        stack = _mock_stack(risk_tier=RiskTier.APPROVAL_REQUIRED)
+        generator = _mock_generator()
+        approval = _mock_approval_provider(status=ApprovalStatus.APPROVED)
+        config = _default_config()
+        ctx = _make_context()
+
+        orch = GovernedOrchestrator(
+            stack=stack,
+            generator=generator,
+            approval_provider=approval,
+            config=config,
+        )
+        result = await orch.run(ctx)
+
+        assert result.phase is OperationPhase.COMPLETE
+        # Verify comm was called with approval notification
+        stack.comm.emit_heartbeat.assert_called()
+        # At least one call should have phase="APPROVE"
+        approve_calls = [
+            call for call in stack.comm.emit_heartbeat.call_args_list
+            if call.kwargs.get("phase") == "APPROVE"
+            or (len(call.args) >= 2 and call.args[1] == "APPROVE")
+        ]
+        assert len(approve_calls) >= 1

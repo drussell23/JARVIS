@@ -311,6 +311,16 @@ class GovernedOrchestrator:
                 {"waiting_approval": True, "risk_tier": risk_tier.name},
             )
 
+            # Notify via comm channel (TUI + voice will receive this)
+            try:
+                await self._stack.comm.emit_heartbeat(
+                    op_id=ctx.op_id,
+                    phase="APPROVE",
+                    progress_pct=0.0,
+                )
+            except Exception:
+                pass  # Comm failures never block pipeline
+
             request_id = await self._approval_provider.request(ctx)
             decision: ApprovalResult = await self._approval_provider.await_decision(
                 request_id, self._config.approval_timeout_s
