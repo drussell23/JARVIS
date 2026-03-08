@@ -53,6 +53,8 @@ _MAX_TEST_CONTEXT_CHARS = 1500     # total across all discovered test files
 _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
 _MAX_TEST_FILES = 2                # hard cap on discovered test files
 _SCHEMA_VERSION = "2b.1"
+_SCHEMA_TOP_LEVEL_KEYS = frozenset({"schema_version", "candidates", "provider_metadata"})
+_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "rationale"})
 
 
 def _safe_context_path(repo_root: Path, target: Path) -> Path:
@@ -297,85 +299,128 @@ def _parse_generation_response(
     raw: str,
     provider_name: str,
     duration_s: float,
-) -> GenerationResult:
-    """Parse and validate a model's JSON response into a GenerationResult.
+    ctx: "OperationContext",
+    source_hash: str,
+    source_path: str,
+) -> "GenerationResult":
+    """Parse and strictly validate a schema_version 2b.1 generation response.
 
-    Parameters
-    ----------
-    raw:
-        Raw string response from the model.
-    provider_name:
-        Name of the provider for provenance tracking.
-    duration_s:
-        Wall-clock seconds the generation took.
+    Validation sequence (fail-fast):
+      1. JSON parse
+      2. Top-level type = dict
+      3. schema_version == "2b.1"
+      4. No extra top-level keys
+      5. candidates: non-empty list, len 1-3 (>3 → normalize + continue)
+      6. Per-candidate: required fields, no extras, AST check for .py files
+         SyntaxError → skip candidate; all fail → RuntimeError
+      7. Compute per-candidate candidate_hash; attach source_hash, source_path
 
-    Returns
-    -------
-    GenerationResult
-        Validated generation result.
-
-    Raises
-    ------
-    RuntimeError
-        With deterministic reason code if validation fails:
-        ``"<provider_name>_schema_invalid:<detail>"``.
+    Returns GenerationResult with validated candidates as a tuple of dicts.
     """
-    # Parse JSON
-    json_str = _extract_json_block(raw)
+    pfx = provider_name
+
+    # Step 1: JSON parse
     try:
-        data = json.loads(json_str)
+        data = json.loads(_extract_json_block(raw))
     except (json.JSONDecodeError, ValueError) as exc:
-        raise RuntimeError(
-            f"{provider_name}_schema_invalid:json_parse_error"
-        ) from exc
+        raise RuntimeError(f"{pfx}_schema_invalid:json_parse_error") from exc
 
+    # Step 2: top-level type
     if not isinstance(data, dict):
+        raise RuntimeError(f"{pfx}_schema_invalid:expected_object")
+
+    # Step 3: schema_version
+    actual_version = data.get("schema_version", "__missing__")
+    if actual_version != _SCHEMA_VERSION:
         raise RuntimeError(
-            f"{provider_name}_schema_invalid:expected_object"
+            f"{pfx}_schema_invalid:wrong_schema_version:{actual_version}"
         )
 
-    # Validate candidates array
-    candidates_raw = data.get("candidates")
-    if not candidates_raw or not isinstance(candidates_raw, list):
+    # Step 4: extra top-level keys
+    extra_top = set(data.keys()) - _SCHEMA_TOP_LEVEL_KEYS
+    if extra_top:
         raise RuntimeError(
-            f"{provider_name}_schema_invalid:missing_or_empty_candidates"
+            f"{pfx}_schema_invalid:unexpected_keys:{','.join(sorted(extra_top))}"
         )
 
-    # Validate each candidate
+    # Step 5: candidates
+    if "candidates" not in data:
+        raise RuntimeError(f"{pfx}_schema_invalid:missing_candidates")
+    raw_candidates = data["candidates"]
+    if not isinstance(raw_candidates, list) or len(raw_candidates) == 0:
+        raise RuntimeError(f"{pfx}_schema_invalid:candidates_empty")
+
+    # Normalize >3 candidates
+    if len(raw_candidates) > 3:
+        dropped_ids = [
+            c.get("candidate_id", f"idx{i}") if isinstance(c, dict) else f"idx{i}"
+            for i, c in enumerate(raw_candidates[3:], 3)
+        ]
+        logger.warning(
+            "candidates_normalized: truncating %d candidates to 3; dropped=%s",
+            len(raw_candidates),
+            dropped_ids,
+        )
+        raw_candidates = raw_candidates[:3]
+
+    # Step 6: per-candidate validation
     validated: List[Dict[str, Any]] = []
-    for i, candidate in enumerate(candidates_raw):
-        if not isinstance(candidate, dict):
+    for i, cand in enumerate(raw_candidates):
+        if not isinstance(cand, dict):
+            raise RuntimeError(f"{pfx}_schema_invalid:candidate_{i}_not_object")
+
+        # Required fields
+        for field in ("candidate_id", "file_path", "full_content", "rationale"):
+            if field not in cand:
+                raise RuntimeError(
+                    f"{pfx}_schema_invalid:candidate_{i}_missing_{field}"
+                )
+
+        # Extra fields
+        extra_cand = set(cand.keys()) - _CANDIDATE_KEYS
+        if extra_cand:
             raise RuntimeError(
-                f"{provider_name}_schema_invalid:candidate_{i}_not_object"
+                f"{pfx}_schema_invalid:candidate_{i}_unexpected_keys:{','.join(sorted(extra_cand))}"
             )
 
-        file_path = candidate.get("file", "")
-        content = candidate.get("content", "")
-
-        if not file_path or not isinstance(file_path, str):
-            raise RuntimeError(
-                f"{provider_name}_schema_invalid:candidate_{i}_missing_file"
-            )
-        if not content or not isinstance(content, str):
-            raise RuntimeError(
-                f"{provider_name}_schema_invalid:candidate_{i}_missing_content"
-            )
-
-        # AST validation for Python files
+        # AST check for Python files
+        file_path: str = cand["file_path"]
+        full_content: str = cand["full_content"]
         if file_path.endswith(".py"):
             try:
-                ast.parse(content)
-            except SyntaxError as exc:
-                raise RuntimeError(
-                    f"{provider_name}_schema_invalid:candidate_{i}_syntax_error"
-                ) from exc
+                ast.parse(full_content)
+            except SyntaxError:
+                logger.warning(
+                    "Skipping candidate %s: SyntaxError in %s",
+                    cand["candidate_id"],
+                    file_path,
+                )
+                continue  # skip this candidate; try next
 
-        validated.append({"file": file_path, "content": content})
+        # Step 7: compute hashes and attach provenance
+        candidate_hash = hashlib.sha256(full_content.encode()).hexdigest()
+        enriched = dict(cand)
+        enriched["candidate_hash"] = candidate_hash
+        enriched["source_hash"] = source_hash
+        enriched["source_path"] = source_path
+        validated.append(enriched)
+
+    if not validated:
+        raise RuntimeError(f"{pfx}_schema_invalid:all_candidates_syntax_error")
+
+    # Extract model_id from provider_metadata (optional)
+    provider_metadata = data.get("provider_metadata", {})
+    model_id = (
+        provider_metadata.get("model_id", "")
+        if isinstance(provider_metadata, dict)
+        else ""
+    )
 
     return GenerationResult(
         candidates=tuple(validated),
         provider_name=provider_name,
         generation_duration_s=duration_s,
+        model_id=model_id,
     )
 
 
@@ -441,10 +486,25 @@ class PrimeProvider:
 
         duration = time.monotonic() - start
 
+        # Compute source_hash for the first target file
+        source_hash = ""
+        source_path = ""
+        if context.target_files:
+            source_path = context.target_files[0]
+            abs_path = (self._repo_root / source_path) if self._repo_root else Path(source_path)
+            try:
+                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                source_hash = _file_source_hash(content_bytes)
+            except OSError:
+                pass
+
         result = _parse_generation_response(
             response.content,
             self.provider_name,
             duration,
+            context,
+            source_hash,
+            source_path,
         )
 
         logger.info(
@@ -590,10 +650,25 @@ class ClaudeProvider:
         cost = self._estimate_cost(input_tokens, output_tokens)
         self._record_cost(cost)
 
+        # Compute source_hash for the first target file
+        source_hash = ""
+        source_path = ""
+        if context.target_files:
+            source_path = context.target_files[0]
+            abs_path = (self._repo_root / source_path) if self._repo_root else Path(source_path)
+            try:
+                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                source_hash = _file_source_hash(content_bytes)
+            except OSError:
+                pass
+
         result = _parse_generation_response(
             raw_content,
             self.provider_name,
             duration,
+            context,
+            source_hash,
+            source_path,
         )
 
         logger.info(
