@@ -281,11 +281,17 @@ class TestWatcher:
     async def poll_once(self) -> List[IntentSignal]:
         """Run one poll cycle: invoke pytest, parse output, process failures.
 
+        If pytest times out (exit_code == -1), the cycle is skipped and
+        existing failure streaks are preserved -- a timeout does NOT mean
+        tests are passing.
+
         Returns
         -------
         List of :class:`IntentSignal` emitted for stable failures.
         """
         output, exit_code = await self.run_pytest()
+        if exit_code == -1:
+            return []  # timeout -- skip cycle, preserve streaks
         failures = self.parse_pytest_output(output, exit_code)
         return self.process_failures(failures)
 

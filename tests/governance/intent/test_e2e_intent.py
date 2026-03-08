@@ -125,6 +125,7 @@ class TestE2EObserveOnlyStackTrace:
             governed_loop_service=mock_gls,
             narrate_fn=mock_narrate,
         )
+        await engine.start()
 
         # Create an ErrorInterceptor and collect signals
         interceptor = ErrorInterceptor(repo="jarvis")
@@ -188,6 +189,7 @@ class TestE2EDedupBlocksRepeatedSignals:
             config=config,
             governed_loop_service=mock_gls,
         )
+        await engine.start()
 
         # Create a stable test-failure signal
         signal = IntentSignal(

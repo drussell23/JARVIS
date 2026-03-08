@@ -330,6 +330,11 @@ class IntentEngine:
             One of ``"submitted"``, ``"deduplicated"``, ``"rate_limited"``,
             or ``"observed"``.
         """
+        # 0. State guard -- reject signals when engine is inactive
+        if self._state == "inactive":
+            logger.warning("Signal received while engine is inactive, ignoring")
+            return "observed"
+
         # 1. Dedup check
         if not self._dedup.is_new(signal):
             logger.debug(
