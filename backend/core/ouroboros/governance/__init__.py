@@ -231,3 +231,15 @@ from backend.core.ouroboros.governance.intent import (
     IntentEngine,
     IntentEngineConfig,
 )
+
+# --- Real-Time Communication (Layer 3) ---
+from backend.core.ouroboros.governance.comms import (
+    format_narration,
+    SCRIPTS,
+    VoiceNarrator,
+    OpsLogger,
+    TUISelfProgramPanel,
+    SelfProgramPanelState,
+    PipelineStatus,
+    CompletionSummary,
+)
