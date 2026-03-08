@@ -83,6 +83,28 @@ class OperationResult:
 
 
 # ---------------------------------------------------------------------------
+# ReadyToCommitPayload
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ReadyToCommitPayload:
+    """Terminal payload emitted when a governed op completes successfully.
+
+    Contains all information needed for the human to decide whether to commit.
+    """
+
+    op_id: str
+    changed_files: Tuple[str, ...]
+    provider_id: str
+    model_id: str
+    routing_reason: str
+    verification_summary: str
+    rollback_status: str  # "clean" | "rolled_back" | "rollback_failed"
+    suggested_commit_message: str
+
+
+# ---------------------------------------------------------------------------
 # GovernedLoopConfig
 # ---------------------------------------------------------------------------
 
