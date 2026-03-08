@@ -1118,11 +1118,7 @@ class TestGovernedLoopServiceEndToEnd:
         assert result.op_id == ctx.op_id
         assert result.trigger_source == "test"
         # Terminal phase — the mock advances to CANCELLED
-        assert result.terminal_phase in (
-            OperationPhase.COMPLETE,
-            OperationPhase.CANCELLED,
-            OperationPhase.POSTMORTEM,
-        )
+        assert result.terminal_phase is OperationPhase.CANCELLED
 
         await service.stop()
         assert service.state is ServiceState.INACTIVE
