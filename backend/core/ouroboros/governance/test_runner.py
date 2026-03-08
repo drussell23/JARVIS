@@ -165,10 +165,10 @@ class PythonAdapter:
     async def resolve(
         self,
         changed_files: Tuple[Path, ...],
-        repo_root: Path,
+        _repo_root: Path,  # protocol-required; PythonAdapter uses self._repo_root for consistency with run()
     ) -> Tuple[Path, ...]:
         """Delegate to TestRunner.resolve_affected_tests()."""
-        runner = TestRunner(repo_root=repo_root, timeout=self._timeout)
+        runner = TestRunner(repo_root=self._repo_root, timeout=self._timeout)
         return await runner.resolve_affected_tests(changed_files)
 
     async def run(
@@ -176,6 +176,7 @@ class PythonAdapter:
         test_files: Tuple[Path, ...],
         sandbox_dir: Optional[Path],
         timeout_budget_s: float,
+        # TODO: forward _op_id to TestRunner once TestRunner supports tracing (Task 4+)
         _op_id: str,
     ) -> AdapterResult:
         """Run pytest and wrap result in AdapterResult."""
