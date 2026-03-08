@@ -457,6 +457,20 @@ class GovernedLoopService:
         # Build approval provider
         self._approval_provider = CLIApprovalProvider()
 
+        # Build ValidationRunner (LanguageRouter with Python + C++ adapters)
+        from backend.core.ouroboros.governance.test_runner import (
+            CppAdapter,
+            LanguageRouter,
+            PythonAdapter,
+        )
+        validation_runner = LanguageRouter(
+            repo_root=self._config.project_root,
+            adapters={
+                "python": PythonAdapter(repo_root=self._config.project_root),
+                "cpp": CppAdapter(),
+            },
+        )
+
         # Build orchestrator
         orch_config = OrchestratorConfig(
             project_root=self._config.project_root,
@@ -468,6 +482,7 @@ class GovernedLoopService:
             generator=self._generator,
             approval_provider=self._approval_provider,
             config=orch_config,
+            validation_runner=validation_runner,
         )
 
     def _register_canary_slices(self) -> None:

@@ -119,11 +119,13 @@ class GovernedOrchestrator:
         generator: Any,
         approval_provider: Any,
         config: OrchestratorConfig,
+        validation_runner: Any = None,  # LanguageRouter | duck-typed for testing
     ) -> None:
         self._stack = stack
         self._generator = generator
         self._approval_provider = approval_provider
         self._config = config
+        self._validation_runner = validation_runner
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.

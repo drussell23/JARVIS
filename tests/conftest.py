@@ -7,6 +7,7 @@ This file contains:
 - Common test utilities
 """
 
+import asyncio
 import pytest
 import sys
 import os
@@ -135,3 +136,21 @@ def pytest_report_header(config):
         "JARVIS AI Agent Test Suite",
         f"Project Root: {project_root}",
     ]
+
+
+@pytest.fixture(autouse=True)
+async def _cancel_pending_async_tasks():
+    """
+    Cancel any tasks left pending after each async test completes.
+
+    Prevents tests that spawn background asyncio tasks (audio capture,
+    socket listeners, etc.) from hanging the process indefinitely.
+    This is the structural fix for zombie pytest processes.
+    """
+    yield
+    loop = asyncio.get_event_loop()
+    tasks = [t for t in asyncio.all_tasks(loop) if not t.done() and t is not asyncio.current_task()]
+    if tasks:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
