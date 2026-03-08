@@ -10,7 +10,8 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
-from typing import Any, Callable, Coroutine, Dict, Optional, Set
+from collections import OrderedDict
+from typing import Any, Callable, Coroutine
 
 from backend.core.ouroboros.governance.comm_protocol import CommMessage, MessageType
 
@@ -20,6 +21,9 @@ logger = logging.getLogger(__name__)
 
 # Message types that trigger narration
 _NARRATE_TYPES = {MessageType.INTENT, MessageType.DECISION, MessageType.POSTMORTEM}
+
+# Bounded LRU cap for idempotency tracking (~16h at 20 ops/day * 3 types)
+_MAX_NARRATED_IDS = 1000
 
 
 class VoiceNarrator:
@@ -35,7 +39,7 @@ class VoiceNarrator:
         self._debounce_s = debounce_s
         self._source = source
         self._last_narration: float = float("-inf")  # monotonic; -inf so first msg always passes
-        self._narrated_ids: Set[str] = set()  # notification_id for idempotency
+        self._narrated_ids: OrderedDict[str, None] = OrderedDict()  # bounded LRU for idempotency
 
     async def send(self, msg: CommMessage) -> None:
         """CommProtocol transport interface. Called for every pipeline message."""
@@ -48,7 +52,6 @@ class VoiceNarrator:
         ).hexdigest()[:12]
         if notification_id in self._narrated_ids:
             return
-        self._narrated_ids.add(notification_id)
 
         # Debounce: max 1 narration per debounce_s
         now = time.monotonic()
@@ -68,6 +71,10 @@ class VoiceNarrator:
 
         try:
             await self._say_fn(text, source=self._source)
+            # Mark as narrated only on success (so failed TTS can retry)
+            self._narrated_ids[notification_id] = None
+            if len(self._narrated_ids) > _MAX_NARRATED_IDS:
+                self._narrated_ids.popitem(last=False)  # evict oldest
             self._last_narration = now
         except Exception:
             logger.debug("VoiceNarrator: say_fn failed for op %s", msg.op_id)
