@@ -2,17 +2,10 @@
 
 Tests for GovernedLoopService vertical integration extensions.
 """
-from pathlib import Path
-from unittest.mock import MagicMock
-
 import pytest
 
 from backend.core.ouroboros.governance.governed_loop_service import (
-    GovernedLoopConfig,
-    GovernedLoopService,
-    OperationResult,
     ReadyToCommitPayload,
-    ServiceState,
 )
 
 
