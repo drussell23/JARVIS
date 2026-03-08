@@ -35,12 +35,15 @@ Future adapters (TUI, voice, webhook) implement the same
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import OperationContext
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +270,10 @@ class CLIApprovalProvider:
                 event=asyncio.Event(),
                 created_at=datetime.now(tz=timezone.utc),
             )
+            logger.info(
+                "[Approval] Pending: op_id=%s desc=%s files=%s",
+                context.op_id, context.description, context.target_files,
+            )
         return request_id
 
     # -- approve --
@@ -285,6 +292,7 @@ class CLIApprovalProvider:
             if pending.result.status is ApprovalStatus.APPROVED:
                 return pending.result
             # Was REJECTED or EXPIRED -> SUPERSEDED
+            logger.warning("[Approval] SUPERSEDED: %s (approve after %s)", request_id, pending.result.status.name)
             return ApprovalResult(
                 status=ApprovalStatus.SUPERSEDED,
                 approver=approver,
@@ -302,6 +310,7 @@ class CLIApprovalProvider:
         )
         pending.result = result
         pending.event.set()
+        logger.info("[Approval] APPROVED: %s by %s", request_id, approver)
         return result
 
     # -- reject --
@@ -322,6 +331,7 @@ class CLIApprovalProvider:
             if pending.result.status is ApprovalStatus.REJECTED:
                 return pending.result
             # Was APPROVED or EXPIRED -> SUPERSEDED
+            logger.warning("[Approval] SUPERSEDED: %s (reject after %s)", request_id, pending.result.status.name)
             return ApprovalResult(
                 status=ApprovalStatus.SUPERSEDED,
                 approver=approver,
@@ -339,6 +349,7 @@ class CLIApprovalProvider:
         )
         pending.result = result
         pending.event.set()
+        logger.info("[Approval] REJECTED: %s by %s reason=%s", request_id, approver, reason)
         return result
 
     # -- await_decision --
@@ -370,6 +381,7 @@ class CLIApprovalProvider:
                 )
                 pending.result = expired
                 pending.event.set()
+                logger.warning("[Approval] EXPIRED: %s after %.1fs", request_id, timeout_s)
 
         # At this point pending.result is guaranteed non-None
         assert pending.result is not None  # invariant

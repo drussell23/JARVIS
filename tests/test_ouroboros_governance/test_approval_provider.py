@@ -196,7 +196,7 @@ class TestCLIApprovalProvider:
             await asyncio.sleep(0.05)
             await provider.approve(request_id, approver="derek")
 
-        asyncio.get_event_loop().create_task(_approve_after_delay())
+        asyncio.create_task(_approve_after_delay())
         result = await provider.await_decision(request_id, timeout_s=5.0)
         assert result.status is ApprovalStatus.APPROVED
         assert result.approver == "derek"
