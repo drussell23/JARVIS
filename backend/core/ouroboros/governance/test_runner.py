@@ -85,29 +85,26 @@ class MultiAdapterResult:
 # Declarative routing table — no if-chains
 # ---------------------------------------------------------------------------
 
-import re as _re
-
-
 @dataclass(frozen=True)
 class _AdapterRule:
-    pattern: _re.Pattern[str]
+    pattern: re.Pattern[str]
     adapters: Tuple[str, ...]
     reason: str
 
 
 _ADAPTER_RULES: Tuple[_AdapterRule, ...] = (
     _AdapterRule(
-        pattern=_re.compile(r"^(mlforge|bindings)/"),
+        pattern=re.compile(r"^(mlforge|bindings)/"),
         adapters=("python", "cpp"),
         reason="native sublayer: mlforge/bindings require dual verification",
     ),
     _AdapterRule(
-        pattern=_re.compile(r"^(reactor_core|tests)/"),
+        pattern=re.compile(r"^(reactor_core|tests)/"),
         adapters=("python",),
         reason="pure python layer",
     ),
     _AdapterRule(
-        pattern=_re.compile(r".*"),  # catch-all
+        pattern=re.compile(r".*"),  # catch-all
         adapters=("python",),
         reason="default: python adapter",
     ),

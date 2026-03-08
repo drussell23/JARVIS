@@ -89,3 +89,8 @@ def test_multi_adapter_result_failure_class_from_dominant():
     )
     assert mar.passed is False
     assert mar.failure_class == "test"
+
+
+def test_empty_changed_files_returns_empty_frozenset():
+    """No files changed -> no adapters required."""
+    assert _route((), REPO) == frozenset()
