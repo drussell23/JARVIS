@@ -517,3 +517,28 @@ class TestLedgerRecording:
             and call.args[0].state is OperationState.APPLIED
         ]
         assert len(applied_calls) >= 1
+
+
+class TestOrchestratorTerminalInvariant:
+    """Verify the top-level handler always returns a terminal state."""
+
+    @pytest.mark.asyncio
+    async def test_exception_in_classify_phase_returns_terminal(self):
+        """Exception during risk classification -> CANCELLED (not stuck in CLASSIFY)."""
+        stack = _mock_stack()
+        stack.risk_engine.classify.side_effect = RuntimeError("classify exploded")
+        generator = _mock_generator()
+        config = _default_config()
+        ctx = _make_context()
+
+        orch = GovernedOrchestrator(
+            stack=stack,
+            generator=generator,
+            approval_provider=None,
+            config=config,
+        )
+        result = await orch.run(ctx)
+        assert result.phase in (
+            OperationPhase.CANCELLED,
+            OperationPhase.POSTMORTEM,
+        ), f"Expected terminal state, got {result.phase}"

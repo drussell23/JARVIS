@@ -156,10 +156,12 @@ class GovernedOrchestrator:
             try:
                 ctx = ctx.advance(OperationPhase.POSTMORTEM)
             except ValueError:
-                # Already in a terminal phase or transition not allowed;
-                # force a new context at POSTMORTEM via a fresh create+advance
-                # path. Since we must always return terminal, build one.
-                pass
+                # POSTMORTEM not legal from this phase — fall back to CANCELLED
+                # (legal from all non-terminal phases except VERIFY).
+                try:
+                    ctx = ctx.advance(OperationPhase.CANCELLED)
+                except ValueError:
+                    pass  # Already terminal — safe to return as-is
             await self._record_ledger(
                 ctx,
                 OperationState.FAILED,
