@@ -275,3 +275,13 @@ from backend.core.ouroboros.governance.autonomy import (
     TrustGraduator,
     AutonomyState,
 )
+
+# --- Test Runner / Language Adapters (Phase 1.5) ---
+from backend.core.ouroboros.governance.test_runner import (
+    AdapterResult,
+    MultiAdapterResult,
+    BlockedPathError,
+    LanguageRouter,
+    PythonAdapter,
+    CppAdapter,
+)
