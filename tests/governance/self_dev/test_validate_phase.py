@@ -106,7 +106,7 @@ async def test_run_validation_syntax_error_no_subprocess():
     result = await orch._run_validation(_ctx(), candidate, remaining_s=60.0)
 
     assert result.passed is False
-    assert result.failure_class == "test"
+    assert result.failure_class == "build"
     assert "syntax" in result.short_summary.lower() or "SyntaxError" in result.short_summary
     runner.run.assert_not_called()
 

@@ -637,7 +637,7 @@ class GovernedOrchestrator:
                 best_candidate=None,
                 validation_duration_s=0.0,
                 error=syntax_error,
-                failure_class="test",
+                failure_class="build",
                 short_summary=syntax_error[:300],
                 adapter_names_run=(),
             )
@@ -665,19 +665,7 @@ class GovernedOrchestrator:
             sandbox_file = sandbox / target_name
             sandbox_file.write_text(content, encoding="utf-8")
 
-            # Step 4a: No runner — fall back to AST-only pass (safe when no DI)
-            if self._validation_runner is None:
-                return ValidationResult(
-                    passed=True,
-                    best_candidate=candidate,
-                    validation_duration_s=time.monotonic() - t0,
-                    error=None,
-                    failure_class=None,
-                    short_summary="no validation_runner; AST-only gate passed",
-                    adapter_names_run=(),
-                )
-
-            # Step 4b: Run LanguageRouter (or any duck-typed runner)
+            # Step 4: Run LanguageRouter (or any duck-typed runner)
             try:
                 multi = await self._validation_runner.run(
                     changed_files=(sandbox_file,),
@@ -686,13 +674,13 @@ class GovernedOrchestrator:
                     op_id=ctx.op_id,
                 )
             except BlockedPathError as exc:
-                # Security gate rejection — treat as a build failure (CANCELLED), not infra (POSTMORTEM)
+                # Security gate rejection → failure_class="security" → CANCELLED (not POSTMORTEM)
                 return ValidationResult(
                     passed=False,
                     best_candidate=None,
                     validation_duration_s=time.monotonic() - t0,
                     error=str(exc),
-                    failure_class="build",
+                    failure_class="security",
                     short_summary=f"BlockedPathError: {str(exc)[:280]}",
                     adapter_names_run=(),
                 )
