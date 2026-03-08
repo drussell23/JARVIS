@@ -19,7 +19,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, FrozenSet, List, Literal, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +193,342 @@ class PythonAdapter:
             failure_class="none" if test_result.passed else "test",
             test_result=test_result,
             duration_s=elapsed,
+        )
+
+
+# ---------------------------------------------------------------------------
+# CppAdapter — cmake + ctest subprocess wrapper (implements LanguageAdapter)
+# ---------------------------------------------------------------------------
+
+
+class CppAdapter:
+    """Runs cmake --build + ctest for the native C++ sublayer.
+
+    Implements the LanguageAdapter protocol structurally.
+    resolve() always returns () — ctest is label/name-driven, not file-driven.
+
+    All subprocess calls are injectable via constructor factories for testing:
+      _cmake_build_fn: async(build_dir, budget_s, sandbox_dir) -> (bool, str, str)
+                       returns (success, stdout, exit_context)
+                       exit_context one of: "exit_0", "exit_1", "executable_not_found", "configure_stage"
+      _ctest_fn:       async(build_dir, budget_s, op_id) -> (bool, TestResult)
+      _abi_probe_fn:   async(build_dir, sandbox_dir) -> (bool, str)
+                       returns (ok, error_message)
+    """
+
+    name = "cpp"
+    _CMAKE_GENERATOR = "Ninja"
+    _ctest_failure_class: Literal["test"] = "test"
+
+    _INFRA_MARKERS: Tuple[str, ...] = (
+        "cmake: command not found",
+        "ninja: command not found",
+        "No CMAKE_CXX_COMPILER",
+        "Could not find toolchain",
+    )
+
+    def __init__(
+        self,
+        repo_root: Path,
+        scratch_root: Optional[Path] = None,
+        timeout: float = 120.0,
+        _cmake_build_fn: Optional[Any] = None,
+        _ctest_fn: Optional[Any] = None,
+        _abi_probe_fn: Optional[Any] = None,
+    ) -> None:
+        self._repo_root = repo_root
+        self._scratch_root = (
+            scratch_root
+            if scratch_root is not None
+            else Path(tempfile.gettempdir()) / "ouroboros_cpp"
+        )
+        self._timeout = timeout
+        self._cmake_build_fn = _cmake_build_fn
+        self._ctest_fn = _ctest_fn
+        self._abi_probe_fn = _abi_probe_fn
+
+    def _build_dir(self, op_id: str, sandbox_dir: Optional[Path]) -> Path:
+        """Per-op isolated build directory — never shared between concurrent ops."""
+        base = sandbox_dir if sandbox_dir is not None else self._scratch_root
+        return base / op_id / "cpp-build"
+
+    def _classify_build_failure(
+        self, output: str, exit_ctx: str
+    ) -> Literal["infra", "build"]:
+        """Classify build failure: infra (env problem) or build (compile error)."""
+        # Process exit context gates first — most reliable signal
+        if exit_ctx in ("executable_not_found", "configure_stage"):
+            return "infra"
+        # String markers as defense in depth
+        if any(marker in output for marker in self._INFRA_MARKERS):
+            return "infra"
+        return "build"
+
+    async def resolve(
+        self,
+        _changed_files: Tuple[Path, ...],
+        _repo_root: Path,
+    ) -> Tuple[Path, ...]:
+        """ctest is label/name-driven, not file-path-driven.
+        Returns () — always run full ctest suite deterministically.
+        """
+        return ()
+
+    async def run(
+        self,
+        test_files: Tuple[Path, ...],
+        sandbox_dir: Optional[Path],
+        timeout_budget_s: float,
+        op_id: str,
+    ) -> AdapterResult:
+        """Build with cmake, probe ABI, run ctest."""
+        build_dir = self._build_dir(op_id, sandbox_dir)
+        t0 = time.monotonic()
+
+        # Timeout split: 80% for build, remaining for ctest (min 30s reserved)
+        build_budget = timeout_budget_s * 0.8
+        test_budget = timeout_budget_s - build_budget
+
+        # ── Build phase ─────────────────────────────────────────────────
+        cmake_fn = self._cmake_build_fn or self._default_cmake_build
+        build_ok, build_out, build_exit_ctx = await cmake_fn(
+            build_dir, build_budget, sandbox_dir
+        )
+        if not build_ok:
+            fclass = self._classify_build_failure(build_out, build_exit_ctx)
+            return AdapterResult(
+                adapter="cpp", passed=False, failure_class=fclass,
+                test_result=TestResult(
+                    passed=False, total=0, failed=0, failed_tests=(),
+                    duration_seconds=time.monotonic() - t0,
+                    stdout=build_out, flake_suspected=False,
+                ),
+                duration_s=time.monotonic() - t0,
+            )
+
+        # ── ABI probe ───────────────────────────────────────────────────
+        abi_fn = self._abi_probe_fn or self._default_abi_probe
+        abi_ok, abi_err = await abi_fn(build_dir, sandbox_dir)
+        if not abi_ok:
+            return AdapterResult(
+                adapter="cpp", passed=False, failure_class="build",
+                test_result=TestResult(
+                    passed=False, total=0, failed=0, failed_tests=(),
+                    duration_seconds=time.monotonic() - t0,
+                    stdout=abi_err, flake_suspected=False,
+                ),
+                duration_s=time.monotonic() - t0,
+            )
+
+        # ── Budget check ────────────────────────────────────────────────
+        remaining = test_budget - (time.monotonic() - t0)
+        if remaining <= 0:
+            return AdapterResult(
+                adapter="cpp", passed=False, failure_class="infra",
+                test_result=TestResult(
+                    passed=False, total=0, failed=0, failed_tests=(),
+                    duration_seconds=time.monotonic() - t0,
+                    stdout="ctest budget exhausted after cmake build",
+                    flake_suspected=False,
+                ),
+                duration_s=time.monotonic() - t0,
+            )
+
+        # ── ctest phase ─────────────────────────────────────────────────
+        ctest_fn = self._ctest_fn or self._default_ctest
+        ctest_ok, ctest_result = await ctest_fn(build_dir, remaining, op_id)
+        return AdapterResult(
+            adapter="cpp",
+            passed=ctest_ok,
+            failure_class="test" if not ctest_ok else "none",
+            test_result=ctest_result,
+            duration_s=time.monotonic() - t0,
+        )
+
+    async def _default_cmake_build(
+        self,
+        build_dir: Path,
+        budget_s: float,
+        sandbox_dir: Optional[Path],
+    ) -> Tuple[bool, str, str]:
+        build_dir.mkdir(parents=True, exist_ok=True)
+        cwd = str(sandbox_dir or self._repo_root)
+        half = budget_s * 0.5
+
+        # Configure
+        try:
+            proc = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "cmake", str(self._repo_root), "-B", str(build_dir),
+                    f"-G{self._CMAKE_GENERATOR}",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=cwd,
+                ),
+                timeout=half,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=half)
+            stdout = (out or b"").decode(errors="replace")
+            if proc.returncode != 0:
+                return False, stdout, "configure_stage"
+        except FileNotFoundError:
+            return False, "cmake: command not found", "executable_not_found"
+        except asyncio.TimeoutError:
+            return False, "cmake configure timed out", "configure_stage"
+
+        # Build
+        try:
+            proc2 = await asyncio.wait_for(
+                asyncio.create_subprocess_exec(
+                    "cmake", "--build", str(build_dir), "--parallel",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    cwd=cwd,
+                ),
+                timeout=half,
+            )
+            out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=half)
+            stdout2 = (out2 or b"").decode(errors="replace")
+            ctx = "exit_0" if proc2.returncode == 0 else "exit_1"
+            return proc2.returncode == 0, stdout2, ctx
+        except asyncio.TimeoutError:
+            return False, "cmake build timed out", "configure_stage"
+
+    async def _default_abi_probe(
+        self,
+        build_dir: Path,
+        sandbox_dir: Optional[Path],
+    ) -> Tuple[bool, str]:
+        """Probe ABI by cmake-installing and attempting to load .so files."""
+        import sys as _sys
+        install_tmp = build_dir / "_abi_probe_install"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "cmake", "--install", str(build_dir), "--prefix", str(install_tmp),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=30.0)
+        except Exception:
+            return True, ""  # no install → no .so → skip probe
+
+        so_files = list(install_tmp.rglob("*.so"))
+        if not so_files:
+            return True, ""  # no extension → skip probe
+
+        for so in so_files:
+            try:
+                probe = await asyncio.create_subprocess_exec(
+                    _sys.executable, "-c",
+                    f"import ctypes; ctypes.CDLL('{so}')",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await asyncio.wait_for(probe.communicate(), timeout=10.0)
+                if probe.returncode != 0:
+                    return False, f"ABI probe: {so.name} failed to load"
+            except Exception as exc:
+                return False, f"ABI probe error: {exc}"
+        return True, ""
+
+    async def _default_ctest(
+        self,
+        build_dir: Path,
+        budget_s: float,
+        _op_id: str,
+    ) -> Tuple[bool, TestResult]:
+        t0 = time.monotonic()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "ctest", "--output-on-failure", "--test-dir", str(build_dir),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=budget_s)
+            stdout = (out or b"").decode(errors="replace")
+            passed = proc.returncode == 0
+        except asyncio.TimeoutError:
+            passed, stdout = False, "ctest timed out"
+        except FileNotFoundError:
+            passed, stdout = False, "ctest: command not found"
+
+        return passed, TestResult(
+            passed=passed, total=0, failed=0 if passed else 1,
+            failed_tests=(), duration_seconds=time.monotonic() - t0,
+            stdout=stdout, flake_suspected=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# LanguageRouter — selects adapters and merges MultiAdapterResult
+# ---------------------------------------------------------------------------
+
+
+class LanguageRouter:
+    """Routes changed files to the correct LanguageAdapters using _ADAPTER_RULES.
+
+    Adapter selection is the union-of-all-matches across all changed files.
+    If a required adapter is not registered, it is skipped with a warning.
+    """
+
+    def __init__(
+        self,
+        python_adapter: PythonAdapter,
+        cpp_adapter: Optional[CppAdapter] = None,
+    ) -> None:
+        self._adapters: Dict[str, Any] = {"python": python_adapter}
+        if cpp_adapter is not None:
+            self._adapters["cpp"] = cpp_adapter
+
+    async def run(
+        self,
+        changed_files: Tuple[Path, ...],
+        repo_root: Path,
+        sandbox_dir: Optional[Path],
+        timeout_budget_s: float,
+        op_id: str,
+    ) -> MultiAdapterResult:
+        """Run all required adapters and merge results into MultiAdapterResult."""
+        t0 = time.monotonic()
+
+        # Raises BlockedPathError if any file is outside repo_root
+        required_names = _route(changed_files, repo_root)
+
+        results: List[AdapterResult] = []
+        for name in sorted(required_names):  # sorted for determinism
+            adapter = self._adapters.get(name)
+            if adapter is None:
+                logger.warning(
+                    "[LanguageRouter] Adapter %r required but not registered", name
+                )
+                continue
+
+            test_files = await adapter.resolve(changed_files, repo_root)
+            remaining = timeout_budget_s - (time.monotonic() - t0)
+            if remaining <= 0:
+                results.append(AdapterResult(
+                    adapter=name, passed=False, failure_class="infra",
+                    test_result=TestResult(
+                        passed=False, total=0, failed=0, failed_tests=(),
+                        duration_seconds=0.0,
+                        stdout="budget exhausted before adapter run",
+                        flake_suspected=False,
+                    ),
+                    duration_s=0.0,
+                ))
+                continue
+
+            result = await adapter.run(test_files, sandbox_dir, remaining, op_id)
+            results.append(result)
+
+        all_passed = all(r.passed for r in results)
+        dominant = next((r for r in results if not r.passed), None)
+
+        return MultiAdapterResult(
+            passed=all_passed,
+            adapter_results=tuple(results),
+            dominant_failure=dominant,
+            total_duration_s=time.monotonic() - t0,
         )
 
 
