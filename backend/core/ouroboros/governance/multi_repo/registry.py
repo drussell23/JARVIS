@@ -95,7 +95,11 @@ class RepoRegistry:
     async def read_file(self, repo: str, path: str) -> Optional[str]:
         """Read a file from a repo. Returns None if file doesn't exist."""
         config = self._repos[repo]
-        file_path = config.local_path / path
+        file_path = (config.local_path / path).resolve()
+        # Path traversal guard
+        if not str(file_path).startswith(str(config.local_path.resolve())):
+            logger.warning("Path traversal blocked: %s", path)
+            return None
         if not file_path.exists():
             return None
         return await asyncio.to_thread(file_path.read_text, encoding="utf-8")

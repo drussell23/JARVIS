@@ -55,15 +55,25 @@ class RepoPipelineManager:
 
         pipeline = self._pipelines[repo_name]
 
-        # Blast radius analysis
+        # Blast radius analysis — failure escalates to approval_required
         blast_report = None
         if self._blast_analyzer is not None:
             try:
                 blast_report = await self._blast_analyzer.analyze(signal)
             except Exception:
                 logger.warning(
-                    "Blast radius analysis failed for %s, proceeding without",
+                    "Blast radius analysis failed for %s, escalating to approval_required",
                     signal.description,
+                )
+                from .blast_radius import BlastRadiusReport
+                blast_report = BlastRadiusReport(
+                    target_repo=repo_name,
+                    target_files=signal.target_files,
+                    affected_repos=(repo_name,),
+                    affected_files=(),
+                    crosses_repo_boundary=True,
+                    risk_escalation="approval_required",
+                    contract_impact=None,
                 )
 
         # Build operation context
