@@ -19,7 +19,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, FrozenSet, List, Literal, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,111 @@ class TestResult:
     duration_seconds: float
     stdout: str
     flake_suspected: bool
+
+
+# ---------------------------------------------------------------------------
+# Language adapter types
+# ---------------------------------------------------------------------------
+
+
+class BlockedPathError(Exception):
+    """Raised when a changed file resolves outside the repo root.
+    Pipeline must be CANCELLED — this is a security gate.
+    """
+
+
+@dataclass(frozen=True)
+class AdapterResult:
+    """Result from a single LanguageAdapter run."""
+
+    adapter: str  # "python" | "cpp"
+    passed: bool
+    failure_class: Literal["none", "test", "build", "infra"]
+    # "none"  = success
+    # "test"  = test assertion failure
+    # "build" = compile error or ABI drift
+    # "infra" = toolchain missing / configure-stage failure
+    test_result: TestResult
+    duration_s: float
+
+
+@dataclass(frozen=True)
+class MultiAdapterResult:
+    """Combined result from all adapters for one operation."""
+
+    passed: bool  # True only if ALL adapters passed
+    adapter_results: Tuple[AdapterResult, ...]
+    dominant_failure: Optional[AdapterResult]  # first failing adapter
+    total_duration_s: float
+
+    @property
+    def failure_class(self) -> str:
+        return self.dominant_failure.failure_class if self.dominant_failure else "none"
+
+
+# ---------------------------------------------------------------------------
+# Declarative routing table — no if-chains
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+
+@dataclass(frozen=True)
+class _AdapterRule:
+    pattern: _re.Pattern[str]
+    adapters: Tuple[str, ...]
+    reason: str
+
+
+_ADAPTER_RULES: Tuple[_AdapterRule, ...] = (
+    _AdapterRule(
+        pattern=_re.compile(r"^(mlforge|bindings)/"),
+        adapters=("python", "cpp"),
+        reason="native sublayer: mlforge/bindings require dual verification",
+    ),
+    _AdapterRule(
+        pattern=_re.compile(r"^(reactor_core|tests)/"),
+        adapters=("python",),
+        reason="pure python layer",
+    ),
+    _AdapterRule(
+        pattern=_re.compile(r".*"),  # catch-all
+        adapters=("python",),
+        reason="default: python adapter",
+    ),
+)
+
+
+def _normalize(path: Path, repo_root: Path) -> str:
+    """Resolve path to repo-relative POSIX string.
+
+    Raises BlockedPathError if path resolves outside repo_root.
+    This is for routing decisions only (not the _is_safe_path test security check).
+    """
+    try:
+        resolved = path.resolve()
+        return resolved.relative_to(repo_root.resolve()).as_posix()
+    except ValueError:
+        raise BlockedPathError(
+            f"Path {path} resolves outside repo root {repo_root}. "
+            "Pipeline CANCELLED — security gate."
+        )
+
+
+def _route(changed_files: Tuple[Path, ...], repo_root: Path) -> FrozenSet[str]:
+    """Return union of required adapters across all changed files.
+
+    Uses first-matching rule per file (table order), union across all files.
+    Raises BlockedPathError if any file is outside repo_root.
+    """
+    required: set[str] = set()
+    for path in changed_files:
+        norm = _normalize(path, repo_root)
+        for rule in _ADAPTER_RULES:
+            if rule.pattern.match(norm):
+                required.update(rule.adapters)
+                break
+    return frozenset(required)
 
 
 # ---------------------------------------------------------------------------
