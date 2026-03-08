@@ -1022,3 +1022,107 @@ class TestGovernedLoopServiceExports:
 
     def test_import_claude_provider(self) -> None:
         from backend.core.ouroboros.governance import ClaudeProvider
+
+
+# -- GovernedLoopService End-to-End -----------------------------------------
+
+
+def _make_e2e_stack() -> MagicMock:
+    """Build a mock GovernanceStack with enough surface for GovernedLoopService.
+
+    GovernedLoopService.start() calls:
+      _build_components()  — needs stack for GovernedOrchestrator
+      _register_canary_slices() — needs stack.canary.register_slice()
+      _attach_to_stack()  — sets stack.orchestrator / generator / approval_provider
+    """
+    stack = MagicMock()
+    # canary.register_slice() must be callable without error
+    stack.canary.register_slice = MagicMock()
+    # Attributes set during _attach_to_stack must be settable (MagicMock allows this)
+    stack.orchestrator = None
+    stack.generator = None
+    stack.approval_provider = None
+    # can_write() — needed by GovernedOrchestrator
+    stack.can_write = MagicMock(return_value=(True, "ok"))
+    # _started — GovernanceStack health/lifecycle flag
+    stack._started = True
+    # risk_engine — needed by orchestrator
+    from backend.core.ouroboros.governance.risk_engine import (
+        RiskClassification,
+        RiskTier,
+    )
+    stack.risk_engine.classify = MagicMock(
+        return_value=RiskClassification(
+            tier=RiskTier.SAFE_AUTO, reason_code="test_default",
+        )
+    )
+    # ledger — async
+    stack.ledger = AsyncMock()
+    stack.ledger.append = AsyncMock(return_value=True)
+    # comm — async
+    stack.comm = AsyncMock()
+    # change_engine — async
+    stack.change_engine = AsyncMock()
+    stack.change_engine.execute = AsyncMock(
+        return_value=MagicMock(success=True, rolled_back=False, op_id="test")
+    )
+    return stack
+
+
+def _make_e2e_context() -> "OperationContext":
+    """Build a test OperationContext in the initial CLASSIFY phase."""
+    from backend.core.ouroboros.governance.op_context import OperationContext
+
+    return OperationContext.create(
+        target_files=("tests/test_foo.py",),
+        description="Integration test operation",
+    )
+
+
+@pytest.mark.asyncio
+class TestGovernedLoopServiceEndToEnd:
+    """End-to-end test of GovernedLoopService with mocked providers."""
+
+    async def test_submit_through_service(self) -> None:
+        """Submit an operation through GovernedLoopService and verify result."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+            OperationResult,
+            ServiceState,
+        )
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+
+        stack = _make_e2e_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        service = GovernedLoopService(
+            stack=stack,
+            prime_client=None,
+            config=config,
+        )
+
+        await service.start()
+        assert service.state in (ServiceState.ACTIVE, ServiceState.DEGRADED)
+
+        # Mock orchestrator.run to return a terminal context.
+        # Use side_effect so whatever ctx is submitted gets advanced to CANCELLED.
+        async def _fake_run(ctx):
+            return ctx.advance(OperationPhase.CANCELLED)
+
+        service._orchestrator.run = AsyncMock(side_effect=_fake_run)
+
+        ctx = _make_e2e_context()
+        result = await service.submit(ctx, trigger_source="test")
+
+        assert isinstance(result, OperationResult)
+        assert result.op_id == ctx.op_id
+        assert result.trigger_source == "test"
+        # Terminal phase — the mock advances to CANCELLED
+        assert result.terminal_phase in (
+            OperationPhase.COMPLETE,
+            OperationPhase.CANCELLED,
+            OperationPhase.POSTMORTEM,
+        )
+
+        await service.stop()
+        assert service.state is ServiceState.INACTIVE
