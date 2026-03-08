@@ -62,11 +62,14 @@ def test_decide_already_decided_returns_superseded(store: ApprovalStore):
 
 
 def test_decide_idempotent_same_decision(store: ApprovalStore):
+    # Under strict CAS semantics, any second decide() call on a non-PENDING
+    # record returns SUPERSEDED — even if the decision matches.  This ensures
+    # concurrent callers cannot both claim "winner" status.
     store.create("op-123", policy_version="v1.0")
     r1 = store.decide("op-123", ApprovalState.APPROVED, reason="ok")
+    assert r1.state == ApprovalState.APPROVED
     r2 = store.decide("op-123", ApprovalState.APPROVED, reason="ok again")
-    assert r2.state == ApprovalState.APPROVED
-    assert r2.decided_at == r1.decided_at  # same original decision
+    assert r2.state == ApprovalState.SUPERSEDED
 
 
 def test_decide_unknown_raises(store: ApprovalStore):

@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 _DEFAULT_STORE_PATH = Path.home() / ".jarvis" / "approvals" / "pending.json"
 _STORE_VERSION = 1
 
+# Ledger states that represent a terminal (non-recoverable) outcome.
+# Kept as raw string values to avoid importing ledger.OperationState here
+# (prevents a circular import between approval_store ↔ ledger).
+_TERMINAL_LEDGER_STATES: frozenset[str] = frozenset({
+    "rolled_back", "failed", "blocked",
+})
+
 
 class ApprovalState(enum.Enum):
     """Possible states for an approval record."""
@@ -79,40 +86,121 @@ class ApprovalStore:
     def decide(
         self, op_id: str, decision: ApprovalState, reason: str = "",
     ) -> ApprovalRecord:
-        """CAS transition: PENDING to decision. First valid wins."""
-        data = self._read()
-        entry = data.get(op_id)
-        if entry is None:
-            raise KeyError(f"Unknown approval op_id: {op_id!r}")
+        """CAS transition: PENDING to decision. First valid wins.
 
-        current_state = ApprovalState(entry["state"])
+        The read-check-write is performed under a single exclusive flock so
+        that concurrent callers are serialised and exactly one writer wins.
 
-        # Idempotent: same decision returns existing
-        if current_state == decision:
+        Under concurrency, only the thread that observes PENDING and
+        successfully writes the decision receives a record with the chosen
+        state.  Any thread that observes an already-decided record (even if
+        the decision matches) receives an ApprovalRecord with state SUPERSEDED.
+        """
+        lock_path = self._path.with_suffix(".lock")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            # Read inside the exclusive lock so no other writer can race.
+            data = self._read_unlocked()
+            entry = data.get(op_id)
+            if entry is None:
+                raise KeyError(f"Unknown approval op_id: {op_id!r}")
+
+            current_state = ApprovalState(entry["state"])
+
+            # Already decided (by this call or another concurrent one) → SUPERSEDED.
+            if current_state != ApprovalState.PENDING:
+                return ApprovalRecord(
+                    op_id=op_id,
+                    state=ApprovalState.SUPERSEDED,
+                    actor="cli_user",
+                    channel="cli",
+                    reason=reason,
+                    policy_version=entry["policy_version"],
+                    created_at=entry["created_at"],
+                    decided_at=time.time(),
+                )
+
+            # Apply decision — write while still holding the lock.
+            now = time.time()
+            entry["state"] = decision.value
+            entry["reason"] = reason
+            entry["actor"] = "cli_user"
+            entry["decided_at"] = now
+            data[op_id] = entry
+            self._atomic_write_locked(data)
             return self._to_record(op_id, entry)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
-        # Already decided with different status means SUPERSEDED
-        if current_state != ApprovalState.PENDING:
-            return ApprovalRecord(
-                op_id=op_id,
-                state=ApprovalState.SUPERSEDED,
-                actor="cli_user",
-                channel="cli",
-                reason=reason,
-                policy_version=entry["policy_version"],
-                created_at=entry["created_at"],
-                decided_at=time.time(),
-            )
+    def decide_with_ledger(
+        self,
+        op_id: str,
+        decision: ApprovalState,
+        ledger: Any,  # OperationLedger — kept as Any to avoid circular import
+        reason: str = "",
+    ) -> str:
+        """CAS transition with ledger terminal check in same lock scope.
 
-        # Apply decision
-        now = time.time()
-        entry["state"] = decision.value
-        entry["reason"] = reason
-        entry["actor"] = "cli_user"
-        entry["decided_at"] = now
-        data[op_id] = entry
-        self._atomic_write(data)
-        return self._to_record(op_id, entry)
+        Combines the approval store CAS write with a synchronous ledger read
+        so that both the "already decided" guard and the "ledger is terminal"
+        guard are evaluated atomically under the same exclusive flock.
+
+        Parameters
+        ----------
+        op_id:
+            The operation identifier to decide on.
+        decision:
+            The :class:`ApprovalState` to apply (e.g. APPROVED or REJECTED).
+        ledger:
+            An ``OperationLedger`` instance.  Its ``get_latest_state_sync()``
+            method is called inside the lock scope.
+        reason:
+            Optional human-readable explanation for the decision.
+
+        Returns
+        -------
+        str
+            ``"ok"``         — transition applied successfully.
+            ``"superseded"`` — ledger is already terminal, or the store record
+                               was already decided by another writer.
+            ``"not_found"``  — *op_id* is unknown in the approval store.
+        """
+        lock_path = self._path.with_suffix(".lock")
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+
+            # Read inside the exclusive lock — no other writer can race.
+            data = self._read_unlocked()
+            entry = data.get(op_id)
+            if entry is None or not isinstance(entry, dict):
+                return "not_found"
+
+            current_state = ApprovalState(entry["state"])
+            if current_state != ApprovalState.PENDING:
+                return "superseded"
+
+            # Check ledger terminal state synchronously — safe inside flock.
+            ledger_state = ledger.get_latest_state_sync(op_id)
+            if ledger_state is not None and ledger_state.value in _TERMINAL_LEDGER_STATES:
+                return "superseded"
+
+            # All guards passed — write while still holding the lock.
+            now = time.time()
+            entry["state"] = decision.value
+            entry["decided_at"] = now
+            entry["reason"] = reason
+            data[op_id] = entry
+            self._atomic_write_locked(data)
+            return "ok"
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     def get(self, op_id: str) -> Optional[ApprovalRecord]:
         """Read current state for an op_id."""
@@ -178,17 +266,44 @@ class ApprovalStore:
         lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            with tempfile.NamedTemporaryFile(
-                "w", dir=self._path.parent, delete=False, suffix=".tmp",
-            ) as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-                tmp = Path(f.name)
-            tmp.rename(self._path)
+            self._atomic_write_locked(data)
         finally:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
+
+    def _read_unlocked(self) -> Dict[str, Any]:
+        """Read store file without acquiring a lock.
+
+        Must only be called when the caller already holds the exclusive
+        lockfile flock.  Returns empty dict on missing or corrupt file.
+        """
+        if not self._path.exists():
+            return {"_version": _STORE_VERSION}
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                return {"_version": _STORE_VERSION}
+            return data
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning("Approval store corrupt in _read_unlocked: %s", exc)
+            return {"_version": _STORE_VERSION}
+
+    def _atomic_write_locked(self, data: Dict[str, Any]) -> None:
+        """Write via tempfile + fsync + rename.
+
+        Must only be called when the caller already holds the exclusive
+        lockfile flock.  Does NOT re-acquire the lock.
+        """
+        data["_version"] = _STORE_VERSION
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w", dir=self._path.parent, delete=False, suffix=".tmp",
+        ) as f:
+            json.dump(data, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+            tmp = Path(f.name)
+        tmp.rename(self._path)
 
     @staticmethod
     def _to_record(op_id: str, entry: Dict[str, Any]) -> ApprovalRecord:
