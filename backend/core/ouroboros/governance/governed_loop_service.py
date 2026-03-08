@@ -404,7 +404,7 @@ class GovernedLoopService:
                     PrimeProvider,
                 )
 
-                primary = PrimeProvider(self._prime_client)
+                primary = PrimeProvider(self._prime_client, repo_root=self._config.project_root)
                 if await primary.health_probe():
                     logger.info("[GovernedLoop] PrimeProvider: healthy")
                 else:
@@ -428,6 +428,7 @@ class GovernedLoopService:
                     model=self._config.claude_model,
                     max_cost_per_op=self._config.claude_max_cost_per_op,
                     daily_budget=self._config.claude_daily_budget,
+                    repo_root=self._config.project_root,
                 )
                 logger.info("[GovernedLoop] ClaudeProvider: configured")
             except Exception as exc:

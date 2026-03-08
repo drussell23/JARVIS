@@ -16,12 +16,14 @@ Components
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import logging
 import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
@@ -37,51 +39,235 @@ logger = logging.getLogger("Ouroboros.Providers")
 # ---------------------------------------------------------------------------
 
 _CODEGEN_SYSTEM_PROMPT = (
-    "You are a precise code generation assistant. You MUST respond with valid JSON only. "
-    "No markdown, no explanations, no preamble. Only the JSON object."
+    "You are a precise code modification assistant for the JARVIS codebase. "
+    "You MUST respond with valid JSON only, matching schema_version 2b.1. "
+    "No markdown preamble, no explanations outside the JSON. Only the JSON object."
 )
 
-_CODEGEN_SCHEMA_INSTRUCTION = """
-Return a JSON object matching this exact schema:
-{
+# ── Phase 2B: size/security constants ────────────────────────────────────
+_MAX_TARGET_FILE_CHARS = 6000      # full content below this
+_TARGET_FILE_HEAD_CHARS = 4000     # head kept on truncation
+_TARGET_FILE_TAIL_CHARS = 1000     # tail kept on truncation
+_MAX_IMPORT_CONTEXT_CHARS = 1500   # total across all discovered import files
+_MAX_TEST_CONTEXT_CHARS = 1500     # total across all discovered test files
+_MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
+_MAX_TEST_FILES = 2                # hard cap on discovered test files
+_SCHEMA_VERSION = "2b.1"
+
+
+def _safe_context_path(repo_root: Path, target: Path) -> Path:
+    """Resolve target path and verify it stays within repo_root.
+
+    Raises BlockedPathError if the resolved path is outside repo_root
+    or if the path is a symlink.
+    """
+    from backend.core.ouroboros.governance.test_runner import BlockedPathError
+    # Check for symlink before resolving (resolve() follows symlinks)
+    if target.is_symlink():
+        raise BlockedPathError(f"Symlink not allowed in context discovery: {target}")
+    resolved = target.resolve()
+    repo_resolved = repo_root.resolve()
+    if not str(resolved).startswith(str(repo_resolved) + "/") and resolved != repo_resolved:
+        raise BlockedPathError(f"Context file outside repo root: {target}")
+    return resolved
+
+
+def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -> str:
+    """Read file content, applying truncation with an explicit marker if needed."""
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    if len(content) <= max_chars:
+        return content
+    head = content[:_TARGET_FILE_HEAD_CHARS]
+    tail = content[-_TARGET_FILE_TAIL_CHARS:]
+    omitted_bytes = len(content.encode()) - len(head.encode()) - len(tail.encode())
+    omitted_lines = content.count("\n") - head.count("\n") - tail.count("\n")
+    marker = f"\n[TRUNCATED: {omitted_bytes} bytes, {omitted_lines} lines omitted]\n"
+    return head + marker + tail
+
+
+def _file_source_hash(content: str) -> str:
+    """Return hex SHA-256 of file content."""
+    return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _find_context_files(
+    target_file: Path,
+    repo_root: Path,
+) -> Tuple[List[Path], List[Path]]:
+    """Discover import sources and test files related to target_file.
+
+    Returns (import_files, test_files) — each capped by hard limits.
+    All returned paths are safe (within repo_root, no symlinks).
+    """
+    from backend.core.ouroboros.governance.test_runner import BlockedPathError
+
+    import_files: List[Path] = []
+    test_files: List[Path] = []
+
+    # -- Import context: scan first 60 lines for import statements --------
+    try:
+        lines = target_file.read_text(encoding="utf-8", errors="replace").splitlines()[:60]
+    except OSError:
+        lines = []
+
+    import_pattern = re.compile(r"^\s*(?:from|import)\s+([\w.]+)")
+    for line in lines:
+        if len(import_files) >= _MAX_IMPORT_FILES:
+            break
+        m = import_pattern.match(line)
+        if not m:
+            continue
+        module_name = m.group(1).split(".")[0]
+        # Look for module as a .py file in repo
+        candidate = repo_root / f"{module_name}.py"
+        if not candidate.exists():
+            # Try subdirectory package
+            candidate = repo_root / module_name / "__init__.py"
+        if not candidate.exists():
+            continue
+        try:
+            safe = _safe_context_path(repo_root, candidate)
+            if safe not in import_files:
+                import_files.append(safe)
+        except BlockedPathError:
+            continue
+
+    # -- Test context: find test_*.py that mentions target module name ----
+    target_stem = target_file.stem
+    tests_dir = repo_root / "tests"
+    if tests_dir.is_dir():
+        for test_file in sorted(tests_dir.rglob("test_*.py")):
+            if len(test_files) >= _MAX_TEST_FILES:
+                break
+            try:
+                text = test_file.read_text(encoding="utf-8", errors="replace")
+                if target_stem in text:
+                    safe = _safe_context_path(repo_root, test_file)
+                    test_files.append(safe)
+            except (OSError, Exception):
+                continue
+
+    return import_files, test_files
+
+
+def _build_codegen_prompt(
+    ctx: "OperationContext",
+    repo_root: Optional[Path] = None,
+) -> str:
+    """Build an enriched codegen prompt with file contents, context, and schema.
+
+    Reads each target file from disk, hashes it, applies truncation, discovers
+    surrounding import/test context (capped), and injects the schema_version 2b.1
+    output specification.
+    """
+    from backend.core.ouroboros.governance.test_runner import BlockedPathError
+
+    if repo_root is None:
+        repo_root = Path.cwd()
+
+    # ── 1. Build source snapshot for each target file ──────────────────
+    file_sections: List[str] = []
+    for raw_path in ctx.target_files:
+        abs_path = (repo_root / raw_path).resolve()
+        try:
+            abs_path = _safe_context_path(repo_root, abs_path)
+        except BlockedPathError as exc:
+            file_sections.append(f"## File: {raw_path}\n[BLOCKED: {exc}]\n")
+            continue
+
+        content = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+        source_hash = _file_source_hash(content)
+        size_bytes = len(content.encode())
+        line_count = content.count("\n")
+        truncated = _read_with_truncation(abs_path)
+
+        file_sections.append(
+            f"## File: {raw_path} [SHA-256: {source_hash[:12]}]"
+            f" [{size_bytes} bytes, {line_count} lines]\n"
+            f"```\n{truncated}\n```"
+        )
+
+    # ── 2. Discover surrounding context (import sources + tests) ────────
+    context_parts: List[str] = []
+    if ctx.target_files:
+        primary = (repo_root / ctx.target_files[0]).resolve()
+        try:
+            primary = _safe_context_path(repo_root, primary)
+            import_files, test_files = _find_context_files(primary, repo_root)
+        except BlockedPathError:
+            import_files, test_files = [], []
+
+        import_budget = _MAX_IMPORT_CONTEXT_CHARS
+        for ifile in import_files:
+            try:
+                text = ifile.read_text(encoding="utf-8", errors="replace")
+                snippet = "\n".join(text.splitlines()[:30])[:import_budget]
+                rel = ifile.relative_to(repo_root)
+                context_parts.append(f"### Import source: {rel}\n```\n{snippet}\n```")
+                import_budget -= len(snippet)
+                if import_budget <= 0:
+                    break
+            except OSError:
+                continue
+
+        test_budget = _MAX_TEST_CONTEXT_CHARS
+        for tfile in test_files:
+            try:
+                text = tfile.read_text(encoding="utf-8", errors="replace")
+                snippet = "\n".join(text.splitlines()[:50])[:test_budget]
+                rel = tfile.relative_to(repo_root)
+                context_parts.append(f"### Test context: {rel}\n```\n{snippet}\n```")
+                test_budget -= len(snippet)
+                if test_budget <= 0:
+                    break
+            except OSError:
+                continue
+
+    context_block = (
+        "## Surrounding Context (read-only — do not modify)\n\n"
+        + ("\n\n".join(context_parts) if context_parts else "_No surrounding context discovered._")
+    )
+
+    # ── 3. Output schema instruction ────────────────────────────────────
+    schema_instruction = f"""## Output Schema
+
+Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
+
+```json
+{{
+  "schema_version": "{_SCHEMA_VERSION}",
   "candidates": [
-    {
-      "file": "<relative file path>",
-      "content": "<complete file content>"
-    }
+    {{
+      "candidate_id": "c1",
+      "file_path": "<repo-relative path matching the target file>",
+      "full_content": "<complete modified file content — not a diff>",
+      "rationale": "<one sentence, max 200 chars>"
+    }}
   ],
-  "model_id": "<your model identifier>",
-  "reasoning_summary": "<brief explanation of changes>"
-}
+  "provider_metadata": {{
+    "model_id": "<your model identifier>",
+    "reasoning_summary": "<max 200 chars>"
+  }}
+}}
+```
 
 Rules:
-- Each candidate must have non-empty "file" and "content" fields.
-- Python files must be syntactically valid (parseable by ast.parse).
-- Return ONLY the JSON object. No markdown fences, no extra text.
-"""
+- Return 1–3 candidates. c1 = primary approach, c2 = alternative, c3 = minimal-change fallback.
+- `full_content` must be the **complete** file (not a diff or patch).
+- Python files must be syntactically valid (`ast.parse()`-clean).
+- No extra keys at any level. Return ONLY the JSON object."""
 
-
-def _build_codegen_prompt(ctx: OperationContext) -> str:
-    """Build a structured code generation prompt from an OperationContext.
-
-    Parameters
-    ----------
-    ctx:
-        The operation context with target files and description.
-
-    Returns
-    -------
-    str
-        The full prompt string including schema instructions.
-    """
-    target_list = "\n".join(f"  - {f}" for f in ctx.target_files)
-    return (
-        f"Goal: {ctx.description}\n\n"
-        f"Target files:\n{target_list}\n\n"
-        f"Generate candidate code changes for the files listed above.\n"
-        f"Each candidate must include the complete file content (not a diff).\n\n"
-        f"{_CODEGEN_SCHEMA_INSTRUCTION}"
-    )
+    # ── 4. Assemble final prompt ─────────────────────────────────────────
+    file_block = "\n\n".join(file_sections) if file_sections else "_No target files._"
+    return "\n\n".join([
+        f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}",
+        f"## Source Snapshot\n\n{file_block}",
+        context_block,
+        schema_instruction,
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -217,9 +403,11 @@ class PrimeProvider:
         self,
         prime_client: Any,
         max_tokens: int = 8192,
+        repo_root: Optional[Path] = None,
     ) -> None:
         self._client = prime_client
         self._max_tokens = max_tokens
+        self._repo_root = repo_root
 
     @property
     def provider_name(self) -> str:
@@ -241,7 +429,7 @@ class PrimeProvider:
         RuntimeError
             On schema validation failure (``gcp-jprime_schema_invalid:...``).
         """
-        prompt = _build_codegen_prompt(context)
+        prompt = _build_codegen_prompt(context, repo_root=self._repo_root)
         start = time.monotonic()
 
         response = await self._client.generate(
@@ -315,6 +503,7 @@ class ClaudeProvider:
         max_tokens: int = 8192,
         max_cost_per_op: float = 0.50,
         daily_budget: float = 10.00,
+        repo_root: Optional[Path] = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -324,6 +513,7 @@ class ClaudeProvider:
         self._daily_spend: float = 0.0
         self._budget_reset_date = datetime.now(tz=timezone.utc).date()
         self._client: Any = None  # Lazy init
+        self._repo_root = repo_root
 
     @property
     def provider_name(self) -> str:
@@ -380,7 +570,7 @@ class ClaudeProvider:
             raise RuntimeError("claude_budget_exhausted")
 
         client = self._ensure_client()
-        prompt = _build_codegen_prompt(context)
+        prompt = _build_codegen_prompt(context, repo_root=self._repo_root)
         start = time.monotonic()
 
         message = await client.messages.create(
