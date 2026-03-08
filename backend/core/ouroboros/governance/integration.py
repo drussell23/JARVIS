@@ -667,3 +667,50 @@ async def handle_break_glass_command(
 
     print(f"[Governance] Unknown break-glass action: {action}")
     return 1
+
+
+# ---------------------------------------------------------------------------
+# Self-development subcommand registration
+# ---------------------------------------------------------------------------
+
+
+def register_self_dev_commands(
+    subparsers: "_argparse._SubParsersAction",  # type: ignore[type-arg]
+    integration_fn: Optional[Any] = None,
+) -> None:
+    """Register self-dev CLI subcommands into the given subparsers group.
+
+    B-compatible seam: integration_fn is injectable for testing.
+    All handler logic lives in loop_cli.py — supervisor stays thin.
+
+    Subcommands:
+      self-modify      --target FILE --goal TEXT [--op-id ID] [--dry-run]
+      approve          OP_ID
+      reject           OP_ID [--reason TEXT]
+      self-dev-status  [OP_ID]
+    """
+    # self-modify
+    p_modify = subparsers.add_parser(
+        "self-modify",
+        help="Trigger a governed code generation pipeline",
+    )
+    p_modify.add_argument("--target", required=True, help="Target file or directory")
+    p_modify.add_argument("--goal", required=True, help="Description of desired change")
+    p_modify.add_argument("--op-id", default=None, dest="op_id", help="Explicit operation ID")
+    p_modify.add_argument("--dry-run", action="store_true", dest="dry_run",
+                          help="CLASSIFY + ROUTE only (no generation/apply)")
+
+    # approve
+    p_approve = subparsers.add_parser("approve", help="Approve a pending governed operation")
+    p_approve.add_argument("op_id", help="Operation ID to approve")
+    p_approve.add_argument("--approver", default="cli-operator", help="Approver identity")
+
+    # reject
+    p_reject = subparsers.add_parser("reject", help="Reject a pending governed operation")
+    p_reject.add_argument("op_id", help="Operation ID to reject")
+    p_reject.add_argument("--approver", default="cli-operator", help="Rejector identity")
+    p_reject.add_argument("--reason", default="rejected via CLI", help="Rejection reason")
+
+    # self-dev-status
+    p_status = subparsers.add_parser("self-dev-status", help="Query self-dev service health")
+    p_status.add_argument("op_id", nargs="?", default=None, help="Optional operation ID to inspect")
