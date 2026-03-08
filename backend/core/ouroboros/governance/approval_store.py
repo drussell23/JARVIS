@@ -84,7 +84,7 @@ class ApprovalStore:
         return self._to_record(op_id, entry)
 
     def decide(
-        self, op_id: str, decision: ApprovalState, reason: str = "",
+        self, op_id: str, decision: ApprovalState, reason: str = "", actor: str = "cli_user",
     ) -> ApprovalRecord:
         """CAS transition: PENDING to decision. First valid wins.
 
@@ -115,7 +115,7 @@ class ApprovalStore:
                 return ApprovalRecord(
                     op_id=op_id,
                     state=ApprovalState.SUPERSEDED,
-                    actor="cli_user",
+                    actor=actor,
                     channel="cli",
                     reason=reason,
                     policy_version=entry["policy_version"],
@@ -127,7 +127,7 @@ class ApprovalStore:
             now = time.time()
             entry["state"] = decision.value
             entry["reason"] = reason
-            entry["actor"] = "cli_user"
+            entry["actor"] = actor
             entry["decided_at"] = now
             data[op_id] = entry
             self._atomic_write_locked(data)
@@ -142,6 +142,7 @@ class ApprovalStore:
         decision: ApprovalState,
         ledger: Any,  # OperationLedger — kept as Any to avoid circular import
         reason: str = "",
+        actor: str = "api",
     ) -> str:
         """CAS transition with ledger terminal check in same lock scope.
 
@@ -160,6 +161,8 @@ class ApprovalStore:
             method is called inside the lock scope.
         reason:
             Optional human-readable explanation for the decision.
+        actor:
+            Identity of the caller making the decision. Defaults to ``"api"``.
 
         Returns
         -------
@@ -168,6 +171,12 @@ class ApprovalStore:
             ``"superseded"`` — ledger is already terminal, or the store record
                                was already decided by another writer.
             ``"not_found"``  — *op_id* is unknown in the approval store.
+
+        Note: The ledger terminal check is time-of-check only. The approval-store
+        CAS is atomic (protected by the exclusive flock), but the ledger JSONL
+        has separate locking. A concurrent ledger write could theoretically
+        terminal-ize the op between the check and the commit. Callers should
+        treat "ok" as "was not terminal at the moment of check."
         """
         lock_path = self._path.with_suffix(".lock")
         self._path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,6 +204,7 @@ class ApprovalStore:
             entry["state"] = decision.value
             entry["decided_at"] = now
             entry["reason"] = reason
+            entry["actor"] = actor
             data[op_id] = entry
             self._atomic_write_locked(data)
             return "ok"

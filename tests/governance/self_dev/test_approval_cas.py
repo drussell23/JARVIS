@@ -61,3 +61,33 @@ def test_concurrent_decide_exactly_one_wins(tmp_path):
     # Exactly one must be APPROVED; the other SUPERSEDED (already decided)
     assert results.count(ApprovalState.APPROVED) == 1
     assert results.count(ApprovalState.SUPERSEDED) == 1
+
+
+def test_concurrent_decide_with_ledger_exactly_one_wins(tmp_path):
+    """Two concurrent decide_with_ledger() calls: exactly one returns 'ok', one 'superseded'."""
+    from unittest.mock import MagicMock
+
+    store = ApprovalStore(store_path=tmp_path / "approvals" / "pending.json")
+    op_id = "op-concurrent-ledger"
+    store.create(op_id, policy_version="v0.1.0")
+
+    # Build a minimal ledger stub that returns a non-terminal state
+    mock_ledger = MagicMock()
+    mock_ledger.get_latest_state_sync.return_value = None  # no ledger entry = not terminal
+
+    results = []
+
+    def approve():
+        outcome = store.decide_with_ledger(op_id, ApprovalState.APPROVED, ledger=mock_ledger)
+        results.append(outcome)
+
+    t1 = threading.Thread(target=approve)
+    t2 = threading.Thread(target=approve)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    # Exactly one must return "ok"; the other "superseded"
+    assert results.count("ok") == 1
+    assert results.count("superseded") == 1
