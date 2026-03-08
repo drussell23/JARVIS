@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from backend.core.ouroboros.governance.approval_store import (
-    ApprovalRecord,
     ApprovalState,
     ApprovalStore,
 )
@@ -68,6 +67,11 @@ def test_decide_idempotent_same_decision(store: ApprovalStore):
     r2 = store.decide("op-123", ApprovalState.APPROVED, reason="ok again")
     assert r2.state == ApprovalState.APPROVED
     assert r2.decided_at == r1.decided_at  # same original decision
+
+
+def test_decide_unknown_raises(store: ApprovalStore):
+    with pytest.raises(KeyError):
+        store.decide("nonexistent", ApprovalState.APPROVED)
 
 
 # -- get --

@@ -172,14 +172,23 @@ class ApprovalStore:
         """Atomic write: flock + tempfile + fsync + rename."""
         data["_version"] = _STORE_VERSION
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            "w", dir=self._path.parent, delete=False, suffix=".tmp",
-        ) as f:
-            json.dump(data, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-            tmp = Path(f.name)
-        tmp.rename(self._path)
+
+        # Acquire exclusive lock on a lockfile to prevent concurrent writers
+        lock_path = self._path.with_suffix(".lock")
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            with tempfile.NamedTemporaryFile(
+                "w", dir=self._path.parent, delete=False, suffix=".tmp",
+            ) as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+                tmp = Path(f.name)
+            tmp.rename(self._path)
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
 
     @staticmethod
     def _to_record(op_id: str, entry: Dict[str, Any]) -> ApprovalRecord:
