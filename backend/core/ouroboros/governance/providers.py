@@ -179,10 +179,10 @@ def _parse_generation_response(
         if file_path.endswith(".py"):
             try:
                 ast.parse(content)
-            except SyntaxError:
+            except SyntaxError as exc:
                 raise RuntimeError(
                     f"{provider_name}_schema_invalid:candidate_{i}_syntax_error"
-                )
+                ) from exc
 
         validated.append({"file": file_path, "content": content})
 
@@ -191,3 +191,89 @@ def _parse_generation_response(
         provider_name=provider_name,
         generation_duration_s=duration_s,
     )
+
+
+# ---------------------------------------------------------------------------
+# PrimeProvider
+# ---------------------------------------------------------------------------
+
+
+class PrimeProvider:
+    """CandidateProvider adapter wrapping PrimeClient.generate().
+
+    Uses the existing PrimeClient for code generation with strict JSON
+    schema enforcement. Temperature is fixed at 0.2 for deterministic
+    code generation.
+
+    Parameters
+    ----------
+    prime_client:
+        An initialized PrimeClient instance.
+    max_tokens:
+        Maximum tokens for generation requests.
+    """
+
+    def __init__(
+        self,
+        prime_client: Any,
+        max_tokens: int = 8192,
+    ) -> None:
+        self._client = prime_client
+        self._max_tokens = max_tokens
+
+    @property
+    def provider_name(self) -> str:
+        return "gcp-jprime"
+
+    async def generate(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> GenerationResult:
+        """Generate code candidates via PrimeClient.
+
+        Builds a structured prompt, calls PrimeClient.generate() with
+        low temperature, and parses the response with strict schema
+        validation.
+
+        Raises
+        ------
+        RuntimeError
+            On schema validation failure (``gcp-jprime_schema_invalid:...``).
+        """
+        prompt = _build_codegen_prompt(context)
+        start = time.monotonic()
+
+        response = await self._client.generate(
+            prompt=prompt,
+            system_prompt=_CODEGEN_SYSTEM_PROMPT,
+            max_tokens=self._max_tokens,
+            temperature=0.2,
+        )
+
+        duration = time.monotonic() - start
+
+        result = _parse_generation_response(
+            response.content,
+            self.provider_name,
+            duration,
+        )
+
+        logger.info(
+            "[PrimeProvider] Generated %d candidates in %.1fs, model=%s, tokens=%d",
+            len(result.candidates),
+            duration,
+            getattr(response, "model", "unknown"),
+            getattr(response, "tokens_used", 0),
+        )
+
+        return result
+
+    async def health_probe(self) -> bool:
+        """Check PrimeClient health. Returns True only if AVAILABLE."""
+        try:
+            status = await self._client._check_health()
+            return status.name == "AVAILABLE"
+        except Exception:
+            logger.debug("[PrimeProvider] Health probe failed", exc_info=True)
+            return False

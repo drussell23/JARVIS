@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import Dict, Tuple
+from unittest.mock import AsyncMock, MagicMock, PropertyMock
 
 import pytest
 
+from backend.core.ouroboros.governance.candidate_generator import CandidateProvider
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -221,3 +224,117 @@ class TestBuildCodegenPrompt:
         prompt = _build_codegen_prompt(ctx)
         assert "file" in prompt
         assert "content" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Helpers for PrimeProvider tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_prime_client(
+    content: str = "",
+    status: str = "available",
+    latency_ms: float = 500.0,
+    tokens_used: int = 200,
+) -> MagicMock:
+    """Build a mock PrimeClient."""
+    client = MagicMock()
+    response = MagicMock()
+    response.content = content
+    response.request_id = "req-001"
+    response.model = "jarvis-prime-7b"
+    response.source = "gcp_prime"
+    response.latency_ms = latency_ms
+    response.tokens_used = tokens_used
+    response.metadata = {}
+    client.generate = AsyncMock(return_value=response)
+
+    # Health check mock
+    health_result = MagicMock()
+    health_result.name = status.upper()
+    client._check_health = AsyncMock(return_value=health_result)
+    client._last_health_data = {"status": status}
+
+    return client
+
+
+# ---------------------------------------------------------------------------
+# Test PrimeProvider
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+class TestPrimeProvider:
+    """Tests for PrimeProvider adapter."""
+
+    async def test_satisfies_candidate_provider_protocol(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        client = _mock_prime_client()
+        provider = PrimeProvider(client)
+        assert isinstance(provider, CandidateProvider)
+
+    async def test_provider_name(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        provider = PrimeProvider(_mock_prime_client())
+        assert provider.provider_name == "gcp-jprime"
+
+    async def test_generate_success(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        valid_response = json.dumps({
+            "candidates": [
+                {"file": "tests/test_foo.py", "content": "def test_foo():\n    assert True\n"}
+            ],
+            "model_id": "prime-7b",
+            "reasoning_summary": "Added test",
+        })
+        client = _mock_prime_client(content=valid_response)
+        provider = PrimeProvider(client)
+        ctx = _make_context()
+        deadline = datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        result = await provider.generate(ctx, deadline)
+        assert len(result.candidates) == 1
+        assert result.provider_name == "gcp-jprime"
+        client.generate.assert_called_once()
+
+    async def test_generate_schema_failure_raises(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        client = _mock_prime_client(content="not valid json")
+        provider = PrimeProvider(client)
+        ctx = _make_context()
+        deadline = datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        with pytest.raises(RuntimeError, match="schema_invalid"):
+            await provider.generate(ctx, deadline)
+
+    async def test_generate_uses_low_temperature(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        valid_response = json.dumps({
+            "candidates": [
+                {"file": "test.py", "content": "def f():\n    pass\n"}
+            ],
+        })
+        client = _mock_prime_client(content=valid_response)
+        provider = PrimeProvider(client)
+        ctx = _make_context()
+        deadline = datetime(2026, 3, 7, 12, 5, 0, tzinfo=timezone.utc)
+        await provider.generate(ctx, deadline)
+        call_kwargs = client.generate.call_args
+        assert call_kwargs.kwargs.get("temperature", call_kwargs[1].get("temperature")) == 0.2
+
+    async def test_health_probe_available(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        client = _mock_prime_client(status="available")
+        provider = PrimeProvider(client)
+        assert await provider.health_probe() is True
+
+    async def test_health_probe_unavailable(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        client = _mock_prime_client(status="unavailable")
+        provider = PrimeProvider(client)
+        assert await provider.health_probe() is False
+
+    async def test_health_probe_exception_returns_false(self) -> None:
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        client = _mock_prime_client()
+        client._check_health = AsyncMock(side_effect=ConnectionError("unreachable"))
+        provider = PrimeProvider(client)
+        assert await provider.health_probe() is False
