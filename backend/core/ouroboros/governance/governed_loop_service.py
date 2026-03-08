@@ -22,7 +22,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
 from typing import Any, Dict, Optional, Set, Tuple
@@ -126,17 +126,18 @@ class GovernedLoopConfig:
     initial_canary_slices: Tuple[str, ...] = ("tests/",)
     cold_start_grace_s: float = 300.0   # ops younger than this are not cancelled on boot
     approval_ttl_s: float = 1800.0      # stale approval expiry timeout
+    pipeline_timeout_s: float = 600.0   # total wall-clock budget per submit(); env: JARVIS_PIPELINE_TIMEOUT_S
 
     @classmethod
-    def from_env(cls, args: Any = None) -> GovernedLoopConfig:
+    def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
         """Build config from environment variables with safe defaults."""
         import os
 
-        project_root = Path(
+        resolved_root = project_root if project_root is not None else Path(
             os.getenv("JARVIS_PROJECT_ROOT", os.getcwd())
         )
         return cls(
-            project_root=project_root,
+            project_root=resolved_root,
             claude_api_key=os.getenv("ANTHROPIC_API_KEY"),
             claude_model=os.getenv(
                 "JARVIS_GOVERNED_CLAUDE_MODEL", "claude-sonnet-4-20250514"
@@ -161,6 +162,9 @@ class GovernedLoopConfig:
             ),
             cold_start_grace_s=float(os.environ.get("JARVIS_COLD_START_GRACE_S", "300")),
             approval_ttl_s=float(os.environ.get("JARVIS_APPROVAL_TTL_S", "1800")),
+            pipeline_timeout_s=float(
+                os.environ.get("JARVIS_PIPELINE_TIMEOUT_S", "600.0")
+            ),
         )
 
 
@@ -332,6 +336,10 @@ class GovernedLoopService:
         self._active_ops.add(dedupe_key)
         try:
             assert self._orchestrator is not None
+            # Stamp pipeline_deadline exactly once — shared budget for all downstream phases
+            ctx = ctx.with_pipeline_deadline(
+                datetime.now(tz=timezone.utc) + timedelta(seconds=self._config.pipeline_timeout_s)
+            )
             terminal_ctx = await self._orchestrator.run(ctx)
 
             duration = time.monotonic() - start_time

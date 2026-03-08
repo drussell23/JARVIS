@@ -484,6 +484,28 @@ class OperationContext:
         # Final instance with correct hash
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
+    def with_pipeline_deadline(self, deadline: "datetime") -> "OperationContext":
+        """Return a new context with pipeline_deadline set (no phase change).
+
+        Uses the same hash-chain update as advance() but does not validate a
+        phase transition. Called exactly once by GovernedLoopService.submit()
+        before handing ctx to the orchestrator.
+        """
+        # Create intermediate with updated deadline and previous_hash chain
+        intermediate = dataclasses.replace(
+            self,
+            pipeline_deadline=deadline,
+            previous_hash=self.context_hash,
+            context_hash="",  # placeholder — will be recomputed below
+        )
+
+        # Compute hash over all fields except context_hash
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+
+        # Final instance with correct hash
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers
