@@ -13,6 +13,7 @@ Commands
 - ``handle_self_modify``: trigger a governed code generation pipeline
 - ``handle_approve``: approve a pending operation
 - ``handle_reject``: reject a pending operation
+- ``handle_status``: query service health and operation state
 """
 
 from __future__ import annotations
@@ -81,7 +82,7 @@ async def handle_self_modify(
     )
 
     # Submit to service
-    result = await service.submit(ctx, trigger_source="cli")
+    result = await service.submit(ctx, trigger_source="cli_manual")
 
     logger.info(
         "[CLI] self-modify result: op_id=%s phase=%s provider=%s duration=%.1fs",
@@ -189,3 +190,30 @@ async def handle_reject(
     )
 
     return result
+
+
+async def handle_status(
+    service: Any,
+    op_id: Optional[str] = None,
+) -> str:
+    """Query service health and optional op_id state."""
+    if service is None:
+        return "Governed loop is not active."
+
+    health = service.health()
+    lines = [
+        f"State: {health.get('state', 'unknown')}",
+        f"Active ops: {health.get('active_ops', 0)}",
+        f"Completed ops: {health.get('completed_ops', 0)}",
+        f"Uptime: {health.get('uptime_s', 0):.1f}s",
+        f"Provider: {health.get('provider_fsm_state', 'unknown')}",
+    ]
+
+    if op_id and op_id in getattr(service, '_completed_ops', {}):
+        result = service._completed_ops[op_id]
+        lines.append(f"\nOp {op_id}:")
+        lines.append(f"  Phase: {result.terminal_phase.name}")
+        lines.append(f"  Provider: {result.provider_used or 'none'}")
+        lines.append(f"  Duration: {result.total_duration_s:.1f}s")
+
+    return "\n".join(lines)
