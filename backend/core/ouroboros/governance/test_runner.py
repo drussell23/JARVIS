@@ -357,42 +357,48 @@ class CppAdapter:
 
         # Configure
         try:
-            proc = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "cmake", str(self._repo_root), "-B", str(build_dir),
-                    f"-G{self._CMAKE_GENERATOR}",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=cwd,
-                ),
-                timeout=half,
+            proc = await asyncio.create_subprocess_exec(
+                "cmake", str(self._repo_root), "-B", str(build_dir),
+                f"-G{self._CMAKE_GENERATOR}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=cwd,
             )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=half)
+            try:
+                out, _ = await asyncio.wait_for(proc.communicate(), timeout=half)
+            except asyncio.TimeoutError:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                return False, "cmake configure timed out", "configure_stage"
             stdout = (out or b"").decode(errors="replace")
             if proc.returncode != 0:
                 return False, stdout, "configure_stage"
         except FileNotFoundError:
             return False, "cmake: command not found", "executable_not_found"
-        except asyncio.TimeoutError:
-            return False, "cmake configure timed out", "configure_stage"
 
         # Build
         try:
-            proc2 = await asyncio.wait_for(
-                asyncio.create_subprocess_exec(
-                    "cmake", "--build", str(build_dir), "--parallel",
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
-                    cwd=cwd,
-                ),
-                timeout=half,
+            proc2 = await asyncio.create_subprocess_exec(
+                "cmake", "--build", str(build_dir), "--parallel",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=cwd,
             )
-            out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=half)
+            try:
+                out2, _ = await asyncio.wait_for(proc2.communicate(), timeout=half)
+            except asyncio.TimeoutError:
+                try:
+                    proc2.kill()
+                except ProcessLookupError:
+                    pass
+                return False, "cmake build timed out", "exit_1"
             stdout2 = (out2 or b"").decode(errors="replace")
             ctx = "exit_0" if proc2.returncode == 0 else "exit_1"
             return proc2.returncode == 0, stdout2, ctx
-        except asyncio.TimeoutError:
-            return False, "cmake build timed out", "configure_stage"
+        except FileNotFoundError:
+            return False, "cmake: command not found", "executable_not_found"
 
     async def _default_abi_probe(
         self,
@@ -420,7 +426,8 @@ class CppAdapter:
             try:
                 probe = await asyncio.create_subprocess_exec(
                     _sys.executable, "-c",
-                    f"import ctypes; ctypes.CDLL('{so}')",
+                    "import ctypes, sys; ctypes.CDLL(sys.argv[1])",
+                    str(so),
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                 )
@@ -448,6 +455,10 @@ class CppAdapter:
             stdout = (out or b"").decode(errors="replace")
             passed = proc.returncode == 0
         except asyncio.TimeoutError:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
             passed, stdout = False, "ctest timed out"
         except FileNotFoundError:
             passed, stdout = False, "ctest: command not found"
@@ -487,6 +498,7 @@ class LanguageRouter:
         op_id: str,
     ) -> MultiAdapterResult:
         """Run all required adapters and merge results into MultiAdapterResult."""
+        t0 = time.monotonic()
         # Raises BlockedPathError if any file is outside repo_root
         required_names = _route(changed_files, self._repo_root)
 
@@ -500,8 +512,7 @@ class LanguageRouter:
                 continue
 
             test_files = await adapter.resolve(changed_files, self._repo_root)
-            elapsed_so_far = sum(r.duration_s for r in results)
-            remaining = timeout_budget_s - elapsed_so_far
+            remaining = timeout_budget_s - (time.monotonic() - t0)
             if remaining <= 0:
                 results.append(AdapterResult(
                     adapter=name, passed=False, failure_class="infra",
@@ -525,7 +536,7 @@ class LanguageRouter:
             passed=all_passed,
             adapter_results=tuple(results),
             dominant_failure=dominant,
-            total_duration_s=sum(r.duration_s for r in results),
+            total_duration_s=time.monotonic() - t0,
         )
 
 
