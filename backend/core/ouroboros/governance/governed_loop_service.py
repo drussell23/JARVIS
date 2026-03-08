@@ -491,17 +491,16 @@ class GovernedLoopService:
             return cancelled
 
         # Connectivity preflight: probe primary provider
-        # Access via getattr to support both real CandidateGenerator (_primary)
-        # and test mocks (primary).
+        # CandidateGenerator stores the primary provider as _primary (private).
+        # health_probe() takes no arguments; wrap with asyncio.wait_for for timeout.
         probe_timeout = min(5.0, remaining_s * 0.05)
         try:
-            provider = getattr(
-                self._generator, "primary",
-                getattr(self._generator, "_primary", None),
-            )
+            provider = getattr(self._generator, "_primary", None)
             if provider is None:
                 raise RuntimeError("no_primary_provider")
-            primary_ok = await provider.health_probe(timeout=probe_timeout)
+            primary_ok = await asyncio.wait_for(
+                provider.health_probe(), timeout=probe_timeout
+            )
         except Exception:
             logger.debug(
                 "[GovernedLoop] Preflight: primary probe raised exception",
@@ -514,11 +513,11 @@ class GovernedLoopService:
             return None
 
         # Primary unavailable: decide based on FSM state
-        fsm_state_name = getattr(
-            getattr(self._generator, "_fsm_state", None), "name", ""
-        )
+        # CandidateGenerator.fsm is a FailbackStateMachine; .state is a FailbackState enum.
+        fsm = getattr(self._generator, "fsm", None)
+        fsm_state = getattr(fsm, "state", None) if fsm is not None else None
 
-        if fsm_state_name == "QUEUE_ONLY":
+        if fsm_state is FailbackState.QUEUE_ONLY:
             # No fallback available — cancel
             cancelled = ctx.advance(OperationPhase.CANCELLED)
             await _record_ledger(

@@ -1,9 +1,9 @@
 """Tests for Phase 2B connectivity preflight in GovernedLoopService.submit()."""
-import pytest
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
+from backend.core.ouroboros.governance.candidate_generator import FailbackState
 from backend.core.ouroboros.governance.governed_loop_service import (
     GovernedLoopConfig,
     GovernedLoopService,
@@ -14,25 +14,30 @@ from backend.core.ouroboros.governance.op_context import OperationContext, Opera
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _make_service(fsm_state_name="PRIMARY_READY", primary_health=True):
-    """Build a GovernedLoopService with mocked internals."""
+def _make_service(fsm_state: FailbackState = FailbackState.PRIMARY_READY, primary_health: bool = True):
+    """Build a GovernedLoopService with mocked internals matching real CandidateGenerator API."""
     config = GovernedLoopConfig(
         project_root=REPO_ROOT,
         pipeline_timeout_s=300.0,
     )
     svc = GovernedLoopService.__new__(GovernedLoopService)
     svc._config = config
-    svc._started = True
 
-    # Mock generator with FSM state and primary.health_probe
+    # Mock generator using real CandidateGenerator attribute names:
+    #   ._primary  → primary provider (has .health_probe())
+    #   .fsm.state → FailbackState enum value
+    mock_primary = MagicMock()
+    mock_primary.health_probe = AsyncMock(return_value=primary_health)
+
+    mock_fsm = MagicMock()
+    mock_fsm.state = fsm_state
+
     mock_generator = MagicMock()
-    mock_generator._fsm_state = MagicMock()
-    mock_generator._fsm_state.name = fsm_state_name
-    mock_generator.primary = MagicMock()
-    mock_generator.primary.health_probe = AsyncMock(return_value=primary_health)
+    mock_generator._primary = mock_primary
+    mock_generator.fsm = mock_fsm
     svc._generator = mock_generator
 
-    # Mock orchestrator that returns a terminal ctx
+    # Mock orchestrator
     mock_orch = MagicMock()
     mock_orch.run = AsyncMock(side_effect=lambda ctx: ctx.advance(OperationPhase.COMPLETE))
     svc._orchestrator = mock_orch
@@ -77,7 +82,7 @@ async def test_budget_exhausted_pre_generation_cancels():
 
 async def test_queue_only_state_cancels():
     """FSM in QUEUE_ONLY + primary unhealthy → CANCELLED."""
-    svc = _make_service(fsm_state_name="QUEUE_ONLY", primary_health=False)
+    svc = _make_service(fsm_state=FailbackState.QUEUE_ONLY, primary_health=False)
     ctx = _ctx(deadline_s=300.0)
     terminal = await svc._preflight_check(ctx)
     assert terminal is not None
@@ -88,7 +93,7 @@ async def test_queue_only_state_cancels():
 
 async def test_primary_unavailable_fallback_active_continues():
     """Primary unhealthy, FSM != QUEUE_ONLY → returns None (continue)."""
-    svc = _make_service(fsm_state_name="FALLBACK_ACTIVE", primary_health=False)
+    svc = _make_service(fsm_state=FailbackState.FALLBACK_ACTIVE, primary_health=False)
     ctx = _ctx(deadline_s=300.0)
     result = await svc._preflight_check(ctx)
     # None means "proceed — no early exit"
@@ -99,7 +104,7 @@ async def test_primary_unavailable_fallback_active_continues():
 
 async def test_healthy_primary_continues():
     """Primary healthy → returns None (continue)."""
-    svc = _make_service(fsm_state_name="PRIMARY_READY", primary_health=True)
+    svc = _make_service(fsm_state=FailbackState.PRIMARY_READY, primary_health=True)
     ctx = _ctx(deadline_s=300.0)
     result = await svc._preflight_check(ctx)
     assert result is None
