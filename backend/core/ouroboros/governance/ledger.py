@@ -301,6 +301,7 @@ class OperationLedger:
             try:
                 entry = _dict_to_entry(json.loads(stripped))
                 last_state = entry.state
+                self._seen.add(self._dedup_key(entry))
             except Exception:
                 continue
         return last_state

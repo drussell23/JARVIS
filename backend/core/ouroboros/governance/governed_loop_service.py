@@ -124,6 +124,8 @@ class GovernedLoopConfig:
     health_probe_interval_s: float = 30.0
     max_concurrent_ops: int = 2
     initial_canary_slices: Tuple[str, ...] = ("tests/",)
+    cold_start_grace_s: float = 300.0   # ops younger than this are not cancelled on boot
+    approval_ttl_s: float = 1800.0      # stale approval expiry timeout
 
     @classmethod
     def from_env(cls, args: Any = None) -> GovernedLoopConfig:
@@ -157,6 +159,8 @@ class GovernedLoopConfig:
             max_concurrent_ops=int(
                 os.getenv("JARVIS_GOVERNED_MAX_CONCURRENT_OPS", "2")
             ),
+            cold_start_grace_s=float(os.environ.get("JARVIS_COLD_START_GRACE_S", "300")),
+            approval_ttl_s=float(os.environ.get("JARVIS_APPROVAL_TTL_S", "1800")),
         )
 
 
@@ -520,7 +524,7 @@ class GovernedLoopService:
             # ── Stale PLANNED cancellation ──────────────────────────────────
             if latest.state == OperationState.PLANNED:
                 import time as _time
-                stored_ts = latest.data.get("timestamp", 0.0)
+                stored_ts = latest.wall_time
                 now_ts = _time.time()
                 grace_s = getattr(self._config, "cold_start_grace_s", 300.0)
                 skew_tol = 60.0
@@ -554,11 +558,10 @@ class GovernedLoopService:
 
             # Hash-guarded rollback
             target_path_str = latest.data.get("target_file")
-            expected_hash = latest.data.get("post_apply_hash")
-            rollback_data = latest.data.get("rollback_artifact")
+            rollback_hash = latest.data.get("rollback_hash")  # pre-apply hash (set by ChangeEngine)
 
-            if not target_path_str or not expected_hash:
-                # Insufficient provenance — cannot rollback, escalate
+            if not target_path_str or not rollback_hash:
+                # Insufficient provenance — cannot assess rollback, escalate
                 await ledger.append(LedgerEntry(
                     op_id=op_id, state=OperationState.FAILED,
                     data={"reason": "boot_recovery_missing_provenance",
@@ -578,45 +581,35 @@ class GovernedLoopService:
                     data={"reason": "boot_recovery_file_missing",
                           "recovery_attempt_id": recovery_id},
                 ))
+                await self._stack.comm.emit_decision(
+                    op_id=op_id, outcome="manual_intervention_required",
+                    reason_code="boot_recovery_file_missing",
+                )
                 continue
 
             current_hash = _hashlib.sha256(target.read_bytes()).hexdigest()
-            if current_hash != expected_hash:
-                # File drifted — human or other op touched it, do NOT overwrite
-                await ledger.append(LedgerEntry(
-                    op_id=op_id, state=OperationState.FAILED,
-                    data={"reason": "boot_recovery_hash_mismatch",
-                          "current_hash": current_hash,
-                          "expected_hash": expected_hash,
-                          "recovery_attempt_id": recovery_id},
-                ))
-                await self._stack.comm.emit_decision(
-                    op_id=op_id, outcome="manual_intervention_required",
-                    reason_code="boot_recovery_hash_mismatch",
-                )
-                continue
-
-            # Hash matches — attempt rollback
-            try:
-                if rollback_data:
-                    from backend.core.ouroboros.governance.change_engine import RollbackArtifact
-                    artifact = RollbackArtifact(**rollback_data)
-                    artifact.apply(target)
+            if current_hash == rollback_hash:
+                # File already matches pre-apply content — change was undone externally
                 await ledger.append(LedgerEntry(
                     op_id=op_id, state=OperationState.ROLLED_BACK,
-                    data={"reason": "boot_recovery", "recovery_attempt_id": recovery_id},
-                ))
-                logger.info("[GovernedLoop] Boot recovery: rolled back op=%s", op_id)
-            except Exception as exc:
-                await ledger.append(LedgerEntry(
-                    op_id=op_id, state=OperationState.FAILED,
-                    data={"reason": "boot_recovery_failed", "error": str(exc),
+                    data={"reason": "boot_recovery_already_reverted",
                           "recovery_attempt_id": recovery_id},
                 ))
-                await self._stack.comm.emit_decision(
-                    op_id=op_id, outcome="manual_intervention_required",
-                    reason_code="boot_recovery_failed",
-                )
+                logger.info("[GovernedLoop] Boot recovery: op=%s already reverted externally", op_id)
+                continue
+
+            # File still has post-apply content; original bytes not stored — escalate
+            await ledger.append(LedgerEntry(
+                op_id=op_id, state=OperationState.FAILED,
+                data={"reason": "boot_recovery_needs_manual_rollback",
+                      "current_hash": current_hash,
+                      "rollback_hash": rollback_hash,
+                      "recovery_attempt_id": recovery_id},
+            ))
+            await self._stack.comm.emit_decision(
+                op_id=op_id, outcome="manual_intervention_required",
+                reason_code="boot_recovery_needs_manual_rollback",
+            )
 
         # Expire stale approvals — batch notify (no per-op comm storm)
         approval_store = getattr(self._stack, "approval_store", None)
