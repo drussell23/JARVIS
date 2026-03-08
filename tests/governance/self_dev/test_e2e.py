@@ -50,7 +50,7 @@ def _make_service(tmp_path: Path, max_concurrent_ops: int = 2) -> GovernedLoopSe
 
 
 def _mock_terminal_context(
-    ctx: OperationContext,
+    _ctx: OperationContext,
     phase: OperationPhase,
     provider_name: str = "mock-provider",
     duration_s: float = 0.42,
@@ -123,7 +123,7 @@ def test_e2e_reject_stops_pipeline(tmp_path: Path):
     # Wire mock orchestrator that returns CANCELLED context (simulating rejection)
     mock_orch = MagicMock()
 
-    async def fake_run(ctx: OperationContext) -> OperationContext:
+    async def fake_run(_ctx: OperationContext) -> OperationContext:
         terminal = MagicMock(spec=OperationContext)
         terminal.phase = OperationPhase.CANCELLED
         terminal.generation = None  # no generation on cancellation
