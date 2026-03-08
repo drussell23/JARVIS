@@ -467,7 +467,7 @@ class GovernedLoopService:
             repo_root=self._config.project_root,
             adapters={
                 "python": PythonAdapter(repo_root=self._config.project_root),
-                "cpp": CppAdapter(),
+                "cpp": CppAdapter(repo_root=self._config.project_root),
             },
         )
 
