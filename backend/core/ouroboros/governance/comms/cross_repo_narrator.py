@@ -1,7 +1,17 @@
-"""CrossRepoNarrator: converts inbound CrossRepoEventBus events to CommProtocol narration."""
+"""CrossRepoNarrator: converts inbound CrossRepoEventBus events to CommProtocol narration.
+
+Loop-safety note
+----------------
+EventBridge (a CommProtocol transport) emits events to the same CrossRepoEventBus that
+CrossRepoNarrator listens on, always with ``source_repo == RepoType.JARVIS``.  To prevent
+a reflexive loop (JARVIS emits → narrator narrates → EventBridge re-emits → …) each
+handler checks the event source and silently discards events that originated from JARVIS
+itself.  Only events from external repos (Prime, Reactor-Core, etc.) are narrated.
+"""
 from __future__ import annotations
 
 import logging
+import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -10,9 +20,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# String value of the local repo as set in RepoType.JARVIS — used for loop-break guard.
+_LOCAL_REPO_VALUE = "jarvis"
+
+
+def _repo_value(event: "CrossRepoEvent") -> str:
+    src = event.source_repo
+    return src.value if hasattr(src, "value") else str(src)
+
 
 class CrossRepoNarrator:
     """Handles inbound CrossRepoEventBus events and routes them to CommProtocol.
+
+    Only events from EXTERNAL repos are narrated.  Events with
+    ``source_repo == RepoType.JARVIS`` are silently skipped to prevent a
+    reflexive loop through EventBridge.
 
     Usage::
 
@@ -26,10 +48,12 @@ class CrossRepoNarrator:
         self._comm = comm
 
     async def on_improvement_request(self, event: "CrossRepoEvent") -> None:
-        """IMPROVEMENT_REQUEST: narrate that JARVIS detected work in a remote repo."""
+        """IMPROVEMENT_REQUEST: narrate that an external repo detected work."""
         try:
-            repo = event.source_repo.value if hasattr(event.source_repo, "value") else str(event.source_repo)
-            op_id = event.payload.get("op_id", f"cross-{repo}-unknown")
+            repo = _repo_value(event)
+            if repo == _LOCAL_REPO_VALUE:
+                return  # own event re-entering from EventBridge — skip to break loop
+            op_id = event.payload.get("op_id") or f"cross-{repo}-{uuid.uuid4().hex[:8]}"
             goal = event.payload.get("goal", "improvement detected")
             await self._comm.emit_intent(
                 op_id=op_id,
@@ -42,10 +66,12 @@ class CrossRepoNarrator:
             logger.exception("[CrossRepoNarrator] on_improvement_request failed; swallowing")
 
     async def on_improvement_complete(self, event: "CrossRepoEvent") -> None:
-        """IMPROVEMENT_COMPLETE: narrate that a remote repo change was applied."""
+        """IMPROVEMENT_COMPLETE: narrate that an external repo change was applied."""
         try:
-            repo = event.source_repo.value if hasattr(event.source_repo, "value") else str(event.source_repo)
-            op_id = event.payload.get("op_id", f"cross-{repo}-unknown")
+            repo = _repo_value(event)
+            if repo == _LOCAL_REPO_VALUE:
+                return
+            op_id = event.payload.get("op_id") or f"cross-{repo}-{uuid.uuid4().hex[:8]}"
             await self._comm.emit_decision(
                 op_id=op_id,
                 outcome="applied",
@@ -56,10 +82,12 @@ class CrossRepoNarrator:
             logger.exception("[CrossRepoNarrator] on_improvement_complete failed; swallowing")
 
     async def on_improvement_failed(self, event: "CrossRepoEvent") -> None:
-        """IMPROVEMENT_FAILED: narrate that a remote repo change failed."""
+        """IMPROVEMENT_FAILED: narrate that an external repo change failed."""
         try:
-            repo = event.source_repo.value if hasattr(event.source_repo, "value") else str(event.source_repo)
-            op_id = event.payload.get("op_id", f"cross-{repo}-unknown")
+            repo = _repo_value(event)
+            if repo == _LOCAL_REPO_VALUE:
+                return
+            op_id = event.payload.get("op_id") or f"cross-{repo}-{uuid.uuid4().hex[:8]}"
             reason = event.payload.get("reason_code", "unknown_failure")
             await self._comm.emit_postmortem(
                 op_id=op_id,

@@ -450,15 +450,16 @@ def _parse_multi_repo_response(
                 preimage: Optional[bytes] = None
                 if op in (FileOp.MODIFY, FileOp.DELETE):
                     repo_root = repo_roots.get(repo_name)
-                    if repo_root is not None:
-                        full_disk_path = Path(repo_root) / file_path
-                        try:
-                            preimage = full_disk_path.read_bytes()
-                        except OSError:
-                            preimage = b""
-                            op = FileOp.CREATE
-                    else:
+                    if repo_root is None:
+                        raise RuntimeError(
+                            f"{pfx}_schema_invalid:unknown_repo_in_patches:{repo_name}"
+                        )
+                    full_disk_path = Path(repo_root) / file_path
+                    try:
+                        preimage = full_disk_path.read_bytes()
+                    except OSError:
                         preimage = b""
+                        op = FileOp.CREATE
 
                 patched_files.append(PatchedFile(path=file_path, op=op, preimage=preimage))
                 # DELETE ops carry no new bytes — omit from new_content

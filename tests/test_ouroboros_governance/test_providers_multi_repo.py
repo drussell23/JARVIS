@@ -176,6 +176,28 @@ def test_parse_2c1_rejects_missing_patches(tmp_path):
         _parse_generation_response(bad, "gcp-jprime", 0.5, ctx, "h", "f", repo_roots=repo_roots)
 
 
+def test_parse_2c1_rejects_modify_on_unknown_repo(tmp_path):
+    """2c.1 MODIFY op for a repo not in repo_roots must raise RuntimeError."""
+    from backend.core.ouroboros.governance.providers import _parse_generation_response
+
+    ctx = _multi_ctx(tmp_path)
+    # Only supply "jarvis" root — "prime" is absent
+    repo_roots = {"jarvis": tmp_path / "jarvis"}
+    raw = json.dumps({
+        "schema_version": "2c.1",
+        "candidates": [{
+            "candidate_id": "c1",
+            "patches": {
+                "prime": [{"file_path": "api.py", "full_content": "x=1\n", "op": "modify"}]
+            },
+            "rationale": "test",
+        }],
+        "provider_metadata": {"model_id": "m", "reasoning_summary": "s"},
+    })
+    with pytest.raises(RuntimeError, match="unknown_repo_in_patches"):
+        _parse_generation_response(raw, "gcp-jprime", 0.5, ctx, "h", "api.py", repo_roots=repo_roots)
+
+
 def test_2b1_still_parses_after_2c1_added(tmp_path):
     """Existing 2b.1 single-repo responses must still parse correctly after this change."""
     from backend.core.ouroboros.governance.providers import _parse_generation_response

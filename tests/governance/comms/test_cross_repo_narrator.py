@@ -66,3 +66,28 @@ async def test_handler_never_raises_on_comm_failure():
 
     # Must not raise
     await narrator.on_improvement_request(_make_event(EventType.IMPROVEMENT_REQUEST))
+
+
+async def test_jarvis_source_events_are_skipped_to_prevent_loop():
+    """Events from source_repo=JARVIS must be silently dropped (EventBridge loop-break)."""
+    from backend.core.ouroboros.governance.comms.cross_repo_narrator import CrossRepoNarrator
+    from backend.core.ouroboros.cross_repo import EventType
+
+    comm = MagicMock()
+    comm.emit_intent = AsyncMock()
+    comm.emit_decision = AsyncMock()
+    comm.emit_postmortem = AsyncMock()
+    narrator = CrossRepoNarrator(comm=comm)
+
+    jarvis_event = _make_event(EventType.IMPROVEMENT_REQUEST, repo="jarvis")
+    await narrator.on_improvement_request(jarvis_event)
+    await narrator.on_improvement_complete(
+        _make_event(EventType.IMPROVEMENT_COMPLETE, repo="jarvis")
+    )
+    await narrator.on_improvement_failed(
+        _make_event(EventType.IMPROVEMENT_FAILED, repo="jarvis")
+    )
+
+    comm.emit_intent.assert_not_awaited()
+    comm.emit_decision.assert_not_awaited()
+    comm.emit_postmortem.assert_not_awaited()
