@@ -322,3 +322,5 @@ def test_governance_package_exports():
     )
     assert IntakeLayerService is not None
     assert IntakeLayerConfig is not None
+    assert IntakeServiceState is not None
+    assert IntakeNarrator is not None
