@@ -15,14 +15,14 @@ import fcntl
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
-from .intent_envelope import EnvelopeValidationError, IntentEnvelope
+from .intent_envelope import IntentEnvelope
 from .wal import WAL, WALEntry
 
 logger = logging.getLogger(__name__)
@@ -280,9 +280,20 @@ class UnifiedIntakeRouter:
                 self._dead_letter.append(envelope)
                 self._retry_count.pop(ikey, None)
             else:
-                # Re-enqueue for retry at the same priority
+                # Re-enqueue for retry at the same priority.
+                # Use put_nowait() to avoid blocking the dispatch loop (self-deadlock).
+                # If the queue is full, dead-letter immediately rather than stall.
                 priority = _PRIORITY_MAP.get(envelope.source, 99)
-                await self._queue.put((priority, envelope.submitted_at, envelope))
+                try:
+                    self._queue.put_nowait((priority, envelope.submitted_at, envelope))
+                except asyncio.QueueFull:
+                    logger.error(
+                        "Router: queue full during retry — dead-lettering lease_id=%s",
+                        envelope.lease_id,
+                    )
+                    self._wal.update_status(envelope.lease_id, "dead_letter")
+                    self._dead_letter.append(envelope)
+                    self._retry_count.pop(ikey, None)
 
     # ------------------------------------------------------------------
     # WAL crash recovery

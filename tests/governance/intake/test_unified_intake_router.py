@@ -85,7 +85,7 @@ async def test_voice_human_priority_higher_than_backlog(tmp_path):
 async def test_intake_queue_depth_increments(tmp_path):
     gls = MagicMock()
     # Never resolve so queue fills up
-    gls.submit = AsyncMock(side_effect=asyncio.sleep(9999))
+    gls.submit = AsyncMock(side_effect=lambda *a, **kw: asyncio.sleep(9999))
     router, _ = _make_router(tmp_path, gls=gls)
     await router.start()
     try:
@@ -109,10 +109,10 @@ async def test_submit_called_with_correct_trigger_source(tmp_path):
         await asyncio.sleep(0.1)
     finally:
         await router.stop()
-    # GLS.submit was called with trigger_source="test_failure"
-    if gls.submit.call_count > 0:
-        kwargs = gls.submit.call_args.kwargs
-        assert kwargs.get("trigger_source") == "test_failure"
+    # GLS.submit must have been called with trigger_source="test_failure"
+    assert gls.submit.call_count > 0, "expected GLS.submit to be called at least once"
+    kwargs = gls.submit.call_args.kwargs
+    assert kwargs.get("trigger_source") == "test_failure"
 
 
 async def test_dead_letter_after_max_retries(tmp_path):
@@ -137,7 +137,7 @@ async def test_dead_letter_after_max_retries(tmp_path):
 
 async def test_backpressure_signal_when_queue_full(tmp_path):
     gls = MagicMock()
-    gls.submit = AsyncMock(side_effect=asyncio.sleep(9999))
+    gls.submit = AsyncMock(side_effect=lambda *a, **kw: asyncio.sleep(9999))
     config = IntakeRouterConfig(
         project_root=tmp_path,
         backpressure_threshold=1,
