@@ -93,7 +93,7 @@ class VoiceCommandSensor:
             source="voice_human",
             description=payload.description,
             target_files=tuple(payload.target_files),
-            repo=self._repo,
+            repo=payload.repo or self._repo,
             confidence=payload.stt_confidence,
             urgency="critical",
             evidence=evidence,
