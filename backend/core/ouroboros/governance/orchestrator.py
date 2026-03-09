@@ -509,6 +509,7 @@ class GovernedOrchestrator:
 
         change_request = self._build_change_request(ctx, best_candidate)
 
+        _t_apply = time.monotonic()
         try:
             change_result = await self._stack.change_engine.execute(change_request)
         except Exception as exc:
@@ -521,6 +522,7 @@ class GovernedOrchestrator:
                 OperationState.FAILED,
                 {"reason": "change_engine_error", "error": str(exc)},
             )
+            self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
             return ctx
 
         if not change_result.success:
@@ -533,6 +535,10 @@ class GovernedOrchestrator:
                     "rolled_back": change_result.rolled_back,
                 },
             )
+            self._record_canary_for_ctx(
+                ctx, False, time.monotonic() - _t_apply,
+                rolled_back=change_result.rolled_back,
+            )
             return ctx
 
         # ---- Phase 8: VERIFY ----
@@ -544,11 +550,28 @@ class GovernedOrchestrator:
         )
 
         ctx = ctx.advance(OperationPhase.COMPLETE)
+        self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
         return ctx
 
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    def _record_canary_for_ctx(
+        self,
+        ctx: OperationContext,
+        success: bool,
+        latency_s: float,
+        rolled_back: bool = False,
+    ) -> None:
+        """Record canary telemetry for every file in ctx.target_files."""
+        for f in ctx.target_files:
+            self._stack.canary.record_operation(
+                file_path=str(f),
+                success=success,
+                latency_s=latency_s,
+                rolled_back=rolled_back,
+            )
 
     def _build_profile(self, ctx: OperationContext) -> OperationProfile:
         """Build an OperationProfile from the context's target files.
@@ -819,6 +842,7 @@ class GovernedOrchestrator:
             repo_roots=repo_roots,
             ledger=self._stack.ledger,
         )
+        _t_saga = time.monotonic()
         apply_result = await strategy.execute(ctx, patch_map)
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_ABORTED:
@@ -828,6 +852,7 @@ class GovernedOrchestrator:
                 OperationState.FAILED,
                 {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
             )
+            self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
             return ctx
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_APPLY_COMPLETED:
@@ -857,6 +882,7 @@ class GovernedOrchestrator:
                         "compensated": comp_ok,
                     },
                 )
+                self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
                 return ctx
 
             # SAGA_SUCCEEDED
@@ -867,6 +893,7 @@ class GovernedOrchestrator:
                 {"saga_id": apply_result.saga_id},
             )
             ctx = ctx.advance(OperationPhase.COMPLETE)
+            self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_saga)
             return ctx
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_STUCK:
@@ -900,6 +927,7 @@ class GovernedOrchestrator:
                 OperationState.FAILED,
                 {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
             )
+            self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
             return ctx
 
         # SAGA_ROLLED_BACK: clean rollback — change not applied, system is clean
@@ -909,6 +937,7 @@ class GovernedOrchestrator:
             OperationState.FAILED,
             {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id, "rolled_back": True},
         )
+        self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga, rolled_back=True)
         return ctx
 
     async def _record_ledger(

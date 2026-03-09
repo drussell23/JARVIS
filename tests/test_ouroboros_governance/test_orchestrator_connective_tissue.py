@@ -30,6 +30,7 @@ from backend.core.ouroboros.governance.saga.saga_types import (
     SagaApplyResult,
     SagaTerminalState,
 )
+from backend.core.ouroboros.governance.test_runner import MultiAdapterResult
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,20 @@ def _mock_approval_provider() -> MagicMock:
     return provider
 
 
+def _mock_validation_runner() -> MagicMock:
+    """Return a duck-typed validation runner that always passes."""
+    runner = MagicMock()
+    runner.run = AsyncMock(
+        return_value=MultiAdapterResult(
+            passed=True,
+            adapter_results=(),
+            dominant_failure=None,
+            total_duration_s=0.01,
+        )
+    )
+    return runner
+
+
 def _make_orchestrator(tmp_path: Path, stack=None) -> GovernedOrchestrator:
     if stack is None:
         stack = _mock_stack()
@@ -137,6 +152,7 @@ def _make_orchestrator(tmp_path: Path, stack=None) -> GovernedOrchestrator:
         generator=_mock_generator(tmp_path),
         approval_provider=_mock_approval_provider(),
         config=_config(tmp_path),
+        validation_runner=_mock_validation_runner(),
     )
 
 
@@ -202,3 +218,62 @@ async def test_saga_stuck_pause_failure_does_not_reraise(tmp_path):
     stack.controller.pause.assert_awaited_once()
     assert result_ctx is not None
     assert result_ctx.phase == OperationPhase.POSTMORTEM
+
+
+async def test_canary_record_on_single_repo_success(tmp_path):
+    """CanaryController.record_operation must be called with success=True after a clean apply."""
+    stack = _mock_stack()
+    orch = _make_orchestrator(tmp_path, stack=stack)
+    ctx = _make_ctx(tmp_path)
+
+    await orch.run(ctx)
+
+    assert stack.canary.record_operation.called
+    call = stack.canary.record_operation.call_args
+    success_val = call.kwargs.get("success") if call.kwargs else call.args[1]
+    assert success_val is True
+
+
+async def test_canary_record_on_single_repo_failure(tmp_path):
+    """CanaryController.record_operation must be called with success=False when change_engine fails."""
+    stack = _mock_stack()
+    stack.change_engine.execute = AsyncMock(
+        return_value=MagicMock(success=False, rolled_back=True)
+    )
+    orch = _make_orchestrator(tmp_path, stack=stack)
+    ctx = _make_ctx(tmp_path)
+
+    await orch.run(ctx)
+
+    assert stack.canary.record_operation.called
+    call = stack.canary.record_operation.call_args
+    if call.kwargs:
+        assert call.kwargs.get("success") is False
+        assert call.kwargs.get("rolled_back") is True
+    else:
+        assert call.args[1] is False
+        assert call.args[3] is True
+
+
+async def test_canary_record_on_saga_stuck(tmp_path):
+    """CanaryController.record_operation must be called with success=False for SAGA_STUCK."""
+    stack = _mock_stack()
+    orch = _make_orchestrator(tmp_path, stack=stack)
+    ctx = _make_ctx(tmp_path)
+    ctx_apply = _advance_to_apply(ctx)
+
+    stuck_result = _make_stuck_result(op_id="op-001")
+
+    with patch(
+        "backend.core.ouroboros.governance.orchestrator.SagaApplyStrategy"
+    ) as MockStrategy:
+        mock_strat = MagicMock()
+        mock_strat.execute = AsyncMock(return_value=stuck_result)
+        MockStrategy.return_value = mock_strat
+
+        await orch._execute_saga_apply(ctx_apply, {"mock_candidate": {}})
+
+    assert stack.canary.record_operation.called
+    call = stack.canary.record_operation.call_args
+    success_val = call.kwargs.get("success") if call.kwargs else call.args[1]
+    assert success_val is False
