@@ -219,6 +219,29 @@ class PerformanceRecord:
     error_message: Optional[str] = None
     context_tokens: int = 0
     output_tokens: int = 0
+    # v2 — linkage + objective quality metrics (all default to safe zero-value)
+    op_id: str = ""
+    patch_hash: str = ""
+    pass_rate: float = 0.0
+    lint_violations: int = 0
+    coverage_pct: float = 0.0
+    complexity_delta: float = 0.0
+
+
+@dataclass
+class ModelAttributionRecord:
+    """Per-model, per-task-type quality delta recorded at model promotion."""
+    model_id: str
+    previous_model_id: str
+    training_batch_size: int
+    task_type: str
+    success_rate_delta: float
+    latency_delta_ms: float
+    quality_delta: float
+    sample_size: int
+    confidence: float   # 0..1 = min(n_old, n_new) / lookback_n
+    summary: str
+    recorded_at: datetime = field(default_factory=datetime.now)
 
 
 class PerformanceRecordPersistence:
@@ -235,7 +258,7 @@ class PerformanceRecordPersistence:
     - Export/import for backup and migration
     """
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
     DEFAULT_RETENTION_DAYS = 90
     BATCH_WRITE_INTERVAL = 5.0  # seconds
 
@@ -291,7 +314,13 @@ class PerformanceRecordPersistence:
                     error_message TEXT,
                     context_tokens INTEGER DEFAULT 0,
                     output_tokens INTEGER DEFAULT 0,
-                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    op_id TEXT NOT NULL DEFAULT '',
+                    patch_hash TEXT NOT NULL DEFAULT '',
+                    pass_rate REAL NOT NULL DEFAULT 0.0,
+                    lint_violations INTEGER NOT NULL DEFAULT 0,
+                    coverage_pct REAL NOT NULL DEFAULT 0.0,
+                    complexity_delta REAL NOT NULL DEFAULT 0.0
                 )
             """)
             conn.execute("""
@@ -304,6 +333,24 @@ class PerformanceRecordPersistence:
                 CREATE INDEX IF NOT EXISTS idx_task_type ON performance_records(task_type)
             """)
 
+            # model_attribution table (v2+)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS model_attribution (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_id TEXT NOT NULL,
+                    previous_model_id TEXT NOT NULL,
+                    training_batch_size INTEGER NOT NULL,
+                    task_type TEXT NOT NULL,
+                    success_rate_delta REAL NOT NULL,
+                    latency_delta_ms REAL NOT NULL,
+                    quality_delta REAL NOT NULL,
+                    sample_size INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    summary TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                )
+            """)
+
             # Schema version table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS schema_version (
@@ -311,14 +358,45 @@ class PerformanceRecordPersistence:
                 )
             """)
 
-            # Check and update schema version
+            # Check stored version; migrate if behind, insert if fresh
             cursor = conn.execute("SELECT version FROM schema_version LIMIT 1")
             row = cursor.fetchone()
             if not row:
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)",
                            (self.SCHEMA_VERSION,))
+            else:
+                stored = row[0]
+                if stored < self.SCHEMA_VERSION:
+                    self._migrate_sqlite(conn, stored)
 
             conn.commit()
+
+    def _migrate_sqlite(self, conn: sqlite3.Connection, from_version: int) -> None:
+        """Apply incremental schema migrations."""
+        if from_version < 2:
+            conn.execute("ALTER TABLE performance_records ADD COLUMN op_id TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE performance_records ADD COLUMN patch_hash TEXT NOT NULL DEFAULT ''")
+            conn.execute("ALTER TABLE performance_records ADD COLUMN pass_rate REAL NOT NULL DEFAULT 0.0")
+            conn.execute("ALTER TABLE performance_records ADD COLUMN lint_violations INTEGER NOT NULL DEFAULT 0")
+            conn.execute("ALTER TABLE performance_records ADD COLUMN coverage_pct REAL NOT NULL DEFAULT 0.0")
+            conn.execute("ALTER TABLE performance_records ADD COLUMN complexity_delta REAL NOT NULL DEFAULT 0.0")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS model_attribution (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    model_id TEXT NOT NULL,
+                    previous_model_id TEXT NOT NULL,
+                    training_batch_size INTEGER NOT NULL,
+                    task_type TEXT NOT NULL,
+                    success_rate_delta REAL NOT NULL,
+                    latency_delta_ms REAL NOT NULL,
+                    quality_delta REAL NOT NULL,
+                    sample_size INTEGER NOT NULL,
+                    confidence REAL NOT NULL,
+                    summary TEXT NOT NULL,
+                    recorded_at TEXT NOT NULL
+                )
+            """)
+            conn.execute("UPDATE schema_version SET version = 2")
 
     def _record_to_dict(self, record: PerformanceRecord) -> Dict[str, Any]:
         """Convert PerformanceRecord to dictionary for serialization."""
@@ -334,6 +412,12 @@ class PerformanceRecordPersistence:
             "error_message": record.error_message,
             "context_tokens": record.context_tokens,
             "output_tokens": record.output_tokens,
+            "op_id": record.op_id,
+            "patch_hash": record.patch_hash,
+            "pass_rate": record.pass_rate,
+            "lint_violations": record.lint_violations,
+            "coverage_pct": record.coverage_pct,
+            "complexity_delta": record.complexity_delta,
         }
 
     def _dict_to_record(self, data: Dict[str, Any]) -> PerformanceRecord:
@@ -350,6 +434,12 @@ class PerformanceRecordPersistence:
             error_message=data.get("error_message"),
             context_tokens=data.get("context_tokens", 0),
             output_tokens=data.get("output_tokens", 0),
+            op_id=data.get("op_id", ""),
+            patch_hash=data.get("patch_hash", ""),
+            pass_rate=data.get("pass_rate", 0.0),
+            lint_violations=data.get("lint_violations", 0),
+            coverage_pct=data.get("coverage_pct", 0.0),
+            complexity_delta=data.get("complexity_delta", 0.0),
         )
 
     async def save_record(self, record: PerformanceRecord) -> None:
@@ -406,13 +496,17 @@ class PerformanceRecordPersistence:
                     INSERT INTO performance_records
                     (model_id, task_type, difficulty, success, latency_ms,
                      iterations_used, code_quality_score, timestamp,
-                     error_message, context_tokens, output_tokens)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     error_message, context_tokens, output_tokens,
+                     op_id, patch_hash, pass_rate, lint_violations,
+                     coverage_pct, complexity_delta)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, [
                     (r.model_id, r.task_type, r.difficulty.name, int(r.success),
                      r.latency_ms, r.iterations_used, r.code_quality_score,
                      r.timestamp.isoformat(), r.error_message,
-                     r.context_tokens, r.output_tokens)
+                     r.context_tokens, r.output_tokens,
+                     r.op_id, r.patch_hash, r.pass_rate, r.lint_violations,
+                     r.coverage_pct, r.complexity_delta)
                     for r in records
                 ])
                 conn.commit()
@@ -504,6 +598,12 @@ class PerformanceRecordPersistence:
                         error_message=row["error_message"],
                         context_tokens=row["context_tokens"] or 0,
                         output_tokens=row["output_tokens"] or 0,
+                        op_id=row["op_id"] if "op_id" in row.keys() else "",
+                        patch_hash=row["patch_hash"] if "patch_hash" in row.keys() else "",
+                        pass_rate=row["pass_rate"] if "pass_rate" in row.keys() else 0.0,
+                        lint_violations=row["lint_violations"] if "lint_violations" in row.keys() else 0,
+                        coverage_pct=row["coverage_pct"] if "coverage_pct" in row.keys() else 0.0,
+                        complexity_delta=row["complexity_delta"] if "complexity_delta" in row.keys() else 0.0,
                     )
 
                     # Respect per-model limit
@@ -613,6 +713,57 @@ class PerformanceRecordPersistence:
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, _clean)
+
+    async def save_attribution_record(self, record: ModelAttributionRecord) -> None:
+        """Persist a ModelAttributionRecord to SQLite immediately."""
+        if not self._use_sqlite:
+            return
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._write_attribution_sync, record)
+
+    def _write_attribution_sync(self, record: ModelAttributionRecord) -> None:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.execute(
+                """INSERT INTO model_attribution
+                   (model_id, previous_model_id, training_batch_size, task_type,
+                    success_rate_delta, latency_delta_ms, quality_delta,
+                    sample_size, confidence, summary, recorded_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    record.model_id, record.previous_model_id, record.training_batch_size,
+                    record.task_type, record.success_rate_delta, record.latency_delta_ms,
+                    record.quality_delta, record.sample_size, record.confidence,
+                    record.summary, record.recorded_at.isoformat(),
+                ),
+            )
+            conn.commit()
+
+    async def get_records_by_model_and_task(
+        self,
+        model_id: str,
+        task_type: str,
+        limit: int = 20,
+    ) -> List[PerformanceRecord]:
+        """Return up to `limit` most-recent PerformanceRecords for a model+task pair."""
+        if not self._use_sqlite:
+            return []
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._query_by_model_task_sync, model_id, task_type, limit
+        )
+
+    def _query_by_model_task_sync(
+        self, model_id: str, task_type: str, limit: int
+    ) -> List[PerformanceRecord]:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                """SELECT * FROM performance_records
+                   WHERE model_id = ? AND task_type = ?
+                   ORDER BY timestamp DESC LIMIT ?""",
+                (model_id, task_type, limit),
+            ).fetchall()
+        return [self._dict_to_record(dict(row)) for row in rows]
 
     async def get_statistics(
         self,
