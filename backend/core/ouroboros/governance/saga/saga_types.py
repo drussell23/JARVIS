@@ -31,6 +31,12 @@ class PatchedFile:
     op: FileOp
     preimage: Optional[bytes]
 
+    def __post_init__(self) -> None:
+        if self.op in (FileOp.MODIFY, FileOp.DELETE) and self.preimage is None:
+            raise ValueError(
+                f"PatchedFile with op={self.op.value} requires preimage; got None for path={self.path!r}"
+            )
+
 
 @dataclass(frozen=True)
 class RepoPatch:
@@ -45,12 +51,18 @@ class RepoPatch:
     new_content:
         Tuple of (path, bytes) pairs to write during apply.
         Stored separately from preimage so the patch is self-contained.
+        Every path in `new_content` must correspond to a path in `files`.
     """
     repo: str
     files: Tuple[PatchedFile, ...]
     new_content: Tuple[Tuple[str, bytes], ...] = ()
 
     def is_empty(self) -> bool:
+        """Return True when there are no file operations to apply.
+
+        `new_content` entries without matching `files` entries are invalid
+        and treated as empty for apply purposes.
+        """
         return len(self.files) == 0
 
 
@@ -64,7 +76,7 @@ class SagaTerminalState(str, Enum):
     SAGA_ABORTED = "saga_aborted"                    # pre-flight drift check failed
 
 
-@dataclass
+@dataclass  # intentionally NOT frozen: strategy builds this incrementally
 class SagaApplyResult:
     """Result returned by SagaApplyStrategy.execute()."""
     terminal_state: SagaTerminalState

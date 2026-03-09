@@ -10,7 +10,7 @@ from backend.core.ouroboros.governance.saga.saga_types import (
 
 
 def test_file_op_values():
-    assert {FileOp.MODIFY, FileOp.CREATE, FileOp.DELETE}
+    assert {m.value for m in FileOp} == {"modify", "create", "delete"}
 
 
 def test_patched_file_frozen():
@@ -62,7 +62,7 @@ def test_saga_apply_result_fields():
 
 
 def test_package_imports():
-    """All public types importable from the package root."""
+    """All public types importable and instantiable from the package root."""
     from backend.core.ouroboros.governance.saga import (
         FileOp,
         PatchedFile,
@@ -70,5 +70,27 @@ def test_package_imports():
         SagaApplyResult,
         SagaTerminalState,
     )
-    assert FileOp.CREATE
-    assert SagaTerminalState.SAGA_STUCK
+    # Verify each type is actually constructable
+    pf = PatchedFile(path="x.py", op=FileOp.MODIFY, preimage=b"old")
+    assert pf.op == FileOp.MODIFY
+    rp = RepoPatch(repo="jarvis", files=(pf,))
+    assert not rp.is_empty()
+    result = SagaApplyResult(
+        terminal_state=SagaTerminalState.SAGA_STUCK,
+        saga_id="s1",
+        saga_step_index=0,
+        error="test",
+    )
+    assert result.terminal_state == SagaTerminalState.SAGA_STUCK
+
+
+def test_patched_file_modify_requires_preimage():
+    """MODIFY with preimage=None raises ValueError."""
+    with pytest.raises(ValueError, match="requires preimage"):
+        PatchedFile(path="x.py", op=FileOp.MODIFY, preimage=None)
+
+
+def test_patched_file_delete_requires_preimage():
+    """DELETE with preimage=None raises ValueError."""
+    with pytest.raises(ValueError, match="requires preimage"):
+        PatchedFile(path="x.py", op=FileOp.DELETE, preimage=None)
