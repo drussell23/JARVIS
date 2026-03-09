@@ -1,8 +1,9 @@
 """Tests for ModelAttributionRecorder."""
-import asyncio
+import sqlite3
 import tempfile
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -30,6 +31,10 @@ def _make_record(model_id: str, task_type: str, success: bool, latency_ms: float
 async def _populate(persistence, model_id, task_type, count, success_rate, latency_ms=500.0, quality=0.8):
     for i in range(count):
         rec = _make_record(model_id, task_type, (i / count) < success_rate, latency_ms, quality)
+        # `save_record` batches writes asynchronously via an internal write queue, which
+        # makes it unreliable for test setup that queries the DB immediately afterward.
+        # `_save_to_sqlite` is used here to write synchronously and guarantee the rows
+        # are present before the test assertion runs.
         await persistence._save_to_sqlite([rec])
 
 
@@ -72,7 +77,6 @@ class TestModelAttributionRecorder:
                 assert r.confidence <= 1.0
 
     async def test_record_persisted_to_database(self):
-        import sqlite3
         with tempfile.TemporaryDirectory() as tmp:
             p = PerformanceRecordPersistence(storage_path=Path(tmp), use_sqlite=True)
             await _populate(p, "v2", "refactoring", 5, success_rate=0.8)
@@ -84,3 +88,21 @@ class TestModelAttributionRecorder:
             with sqlite3.connect(db) as conn:
                 count = conn.execute("SELECT COUNT(*) FROM model_attribution").fetchone()[0]
             assert count >= 1
+
+    async def test_write_failure_does_not_raise_and_returns_empty(self):
+        """A disk-full write error must be fault-isolated: no exception propagates and
+        the failed record is excluded from the returned list."""
+        with tempfile.TemporaryDirectory() as tmp:
+            p = PerformanceRecordPersistence(storage_path=Path(tmp), use_sqlite=True)
+            await _populate(p, "v2", "bug_fix", 5, success_rate=0.9)
+            await _populate(p, "v1", "bug_fix", 5, success_rate=0.5)
+            recorder = ModelAttributionRecorder(persistence=p, lookback_n=20, min_sample_size=3)
+
+            # Patch save_attribution_record to simulate a DB write failure on every call.
+            p.save_attribution_record = AsyncMock(
+                side_effect=sqlite3.OperationalError("disk full")
+            )
+
+            # Must not raise; must return an empty list because every write failed.
+            results = await recorder.record_model_transition("v2", "v1", 10, task_types=["bug_fix"])
+            assert results == []
