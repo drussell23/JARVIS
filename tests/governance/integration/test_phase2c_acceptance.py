@@ -15,7 +15,6 @@ import json
 from unittest.mock import AsyncMock, MagicMock
 
 from backend.core.ouroboros.governance.intake import (
-    IntentEnvelope,
     make_envelope,
     UnifiedIntakeRouter,
     IntakeRouterConfig,

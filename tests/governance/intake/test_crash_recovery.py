@@ -1,8 +1,6 @@
 """Crash recovery: WAL replay on router restart."""
 import asyncio
-import json
 import time
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
