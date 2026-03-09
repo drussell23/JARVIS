@@ -66,6 +66,9 @@ def _compute_quality_score(
         return 0.50 * ls + 0.50 * cs
 
 
+# NOTE: All fields must be JSON-primitive (str, int, float, bool, None).
+# Adding Enum-typed fields would break the OperationContext hash chain
+# because dataclasses.asdict() does not normalize enums to their .name string.
 @dataclass(frozen=True)
 class BenchmarkResult:
     pass_rate: float

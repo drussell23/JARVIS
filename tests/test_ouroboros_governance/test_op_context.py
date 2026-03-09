@@ -545,7 +545,7 @@ class TestOperationContextBenchmarkFields:
         )
         ctx2 = ctx.with_benchmark_result(br)
         assert ctx2.benchmark_result == br
-        assert ctx2.benchmark_result is not ctx.benchmark_result or ctx.benchmark_result is None
+        assert ctx.benchmark_result is None
 
     def test_with_benchmark_result_does_not_change_phase(self):
         from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
@@ -592,3 +592,10 @@ class TestOperationContextBenchmarkFields:
         ctx2a = ctx.with_benchmark_result(br)
         ctx2b = ctx.with_benchmark_result(br)
         assert ctx2a.context_hash == ctx2b.context_hash
+
+    def test_with_pre_apply_snapshots_updates_hash_chain(self):
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        snapshots = {"src/foo.py": "content"}
+        ctx2 = ctx.with_pre_apply_snapshots(snapshots)
+        assert ctx2.context_hash != ctx.context_hash
+        assert ctx2.previous_hash == ctx.context_hash

@@ -666,7 +666,7 @@ class OperationContext:
         """Return a new context with pre_apply_snapshots set (no phase change)."""
         intermediate = dataclasses.replace(
             self,
-            pre_apply_snapshots=snapshots,
+            pre_apply_snapshots=dict(snapshots),  # shallow copy for immutability
             previous_hash=self.context_hash,
             context_hash="",
         )
