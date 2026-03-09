@@ -449,10 +449,30 @@ async def create_governance_stack(
     capabilities: Dict[str, CapabilityStatus] = {}
 
     try:
+        # Build EventBridge FIRST so it can be wired as CommProtocol transport
+        _event_bridge: Optional[Any] = None
+        if event_bus is not None:
+            try:
+                _event_bridge = EventBridge(event_bus=event_bus)
+                capabilities["event_bridge"] = CapabilityStatus(
+                    enabled=True, reason="ok"
+                )
+            except Exception as exc:
+                capabilities["event_bridge"] = CapabilityStatus(
+                    enabled=False, reason=f"init_error: {exc}"
+                )
+        else:
+            capabilities["event_bridge"] = CapabilityStatus(
+                enabled=False, reason="dep_missing"
+            )
+
+        # Build CommProtocol — include EventBridge as extra transport if available
+        _bridge_transports: List[Any] = [_event_bridge] if _event_bridge is not None else []
+        comm = _build_comm_protocol(config=config, extra_transports=_bridge_transports)
+
         # Core components (always present)
         risk_engine = RiskEngine()
         ledger = OperationLedger(storage_dir=config.ledger_dir)
-        comm = _build_comm_protocol(config=config)
         controller = SupervisorOuroborosController()
         lock_manager = GovernanceLockManager()
         break_glass = BreakGlassManager()
@@ -473,21 +493,6 @@ async def create_governance_stack(
         )
 
         # Optional bridges
-        _event_bridge: Optional[Any] = None
-        if event_bus is not None:
-            try:
-                _event_bridge = EventBridge(event_bus=event_bus)
-                capabilities["event_bridge"] = CapabilityStatus(
-                    enabled=True, reason="ok"
-                )
-            except Exception as exc:
-                capabilities["event_bridge"] = CapabilityStatus(
-                    enabled=False, reason=f"init_error: {exc}"
-                )
-        else:
-            capabilities["event_bridge"] = CapabilityStatus(
-                enabled=False, reason="dep_missing"
-            )
 
         _blast_adapter: Optional[Any] = None
         if oracle is not None:
