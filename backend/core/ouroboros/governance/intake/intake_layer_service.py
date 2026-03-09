@@ -342,18 +342,41 @@ class IntakeLayerService:
             router=self._router,
             poll_interval_s=self._config.backlog_scan_interval_s,
         )
-        test_failure_sensor = TestFailureSensor(
-            repo="jarvis",
-            router=self._router,
-        )
-        opportunity_miner_sensor = OpportunityMinerSensor(
-            repo_root=self._config.project_root,
-            router=self._router,
-            scan_paths=self._config.miner_scan_paths,
-            complexity_threshold=self._config.miner_complexity_threshold,
-            poll_interval_s=self._config.miner_scan_interval_s,
-            auto_submit_threshold=self._config.miner_auto_submit_threshold,
-        )
+
+        # Fan out per-repo sensors when a registry is available; fall back to
+        # single "jarvis" sensor for backward compatibility.
+        registry = self._config.repo_registry
+        enabled_repos = list(registry.list_enabled()) if registry is not None else []
+
+        if enabled_repos:
+            test_failure_sensors = [
+                TestFailureSensor(repo=rc.name, router=self._router)
+                for rc in enabled_repos
+            ]
+            miner_sensors = [
+                OpportunityMinerSensor(
+                    repo_root=rc.local_path,
+                    router=self._router,
+                    scan_paths=self._config.miner_scan_paths,
+                    complexity_threshold=self._config.miner_complexity_threshold,
+                    poll_interval_s=self._config.miner_scan_interval_s,
+                    auto_submit_threshold=self._config.miner_auto_submit_threshold,
+                    repo=rc.name,
+                )
+                for rc in enabled_repos
+            ]
+        else:
+            test_failure_sensors = [TestFailureSensor(repo="jarvis", router=self._router)]
+            miner_sensors = [
+                OpportunityMinerSensor(
+                    repo_root=self._config.project_root,
+                    router=self._router,
+                    scan_paths=self._config.miner_scan_paths,
+                    complexity_threshold=self._config.miner_complexity_threshold,
+                    poll_interval_s=self._config.miner_scan_interval_s,
+                    auto_submit_threshold=self._config.miner_auto_submit_threshold,
+                )
+            ]
 
         # VoiceCommandSensor has no start/stop lifecycle; store as attribute only.
         self._voice_sensor = VoiceCommandSensor(
@@ -363,7 +386,7 @@ class IntakeLayerService:
         )
 
         # Sensors with start/stop lifecycle
-        self._sensors = [backlog_sensor, test_failure_sensor, opportunity_miner_sensor]
+        self._sensors = [backlog_sensor] + test_failure_sensors + miner_sensors
 
         await self._router.start()
         for sensor in self._sensors:
