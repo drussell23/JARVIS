@@ -19,7 +19,7 @@ def test_saga_step_status_values():
 def test_repo_saga_status_frozen():
     """RepoSagaStatus is a frozen dataclass."""
     s = RepoSagaStatus(repo="jarvis", status=SagaStepStatus.PENDING)
-    with pytest.raises((AttributeError, TypeError)):
+    with pytest.raises(AttributeError):
         s.repo = "prime"  # type: ignore
 
 
@@ -128,3 +128,50 @@ def test_existing_create_still_works():
     assert ctx.primary_repo == "jarvis"
     assert ctx.schema_version == "3.0"
     assert ctx.cross_repo is False
+
+
+def test_dag_self_loop_raises():
+    """Self-loop in dependency_edges raises ArchitecturalCycleError."""
+    with pytest.raises(ArchitecturalCycleError):
+        OperationContext.create(
+            target_files=("x.py",),
+            description="self loop",
+            repo_scope=("jarvis",),
+            primary_repo="jarvis",
+            dependency_edges=(("jarvis", "jarvis"),),
+        )
+
+
+def test_repo_scope_none_uses_primary_repo():
+    """repo_scope=None resolves to (primary_repo,) tuple."""
+    ctx = OperationContext.create(
+        target_files=("x.py",),
+        description="scope from primary",
+        primary_repo="prime",
+        # repo_scope intentionally omitted
+    )
+    assert ctx.repo_scope == ("prime",)
+    assert ctx.primary_repo == "prime"
+    assert ctx.cross_repo is False
+
+
+def test_saga_state_survives_advance():
+    """Populated saga_state tuple is preserved through advance()."""
+    status_entry = RepoSagaStatus(
+        repo="jarvis",
+        status=SagaStepStatus.APPLIED,
+        attempt=1,
+        last_error="",
+        reason_code="",
+        compensation_attempted=False,
+    )
+    ctx = OperationContext.create(
+        target_files=("x.py",),
+        description="saga state test",
+        primary_repo="jarvis",
+        saga_state=(status_entry,),
+    )
+    ctx2 = ctx.advance(OperationPhase.ROUTE)
+    assert len(ctx2.saga_state) == 1
+    assert ctx2.saga_state[0].repo == "jarvis"
+    assert ctx2.saga_state[0].status == SagaStepStatus.APPLIED

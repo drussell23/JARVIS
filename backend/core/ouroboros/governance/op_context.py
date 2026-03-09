@@ -328,8 +328,9 @@ def _validate_dag(edges: Tuple[Tuple[str, str], ...]) -> None:
             if in_degree[neighbor] == 0:
                 queue.append(neighbor)
     if visited < len(nodes):
+        cycle_nodes = [n for n in nodes if in_degree[n] > 0]
         raise ArchitecturalCycleError(
-            f"Cycle detected in dependency_edges: {edges}"
+            f"Cycle detected in dependency_edges involving repos: {sorted(cycle_nodes)}"
         )
 
 
@@ -438,7 +439,7 @@ class OperationContext:
         apply_plan: Tuple[str, ...] = (),
         repo_snapshots: Tuple[Tuple[str, str], ...] = (),
         saga_id: str = "",
-        saga_state: Tuple["RepoSagaStatus", ...] = (),
+        saga_state: Tuple[RepoSagaStatus, ...] = (),
         schema_version: str = "3.0",
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
