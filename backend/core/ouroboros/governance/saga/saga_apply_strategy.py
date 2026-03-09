@@ -13,12 +13,17 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import logging
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from backend.core.ouroboros.governance.op_context import OperationContext
+from backend.core.ouroboros.governance.op_context import (
+    OperationContext,
+    RepoSagaStatus,
+    SagaStepStatus,
+)
 from backend.core.ouroboros.governance.saga.saga_types import (
     FileOp,
     RepoPatch,
@@ -59,6 +64,11 @@ class SagaApplyStrategy:
         apply_order = self._resolve_apply_order(ctx)
         saga_id = ctx.saga_id or ctx.op_id
 
+        # Initialise per-repo status tracking from any existing saga_state for idempotent resume
+        repo_statuses: Dict[str, RepoSagaStatus] = {
+            rss.repo: rss for rss in (ctx.saga_state or ())
+        }
+
         # Phase A: Pre-flight drift check
         abort = await self._phase_a_preflight(ctx, apply_order, saga_id)
         if abort is not None:
@@ -76,6 +86,10 @@ class SagaApplyStrategy:
 
             if patch.is_empty():
                 logger.info("[Saga] %s SKIPPED (empty patch)", repo)
+                repo_statuses[repo] = RepoSagaStatus(
+                    repo=repo,
+                    status=SagaStepStatus.SKIPPED,
+                )
                 step_index += 1
                 continue
 
@@ -88,21 +102,38 @@ class SagaApplyStrategy:
                     failed_repo = repo
                     failure_reason = "drift_detected_mid_apply"
                     failure_error = f"{repo} HEAD moved during apply"
+                    repo_statuses[repo] = RepoSagaStatus(
+                        repo=repo,
+                        status=SagaStepStatus.FAILED,
+                        last_error=failure_error,
+                        reason_code=failure_reason,
+                    )
                     break
 
             logger.info("[Saga] Applying %s (step %d)", repo, step_index)
-            await self._emit_sub_event("apply_repo", saga_id, ctx.op_id, repo=repo)
 
             try:
                 await self._apply_patch(repo, patch)
                 applied_repos.append(repo)
                 step_index += 1
                 logger.info("[Saga] %s APPLIED", repo)
+                # Issue 1 fix: emit apply_repo AFTER successful write+git-add
+                await self._emit_sub_event("apply_repo", saga_id, ctx.op_id, repo=repo)
+                repo_statuses[repo] = RepoSagaStatus(
+                    repo=repo,
+                    status=SagaStepStatus.APPLIED,
+                )
             except Exception as exc:
                 failed_repo = repo
                 failure_reason = "apply_write_error"
                 failure_error = str(exc)
                 logger.error("[Saga] Apply failed for %s: %s", repo, exc)
+                repo_statuses[repo] = RepoSagaStatus(
+                    repo=repo,
+                    status=SagaStepStatus.FAILED,
+                    last_error=failure_error,
+                    reason_code=failure_reason,
+                )
                 break
 
         if failed_repo is None:
@@ -112,11 +143,12 @@ class SagaApplyStrategy:
                 saga_id=saga_id,
                 saga_step_index=step_index,
                 error=None,
+                saga_state=tuple(repo_statuses.values()),
             )
 
         # Phase C: Compensating rollback in reverse order
-        all_compensated = await self._phase_c_compensate(
-            applied_repos, patch_map, saga_id, ctx.op_id, failure_reason
+        all_compensated, repo_statuses = await self._phase_c_compensate(
+            applied_repos, patch_map, saga_id, ctx.op_id, failure_reason, repo_statuses
         )
 
         if all_compensated:
@@ -126,13 +158,20 @@ class SagaApplyStrategy:
                 saga_step_index=step_index,
                 error=failure_error,
                 reason_code=failure_reason,
+                saga_state=tuple(repo_statuses.values()),
             )
+
+        # Issue 3 fix: emit saga.stuck before returning SAGA_STUCK terminal state
+        await self._emit_sub_event(
+            "stuck", saga_id, ctx.op_id, reason="compensation_failed"
+        )
         return SagaApplyResult(
             terminal_state=SagaTerminalState.SAGA_STUCK,
             saga_id=saga_id,
             saga_step_index=step_index,
             error=failure_error,
             reason_code="compensation_failed",
+            saga_state=tuple(repo_statuses.values()),
         )
 
     # ------------------------------------------------------------------
@@ -143,6 +182,9 @@ class SagaApplyStrategy:
         self, ctx: OperationContext, apply_order: List[str], saga_id: str
     ) -> Optional[SagaApplyResult]:
         """Verify HEAD anchors for all repos before touching any file."""
+        # Issue 4 fix: acquire repo leases in deterministic sorted order before drift check
+        self._acquire_repo_leases(list(apply_order))
+
         await self._emit_sub_event("prepare", saga_id, ctx.op_id)
         snapshots = dict(ctx.repo_snapshots)
         for repo in apply_order:
@@ -216,8 +258,12 @@ class SagaApplyStrategy:
         saga_id: str,
         op_id: str,
         failure_reason: str,
-    ) -> bool:
-        """Compensate all applied repos in reverse order. Returns True if all succeeded."""
+        repo_statuses: Dict[str, RepoSagaStatus],
+    ) -> Tuple[bool, Dict[str, RepoSagaStatus]]:
+        """Compensate all applied repos in reverse order.
+
+        Returns (all_succeeded, updated_repo_statuses).
+        """
         all_ok = True
         for repo in reversed(applied_repos):
             patch = patch_map[repo]
@@ -227,10 +273,21 @@ class SagaApplyStrategy:
             try:
                 await self._compensate_patch(repo, patch)
                 logger.info("[Saga] Compensated %s", repo)
+                repo_statuses[repo] = dataclasses.replace(
+                    repo_statuses.get(repo, RepoSagaStatus(repo=repo, status=SagaStepStatus.APPLIED)),
+                    status=SagaStepStatus.COMPENSATED,
+                    compensation_attempted=True,
+                )
             except Exception as exc:
                 logger.error("[Saga] Compensation FAILED for %s: %s", repo, exc)
+                repo_statuses[repo] = dataclasses.replace(
+                    repo_statuses.get(repo, RepoSagaStatus(repo=repo, status=SagaStepStatus.APPLIED)),
+                    status=SagaStepStatus.COMPENSATION_FAILED,
+                    last_error=str(exc),
+                    compensation_attempted=True,
+                )
                 all_ok = False
-        return all_ok
+        return all_ok, repo_statuses
 
     async def _compensate_patch(self, repo: str, patch: RepoPatch) -> None:
         """Restore all files in patch to their preimage state."""
@@ -263,6 +320,15 @@ class SagaApplyStrategy:
     # ------------------------------------------------------------------
     # Utilities
     # ------------------------------------------------------------------
+
+    def _acquire_repo_leases(self, repos: List[str]) -> None:
+        """Acquire repo leases in deterministic sorted order to prevent cross-saga deadlocks.
+
+        TODO: Integrate with DistributedLockManager when available.
+        Currently a no-op stub that establishes the correct call site and acquisition order.
+        """
+        sorted_repos = sorted(repos)
+        logger.debug("[SagaApplyStrategy] Lease acquisition order: %s", sorted_repos)
 
     def _get_head_hash(self, repo: str) -> str:
         """Return the current HEAD commit hash for a repo. Returns '' on error."""

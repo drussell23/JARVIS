@@ -84,3 +84,4 @@ class SagaApplyResult:
     saga_step_index: int
     error: Optional[str]
     reason_code: str = ""
+    saga_state: Tuple = ()  # updated RepoSagaStatus entries for idempotent resume

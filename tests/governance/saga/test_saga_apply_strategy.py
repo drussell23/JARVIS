@@ -1,8 +1,9 @@
 """Tests for SagaApplyStrategy."""
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from backend.core.ouroboros.governance.op_context import OperationContext
+from backend.core.ouroboros.governance.op_context import OperationContext, SagaStepStatus
 from backend.core.ouroboros.governance.saga.saga_types import (
     FileOp,
     PatchedFile,
@@ -161,3 +162,191 @@ def test_topological_sort_respects_dependency_edges():
         apply_plan=(),
     )
     assert order.index("jarvis") < order.index("prime")
+
+
+async def test_compensation_failure_returns_saga_stuck(tmp_path):
+    """When compensation fails for an applied repo, returns SAGA_STUCK.
+
+    Setup: two repos in apply order [repo_a, repo_b].
+    - repo_a applies successfully.
+    - repo_b fails to apply (missing repo root → FileNotFoundError).
+    - Compensation of repo_a raises OSError → compensation_failed.
+    Result: SAGA_STUCK, repo_a.status == COMPENSATION_FAILED.
+    """
+    # repo_a is a real git repo; repo_b's root is intentionally missing to force apply failure
+    repo_a_root = tmp_path / "repo_a"
+    repo_a_root.mkdir()
+    subprocess.run(["git", "init"], cwd=repo_a_root, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=repo_a_root,
+        capture_output=True,
+    )
+    repo_a_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repo_a_root,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Pre-create file so repo_a MODIFY patch succeeds
+    (repo_a_root / "a.py").write_bytes(b"old a")
+
+    patch_map = {
+        "repo_a": RepoPatch(
+            repo="repo_a",
+            files=(PatchedFile(path="a.py", op=FileOp.MODIFY, preimage=b"old a"),),
+            new_content=(("a.py", b"new a"),),
+        ),
+        "repo_b": RepoPatch(
+            repo="repo_b",
+            files=(PatchedFile(path="b.py", op=FileOp.CREATE, preimage=None),),
+            new_content=(("b.py", b"new b"),),
+        ),
+    }
+
+    # repo_b root is missing → _apply_patch will raise FileNotFoundError
+    missing_root = tmp_path / "nonexistent_repo_b"
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+
+    strategy = SagaApplyStrategy(
+        repo_roots={"repo_a": repo_a_root, "repo_b": missing_root},
+        ledger=ledger,
+    )
+
+    ctx = OperationContext.create(
+        target_files=("a.py", "b.py"),
+        description="stuck test",
+        primary_repo="repo_a",
+        repo_scope=("repo_a", "repo_b"),
+        apply_plan=("repo_a", "repo_b"),
+        repo_snapshots=(("repo_a", repo_a_head),),  # no snapshot for repo_b → no TOCTOU check
+        saga_id="stuck-001",
+    )
+
+    # Make compensation of repo_a raise to simulate COMPENSATION_FAILED
+    async def failing_compensate(repo: str, patch: RepoPatch) -> None:
+        raise OSError(f"Cannot restore {repo}: permission denied")
+
+    strategy._compensate_patch = failing_compensate
+
+    result = await strategy.execute(ctx, patch_map)
+
+    assert result.terminal_state == SagaTerminalState.SAGA_STUCK
+    assert result.reason_code == "compensation_failed"
+    # Per-repo saga_state must record COMPENSATION_FAILED for repo_a
+    stuck_statuses = {s.repo: s for s in result.saga_state}
+    assert "repo_a" in stuck_statuses
+    assert stuck_statuses["repo_a"].status == SagaStepStatus.COMPENSATION_FAILED
+    assert stuck_statuses["repo_a"].compensation_attempted is True
+
+
+async def test_mid_apply_drift_triggers_compensation(tmp_path):
+    """TOCTOU guard: HEAD drifts between Phase A and Phase B write → compensation runs.
+
+    This covers the mid-apply drift path (drift_detected_mid_apply reason code).
+    The first repo ("prime") applies successfully; the second ("jarvis") detects
+    drift and aborts, triggering compensation of "prime".
+    """
+    # Build two real git repos so HEAD hashes are real
+    prime_root = tmp_path / "prime"
+    prime_root.mkdir()
+    subprocess.run(["git", "init"], cwd=prime_root, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=prime_root,
+        capture_output=True,
+    )
+    prime_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=prime_root,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    jarvis_root = tmp_path / "jarvis"
+    jarvis_root.mkdir()
+    subprocess.run(["git", "init"], cwd=jarvis_root, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "--allow-empty", "-m", "init"],
+        cwd=jarvis_root,
+        capture_output=True,
+    )
+    jarvis_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=jarvis_root,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    # Pre-create files for the patches
+    prime_file = prime_root / "p.py"
+    prime_file.write_bytes(b"prime old")
+    jarvis_file = jarvis_root / "j.py"
+    jarvis_file.write_bytes(b"jarvis old")
+
+    patch_map = {
+        "prime": RepoPatch(
+            repo="prime",
+            files=(PatchedFile(path="p.py", op=FileOp.MODIFY, preimage=b"prime old"),),
+            new_content=(("p.py", b"prime new"),),
+        ),
+        "jarvis": RepoPatch(
+            repo="jarvis",
+            files=(PatchedFile(path="j.py", op=FileOp.MODIFY, preimage=b"jarvis old"),),
+            new_content=(("j.py", b"jarvis new"),),
+        ),
+    }
+
+    ledger = MagicMock()
+    ledger.append = AsyncMock()
+
+    strategy = SagaApplyStrategy(
+        repo_roots={"prime": prime_root, "jarvis": jarvis_root},
+        ledger=ledger,
+    )
+
+    ctx = OperationContext.create(
+        target_files=("p.py", "j.py"),
+        description="mid-apply drift test",
+        primary_repo="prime",
+        repo_scope=("prime", "jarvis"),
+        apply_plan=("prime", "jarvis"),  # prime applied first, jarvis second
+        repo_snapshots=(("prime", prime_head), ("jarvis", jarvis_head)),
+        saga_id="drift-mid-001",
+    )
+
+    # Phase A: both pass with correct hashes.
+    # During Phase B, prime applies OK; then jarvis HEAD appears drifted.
+    call_count = {"n": 0}
+
+    def head_hash_with_mid_drift(repo: str) -> str:
+        # Phase A calls prime then jarvis (both correct).
+        # Phase B TOCTOU call for prime → correct; for jarvis → drifted.
+        call_count["n"] += 1
+        if repo == "prime":
+            return prime_head
+        # jarvis: first call (Phase A) returns real head; second (Phase B) returns drifted
+        jarvis_call_index = call_count["n"]
+        # The pattern: Phase A iterates [prime, jarvis], then Phase B iterates same order.
+        # Prime gets its Phase-B TOCTOU check first (call 3), jarvis gets call 4.
+        # We make jarvis always return a drifted hash after the first time it's called.
+        if not hasattr(head_hash_with_mid_drift, "_jarvis_seen"):
+            head_hash_with_mid_drift._jarvis_seen = True
+            return jarvis_head  # Phase A call — return real hash
+        return "DRIFTED_HASH"  # Phase B TOCTOU call — simulate drift
+
+    with patch.object(strategy, "_get_head_hash", side_effect=head_hash_with_mid_drift):
+        result = await strategy.execute(ctx, patch_map)
+
+    # prime was applied, jarvis drifted → rollback prime → SAGA_ROLLED_BACK
+    assert result.terminal_state == SagaTerminalState.SAGA_ROLLED_BACK
+    assert result.reason_code == "drift_detected_mid_apply"
+    # prime should be compensated (file restored to preimage)
+    assert prime_file.read_bytes() == b"prime old"
+    # Per-repo statuses
+    statuses = {s.repo: s for s in result.saga_state}
+    assert statuses["prime"].status == SagaStepStatus.COMPENSATED
+    assert statuses["jarvis"].status == SagaStepStatus.FAILED
