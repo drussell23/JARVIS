@@ -307,3 +307,9 @@ from backend.core.ouroboros.governance.intake.sensors import (
     OpportunityMinerSensor,
     StaticCandidate,
 )
+from backend.core.ouroboros.governance.intake import (
+    IntakeLayerConfig,
+    IntakeLayerService,
+    IntakeServiceState,
+    IntakeNarrator,
+)

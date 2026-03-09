@@ -11,6 +11,12 @@ from .unified_intake_router import (
     IntakeRouterConfig,
     RouterAlreadyRunningError,
 )
+from .intake_layer_service import (
+    IntakeLayerConfig,
+    IntakeLayerService,
+    IntakeServiceState,
+    IntakeNarrator,
+)
 
 __all__ = [
     "IntentEnvelope",
@@ -22,4 +28,8 @@ __all__ = [
     "UnifiedIntakeRouter",
     "IntakeRouterConfig",
     "RouterAlreadyRunningError",
+    "IntakeLayerConfig",
+    "IntakeLayerService",
+    "IntakeServiceState",
+    "IntakeNarrator",
 ]

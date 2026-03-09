@@ -296,3 +296,29 @@ async def test_router_hook_not_called_on_dedup(tmp_path):
     await router.stop()
 
     assert hook_count == 1  # hook fires once for first, not for duplicate
+
+
+def test_intake_layer_exports():
+    """IntakeLayerService and friends are importable from the intake package."""
+    from backend.core.ouroboros.governance.intake import (
+        IntakeLayerConfig,
+        IntakeLayerService,
+        IntakeServiceState,
+        IntakeNarrator,
+    )
+    assert IntakeLayerService is not None
+    assert IntakeLayerConfig is not None
+    assert IntakeServiceState is not None
+    assert IntakeNarrator is not None
+
+
+def test_governance_package_exports():
+    """Governance top-level exports include IntakeLayerService."""
+    from backend.core.ouroboros.governance import (
+        IntakeLayerConfig,
+        IntakeLayerService,
+        IntakeServiceState,
+        IntakeNarrator,
+    )
+    assert IntakeLayerService is not None
+    assert IntakeLayerConfig is not None
