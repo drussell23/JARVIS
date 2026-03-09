@@ -61,6 +61,7 @@ class OperationPhase(Enum):
 
     CLASSIFY = auto()
     ROUTE = auto()
+    CONTEXT_EXPANSION = auto()
     GENERATE = auto()
     GENERATE_RETRY = auto()
     VALIDATE = auto()
@@ -85,6 +86,11 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
         OperationPhase.CANCELLED,
     },
     OperationPhase.ROUTE: {
+        OperationPhase.CONTEXT_EXPANSION,
+        OperationPhase.GENERATE,
+        OperationPhase.CANCELLED,
+    },
+    OperationPhase.CONTEXT_EXPANSION: {
         OperationPhase.GENERATE,
         OperationPhase.CANCELLED,
     },
@@ -410,6 +416,7 @@ class OperationContext:
     saga_id: str = ""
     saga_state: Tuple[RepoSagaStatus, ...] = ()
     schema_version: str = "3.0"
+    expanded_context_files: Tuple[str, ...] = ()
 
     # ------------------------------------------------------------------
     # Post-init
@@ -493,6 +500,7 @@ class OperationContext:
             "saga_id": saga_id,
             "saga_state": saga_state,
             "schema_version": schema_version,
+            "expanded_context_files": (),
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -617,6 +625,22 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
 
         # Final instance with correct hash
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_expanded_files(self, files: Tuple[str, ...]) -> "OperationContext":
+        """Return a new context with expanded_context_files set (no phase change).
+
+        Called by ContextExpander after expansion rounds complete.
+        Uses the same hash-chain mechanics as with_pipeline_deadline().
+        """
+        intermediate = dataclasses.replace(
+            self,
+            expanded_context_files=files,
+            previous_hash=self.context_hash,
+            context_hash="",  # placeholder — recomputed below
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
 

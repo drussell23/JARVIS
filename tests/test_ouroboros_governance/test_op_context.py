@@ -36,6 +36,7 @@ class TestOperationPhase:
     EXPECTED_PHASES = {
         "CLASSIFY",
         "ROUTE",
+        "CONTEXT_EXPANSION",
         "GENERATE",
         "GENERATE_RETRY",
         "VALIDATE",
@@ -77,6 +78,7 @@ class TestOperationPhase:
 
     def test_route_transitions(self) -> None:
         assert PHASE_TRANSITIONS[OperationPhase.ROUTE] == {
+            OperationPhase.CONTEXT_EXPANSION,
             OperationPhase.GENERATE,
             OperationPhase.CANCELLED,
         }
@@ -444,3 +446,77 @@ class TestComputeHash:
     def test_sha256_hex_length(self) -> None:
         h = _compute_hash({"key": "value"})
         assert len(h) == 64
+
+
+class TestContextExpansionPhase:
+    """CONTEXT_EXPANSION phase state machine additions."""
+
+    def test_context_expansion_in_enum(self):
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+        assert hasattr(OperationPhase, "CONTEXT_EXPANSION")
+
+    def test_route_to_context_expansion_legal(self):
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, OperationPhase,
+        )
+        ctx = OperationContext.create(target_files=("foo.py",), description="test")
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+        assert ctx.phase is OperationPhase.CONTEXT_EXPANSION
+
+    def test_context_expansion_to_generate_legal(self):
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, OperationPhase,
+        )
+        ctx = OperationContext.create(target_files=("foo.py",), description="test")
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+        ctx = ctx.advance(OperationPhase.GENERATE)
+        assert ctx.phase is OperationPhase.GENERATE
+
+    def test_context_expansion_to_cancelled_legal(self):
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, OperationPhase,
+        )
+        ctx = OperationContext.create(target_files=("foo.py",), description="test")
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+        ctx = ctx.advance(OperationPhase.CANCELLED)
+        assert ctx.phase is OperationPhase.CANCELLED
+
+    def test_route_to_generate_still_legal_direct(self):
+        """ROUTE -> GENERATE direct path must remain valid (expansion is optional)."""
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, OperationPhase,
+        )
+        ctx = OperationContext.create(target_files=("foo.py",), description="test")
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.GENERATE)
+        assert ctx.phase is OperationPhase.GENERATE
+
+    def test_expanded_context_files_default_empty(self):
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        ctx = OperationContext.create(target_files=("foo.py",), description="test")
+        assert ctx.expanded_context_files == ()
+
+    def test_with_expanded_files_updates_field(self):
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, OperationPhase,
+        )
+        ctx = OperationContext.create(target_files=("foo.py",), description="test")
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+        enriched = ctx.with_expanded_files(("helpers.py", "utils.py"))
+        assert enriched.expanded_context_files == ("helpers.py", "utils.py")
+        assert enriched.phase is OperationPhase.CONTEXT_EXPANSION
+
+    def test_with_expanded_files_updates_hash_chain(self):
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, OperationPhase,
+        )
+        ctx = OperationContext.create(target_files=("foo.py",), description="test")
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+        enriched = ctx.with_expanded_files(("helpers.py",))
+        assert enriched.previous_hash == ctx.context_hash
+        assert enriched.context_hash != ctx.context_hash
