@@ -69,6 +69,17 @@ class IntakeLayerConfig:
             miner_complexity_threshold=int(
                 os.getenv("JARVIS_INTAKE_MINER_COMPLEXITY_THRESHOLD", "10")
             ),
+            miner_scan_paths=list(
+                filter(
+                    None,
+                    [
+                        p.strip()
+                        for p in os.getenv(
+                            "JARVIS_INTAKE_MINER_SCAN_PATHS", "backend/,tests/"
+                        ).split(",")
+                    ],
+                )
+            ),
             voice_stt_confidence_threshold=float(
                 os.getenv("JARVIS_INTAKE_VOICE_STT_THRESHOLD", "0.70")
             ),

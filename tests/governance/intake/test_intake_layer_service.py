@@ -16,11 +16,20 @@ def test_intake_layer_config_defaults(tmp_path):
     assert config.backlog_scan_interval_s > 0
     assert config.miner_complexity_threshold > 0
     assert config.a_narrator_enabled is True
+    assert config.miner_scan_paths == ["backend/", "tests/"]
+
+
+def test_intake_layer_config_from_env_bool(monkeypatch):
+    monkeypatch.setenv("JARVIS_INTAKE_A_NARRATOR_ENABLED", "false")
+    config = IntakeLayerConfig.from_env()
+    assert config.a_narrator_enabled is False
 
 
 def test_intake_layer_config_from_env(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_PROJECT_ROOT", str(tmp_path))
     monkeypatch.setenv("JARVIS_INTAKE_DEDUP_WINDOW_S", "120.0")
+    monkeypatch.setenv("JARVIS_INTAKE_MINER_SCAN_PATHS", "src/,lib/")
     config = IntakeLayerConfig.from_env()
     assert config.project_root == tmp_path
     assert config.dedup_window_s == 120.0
+    assert config.miner_scan_paths == ["src/", "lib/"]
