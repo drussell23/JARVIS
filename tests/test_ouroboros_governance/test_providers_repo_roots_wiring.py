@@ -114,9 +114,11 @@ def test_claude_provider_accepts_repo_roots():
 # ---------------------------------------------------------------------------
 
 
-async def test_build_components_injects_repo_roots_into_prime_provider(tmp_path):
-    """_build_components must set _repo_roots on PrimeProvider from RepoRegistry."""
+async def test_build_components_passes_repo_roots_to_providers_at_construction(tmp_path):
+    """_build_components must pass repo_roots_map to both PrimeProvider and ClaudeProvider
+    at construction time (not via retroactive injection)."""
     from unittest.mock import AsyncMock, patch
+    import os
     from backend.core.ouroboros.governance.governed_loop_service import (
         GovernedLoopConfig,
         GovernedLoopService,
@@ -125,8 +127,6 @@ async def test_build_components_injects_repo_roots_into_prime_provider(tmp_path)
         RepoConfig,
         RepoRegistry,
     )
-
-    config = GovernedLoopConfig(project_root=tmp_path)
 
     jarvis_path = tmp_path / "jarvis"
     prime_path = tmp_path / "prime"
@@ -145,6 +145,11 @@ async def test_build_components_injects_repo_roots_into_prime_provider(tmp_path)
     mock_health.name = "AVAILABLE"
     mock_prime._check_health = AsyncMock(return_value=mock_health)
 
+    # Supply a fake API key so ClaudeProvider gets built too
+    config = GovernedLoopConfig(
+        project_root=tmp_path,
+        claude_api_key="test-key",
+    )
     gls = GovernedLoopService(config=config, stack=None, prime_client=mock_prime)
 
     with patch(
@@ -153,11 +158,19 @@ async def test_build_components_injects_repo_roots_into_prime_provider(tmp_path)
     ):
         await gls._build_components()
 
-    from backend.core.ouroboros.governance.providers import PrimeProvider
+    from backend.core.ouroboros.governance.providers import ClaudeProvider, PrimeProvider
 
     assert gls._generator is not None
-    provider = gls._generator._primary
-    assert isinstance(provider, PrimeProvider)
-    assert provider._repo_roots is not None
-    assert "jarvis" in provider._repo_roots
-    assert provider._repo_roots["jarvis"] == jarvis_path
+
+    # Primary (PrimeProvider) has repo_roots
+    primary = gls._generator._primary
+    assert isinstance(primary, PrimeProvider)
+    assert primary._repo_roots is not None
+    assert primary._repo_roots.get("jarvis") == jarvis_path
+    assert primary._repo_roots.get("prime") == prime_path
+
+    # Fallback (ClaudeProvider) also has repo_roots
+    fallback = gls._generator._fallback
+    assert isinstance(fallback, ClaudeProvider)
+    assert fallback._repo_roots is not None
+    assert fallback._repo_roots.get("jarvis") == jarvis_path

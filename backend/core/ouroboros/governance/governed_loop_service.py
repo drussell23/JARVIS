@@ -562,6 +562,16 @@ class GovernedLoopService:
         if self._stack is not None:
             self._ledger = getattr(self._stack, "ledger", None)
 
+        # Build RepoRegistry first so providers receive repo_roots at construction time.
+        # RepoRegistry.from_env() is synchronous — no ordering dependency prevents this.
+        repo_registry = RepoRegistry.from_env()
+        enabled_repos = repo_registry.list_enabled()
+        logger.info(
+            "[GovernedLoop] RepoRegistry enabled repos: %s",
+            [r.name for r in enabled_repos],
+        )
+        repo_roots_map: Dict[str, Path] = {r.name: r.local_path for r in enabled_repos}
+
         primary = None
         fallback = None
 
@@ -573,7 +583,11 @@ class GovernedLoopService:
                     PrimeProvider,
                 )
 
-                primary = PrimeProvider(self._prime_client, repo_root=self._config.project_root)
+                primary = PrimeProvider(
+                    self._prime_client,
+                    repo_root=self._config.project_root,
+                    repo_roots=repo_roots_map,
+                )
                 try:
                     if await primary.health_probe():
                         logger.info("[GovernedLoop] PrimeProvider: healthy at startup")
@@ -611,6 +625,7 @@ class GovernedLoopService:
                     max_cost_per_op=self._config.claude_max_cost_per_op,
                     daily_budget=self._config.claude_daily_budget,
                     repo_root=self._config.project_root,
+                    repo_roots=repo_roots_map,
                 )
                 logger.info("[GovernedLoop] ClaudeProvider: configured")
             except Exception as exc:
@@ -662,23 +677,6 @@ class GovernedLoopService:
                 "cpp": CppAdapter(repo_root=self._config.project_root),
             },
         )
-
-        # Build RepoRegistry from environment (always; empty if env vars not set)
-        repo_registry = RepoRegistry.from_env()
-        enabled_repos = repo_registry.list_enabled()
-        logger.info(
-            "[GovernedLoop] RepoRegistry enabled repos: %s",
-            [r.name for r in enabled_repos],
-        )
-
-        # Build repo_roots_map for cross-repo prompt/parse wiring
-        repo_roots_map: Dict[str, Path] = {r.name: r.local_path for r in enabled_repos}
-
-        # Retroactively inject repo_roots into providers now that registry is built
-        if primary is not None:
-            primary._repo_roots = repo_roots_map
-        if fallback is not None:
-            fallback._repo_roots = repo_roots_map
 
         # Build orchestrator
         orch_config = OrchestratorConfig(
