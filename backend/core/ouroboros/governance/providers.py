@@ -39,8 +39,11 @@ logger = logging.getLogger("Ouroboros.Providers")
 # ---------------------------------------------------------------------------
 
 _CODEGEN_SYSTEM_PROMPT = (
-    "You are a precise code modification assistant for the JARVIS codebase. "
-    "You MUST respond with valid JSON only, matching schema_version 2b.1. "
+    "You are a precise code modification assistant for the JARVIS multi-repo ecosystem. "
+    "For single-repo requests respond with schema_version 2b.1. "
+    "For cross-repo requests (where the prompt specifies schema_version 2c.1) "
+    "respond with schema_version 2c.1 and a patches dict keyed by repo name. "
+    "You MUST respond with valid JSON only. "
     "No markdown preamble, no explanations outside the JSON. Only the JSON object."
 )
 
@@ -53,6 +56,7 @@ _MAX_TEST_CONTEXT_CHARS = 1500     # total across all discovered test files
 _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
 _MAX_TEST_FILES = 2                # hard cap on discovered test files
 _SCHEMA_VERSION = "2b.1"
+_SCHEMA_VERSION_MULTI = "2c.1"
 _SCHEMA_TOP_LEVEL_KEYS = frozenset({"schema_version", "candidates", "provider_metadata"})
 _CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "rationale"})
 
@@ -158,12 +162,25 @@ def _find_context_files(
 def _build_codegen_prompt(
     ctx: "OperationContext",
     repo_root: Optional[Path] = None,
+    repo_roots: Optional[Dict[str, Path]] = None,
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
     Reads each target file from disk, hashes it, applies truncation, discovers
-    surrounding import/test context (capped), and injects the schema_version 2b.1
-    output specification.
+    surrounding import/test context (capped), and injects the appropriate output
+    schema specification: schema_version 2b.1 for single-repo operations and
+    schema_version 2c.1 for cross-repo operations.
+
+    Parameters
+    ----------
+    ctx:
+        The operation context describing target files, description, and repo scope.
+    repo_root:
+        Root path for single-repo operations. Defaults to cwd if not provided.
+    repo_roots:
+        Mapping of repo name -> root path for cross-repo operations. When
+        provided alongside a cross-repo ctx, each file section is labelled with
+        the repo it belongs to and the 2c.1 schema is emitted.
     """
     from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
@@ -173,9 +190,34 @@ def _build_codegen_prompt(
     # ── 1. Build source snapshot for each target file ──────────────────
     file_sections: List[str] = []
     for raw_path in ctx.target_files:
-        abs_path = (repo_root / raw_path).resolve()
+        # Determine which repo root governs this file and resolve label
+        repo_label: Optional[str] = None
+        effective_root = repo_root
+        if ctx.cross_repo and repo_roots:
+            abs_raw = Path(raw_path)
+            for rname, rroot in repo_roots.items():
+                try:
+                    abs_raw.relative_to(rroot)
+                    repo_label = rname
+                    effective_root = rroot
+                    break
+                except ValueError:
+                    continue
+            # Fall back to absolute path resolution against each root
+            if repo_label is None:
+                for rname, rroot in repo_roots.items():
+                    candidate = (rroot / raw_path).resolve()
+                    try:
+                        candidate.relative_to(rroot.resolve())
+                        repo_label = rname
+                        effective_root = rroot
+                        break
+                    except ValueError:
+                        continue
+
+        abs_path = Path(raw_path) if Path(raw_path).is_absolute() else (effective_root / raw_path).resolve()
         try:
-            abs_path = _safe_context_path(repo_root, abs_path)
+            abs_path = _safe_context_path(effective_root, abs_path)
         except BlockedPathError as exc:
             file_sections.append(f"## File: {raw_path}\n[BLOCKED: {exc}]\n")
             continue
@@ -186,11 +228,19 @@ def _build_codegen_prompt(
         line_count = content.count("\n")
         truncated = _read_with_truncation(abs_path)
 
-        file_sections.append(
-            f"## File: {raw_path} [SHA-256: {source_hash[:12]}]"
-            f" [{size_bytes} bytes, {line_count} lines]\n"
-            f"```\n{truncated}\n```"
-        )
+        # Build the section header — include [repo_name] label for cross-repo ops
+        if repo_label is not None:
+            header = (
+                f"## File: {raw_path} [{repo_label}] [SHA-256: {source_hash[:12]}]"
+                f" [{size_bytes} bytes, {line_count} lines]"
+            )
+        else:
+            header = (
+                f"## File: {raw_path} [SHA-256: {source_hash[:12]}]"
+                f" [{size_bytes} bytes, {line_count} lines]"
+            )
+
+        file_sections.append(f"{header}\n```\n{truncated}\n```")
 
     # ── 2. Discover surrounding context (import sources + tests) ────────
     context_parts: List[str] = []
@@ -234,7 +284,47 @@ def _build_codegen_prompt(
     )
 
     # ── 3. Output schema instruction ────────────────────────────────────
-    schema_instruction = f"""## Output Schema
+    if ctx.cross_repo and repo_roots:
+        repos_listed = "\n".join(
+            f'        "{r}": [{{"file_path": "...", "full_content": "...", "op": "modify"}}]'
+            for r in ctx.repo_scope
+        )
+        schema_instruction = f"""## Output Schema
+
+Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_MULTI}"):
+
+```json
+{{
+  "schema_version": "{_SCHEMA_VERSION_MULTI}",
+  "candidates": [
+    {{
+      "candidate_id": "c1",
+      "patches": {{
+{repos_listed}
+      }},
+      "rationale": "<one sentence, max 200 chars>"
+    }}
+  ],
+  "provider_metadata": {{
+    "model_id": "<your model identifier>",
+    "reasoning_summary": "<max 200 chars>"
+  }}
+}}
+```
+
+Each repo entry in `patches` is a list of file patch objects:
+- `file_path`: path relative to that repo's root
+- `full_content`: complete modified file content (not a diff)
+- `op`: one of "modify", "create", "delete"
+
+Rules:
+- Return 1–3 candidates. c1 = primary, c2 = alternative.
+- `full_content` must be the **complete** file (not a diff or patch).
+- Python files must be syntactically valid.
+- Only include repos that actually require changes. Omit unchanged repos.
+- No extra keys at any level. Return ONLY the JSON object."""
+    else:
+        schema_instruction = f"""## Output Schema
 
 Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
 
