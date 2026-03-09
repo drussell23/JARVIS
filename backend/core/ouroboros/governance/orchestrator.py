@@ -586,14 +586,20 @@ class GovernedOrchestrator:
         """Publish operation outcome to LearningBridge. Fault-isolated -- never raises."""
         if self._stack.learning_bridge is None:
             return
-        outcome = OperationOutcome(
-            op_id=ctx.op_id,
-            goal=ctx.description,
-            target_files=list(ctx.target_files),
-            final_state=final_state,
-            error_pattern=error_pattern,
-        )
-        await self._stack.learning_bridge.publish(outcome)
+        try:
+            outcome = OperationOutcome(
+                op_id=ctx.op_id,
+                goal=ctx.description,
+                target_files=list(ctx.target_files),
+                final_state=final_state,
+                error_pattern=error_pattern,
+            )
+            await self._stack.learning_bridge.publish(outcome)
+        except Exception:
+            logger.exception(
+                "[Orchestrator] LearningBridge.publish failed for op %s; outcome not recorded",
+                ctx.op_id,
+            )
 
     def _build_profile(self, ctx: OperationContext) -> OperationProfile:
         """Build an OperationProfile from the context's target files.
