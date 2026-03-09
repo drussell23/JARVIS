@@ -199,3 +199,51 @@ class TestRepoPipelineManagerLifecycle:
 
         await manager.stop_all()
         mock_gls.stop.assert_called_once()
+
+
+async def test_submit_sets_primary_repo_on_context(tmp_path):
+    """RepoPipelineManager.submit() passes signal.repo as primary_repo."""
+    from pathlib import Path
+    from unittest.mock import AsyncMock, MagicMock
+
+    from backend.core.ouroboros.governance.multi_repo.repo_pipeline import (
+        RepoPipelineManager,
+    )
+    from backend.core.ouroboros.governance.multi_repo.registry import (
+        RepoConfig, RepoRegistry,
+    )
+    from backend.core.ouroboros.governance.intent.signals import IntentSignal
+
+    registry = RepoRegistry(configs=(
+        RepoConfig(name="prime", local_path=Path("/tmp/p"), canary_slices=("tests/",)),
+    ))
+
+    captured_ctx = None
+
+    async def fake_submit(ctx, *, trigger_source):
+        nonlocal captured_ctx
+        captured_ctx = ctx
+        return MagicMock(op_id="op-capture-01")
+
+    mock_gls = AsyncMock()
+    mock_gls.submit = fake_submit
+
+    manager = RepoPipelineManager(
+        registry=registry,
+        pipelines={"prime": mock_gls},
+    )
+
+    signal = IntentSignal(
+        source="intent:test_failure",
+        target_files=("tests/test_prime.py",),
+        repo="prime",
+        description="prime test failure",
+        evidence={"signature": "err:prime"},
+        confidence=0.9,
+        stable=True,
+    )
+    await manager.submit(signal)
+
+    assert captured_ctx is not None, "pipeline.submit() was never called"
+    assert captured_ctx.primary_repo == "prime"
+    assert captured_ctx.repo_scope == ("prime",)

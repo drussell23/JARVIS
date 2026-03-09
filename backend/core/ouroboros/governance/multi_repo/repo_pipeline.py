@@ -82,6 +82,8 @@ class RepoPipelineManager:
             target_files=signal.target_files,
             description=signal.description,
             op_id=op_id,
+            primary_repo=repo_name,
+            repo_scope=(repo_name,),
         )
 
         # Submit to the repo's pipeline
