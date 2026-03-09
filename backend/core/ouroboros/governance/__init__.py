@@ -285,3 +285,25 @@ from backend.core.ouroboros.governance.test_runner import (
     PythonAdapter,
     CppAdapter,
 )
+
+# ── Intake Layer (Phase 2C) ──────────────────────────────────────────────────
+from backend.core.ouroboros.governance.intake import (
+    IntentEnvelope,
+    EnvelopeValidationError,
+    make_envelope as make_intent_envelope,
+    SCHEMA_VERSION as INTAKE_SCHEMA_VERSION,
+    WAL,
+    WALEntry,
+    UnifiedIntakeRouter,
+    IntakeRouterConfig,
+    RouterAlreadyRunningError,
+)
+from backend.core.ouroboros.governance.intake.sensors import (
+    BacklogSensor,
+    BacklogTask,
+    TestFailureSensor,
+    VoiceCommandSensor,
+    VoiceCommandPayload,
+    OpportunityMinerSensor,
+    StaticCandidate,
+)
