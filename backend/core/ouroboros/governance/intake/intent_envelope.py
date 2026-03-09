@@ -104,29 +104,32 @@ class IntentEnvelope:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "IntentEnvelope":
-        return cls(
-            schema_version=d["schema_version"],
-            source=d["source"],
-            description=d["description"],
-            target_files=tuple(d["target_files"]),
-            repo=d["repo"],
-            confidence=float(d["confidence"]),
-            urgency=d["urgency"],
-            dedup_key=d["dedup_key"],
-            causal_id=d["causal_id"],
-            signal_id=d["signal_id"],
-            idempotency_key=d["idempotency_key"],
-            lease_id=d.get("lease_id", ""),
-            evidence=dict(d.get("evidence", {})),
-            requires_human_ack=bool(d["requires_human_ack"]),
-            submitted_at=float(d["submitted_at"]),
-        )
+        try:
+            return cls(
+                schema_version=d["schema_version"],
+                source=d["source"],
+                description=d["description"],
+                target_files=tuple(d["target_files"]),
+                repo=d["repo"],
+                confidence=float(d["confidence"]),
+                urgency=d["urgency"],
+                dedup_key=d["dedup_key"],
+                causal_id=d["causal_id"],
+                signal_id=d["signal_id"],
+                idempotency_key=d["idempotency_key"],
+                lease_id=d.get("lease_id", ""),
+                evidence=dict(d.get("evidence", {})),
+                requires_human_ack=bool(d["requires_human_ack"]),
+                submitted_at=float(d["submitted_at"]),
+            )
+        except KeyError as exc:
+            raise EnvelopeValidationError(f"missing required field: {exc}") from exc
 
 
 def _dedup_key(source: str, target_files: Tuple[str, ...], evidence: Dict[str, Any]) -> str:
     sig = evidence.get("signature", "")
     raw = f"{source}|{'|'.join(sorted(target_files))}|{sig}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+    return hashlib.sha256(raw.encode()).hexdigest()[:32]
 
 
 def make_envelope(
@@ -160,7 +163,7 @@ def make_envelope(
         signal_id=sid,
         idempotency_key=ikey,
         lease_id="",
-        evidence=evidence,
+        evidence=dict(evidence),
         requires_human_ack=requires_human_ack,
         submitted_at=time.monotonic(),
     )

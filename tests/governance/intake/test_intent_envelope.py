@@ -1,5 +1,4 @@
 """Tests for IntentEnvelope schema 2c.1."""
-import time
 import pytest
 from backend.core.ouroboros.governance.intake.intent_envelope import (
     IntentEnvelope,
