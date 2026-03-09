@@ -29,10 +29,10 @@ import asyncio
 import logging
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
@@ -61,6 +61,8 @@ from backend.core.ouroboros.governance.risk_engine import (
 from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
 from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
 from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTerminalState
+from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult, PatchBenchmarker
+from backend.core.ouroboros.integration import PerformanceRecord
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
@@ -103,6 +105,25 @@ class OrchestratorConfig:
     max_validate_retries: int = 2
     context_expansion_enabled: bool = True
     context_expansion_timeout_s: float = 30.0
+
+    # Benchmarking
+    benchmark_enabled: bool = True
+    benchmark_timeout_s: float = 60.0
+
+    # Model attribution
+    model_attribution_enabled: bool = True
+    model_attribution_lookback_n: int = 20
+    model_attribution_min_sample_size: int = 3
+
+    # Curriculum
+    curriculum_enabled: bool = True
+    curriculum_publish_interval_s: float = 3600.0
+    curriculum_window_n: int = 50
+    curriculum_top_k: int = 5
+    curriculum_impact_weights: Dict[str, float] = field(default_factory=dict)
+
+    # Reactor event polling
+    reactor_event_poll_interval_s: float = 30.0
 
     def resolve_repo_roots(
         self,
@@ -536,6 +557,18 @@ class GovernedOrchestrator:
         if ctx.cross_repo:
             return await self._execute_saga_apply(ctx, best_candidate)
 
+        # Capture pre-apply snapshots for complexity baseline
+        snapshots: Dict[str, str] = {}
+        for f in ctx.target_files:
+            fpath = self._config.project_root / f
+            if fpath.exists():
+                try:
+                    snapshots[str(f)] = fpath.read_text(errors="replace")
+                except OSError:
+                    pass
+        if snapshots:
+            ctx = ctx.with_pre_apply_snapshots(snapshots)
+
         change_request = self._build_change_request(ctx, best_candidate)
 
         _t_apply = time.monotonic()
@@ -579,10 +612,11 @@ class GovernedOrchestrator:
             OperationState.APPLIED,
             {"op_id": ctx.op_id},
         )
-
+        ctx = await self._run_benchmark(ctx, [])
         ctx = ctx.advance(OperationPhase.COMPLETE)
         self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
         await self._publish_outcome(ctx, OperationState.APPLIED)
+        await self._persist_performance_record(ctx)
         return ctx
 
     # ------------------------------------------------------------------
@@ -627,6 +661,60 @@ class GovernedOrchestrator:
             logger.exception(
                 "[Orchestrator] LearningBridge.publish failed for op %s; outcome not recorded",
                 ctx.op_id,
+            )
+
+    async def _run_benchmark(
+        self,
+        ctx: OperationContext,
+        applied_files: Sequence[Path],
+    ) -> OperationContext:
+        """Run PatchBenchmarker. Fault-isolated — never raises, never alters terminal state."""
+        if not self._config.benchmark_enabled:
+            return ctx
+        try:
+            benchmarker = PatchBenchmarker(
+                project_root=self._config.project_root,
+                timeout_s=self._config.benchmark_timeout_s,
+                pre_apply_snapshots=getattr(ctx, "pre_apply_snapshots", {}),
+            )
+            result = await asyncio.wait_for(
+                benchmarker.benchmark(ctx),
+                timeout=self._config.benchmark_timeout_s,
+            )
+            return ctx.with_benchmark_result(result)
+        except Exception as exc:
+            logger.warning(
+                "[Orchestrator] Benchmark failed for op=%s: %s; continuing without metrics",
+                ctx.op_id, exc,
+            )
+            return ctx
+
+    async def _persist_performance_record(self, ctx: OperationContext) -> None:
+        """Write PerformanceRecord to persistence. Fault-isolated — never raises."""
+        if self._stack.performance_persistence is None:
+            return
+        try:
+            br = getattr(ctx, "benchmark_result", None)
+            record = PerformanceRecord(
+                model_id=getattr(ctx, "model_id", None) or "unknown",
+                task_type=br.task_type if br else "code_improvement",
+                difficulty=ctx.difficulty,
+                success=ctx.phase == OperationPhase.COMPLETE,
+                latency_ms=getattr(ctx, "elapsed_ms", 0.0),
+                iterations_used=getattr(ctx, "iterations_used", 1),
+                code_quality_score=br.quality_score if br else 0.0,
+                op_id=ctx.op_id,
+                patch_hash=br.patch_hash if br else "",
+                pass_rate=br.pass_rate if br else 0.0,
+                lint_violations=br.lint_violations if br else 0,
+                coverage_pct=br.coverage_pct if br else 0.0,
+                complexity_delta=br.complexity_delta if br else 0.0,
+            )
+            await self._stack.performance_persistence.save_record(record)
+        except Exception as exc:
+            logger.warning(
+                "[Orchestrator] PerformanceRecord persist failed for op=%s: %s",
+                ctx.op_id, exc,
             )
 
     def _build_profile(self, ctx: OperationContext) -> OperationProfile:
@@ -950,9 +1038,11 @@ class GovernedOrchestrator:
                 OperationState.APPLIED,
                 {"saga_id": apply_result.saga_id},
             )
+            ctx = await self._run_benchmark(ctx, [])
             ctx = ctx.advance(OperationPhase.COMPLETE)
             self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_saga)
             await self._publish_outcome(ctx, OperationState.APPLIED)
+            await self._persist_performance_record(ctx)
             return ctx
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_STUCK:
@@ -1027,3 +1117,7 @@ class GovernedOrchestrator:
                 entry.state.value,
                 exc,
             )
+
+
+# Alias so tests can import `Orchestrator` as well as `GovernedOrchestrator`
+Orchestrator = GovernedOrchestrator

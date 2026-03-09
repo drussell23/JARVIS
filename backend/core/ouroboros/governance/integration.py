@@ -323,6 +323,7 @@ class GovernanceStack:
     approval_provider: Optional[Any] = None
     shadow_harness: Optional[Any] = None
     governed_loop_service: Optional[Any] = None
+    performance_persistence: Optional[Any] = None
 
     _started: bool = False
 
@@ -541,6 +542,18 @@ async def create_governance_stack(
                 enabled=False, reason="dep_missing"
             )
 
+        _performance_persistence: Optional[Any] = None
+        try:
+            from backend.core.ouroboros.integration import get_performance_persistence
+            _performance_persistence = get_performance_persistence()
+            capabilities["performance_persistence"] = CapabilityStatus(
+                enabled=True, reason="ok"
+            )
+        except Exception as exc:
+            capabilities["performance_persistence"] = CapabilityStatus(
+                enabled=False, reason=f"init_error: {exc}"
+            )
+
         return GovernanceStack(
             controller=controller,
             risk_engine=risk_engine,
@@ -559,6 +572,7 @@ async def create_governance_stack(
             learning_bridge=_learning_bridge,
             policy_version=config.policy_version,
             capabilities=capabilities,
+            performance_persistence=_performance_persistence,
         )
 
     except GovernanceInitError:

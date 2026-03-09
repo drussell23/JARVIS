@@ -702,3 +702,106 @@ class TestContextExpansionPhaseWiring:
             await orch.run(ctx)
 
         MockExpander.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# TestBenchmarkWiring
+# ---------------------------------------------------------------------------
+
+
+class TestBenchmarkWiring:
+    """Tests for _run_benchmark and _persist_performance_record wiring."""
+
+    async def test_run_benchmark_disabled_returns_ctx_unchanged(self):
+        """When benchmark_enabled=False, ctx is returned unmodified."""
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator, OrchestratorConfig
+        from unittest.mock import MagicMock, AsyncMock
+        config = MagicMock(spec=OrchestratorConfig)
+        config.benchmark_enabled = False
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = config
+        ctx = MagicMock()
+        result = await orch._run_benchmark(ctx, [])
+        assert result is ctx
+
+    async def test_run_benchmark_enabled_calls_benchmarker(self):
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator, OrchestratorConfig
+        from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from pathlib import Path
+        config = MagicMock(spec=OrchestratorConfig)
+        config.benchmark_enabled = True
+        config.benchmark_timeout_s = 5.0
+        config.project_root = Path("/tmp")
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = config
+        ctx = MagicMock()
+        ctx.pre_apply_snapshots = {}
+        br = BenchmarkResult(
+            pass_rate=1.0, lint_violations=0, coverage_pct=80.0,
+            complexity_delta=0.0, patch_hash="h", quality_score=0.9,
+            task_type="code_improvement", timed_out=False, error=None,
+        )
+        ctx.with_benchmark_result.return_value = ctx
+        with patch(
+            "backend.core.ouroboros.governance.orchestrator.PatchBenchmarker"
+        ) as MockBenchmarker:
+            MockBenchmarker.return_value.benchmark = AsyncMock(return_value=br)
+            result = await orch._run_benchmark(ctx, [])
+            ctx.with_benchmark_result.assert_called_once_with(br)
+
+    async def test_run_benchmark_never_raises_on_exception(self):
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator, OrchestratorConfig
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from pathlib import Path
+        config = MagicMock(spec=OrchestratorConfig)
+        config.benchmark_enabled = True
+        config.benchmark_timeout_s = 5.0
+        config.project_root = Path("/tmp")
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = config
+        ctx = MagicMock()
+        ctx.pre_apply_snapshots = {}
+        ctx.op_id = "op-x"
+        with patch(
+            "backend.core.ouroboros.governance.orchestrator.PatchBenchmarker"
+        ) as MockBenchmarker:
+            MockBenchmarker.return_value.benchmark = AsyncMock(side_effect=RuntimeError("boom"))
+            result = await orch._run_benchmark(ctx, [])
+            assert result is ctx  # original ctx returned on failure
+
+    async def test_persist_performance_record_no_persistence_is_noop(self):
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator
+        from unittest.mock import MagicMock
+        orch = Orchestrator.__new__(Orchestrator)
+        stack = MagicMock()
+        stack.performance_persistence = None
+        orch._stack = stack
+        ctx = MagicMock()
+        ctx.op_id = "op-x"
+        await orch._persist_performance_record(ctx)  # must not raise
+
+    async def test_persist_performance_record_calls_save_record(self):
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator
+        from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+        from unittest.mock import MagicMock, AsyncMock
+        orch = Orchestrator.__new__(Orchestrator)
+        stack = MagicMock()
+        stack.performance_persistence = MagicMock()
+        stack.performance_persistence.save_record = AsyncMock()
+        orch._stack = stack
+        ctx = MagicMock()
+        ctx.op_id = "op-x"
+        ctx.phase = OperationPhase.COMPLETE
+        ctx.model_id = "m1"
+        ctx.difficulty = MagicMock()
+        ctx.elapsed_ms = 500.0
+        ctx.iterations_used = 1
+        ctx.benchmark_result = BenchmarkResult(
+            pass_rate=0.9, lint_violations=0, coverage_pct=75.0,
+            complexity_delta=0.0, patch_hash="p", quality_score=0.85,
+            task_type="bug_fix", timed_out=False, error=None,
+        )
+        await orch._persist_performance_record(ctx)
+        stack.performance_persistence.save_record.assert_called_once()
