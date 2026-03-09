@@ -1,6 +1,6 @@
 """Tests for OrchestratorConfig repo_registry wiring and saga root resolution."""
+import logging
 from pathlib import Path
-from unittest.mock import MagicMock
 
 from backend.core.ouroboros.governance.orchestrator import OrchestratorConfig
 from backend.core.ouroboros.governance.multi_repo.registry import (
@@ -50,8 +50,9 @@ def test_resolve_repo_roots_uses_registry(tmp_path):
     assert roots["reactor-core"] == tmp_path / "reactor-core"
 
 
-def test_resolve_repo_roots_fallback_for_unknown_repo(tmp_path):
+def test_resolve_repo_roots_fallback_for_unknown_repo(tmp_path, caplog):
     """Missing repo key falls back to project_root with a warning (no KeyError)."""
+    caplog.set_level(logging.WARNING)
     registry = _make_registry(tmp_path)
     cfg = OrchestratorConfig(project_root=tmp_path / "jarvis", repo_registry=registry)
     roots = cfg.resolve_repo_roots(
@@ -60,6 +61,9 @@ def test_resolve_repo_roots_fallback_for_unknown_repo(tmp_path):
     )
     assert roots["jarvis"] == tmp_path / "jarvis"
     assert roots["unknown_repo"] == tmp_path / "jarvis"  # fallback to project_root
+    warning_messages = [r.message for r in caplog.records if r.levelname == "WARNING"]
+    assert any("unknown_repo" in str(m) for m in warning_messages)
+    assert any("op-test-002" in str(m) for m in warning_messages)
 
 
 def test_resolve_repo_roots_no_registry_uses_project_root(tmp_path):
@@ -71,3 +75,10 @@ def test_resolve_repo_roots_no_registry_uses_project_root(tmp_path):
     )
     assert roots["jarvis"] == tmp_path
     assert roots["prime"] == tmp_path
+
+
+def test_resolve_repo_roots_empty_scope_returns_empty_dict(tmp_path):
+    """Empty repo_scope returns empty dict — no repos to resolve."""
+    cfg = OrchestratorConfig(project_root=tmp_path)
+    roots = cfg.resolve_repo_roots(repo_scope=(), op_id="op-test-empty")
+    assert roots == {}

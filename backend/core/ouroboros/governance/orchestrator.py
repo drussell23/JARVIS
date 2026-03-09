@@ -32,7 +32,10 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+
+if TYPE_CHECKING:
+    from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
 from backend.core.ouroboros.governance.approval_provider import (
@@ -90,7 +93,7 @@ class OrchestratorConfig:
     """
 
     project_root: Path
-    repo_registry: Optional[Any] = None  # RepoRegistry at runtime; Any avoids circular import
+    repo_registry: Optional["RepoRegistry"] = None  # Forward ref avoids circular import; resolved at type-check time
     generation_timeout_s: float = 120.0
     validation_timeout_s: float = 60.0
     approval_timeout_s: float = 600.0
@@ -121,7 +124,8 @@ class OrchestratorConfig:
             if self.repo_registry is not None:
                 try:
                     roots[repo] = Path(self.repo_registry.get(repo).local_path)
-                except KeyError:
+                except (KeyError, AttributeError, TypeError):
+                    # repo_registry may be a duck-typed substitute; catch all lookup failures
                     logger.warning(
                         "[OrchestratorConfig] repo=%s not in registry for op_id=%s; "
                         "falling back to project_root=%s",
@@ -297,7 +301,7 @@ class GovernedOrchestrator:
         best_validation: Optional[ValidationResult] = None
         validate_retries_remaining = self._config.max_validate_retries
 
-        for _attempt in range(1 + self._config.max_validate_retries):
+        for _ in range(1 + self._config.max_validate_retries):
             # Compute remaining budget from pipeline_deadline
             if ctx.pipeline_deadline is not None:
                 remaining_s = (
