@@ -113,6 +113,7 @@ async def test_sensor_start_stop(tmp_path):
         poll_interval_s=0.05,
     )
     await sensor.start()
+    assert sensor._running is True
     await asyncio.sleep(0.1)
     sensor.stop()
-    # No crash = pass
+    assert sensor._running is False

@@ -22,7 +22,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope, IntentEnvelope
 
@@ -78,7 +78,7 @@ class BacklogSensor:
         self._router = router
         self._poll_interval_s = poll_interval_s
         self._running = False
-        self._seen_task_ids: set = set()
+        self._seen_task_ids: set[str] = set()
 
     async def scan_once(self) -> List[IntentEnvelope]:
         """Run one scan. Returns list of envelopes produced and ingested."""
