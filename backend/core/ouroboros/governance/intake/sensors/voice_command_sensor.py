@@ -15,10 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any, List
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
-from backend.core.ouroboros.governance.intake.intent_envelope import (
-    IntentEnvelope,
-    make_envelope,
-)
+from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
 logger = logging.getLogger(__name__)
 
