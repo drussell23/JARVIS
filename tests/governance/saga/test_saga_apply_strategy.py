@@ -158,7 +158,6 @@ def test_topological_sort_respects_dependency_edges():
     order = strategy._topological_sort(
         repo_scope=("jarvis", "prime"),
         edges=(("prime", "jarvis"),),
-        _apply_plan=(),
     )
     assert order.index("jarvis") < order.index("prime")
 
@@ -226,7 +225,7 @@ async def test_compensation_failure_returns_saga_stuck(tmp_path):
     )
 
     # Make compensation of repo_a raise to simulate COMPENSATION_FAILED
-    async def failing_compensate(repo: str, patch: RepoPatch) -> None:
+    async def failing_compensate(repo: str, _patch) -> None:  # noqa: ANN001
         raise OSError(f"Cannot restore {repo}: permission denied")
 
     strategy._compensate_patch = failing_compensate
@@ -328,7 +327,6 @@ async def test_mid_apply_drift_triggers_compensation(tmp_path):
         if repo == "prime":
             return prime_head
         # jarvis: first call (Phase A) returns real head; second (Phase B) returns drifted
-        _ = call_count["n"]
         # The pattern: Phase A iterates [prime, jarvis], then Phase B iterates same order.
         # Prime gets its Phase-B TOCTOU check first (call 3), jarvis gets call 4.
         # We make jarvis always return a drifted hash after the first time it's called.

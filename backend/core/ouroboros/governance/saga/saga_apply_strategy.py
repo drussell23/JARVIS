@@ -354,14 +354,12 @@ class SagaApplyStrategy:
         return self._topological_sort(
             repo_scope=ctx.repo_scope,
             edges=ctx.dependency_edges,
-            _apply_plan=(),
         )
 
     def _topological_sort(
         self,
         repo_scope: Tuple[str, ...],
         edges: Tuple[Tuple[str, str], ...],
-        _apply_plan: Tuple[str, ...],
     ) -> List[str]:
         """Kahn's algorithm topological sort. Stable: alphabetical within same depth."""
         graph: Dict[str, List[str]] = collections.defaultdict(list)
