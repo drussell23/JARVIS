@@ -571,3 +571,134 @@ class TestApprovalNotifications:
             phase="approve",
             progress_pct=0.0,
         )
+
+
+class TestContextExpansionPhaseWiring:
+    def test_orchestrator_config_expansion_defaults(self, tmp_path):
+        from backend.core.ouroboros.governance.orchestrator import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path)
+        assert config.context_expansion_enabled is True
+        assert config.context_expansion_timeout_s == 30.0
+
+    def test_orchestrator_config_expansion_can_be_disabled(self, tmp_path):
+        from backend.core.ouroboros.governance.orchestrator import OrchestratorConfig
+        config = OrchestratorConfig(project_root=tmp_path, context_expansion_enabled=False)
+        assert config.context_expansion_enabled is False
+
+    async def test_context_expansion_called_when_enabled(self, tmp_path):
+        """ContextExpander.expand() must be called when context_expansion_enabled=True."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator, OrchestratorConfig,
+        )
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, GenerationResult,
+        )
+        from backend.core.ouroboros.governance.risk_engine import RiskTier
+
+        stack = MagicMock()
+        stack.can_write.return_value = (True, "ok")
+        mock_classification = MagicMock()
+        mock_classification.tier = MagicMock()
+        mock_classification.tier.name = "SAFE_AUTO"
+        mock_classification.tier.__eq__ = lambda self, other: False  # not BLOCKED, not APPROVAL_REQUIRED
+        mock_classification.reason_code = "safe"
+        stack.risk_engine.classify.return_value = mock_classification
+        stack.ledger.append = AsyncMock(return_value=True)
+        stack.comm = AsyncMock()
+        stack.change_engine.execute = AsyncMock(return_value=MagicMock(
+            success=True, rolled_back=False, op_id="op-test"
+        ))
+        stack.learning_bridge = None
+        stack.canary.record_operation = MagicMock()
+
+        mock_gen = MagicMock()
+        mock_gen.generate = AsyncMock(return_value=GenerationResult(
+            candidates=({"candidate_id": "c1", "file_path": "foo.py",
+                         "full_content": "x = 1\n", "rationale": "test",
+                         "candidate_hash": "abc", "source_hash": "", "source_path": "foo.py"},),
+            provider_name="mock",
+            generation_duration_s=0.1,
+        ))
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            context_expansion_enabled=True,
+            context_expansion_timeout_s=5.0,
+        )
+        orch = GovernedOrchestrator(
+            stack=stack, generator=mock_gen, approval_provider=None, config=config
+        )
+
+        expand_called = []
+
+        async def fake_expand(ctx, deadline):
+            expand_called.append(True)
+            return ctx
+
+        with patch(
+            "backend.core.ouroboros.governance.orchestrator.ContextExpander"
+        ) as MockExpander:
+            instance = MagicMock()
+            instance.expand = AsyncMock(side_effect=fake_expand)
+            MockExpander.return_value = instance
+
+            ctx = OperationContext.create(
+                target_files=("foo.py",), description="test expansion wiring"
+            )
+            await orch.run(ctx)
+
+        assert expand_called, "ContextExpander.expand() was never called"
+
+    async def test_context_expansion_skipped_when_disabled(self, tmp_path):
+        """ContextExpander must NOT be instantiated when context_expansion_enabled=False."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator, OrchestratorConfig,
+        )
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext, GenerationResult,
+        )
+
+        stack = MagicMock()
+        stack.can_write.return_value = (True, "ok")
+        mock_classification = MagicMock()
+        mock_classification.tier = MagicMock()
+        mock_classification.tier.name = "SAFE_AUTO"
+        mock_classification.tier.__eq__ = lambda self, other: False
+        mock_classification.reason_code = "safe"
+        stack.risk_engine.classify.return_value = mock_classification
+        stack.ledger.append = AsyncMock(return_value=True)
+        stack.comm = AsyncMock()
+        stack.change_engine.execute = AsyncMock(return_value=MagicMock(
+            success=True, rolled_back=False, op_id="op-test"
+        ))
+        stack.learning_bridge = None
+        stack.canary.record_operation = MagicMock()
+
+        mock_gen = MagicMock()
+        mock_gen.generate = AsyncMock(return_value=GenerationResult(
+            candidates=({"candidate_id": "c1", "file_path": "foo.py",
+                         "full_content": "x = 1\n", "rationale": "test",
+                         "candidate_hash": "abc", "source_hash": "", "source_path": "foo.py"},),
+            provider_name="mock",
+            generation_duration_s=0.1,
+        ))
+
+        config = OrchestratorConfig(
+            project_root=tmp_path,
+            context_expansion_enabled=False,
+        )
+        orch = GovernedOrchestrator(
+            stack=stack, generator=mock_gen, approval_provider=None, config=config
+        )
+
+        with patch(
+            "backend.core.ouroboros.governance.orchestrator.ContextExpander"
+        ) as MockExpander:
+            ctx = OperationContext.create(
+                target_files=("foo.py",), description="test no expansion"
+            )
+            await orch.run(ctx)
+
+        MockExpander.assert_not_called()

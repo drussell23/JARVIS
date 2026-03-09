@@ -8,7 +8,7 @@ engine, and operation ledger into a single deterministic pipeline:
 
 .. code-block:: text
 
-    CLASSIFY -> ROUTE -> GENERATE -> VALIDATE -> GATE -> [APPROVE] -> APPLY -> VERIFY -> COMPLETE
+    CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> GENERATE -> VALIDATE -> GATE -> [APPROVE] -> APPLY -> VERIFY -> COMPLETE
 
 The orchestrator owns **no domain logic** -- only phase transitions and
 error handling.  Every code path ends in a terminal phase (COMPLETE,
@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
+from backend.core.ouroboros.governance.context_expander import ContextExpander
 from backend.core.ouroboros.governance.approval_provider import (
     ApprovalResult,
     ApprovalStatus,
@@ -100,6 +101,8 @@ class OrchestratorConfig:
     approval_timeout_s: float = 600.0
     max_generate_retries: int = 1
     max_validate_retries: int = 2
+    context_expansion_enabled: bool = True
+    context_expansion_timeout_s: float = 30.0
 
     def resolve_repo_roots(
         self,
@@ -250,8 +253,33 @@ class GovernedOrchestrator:
         ctx = ctx.advance(OperationPhase.ROUTE, risk_tier=risk_tier)
 
         # ---- Phase 2: ROUTE ----
-        # Thin transition: just advance to GENERATE
-        ctx = ctx.advance(OperationPhase.GENERATE)
+        if self._config.context_expansion_enabled:
+            ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+
+            # ---- Phase 2b: CONTEXT_EXPANSION ----
+            try:
+                expansion_deadline = datetime.now(tz=timezone.utc) + timedelta(
+                    seconds=self._config.context_expansion_timeout_s
+                )
+                expander = ContextExpander(
+                    generator=self._generator,
+                    repo_root=self._config.project_root,
+                )
+                ctx = await asyncio.wait_for(
+                    expander.expand(ctx, expansion_deadline),
+                    timeout=self._config.context_expansion_timeout_s,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[Orchestrator] Context expansion failed for op=%s: %s; "
+                    "continuing to GENERATE",
+                    ctx.op_id, exc,
+                )
+
+            ctx = ctx.advance(OperationPhase.GENERATE)
+        else:
+            # Expansion disabled: skip directly from ROUTE to GENERATE
+            ctx = ctx.advance(OperationPhase.GENERATE)
 
         # ---- Phase 3: GENERATE (with retry) ----
         generation: Optional[GenerationResult] = None
