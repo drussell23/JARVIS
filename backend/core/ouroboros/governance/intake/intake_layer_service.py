@@ -189,7 +189,7 @@ class IntakeLayerService:
         # Built during start()
         self._router: Optional[Any] = None
         self._sensors: List[Any] = []
-        self._narrator: Optional[Any] = None  # IntakeNarrator, added in Task 4
+        self._narrator: Optional[Any] = None  # IntakeNarrator; set in _build_components
         self._voice_sensor: Optional[Any] = None
         self._dead_letter_count: int = 0
         self._per_source_count: Dict[str, int] = {}
