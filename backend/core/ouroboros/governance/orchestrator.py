@@ -44,6 +44,7 @@ from backend.core.ouroboros.governance.approval_provider import (
 )
 from backend.core.ouroboros.governance.change_engine import ChangeRequest
 from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
+from backend.core.ouroboros.governance.learning_bridge import OperationOutcome
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -523,6 +524,7 @@ class GovernedOrchestrator:
                 {"reason": "change_engine_error", "error": str(exc)},
             )
             self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
+            await self._publish_outcome(ctx, OperationState.FAILED, "change_engine_error")
             return ctx
 
         if not change_result.success:
@@ -539,6 +541,7 @@ class GovernedOrchestrator:
                 ctx, False, time.monotonic() - _t_apply,
                 rolled_back=change_result.rolled_back,
             )
+            await self._publish_outcome(ctx, OperationState.FAILED, "change_engine_failed")
             return ctx
 
         # ---- Phase 8: VERIFY ----
@@ -551,6 +554,7 @@ class GovernedOrchestrator:
 
         ctx = ctx.advance(OperationPhase.COMPLETE)
         self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
+        await self._publish_outcome(ctx, OperationState.APPLIED)
         return ctx
 
     # ------------------------------------------------------------------
@@ -572,6 +576,24 @@ class GovernedOrchestrator:
                 latency_s=latency_s,
                 rolled_back=rolled_back,
             )
+
+    async def _publish_outcome(
+        self,
+        ctx: OperationContext,
+        final_state: OperationState,
+        error_pattern: Optional[str] = None,
+    ) -> None:
+        """Publish operation outcome to LearningBridge. Fault-isolated -- never raises."""
+        if self._stack.learning_bridge is None:
+            return
+        outcome = OperationOutcome(
+            op_id=ctx.op_id,
+            goal=ctx.description,
+            target_files=list(ctx.target_files),
+            final_state=final_state,
+            error_pattern=error_pattern,
+        )
+        await self._stack.learning_bridge.publish(outcome)
 
     def _build_profile(self, ctx: OperationContext) -> OperationProfile:
         """Build an OperationProfile from the context's target files.
@@ -853,6 +875,7 @@ class GovernedOrchestrator:
                 {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
             )
             self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
+            await self._publish_outcome(ctx, OperationState.FAILED, apply_result.reason_code)
             return ctx
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_APPLY_COMPLETED:
@@ -883,6 +906,7 @@ class GovernedOrchestrator:
                     },
                 )
                 self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
+                await self._publish_outcome(ctx, OperationState.FAILED, verify_result.reason_code)
                 return ctx
 
             # SAGA_SUCCEEDED
@@ -894,6 +918,7 @@ class GovernedOrchestrator:
             )
             ctx = ctx.advance(OperationPhase.COMPLETE)
             self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_saga)
+            await self._publish_outcome(ctx, OperationState.APPLIED)
             return ctx
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_STUCK:
@@ -928,6 +953,7 @@ class GovernedOrchestrator:
                 {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
             )
             self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
+            await self._publish_outcome(ctx, OperationState.FAILED, "saga_stuck")
             return ctx
 
         # SAGA_ROLLED_BACK: clean rollback — change not applied, system is clean
@@ -938,6 +964,7 @@ class GovernedOrchestrator:
             {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id, "rolled_back": True},
         )
         self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga, rolled_back=True)
+        await self._publish_outcome(ctx, OperationState.FAILED, apply_result.reason_code)
         return ctx
 
     async def _record_ledger(

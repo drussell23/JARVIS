@@ -12,6 +12,7 @@ from backend.core.ouroboros.governance.approval_provider import (
     ApprovalStatus,  # used in Task 2/3 tests below
 )
 from backend.core.ouroboros.governance.ledger import OperationState  # used in Task 3 tests below
+from backend.core.ouroboros.governance.learning_bridge import OperationOutcome  # Task 3
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -88,6 +89,7 @@ def _mock_stack() -> MagicMock:
     stack.change_engine.execute = AsyncMock(
         return_value=MagicMock(success=True, rolled_back=False, op_id="op-001")
     )
+    stack.learning_bridge = None  # Task 3: default None so existing tests are unaffected
     return stack
 
 
@@ -271,3 +273,77 @@ async def test_canary_record_on_saga_stuck(tmp_path):
     assert stack.canary.record_operation.called
     call = stack.canary.record_operation.call_args
     assert call.kwargs["success"] is False
+
+
+# ---------------------------------------------------------------------------
+# Task 3: LearningBridge outcome publishing
+# ---------------------------------------------------------------------------
+
+
+async def test_learning_bridge_publish_on_single_repo_success(tmp_path):
+    """learning_bridge.publish called with APPLIED outcome on single-repo success."""
+    stack = _mock_stack()
+    stack.learning_bridge = AsyncMock()
+    stack.learning_bridge.publish = AsyncMock()
+    orch = _make_orchestrator(tmp_path, stack=stack)
+
+    await orch.run(_make_ctx(tmp_path))
+
+    stack.learning_bridge.publish.assert_awaited_once()
+    outcome = stack.learning_bridge.publish.call_args.args[0]
+    assert outcome.final_state == OperationState.APPLIED
+    assert outcome.op_id == "op-001"
+
+
+async def test_learning_bridge_publish_on_single_repo_failure(tmp_path):
+    """learning_bridge.publish called with FAILED outcome when change_engine fails."""
+    stack = _mock_stack()
+    stack.learning_bridge = AsyncMock()
+    stack.learning_bridge.publish = AsyncMock()
+    stack.change_engine.execute = AsyncMock(
+        return_value=MagicMock(success=False, rolled_back=False)
+    )
+    orch = _make_orchestrator(tmp_path, stack=stack)
+
+    await orch.run(_make_ctx(tmp_path))
+
+    stack.learning_bridge.publish.assert_awaited_once()
+    outcome = stack.learning_bridge.publish.call_args.args[0]
+    assert outcome.final_state == OperationState.FAILED
+    assert outcome.error_pattern == "change_engine_failed"
+
+
+async def test_learning_bridge_skipped_when_none(tmp_path):
+    """No AttributeError when learning_bridge is None (default in _mock_stack)."""
+    stack = _mock_stack()
+    assert stack.learning_bridge is None
+    orch = _make_orchestrator(tmp_path, stack=stack)
+
+    # Must not raise
+    await orch.run(_make_ctx(tmp_path))
+
+
+async def test_learning_bridge_publish_on_saga_stuck(tmp_path):
+    """learning_bridge.publish called with FAILED/saga_stuck on SAGA_STUCK."""
+    stack = _mock_stack()
+    stack.learning_bridge = AsyncMock()
+    stack.learning_bridge.publish = AsyncMock()
+    orch = _make_orchestrator(tmp_path, stack=stack)
+    ctx = _make_ctx(tmp_path)
+    ctx_apply = _advance_to_apply(ctx)
+
+    stuck_result = _make_stuck_result(op_id="op-001")
+
+    with patch(
+        "backend.core.ouroboros.governance.orchestrator.SagaApplyStrategy"
+    ) as MockStrategy:
+        mock_strat = MagicMock()
+        mock_strat.execute = AsyncMock(return_value=stuck_result)
+        MockStrategy.return_value = mock_strat
+
+        await orch._execute_saga_apply(ctx_apply, {"mock_candidate": {}})
+
+    stack.learning_bridge.publish.assert_awaited_once()
+    outcome = stack.learning_bridge.publish.call_args.args[0]
+    assert outcome.final_state == OperationState.FAILED
+    assert outcome.error_pattern == "saga_stuck"
