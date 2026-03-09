@@ -152,6 +152,28 @@ class CrossRepoVerifier:
         except FileNotFoundError:
             logger.debug("[Tier1] ruff not found for %s, skipping lint", repo)
 
+        # Fast unit tests: run pytest scoped to changed files
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run,
+                ["python3", "-m", "pytest", "--tb=short", "-q", "--no-header"] + changed_files,
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            if proc.returncode != 0 and proc.returncode != 5:  # 5 = no tests collected
+                return VerifyResult(
+                    passed=False,
+                    failure_class=VerifyFailureClass.PER_REPO,
+                    reason_code="verify_test_failed",
+                    details=f"{repo}: {proc.stdout[-400:]}",
+                )
+        except FileNotFoundError:
+            logger.debug("[Tier1] pytest not found for %s, skipping tests", repo)
+        except Exception as exc:
+            logger.warning("[Tier1] Test run failed for %s: %s", repo, exc)
+
         return None
 
     async def _tier2_cross_repo_contracts(
