@@ -1,6 +1,5 @@
 """Tests for SagaApplyStrategy."""
 import subprocess
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.core.ouroboros.governance.op_context import OperationContext, SagaStepStatus
@@ -159,7 +158,7 @@ def test_topological_sort_respects_dependency_edges():
     order = strategy._topological_sort(
         repo_scope=("jarvis", "prime"),
         edges=(("prime", "jarvis"),),
-        apply_plan=(),
+        _apply_plan=(),
     )
     assert order.index("jarvis") < order.index("prime")
 
@@ -329,7 +328,7 @@ async def test_mid_apply_drift_triggers_compensation(tmp_path):
         if repo == "prime":
             return prime_head
         # jarvis: first call (Phase A) returns real head; second (Phase B) returns drifted
-        jarvis_call_index = call_count["n"]
+        _ = call_count["n"]
         # The pattern: Phase A iterates [prime, jarvis], then Phase B iterates same order.
         # Prime gets its Phase-B TOCTOU check first (call 3), jarvis gets call 4.
         # We make jarvis always return a drifted hash after the first time it's called.
