@@ -682,6 +682,12 @@ class GovernedOrchestrator:
                 timeout=self._config.benchmark_timeout_s,
             )
             return ctx.with_benchmark_result(result)
+        except asyncio.CancelledError:
+            logger.debug(
+                "[Orchestrator] Benchmark cancelled for op=%s; continuing without metrics",
+                ctx.op_id,
+            )
+            return ctx
         except Exception as exc:
             logger.warning(
                 "[Orchestrator] Benchmark failed for op=%s: %s; continuing without metrics",

@@ -770,6 +770,30 @@ class TestBenchmarkWiring:
             result = await orch._run_benchmark(ctx, [])
             assert result is ctx  # original ctx returned on failure
 
+    async def test_run_benchmark_never_raises_on_cancelled_error(self):
+        """CancelledError during benchmark must be swallowed — benchmark is non-blocking."""
+        import asyncio
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator, OrchestratorConfig
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from pathlib import Path
+        config = MagicMock(spec=OrchestratorConfig)
+        config.benchmark_enabled = True
+        config.benchmark_timeout_s = 5.0
+        config.project_root = Path("/tmp")
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = config
+        ctx = MagicMock()
+        ctx.pre_apply_snapshots = {}
+        ctx.op_id = "op-cancel"
+        with patch(
+            "backend.core.ouroboros.governance.orchestrator.PatchBenchmarker"
+        ) as MockBenchmarker:
+            MockBenchmarker.return_value.benchmark = AsyncMock(
+                side_effect=asyncio.CancelledError()
+            )
+            result = await orch._run_benchmark(ctx, [])
+            assert result is ctx  # ctx returned, CancelledError swallowed
+
     async def test_persist_performance_record_no_persistence_is_noop(self):
         from backend.core.ouroboros.governance.orchestrator import Orchestrator
         from unittest.mock import MagicMock
