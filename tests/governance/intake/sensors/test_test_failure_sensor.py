@@ -1,6 +1,5 @@
 """Tests for TestFailureSensor (Sensor B)."""
 from unittest.mock import AsyncMock, MagicMock
-import pytest
 
 from backend.core.ouroboros.governance.intake.sensors.test_failure_sensor import (
     TestFailureSensor,
@@ -55,7 +54,8 @@ async def test_handle_signals_batch():
     sensor = TestFailureSensor(repo="jarvis", router=router)
     signals = [_make_signal(stable=True), _make_signal(stable=False)]
     results = await sensor.handle_signals(signals)
-    # Only 1 stable signal → 1 envelope
+    # Returns one entry per input signal (None for the unstable one)
+    assert len(results) == 2
     assert len([r for r in results if r is not None]) == 1
 
 
