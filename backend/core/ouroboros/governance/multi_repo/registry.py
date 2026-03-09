@@ -101,7 +101,7 @@ class RepoRegistry:
         config = self._repos[repo]
         file_path = (config.local_path / path).resolve()
         # Path traversal guard
-        if not str(file_path).startswith(str(config.local_path.resolve())):
+        if not file_path.is_relative_to(config.local_path.resolve()):
             logger.warning("Path traversal blocked: %s", path)
             return None
         if not file_path.exists():

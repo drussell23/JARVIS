@@ -630,7 +630,7 @@ class GovernedLoopService:
             # Sync FSM to reflect actual startup probe result.
             # Without this, the FSM stays at PRIMARY_READY even when the startup
             # probe failed, making the FALLBACK_ACTIVE branch in start() unreachable.
-            if not _primary_probe_ok and self._generator is not None:
+            if primary is not None and not _primary_probe_ok and self._generator is not None:
                 try:
                     self._generator.fsm.record_primary_failure()
                 except Exception:

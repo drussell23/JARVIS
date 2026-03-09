@@ -103,3 +103,28 @@ async def test_ac3_queue_only_still_maps_to_degraded(tmp_path):
 
     assert svc.state == ServiceState.DEGRADED
     await svc.stop()
+
+
+async def test_ac1b_prime_provider_retained_on_probe_raise(tmp_path):
+    """PrimeProvider is kept even when health_probe() raises an exception at startup."""
+    config = GovernedLoopConfig(project_root=tmp_path)
+    mock_prime_client = MagicMock()
+    stack = _make_mock_stack()
+    svc = GovernedLoopService(stack=stack, prime_client=mock_prime_client, config=config)
+
+    with patch(
+        # Patch at definition site — correct for deferred local import resolved via sys.modules
+        "backend.core.ouroboros.governance.providers.PrimeProvider"
+    ) as MockProvider, \
+         patch.object(svc, "_reconcile_on_boot", new=AsyncMock()), \
+         patch.object(svc, "_register_canary_slices"), \
+         patch.object(svc, "_attach_to_stack"):
+        mock_provider_instance = MagicMock()
+        mock_provider_instance.health_probe = AsyncMock(side_effect=ConnectionError("GCP unreachable"))
+        MockProvider.return_value = mock_provider_instance
+
+        await svc.start()
+
+    # Generator must exist — provider retained even when probe raised
+    assert svc._generator is not None
+    await svc.stop()
