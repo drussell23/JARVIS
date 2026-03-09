@@ -117,6 +117,14 @@ class CandidateProvider(Protocol):
         """
         ...  # pragma: no cover
 
+    async def plan(self, prompt: str, deadline: datetime) -> str:
+        """Send a lightweight planning prompt; return the raw string response.
+
+        Used by ContextExpander. Planning failures are soft — callers tolerate
+        exceptions and skip expansion rounds gracefully.
+        """
+        ...  # pragma: no cover
+
 
 # ---------------------------------------------------------------------------
 # FailbackState Enum
@@ -376,6 +384,41 @@ class CandidateGenerator:
             self.fsm.record_probe_failure()
 
         return healthy
+
+    async def plan(self, prompt: str, deadline: datetime) -> str:
+        """Send a planning prompt to the active provider, with soft fallback.
+
+        Does NOT update the failback state machine on failure — planning errors
+        are non-fatal and the orchestrator continues to GENERATE regardless.
+
+        Raises RuntimeError("all_providers_exhausted") only if QUEUE_ONLY.
+        """
+        state = self.fsm.state
+
+        if state is FailbackState.QUEUE_ONLY:
+            raise RuntimeError("all_providers_exhausted")
+
+        if state is FailbackState.PRIMARY_READY:
+            try:
+                remaining = self._remaining_seconds(deadline)
+                async with self._primary_sem:
+                    return await asyncio.wait_for(
+                        self._primary.plan(prompt, deadline),
+                        timeout=remaining,
+                    )
+            except (Exception, asyncio.CancelledError) as exc:
+                logger.warning(
+                    "[CandidateGenerator] Primary plan() failed (%s), trying fallback",
+                    exc,
+                )
+
+        # FALLBACK_ACTIVE, PRIMARY_DEGRADED, or primary plan() just failed
+        remaining = self._remaining_seconds(deadline)
+        async with self._fallback_sem:
+            return await asyncio.wait_for(
+                self._fallback.plan(prompt, deadline),
+                timeout=remaining,
+            )
 
     # ------------------------------------------------------------------
     # Internal

@@ -433,3 +433,51 @@ class TestClaudeProvider:
         mock_client.messages.create = AsyncMock(side_effect=Exception("auth failed"))
         provider._client = mock_client
         assert await provider.health_probe() is False
+
+
+class TestPrimeProviderPlan:
+    async def test_plan_calls_client_and_returns_string(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from datetime import datetime, timedelta, timezone
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.content = '{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "ok"}'
+        mock_client.generate = AsyncMock(return_value=mock_response)
+
+        provider = PrimeProvider(prime_client=mock_client)
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        result = await provider.plan("describe the task", deadline)
+
+        assert isinstance(result, str)
+        mock_client.generate.assert_called_once()
+        call_kwargs = mock_client.generate.call_args.kwargs
+        assert call_kwargs.get("max_tokens", 9999) <= 512
+        assert call_kwargs.get("temperature", 1.0) == 0.0
+
+
+class TestClaudeProviderPlan:
+    async def test_plan_calls_api_and_returns_string(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from datetime import datetime, timedelta, timezone
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+
+        provider = ClaudeProvider(api_key="test-key")
+        mock_message = MagicMock()
+        mock_message.content = [MagicMock(
+            text='{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "ok"}'
+        )]
+        mock_message.usage = MagicMock(input_tokens=10, output_tokens=5)
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(return_value=mock_message)
+        provider._client = mock_client
+
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        result = await provider.plan("describe the task", deadline)
+
+        assert isinstance(result, str)
+        mock_client.messages.create.assert_called_once()
+        call_kwargs = mock_client.messages.create.call_args.kwargs
+        assert call_kwargs.get("max_tokens", 9999) <= 512
+        assert call_kwargs.get("temperature", 1.0) == 0.0

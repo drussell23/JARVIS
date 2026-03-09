@@ -574,3 +574,54 @@ class TestCandidateGenerator:
         await asyncio.gather(*tasks)
 
         assert max_active <= 1
+
+
+class TestCandidateGeneratorPlan:
+    async def test_plan_delegates_to_primary_when_ready(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from datetime import datetime, timedelta, timezone
+        from backend.core.ouroboros.governance.candidate_generator import CandidateGenerator
+
+        mock_primary = MagicMock()
+        mock_primary.provider_name = "primary"
+        mock_primary.plan = AsyncMock(return_value='{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "ok"}')
+        mock_primary.generate = AsyncMock()
+        mock_primary.health_probe = AsyncMock(return_value=True)
+
+        mock_fallback = MagicMock()
+        mock_fallback.provider_name = "fallback"
+        mock_fallback.plan = AsyncMock(return_value='{}')
+        mock_fallback.generate = AsyncMock()
+        mock_fallback.health_probe = AsyncMock(return_value=True)
+
+        gen = CandidateGenerator(primary=mock_primary, fallback=mock_fallback)
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        result = await gen.plan("test prompt", deadline)
+
+        assert isinstance(result, str)
+        mock_primary.plan.assert_called_once()
+        mock_fallback.plan.assert_not_called()
+
+    async def test_plan_falls_back_when_primary_fails(self):
+        from unittest.mock import AsyncMock, MagicMock
+        from datetime import datetime, timedelta, timezone
+        from backend.core.ouroboros.governance.candidate_generator import CandidateGenerator
+
+        mock_primary = MagicMock()
+        mock_primary.provider_name = "primary"
+        mock_primary.plan = AsyncMock(side_effect=RuntimeError("primary_down"))
+        mock_primary.generate = AsyncMock()
+        mock_primary.health_probe = AsyncMock(return_value=False)
+
+        mock_fallback = MagicMock()
+        mock_fallback.provider_name = "fallback"
+        mock_fallback.plan = AsyncMock(return_value='{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "fallback"}')
+        mock_fallback.generate = AsyncMock()
+        mock_fallback.health_probe = AsyncMock(return_value=True)
+
+        gen = CandidateGenerator(primary=mock_primary, fallback=mock_fallback)
+        deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
+        result = await gen.plan("test prompt", deadline)
+
+        assert isinstance(result, str)
+        mock_fallback.plan.assert_called_once()

@@ -732,6 +732,25 @@ class PrimeProvider:
             logger.debug("[PrimeProvider] Health probe failed", exc_info=True)
             return False
 
+    async def plan(self, prompt: str, deadline: datetime) -> str:
+        """Send a lightweight planning prompt; return raw string response.
+
+        Used by ContextExpander for expansion rounds. Caller parses expansion.1 JSON.
+        Low token budget (512) and temperature=0.0 for deterministic planning.
+        """
+        response = await self._client.generate(
+            prompt=prompt,
+            system_prompt=(
+                "You are a code context analyst for the JARVIS self-programming pipeline. "
+                "Identify additional files needed for context. "
+                "Respond with valid JSON only matching schema_version expansion.1. "
+                "No markdown, no preamble."
+            ),
+            max_tokens=512,
+            temperature=0.0,
+        )
+        return response.content
+
 
 # ---------------------------------------------------------------------------
 # ClaudeProvider
@@ -910,3 +929,31 @@ class ClaudeProvider:
         except Exception:
             logger.debug("[ClaudeProvider] Health probe failed", exc_info=True)
             return False
+
+    async def plan(self, prompt: str, deadline: datetime) -> str:
+        """Send a lightweight planning prompt; return raw string response.
+
+        Used by ContextExpander for expansion rounds. Caller parses expansion.1 JSON.
+        Counts against daily budget (low token usage).
+        """
+        self._maybe_reset_daily_budget()
+        if self._daily_spend >= self._daily_budget:
+            raise RuntimeError("claude_budget_exhausted")
+
+        client = self._ensure_client()
+        message = await client.messages.create(
+            model=self._model,
+            max_tokens=512,
+            system=(
+                "You are a code context analyst for the JARVIS self-programming pipeline. "
+                "Identify additional files needed for context. "
+                "Respond with valid JSON only matching schema_version expansion.1. "
+                "No markdown, no preamble."
+            ),
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        input_tokens = getattr(message.usage, "input_tokens", 0)
+        output_tokens = getattr(message.usage, "output_tokens", 0)
+        self._record_cost(self._estimate_cost(input_tokens, output_tokens))
+        return message.content[0].text
