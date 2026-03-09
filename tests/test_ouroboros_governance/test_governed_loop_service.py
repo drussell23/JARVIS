@@ -311,7 +311,6 @@ class TestGovernedLoopIntakeRegistryWiring:
             GovernedLoopService,
         )
         from backend.core.ouroboros.governance.intake.intake_layer_service import (
-            IntakeLayerConfig,
             IntakeLayerService,
         )
 
