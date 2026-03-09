@@ -43,14 +43,6 @@ def _mock_gls() -> MagicMock:
     return gls
 
 
-def _patched_build(svc: IntakeLayerService):
-    """Context manager that mocks router + sensor start() so _build_components runs cleanly."""
-    return patch.multiple(
-        "",
-        **{},
-    )
-
-
 async def _run_build(svc: IntakeLayerService) -> None:
     with patch(_ROUTER_PATH) as MockRouter, \
          patch(_BACKLOG_START, new=AsyncMock()), \

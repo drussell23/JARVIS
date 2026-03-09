@@ -388,7 +388,9 @@ class IntakeLayerService:
         # Sensors with start/stop lifecycle
         self._sensors = [backlog_sensor] + test_failure_sensors + miner_sensors
 
-        await self._router.start()
+        router = self._router
+        assert router is not None
+        await router.start()
         for sensor in self._sensors:
             await sensor.start()
 
