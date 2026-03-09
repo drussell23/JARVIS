@@ -96,9 +96,192 @@ class IntakeLayerConfig:
 
 
 # ---------------------------------------------------------------------------
-# IntakeLayerService (stub — fully implemented in Task 3)
+# IntakeLayerService
 # ---------------------------------------------------------------------------
 
+
 class IntakeLayerService:
-    """Stub. Full implementation in Task 3."""
-    pass
+    """Lifecycle manager for router + sensors + A-narrator (Zone 6.9).
+
+    Constructor is side-effect free. All async setup in start().
+    """
+
+    def __init__(
+        self,
+        gls: Any,
+        config: IntakeLayerConfig,
+        say_fn: Optional[Callable[..., Coroutine[Any, Any, bool]]],
+    ) -> None:
+        self._gls = gls
+        self._config = config
+        self._say_fn = say_fn
+        self._state = IntakeServiceState.INACTIVE
+        self._started_at_monotonic: float = 0.0
+
+        # Built during start()
+        self._router: Optional[Any] = None
+        self._sensors: List[Any] = []
+        self._narrator: Optional[Any] = None  # IntakeNarrator, added in Task 4
+        self._dead_letter_count: int = 0
+        self._per_source_count: Dict[str, int] = {}
+
+    @property
+    def state(self) -> IntakeServiceState:
+        return self._state
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Build and start router, sensors, A-narrator. Idempotent."""
+        if self._state in (IntakeServiceState.ACTIVE, IntakeServiceState.DEGRADED):
+            return
+
+        self._state = IntakeServiceState.STARTING
+        try:
+            await self._build_components()
+            self._state = IntakeServiceState.ACTIVE
+            self._started_at_monotonic = time.monotonic()
+            logger.info("[IntakeLayer] Started: state=%s", self._state.name)
+        except Exception as exc:
+            self._state = IntakeServiceState.FAILED
+            logger.error("[IntakeLayer] Start failed: %s", exc, exc_info=True)
+            await self._teardown()
+            raise
+
+    async def stop(self) -> None:
+        """Stop sensors first (drain), then router. Idempotent from INACTIVE."""
+        if self._state is IntakeServiceState.INACTIVE:
+            return
+
+        self._state = IntakeServiceState.STOPPING
+
+        # Stop sensors first to prevent new envelopes entering router.
+        # Sensor stop() methods are synchronous; call directly.
+        for sensor in self._sensors:
+            try:
+                result = sensor.stop()
+                # Await if stop() happens to be a coroutine
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                logger.warning("[IntakeLayer] Sensor stop error: %s", exc)
+
+        # Stop router (drains in-flight queue)
+        if self._router is not None:
+            try:
+                await self._router.stop()
+            except Exception as exc:
+                logger.warning("[IntakeLayer] Router stop error: %s", exc)
+
+        self._sensors = []
+        self._router = None
+        self._narrator = None
+        self._state = IntakeServiceState.INACTIVE
+        logger.info("[IntakeLayer] Stopped.")
+
+    def health(self) -> Dict[str, Any]:
+        """Return health metrics for supervisor health checks."""
+        queue_depth = 0
+        if self._router is not None:
+            try:
+                queue_depth = self._router._queue.qsize()
+            except Exception:
+                pass
+
+        uptime_s = (
+            time.monotonic() - self._started_at_monotonic
+            if self._started_at_monotonic > 0
+            else 0.0
+        )
+        per_source_rate: Dict[str, float] = {}
+        if uptime_s > 0:
+            for src, cnt in self._per_source_count.items():
+                per_source_rate[src] = round(cnt / (uptime_s / 60.0), 3)
+
+        return {
+            "state": self._state.name.lower(),
+            "queue_depth": queue_depth,
+            "dead_letter_count": self._dead_letter_count,
+            "wal_entries_pending": 0,
+            "per_source_rate": per_source_rate,
+            "uptime_s": round(uptime_s, 1),
+        }
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    async def _build_components(self) -> None:
+        """Construct and start router + sensors."""
+        from backend.core.ouroboros.governance.intake import (
+            IntakeRouterConfig,
+            UnifiedIntakeRouter,
+        )
+        from backend.core.ouroboros.governance.intake.sensors import (
+            BacklogSensor,
+            OpportunityMinerSensor,
+            TestFailureSensor,
+            VoiceCommandSensor,
+        )
+
+        router_config = IntakeRouterConfig(
+            project_root=self._config.project_root,
+            dedup_window_s=self._config.dedup_window_s,
+        )
+        self._router = UnifiedIntakeRouter(gls=self._gls, config=router_config)
+
+        # Build sensors — using actual constructor parameter names.
+        # BacklogSensor uses poll_interval_s (not scan_interval_s).
+        # VoiceCommandSensor is event-driven (no start/stop); stored separately.
+        backlog_path = self._config.project_root / ".jarvis" / "backlog.json"
+
+        backlog_sensor = BacklogSensor(
+            backlog_path=backlog_path,
+            repo_root=self._config.project_root,
+            router=self._router,
+            poll_interval_s=self._config.backlog_scan_interval_s,
+        )
+        test_failure_sensor = TestFailureSensor(
+            repo="jarvis",
+            router=self._router,
+        )
+        opportunity_miner_sensor = OpportunityMinerSensor(
+            repo_root=self._config.project_root,
+            router=self._router,
+            scan_paths=self._config.miner_scan_paths,
+            complexity_threshold=self._config.miner_complexity_threshold,
+            poll_interval_s=self._config.miner_scan_interval_s,
+        )
+
+        # VoiceCommandSensor has no start/stop lifecycle; store as attribute only.
+        self._voice_sensor = VoiceCommandSensor(
+            router=self._router,
+            repo="jarvis",
+            stt_confidence_threshold=self._config.voice_stt_confidence_threshold,
+        )
+
+        # Sensors with start/stop lifecycle
+        self._sensors = [backlog_sensor, test_failure_sensor, opportunity_miner_sensor]
+
+        await self._router.start()
+        for sensor in self._sensors:
+            await sensor.start()
+
+    async def _teardown(self) -> None:
+        """Best-effort cleanup after failed start."""
+        for sensor in self._sensors:
+            try:
+                result = sensor.stop()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                pass
+        if self._router is not None:
+            try:
+                await self._router.stop()
+            except Exception:
+                pass
+        self._sensors = []
+        self._router = None

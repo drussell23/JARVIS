@@ -33,3 +33,59 @@ def test_intake_layer_config_from_env(tmp_path, monkeypatch):
     assert config.project_root == tmp_path
     assert config.dedup_window_s == 120.0
     assert config.miner_scan_paths == ["src/", "lib/"]
+
+
+from unittest.mock import AsyncMock, MagicMock
+
+
+async def test_service_initial_state(tmp_path):
+    gls = MagicMock()
+    config = IntakeLayerConfig(project_root=tmp_path)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+    assert svc.state is IntakeServiceState.INACTIVE
+
+
+async def test_service_start_reaches_active(tmp_path):
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeLayerConfig(project_root=tmp_path)
+    say_fn = AsyncMock(return_value=True)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=say_fn)
+    await svc.start()
+    assert svc.state in (IntakeServiceState.ACTIVE, IntakeServiceState.DEGRADED)
+    await svc.stop()
+    assert svc.state is IntakeServiceState.INACTIVE
+
+
+async def test_service_start_idempotent(tmp_path):
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeLayerConfig(project_root=tmp_path)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+    await svc.start()
+    state_after_first = svc.state
+    await svc.start()  # second call must be no-op
+    assert svc.state is state_after_first
+    await svc.stop()
+
+
+async def test_service_health_keys(tmp_path):
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeLayerConfig(project_root=tmp_path)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+    await svc.start()
+    h = svc.health()
+    assert "state" in h
+    assert "queue_depth" in h
+    assert "dead_letter_count" in h
+    assert "per_source_rate" in h
+    await svc.stop()
+
+
+async def test_service_stop_from_inactive_is_noop(tmp_path):
+    gls = MagicMock()
+    config = IntakeLayerConfig(project_root=tmp_path)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+    await svc.stop()  # must not raise
+    assert svc.state is IntakeServiceState.INACTIVE
