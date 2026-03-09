@@ -38,6 +38,7 @@ from backend.core.ouroboros.governance.op_context import (
     OperationContext,
     OperationPhase,
 )
+from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
 from backend.core.ouroboros.governance.orchestrator import (
     GovernedOrchestrator,
     OrchestratorConfig,
@@ -634,7 +635,6 @@ class GovernedLoopService:
         )
 
         # Build RepoRegistry from environment (always; empty if env vars not set)
-        from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
         repo_registry = RepoRegistry.from_env()
         logger.info(
             "[GovernedLoop] RepoRegistry enabled repos: %s",

@@ -259,16 +259,32 @@ class TestGovernedLoopRegistryWiring:
         stack = _mock_stack()
         svc = GovernedLoopService(stack=stack, prime_client=None, config=config)
 
-        await svc.start()
+        try:
+            await svc.start()
 
-        assert svc._orchestrator is not None
-        registry = svc._orchestrator._config.repo_registry
-        assert registry is not None
-        names = {r.name for r in registry.list_enabled()}
-        assert "jarvis" in names
-        assert "prime" in names
+            assert svc._orchestrator is not None
+            registry = svc._orchestrator._config.repo_registry
+            assert registry is not None
+            names = {r.name for r in registry.list_enabled()}
+            assert "jarvis" in names
+            assert "prime" in names
+        finally:
+            await svc.stop()
 
-        await svc.stop()
+    def test_reactor_canonical_wins_over_legacy(self, tmp_path, monkeypatch):
+        """JARVIS_REACTOR_REPO_PATH takes priority over REACTOR_CORE_REPO_PATH."""
+        from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
+        canonical_path = tmp_path / "canonical"
+        legacy_path = tmp_path / "legacy"
+        canonical_path.mkdir()
+        legacy_path.mkdir()
+        monkeypatch.setenv("JARVIS_REPO_PATH", str(tmp_path))
+        monkeypatch.setenv("JARVIS_REACTOR_REPO_PATH", str(canonical_path))
+        monkeypatch.setenv("REACTOR_CORE_REPO_PATH", str(legacy_path))
+
+        registry = RepoRegistry.from_env()
+        rc = registry.get("reactor-core")
+        assert rc.local_path == canonical_path
 
     def test_reactor_legacy_env_var_wired(self, tmp_path, monkeypatch):
         """REACTOR_CORE_REPO_PATH is accepted as legacy alias for reactor-core."""
