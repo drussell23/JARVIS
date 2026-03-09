@@ -332,6 +332,9 @@ class PerformanceRecordPersistence:
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_task_type ON performance_records(task_type)
             """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_model_task ON performance_records(model_id, task_type)
+            """)
 
             # model_attribution table (v2+)
             conn.execute("""
@@ -396,7 +399,10 @@ class PerformanceRecordPersistence:
                     recorded_at TEXT NOT NULL
                 )
             """)
-            conn.execute("UPDATE schema_version SET version = 2")
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_model_task ON performance_records(model_id, task_type)
+            """)
+            conn.execute("UPDATE schema_version SET version = ?", (self.SCHEMA_VERSION,))
 
     def _record_to_dict(self, record: PerformanceRecord) -> Dict[str, Any]:
         """Convert PerformanceRecord to dictionary for serialization."""
@@ -426,7 +432,7 @@ class PerformanceRecordPersistence:
             model_id=data["model_id"],
             task_type=data["task_type"],
             difficulty=TaskDifficulty[data["difficulty"]],
-            success=data["success"],
+            success=bool(data["success"]),
             latency_ms=data["latency_ms"],
             iterations_used=data["iterations_used"],
             code_quality_score=data["code_quality_score"],
@@ -722,21 +728,24 @@ class PerformanceRecordPersistence:
         await loop.run_in_executor(None, self._write_attribution_sync, record)
 
     def _write_attribution_sync(self, record: ModelAttributionRecord) -> None:
-        with sqlite3.connect(self._db_path) as conn:
-            conn.execute(
-                """INSERT INTO model_attribution
-                   (model_id, previous_model_id, training_batch_size, task_type,
-                    success_rate_delta, latency_delta_ms, quality_delta,
-                    sample_size, confidence, summary, recorded_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    record.model_id, record.previous_model_id, record.training_batch_size,
-                    record.task_type, record.success_rate_delta, record.latency_delta_ms,
-                    record.quality_delta, record.sample_size, record.confidence,
-                    record.summary, record.recorded_at.isoformat(),
-                ),
-            )
-            conn.commit()
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.execute(
+                    """INSERT INTO model_attribution
+                       (model_id, previous_model_id, training_batch_size, task_type,
+                        success_rate_delta, latency_delta_ms, quality_delta,
+                        sample_size, confidence, summary, recorded_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        record.model_id, record.previous_model_id, record.training_batch_size,
+                        record.task_type, record.success_rate_delta, record.latency_delta_ms,
+                        record.quality_delta, record.sample_size, record.confidence,
+                        record.summary, record.recorded_at.isoformat(),
+                    ),
+                )
+                conn.commit()
+        except Exception as exc:
+            logger.error(f"Failed to write attribution record for model {record.model_id!r}: {exc}")
 
     async def get_records_by_model_and_task(
         self,
