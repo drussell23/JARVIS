@@ -254,7 +254,7 @@ def _build_comm_protocol(
     # VoiceNarrator — requires safe_say; skip gracefully if unavailable
     try:
         from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
-        from backend.audio import safe_say  # type: ignore[import]
+        from backend.core.supervisor.unified_voice_orchestrator import safe_say  # type: ignore[import]
     except ImportError as exc:
         logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
     else:
