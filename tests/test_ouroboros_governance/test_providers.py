@@ -481,3 +481,56 @@ class TestClaudeProviderPlan:
         call_kwargs = mock_client.messages.create.call_args.kwargs
         assert call_kwargs.get("max_tokens", 9999) <= 512
         assert call_kwargs.get("temperature", 1.0) == 0.0
+
+
+class TestBuildCodegenPromptExpandedContext:
+    def test_expanded_files_appear_in_prompt(self, tmp_path):
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext, OperationPhase
+
+        (tmp_path / "target.py").write_text("def foo(): pass\n")
+        (tmp_path / "helpers.py").write_text("def bar(): pass\n")
+
+        ctx = OperationContext.create(
+            target_files=("target.py",), description="update foo"
+        )
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+        ctx = ctx.with_expanded_files(("helpers.py",))
+        ctx = ctx.advance(OperationPhase.GENERATE)
+
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+
+        assert "helpers.py" in prompt
+        assert "CONTEXT ONLY" in prompt
+        assert "DO NOT MODIFY" in prompt
+
+    def test_no_expanded_files_omits_section(self, tmp_path):
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        (tmp_path / "target.py").write_text("def foo(): pass\n")
+        ctx = OperationContext.create(
+            target_files=("target.py",), description="update foo"
+        )
+
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "CONTEXT ONLY" not in prompt
+
+    def test_expanded_file_content_appears_in_prompt(self, tmp_path):
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext, OperationPhase
+
+        (tmp_path / "target.py").write_text("def foo(): pass\n")
+        (tmp_path / "helpers.py").write_text("UNIQUE_MARKER_XYZ = 42\n")
+
+        ctx = OperationContext.create(
+            target_files=("target.py",), description="update foo"
+        )
+        ctx = ctx.advance(OperationPhase.ROUTE)
+        ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
+        ctx = ctx.with_expanded_files(("helpers.py",))
+        ctx = ctx.advance(OperationPhase.GENERATE)
+
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "UNIQUE_MARKER_XYZ" in prompt

@@ -283,6 +283,27 @@ def _build_codegen_prompt(
         + ("\n\n".join(context_parts) if context_parts else "_No surrounding context discovered._")
     )
 
+    # ── 2b. Expanded context files (pre-generation context expansion result) ──
+    expanded_context_parts: List[str] = []
+    for raw_exp in getattr(ctx, "expanded_context_files", ()):
+        abs_exp = Path(raw_exp) if Path(raw_exp).is_absolute() else (repo_root / raw_exp).resolve()
+        try:
+            abs_exp = _safe_context_path(repo_root, abs_exp)
+        except BlockedPathError:
+            continue
+        exp_content = _read_with_truncation(abs_exp, max_chars=_MAX_TARGET_FILE_CHARS)
+        if not exp_content:
+            continue
+        expanded_context_parts.append(
+            f"### Expanded context: {raw_exp} [CONTEXT ONLY — DO NOT MODIFY]\n```\n{exp_content}\n```"
+        )
+    expanded_context_block = ""
+    if expanded_context_parts:
+        expanded_context_block = (
+            "## Expanded Context Files (CONTEXT ONLY — DO NOT MODIFY)\n\n"
+            + "\n\n".join(expanded_context_parts)
+        )
+
     # ── 3. Output schema instruction ────────────────────────────────────
     if ctx.cross_repo and repo_roots:
         repos_listed = "\n".join(
@@ -354,12 +375,15 @@ Rules:
 
     # ── 4. Assemble final prompt ─────────────────────────────────────────
     file_block = "\n\n".join(file_sections) if file_sections else "_No target files._"
-    return "\n\n".join([
+    parts = [
         f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}",
         f"## Source Snapshot\n\n{file_block}",
         context_block,
-        schema_instruction,
-    ])
+    ]
+    if expanded_context_block:
+        parts.append(expanded_context_block)
+    parts.append(schema_instruction)
+    return "\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
