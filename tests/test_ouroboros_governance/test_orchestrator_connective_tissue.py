@@ -230,8 +230,7 @@ async def test_canary_record_on_single_repo_success(tmp_path):
 
     assert stack.canary.record_operation.called
     call = stack.canary.record_operation.call_args
-    success_val = call.kwargs.get("success") if call.kwargs else call.args[1]
-    assert success_val is True
+    assert call.kwargs["success"] is True
 
 
 async def test_canary_record_on_single_repo_failure(tmp_path):
@@ -247,12 +246,8 @@ async def test_canary_record_on_single_repo_failure(tmp_path):
 
     assert stack.canary.record_operation.called
     call = stack.canary.record_operation.call_args
-    if call.kwargs:
-        assert call.kwargs.get("success") is False
-        assert call.kwargs.get("rolled_back") is True
-    else:
-        assert call.args[1] is False
-        assert call.args[3] is True
+    assert call.kwargs["success"] is False
+    assert call.kwargs["rolled_back"] is True
 
 
 async def test_canary_record_on_saga_stuck(tmp_path):
@@ -275,5 +270,4 @@ async def test_canary_record_on_saga_stuck(tmp_path):
 
     assert stack.canary.record_operation.called
     call = stack.canary.record_operation.call_args
-    success_val = call.kwargs.get("success") if call.kwargs else call.args[1]
-    assert success_val is False
+    assert call.kwargs["success"] is False
