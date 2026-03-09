@@ -32,6 +32,10 @@ class VoiceCommandPayload:
     stt_confidence: float = 1.0
     evidence: dict = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        if self.repo is None:
+            raise ValueError("VoiceCommandPayload.repo must be a string, not None")
+
 
 class VoiceCommandSensor:
     """Converts recognized voice self-dev commands into IntentEnvelopes.
