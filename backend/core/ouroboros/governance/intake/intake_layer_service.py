@@ -100,11 +100,11 @@ class IntakeLayerConfig:
 # ---------------------------------------------------------------------------
 
 # Sources that always trigger narration
-_A_NARRATE_ALWAYS = {"voice_human"}
+_A_NARRATE_ALWAYS: frozenset[str] = frozenset({"voice_human"})
 # Sources that require a count threshold
-_A_NARRATE_THRESHOLD = {"test_failure"}
+_A_NARRATE_THRESHOLD: frozenset[str] = frozenset({"test_failure"})
 # Sources that are always silent at A-layer
-_A_NARRATE_SILENT = {"backlog", "ai_miner"}
+_A_NARRATE_SILENT: frozenset[str] = frozenset({"backlog", "ai_miner"})
 
 _A_TEMPLATES: Dict[str, str] = {
     "voice_human": "Voice command queued: {description}",
