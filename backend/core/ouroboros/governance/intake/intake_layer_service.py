@@ -57,7 +57,7 @@ class IntakeLayerConfig:
     a_narrator_enabled: bool = True
     a_narrator_debounce_s: float = 10.0
     test_failure_min_count_for_narration: int = 2
-    repo_registry: Optional["RepoRegistry"] = None  # Forward ref; multi-repo sensor fan-out
+    repo_registry: Optional[RepoRegistry] = None  # TYPE_CHECKING import; multi-repo sensor fan-out
 
     @classmethod
     def from_env(cls, project_root: Optional[Path] = None) -> "IntakeLayerConfig":
