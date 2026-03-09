@@ -16,7 +16,10 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Coroutine, Dict, List, Optional
+
+if TYPE_CHECKING:
+    from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
 
 logger = logging.getLogger("Ouroboros.IntakeLayer")
 
@@ -54,6 +57,7 @@ class IntakeLayerConfig:
     a_narrator_enabled: bool = True
     a_narrator_debounce_s: float = 10.0
     test_failure_min_count_for_narration: int = 2
+    repo_registry: Optional["RepoRegistry"] = None  # Forward ref; multi-repo sensor fan-out
 
     @classmethod
     def from_env(cls, project_root: Optional[Path] = None) -> "IntakeLayerConfig":
