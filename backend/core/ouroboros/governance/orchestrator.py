@@ -456,6 +456,10 @@ class GovernedOrchestrator:
         # ---- Phase 7: APPLY ----
         ctx = ctx.advance(OperationPhase.APPLY)
 
+        # Cross-repo saga path
+        if ctx.cross_repo:
+            return await self._execute_saga_apply(ctx, best_candidate)
+
         change_request = self._build_change_request(ctx, best_candidate)
 
         try:
@@ -740,6 +744,109 @@ class GovernedOrchestrator:
             proposed_content=proposed_content,
             profile=profile,
         )
+
+    async def _execute_saga_apply(
+        self,
+        ctx: OperationContext,
+        best_candidate: Optional[Dict[str, Any]],
+    ) -> OperationContext:
+        """Execute multi-repo saga apply + three-tier verify.
+
+        Selected when ctx.cross_repo is True. Single-repo path is unchanged.
+        """
+        from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
+        from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
+        from backend.core.ouroboros.governance.saga.saga_types import (
+            RepoPatch,
+            SagaTerminalState,
+        )
+
+        # Build patch_map from best_candidate["patches"] or fall back to empty per-repo patches
+        patch_map: Dict[str, RepoPatch] = {}
+        if best_candidate and "patches" in best_candidate:
+            patch_map = best_candidate["patches"]
+        else:
+            for repo in ctx.repo_scope:
+                patch_map[repo] = RepoPatch(repo=repo, files=())
+
+        # Resolve repo roots: all repos map to project_root for now
+        repo_roots = {repo: self._config.project_root for repo in ctx.repo_scope}
+
+        strategy = SagaApplyStrategy(
+            repo_roots=repo_roots,
+            ledger=self._stack.ledger,
+        )
+        apply_result = await strategy.execute(ctx, patch_map)
+
+        if apply_result.terminal_state == SagaTerminalState.SAGA_ABORTED:
+            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            await self._record_ledger(
+                ctx,
+                OperationState.FAILED,
+                {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
+            )
+            return ctx
+
+        if apply_result.terminal_state == SagaTerminalState.SAGA_APPLY_COMPLETED:
+            verifier = CrossRepoVerifier(
+                repo_roots=repo_roots,
+                dependency_edges=ctx.dependency_edges,
+            )
+            verify_result = await verifier.verify(
+                repo_scope=ctx.repo_scope,
+                patch_map=patch_map,
+                dependency_edges=ctx.dependency_edges,
+            )
+
+            if not verify_result.passed:
+                await strategy._phase_c_compensate(
+                    list(ctx.apply_plan),
+                    patch_map,
+                    apply_result.saga_id,
+                    ctx.op_id,
+                    verify_result.reason_code,
+                    {},
+                )
+                ctx = ctx.advance(OperationPhase.POSTMORTEM)
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {
+                        "reason": verify_result.reason_code,
+                        "saga_id": apply_result.saga_id,
+                    },
+                )
+                return ctx
+
+            # SAGA_SUCCEEDED
+            ctx = ctx.advance(OperationPhase.VERIFY)
+            await self._record_ledger(
+                ctx,
+                OperationState.APPLIED,
+                {"saga_id": apply_result.saga_id},
+            )
+            ctx = ctx.advance(OperationPhase.COMPLETE)
+            return ctx
+
+        # SAGA_ROLLED_BACK or SAGA_STUCK
+        if apply_result.terminal_state == SagaTerminalState.SAGA_STUCK:
+            try:
+                await self._stack.comm.emit_postmortem(
+                    op_id=ctx.op_id,
+                    root_cause="saga_stuck",
+                    failed_phase="APPLY",
+                    next_safe_action="human_intervention_required",
+                )
+            except Exception:
+                pass
+
+        ctx = ctx.advance(OperationPhase.POSTMORTEM)
+        await self._record_ledger(
+            ctx,
+            OperationState.FAILED,
+            {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
+        )
+        return ctx
 
     async def _record_ledger(
         self,
