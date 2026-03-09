@@ -1,7 +1,5 @@
 """Tests for CrossRepoVerifier three-tier verification."""
-import asyncio
-from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 from backend.core.ouroboros.governance.saga.cross_repo_verifier import (
     CrossRepoVerifier,
@@ -82,7 +80,7 @@ async def test_tier2_skipped_when_single_repo(tmp_path):
     called = []
 
     with patch.object(verifier, "_tier1_per_repo", return_value=None), \
-         patch.object(verifier, "_tier2_cross_repo_contracts", side_effect=lambda **kw: called.append(True) or None), \
+         patch.object(verifier, "_tier2_cross_repo_contracts", side_effect=lambda **_kw: called.append(True) or None), \
          patch.object(verifier, "_tier3_integration_tests", return_value=None):
         result = await verifier.verify(
             repo_scope=("jarvis",),

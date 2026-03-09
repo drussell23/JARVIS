@@ -78,7 +78,7 @@ class CrossRepoVerifier:
         # Tier 2: cross-repo contracts (only for multi-repo)
         if len(repo_scope) > 1:
             t2 = await self._tier2_cross_repo_contracts(
-                repo_scope=repo_scope,
+                _repo_scope=repo_scope,
                 dependency_edges=dependency_edges,
             )
             if t2 is not None:
@@ -156,7 +156,7 @@ class CrossRepoVerifier:
 
     async def _tier2_cross_repo_contracts(
         self,
-        repo_scope: Tuple[str, ...],
+        _repo_scope: Tuple[str, ...],
         dependency_edges: Tuple[Tuple[str, str], ...],
     ) -> Optional[VerifyResult]:
         """Check import boundaries along declared dependency edges.
