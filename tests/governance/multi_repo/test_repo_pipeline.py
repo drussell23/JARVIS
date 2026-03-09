@@ -77,7 +77,7 @@ class TestRepoPipelineManagerSubmit:
             confidence=0.9,
             stable=True,
         )
-        result = await manager.submit(signal)
+        await manager.submit(signal)
         mock_prime_gls.submit.assert_called_once()
         mock_jarvis_gls.submit.assert_not_called()
 
@@ -201,7 +201,7 @@ class TestRepoPipelineManagerLifecycle:
         mock_gls.stop.assert_called_once()
 
 
-async def test_submit_sets_primary_repo_on_context(tmp_path):
+async def test_submit_sets_primary_repo_on_context():
     """RepoPipelineManager.submit() passes signal.repo as primary_repo."""
     from pathlib import Path
     from unittest.mock import AsyncMock, MagicMock
@@ -220,7 +220,8 @@ async def test_submit_sets_primary_repo_on_context(tmp_path):
 
     captured_ctx = None
 
-    async def fake_submit(ctx, *, trigger_source):
+    async def fake_submit(ctx, *, trigger_source=None):
+        del trigger_source  # accepted by interface, not inspected
         nonlocal captured_ctx
         captured_ctx = ctx
         return MagicMock(op_id="op-capture-01")
