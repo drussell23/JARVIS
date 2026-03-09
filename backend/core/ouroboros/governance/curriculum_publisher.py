@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import logging
 import math
-import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -58,6 +57,13 @@ class CurriculumPublisher:
         self._half_life_hours = half_life_hours
 
     async def publish(self) -> Optional[CurriculumPayload]:
+        try:
+            return await self._publish_inner()
+        except Exception as exc:
+            logger.exception("[CurriculumPublisher] publish() failed: %s", exc)
+            return None
+
+    async def _publish_inner(self) -> Optional[CurriculumPayload]:
         now = datetime.now(tz=timezone.utc)
         # (task_type, raw_priority, failure_rate, sample_size, confidence)
         entries: list[tuple[str, float, float, int, float]] = []
@@ -99,6 +105,7 @@ class CurriculumPublisher:
 
         total = sum(e[1] for e in top)
         if total == 0.0:
+            logger.debug("[CurriculumPublisher] All qualifying task types have zero failure rate; skipping publish")
             return None
 
         payload_entries = [
@@ -119,7 +126,7 @@ class CurriculumPublisher:
             top_k=payload_entries,
         )
 
-        ts_ms = int(time.time() * 1000)
+        ts_ms = int(now.timestamp() * 1000)
         out_path = self._event_dir / f"curriculum_{ts_ms}.json"
         out_path.write_text(
             json.dumps(
@@ -130,7 +137,8 @@ class CurriculumPublisher:
                     "top_k": [asdict(e) for e in payload.top_k],
                 },
                 indent=2,
-            )
+            ),
+            encoding="utf-8",
         )
         logger.info(
             "[CurriculumPublisher] Wrote %s (%d task types)",

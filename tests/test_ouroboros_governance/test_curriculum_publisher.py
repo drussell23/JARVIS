@@ -3,11 +3,7 @@ import json
 import tempfile
 from pathlib import Path
 
-import pytest
-
 from backend.core.ouroboros.governance.curriculum_publisher import (
-    CurriculumEntry,
-    CurriculumPayload,
     CurriculumPublisher,
 )
 from backend.core.ouroboros.integration import PerformanceRecord, PerformanceRecordPersistence, TaskDifficulty

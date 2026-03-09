@@ -788,13 +788,17 @@ class PerformanceRecordPersistence:
         )
 
     def _query_by_task_sync(self, task_type: str, limit: int) -> List[PerformanceRecord]:
-        with sqlite3.connect(self._db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM performance_records WHERE task_type = ? ORDER BY timestamp DESC LIMIT ?",
-                (task_type, limit),
-            ).fetchall()
-        return [self._dict_to_record(dict(row)) for row in rows]
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM performance_records WHERE task_type = ? ORDER BY timestamp DESC LIMIT ?",
+                    (task_type, limit),
+                ).fetchall()
+            return [self._dict_to_record(dict(row)) for row in rows]
+        except Exception as exc:
+            logger.warning("[Persistence] _query_by_task_sync failed: %s", exc)
+            return []
 
     async def get_statistics(
         self,
