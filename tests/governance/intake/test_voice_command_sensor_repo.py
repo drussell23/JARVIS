@@ -1,5 +1,5 @@
 """VoiceCommandSensor must route envelope.repo from payload.repo, not self._repo."""
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from backend.core.ouroboros.governance.intake.sensors.voice_command_sensor import (
     VoiceCommandPayload,
