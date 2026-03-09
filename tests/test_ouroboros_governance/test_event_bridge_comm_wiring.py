@@ -73,7 +73,7 @@ async def test_cross_repo_narrator_registered_when_event_bus_provided(tmp_path):
     mock_event_bus.register_handler = fake_register
 
     config = _make_config(tmp_path)
-    stack = await create_governance_stack(config, event_bus=mock_event_bus)
+    await create_governance_stack(config, event_bus=mock_event_bus)
 
     assert EventType.IMPROVEMENT_REQUEST in registered_handlers
     assert EventType.IMPROVEMENT_COMPLETE in registered_handlers
