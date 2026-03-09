@@ -2,7 +2,7 @@
 
 **The Body of the AGI OS — macOS integration, computer use, action execution, and unified orchestration**
 
-JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v260.0**, JARVIS features a **Memory Control Plane** with lease-based memory governance and pressure-driven ghost display resolution shedding (v260.0), command lifecycle event infrastructure (v243.0/v243.1), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
+JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v261.0 (Ouroboros 2c.1)**, JARVIS autonomously self-develops across all three repos in real time: the Ouroboros governance loop (Zones 6.0–6.9) detects improvement opportunities, generates multi-repo patches via GCP J-Prime (schema 2c.1), validates them, applies them with git commits, and narrates every decision via voice and TUI — all without human intervention. Previous milestones include: Memory Control Plane with lease-based memory governance (v260.0), command lifecycle event infrastructure (v243.0/v243.1), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
 
 ---
 
@@ -56,8 +56,276 @@ python3 unified_supervisor.py
 - **Backend** (Body) — FastAPI on port 8010, WebSocket, voice/vision
 - **Trinity** — JARVIS-Prime (port 8000/8002), Reactor-Core (port 8090)
 - **Frontend** — UI on port 3000
+- **Zone 6.0** — Governance gate (CommProtocol + EventBridge + CrossRepoNarrator)
+- **Zone 6.8** — Governed self-programming loop (GovernedLoopService, J-Prime + Claude providers)
+- **Zone 6.9** — Intake layer (BacklogSensor × 3 repos, TestFailureSensor × 3, OpportunityMiner × 3)
 
-**Optional:** Use `unified_supervisor.py --status` to see component status; use `--shutdown` then run again for a clean restart.
+**Optional:** Use `unified_supervisor.py --status` to see component status; use `--shutdown` then run again for a clean restart. Use `--skip-governance` to boot without the self-programming loop.
+
+---
+
+## Autonomous Multi-Repo Self-Development (Ouroboros — Schema 2c.1)
+
+JARVIS can autonomously detect, generate, review, and apply code improvements across **all three repos** (JARVIS, JARVIS-Prime, Reactor-Core) without human intervention, narrating every decision in real time via voice and TUI.
+
+This is the **Ouroboros governance system** — a self-programming loop that runs inside the supervisor kernel starting at Zone 6.0.
+
+---
+
+### What Happens When You Run `python3 unified_supervisor.py --force`
+
+`--force` kills any existing kernel instance, cleans stale locks and child processes, then starts a fresh full boot. The complete governance timeline looks like this:
+
+```
+python3 unified_supervisor.py --force
+│
+├── [immediate] Kill existing kernel (SIGTERM → SIGKILL) + clean locks
+│
+├── Zone 0-4  Early protection, imports, resource managers, ML routing     (~60–180s)
+├── Zone 5    Trinity (JARVIS-Prime + Reactor-Core readiness)               (~60–300s)
+│             ├── J-Prime health: HTTP /health → state=READY, ready_for_inference=true
+│             └── Reactor health: HTTP /health → training_ready=true
+│
+├── Zone 6.0  Governance Gate                                               (~20–60s)
+│             ├── Reads JARVIS_GOVERNANCE_ENABLED (default true)
+│             ├── Calls create_governance_stack() — builds CommProtocol transport chain:
+│             │     LogTransport → TUITransport → VoiceNarrator → OpsLogger → EventBridge
+│             ├── EventBridge forwards every governance event to CrossRepoEventBus
+│             ├── CrossRepoNarrator converts inbound cross-repo events back to voice narration
+│             └── On failure: degrades to read_only_planning (never crashes the kernel)
+│
+├── Zone 6.8  Governed Self-Programming Loop                                (~10–30s)
+│             ├── GovernedLoopService.start()
+│             ├── Calls RepoRegistry.from_env() → reads:
+│             │     JARVIS_REPO_PATH         (default: cwd)
+│             │     JARVIS_PRIME_REPO_PATH   = /Users/.../jarvis-prime
+│             │     JARVIS_REACTOR_REPO_PATH = /Users/.../reactor-core
+│             ├── Builds repo_roots_map: {jarvis, prime, reactor-core} → local paths
+│             ├── Constructs PrimeProvider(repo_roots=repo_roots_map)  — J-Prime on GCP
+│             ├── Constructs ClaudeProvider(repo_roots=repo_roots_map) — Claude fallback
+│             ├── Stores self._repo_registry for Zone 6.9 to reuse
+│             └── Logs health: state=ACTIVE/DEGRADED, generator=PrimeProvider|fallback
+│
+└── Zone 6.9  Intake Layer Service                                          (~5–10s)
+              ├── Reuses _repo_registry from Zone 6.8 via dataclasses.replace()
+              ├── Starts sensors PER REPO (jarvis + prime + reactor-core):
+              │     BacklogSensor          polls {repo}/.jarvis/backlog.json every 30s
+              │     TestFailureSensor      fires on test run failures (min 2 before narration)
+              │     OpportunityMinerSensor scans backend/+tests/ every 300s (complexity≥10)
+              ├── VoiceCommandSensor       always on (event-driven, no polling)
+              └── A-Narrator              announces voice commands and 2+ test failures
+                                          (silent for backlog/miner — non-intrusive)
+```
+
+After all zones complete, the kernel enters its **main event loop**: background health monitors, IPC socket (`~/.jarvis/locks/kernel.sock`), and `wait_for_shutdown()`. No REPL. Communicates via voice, TUI, and HTTP.
+
+---
+
+### What You Will See and Hear
+
+Once Zone 6.9 is active, JARVIS is autonomously watching all three repos simultaneously. Here is what real-time narration looks like:
+
+| Event | What you hear |
+|-------|--------------|
+| BacklogSensor finds a pending task | *(silent — non-intrusive, queued directly)* |
+| OpportunityMiner finds complex code | *(silent — auto-submitted if confidence ≥ 0.75)* |
+| 2+ test failures detected | "2 test failures detected. Investigating." |
+| Voice command queued | "Voice command queued: fix auth handler" |
+| J-Prime generates a cross-repo patch | TUI shows diff; voice narrates intent |
+| Cross-repo patch approved and applied | "Change applied to prime." |
+| Patch fails validation | "Post-mortem: validation_failed. Reviewing cross-repo logs." |
+| Prime repo sends an improvement request | "[prime] improvement detected" — narrated immediately |
+
+---
+
+### The Autonomous Self-Programming Loop in Detail
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                      OUROBOROS GOVERNANCE LOOP                           │
+│                                                                          │
+│  Intake Layer (Zone 6.9)                                                 │
+│  ┌──────────────────────────────────────────────────────────┐            │
+│  │  BacklogSensor × 3 repos    TestFailureSensor × 3 repos │            │
+│  │  OpportunityMiner × 3 repos  VoiceCommandSensor          │            │
+│  └──────────────────┬───────────────────────────────────────┘            │
+│                     │ IntakeEnvelopes (dedup window 60s)                 │
+│                     ▼                                                    │
+│  UnifiedIntakeRouter  →  GovernedLoopService.submit()                    │
+│                     │                                                    │
+│                     ▼                                                    │
+│  OperationContext.create()                                               │
+│    ├─ single-repo: repo_scope=None   → schema 2b.1 (file_path+content)  │
+│    └─ cross-repo:  repo_scope=(j,p)  → schema 2c.1 (patches dict)       │
+│                     │                                                    │
+│                     ▼                                                    │
+│  CandidateGenerator                                                      │
+│    ├─ Primary:  PrimeProvider → GCP J-Prime (golden image)               │
+│    │              _build_codegen_prompt()  — includes schema version     │
+│    │              J-Prime returns JSON with schema_version: "2c.1"       │
+│    │              _parse_generation_response() → RepoPatch per repo      │
+│    └─ Fallback: ClaudeProvider → claude-sonnet-4-6 (local API)          │
+│                     │                                                    │
+│                     ▼                                                    │
+│  GovernedOrchestrator (saga)                                             │
+│    ├─ Phase validate → lint + test (per repo)                            │
+│    ├─ Phase review   → canary slice check                                │
+│    ├─ Phase apply    → write files to repo disk                          │
+│    └─ Phase commit   → git commit per repo                               │
+│                     │                                                    │
+│                     ▼                                                    │
+│  CommProtocol transport chain                                            │
+│    LogTransport → TUITransport → VoiceNarrator → OpsLogger → EventBridge│
+│                                                          │               │
+│                                                          ▼               │
+│                                               CrossRepoEventBus          │
+│                                                          │               │
+│                                          ┌───────────────┘               │
+│                                          ▼                               │
+│                                 CrossRepoNarrator                        │
+│                                 (loop-break: drops JARVIS-origin events) │
+│                                 on_improvement_request → emit_intent     │
+│                                 on_improvement_complete→ emit_decision   │
+│                                 on_improvement_failed  → emit_postmortem │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Schema 2b.1 vs 2c.1 — Single-Repo vs Cross-Repo Patches
+
+J-Prime (or Claude fallback) returns one of two response schemas depending on whether the operation touches one repo or multiple:
+
+**Schema 2b.1 — single-repo** (existing, unchanged):
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/utils.py",
+      "full_content": "def hello(): return 1\n",
+      "rationale": "Fixed return type"
+    }
+  ],
+  "provider_metadata": { "model_id": "...", "reasoning_summary": "..." }
+}
+```
+
+**Schema 2c.1 — cross-repo** (new):
+```json
+{
+  "schema_version": "2c.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "patches": {
+        "jarvis": [
+          { "file_path": "backend/api.py", "full_content": "...", "op": "modify" }
+        ],
+        "prime": [
+          { "file_path": "api/handler.py", "full_content": "...", "op": "modify" }
+        ]
+      },
+      "rationale": "Coordinated API change across JARVIS and Prime"
+    }
+  ],
+  "provider_metadata": { "model_id": "...", "reasoning_summary": "..." }
+}
+```
+
+`op` can be `"modify"`, `"create"`, or `"delete"`. Unknown ops raise `RuntimeError` immediately — no silent coercion.
+
+---
+
+### Real-Time Communication: EventBridge + CrossRepoNarrator
+
+The CommProtocol transport chain means every governance event flows in two directions simultaneously:
+
+**Outbound (JARVIS → repos):** Every `emit_intent`, `emit_decision`, `emit_postmortem` call travels through `EventBridge` → `CrossRepoEventBus` → picked up by J-Prime and Reactor-Core event listeners.
+
+**Inbound (repos → JARVIS):** When J-Prime or Reactor-Core raise an `IMPROVEMENT_REQUEST`, `IMPROVEMENT_COMPLETE`, or `IMPROVEMENT_FAILED` event, `CrossRepoNarrator` converts it to a CommProtocol call. JARVIS narrates it via voice and TUI.
+
+**Loop-break guard:** `CrossRepoNarrator` silently drops events where `source_repo == "jarvis"` to prevent reflexive loops where JARVIS narrates its own events back to itself.
+
+---
+
+### Environment Variables
+
+**Repo Paths (required for multi-repo):**
+```bash
+JARVIS_REPO_PATH=/path/to/JARVIS-AI-Agent          # default: cwd
+JARVIS_PRIME_REPO_PATH=/path/to/jarvis-prime        # enables Prime sensor fan-out
+JARVIS_REACTOR_REPO_PATH=/path/to/reactor-core      # enables Reactor sensor fan-out
+# Alternate name also accepted:
+REACTOR_CORE_REPO_PATH=/path/to/reactor-core
+```
+
+**Governance tuning:**
+```bash
+JARVIS_GOVERNANCE_ENABLED=true          # master switch (default true)
+JARVIS_GOVERNED_CLAUDE_MODEL=claude-sonnet-4-6
+JARVIS_GOVERNED_CLAUDE_MAX_COST_PER_OP=0.50     # per-op budget cap in USD
+JARVIS_GOVERNED_CLAUDE_DAILY_BUDGET=10.00       # daily total budget in USD
+JARVIS_GOVERNED_GENERATION_TIMEOUT=120.0        # seconds
+JARVIS_GOVERNED_APPROVAL_TIMEOUT=600.0          # seconds (for human-ack ops)
+JARVIS_GOVERNED_MAX_CONCURRENT_OPS=2
+```
+
+**Intake sensor tuning:**
+```bash
+JARVIS_INTAKE_BACKLOG_SCAN_INTERVAL_S=30.0      # how often .jarvis/backlog.json is polled
+JARVIS_INTAKE_MINER_SCAN_INTERVAL_S=300.0       # how often code complexity scan runs
+JARVIS_INTAKE_MINER_COMPLEXITY_THRESHOLD=10     # cyclomatic complexity floor for mining
+JARVIS_INTAKE_MINER_AUTO_SUBMIT_THRESHOLD=0.75  # confidence floor for silent auto-submit
+JARVIS_INTAKE_TF_MIN_COUNT=2                    # min test failures before narration
+JARVIS_INTAKE_A_NARRATOR_DEBOUNCE_S=10.0        # min seconds between A-layer announcements
+```
+
+**Disable governance entirely (emergency):**
+```bash
+python3 unified_supervisor.py --skip-governance
+# or
+JARVIS_GOVERNANCE_ENABLED=false python3 unified_supervisor.py
+```
+
+---
+
+### Backlog Files — Queuing Tasks for JARVIS
+
+Any of the three repos can queue autonomous work by writing to `.jarvis/backlog.json`:
+
+```json
+[
+  {
+    "op_id": "fix-auth-001",
+    "description": "Fix JWT expiry check in auth middleware",
+    "target_files": ["backend/auth/middleware.py"],
+    "priority": "high",
+    "requires_human_ack": false
+  }
+]
+```
+
+JARVIS polls this file every 30 seconds per repo. Once picked up, the envelope flows through dedup, the intake router, the governed loop, J-Prime code generation, validation, and commit — all without you touching anything.
+
+---
+
+### Governance Failure Modes (Graceful Degradation)
+
+| Failure | Behavior |
+|---------|----------|
+| J-Prime GCP unreachable | Falls back to ClaudeProvider (local API); no user interruption |
+| Claude API key missing | Generator is `None`; loop runs in `DEGRADED` state; queued ops wait |
+| Zone 6.8 times out (>30s) | `_governed_loop = None`; Zone 6.9 skipped; kernel continues normally |
+| Zone 6.9 times out (>30s) | `_intake_layer = None`; no sensors; kernel continues normally |
+| Governance gate fails | Mode set to `read_only_planning`; no code written; kernel continues |
+| Unknown op in 2c.1 response | `RuntimeError` raised, candidate rejected, postmortem emitted |
+| Unknown repo in 2c.1 patches | `RuntimeError` raised, candidate rejected with `unknown_repo_in_patches` |
+| CommProtocol transport error | Logged and swallowed per transport; other transports continue |
+| CrossRepoNarrator comm error | Logged and swallowed; never raises |
+
+The kernel **never crashes** due to governance failures. Self-programming is strictly additive — the system degrades gracefully and continues operating.
 
 ---
 
