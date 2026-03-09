@@ -633,9 +633,18 @@ class GovernedLoopService:
             },
         )
 
+        # Build RepoRegistry from environment (always; empty if env vars not set)
+        from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
+        repo_registry = RepoRegistry.from_env()
+        logger.info(
+            "[GovernedLoop] RepoRegistry enabled repos: %s",
+            [r.name for r in repo_registry.list_enabled()],
+        )
+
         # Build orchestrator
         orch_config = OrchestratorConfig(
             project_root=self._config.project_root,
+            repo_registry=repo_registry,
             generation_timeout_s=self._config.generation_timeout_s,
             approval_timeout_s=self._config.approval_timeout_s,
         )

@@ -69,8 +69,9 @@ class RepoRegistry:
                 canary_slices=("tests/",),
             ))
 
-        # Optional: reactor-core
-        reactor_path = os.environ.get("JARVIS_REACTOR_REPO_PATH")
+        # Optional: reactor-core (canonical var + legacy alias)
+        reactor_path = os.environ.get("JARVIS_REACTOR_REPO_PATH") or \
+                       os.environ.get("REACTOR_CORE_REPO_PATH")
         if reactor_path:
             configs.append(RepoConfig(
                 name="reactor-core",

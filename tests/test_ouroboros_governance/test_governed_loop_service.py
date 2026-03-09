@@ -240,3 +240,47 @@ class TestGovernedLoopServiceSubmit:
         # Second submit with same op_id should be deduplicated
         result2 = await service.submit(ctx, trigger_source="cli")
         assert "duplicate" in result2.reason_code
+
+
+class TestGovernedLoopRegistryWiring:
+    async def test_build_components_wires_registry(self, tmp_path, monkeypatch):
+        """_build_components() passes RepoRegistry to OrchestratorConfig."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+
+        prime_path = tmp_path / "prime"
+        prime_path.mkdir()
+        monkeypatch.setenv("JARVIS_REPO_PATH", str(tmp_path))
+        monkeypatch.setenv("JARVIS_PRIME_REPO_PATH", str(prime_path))
+
+        config = GovernedLoopConfig(project_root=tmp_path)
+        stack = _mock_stack()
+        svc = GovernedLoopService(stack=stack, prime_client=None, config=config)
+
+        await svc.start()
+
+        assert svc._orchestrator is not None
+        registry = svc._orchestrator._config.repo_registry
+        assert registry is not None
+        names = {r.name for r in registry.list_enabled()}
+        assert "jarvis" in names
+        assert "prime" in names
+
+        await svc.stop()
+
+    def test_reactor_legacy_env_var_wired(self, tmp_path, monkeypatch):
+        """REACTOR_CORE_REPO_PATH is accepted as legacy alias for reactor-core."""
+        from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
+        reactor_path = tmp_path / "reactor-core"
+        reactor_path.mkdir()
+        monkeypatch.setenv("JARVIS_REPO_PATH", str(tmp_path))
+        monkeypatch.delenv("JARVIS_REACTOR_REPO_PATH", raising=False)
+        monkeypatch.setenv("REACTOR_CORE_REPO_PATH", str(reactor_path))
+
+        registry = RepoRegistry.from_env()
+        names = {r.name for r in registry.list_all()}
+        assert "reactor-core" in names
+        rc = registry.get("reactor-core")
+        assert rc.local_path == reactor_path
