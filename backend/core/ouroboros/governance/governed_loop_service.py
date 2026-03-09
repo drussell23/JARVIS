@@ -38,6 +38,10 @@ from backend.core.ouroboros.governance.op_context import (
     OperationContext,
     OperationPhase,
 )
+from backend.core.ouroboros.governance.intake.intake_layer_service import (
+    IntakeLayerConfig,
+    IntakeLayerService,
+)
 from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
 from backend.core.ouroboros.governance.orchestrator import (
     GovernedOrchestrator,
@@ -242,6 +246,7 @@ class GovernedLoopService:
         self._approval_provider: Optional[CLIApprovalProvider] = None
         self._health_probe_task: Optional[asyncio.Task] = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
+        self._intake_layer: Optional[IntakeLayerService] = None
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
@@ -678,6 +683,17 @@ class GovernedLoopService:
             approval_provider=self._approval_provider,
             config=orch_config,
             validation_runner=validation_runner,
+        )
+
+        # Build IntakeLayerService — passes repo_registry so sensors fan out per repo
+        intake_config = IntakeLayerConfig(
+            project_root=self._config.project_root,
+            repo_registry=repo_registry,
+        )
+        self._intake_layer = IntakeLayerService(
+            gls=self,
+            config=intake_config,
+            say_fn=None,
         )
 
     def _register_canary_slices(self) -> None:
