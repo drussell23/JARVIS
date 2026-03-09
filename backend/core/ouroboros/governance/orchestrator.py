@@ -880,6 +880,19 @@ class GovernedOrchestrator:
                 )
             except Exception:
                 pass
+            # Halt intake: dirty state requires human review before next op
+            try:
+                await self._stack.controller.pause()
+                logger.warning(
+                    "[Orchestrator] Safe pause triggered after SAGA_STUCK on %s",
+                    ctx.op_id,
+                )
+            except Exception:
+                logger.exception(
+                    "[Orchestrator] controller.pause() failed for stuck saga %s; "
+                    "manual pause may be required",
+                    ctx.op_id,
+                )
             ctx = ctx.advance(OperationPhase.POSTMORTEM)
             await self._record_ledger(
                 ctx,
