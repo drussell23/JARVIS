@@ -312,6 +312,96 @@ def test_intake_layer_exports():
     assert IntakeNarrator is not None
 
 
+# ---------------------------------------------------------------------------
+# BacklogSensor multi-repo fan-out tests
+# ---------------------------------------------------------------------------
+
+
+async def test_backlog_sensor_fanned_out_per_repo(tmp_path):
+    """When registry has N repos, N BacklogSensors must be built (one per repo)."""
+    from backend.core.ouroboros.governance.multi_repo.registry import (
+        RepoConfig,
+        RepoRegistry,
+    )
+
+    jarvis_path = tmp_path / "jarvis"
+    prime_path = tmp_path / "prime"
+    jarvis_path.mkdir()
+    prime_path.mkdir()
+
+    registry = RepoRegistry(
+        configs=(
+            RepoConfig(name="jarvis", local_path=jarvis_path, canary_slices=()),
+            RepoConfig(name="prime", local_path=prime_path, canary_slices=()),
+        )
+    )
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeLayerConfig(project_root=tmp_path, repo_registry=registry)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+    await svc.start()
+
+    from backend.core.ouroboros.governance.intake.sensors import BacklogSensor
+
+    backlog_sensors = [s for s in svc._sensors if isinstance(s, BacklogSensor)]
+    assert len(backlog_sensors) == 2, (
+        f"Expected 2 BacklogSensors (one per repo), got {len(backlog_sensors)}"
+    )
+
+    paths = {s._backlog_path for s in backlog_sensors}
+    assert jarvis_path / ".jarvis" / "backlog.json" in paths
+    assert prime_path / ".jarvis" / "backlog.json" in paths
+
+    await svc.stop()
+
+
+async def test_backlog_sensor_fallback_when_no_registry(tmp_path):
+    """Without a registry, exactly one BacklogSensor is built for project_root."""
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeLayerConfig(project_root=tmp_path)  # no repo_registry
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+    await svc.start()
+
+    from backend.core.ouroboros.governance.intake.sensors import BacklogSensor
+
+    backlog_sensors = [s for s in svc._sensors if isinstance(s, BacklogSensor)]
+    assert len(backlog_sensors) == 1
+    assert backlog_sensors[0]._backlog_path == tmp_path / ".jarvis" / "backlog.json"
+
+    await svc.stop()
+
+
+async def test_backlog_sensor_uses_repo_local_path_not_project_root(tmp_path):
+    """Each BacklogSensor must use rc.local_path, not config.project_root."""
+    from backend.core.ouroboros.governance.multi_repo.registry import (
+        RepoConfig,
+        RepoRegistry,
+    )
+
+    prime_path = tmp_path / "prime"
+    prime_path.mkdir()
+
+    registry = RepoRegistry(
+        configs=(RepoConfig(name="prime", local_path=prime_path, canary_slices=()),)
+    )
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeLayerConfig(project_root=tmp_path, repo_registry=registry)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+    await svc.start()
+
+    from backend.core.ouroboros.governance.intake.sensors import BacklogSensor
+
+    backlog_sensors = [s for s in svc._sensors if isinstance(s, BacklogSensor)]
+    assert len(backlog_sensors) == 1
+    # Must use prime_path, NOT tmp_path (project_root)
+    assert backlog_sensors[0]._backlog_path == prime_path / ".jarvis" / "backlog.json"
+    assert backlog_sensors[0]._backlog_path != tmp_path / ".jarvis" / "backlog.json"
+
+    await svc.stop()
+
+
 def test_governance_package_exports():
     """Governance top-level exports include IntakeLayerService."""
     from backend.core.ouroboros.governance import (

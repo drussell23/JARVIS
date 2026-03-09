@@ -334,14 +334,6 @@ class IntakeLayerService:
         # Build sensors — using actual constructor parameter names.
         # BacklogSensor uses poll_interval_s (not scan_interval_s).
         # VoiceCommandSensor is event-driven (no start/stop); stored separately.
-        backlog_path = self._config.project_root / ".jarvis" / "backlog.json"
-
-        backlog_sensor = BacklogSensor(
-            backlog_path=backlog_path,
-            repo_root=self._config.project_root,
-            router=self._router,
-            poll_interval_s=self._config.backlog_scan_interval_s,
-        )
 
         # Fan out per-repo sensors when a registry is available; fall back to
         # single "jarvis" sensor for backward compatibility.
@@ -349,6 +341,15 @@ class IntakeLayerService:
         enabled_repos = list(registry.list_enabled()) if registry is not None else []
 
         if enabled_repos:
+            backlog_sensors: List[Any] = [
+                BacklogSensor(
+                    backlog_path=rc.local_path / ".jarvis" / "backlog.json",
+                    repo_root=rc.local_path,
+                    router=self._router,
+                    poll_interval_s=self._config.backlog_scan_interval_s,
+                )
+                for rc in enabled_repos
+            ]
             test_failure_sensors = [
                 TestFailureSensor(repo=rc.name, router=self._router)
                 for rc in enabled_repos
@@ -366,6 +367,14 @@ class IntakeLayerService:
                 for rc in enabled_repos
             ]
         else:
+            backlog_sensors = [
+                BacklogSensor(
+                    backlog_path=self._config.project_root / ".jarvis" / "backlog.json",
+                    repo_root=self._config.project_root,
+                    router=self._router,
+                    poll_interval_s=self._config.backlog_scan_interval_s,
+                )
+            ]
             test_failure_sensors = [TestFailureSensor(repo="jarvis", router=self._router)]
             miner_sensors = [
                 OpportunityMinerSensor(
@@ -386,7 +395,7 @@ class IntakeLayerService:
         )
 
         # Sensors with start/stop lifecycle
-        self._sensors = [backlog_sensor] + test_failure_sensors + miner_sensors
+        self._sensors = backlog_sensors + test_failure_sensors + miner_sensors
 
         router = self._router
         assert router is not None
