@@ -38,10 +38,8 @@ from backend.core.ouroboros.governance.op_context import (
     OperationContext,
     OperationPhase,
 )
-from backend.core.ouroboros.governance.intake.intake_layer_service import (
-    IntakeLayerConfig,
-    IntakeLayerService,
-)
+# IntakeLayerService is started by the supervisor (Zone 6.9); GLS only stores
+# the resolved RepoRegistry on self._repo_registry for Zone 6.9 to reuse.
 from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
 from backend.core.ouroboros.governance.orchestrator import (
     GovernedOrchestrator,
@@ -246,7 +244,7 @@ class GovernedLoopService:
         self._approval_provider: Optional[CLIApprovalProvider] = None
         self._health_probe_task: Optional[asyncio.Task] = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
-        self._intake_layer: Optional[IntakeLayerService] = None
+        self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
@@ -693,16 +691,10 @@ class GovernedLoopService:
             validation_runner=validation_runner,
         )
 
-        # Build IntakeLayerService — passes repo_registry so sensors fan out per repo
-        intake_config = IntakeLayerConfig(
-            project_root=self._config.project_root,
-            repo_registry=repo_registry,
-        )
-        self._intake_layer = IntakeLayerService(
-            gls=self,
-            config=intake_config,
-            say_fn=None,
-        )
+        # NOTE: IntakeLayerService is started by the supervisor (Zone 6.9) which
+        # injects say_fn and repo_registry.  GLS exposes _repo_registry so Zone 6.9
+        # can reuse the already-resolved registry without a second from_env() call.
+        self._repo_registry = repo_registry
 
     def _register_canary_slices(self) -> None:
         """Register initial canary slices. Idempotent."""

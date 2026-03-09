@@ -303,28 +303,20 @@ class TestGovernedLoopRegistryWiring:
 
 
 class TestGovernedLoopIntakeRegistryWiring:
-    """GovernedLoopService passes RepoRegistry to IntakeLayerConfig at startup."""
+    """GovernedLoopService resolves RepoRegistry and exposes it on _repo_registry."""
 
-    async def test_intake_layer_config_receives_registry(self, tmp_path, monkeypatch):
+    async def test_repo_registry_exposed_on_gls_after_start(self, tmp_path, monkeypatch):
+        """After start(), GovernedLoopService._repo_registry must contain all enabled repos
+        so that supervisor Zone 6.9 can reuse it when building IntakeLayerService."""
         from backend.core.ouroboros.governance.governed_loop_service import (
             GovernedLoopConfig,
             GovernedLoopService,
-        )
-        from backend.core.ouroboros.governance.intake.intake_layer_service import (
-            IntakeLayerService,
         )
 
         prime_path = tmp_path / "prime"
         prime_path.mkdir()
         monkeypatch.setenv("JARVIS_REPO_PATH", str(tmp_path))
         monkeypatch.setenv("JARVIS_PRIME_REPO_PATH", str(prime_path))
-
-        captured_configs: list = []
-        original_init = IntakeLayerService.__init__
-
-        def capturing_init(self_inner, gls, config, say_fn):
-            captured_configs.append(config)
-            original_init(self_inner, gls=gls, config=config, say_fn=say_fn)
 
         config = GovernedLoopConfig(project_root=tmp_path)
         stack = MagicMock()
@@ -336,19 +328,12 @@ class TestGovernedLoopIntakeRegistryWiring:
         stack.ledger.append = AsyncMock(return_value=True)
         svc = GovernedLoopService(stack=stack, prime_client=None, config=config)
 
-        with patch(
-            "backend.core.ouroboros.governance.governed_loop_service.IntakeLayerService.__init__",
-            side_effect=capturing_init,
-            autospec=True,
-        ):
-            try:
-                await svc.start()
-            except Exception:
-                pass  # may fail without real infra; we only need config captured
+        try:
+            await svc.start()
+        except Exception:
+            pass  # may fail without real infra; we only care about _repo_registry
 
-        assert len(captured_configs) > 0, "IntakeLayerService was never constructed"
-        intake_cfg = captured_configs[0]
-        assert intake_cfg.repo_registry is not None, "repo_registry was not passed to IntakeLayerConfig"
-        names = {r.name for r in intake_cfg.repo_registry.list_enabled()}
+        assert svc._repo_registry is not None, "_repo_registry was not set by _build_components"
+        names = {r.name for r in svc._repo_registry.list_enabled()}
         assert "jarvis" in names
         assert "prime" in names
