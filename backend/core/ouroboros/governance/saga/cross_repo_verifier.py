@@ -23,6 +23,19 @@ from backend.core.ouroboros.governance.saga.saga_types import RepoPatch
 logger = logging.getLogger("Ouroboros.CrossRepoVerifier")
 
 
+async def _find_cross_repo_marker(repo_root: Path) -> bool:
+    """Return True if any test_*.py in repo_root contains '@cross_repo'."""
+    def _scan() -> bool:
+        for tf in repo_root.rglob("test_*.py"):
+            try:
+                if "@cross_repo" in tf.read_text(encoding="utf-8"):
+                    return True
+            except Exception:
+                continue
+        return False
+    return await asyncio.to_thread(_scan)
+
+
 class VerifyFailureClass(str, Enum):
     PER_REPO = "verify_failed_per_repo"
     CROSS_REPO = "verify_failed_cross_repo"
@@ -55,7 +68,6 @@ class CrossRepoVerifier:
         dependency_edges: Tuple[Tuple[str, str], ...],
     ) -> None:
         self._repo_roots = {k: Path(v) for k, v in repo_roots.items()}
-        self._dependency_edges = dependency_edges
 
     async def verify(
         self,
@@ -78,7 +90,7 @@ class CrossRepoVerifier:
         # Tier 2: cross-repo contracts (only for multi-repo)
         if len(repo_scope) > 1:
             t2 = await self._tier2_cross_repo_contracts(
-                _repo_scope=repo_scope,
+                repo_scope=repo_scope,
                 dependency_edges=dependency_edges,
             )
             if t2 is not None:
@@ -106,7 +118,7 @@ class CrossRepoVerifier:
         tasks = [
             self._verify_single_repo(repo, patch_map.get(repo))
             for repo in repo_scope
-            if not (patch_map.get(repo, RepoPatch(repo=repo, files=())).is_empty())
+            if patch_map.get(repo) is not None and not patch_map[repo].is_empty()
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for r in results:
@@ -143,11 +155,12 @@ class CrossRepoVerifier:
                 text=True,
             )
             if proc.returncode != 0:
+                output = proc.stdout or proc.stderr
                 return VerifyResult(
                     passed=False,
                     failure_class=VerifyFailureClass.PER_REPO,
                     reason_code="verify_lint_failed",
-                    details=f"{repo}: {proc.stdout[:500]}",
+                    details=f"{repo}: {output[:500]}{'...' if len(output) > 500 else ''}",
                 )
         except FileNotFoundError:
             logger.debug("[Tier1] ruff not found for %s, skipping lint", repo)
@@ -163,12 +176,20 @@ class CrossRepoVerifier:
                 timeout=60,
             )
             if proc.returncode != 0 and proc.returncode != 5:  # 5 = no tests collected
+                output = proc.stdout or proc.stderr
                 return VerifyResult(
                     passed=False,
                     failure_class=VerifyFailureClass.PER_REPO,
                     reason_code="verify_test_failed",
-                    details=f"{repo}: {proc.stdout[-400:]}",
+                    details=f"{repo}: {output[-400:]}{'...' if len(output) > 400 else ''}",
                 )
+        except subprocess.TimeoutExpired:
+            return VerifyResult(
+                passed=False,
+                failure_class=VerifyFailureClass.PER_REPO,
+                reason_code="verify_test_timeout",
+                details=f"{repo}: test run exceeded 60s timeout",
+            )
         except FileNotFoundError:
             logger.debug("[Tier1] pytest not found for %s, skipping tests", repo)
         except Exception as exc:
@@ -178,15 +199,19 @@ class CrossRepoVerifier:
 
     async def _tier2_cross_repo_contracts(
         self,
-        _repo_scope: Tuple[str, ...],
+        repo_scope: Tuple[str, ...],
         dependency_edges: Tuple[Tuple[str, str], ...],
     ) -> Optional[VerifyResult]:
         """Check import boundaries along declared dependency edges.
 
         For each edge (src → dst): verify src can import boundary module from dst.
         Checks contract manifest JSON if present; otherwise skips gracefully.
+        Only edges whose both repos are part of repo_scope are evaluated.
         """
         for src, dst in dependency_edges:
+            # Skip edges whose repos aren't part of this operation
+            if src not in repo_scope or dst not in repo_scope:
+                continue
             src_root = self._repo_roots.get(src)
             dst_root = self._repo_roots.get(dst)
             if src_root is None or dst_root is None:
@@ -200,7 +225,8 @@ class CrossRepoVerifier:
             try:
                 manifest = json.loads(manifest_path.read_text())
                 boundary_modules = manifest.get("boundary_modules", [])
-            except Exception:
+            except Exception as exc:
+                logger.debug("[Tier2] Skipping malformed manifest for %s→%s: %s", src, dst, exc)
                 continue
 
             for module in boundary_modules:
@@ -238,16 +264,8 @@ class CrossRepoVerifier:
             repo_root = repo_roots.get(repo)
             if repo_root is None:
                 continue
-            # Search for any test file with @cross_repo marker
-            test_files = list(repo_root.rglob("test_*.py"))
-            has_cross_repo = False
-            for tf in test_files:
-                try:
-                    if "@cross_repo" in tf.read_text(encoding="utf-8"):
-                        has_cross_repo = True
-                        break
-                except Exception:
-                    continue
+            # Search for any test file with @cross_repo marker (non-blocking)
+            has_cross_repo = await _find_cross_repo_marker(repo_root)
 
             if has_cross_repo:
                 try:

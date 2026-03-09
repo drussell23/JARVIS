@@ -124,7 +124,7 @@ async def test_tier2_import_boundary_failure(tmp_path):
         dependency_edges=(("prime", "jarvis"),),
     )
     result = await verifier._tier2_cross_repo_contracts(
-        _repo_scope=("prime", "jarvis"),
+        repo_scope=("prime", "jarvis"),
         dependency_edges=(("prime", "jarvis"),),
     )
     assert result is not None
@@ -161,3 +161,39 @@ async def test_tier3_failure_when_cross_repo_tests_fail(tmp_path):
     assert result.passed is False
     assert result.failure_class == VerifyFailureClass.INTEGRATION
     assert result.reason_code == "verify_integration_failed"
+
+
+async def test_tier1_test_timeout_returns_failure(tmp_path):
+    """Tier 1 returns failure when pytest times out."""
+    import subprocess as subprocess_mod
+    verifier = CrossRepoVerifier(
+        repo_roots={"jarvis": tmp_path},
+        dependency_edges=(),
+    )
+    patch_map = _make_patch_map(["jarvis"])
+    # Write the file so it exists
+    (tmp_path / "backend").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "backend" / "x.py").write_bytes(b"new")
+
+    # First call (ruff lint) succeeds; second call (pytest) times out.
+    mock_ok = MagicMock()
+    mock_ok.returncode = 0
+    mock_ok.stdout = ""
+    mock_ok.stderr = ""
+    call_count = {"n": 0}
+
+    def _side_effect(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return mock_ok  # ruff succeeds
+        raise subprocess_mod.TimeoutExpired(cmd=["pytest"], timeout=60)
+
+    with patch(
+        "backend.core.ouroboros.governance.saga.cross_repo_verifier.subprocess.run",
+        side_effect=_side_effect,
+    ):
+        result = await verifier._verify_single_repo("jarvis", patch_map["jarvis"])
+
+    assert result is not None
+    assert result.passed is False
+    assert result.reason_code == "verify_test_timeout"
