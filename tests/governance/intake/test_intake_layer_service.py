@@ -112,3 +112,114 @@ async def test_service_start_failure_cleans_up(tmp_path):
     assert svc.state is IntakeServiceState.FAILED
     assert svc._router is None
     assert svc._sensors == []
+
+
+# ---------------------------------------------------------------------------
+# IntakeNarrator tests (Task 4)
+# ---------------------------------------------------------------------------
+
+from backend.core.ouroboros.governance.intake.intake_layer_service import IntakeNarrator
+from backend.core.ouroboros.governance.intake import make_envelope
+
+
+async def test_a_narrator_speaks_for_voice_human():
+    say_fn = AsyncMock(return_value=True)
+    narrator = IntakeNarrator(say_fn=say_fn, debounce_s=0.0)
+    env = make_envelope(
+        source="voice_human", description="fix auth now",
+        target_files=("backend/auth.py",), repo="jarvis",
+        confidence=0.95, urgency="critical",
+        evidence={"signature": "voice_test_1"},
+        requires_human_ack=False,
+    )
+    await narrator.on_envelope(env)
+    say_fn.assert_called_once()
+    text = say_fn.call_args.args[0]
+    assert "command" in text.lower() or "voice" in text.lower()
+
+
+async def test_a_narrator_silent_for_backlog():
+    say_fn = AsyncMock(return_value=True)
+    narrator = IntakeNarrator(say_fn=say_fn, debounce_s=0.0)
+    env = make_envelope(
+        source="backlog", description="fix something",
+        target_files=("backend/x.py",), repo="jarvis",
+        confidence=0.7, urgency="normal",
+        evidence={"signature": "backlog_1"},
+        requires_human_ack=False,
+    )
+    await narrator.on_envelope(env)
+    say_fn.assert_not_called()
+
+
+async def test_a_narrator_silent_for_ai_miner():
+    say_fn = AsyncMock(return_value=True)
+    narrator = IntakeNarrator(say_fn=say_fn, debounce_s=0.0)
+    env = make_envelope(
+        source="ai_miner", description="refactor complex.py",
+        target_files=("backend/complex.py",), repo="jarvis",
+        confidence=0.4, urgency="low",
+        evidence={"signature": "miner_1"},
+        requires_human_ack=True,
+    )
+    await narrator.on_envelope(env)
+    say_fn.assert_not_called()
+
+
+async def test_a_narrator_speaks_test_failure_above_threshold():
+    say_fn = AsyncMock(return_value=True)
+    narrator = IntakeNarrator(say_fn=say_fn, debounce_s=0.0, test_failure_min_count=2)
+    for i in range(2):
+        env = make_envelope(
+            source="test_failure", description=f"test fail {i}",
+            target_files=("tests/test_x.py",), repo="jarvis",
+            confidence=0.9, urgency="high",
+            evidence={"signature": f"tf_{i}"},
+            requires_human_ack=False,
+        )
+        await narrator.on_envelope(env)
+    assert say_fn.call_count >= 1
+
+
+async def test_a_narrator_silent_for_test_failure_below_threshold():
+    say_fn = AsyncMock(return_value=True)
+    narrator = IntakeNarrator(say_fn=say_fn, debounce_s=0.0, test_failure_min_count=3)
+    env = make_envelope(
+        source="test_failure", description="one failure",
+        target_files=("tests/test_x.py",), repo="jarvis",
+        confidence=0.9, urgency="high",
+        evidence={"signature": "tf_below"},
+        requires_human_ack=False,
+    )
+    await narrator.on_envelope(env)
+    say_fn.assert_not_called()
+
+
+async def test_a_narrator_debounce_suppresses_rapid_voice():
+    say_fn = AsyncMock(return_value=True)
+    narrator = IntakeNarrator(say_fn=say_fn, debounce_s=999.0)
+    for i in range(3):
+        env = make_envelope(
+            source="voice_human", description=f"command {i}",
+            target_files=("backend/auth.py",), repo="jarvis",
+            confidence=0.95, urgency="critical",
+            evidence={"signature": f"v_{i}"},
+            requires_human_ack=False,
+        )
+        await narrator.on_envelope(env)
+    assert say_fn.call_count == 1
+
+
+async def test_a_narrator_say_fn_failure_is_swallowed():
+    """say_fn failure must not raise — narrator swallows it."""
+    say_fn = AsyncMock(side_effect=RuntimeError("tts failed"))
+    narrator = IntakeNarrator(say_fn=say_fn, debounce_s=0.0)
+    env = make_envelope(
+        source="voice_human", description="fix something",
+        target_files=("backend/auth.py",), repo="jarvis",
+        confidence=0.95, urgency="critical",
+        evidence={"signature": "fail_test"},
+        requires_human_ack=False,
+    )
+    await narrator.on_envelope(env)  # must not raise
+    say_fn.assert_called_once()

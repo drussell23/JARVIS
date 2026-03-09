@@ -96,6 +96,74 @@ class IntakeLayerConfig:
 
 
 # ---------------------------------------------------------------------------
+# IntakeNarrator (A-layer)
+# ---------------------------------------------------------------------------
+
+# Sources that always trigger narration
+_A_NARRATE_ALWAYS = {"voice_human"}
+# Sources that require a count threshold
+_A_NARRATE_THRESHOLD = {"test_failure"}
+# Sources that are always silent at A-layer
+_A_NARRATE_SILENT = {"backlog", "ai_miner"}
+
+_A_TEMPLATES: Dict[str, str] = {
+    "voice_human": "Voice command queued: {description}",
+    "test_failure": "{count} test failures detected. Investigating.",
+}
+
+
+class IntakeNarrator:
+    """A-layer narrator: salience-gated preflight awareness only.
+
+    Language policy: 'detected/queued' — never 'applying/fixing'.
+    QoS: debounced per-source; silent for backlog and ai_miner.
+    """
+
+    def __init__(
+        self,
+        say_fn: Callable[..., Coroutine[Any, Any, bool]],
+        debounce_s: float = 10.0,
+        test_failure_min_count: int = 2,
+    ) -> None:
+        self._say_fn = say_fn
+        self._debounce_s = debounce_s
+        self._test_failure_min_count = test_failure_min_count
+        self._last_narration: float = float("-inf")
+        self._failure_count: int = 0
+
+    async def on_envelope(self, envelope: Any) -> None:
+        """Called post-ingest. Filters by salience policy, then debounce."""
+        source = envelope.source
+        if source in _A_NARRATE_SILENT:
+            return
+
+        now = time.monotonic()
+
+        if source in _A_NARRATE_THRESHOLD:
+            self._failure_count += 1
+            if self._failure_count < self._test_failure_min_count:
+                return
+            text = _A_TEMPLATES["test_failure"].format(count=self._failure_count)
+        elif source in _A_NARRATE_ALWAYS:
+            text = _A_TEMPLATES["voice_human"].format(
+                description=str(envelope.description)[:80]
+            )
+        else:
+            return  # Unknown source — silent by default
+
+        if (now - self._last_narration) < self._debounce_s:
+            return
+
+        try:
+            await self._say_fn(text, source="intake_narrator")
+            self._last_narration = now
+        except Exception:
+            logger.debug(
+                "[IntakeNarrator] say_fn failed for envelope %s", envelope.causal_id
+            )
+
+
+# ---------------------------------------------------------------------------
 # IntakeLayerService
 # ---------------------------------------------------------------------------
 
@@ -245,6 +313,15 @@ class IntakeLayerService:
             dedup_window_s=self._config.dedup_window_s,
         )
         self._router = UnifiedIntakeRouter(gls=self._gls, config=router_config)
+
+        # A-narrator: salience-gated preflight awareness
+        if self._config.a_narrator_enabled and self._say_fn is not None:
+            self._narrator = IntakeNarrator(
+                say_fn=self._say_fn,
+                debounce_s=self._config.a_narrator_debounce_s,
+                test_failure_min_count=self._config.test_failure_min_count_for_narration,
+            )
+            self._router._on_ingest_hook = self._narrator.on_envelope
 
         # Build sensors — using actual constructor parameter names.
         # BacklogSensor uses poll_interval_s (not scan_interval_s).
