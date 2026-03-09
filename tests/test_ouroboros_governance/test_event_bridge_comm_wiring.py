@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 from unittest.mock import AsyncMock
-import pytest
 
 
 def _make_config(tmp_path):
