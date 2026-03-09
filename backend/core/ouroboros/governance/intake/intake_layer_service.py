@@ -122,6 +122,7 @@ class IntakeLayerService:
         self._router: Optional[Any] = None
         self._sensors: List[Any] = []
         self._narrator: Optional[Any] = None  # IntakeNarrator, added in Task 4
+        self._voice_sensor: Optional[Any] = None
         self._dead_letter_count: int = 0
         self._per_source_count: Dict[str, int] = {}
 
@@ -178,15 +179,28 @@ class IntakeLayerService:
         self._sensors = []
         self._router = None
         self._narrator = None
+        self._started_at_monotonic = 0.0
         self._state = IntakeServiceState.INACTIVE
         logger.info("[IntakeLayer] Stopped.")
 
     def health(self) -> Dict[str, Any]:
         """Return health metrics for supervisor health checks."""
         queue_depth = 0
+        dead_letter_count = 0
         if self._router is not None:
             try:
-                queue_depth = self._router._queue.qsize()
+                # Prefer the public API; fall back to private attr if unavailable.
+                if hasattr(self._router, "intake_queue_depth"):
+                    queue_depth = self._router.intake_queue_depth()
+                else:
+                    queue_depth = self._router._queue.qsize()
+            except Exception:
+                pass
+            try:
+                if hasattr(self._router, "dead_letter_count"):
+                    dead_letter_count = self._router.dead_letter_count()
+                elif hasattr(self._router, "_dead_letter"):
+                    dead_letter_count = len(self._router._dead_letter)
             except Exception:
                 pass
 
@@ -203,7 +217,7 @@ class IntakeLayerService:
         return {
             "state": self._state.name.lower(),
             "queue_depth": queue_depth,
-            "dead_letter_count": self._dead_letter_count,
+            "dead_letter_count": dead_letter_count,
             "wal_entries_pending": 0,
             "per_source_rate": per_source_rate,
             "uptime_s": round(uptime_s, 1),
@@ -285,3 +299,4 @@ class IntakeLayerService:
                 pass
         self._sensors = []
         self._router = None
+        self._voice_sensor = None

@@ -89,3 +89,26 @@ async def test_service_stop_from_inactive_is_noop(tmp_path):
     svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
     await svc.stop()  # must not raise
     assert svc.state is IntakeServiceState.INACTIVE
+
+
+async def test_service_start_failure_cleans_up(tmp_path):
+    """On start failure, state is FAILED and router/sensors are cleaned up."""
+    from unittest.mock import patch
+
+    gls = MagicMock()
+    config = IntakeLayerConfig(project_root=tmp_path)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+
+    # Make _build_components raise
+    async def bad_build():
+        raise RuntimeError("simulated build failure")
+
+    with patch.object(svc, "_build_components", bad_build):
+        try:
+            await svc.start()
+        except RuntimeError:
+            pass
+
+    assert svc.state is IntakeServiceState.FAILED
+    assert svc._router is None
+    assert svc._sensors == []
