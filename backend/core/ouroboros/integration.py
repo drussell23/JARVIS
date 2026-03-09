@@ -774,6 +774,28 @@ class PerformanceRecordPersistence:
             ).fetchall()
         return [self._dict_to_record(dict(row)) for row in rows]
 
+    async def get_records_by_task(
+        self,
+        task_type: str,
+        limit: int = 50,
+    ) -> List[PerformanceRecord]:
+        """Return up to `limit` most-recent PerformanceRecords for a task type (all models)."""
+        if not self._use_sqlite:
+            return []
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._query_by_task_sync, task_type, limit
+        )
+
+    def _query_by_task_sync(self, task_type: str, limit: int) -> List[PerformanceRecord]:
+        with sqlite3.connect(self._db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM performance_records WHERE task_type = ? ORDER BY timestamp DESC LIMIT ?",
+                (task_type, limit),
+            ).fetchall()
+        return [self._dict_to_record(dict(row)) for row in rows]
+
     async def get_statistics(
         self,
         model_id: Optional[str] = None,
