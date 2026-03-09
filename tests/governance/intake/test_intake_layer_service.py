@@ -223,3 +223,76 @@ async def test_a_narrator_say_fn_failure_is_swallowed():
     )
     await narrator.on_envelope(env)  # must not raise
     say_fn.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# UnifiedIntakeRouter._on_ingest_hook tests (Task 5)
+# ---------------------------------------------------------------------------
+
+import asyncio
+
+from backend.core.ouroboros.governance.intake import (
+    UnifiedIntakeRouter, IntakeRouterConfig,
+)
+
+
+async def test_router_on_ingest_hook_called(tmp_path):
+    """UnifiedIntakeRouter calls _on_ingest_hook after successful enqueue."""
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeRouterConfig(project_root=tmp_path)
+    router = UnifiedIntakeRouter(gls=gls, config=config)
+    await router.start()
+
+    hooked_envelopes = []
+
+    async def hook(env):
+        hooked_envelopes.append(env)
+
+    router._on_ingest_hook = hook
+
+    env = make_envelope(
+        source="voice_human", description="test hook",
+        target_files=("a.py",), repo="jarvis",
+        confidence=0.9, urgency="critical",
+        evidence={"signature": "hook_test_t5"},
+        requires_human_ack=False,
+    )
+    await router.ingest(env)
+    await asyncio.sleep(0.05)
+    await router.stop()
+
+    assert len(hooked_envelopes) == 1
+    assert hooked_envelopes[0].causal_id == env.causal_id
+
+
+async def test_router_hook_not_called_on_dedup(tmp_path):
+    """Hook must NOT fire for deduplicated envelopes."""
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeRouterConfig(project_root=tmp_path, dedup_window_s=60.0)
+    router = UnifiedIntakeRouter(gls=gls, config=config)
+    await router.start()
+
+    hook_count = 0
+
+    async def hook(env):
+        nonlocal hook_count
+        hook_count += 1
+
+    router._on_ingest_hook = hook
+
+    env = make_envelope(
+        source="backlog", description="fix y dedup hook",
+        target_files=("backend/y.py",), repo="jarvis",
+        confidence=0.8, urgency="normal",
+        evidence={"signature": "dedup_hook_test"},
+        requires_human_ack=False,
+    )
+    r1 = await router.ingest(env)
+    r2 = await router.ingest(env)  # duplicate
+    assert r1 == "enqueued"
+    assert r2 == "deduplicated"
+    await router.stop()
+
+    assert hook_count == 1  # hook fires once for first, not for duplicate

@@ -18,7 +18,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
@@ -106,6 +106,9 @@ class UnifiedIntakeRouter:
         self._dispatch_task: Optional[asyncio.Task] = None
         self._running = False
         self._lock_fd: Optional[int] = None
+        # Optional post-ingest hook (A-narrator). Called with envelope on "enqueued" only.
+        # Assign a coroutine callable to enable; None disables.
+        self._on_ingest_hook: Optional[Callable[..., Any]] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -179,6 +182,14 @@ class UnifiedIntakeRouter:
         # 6. Place on priority queue (lower int = higher priority)
         priority = _PRIORITY_MAP.get(envelope.source, 99)
         await self._queue.put((priority, envelope.submitted_at, envelope))
+
+        # Fire A-narrator hook — non-critical; failures logged only
+        if self._on_ingest_hook is not None:
+            try:
+                await self._on_ingest_hook(envelope)
+            except Exception as _hook_exc:
+                logger.debug("[Router] on_ingest_hook error: %s", _hook_exc)
+
         return "enqueued"
 
     def intake_queue_depth(self) -> int:
