@@ -1,4 +1,13 @@
-"""Phase 3 acceptance tests — multi-repo saga autonomy."""
+"""Phase 3 acceptance tests — multi-repo saga autonomy.
+
+AC1: DAG cycle raises ArchitecturalCycleError at OperationContext creation time
+AC2: Single-repo context has cross_repo=False
+AC3: SagaApplyStrategy._topological_sort() respects declared dependency order
+AC4: Drift detected before writes → SAGA_ABORTED, file untouched
+AC5: RepoPipelineManager.submit() propagates primary_repo into OperationContext
+AC6: CrossRepoVerifier passes on empty/clean patch map
+AC7: OperationContext.schema_version defaults to "3.0"
+"""
 import pytest
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -69,7 +78,7 @@ async def test_ac4_drift_aborts_before_writes(tmp_path):
         description="drift test",
         repo_scope=("jarvis",),
         primary_repo="jarvis",
-        apply_plan=("jarvis",),
+        apply_plan=("jarvis",),  # single-repo; no dependency_edges needed
         repo_snapshots=(("jarvis", "expected_hash"),),
     )
     ledger = MagicMock()
