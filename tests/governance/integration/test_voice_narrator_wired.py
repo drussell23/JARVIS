@@ -2,7 +2,7 @@
 from backend.core.ouroboros.governance.integration import _build_comm_protocol
 
 
-async def test_build_comm_protocol_includes_voice_narrator():
+def test_build_comm_protocol_includes_voice_narrator():
     """After import fix, VoiceNarrator appears in CommProtocol transports."""
     protocol = _build_comm_protocol()
     transport_types = [type(t).__name__ for t in protocol._transports]
