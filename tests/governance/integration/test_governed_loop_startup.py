@@ -33,6 +33,9 @@ async def test_ac1_prime_provider_retained_on_startup_probe_failure(tmp_path):
     stack = _make_mock_stack()
     svc = GovernedLoopService(stack=stack, prime_client=mock_prime_client, config=config)
 
+    # Patch the class at its definition site — correct for deferred local imports,
+    # because Python resolves the name from sys.modules each time the local
+    # `from ... import PrimeProvider` executes inside _build_components.
     with patch(
         "backend.core.ouroboros.governance.providers.PrimeProvider"
     ) as MockProvider, \

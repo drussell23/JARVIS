@@ -561,6 +561,7 @@ class GovernedLoopService:
         fallback = None
 
         # Build PrimeProvider if PrimeClient available
+        _primary_probe_ok = False  # track for FSM sync after generator build
         if self._prime_client is not None:
             try:
                 from backend.core.ouroboros.governance.providers import (
@@ -568,14 +569,24 @@ class GovernedLoopService:
                 )
 
                 primary = PrimeProvider(self._prime_client, repo_root=self._config.project_root)
-                if await primary.health_probe():
-                    logger.info("[GovernedLoop] PrimeProvider: healthy at startup")
-                else:
+                try:
+                    if await primary.health_probe():
+                        logger.info("[GovernedLoop] PrimeProvider: healthy at startup")
+                        _primary_probe_ok = True
+                    else:
+                        logger.warning(
+                            "[GovernedLoop] PrimeProvider: unhealthy at startup; "
+                            "retained for probe-based recovery"
+                        )
+                        # Do NOT set primary = None — circuit breaker handles retry
+                except Exception as probe_exc:
                     logger.warning(
-                        "[GovernedLoop] PrimeProvider: unhealthy at startup; "
-                        "retained for probe-based recovery"
+                        "[GovernedLoop] PrimeProvider: startup probe raised %s; "
+                        "retained for probe-based recovery",
+                        probe_exc,
                     )
-                    # Do NOT set primary = None — circuit breaker handles retry
+                    # Probe failure (raise) is treated same as probe failure (False):
+                    # retain the provider for circuit-breaker-based recovery
             except Exception as exc:
                 logger.warning(
                     "[GovernedLoop] PrimeProvider build failed: %s", exc
@@ -615,6 +626,15 @@ class GovernedLoopService:
                 primary=effective_primary,
                 fallback=effective_fallback,
             )
+
+            # Sync FSM to reflect actual startup probe result.
+            # Without this, the FSM stays at PRIMARY_READY even when the startup
+            # probe failed, making the FALLBACK_ACTIVE branch in start() unreachable.
+            if not _primary_probe_ok and self._generator is not None:
+                try:
+                    self._generator.fsm.record_primary_failure()
+                except Exception:
+                    pass  # FSM transition error should not abort startup
         else:
             logger.warning(
                 "[GovernedLoop] No providers available — QUEUE_ONLY mode"
