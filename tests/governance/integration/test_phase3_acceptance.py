@@ -1,6 +1,6 @@
 """Phase 3 acceptance tests — multi-repo saga autonomy."""
 import pytest
-from pathlib import Path
+
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.core.ouroboros.governance.op_context import (
@@ -93,6 +93,7 @@ async def test_ac5_repo_pipeline_manager_passes_repo(tmp_path):
 
     class FakePipeline:
         async def submit(self, ctx, *, trigger_source=""):
+            del trigger_source  # accepted by interface, not inspected
             captured.append(ctx)
             return MagicMock(op_id="op-fake-001")
 
