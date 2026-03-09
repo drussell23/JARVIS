@@ -31,6 +31,14 @@ from backend.core.ouroboros.governance.saga.saga_types import (
     SagaTerminalState,
 )
 
+try:
+    from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
+    _LEDGER_IMPORTS_OK = True
+except ImportError:
+    _LEDGER_IMPORTS_OK = False
+    LedgerEntry = None  # type: ignore[assignment,misc]
+    OperationState = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("Ouroboros.SagaApply")
 
 
@@ -97,7 +105,7 @@ class SagaApplyStrategy:
             snapshots = dict(ctx.repo_snapshots)
             expected = snapshots.get(repo, "")
             if expected:
-                current = self._get_head_hash(repo)
+                current = await self._get_head_hash(repo)
                 if current != expected:
                     failed_repo = repo
                     failure_reason = "drift_detected_mid_apply"
@@ -126,7 +134,7 @@ class SagaApplyStrategy:
             except Exception as exc:
                 failed_repo = repo
                 failure_reason = "apply_write_error"
-                failure_error = str(exc)
+                failure_error = f"{type(exc).__name__}: {exc}"
                 logger.error("[Saga] Apply failed for %s: %s", repo, exc)
                 repo_statuses[repo] = RepoSagaStatus(
                     repo=repo,
@@ -191,7 +199,7 @@ class SagaApplyStrategy:
             expected = snapshots.get(repo, "")
             if not expected:
                 continue
-            current = self._get_head_hash(repo)
+            current = await self._get_head_hash(repo)
             if current != expected:
                 logger.warning(
                     "[Saga] Drift detected for %s: expected %s, got %s",
@@ -231,6 +239,7 @@ class SagaApplyStrategy:
                 if full_path.exists():
                     full_path.unlink()
                 else:
+                    # File doesn't exist; nothing to restore. Don't add to written list.
                     continue
             written.append(pf.path)
 
@@ -245,7 +254,8 @@ class SagaApplyStrategy:
                     capture_output=True,
                 )
             except Exception as exc:
-                logger.debug("[Saga] git add failed (non-fatal): %s", exc)
+                logger.warning("[Saga] git add failed for repo %s: %s", repo, exc)
+                raise  # triggers Phase B failure → compensation
 
     # ------------------------------------------------------------------
     # Phase C
@@ -330,13 +340,14 @@ class SagaApplyStrategy:
         sorted_repos = sorted(repos)
         logger.debug("[SagaApplyStrategy] Lease acquisition order: %s", sorted_repos)
 
-    def _get_head_hash(self, repo: str) -> str:
+    async def _get_head_hash(self, repo: str) -> str:
         """Return the current HEAD commit hash for a repo. Returns '' on error."""
         repo_root = self._repo_roots.get(repo)
         if repo_root is None:
             return ""
         try:
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 ["git", "rev-parse", "HEAD"],
                 cwd=str(repo_root),
                 check=True,
@@ -379,14 +390,21 @@ class SagaApplyStrategy:
                 in_degree[neighbor] -= 1
                 if in_degree[neighbor] == 0:
                     queue.append(neighbor)
+        if len(result) != len(repo_scope):
+            cycle_nodes = [r for r in repo_scope if r not in result]
+            raise RuntimeError(
+                f"Topological sort incomplete — cycle detected among repos: {cycle_nodes}"
+            )
         return result
 
     async def _emit_sub_event(
         self, event: str, saga_id: str, op_id: str, **kwargs: Any
     ) -> None:
         """Emit a saga sub-event to the ledger (best-effort; failures are logged)."""
+        if not _LEDGER_IMPORTS_OK:
+            logger.debug("[Saga] ledger unavailable; skipping sub-event emit (%s)", event)
+            return
         try:
-            from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
             entry = LedgerEntry(
                 op_id=op_id,
                 state=OperationState.APPLYING,

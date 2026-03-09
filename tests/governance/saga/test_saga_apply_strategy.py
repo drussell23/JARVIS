@@ -31,6 +31,16 @@ def _make_ctx(
 async def test_happy_path_all_repos_applied(tmp_path):
     """All repos apply successfully → SAGA_APPLY_COMPLETED."""
     ctx = _make_ctx()
+    # Initialize git repo so that `git add` succeeds during apply
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@test.com", "-c", "user.name=Test",
+         "commit", "--allow-empty", "-m", "init"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+    )
+
     jarvis_file = tmp_path / "backend" / "x.py"
     jarvis_file.parent.mkdir(parents=True)
     jarvis_file.write_bytes(b"old content")
@@ -132,6 +142,16 @@ async def test_skipped_repo_with_empty_patch(tmp_path):
         repo_scope=("jarvis", "prime"),
         apply_plan=("prime", "jarvis"),
     )
+    # Initialize git repo so that `git add` succeeds during apply
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=test@test.com", "-c", "user.name=Test",
+         "commit", "--allow-empty", "-m", "init"],
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+    )
+
     patch_map = {
         "prime": RepoPatch(repo="prime", files=(), new_content=()),  # empty
         "jarvis": RepoPatch(
@@ -174,11 +194,13 @@ async def test_compensation_failure_returns_saga_stuck(tmp_path):
     # repo_a is a real git repo; repo_b's root is intentionally missing to force apply failure
     repo_a_root = tmp_path / "repo_a"
     repo_a_root.mkdir()
-    subprocess.run(["git", "init"], cwd=repo_a_root, capture_output=True)
+    subprocess.run(["git", "init"], cwd=repo_a_root, capture_output=True, check=True)
     subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "init"],
+        ["git", "-c", "user.email=test@test.com", "-c", "user.name=Test",
+         "commit", "--allow-empty", "-m", "init"],
         cwd=repo_a_root,
         capture_output=True,
+        check=True,
     )
     repo_a_head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -251,11 +273,13 @@ async def test_mid_apply_drift_triggers_compensation(tmp_path):
     # Build two real git repos so HEAD hashes are real
     prime_root = tmp_path / "prime"
     prime_root.mkdir()
-    subprocess.run(["git", "init"], cwd=prime_root, capture_output=True)
+    subprocess.run(["git", "init"], cwd=prime_root, capture_output=True, check=True)
     subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "init"],
+        ["git", "-c", "user.email=test@test.com", "-c", "user.name=Test",
+         "commit", "--allow-empty", "-m", "init"],
         cwd=prime_root,
         capture_output=True,
+        check=True,
     )
     prime_head = subprocess.run(
         ["git", "rev-parse", "HEAD"],
@@ -266,11 +290,13 @@ async def test_mid_apply_drift_triggers_compensation(tmp_path):
 
     jarvis_root = tmp_path / "jarvis"
     jarvis_root.mkdir()
-    subprocess.run(["git", "init"], cwd=jarvis_root, capture_output=True)
+    subprocess.run(["git", "init"], cwd=jarvis_root, capture_output=True, check=True)
     subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "init"],
+        ["git", "-c", "user.email=test@test.com", "-c", "user.name=Test",
+         "commit", "--allow-empty", "-m", "init"],
         cwd=jarvis_root,
         capture_output=True,
+        check=True,
     )
     jarvis_head = subprocess.run(
         ["git", "rev-parse", "HEAD"],

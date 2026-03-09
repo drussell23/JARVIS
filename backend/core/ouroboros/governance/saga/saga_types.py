@@ -1,9 +1,12 @@
 """Saga type definitions: patch model, terminal states, apply results."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Tuple
+from typing import TYPE_CHECKING, Optional, Tuple
+
+if TYPE_CHECKING:
+    from backend.core.ouroboros.governance.op_context import RepoSagaStatus
 
 
 class FileOp(str, Enum):
@@ -84,4 +87,4 @@ class SagaApplyResult:
     saga_step_index: int
     error: Optional[str]
     reason_code: str = ""
-    saga_state: Tuple = ()  # updated RepoSagaStatus entries for idempotent resume
+    saga_state: Tuple["RepoSagaStatus", ...] = field(default_factory=tuple)  # updated RepoSagaStatus entries for idempotent resume
