@@ -65,9 +65,11 @@ class CrossRepoVerifier:
     def __init__(
         self,
         repo_roots: Dict[str, Path],
-        dependency_edges: Tuple[Tuple[str, str], ...],
+        dependency_edges: Tuple[Tuple[str, str], ...] = (),
     ) -> None:
         self._repo_roots = {k: Path(v) for k, v in repo_roots.items()}
+        # dependency_edges passed directly to verify(); stored here for call-site symmetry
+        self._default_edges = dependency_edges
 
     async def verify(
         self,

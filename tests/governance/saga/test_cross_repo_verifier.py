@@ -182,7 +182,7 @@ async def test_tier1_test_timeout_returns_failure(tmp_path):
     mock_ok.stderr = ""
     call_count = {"n": 0}
 
-    def _side_effect(*args, **kwargs):
+    def _side_effect(*_, **__):
         call_count["n"] += 1
         if call_count["n"] == 1:
             return mock_ok  # ruff succeeds
