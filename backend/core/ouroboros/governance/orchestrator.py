@@ -32,7 +32,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
 from backend.core.ouroboros.governance.approval_provider import (
@@ -72,7 +72,11 @@ class OrchestratorConfig:
     Parameters
     ----------
     project_root:
-        Root directory of the project being modified.
+        Root directory of the project being modified (jarvis repo).
+    repo_registry:
+        Optional multi-repo registry. When set, cross-repo saga applies
+        resolve each repo's local_path from the registry instead of using
+        project_root for all repos. Defaults to None (single-repo mode).
     generation_timeout_s:
         Maximum seconds for candidate generation (per attempt).
     validation_timeout_s:
@@ -86,11 +90,47 @@ class OrchestratorConfig:
     """
 
     project_root: Path
+    repo_registry: Optional[Any] = None  # RepoRegistry at runtime; Any avoids circular import
     generation_timeout_s: float = 120.0
     validation_timeout_s: float = 60.0
     approval_timeout_s: float = 600.0
     max_generate_retries: int = 1
     max_validate_retries: int = 2
+
+    def resolve_repo_roots(
+        self,
+        repo_scope: Tuple[str, ...],
+        op_id: str,
+    ) -> Dict[str, Path]:
+        """Resolve per-repo filesystem roots from registry; fallback to project_root.
+
+        Parameters
+        ----------
+        repo_scope:
+            Tuple of repo names from OperationContext.
+        op_id:
+            Operation ID for structured warning on missing registry keys.
+
+        Returns
+        -------
+        Dict mapping repo name -> absolute Path.
+        Missing keys fall back to project_root with a warning (never raise).
+        """
+        roots: Dict[str, Path] = {}
+        for repo in repo_scope:
+            if self.repo_registry is not None:
+                try:
+                    roots[repo] = Path(self.repo_registry.get(repo).local_path)
+                except KeyError:
+                    logger.warning(
+                        "[OrchestratorConfig] repo=%s not in registry for op_id=%s; "
+                        "falling back to project_root=%s",
+                        repo, op_id, self.project_root,
+                    )
+                    roots[repo] = self.project_root
+            else:
+                roots[repo] = self.project_root
+        return roots
 
 
 # ---------------------------------------------------------------------------
@@ -765,8 +805,11 @@ class GovernedOrchestrator:
             for repo in ctx.repo_scope:
                 patch_map[repo] = RepoPatch(repo=repo, files=())
 
-        # Resolve repo roots: all repos map to project_root for now
-        repo_roots = {repo: self._config.project_root for repo in ctx.repo_scope}
+        # Resolve per-repo filesystem roots from registry (fallback to project_root)
+        repo_roots = self._config.resolve_repo_roots(
+            repo_scope=ctx.repo_scope,
+            op_id=ctx.op_id,
+        )
 
         strategy = SagaApplyStrategy(
             repo_roots=repo_roots,
