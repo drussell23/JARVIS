@@ -144,7 +144,7 @@ class SagaApplyStrategy:
                 break
 
         if failed_repo is None:
-            await self._emit_sub_event("verify_global", saga_id, ctx.op_id)
+            await self._emit_sub_event("pre_verify", saga_id, ctx.op_id)
             return SagaApplyResult(
                 terminal_state=SagaTerminalState.SAGA_APPLY_COMPLETED,
                 saga_id=saga_id,
@@ -194,6 +194,13 @@ class SagaApplyStrategy:
         doesn't need to know the strategy's internal representation.
         Returns True if all compensations succeeded, False if any failed.
         """
+        if not saga_result.saga_state:
+            logger.error(
+                "[Saga] compensate_after_verify_failure: saga_state is empty for saga_id=%s; "
+                "cannot determine applied repos. Treating as compensation failure.",
+                saga_result.saga_id,
+            )
+            return False
         applied_repos = [
             rss.repo for rss in saga_result.saga_state
             if rss.status == SagaStepStatus.APPLIED

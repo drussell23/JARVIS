@@ -53,6 +53,9 @@ from backend.core.ouroboros.governance.risk_engine import (
     RiskClassification,
     RiskTier,
 )
+from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
+from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
+from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTerminalState
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
@@ -748,19 +751,12 @@ class GovernedOrchestrator:
     async def _execute_saga_apply(
         self,
         ctx: OperationContext,
-        best_candidate: Optional[Dict[str, Any]],
+        best_candidate: dict,
     ) -> OperationContext:
         """Execute multi-repo saga apply + three-tier verify.
 
         Selected when ctx.cross_repo is True. Single-repo path is unchanged.
         """
-        from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
-        from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
-        from backend.core.ouroboros.governance.saga.saga_types import (
-            RepoPatch,
-            SagaTerminalState,
-        )
-
         # Build patch_map from best_candidate["patches"] or fall back to empty per-repo patches
         patch_map: Dict[str, RepoPatch] = {}
         if best_candidate and "patches" in best_candidate:
@@ -826,8 +822,8 @@ class GovernedOrchestrator:
             ctx = ctx.advance(OperationPhase.COMPLETE)
             return ctx
 
-        # SAGA_ROLLED_BACK or SAGA_STUCK
         if apply_result.terminal_state == SagaTerminalState.SAGA_STUCK:
+            # Compensation failed: data may be inconsistent — emit postmortem
             try:
                 await self._stack.comm.emit_postmortem(
                     op_id=ctx.op_id,
@@ -837,12 +833,20 @@ class GovernedOrchestrator:
                 )
             except Exception:
                 pass
+            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            await self._record_ledger(
+                ctx,
+                OperationState.FAILED,
+                {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
+            )
+            return ctx
 
-        ctx = ctx.advance(OperationPhase.POSTMORTEM)
+        # SAGA_ROLLED_BACK: clean rollback — change not applied, system is clean
+        # Do NOT advance to POSTMORTEM; record as a cancelled/failed op and return
         await self._record_ledger(
-            ctx,
+            ctx,  # still in APPLY phase
             OperationState.FAILED,
-            {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id},
+            {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id, "rolled_back": True},
         )
         return ctx
 
