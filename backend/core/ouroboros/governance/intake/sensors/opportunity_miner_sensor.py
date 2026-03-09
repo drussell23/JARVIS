@@ -19,7 +19,7 @@ import asyncio
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
@@ -69,7 +69,7 @@ class OpportunityMinerSensor:
         self,
         repo_root: Path,
         router: Any,
-        scan_paths: List[str] = None,
+        scan_paths: Optional[List[str]] = None,
         complexity_threshold: int = 10,
         repo: str = "jarvis",
         poll_interval_s: float = 3600.0,

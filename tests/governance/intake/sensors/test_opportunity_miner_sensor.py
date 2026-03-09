@@ -1,11 +1,9 @@
 """Tests for OpportunityMinerSensor (Sensor D) — observe-only."""
 import ast
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 from backend.core.ouroboros.governance.intake.sensors.opportunity_miner_sensor import (
     OpportunityMinerSensor,
-    StaticCandidate,
     _cyclomatic_complexity,
 )
 
