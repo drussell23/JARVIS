@@ -470,6 +470,19 @@ async def create_governance_stack(
         _bridge_transports: List[Any] = [_event_bridge] if _event_bridge is not None else []
         comm = _build_comm_protocol(config=config, extra_transports=_bridge_transports)
 
+        # Register CrossRepoNarrator on event_bus for inbound narration
+        if event_bus is not None and _event_bridge is not None:
+            try:
+                from backend.core.ouroboros.governance.comms.cross_repo_narrator import CrossRepoNarrator
+                from backend.core.ouroboros.cross_repo import EventType
+                narrator = CrossRepoNarrator(comm=comm)
+                event_bus.register_handler(EventType.IMPROVEMENT_REQUEST, narrator.on_improvement_request)
+                event_bus.register_handler(EventType.IMPROVEMENT_COMPLETE, narrator.on_improvement_complete)
+                event_bus.register_handler(EventType.IMPROVEMENT_FAILED, narrator.on_improvement_failed)
+                logger.info("[Integration] CrossRepoNarrator registered on event bus")
+            except Exception as exc:
+                logger.warning("[Integration] CrossRepoNarrator registration failed: %s", exc)
+
         # Core components (always present)
         risk_engine = RiskEngine()
         ledger = OperationLedger(storage_dir=config.ledger_dir)

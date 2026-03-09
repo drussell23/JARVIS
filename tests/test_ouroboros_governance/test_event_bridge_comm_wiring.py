@@ -56,3 +56,25 @@ async def test_no_event_bridge_when_event_bus_none(tmp_path):
     config = _make_config(tmp_path)
     stack = await create_governance_stack(config, event_bus=None)
     assert stack.event_bridge is None
+
+
+async def test_cross_repo_narrator_registered_when_event_bus_provided(tmp_path):
+    """CrossRepoNarrator handlers must be registered on the bus when event_bus is provided."""
+    from backend.core.ouroboros.governance.integration import create_governance_stack
+    from backend.core.ouroboros.cross_repo import EventType
+
+    mock_event_bus = AsyncMock()
+    mock_event_bus.emit = AsyncMock()
+    registered_handlers: dict = {}
+
+    def fake_register(event_type, handler):
+        registered_handlers[event_type] = handler
+
+    mock_event_bus.register_handler = fake_register
+
+    config = _make_config(tmp_path)
+    stack = await create_governance_stack(config, event_bus=mock_event_bus)
+
+    assert EventType.IMPROVEMENT_REQUEST in registered_handlers
+    assert EventType.IMPROVEMENT_COMPLETE in registered_handlers
+    assert EventType.IMPROVEMENT_FAILED in registered_handlers
