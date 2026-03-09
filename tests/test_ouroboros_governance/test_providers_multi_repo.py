@@ -1,5 +1,8 @@
 """Tests for multi-repo codegen prompt building (schema 2c.1)."""
 from __future__ import annotations
+
+import json
+import pytest
 from pathlib import Path
 
 
@@ -171,7 +174,6 @@ def test_parse_2c1_rejects_missing_patches(tmp_path):
         "candidates": [{"candidate_id": "c1", "rationale": "x"}],
         "provider_metadata": {"model_id": "m", "reasoning_summary": "s"},
     })
-    import pytest
     with pytest.raises(RuntimeError):
         _parse_generation_response(bad, "gcp-jprime", 0.5, ctx, "h", "f", repo_roots=repo_roots)
 
