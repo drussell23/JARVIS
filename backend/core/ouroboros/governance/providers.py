@@ -385,6 +385,106 @@ def _extract_json_block(raw: str) -> str:
     return stripped
 
 
+def _parse_multi_repo_response(
+    data: dict,
+    provider_name: str,
+    duration_s: float,
+    repo_roots: Dict[str, Path],
+) -> "GenerationResult":
+    """Parse schema 2c.1 multi-repo response into GenerationResult with RepoPatch candidates."""
+    from backend.core.ouroboros.governance.saga.saga_types import (
+        FileOp,
+        PatchedFile,
+        RepoPatch,
+    )
+
+    pfx = provider_name
+    raw_candidates = data.get("candidates", [])
+    if not raw_candidates or not isinstance(raw_candidates, list):
+        raise RuntimeError(f"{pfx}_schema_invalid:no_candidates:2c.1")
+
+    validated: List[Dict[str, Any]] = []
+    for raw_cand in raw_candidates[:3]:
+        patches_raw = raw_cand.get("patches")
+        if not isinstance(patches_raw, dict):
+            raise RuntimeError(f"{pfx}_schema_invalid:missing_patches:2c.1")
+
+        repo_patches: Dict[str, Any] = {}
+        for repo_name, file_list in patches_raw.items():
+            if not isinstance(file_list, list):
+                raise RuntimeError(
+                    f"{pfx}_schema_invalid:patches_not_list:{repo_name}"
+                )
+
+            patched_files: List[PatchedFile] = []
+            new_content: List[Tuple[str, bytes]] = []
+
+            for file_entry in file_list:
+                file_path = file_entry.get("file_path")
+                full_content = file_entry.get("full_content")
+                op_str = file_entry.get("op", "modify")
+
+                if not file_path or full_content is None:
+                    raise RuntimeError(
+                        f"{pfx}_schema_invalid:missing_file_fields:{repo_name}:{file_path}"
+                    )
+
+                # AST check for Python files
+                if str(file_path).endswith(".py"):
+                    try:
+                        ast.parse(full_content)
+                    except SyntaxError as e:
+                        raise RuntimeError(
+                            f"{pfx}_schema_invalid:syntax_error:{repo_name}:{file_path}:{e}"
+                        ) from e
+
+                # Validate op
+                try:
+                    op = FileOp(op_str)
+                except ValueError:
+                    op = FileOp.MODIFY
+
+                # Read preimage for MODIFY/DELETE ops
+                preimage: Optional[bytes] = None
+                if op in (FileOp.MODIFY, FileOp.DELETE):
+                    repo_root = repo_roots.get(repo_name)
+                    if repo_root is not None:
+                        full_disk_path = Path(repo_root) / file_path
+                        try:
+                            preimage = full_disk_path.read_bytes()
+                        except OSError:
+                            preimage = b""
+                            op = FileOp.CREATE
+                    else:
+                        preimage = b""
+
+                patched_files.append(PatchedFile(path=file_path, op=op, preimage=preimage))
+                new_content.append((file_path, full_content.encode()))
+
+            repo_patches[repo_name] = RepoPatch(
+                repo=repo_name,
+                files=tuple(patched_files),
+                new_content=tuple(new_content),
+            )
+
+        validated.append({
+            "candidate_id": raw_cand.get("candidate_id", "c1"),
+            "patches": repo_patches,
+            "rationale": raw_cand.get("rationale", ""),
+        })
+
+    if not validated:
+        raise RuntimeError(f"{pfx}_schema_invalid:all_candidates_failed:2c.1")
+
+    model_id = data.get("provider_metadata", {}).get("model_id", provider_name)
+    return GenerationResult(
+        candidates=tuple(validated),
+        provider_name=provider_name,
+        generation_duration_s=duration_s,
+        model_id=model_id,
+    )
+
+
 def _parse_generation_response(
     raw: str,
     provider_name: str,
@@ -392,14 +492,15 @@ def _parse_generation_response(
     ctx: "OperationContext",
     source_hash: str,
     source_path: str,
+    repo_roots: Optional[Dict[str, Path]] = None,
 ) -> "GenerationResult":
-    """Parse and strictly validate a schema_version 2b.1 generation response.
+    """Parse and strictly validate a schema_version 2b.1 or 2c.1 generation response.
 
     Validation sequence (fail-fast):
       1. JSON parse
       2. Top-level type = dict
-      3. schema_version == "2b.1"
-      4. No extra top-level keys
+      3. schema_version routing: 2c.1 → _parse_multi_repo_response; other → fail-fast
+      4. No extra top-level keys (2b.1 only)
       5. candidates: non-empty list, len 1-3 (>3 → normalize + continue)
       6. Per-candidate: required fields, no extras, AST check for .py files
          SyntaxError → skip candidate; all fail → RuntimeError
@@ -419,8 +520,11 @@ def _parse_generation_response(
     if not isinstance(data, dict):
         raise RuntimeError(f"{pfx}_schema_invalid:expected_object")
 
-    # Step 3: schema_version
+    # Step 3: schema_version — route multi-repo schema to dedicated parser
     actual_version = data.get("schema_version", "__missing__")
+    if actual_version == _SCHEMA_VERSION_MULTI:
+        return _parse_multi_repo_response(data, provider_name, duration_s, repo_roots or {})
+
     if actual_version != _SCHEMA_VERSION:
         raise RuntimeError(
             f"{pfx}_schema_invalid:wrong_schema_version:{actual_version}"
