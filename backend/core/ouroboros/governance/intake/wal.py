@@ -22,6 +22,7 @@ from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
 _WAL_VERSION = 1
+_TERMINAL_STATUSES = frozenset({"acked", "dead_letter"})
 
 
 @dataclass
@@ -63,6 +64,10 @@ class WAL:
 
     def update_status(self, lease_id: str, status: str) -> None:
         """Append a status-update tombstone for the given lease_id."""
+        if status not in _TERMINAL_STATUSES:
+            raise ValueError(
+                f"status must be one of {sorted(_TERMINAL_STATUSES)}, got {status!r}"
+            )
         record = {
             "v": _WAL_VERSION,
             "lease_id": lease_id,
@@ -127,39 +132,74 @@ class WAL:
         return [e for e in entries.values() if e.status == "pending"]
 
     def compact(self) -> int:
-        """Remove entries older than ``max_age_days``.
+        """Remove non-pending entries older than ``max_age_days``.
 
+        Pending entries are NEVER removed regardless of age.
         Returns the number of removed lines.
         """
         if not self._path.exists():
             return 0
 
         max_age_s = self._max_age_days * 86400.0
-        now = time.monotonic()
-        kept: List[str] = []
-        removed = 0
+        now_monotonic = time.monotonic()
+        now_utc = datetime.now(timezone.utc)
 
+        # First pass: resolve effective status of every lease
+        effective_statuses: Dict[str, str] = {}
+        raw_lines: List[str] = []
         with self._path.open("r", encoding="utf-8") as f:
             for line in f:
-                line = line.strip()
-                if not line:
+                stripped = line.strip()
+                if not stripped:
                     continue
+                raw_lines.append(stripped)
                 try:
-                    record = json.loads(line)
+                    record = json.loads(stripped)
                 except json.JSONDecodeError:
-                    removed += 1
                     continue
-                ts = record.get("ts_monotonic", now)
-                if (now - ts) < max_age_s:
-                    kept.append(line)
-                else:
-                    removed += 1
+                lid = record.get("lease_id", "")
+                if not lid:
+                    continue
+                if record.get("_type") == "status_update":
+                    effective_statuses[lid] = record.get("status", "pending")
+                elif "envelope" in record:
+                    effective_statuses.setdefault(lid, record.get("status", "pending"))
 
-        with self._path.open("w", encoding="utf-8") as f:
+        # Second pass: keep pending entries always; age-out others
+        kept: List[str] = []
+        removed = 0
+        for stripped in raw_lines:
+            try:
+                record = json.loads(stripped)
+            except json.JSONDecodeError:
+                removed += 1
+                continue
+            lid = record.get("lease_id", "")
+            effective = effective_statuses.get(lid, "pending")
+            if effective == "pending":
+                kept.append(stripped)
+                continue
+            # Use ts_utc for wall-clock age (stable across process restarts)
+            ts_utc_str = record.get("ts_utc", "")
+            try:
+                entry_dt = datetime.fromisoformat(ts_utc_str.replace("Z", "+00:00"))
+                age_s = (now_utc - entry_dt).total_seconds()
+            except (ValueError, TypeError):
+                # Fallback to ts_monotonic if ts_utc is missing/malformed
+                ts_mono = record.get("ts_monotonic", now_monotonic)
+                age_s = now_monotonic - ts_mono
+            if age_s < max_age_s:
+                kept.append(stripped)
+            else:
+                removed += 1
+
+        tmp = self._path.with_suffix(".wal.tmp")
+        with tmp.open("w", encoding="utf-8") as f:
             for line in kept:
                 f.write(line + "\n")
             f.flush()
             os.fsync(f.fileno())
+        os.replace(tmp, self._path)
 
         return removed
 
