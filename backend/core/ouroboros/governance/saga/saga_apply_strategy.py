@@ -181,6 +181,35 @@ class SagaApplyStrategy:
             saga_state=tuple(repo_statuses.values()),
         )
 
+    async def compensate_after_verify_failure(
+        self,
+        saga_result: "SagaApplyResult",
+        patch_map: Dict[str, "RepoPatch"],
+        op_id: str,
+        reason_code: str,
+    ) -> bool:
+        """Public compensation path for verify-phase failures.
+
+        Derives applied_repos and repo_statuses from saga_result so the caller
+        doesn't need to know the strategy's internal representation.
+        Returns True if all compensations succeeded, False if any failed.
+        """
+        applied_repos = [
+            rss.repo for rss in saga_result.saga_state
+            if rss.status == SagaStepStatus.APPLIED
+        ]
+        repo_statuses = {rss.repo: rss for rss in saga_result.saga_state}
+
+        all_ok, _ = await self._phase_c_compensate(
+            applied_repos=applied_repos,
+            patch_map=patch_map,
+            saga_id=saga_result.saga_id,
+            op_id=op_id,
+            failure_reason=reason_code,
+            repo_statuses=repo_statuses,
+        )
+        return all_ok
+
     # ------------------------------------------------------------------
     # Phase A
     # ------------------------------------------------------------------

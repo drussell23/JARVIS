@@ -790,7 +790,6 @@ class GovernedOrchestrator:
         if apply_result.terminal_state == SagaTerminalState.SAGA_APPLY_COMPLETED:
             verifier = CrossRepoVerifier(
                 repo_roots=repo_roots,
-                dependency_edges=ctx.dependency_edges,
             )
             verify_result = await verifier.verify(
                 repo_scope=ctx.repo_scope,
@@ -799,13 +798,11 @@ class GovernedOrchestrator:
             )
 
             if not verify_result.passed:
-                await strategy._phase_c_compensate(
-                    list(ctx.apply_plan),
-                    patch_map,
-                    apply_result.saga_id,
-                    ctx.op_id,
-                    verify_result.reason_code,
-                    {},
+                comp_ok = await strategy.compensate_after_verify_failure(
+                    saga_result=apply_result,
+                    patch_map=patch_map,
+                    op_id=ctx.op_id,
+                    reason_code=verify_result.reason_code,
                 )
                 ctx = ctx.advance(OperationPhase.POSTMORTEM)
                 await self._record_ledger(
@@ -814,6 +811,7 @@ class GovernedOrchestrator:
                     {
                         "reason": verify_result.reason_code,
                         "saga_id": apply_result.saga_id,
+                        "compensated": comp_ok,
                     },
                 )
                 return ctx
