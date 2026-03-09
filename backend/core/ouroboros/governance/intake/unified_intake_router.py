@@ -1,0 +1,365 @@
+"""
+Unified Intake Router — Phase 2C.1
+
+Pipeline: schema_validate → normalize → dedup → priority_arbitration →
+          rate_gate → conflict_detect → human_ack_gate →
+          wal_enqueue → dispatch_queue
+
+Dispatch loop runs as a background asyncio.Task.
+File advisory lock prevents two router instances on the same project root.
+"""
+from __future__ import annotations
+
+import asyncio
+import fcntl
+import logging
+import os
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+from backend.core.ouroboros.governance.operation_id import generate_operation_id
+
+from .intent_envelope import EnvelopeValidationError, IntentEnvelope
+from .wal import WAL, WALEntry
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Priority map — lower int = higher priority
+# ---------------------------------------------------------------------------
+_PRIORITY_MAP: Dict[str, int] = {
+    "voice_human": 0,
+    "test_failure": 1,
+    "backlog": 2,
+    "ai_miner": 3,
+}
+
+# Sources that bypass backpressure
+_BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
+
+
+@dataclass(frozen=True)
+class IntakeRouterConfig:
+    project_root: Path
+    wal_path: Optional[Path] = None
+    lock_path: Optional[Path] = None
+    max_retries: int = 3
+    backpressure_threshold: int = 10
+    dedup_window_s: float = 600.0
+    voice_dedup_window_s: float = 300.0
+    max_queue_size: int = 100
+    dispatch_timeout_s: float = 300.0
+
+    @property
+    def resolved_wal_path(self) -> Path:
+        return self.wal_path or (self.project_root / ".jarvis" / "intake_wal.jsonl")
+
+    @property
+    def resolved_lock_path(self) -> Path:
+        return self.lock_path or (self.project_root / ".jarvis" / "intake_router.lock")
+
+
+class PendingAckStore:
+    def __init__(self) -> None:
+        self._store: Dict[str, IntentEnvelope] = {}
+
+    def park(self, envelope: IntentEnvelope) -> None:
+        self._store[envelope.idempotency_key] = envelope
+
+    def acknowledge(self, idempotency_key: str) -> Optional[IntentEnvelope]:
+        return self._store.pop(idempotency_key, None)
+
+    def count(self) -> int:
+        return len(self._store)
+
+
+class RouterAlreadyRunningError(RuntimeError):
+    pass
+
+
+class UnifiedIntakeRouter:
+    """Central routing hub for all Ouroboros intake signals.
+
+    Implements an async, priority-ordered dispatch pipeline with:
+    - Deduplication within configurable time windows
+    - Human acknowledgement gating
+    - Backpressure signalling for low-priority sources
+    - Write-ahead log for crash recovery
+    - Advisory file lock preventing duplicate router instances
+    - Dead-letter queue after max retries are exhausted
+    """
+
+    def __init__(self, gls: Any, config: IntakeRouterConfig) -> None:
+        self._gls = gls
+        self._config = config
+        self._wal = WAL(config.resolved_wal_path)
+        self._queue: asyncio.PriorityQueue[Tuple[int, float, IntentEnvelope]] = (
+            asyncio.PriorityQueue(maxsize=config.max_queue_size)
+        )
+        self._dedup: Dict[str, float] = {}
+        self._retry_count: Dict[str, int] = {}
+        self._pending_ack = PendingAckStore()
+        self._dead_letter: List[IntentEnvelope] = []
+        self._dispatch_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._lock_fd: Optional[int] = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Acquire advisory lock, start dispatch loop, and replay pending WAL entries."""
+        if self._running:
+            return
+        self._acquire_lock()
+        self._running = True
+        self._dispatch_task = asyncio.create_task(
+            self._dispatch_loop(), name="intake_dispatch"
+        )
+        await self._replay_wal()
+
+    async def stop(self) -> None:
+        """Gracefully stop the dispatch loop and release the advisory lock."""
+        self._running = False
+        if self._dispatch_task and not self._dispatch_task.done():
+            self._dispatch_task.cancel()
+            try:
+                await self._dispatch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        self._release_lock()
+
+    # ------------------------------------------------------------------
+    # Public interface
+    # ------------------------------------------------------------------
+
+    async def ingest(self, envelope: IntentEnvelope) -> str:
+        """Route an envelope through the intake pipeline.
+
+        Returns one of:
+        - ``"enqueued"``       — accepted and placed on the priority queue
+        - ``"deduplicated"``   — duplicate within the dedup window, dropped
+        - ``"pending_ack"``    — parked awaiting human acknowledgement
+        - ``"backpressure"``   — queue is full; non-exempt source rejected
+        """
+        # 1. Dedup check
+        if self._is_duplicate(envelope):
+            return "deduplicated"
+
+        # 2. Human ack gate
+        if envelope.requires_human_ack:
+            self._pending_ack.park(envelope)
+            return "pending_ack"
+
+        # 3. Backpressure check
+        if (
+            envelope.source not in _BACKPRESSURE_EXEMPT
+            and self.intake_queue_depth() >= self._config.backpressure_threshold
+        ):
+            return "backpressure"
+
+        # 4. WAL enqueue — durable before placing on in-memory queue
+        lease_id = generate_operation_id("lse")
+        envelope = envelope.with_lease(lease_id)
+        self._wal.append(WALEntry(
+            lease_id=lease_id,
+            envelope_dict=envelope.to_dict(),
+            status="pending",
+            ts_monotonic=time.monotonic(),
+            ts_utc=datetime.now(timezone.utc).isoformat(),
+        ))
+
+        # 5. Register dedup key now so subsequent duplicates are caught
+        self._register_dedup(envelope)
+
+        # 6. Place on priority queue (lower int = higher priority)
+        priority = _PRIORITY_MAP.get(envelope.source, 99)
+        await self._queue.put((priority, envelope.submitted_at, envelope))
+        return "enqueued"
+
+    def intake_queue_depth(self) -> int:
+        """Current number of items waiting in the dispatch queue."""
+        return self._queue.qsize()
+
+    def dead_letter_count(self) -> int:
+        """Number of envelopes that exhausted all retries."""
+        return len(self._dead_letter)
+
+    def pending_ack_count(self) -> int:
+        """Number of envelopes parked awaiting human acknowledgement."""
+        return self._pending_ack.count()
+
+    async def acknowledge(self, idempotency_key: str) -> bool:
+        """Release a parked envelope back into the pipeline.
+
+        Returns ``True`` if the envelope was found and successfully re-ingested.
+        """
+        envelope = self._pending_ack.acknowledge(idempotency_key)
+        if envelope is None:
+            return False
+        from .intent_envelope import make_envelope
+        unblocked = make_envelope(
+            source=envelope.source,
+            description=envelope.description,
+            target_files=envelope.target_files,
+            repo=envelope.repo,
+            confidence=envelope.confidence,
+            urgency=envelope.urgency,
+            evidence=dict(envelope.evidence),
+            requires_human_ack=False,
+            causal_id=envelope.causal_id,
+            signal_id=envelope.signal_id,
+        )
+        result = await self.ingest(unblocked)
+        return result == "enqueued"
+
+    # ------------------------------------------------------------------
+    # Dispatch loop
+    # ------------------------------------------------------------------
+
+    async def _dispatch_loop(self) -> None:
+        """Background task: drain the priority queue and call GLS.submit()."""
+        while self._running:
+            try:
+                priority, ts, envelope = await asyncio.wait_for(
+                    self._queue.get(), timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+            try:
+                await self._dispatch_one(envelope)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception(
+                    "Router: dispatch error for lease_id=%s", envelope.lease_id
+                )
+            finally:
+                self._queue.task_done()
+
+    async def _dispatch_one(self, envelope: IntentEnvelope) -> None:
+        """Attempt to dispatch a single envelope to GLS, with retry on failure."""
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=envelope.target_files,
+            description=envelope.description,
+            op_id=envelope.causal_id,
+        )
+        ikey = envelope.idempotency_key
+        try:
+            await asyncio.wait_for(
+                self._gls.submit(ctx, trigger_source=envelope.source),
+                timeout=self._config.dispatch_timeout_s,
+            )
+            self._wal.update_status(envelope.lease_id, "acked")
+            self._retry_count.pop(ikey, None)
+        except Exception as exc:
+            retries = self._retry_count.get(ikey, 0) + 1
+            self._retry_count[ikey] = retries
+            logger.warning(
+                "Router: dispatch failed (attempt %d/%d) for lease_id=%s: %s",
+                retries,
+                self._config.max_retries,
+                envelope.lease_id,
+                exc,
+            )
+            if retries >= self._config.max_retries:
+                logger.error(
+                    "Router: dead-lettering envelope lease_id=%s after %d retries",
+                    envelope.lease_id,
+                    retries,
+                )
+                self._wal.update_status(envelope.lease_id, "dead_letter")
+                self._dead_letter.append(envelope)
+                self._retry_count.pop(ikey, None)
+            else:
+                # Re-enqueue for retry at the same priority
+                priority = _PRIORITY_MAP.get(envelope.source, 99)
+                await self._queue.put((priority, envelope.submitted_at, envelope))
+
+    # ------------------------------------------------------------------
+    # WAL crash recovery
+    # ------------------------------------------------------------------
+
+    async def _replay_wal(self) -> None:
+        """Re-enqueue all pending WAL entries from a previous run."""
+        pending = self._wal.pending_entries()
+        if not pending:
+            return
+        logger.info("Router: replaying %d pending WAL entries", len(pending))
+        from .intent_envelope import IntentEnvelope as IE
+        for entry in pending:
+            try:
+                envelope = IE.from_dict(entry.envelope_dict)
+                priority = _PRIORITY_MAP.get(envelope.source, 99)
+                await self._queue.put((priority, envelope.submitted_at, envelope))
+                logger.debug(
+                    "Router: replayed lease_id=%s source=%s",
+                    entry.lease_id,
+                    envelope.source,
+                )
+            except Exception:
+                logger.exception(
+                    "Router: WAL replay failed for lease_id=%s", entry.lease_id
+                )
+
+    # ------------------------------------------------------------------
+    # Deduplication
+    # ------------------------------------------------------------------
+
+    def _is_duplicate(self, envelope: IntentEnvelope) -> bool:
+        """Return True if the envelope's dedup_key was seen within its window."""
+        window = (
+            self._config.voice_dedup_window_s
+            if envelope.source == "voice_human"
+            else self._config.dedup_window_s
+        )
+        # Window of 0.0 effectively disables dedup
+        if window <= 0.0:
+            return False
+        last = self._dedup.get(envelope.dedup_key)
+        if last is None:
+            return False
+        return (time.monotonic() - last) < window
+
+    def _register_dedup(self, envelope: IntentEnvelope) -> None:
+        """Record the current monotonic time for the envelope's dedup_key."""
+        self._dedup[envelope.dedup_key] = time.monotonic()
+
+    # ------------------------------------------------------------------
+    # Advisory file lock
+    # ------------------------------------------------------------------
+
+    def _acquire_lock(self) -> None:
+        """Acquire an exclusive non-blocking flock on the lock file.
+
+        Raises RouterAlreadyRunningError if another process holds the lock.
+        """
+        lock_path = self._config.resolved_lock_path
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise RouterAlreadyRunningError(
+                f"Another router instance holds the lock at {lock_path}"
+            )
+        self._lock_fd = fd
+
+    def _release_lock(self) -> None:
+        """Unlock and close the advisory lock file descriptor."""
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                os.close(self._lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
