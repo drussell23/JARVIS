@@ -32,12 +32,11 @@ from backend.core.ouroboros.governance.saga.saga_types import (
 )
 
 try:
-    from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
+    import backend.core.ouroboros.governance.ledger as _ledger_mod
     _LEDGER_IMPORTS_OK = True
 except ImportError:
+    _ledger_mod = None  # type: ignore[assignment]
     _LEDGER_IMPORTS_OK = False
-    LedgerEntry = None  # type: ignore[assignment,misc]
-    OperationState = None  # type: ignore[assignment,misc]
 
 logger = logging.getLogger("Ouroboros.SagaApply")
 
@@ -401,13 +400,13 @@ class SagaApplyStrategy:
         self, event: str, saga_id: str, op_id: str, **kwargs: Any
     ) -> None:
         """Emit a saga sub-event to the ledger (best-effort; failures are logged)."""
-        if not _LEDGER_IMPORTS_OK:
+        if not _LEDGER_IMPORTS_OK or _ledger_mod is None or self._ledger is None:
             logger.debug("[Saga] ledger unavailable; skipping sub-event emit (%s)", event)
             return
         try:
-            entry = LedgerEntry(
+            entry = _ledger_mod.LedgerEntry(
                 op_id=op_id,
-                state=OperationState.APPLYING,
+                state=_ledger_mod.OperationState.APPLYING,
                 data={"saga_event": event, "saga_id": saga_id, **kwargs},
             )
             await self._ledger.append(entry)
