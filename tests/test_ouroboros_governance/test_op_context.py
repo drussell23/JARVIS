@@ -102,6 +102,7 @@ class TestOperationPhase:
             OperationPhase.GATE,
             OperationPhase.VALIDATE_RETRY,
             OperationPhase.CANCELLED,
+            OperationPhase.POSTMORTEM,  # infra failures during validation
         }
 
     def test_validate_retry_transitions(self) -> None:
@@ -109,6 +110,7 @@ class TestOperationPhase:
             OperationPhase.GATE,
             OperationPhase.VALIDATE_RETRY,
             OperationPhase.CANCELLED,
+            OperationPhase.POSTMORTEM,  # infra failures during validation
         }
 
     def test_gate_transitions(self) -> None:
