@@ -33,10 +33,13 @@ import collections
 import dataclasses
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
 
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 from backend.core.ouroboros.governance.risk_engine import RiskTier
@@ -417,6 +420,8 @@ class OperationContext:
     saga_state: Tuple[RepoSagaStatus, ...] = ()
     schema_version: str = "3.0"
     expanded_context_files: Tuple[str, ...] = ()
+    benchmark_result: Optional["BenchmarkResult"] = None
+    pre_apply_snapshots: Dict[str, str] = field(default_factory=dict)
 
     # ------------------------------------------------------------------
     # Post-init
@@ -501,6 +506,8 @@ class OperationContext:
             "saga_state": saga_state,
             "schema_version": schema_version,
             "expanded_context_files": (),
+            "benchmark_result": None,
+            "pre_apply_snapshots": {},
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -638,6 +645,30 @@ class OperationContext:
             expanded_context_files=files,
             previous_hash=self.context_hash,
             context_hash="",  # placeholder — recomputed below
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_benchmark_result(self, result: "BenchmarkResult") -> "OperationContext":
+        """Return a new context with benchmark_result set (no phase change)."""
+        intermediate = dataclasses.replace(
+            self,
+            benchmark_result=result,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_pre_apply_snapshots(self, snapshots: Dict[str, str]) -> "OperationContext":
+        """Return a new context with pre_apply_snapshots set (no phase change)."""
+        intermediate = dataclasses.replace(
+            self,
+            pre_apply_snapshots=snapshots,
+            previous_hash=self.context_hash,
+            context_hash="",
         )
         fields_for_hash = _context_to_hash_dict(intermediate)
         new_hash = _compute_hash(fields_for_hash)

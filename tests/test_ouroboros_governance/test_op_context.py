@@ -520,3 +520,73 @@ class TestContextExpansionPhase:
         enriched = ctx.with_expanded_files(("helpers.py",))
         assert enriched.previous_hash == ctx.context_hash
         assert enriched.context_hash != ctx.context_hash
+
+
+class TestOperationContextBenchmarkFields:
+    """Tests for benchmark_result and pre_apply_snapshots additions."""
+
+    def test_benchmark_result_defaults_to_none(self):
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        assert ctx.benchmark_result is None
+
+    def test_pre_apply_snapshots_defaults_to_empty_dict(self):
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        assert ctx.pre_apply_snapshots == {}
+
+    def test_with_benchmark_result_returns_new_context(self):
+        from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        br = BenchmarkResult(
+            pass_rate=0.9, lint_violations=2, coverage_pct=75.0,
+            complexity_delta=-0.5, patch_hash="abc", quality_score=0.85,
+            task_type="bug_fix", timed_out=False, error=None,
+        )
+        ctx2 = ctx.with_benchmark_result(br)
+        assert ctx2.benchmark_result == br
+        assert ctx2.benchmark_result is not ctx.benchmark_result or ctx.benchmark_result is None
+
+    def test_with_benchmark_result_does_not_change_phase(self):
+        from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        br = BenchmarkResult(
+            pass_rate=0.9, lint_violations=0, coverage_pct=80.0,
+            complexity_delta=0.0, patch_hash="x", quality_score=0.9,
+            task_type="code_improvement", timed_out=False, error=None,
+        )
+        ctx2 = ctx.with_benchmark_result(br)
+        assert ctx2.phase == ctx.phase
+
+    def test_with_benchmark_result_updates_hash_chain(self):
+        from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        br = BenchmarkResult(
+            pass_rate=0.5, lint_violations=1, coverage_pct=50.0,
+            complexity_delta=1.0, patch_hash="h1", quality_score=0.5,
+            task_type="refactoring", timed_out=False, error=None,
+        )
+        ctx2 = ctx.with_benchmark_result(br)
+        assert ctx2.context_hash != ctx.context_hash
+        assert ctx2.previous_hash == ctx.context_hash
+
+    def test_with_pre_apply_snapshots_stores_content(self):
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        snapshots = {"src/foo.py": "def foo(): pass\n"}
+        ctx2 = ctx.with_pre_apply_snapshots(snapshots)
+        assert ctx2.pre_apply_snapshots == snapshots
+
+    def test_with_pre_apply_snapshots_does_not_change_phase(self):
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        ctx2 = ctx.with_pre_apply_snapshots({"f.py": "x"})
+        assert ctx2.phase == ctx.phase
+
+    def test_hash_deterministic_with_benchmark_result(self):
+        from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult
+        ctx = OperationContext.create(op_id="op1", description="d", target_files=())
+        br = BenchmarkResult(
+            pass_rate=0.9, lint_violations=0, coverage_pct=80.0,
+            complexity_delta=0.0, patch_hash="x", quality_score=0.9,
+            task_type="code_improvement", timed_out=False, error=None,
+        )
+        ctx2a = ctx.with_benchmark_result(br)
+        ctx2b = ctx.with_benchmark_result(br)
+        assert ctx2a.context_hash == ctx2b.context_hash
