@@ -48,6 +48,7 @@ class IntakeLayerConfig:
     backlog_scan_interval_s: float = 30.0
     miner_scan_interval_s: float = 300.0
     miner_complexity_threshold: int = 10
+    miner_auto_submit_threshold: float = 0.75
     miner_scan_paths: List[str] = field(default_factory=lambda: ["backend/", "tests/"])
     voice_stt_confidence_threshold: float = 0.70
     a_narrator_enabled: bool = True
@@ -68,6 +69,9 @@ class IntakeLayerConfig:
             ),
             miner_complexity_threshold=int(
                 os.getenv("JARVIS_INTAKE_MINER_COMPLEXITY_THRESHOLD", "10")
+            ),
+            miner_auto_submit_threshold=float(
+                os.getenv("JARVIS_INTAKE_MINER_AUTO_SUBMIT_THRESHOLD", "0.75")
             ),
             miner_scan_paths=list(
                 filter(
@@ -344,6 +348,7 @@ class IntakeLayerService:
             scan_paths=self._config.miner_scan_paths,
             complexity_threshold=self._config.miner_complexity_threshold,
             poll_interval_s=self._config.miner_scan_interval_s,
+            auto_submit_threshold=self._config.miner_auto_submit_threshold,
         )
 
         # VoiceCommandSensor has no start/stop lifecycle; store as attribute only.

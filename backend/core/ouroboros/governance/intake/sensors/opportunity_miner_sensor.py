@@ -1,16 +1,17 @@
 """
 OpportunityMinerSensor (Sensor D) — Static complexity analysis → observe-only.
 
-Phase 2C.1: ALL D envelopes have requires_human_ack=True. The router parks
-them in PENDING_ACK. Auto-submit is enabled in Phase 2C.4 after confidence
-formula tuning and audit pass.
+Phase 2C.4: requires_human_ack is confidence-driven. Envelopes whose
+computed confidence meets or exceeds auto_submit_threshold are routed
+autonomously (requires_human_ack=False). Below the threshold they are
+parked in PENDING_ACK (requires_human_ack=True).
 
 Static evidence: AST cyclomatic complexity above threshold.
 LLM triage: NOT implemented in Phase 2C.1 (confidence = static only).
 
 Confidence formula (Phase 2C.1, static-only):
     confidence = static_evidence_score × 0.5
-    (llm_quality_score, risk_penalty, novelty_penalty added in Phase 2C.4)
+    (llm_quality_score, risk_penalty, novelty_penalty added in later phases)
 """
 from __future__ import annotations
 
@@ -73,6 +74,7 @@ class OpportunityMinerSensor:
         complexity_threshold: int = 10,
         repo: str = "jarvis",
         poll_interval_s: float = 3600.0,
+        auto_submit_threshold: float = 0.75,
     ) -> None:
         self._repo_root = repo_root
         self._router = router
@@ -80,6 +82,7 @@ class OpportunityMinerSensor:
         self._threshold = complexity_threshold
         self._repo = repo
         self._poll_interval_s = poll_interval_s
+        self._auto_submit_threshold = auto_submit_threshold
         self._running = False
         self._seen_file_paths: set[str] = set()
 
@@ -108,9 +111,11 @@ class OpportunityMinerSensor:
                 if cc < self._threshold:
                     continue
 
-                # Static evidence score: normalize CC against threshold
+                # Static evidence score: normalize CC against threshold.
+                # Phase 2C.4: confidence = static_score (full weight now that
+                # auto-submit is live; the 0.5 dampener from Phase 2C.1 is lifted).
                 static_score = min(1.0, cc / (self._threshold * 2))
-                confidence = static_score * 0.5  # Phase 2C.1: static-only formula
+                confidence = static_score
 
                 candidate = StaticCandidate(
                     file_path=rel,
@@ -130,7 +135,7 @@ class OpportunityMinerSensor:
                         "static_evidence_score": static_score,
                         "signature": rel,
                     },
-                    requires_human_ack=True,  # Phase 2C.1: ALWAYS requires human ack
+                    requires_human_ack=(confidence < self._auto_submit_threshold),
                 )
                 try:
                     result = await self._router.ingest(envelope)
