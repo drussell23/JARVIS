@@ -8,10 +8,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from backend.core.ouroboros.governance.approval_provider import (
-    ApprovalResult,
-    ApprovalStatus,
+    ApprovalResult,  # used in Task 2/3 tests below
+    ApprovalStatus,  # used in Task 2/3 tests below
 )
-from backend.core.ouroboros.governance.ledger import OperationState
+from backend.core.ouroboros.governance.ledger import OperationState  # used in Task 3 tests below
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
     OperationContext,
@@ -57,9 +57,10 @@ def _make_ctx(tmp_path: Path, op_id: str = "op-001") -> OperationContext:
 
 
 def _advance_to_apply(ctx: OperationContext) -> OperationContext:
-    """Walk the context through the required phase sequence to reach APPLY.
+    """Advance a context from its initial CLASSIFY phase through to APPLY.
 
-    CLASSIFY -> ROUTE -> GENERATE -> VALIDATE -> GATE -> APPLY
+    Precondition: ctx must be in CLASSIFY (as returned by OperationContext.create()).
+    Phase walk: CLASSIFY → ROUTE → GENERATE → VALIDATE → GATE → APPLY
     """
     ctx = ctx.advance(OperationPhase.ROUTE)
     ctx = ctx.advance(OperationPhase.GENERATE)
@@ -198,5 +199,6 @@ async def test_saga_stuck_pause_failure_does_not_reraise(tmp_path):
         # Must not raise even though pause() raises
         result_ctx = await orch._execute_saga_apply(ctx_apply, {"mock_candidate": {}})
 
+    stack.controller.pause.assert_awaited_once()
     assert result_ctx is not None
     assert result_ctx.phase == OperationPhase.POSTMORTEM
