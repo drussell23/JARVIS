@@ -1,4 +1,5 @@
 """Saga orchestration package for multi-repo applies."""
+from .saga_apply_strategy import SagaApplyStrategy
 from .saga_types import (
     FileOp,
     PatchedFile,
@@ -12,5 +13,6 @@ __all__ = [
     "PatchedFile",
     "RepoPatch",
     "SagaApplyResult",
+    "SagaApplyStrategy",
     "SagaTerminalState",
 ]
