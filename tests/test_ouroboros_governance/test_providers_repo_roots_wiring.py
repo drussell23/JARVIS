@@ -118,7 +118,6 @@ async def test_build_components_passes_repo_roots_to_providers_at_construction(t
     """_build_components must pass repo_roots_map to both PrimeProvider and ClaudeProvider
     at construction time (not via retroactive injection)."""
     from unittest.mock import AsyncMock, patch
-    import os
     from backend.core.ouroboros.governance.governed_loop_service import (
         GovernedLoopConfig,
         GovernedLoopService,
