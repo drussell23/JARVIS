@@ -278,7 +278,8 @@ class GovernedLoopService:
                 if fsm_state is FailbackState.QUEUE_ONLY:
                     self._state = ServiceState.DEGRADED
                 elif fsm_state is FailbackState.FALLBACK_ACTIVE:
-                    self._state = ServiceState.DEGRADED
+                    # Intentional GCP-first fallback — not degraded
+                    self._state = ServiceState.ACTIVE
                 else:
                     self._state = ServiceState.ACTIVE
             else:
@@ -568,10 +569,13 @@ class GovernedLoopService:
 
                 primary = PrimeProvider(self._prime_client, repo_root=self._config.project_root)
                 if await primary.health_probe():
-                    logger.info("[GovernedLoop] PrimeProvider: healthy")
+                    logger.info("[GovernedLoop] PrimeProvider: healthy at startup")
                 else:
-                    logger.warning("[GovernedLoop] PrimeProvider: unhealthy at startup")
-                    primary = None
+                    logger.warning(
+                        "[GovernedLoop] PrimeProvider: unhealthy at startup; "
+                        "retained for probe-based recovery"
+                    )
+                    # Do NOT set primary = None — circuit breaker handles retry
             except Exception as exc:
                 logger.warning(
                     "[GovernedLoop] PrimeProvider build failed: %s", exc
