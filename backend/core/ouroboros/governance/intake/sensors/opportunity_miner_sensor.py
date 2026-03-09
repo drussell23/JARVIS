@@ -7,11 +7,12 @@ autonomously (requires_human_ack=False). Below the threshold they are
 parked in PENDING_ACK (requires_human_ack=True).
 
 Static evidence: AST cyclomatic complexity above threshold.
-LLM triage: NOT implemented in Phase 2C.1 (confidence = static only).
 
-Confidence formula (Phase 2C.1, static-only):
-    confidence = static_evidence_score × 0.5
-    (llm_quality_score, risk_penalty, novelty_penalty added in later phases)
+Confidence formula (Phase 2C.4):
+    confidence = static_evidence_score
+    (full weight; 0.5 dampener from Phase 2C.1 has been lifted)
+    Auto-submission: envelopes with confidence >= auto_submit_threshold
+    require no human ACK and are routed autonomously.
 """
 from __future__ import annotations
 
@@ -128,7 +129,7 @@ class OpportunityMinerSensor:
                     description=f"High complexity detected in {rel} (CC={cc})",
                     target_files=(rel,),
                     repo=self._repo,
-                    confidence=max(0.1, confidence),
+                    confidence=max(0.1, confidence),  # clamp for envelope; routing uses pre-clamp value
                     urgency="low",
                     evidence={
                         "cyclomatic_complexity": cc,
