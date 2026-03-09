@@ -19,10 +19,11 @@ STARTING -> FAILED (on error)
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
@@ -45,6 +46,9 @@ from backend.core.ouroboros.governance.orchestrator import (
     GovernedOrchestrator,
     OrchestratorConfig,
 )
+from backend.core.ouroboros.governance.curriculum_publisher import CurriculumPublisher
+from backend.core.ouroboros.governance.model_attribution_recorder import ModelAttributionRecorder
+from backend.core.ouroboros.integration import get_performance_persistence
 
 logger = logging.getLogger("Ouroboros.GovernedLoop")
 
@@ -160,7 +164,7 @@ class ReadyToCommitPayload:
 class GovernedLoopConfig:
     """Frozen configuration for the governed loop service."""
 
-    project_root: Path
+    project_root: Path = field(default_factory=lambda: Path(os.getcwd()))
     claude_api_key: Optional[str] = None
     claude_model: str = "claude-sonnet-4-20250514"
     claude_max_cost_per_op: float = 0.50
@@ -173,6 +177,16 @@ class GovernedLoopConfig:
     cold_start_grace_s: float = 300.0   # ops younger than this are not cancelled on boot
     approval_ttl_s: float = 1800.0      # stale approval expiry timeout
     pipeline_timeout_s: float = 600.0   # total wall-clock budget per submit(); env: JARVIS_PIPELINE_TIMEOUT_S
+
+    # Curriculum + reactor event background task settings
+    curriculum_enabled: bool = True
+    curriculum_publish_interval_s: float = 3600.0
+    curriculum_window_n: int = 50
+    curriculum_top_k: int = 5
+    curriculum_impact_weights: Dict[str, float] = field(default_factory=dict)
+    model_attribution_lookback_n: int = 20
+    model_attribution_min_sample_size: int = 3
+    reactor_event_poll_interval_s: float = 30.0
 
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
@@ -227,13 +241,13 @@ class GovernedLoopService:
 
     def __init__(
         self,
-        stack: Any,
-        prime_client: Any,
-        config: GovernedLoopConfig,
+        stack: Any = None,
+        prime_client: Any = None,
+        config: Optional[GovernedLoopConfig] = None,
     ) -> None:
         self._stack = stack
         self._prime_client = prime_client
-        self._config = config
+        self._config = config if config is not None else GovernedLoopConfig.from_env()
         self._state = ServiceState.INACTIVE
         self._started_at: Optional[float] = None
         self._failure_reason: Optional[str] = None
@@ -245,6 +259,13 @@ class GovernedLoopService:
         self._health_probe_task: Optional[asyncio.Task] = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
+
+        # Background task handles (curriculum + reactor event loop)
+        self._curriculum_task: Optional[asyncio.Task] = None
+        self._reactor_event_task: Optional[asyncio.Task] = None
+        self._curriculum_publisher: Optional[CurriculumPublisher] = None
+        self._model_attribution_recorder: Optional[ModelAttributionRecorder] = None
+        self._event_dir: Optional[Path] = None
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
@@ -274,6 +295,39 @@ class GovernedLoopService:
             self._register_canary_slices()
             self._attach_to_stack()
             self._started_at = time.monotonic()
+
+            # Wire curriculum and reactor event background tasks
+            if self._config.curriculum_enabled:
+                event_dir = Path(os.environ.get(
+                    "JARVIS_REACTOR_EVENT_DIR",
+                    str(Path.home() / ".jarvis" / "reactor_events"),
+                ))
+                event_dir.mkdir(parents=True, exist_ok=True)
+                self._event_dir = event_dir
+                persistence = get_performance_persistence()
+                self._curriculum_publisher = CurriculumPublisher(
+                    persistence=persistence,
+                    event_dir=event_dir,
+                    window_n=self._config.curriculum_window_n,
+                    top_k=self._config.curriculum_top_k,
+                    impact_weights=self._config.curriculum_impact_weights,
+                )
+                self._model_attribution_recorder = ModelAttributionRecorder(
+                    persistence=persistence,
+                    lookback_n=self._config.model_attribution_lookback_n,
+                    min_sample_size=self._config.model_attribution_min_sample_size,
+                )
+                self._curriculum_task = asyncio.create_task(
+                    self._curriculum_loop(), name="curriculum_loop"
+                )
+                self._reactor_event_task = asyncio.create_task(
+                    self._reactor_event_loop(), name="reactor_event_loop"
+                )
+
+            # Start health probe background task
+            self._health_probe_task = asyncio.create_task(
+                self._health_probe_loop(), name="health_probe_loop"
+            )
 
             # Determine state based on provider availability
             if self._generator is not None:
@@ -317,6 +371,16 @@ class GovernedLoopService:
                 await self._health_probe_task
             except asyncio.CancelledError:
                 pass
+
+        # Cancel curriculum and reactor event background tasks
+        for task_attr in ("_curriculum_task", "_reactor_event_task"):
+            task: Optional[asyncio.Task] = getattr(self, task_attr, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
         # Drain in-flight ops (wait up to 30s)
         if self._active_ops:
@@ -710,12 +774,16 @@ class GovernedLoopService:
 
     def _attach_to_stack(self) -> None:
         """Attach governed loop components to GovernanceStack."""
+        if self._stack is None:
+            return
         self._stack.orchestrator = self._orchestrator
         self._stack.generator = self._generator
         self._stack.approval_provider = self._approval_provider
 
     def _detach_from_stack(self) -> None:
         """Detach governed loop components from GovernanceStack."""
+        if self._stack is None:
+            return
         self._stack.orchestrator = None
         self._stack.generator = None
         self._stack.approval_provider = None
@@ -865,3 +933,108 @@ class GovernedLoopService:
         self._generator = None
         self._approval_provider = None
         self._detach_from_stack()
+
+    # ------------------------------------------------------------------
+    # Private: Background loops
+    # ------------------------------------------------------------------
+
+    async def _health_probe_loop(self) -> None:
+        """Periodically probe provider health and update FSM state."""
+        while True:
+            try:
+                await asyncio.sleep(self._config.health_probe_interval_s)
+                if self._generator is not None:
+                    provider = getattr(self._generator, "_primary", None)
+                    if provider is not None:
+                        try:
+                            ok = await asyncio.wait_for(
+                                provider.health_probe(), timeout=5.0
+                            )
+                            if ok:
+                                try:
+                                    self._generator.fsm.record_primary_success()
+                                except Exception:
+                                    pass
+                            else:
+                                try:
+                                    self._generator.fsm.record_primary_failure()
+                                except Exception:
+                                    pass
+                        except Exception:
+                            try:
+                                self._generator.fsm.record_primary_failure()
+                            except Exception:
+                                pass
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("[GovernedLoop] health_probe_loop error: %s", exc)
+
+    async def _curriculum_loop(self) -> None:
+        """Publish curriculum signal every interval. Never crashes the service."""
+        while True:
+            try:
+                await asyncio.sleep(self._config.curriculum_publish_interval_s)
+                if self._curriculum_publisher:
+                    await asyncio.wait_for(
+                        self._curriculum_publisher.publish(),
+                        timeout=30.0,
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("[GovernedLoop] curriculum_loop error: %s", exc)
+
+    async def _reactor_event_loop(self) -> None:
+        """Poll event_dir for Reactor events. Never crashes the service."""
+        seen: set[str] = set()
+        while True:
+            try:
+                await asyncio.sleep(self._config.reactor_event_poll_interval_s)
+                await self._handle_event_files(seen)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("[GovernedLoop] reactor_event_loop error: %s", exc)
+
+    async def _handle_event_files(self, seen: Set[str]) -> None:
+        """Process new JSON files in event_dir. Extracted for testability."""
+        if self._event_dir is None:
+            return
+        for path in sorted(self._event_dir.glob("*.json")):
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            try:
+                data = json.loads(path.read_text())
+                event_type = data.get("event_type", "")
+                if event_type == "model_promoted":
+                    await self._handle_model_promoted(data)
+                elif event_type == "ouroboros_improvement":
+                    pass  # consumed elsewhere
+                else:
+                    logger.debug(
+                        "[GovernedLoop] Unknown event_type=%r in %s",
+                        event_type, path.name,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "[GovernedLoop] reactor_event_loop: failed to process %s: %s",
+                    path.name, exc,
+                )
+
+    async def _handle_model_promoted(self, data: dict) -> None:
+        if self._model_attribution_recorder is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._model_attribution_recorder.record_model_transition(
+                    new_model_id=data["model_id"],
+                    previous_model_id=data["previous_model_id"],
+                    training_batch_size=int(data["training_batch_size"]),
+                    task_types=data.get("task_types"),
+                ),
+                timeout=30.0,
+            )
+        except Exception as exc:
+            logger.warning("[GovernedLoop] _handle_model_promoted failed: %s", exc)

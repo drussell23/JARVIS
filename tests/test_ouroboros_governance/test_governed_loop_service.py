@@ -302,6 +302,110 @@ class TestGovernedLoopRegistryWiring:
         assert rc.local_path == reactor_path
 
 
+class TestBackgroundTaskLifecycle:
+    """Tests for curriculum_loop and reactor_event_loop lifecycle."""
+
+    async def test_curriculum_task_created_on_start_when_enabled(self):
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopService, GovernedLoopConfig
+        )
+        config = GovernedLoopConfig(curriculum_enabled=True)
+        service = GovernedLoopService(config=config)
+        with (
+            patch.object(service, "_build_components", new=AsyncMock()),
+            patch.object(service, "_reconcile_on_boot", new=AsyncMock()),
+            patch.object(service, "_register_canary_slices"),
+            patch.object(service, "_attach_to_stack"),
+            patch.object(service, "_health_probe_loop", new=AsyncMock()),
+            patch("backend.core.ouroboros.governance.governed_loop_service.CurriculumPublisher"),
+            patch("backend.core.ouroboros.governance.governed_loop_service.ModelAttributionRecorder"),
+            patch("backend.core.ouroboros.governance.governed_loop_service.get_performance_persistence"),
+        ):
+            service._generator = None
+            await service.start()
+            assert service._curriculum_task is not None
+            assert service._reactor_event_task is not None
+            await service.stop()
+
+    async def test_curriculum_task_cancelled_on_stop(self):
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopService, GovernedLoopConfig
+        )
+        config = GovernedLoopConfig(curriculum_enabled=True)
+        service = GovernedLoopService(config=config)
+        with (
+            patch.object(service, "_build_components", new=AsyncMock()),
+            patch.object(service, "_reconcile_on_boot", new=AsyncMock()),
+            patch.object(service, "_register_canary_slices"),
+            patch.object(service, "_attach_to_stack"),
+            patch.object(service, "_health_probe_loop", new=AsyncMock()),
+            patch("backend.core.ouroboros.governance.governed_loop_service.CurriculumPublisher"),
+            patch("backend.core.ouroboros.governance.governed_loop_service.ModelAttributionRecorder"),
+            patch("backend.core.ouroboros.governance.governed_loop_service.get_performance_persistence"),
+        ):
+            service._generator = None
+            await service.start()
+            curriculum_task = service._curriculum_task
+            await service.stop()
+            assert curriculum_task.done()
+
+    async def test_reactor_event_loop_dispatches_model_promoted(self):
+        import json, time
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock, AsyncMock, patch
+        from backend.core.ouroboros.governance.governed_loop_service import GovernedLoopService, GovernedLoopConfig
+
+        with tempfile.TemporaryDirectory() as ev_dir:
+            ev = Path(ev_dir)
+            # Write a model_promoted event file
+            event = {
+                "schema_version": "reactor.1",
+                "event_type": "model_promoted",
+                "model_id": "v2",
+                "previous_model_id": "v1",
+                "training_batch_size": 40,
+                "promoted_at": "2026-03-09T07:00:00Z",
+            }
+            (ev / f"model_promoted_{int(time.time() * 1000)}.json").write_text(json.dumps(event))
+
+            config = GovernedLoopConfig(curriculum_enabled=True, reactor_event_poll_interval_s=0.0)
+            service = GovernedLoopService(config=config)
+            service._event_dir = ev
+            recorder = AsyncMock()
+            recorder.record_model_transition = AsyncMock(return_value=[])
+            service._model_attribution_recorder = recorder
+            seen: set[str] = set()
+            await service._handle_event_files(seen)
+            recorder.record_model_transition.assert_called_once_with(
+                new_model_id="v2",
+                previous_model_id="v1",
+                training_batch_size=40,
+                task_types=None,
+            )
+
+    async def test_unknown_event_type_does_not_raise(self):
+        import json, time
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import MagicMock, AsyncMock
+        from backend.core.ouroboros.governance.governed_loop_service import GovernedLoopService, GovernedLoopConfig
+
+        with tempfile.TemporaryDirectory() as ev_dir:
+            ev = Path(ev_dir)
+            (ev / f"unknown_{int(time.time() * 1000)}.json").write_text(
+                json.dumps({"event_type": "something_reactor_invented", "data": 42})
+            )
+            config = GovernedLoopConfig(curriculum_enabled=True)
+            service = GovernedLoopService(config=config)
+            service._event_dir = ev
+            service._model_attribution_recorder = AsyncMock()
+            seen: set[str] = set()
+            await service._handle_event_files(seen)  # must not raise
+
+
 class TestGovernedLoopIntakeRegistryWiring:
     """GovernedLoopService resolves RepoRegistry and exposes it on _repo_registry."""
 
