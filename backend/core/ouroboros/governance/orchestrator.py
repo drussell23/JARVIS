@@ -62,7 +62,7 @@ from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApply
 from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
 from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTerminalState
 from backend.core.ouroboros.governance.patch_benchmarker import BenchmarkResult, PatchBenchmarker
-from backend.core.ouroboros.integration import PerformanceRecord
+from backend.core.ouroboros.integration import PerformanceRecord, TaskDifficulty
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
@@ -698,7 +698,7 @@ class GovernedOrchestrator:
             record = PerformanceRecord(
                 model_id=getattr(ctx, "model_id", None) or "unknown",
                 task_type=br.task_type if br else "code_improvement",
-                difficulty=ctx.difficulty,
+                difficulty=getattr(ctx, "difficulty", TaskDifficulty.MODERATE),
                 success=ctx.phase == OperationPhase.COMPLETE,
                 latency_ms=getattr(ctx, "elapsed_ms", 0.0),
                 iterations_used=getattr(ctx, "iterations_used", 1),
