@@ -649,10 +649,12 @@ class PrimeProvider:
         prime_client: Any,
         max_tokens: int = 8192,
         repo_root: Optional[Path] = None,
+        repo_roots: Optional[Dict[str, Path]] = None,
     ) -> None:
         self._client = prime_client
         self._max_tokens = max_tokens
         self._repo_root = repo_root
+        self._repo_roots = repo_roots
 
     @property
     def provider_name(self) -> str:
@@ -674,7 +676,9 @@ class PrimeProvider:
         RuntimeError
             On schema validation failure (``gcp-jprime_schema_invalid:...``).
         """
-        prompt = _build_codegen_prompt(context, repo_root=self._repo_root)
+        prompt = _build_codegen_prompt(
+            context, repo_root=self._repo_root, repo_roots=self._repo_roots
+        )
         start = time.monotonic()
 
         response = await self._client.generate(
@@ -705,6 +709,7 @@ class PrimeProvider:
             context,
             source_hash,
             source_path,
+            repo_roots=self._repo_roots,
         )
 
         logger.info(
@@ -764,6 +769,7 @@ class ClaudeProvider:
         max_cost_per_op: float = 0.50,
         daily_budget: float = 10.00,
         repo_root: Optional[Path] = None,
+        repo_roots: Optional[Dict[str, Path]] = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -774,6 +780,7 @@ class ClaudeProvider:
         self._budget_reset_date = datetime.now(tz=timezone.utc).date()
         self._client: Any = None  # Lazy init
         self._repo_root = repo_root
+        self._repo_roots = repo_roots
 
     @property
     def provider_name(self) -> str:
@@ -830,7 +837,9 @@ class ClaudeProvider:
             raise RuntimeError("claude_budget_exhausted")
 
         client = self._ensure_client()
-        prompt = _build_codegen_prompt(context, repo_root=self._repo_root)
+        prompt = _build_codegen_prompt(
+            context, repo_root=self._repo_root, repo_roots=self._repo_roots
+        )
         start = time.monotonic()
 
         message = await client.messages.create(
@@ -869,6 +878,7 @@ class ClaudeProvider:
             context,
             source_hash,
             source_path,
+            repo_roots=self._repo_roots,
         )
 
         logger.info(

@@ -665,10 +665,20 @@ class GovernedLoopService:
 
         # Build RepoRegistry from environment (always; empty if env vars not set)
         repo_registry = RepoRegistry.from_env()
+        enabled_repos = repo_registry.list_enabled()
         logger.info(
             "[GovernedLoop] RepoRegistry enabled repos: %s",
-            [r.name for r in repo_registry.list_enabled()],
+            [r.name for r in enabled_repos],
         )
+
+        # Build repo_roots_map for cross-repo prompt/parse wiring
+        repo_roots_map: Dict[str, Path] = {r.name: r.local_path for r in enabled_repos}
+
+        # Retroactively inject repo_roots into providers now that registry is built
+        if primary is not None:
+            primary._repo_roots = repo_roots_map
+        if fallback is not None:
+            fallback._repo_roots = repo_roots_map
 
         # Build orchestrator
         orch_config = OrchestratorConfig(
