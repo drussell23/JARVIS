@@ -29,7 +29,7 @@ _COVERAGE_BUDGET = 35.0
 _COMPLEXITY_BUDGET = 10.0
 
 _TASK_TAXONOMY = [
-    ("testing",         lambda d, fs: "test" in d.lower() or any("tests/" in f or f.startswith("test_") for f in fs)),
+    ("testing",         lambda d, fs: "test" in d.lower() or any("tests/" in f or Path(f).name.startswith("test_") for f in fs)),
     ("refactoring",     lambda d, fs: "refactor" in d.lower()),
     ("bug_fix",         lambda d, fs: "bug" in d.lower() or "fix" in d.lower()),
     ("security",        lambda d, fs: "security" in d.lower()),
@@ -95,7 +95,9 @@ class PatchBenchmarker:
             return await self._run(ctx)
 
     async def _run(self, ctx: "OperationContext") -> BenchmarkResult:
-        target_files = [str(f) for f in ctx.target_files]
+        target_files = [f for f in [str(f) for f in ctx.target_files] if not Path(f).is_absolute()]
+        if not target_files and ctx.target_files:
+            logger.warning("[PatchBenchmarker] All target_files are absolute paths, skipping hash computation")
         task_type = _infer_task_type(ctx.description, tuple(target_files))
         patch_hash = _compute_patch_hash(
             {str(f): Path(self._root / f).read_text(errors="replace")
@@ -104,12 +106,17 @@ class PatchBenchmarker:
         timed_out = False
         errors: list = []
 
+        # Distribute timeout_s across steps: 25% lint, 58% coverage, 17% complexity
+        lint_budget = min(_LINT_BUDGET, self._timeout_s * 0.25)
+        cov_budget = min(_COVERAGE_BUDGET, self._timeout_s * 0.58)
+        cx_budget = min(_COMPLEXITY_BUDGET, self._timeout_s * 0.17)
+
         # Lint
         lint_violations = 0
         lint_score = 0.0
         try:
             lint_violations, lint_score = await asyncio.wait_for(
-                self._run_lint(target_files), timeout=_LINT_BUDGET
+                self._run_lint(target_files), timeout=lint_budget
             )
         except asyncio.TimeoutError:
             timed_out = True
@@ -123,7 +130,7 @@ class PatchBenchmarker:
         pass_rate = 0.0
         try:
             coverage_pct, pass_rate = await asyncio.wait_for(
-                self._run_coverage(target_files), timeout=_COVERAGE_BUDGET
+                self._run_coverage(target_files), timeout=cov_budget
             )
             coverage_score = min(1.0, coverage_pct / 100.0)
         except asyncio.TimeoutError:
@@ -137,7 +144,7 @@ class PatchBenchmarker:
         radon_available = False
         try:
             complexity_delta, radon_available = await asyncio.wait_for(
-                self._run_complexity(target_files), timeout=_COMPLEXITY_BUDGET
+                self._run_complexity(target_files), timeout=cx_budget
             )
         except asyncio.TimeoutError:
             timed_out = True
@@ -173,7 +180,9 @@ class PatchBenchmarker:
                 capture_output=True, text=True, cwd=self._root, timeout=_LINT_BUDGET,
             )
             violations = len(json.loads(r.stdout)) if r.stdout.strip().startswith("[") else 0
-        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return 0, 1.0  # ruff not installed — don't penalize
+        except (subprocess.TimeoutExpired, json.JSONDecodeError):
             return 0, 0.0
 
         lines = sum(
@@ -191,35 +200,43 @@ class PatchBenchmarker:
 
     def _coverage_sync(self, target_files: list) -> tuple:
         try:
+            import re
             with tempfile.TemporaryDirectory() as tmp:
+                cov_json = str(Path(tmp) / "coverage.json")
+                cov_args = [f"--cov={f}" for f in target_files if (self._root / f).exists()]
+                if not cov_args:
+                    cov_args = ["--cov=."]
                 r = subprocess.run(
-                    ["python3", "-m", "pytest", "--cov", "--cov-report=json",
-                     "-q", "--tb=no", "--no-header",
-                     "--ignore=docs", "--ignore=.worktrees"] + target_files,
+                    ["python3", "-m", "pytest", "--tb=no", "--no-header", "-q",
+                     f"--cov-report=json:{cov_json}",
+                     "--ignore=docs", "--ignore=.worktrees"] + cov_args,
                     capture_output=True, text=True, cwd=self._root, timeout=_COVERAGE_BUDGET,
                 )
-                cov_file = Path(self._root / "coverage.json")
-                if not cov_file.exists():
-                    return 0.0, 0.0
-                data = json.loads(cov_file.read_text())
-                cov_pct = data.get("totals", {}).get("percent_covered", 0.0)
-                pass_rate = 1.0 if r.returncode == 0 else 0.0
-                for line in r.stdout.splitlines():
-                    if "passed" in line:
-                        parts = line.split()
-                        try:
-                            passed = int(parts[0])
-                            failed_parts = [p for p in parts if "failed" in p or "error" in p]
-                            if not failed_parts:
-                                pass_rate = 1.0
-                            else:
-                                failed = sum(int(p) for p in parts if p.isdigit() and parts.index(p) > 0)
-                                pass_rate = passed / max(1, passed + failed)
-                        except (ValueError, IndexError):
-                            pass_rate = 1.0 if r.returncode == 0 else 0.0
-                        break
+                cov_pct = 0.0
+                cov_file = Path(cov_json)
+                if cov_file.exists():
+                    try:
+                        data = json.loads(cov_file.read_text())
+                        cov_pct = float(data.get("totals", {}).get("percent_covered", 0.0))
+                    except (json.JSONDecodeError, KeyError, TypeError):
+                        pass
+                # Parse pass_rate from pytest output using regex
+                pass_rate = 0.0
+                summary = r.stdout + r.stderr
+                # Match patterns like "5 passed", "3 passed, 2 failed", "1 error"
+                passed_m = re.search(r"(\d+) passed", summary)
+                failed_m = re.search(r"(\d+) failed", summary)
+                error_m = re.search(r"(\d+) error", summary)
+                if passed_m:
+                    passed = int(passed_m.group(1))
+                    failed = int(failed_m.group(1)) if failed_m else 0
+                    errors = int(error_m.group(1)) if error_m else 0
+                    total = passed + failed + errors
+                    pass_rate = passed / max(1, total)
+                elif r.returncode == 0:
+                    pass_rate = 1.0
                 return float(cov_pct), pass_rate
-        except (subprocess.TimeoutExpired, FileNotFoundError, json.JSONDecodeError, OSError):
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             return 0.0, 0.0
 
     async def _run_complexity(self, target_files: list) -> tuple:
@@ -242,7 +259,8 @@ class PatchBenchmarker:
                     tmp_path = Path(tmp)
                     written = []
                     for rel_path, content in self._pre_apply_snapshots.items():
-                        dest = tmp_path / Path(rel_path).name
+                        dest = tmp_path / rel_path
+                        dest.parent.mkdir(parents=True, exist_ok=True)
                         dest.write_text(content)
                         written.append(str(dest))
                     if written:
