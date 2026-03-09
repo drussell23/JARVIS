@@ -29,6 +29,7 @@ Terminal phases: COMPLETE, CANCELLED, EXPIRED, POSTMORTEM
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 import hashlib
 import json
@@ -40,6 +41,14 @@ from typing import Any, Dict, Optional, Set, Tuple
 from backend.core.ouroboros.governance.operation_id import generate_operation_id
 from backend.core.ouroboros.governance.risk_engine import RiskTier
 from backend.core.ouroboros.governance.routing_policy import RoutingDecision
+
+
+class ArchitecturalCycleError(ValueError):
+    """Raised when dependency_edges contains a directed cycle.
+
+    Detected at OperationContext construction via Kahn's algorithm.
+    Prevents deadlock before the GENERATE phase.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +252,36 @@ class ShadowResult:
 
 
 # ---------------------------------------------------------------------------
+# Saga Types
+# ---------------------------------------------------------------------------
+
+
+class SagaStepStatus(str, Enum):
+    """Per-repo lifecycle status inside a multi-repo saga."""
+
+    PENDING = "pending"
+    APPLYING = "applying"
+    APPLIED = "applied"
+    SKIPPED = "skipped"
+    FAILED = "failed"
+    COMPENSATING = "compensating"
+    COMPENSATED = "compensated"
+    COMPENSATION_FAILED = "compensation_failed"
+
+
+@dataclass(frozen=True)
+class RepoSagaStatus:
+    """Frozen per-repo status entry in a multi-repo saga."""
+
+    repo: str
+    status: SagaStepStatus
+    attempt: int = 0
+    last_error: str = ""
+    reason_code: str = ""
+    compensation_attempted: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Hash helper
 # ---------------------------------------------------------------------------
 
@@ -265,6 +304,33 @@ def _compute_hash(ctx_dict: Dict[str, Any]) -> str:
     """
     canonical = json.dumps(ctx_dict, sort_keys=True, default=str)
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _validate_dag(edges: Tuple[Tuple[str, str], ...]) -> None:
+    """Kahn's algorithm cycle detection. Raises ArchitecturalCycleError if cycle found."""
+    if not edges:
+        return
+    graph: Dict[str, list] = collections.defaultdict(list)
+    in_degree: Dict[str, int] = collections.defaultdict(int)
+    nodes: set = set()
+    for src, dst in edges:
+        graph[src].append(dst)
+        in_degree[dst] += 1
+        nodes.add(src)
+        nodes.add(dst)
+    queue = collections.deque(n for n in nodes if in_degree[n] == 0)
+    visited = 0
+    while queue:
+        node = queue.popleft()
+        visited += 1
+        for neighbor in graph[node]:
+            in_degree[neighbor] -= 1
+            if in_degree[neighbor] == 0:
+                queue.append(neighbor)
+    if visited < len(nodes):
+        raise ArchitecturalCycleError(
+            f"Cycle detected in dependency_edges: {edges}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +399,25 @@ class OperationContext:
     side_effects_blocked: bool = True
     pipeline_deadline: Optional[datetime] = None  # stamped once at submit(); phases compute remaining budget
 
+    # ---- Phase 3: Multi-repo saga fields ----
+    primary_repo: str = "jarvis"
+    repo_scope: Tuple[str, ...] = ("jarvis",)
+    cross_repo: bool = dataclasses.field(default=False, init=False)
+    dependency_edges: Tuple[Tuple[str, str], ...] = ()
+    apply_plan: Tuple[str, ...] = ()
+    repo_snapshots: Tuple[Tuple[str, str], ...] = ()
+    saga_id: str = ""
+    saga_state: Tuple[RepoSagaStatus, ...] = ()
+    schema_version: str = "3.0"
+
+    # ------------------------------------------------------------------
+    # Post-init
+    # ------------------------------------------------------------------
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "cross_repo", len(self.repo_scope) > 1)
+        _validate_dag(self.dependency_edges)
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
@@ -347,6 +432,14 @@ class OperationContext:
         policy_version: str = "",
         pipeline_deadline: Optional[datetime] = None,
         _timestamp: Optional[datetime] = None,
+        primary_repo: str = "jarvis",
+        repo_scope: Optional[Tuple[str, ...]] = None,
+        dependency_edges: Tuple[Tuple[str, str], ...] = (),
+        apply_plan: Tuple[str, ...] = (),
+        repo_snapshots: Tuple[Tuple[str, str], ...] = (),
+        saga_id: str = "",
+        saga_state: Tuple["RepoSagaStatus", ...] = (),
+        schema_version: str = "3.0",
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
 
@@ -370,6 +463,7 @@ class OperationContext:
         """
         now = _timestamp or datetime.now(tz=timezone.utc)
         resolved_op_id = op_id or generate_operation_id()
+        resolved_repo_scope = repo_scope if repo_scope is not None else (primary_repo,)
 
         # Build a temporary dict of all fields (except context_hash) for hashing
         fields_for_hash: Dict[str, Any] = {
@@ -389,6 +483,15 @@ class OperationContext:
             "policy_version": policy_version,
             "side_effects_blocked": True,
             "pipeline_deadline": pipeline_deadline,
+            "primary_repo": primary_repo,
+            "repo_scope": resolved_repo_scope,
+            "cross_repo": len(resolved_repo_scope) > 1,
+            "dependency_edges": dependency_edges,
+            "apply_plan": apply_plan,
+            "repo_snapshots": repo_snapshots,
+            "saga_id": saga_id,
+            "saga_state": saga_state,
+            "schema_version": schema_version,
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -410,6 +513,14 @@ class OperationContext:
             policy_version=policy_version,
             side_effects_blocked=True,
             pipeline_deadline=pipeline_deadline,
+            primary_repo=primary_repo,
+            repo_scope=resolved_repo_scope,
+            dependency_edges=dependency_edges,
+            apply_plan=apply_plan,
+            repo_snapshots=repo_snapshots,
+            saga_id=saga_id,
+            saga_state=saga_state,
+            schema_version=schema_version,
         )
 
     # ------------------------------------------------------------------
