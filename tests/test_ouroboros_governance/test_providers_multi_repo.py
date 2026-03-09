@@ -42,8 +42,8 @@ def test_cross_repo_prompt_groups_files_by_repo(tmp_path):
     ctx = _make_cross_repo_ctx(tmp_path)
     repo_roots = {"jarvis": tmp_path / "jarvis", "prime": tmp_path / "prime"}
     prompt = _build_codegen_prompt(ctx, repo_roots=repo_roots)
-    assert "jarvis" in prompt
-    assert "prime" in prompt
+    assert "[jarvis]" in prompt, "Expected [jarvis] repo label in file section header"
+    assert "[prime]" in prompt, "Expected [prime] repo label in file section header"
 
 
 def test_single_repo_prompt_unchanged(tmp_path):
@@ -69,8 +69,6 @@ def test_single_repo_prompt_unchanged(tmp_path):
 # ---------------------------------------------------------------------------
 # Task 5: _parse_generation_response() schema 2c.1 tests
 # ---------------------------------------------------------------------------
-
-import json
 
 
 def _valid_2c1_response(repos=("jarvis", "prime")):

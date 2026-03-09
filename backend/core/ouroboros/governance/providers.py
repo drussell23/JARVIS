@@ -438,11 +438,13 @@ def _parse_multi_repo_response(
                             f"{pfx}_schema_invalid:syntax_error:{repo_name}:{file_path}:{e}"
                         ) from e
 
-                # Validate op
+                # Validate op — unknown values are a model error, not a safe fallback
                 try:
                     op = FileOp(op_str)
                 except ValueError:
-                    op = FileOp.MODIFY
+                    raise RuntimeError(
+                        f"{pfx}_schema_invalid:unknown_op:{repo_name}:{file_path}:{op_str!r}"
+                    )
 
                 # Read preimage for MODIFY/DELETE ops
                 preimage: Optional[bytes] = None
@@ -459,7 +461,9 @@ def _parse_multi_repo_response(
                         preimage = b""
 
                 patched_files.append(PatchedFile(path=file_path, op=op, preimage=preimage))
-                new_content.append((file_path, full_content.encode()))
+                # DELETE ops carry no new bytes — omit from new_content
+                if op != FileOp.DELETE:
+                    new_content.append((file_path, full_content.encode()))
 
             repo_patches[repo_name] = RepoPatch(
                 repo=repo_name,
@@ -523,7 +527,9 @@ def _parse_generation_response(
     # Step 3: schema_version — route multi-repo schema to dedicated parser
     actual_version = data.get("schema_version", "__missing__")
     if actual_version == _SCHEMA_VERSION_MULTI:
-        return _parse_multi_repo_response(data, provider_name, duration_s, repo_roots or {})
+        if not repo_roots:
+            raise RuntimeError(f"{pfx}_schema_invalid:2c1_requires_repo_roots")
+        return _parse_multi_repo_response(data, provider_name, duration_s, repo_roots)
 
     if actual_version != _SCHEMA_VERSION:
         raise RuntimeError(
