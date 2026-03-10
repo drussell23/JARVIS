@@ -83,6 +83,15 @@ class ContextExpander:
             logger.info("[ContextExpander] Oracle not ready \u2014 using blind baseline")
             return ctx
 
+        # Freshness check: warn if index is stale (> 5 minutes old)
+        age_s = self._oracle.index_age_s()
+        if age_s > 300:
+            logger.warning(
+                "[ContextExpander] Oracle index is stale (%.0fs old) — "
+                "context expansion may use outdated graph data",
+                age_s,
+            )
+
         accumulated: List[str] = []
 
         # Pre-fetch fused neighborhood once (async, fault-isolated)

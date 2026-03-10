@@ -1344,6 +1344,7 @@ class TheOracle:
         self._file_hashes: Dict[str, str] = {}  # file_path -> content hash
         self._lock = asyncio.Lock()
         self._running = False
+        self._last_indexed_monotonic_ns: int = 0  # set after each full index build
 
         # Repository configurations
         self._repos: Dict[str, Path] = {
@@ -1369,6 +1370,7 @@ class TheOracle:
             logger.info(f"Loaded cached graph: {self._graph._metrics['total_nodes']} nodes, "
                        f"{self._graph._metrics['total_edges']} edges")
             self._running = True
+            self._last_indexed_monotonic_ns = time.monotonic_ns()
             return True
 
         # No cache, do full index
@@ -1376,6 +1378,7 @@ class TheOracle:
         await self.full_index()
 
         self._running = True
+        self._last_indexed_monotonic_ns = time.monotonic_ns()
         return True
 
     async def shutdown(self) -> None:
@@ -1765,6 +1768,12 @@ class TheOracle:
     def is_ready(self) -> bool:
         """Return True when the oracle has completed initialisation and is running."""
         return self._running
+
+    def index_age_s(self) -> float:
+        """Return seconds since last full index build. 0.0 if never indexed."""
+        if self._last_indexed_monotonic_ns == 0:
+            return 0.0
+        return (time.monotonic_ns() - self._last_indexed_monotonic_ns) / 1_000_000_000
 
     def get_status(self) -> Dict[str, Any]:
         """Get Oracle status."""

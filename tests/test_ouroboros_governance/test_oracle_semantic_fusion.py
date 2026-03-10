@@ -336,6 +336,7 @@ class TestContextExpanderFusedRendering:
         )
         oracle = MagicMock()
         oracle.get_status.return_value = {"running": True}
+        oracle.index_age_s.return_value = 0.0
         oracle.get_fused_neighborhood = AsyncMock(return_value=fused_nh)
         oracle.get_file_neighborhood = MagicMock()
 
@@ -429,6 +430,7 @@ class TestContextExpanderFusedRendering:
         )
         oracle = MagicMock()
         oracle.get_status.return_value = {"running": True}
+        oracle.index_age_s.return_value = 0.0
         oracle.get_fused_neighborhood = AsyncMock(side_effect=RuntimeError("chroma down"))
         oracle.get_file_neighborhood = MagicMock(return_value=structural_nh)
 

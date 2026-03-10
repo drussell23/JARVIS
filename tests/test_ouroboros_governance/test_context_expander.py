@@ -30,6 +30,7 @@ def _make_ready_oracle() -> MagicMock:
     """Return a MagicMock oracle that reports is_ready()=True."""
     oracle = MagicMock()
     oracle.is_ready.return_value = True
+    oracle.index_age_s.return_value = 0.0
     oracle.get_status.return_value = {"running": True}
     oracle.get_fused_neighborhood = AsyncMock(side_effect=Exception("no fused neighborhood"))
     oracle.get_file_neighborhood.side_effect = Exception("no structural neighborhood")
@@ -243,6 +244,7 @@ class TestContextExpanderOracleManifest:
         )
         oracle = MagicMock()
         oracle.get_status = MagicMock(return_value={"running": True})
+        oracle.index_age_s.return_value = 0.0
         oracle.get_file_neighborhood = MagicMock(return_value=neighborhood)
 
         captured_prompts = []
@@ -457,6 +459,7 @@ class TestContextExpanderOracleGuard:
 
         oracle = MagicMock()
         oracle.is_ready.return_value = True
+        oracle.index_age_s.return_value = 0.0
         oracle.get_fused_neighborhood = AsyncMock(side_effect=AttributeError("not present"))
 
         (tmp_path / "extra.py").write_text("# extra\n")
