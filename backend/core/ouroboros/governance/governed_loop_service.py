@@ -647,6 +647,24 @@ class GovernedLoopService:
                 trigger_source=trigger_source,
             )
 
+        # Gate: file-scope in-flight lock (before acquiring — prevents self-cancel)
+        import pathlib as _pl_gate
+        for _fp in ctx.target_files:
+            _canonical = str(_pl_gate.Path(_fp).resolve())
+            if _canonical in self._active_file_ops:
+                logger.warning(
+                    "[GovernedLoop] File-scope lock: %r already in-flight — "
+                    "rejecting op %s to prevent split-brain apply",
+                    _canonical,
+                    ctx.op_id,
+                )
+                return OperationResult(
+                    op_id=ctx.op_id,
+                    terminal_phase=OperationPhase.CANCELLED,
+                    reason_code="file_in_flight",
+                    trigger_source=trigger_source,
+                )
+
         # Execute pipeline
         self._active_ops.add(dedupe_key)
         _locked_files: list = []
@@ -858,18 +876,9 @@ class GovernedLoopService:
             None                 — preflight passed; caller should proceed.
             OperationContext     — early-exit ctx (CANCELLED); caller returns it.
         """
-        # --- File-scope in-flight lock: prevent split-brain concurrent applies ---
-        import pathlib as _pathlib
-        for _fp in ctx.target_files:
-            _canonical = str(_pathlib.Path(_fp).resolve())
-            if _canonical in self._active_file_ops:
-                logger.warning(
-                    "[GovernedLoop] File-scope lock: %r already in-flight — "
-                    "rejecting op %s to prevent split-brain apply",
-                    _canonical,
-                    ctx.op_id,
-                )
-                return ctx.advance(OperationPhase.CANCELLED)
+        # NOTE: File-scope in-flight lock is checked in submit() before the pipeline
+        # starts — not here.  Checking here would cause self-cancellation because
+        # submit() adds files to _active_file_ops before calling the orchestrator.
 
         # --- Cooldown guard: block if same file touched >3 times in 10 min ---
         import collections as _collections

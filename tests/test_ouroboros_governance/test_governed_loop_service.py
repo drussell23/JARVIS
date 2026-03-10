@@ -870,8 +870,13 @@ class TestFileScopeLock:
         assert isinstance(svc._active_file_ops, set)
         assert len(svc._active_file_ops) == 0
 
-    async def test_preflight_rejects_in_flight_file(self, tmp_path):
-        """_preflight_check returns CANCELLED when a target file is already in _active_file_ops."""
+    async def test_submit_rejects_in_flight_file(self, tmp_path):
+        """submit() returns reason_code='file_in_flight' when a target file is already locked."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+            ServiceState,
+        )
         from backend.core.ouroboros.governance.op_context import (
             OperationContext,
             OperationPhase,
@@ -879,62 +884,60 @@ class TestFileScopeLock:
         from pathlib import Path
 
         svc = self._make_service()
+        svc._state = ServiceState.ACTIVE
 
         # Simulate first op holding the file lock
         fp = str(Path(tmp_path / "tests" / "test_foo.py").resolve())
         svc._active_file_ops.add(fp)
 
-        # Create a context targeting the same file
         ctx = OperationContext.create(
             target_files=(fp,),
             description="fix test",
         )
-        # Give ctx a dummy pipeline deadline so budget check passes
-        from datetime import datetime, timezone, timedelta
-        ctx = ctx.with_pipeline_deadline(
-            datetime.now(tz=timezone.utc) + timedelta(seconds=600)
+        result = await svc.submit(ctx, trigger_source="test")
+
+        assert result.terminal_phase is OperationPhase.CANCELLED
+        assert result.reason_code == "file_in_flight"
+
+    async def test_submit_passes_for_different_file(self, tmp_path):
+        """submit() does NOT cancel with file_in_flight when target file is not locked."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            ServiceState,
         )
-
-        result = await svc._preflight_check(ctx)
-
-        assert result is not None, "Expected CANCELLED early-exit, got None (passed)"
-        assert result.phase is OperationPhase.CANCELLED
-        assert hasattr(result, "context_hash")  # confirms it's an OperationContext
-
-    async def test_preflight_passes_for_different_file(self, tmp_path):
-        """_preflight_check does NOT cancel when target file is not in _active_file_ops."""
         from backend.core.ouroboros.governance.op_context import OperationContext
         from pathlib import Path
+        from unittest.mock import MagicMock, AsyncMock
 
         svc = self._make_service()
+        svc._state = ServiceState.ACTIVE
 
-        # Simulate a DIFFERENT file being locked
+        # Lock a DIFFERENT file
         other_fp = str(Path(tmp_path / "tests" / "test_other.py").resolve())
         svc._active_file_ops.add(other_fp)
 
-        # Our op targets a different file
+        # Target a different file; wire a mock orchestrator so pipeline completes
         target_fp = str(Path(tmp_path / "tests" / "test_target.py").resolve())
-        ctx = OperationContext.create(
-            target_files=(target_fp,),
-            description="fix target",
-        )
-        from datetime import datetime, timezone, timedelta
-        ctx = ctx.with_pipeline_deadline(
-            datetime.now(tz=timezone.utc) + timedelta(seconds=600)
-        )
-
-        # _preflight_check will fail for other reasons (no generator), but NOT for file lock
-        # We only check it doesn't immediately return cancelled (None or non-file-lock reason)
-        # Patch the provider probe to avoid network calls
-        from unittest.mock import patch
-        with patch.object(svc, "_generator", None):  # skip probe
-            result = await svc._preflight_check(ctx)
-
-        # File lock should NOT trigger — result is None (passed) or cancelled for other reason
-        if result is not None:
-            assert "file_lock" not in str(getattr(result, "phase", "")), (
-                f"Got unexpected file_lock cancellation for different file: {result}"
+        from backend.core.ouroboros.governance.op_context import OperationPhase, GenerationResult
+        mock_orch = MagicMock()
+        async def _complete(_):
+            result_ctx = MagicMock(spec=OperationContext)
+            result_ctx.phase = OperationPhase.COMPLETE
+            result_ctx.generation = GenerationResult(
+                candidates=({"file": target_fp, "content": "pass"},),
+                provider_name="mock",
+                generation_duration_s=0.1,
             )
+            return result_ctx
+        mock_orch.run = AsyncMock(side_effect=_complete)
+        svc._orchestrator = mock_orch
+
+        ctx = OperationContext.create(target_files=(target_fp,), description="fix target")
+        result = await svc.submit(ctx, trigger_source="test")
+
+        # Must NOT be cancelled due to file_in_flight
+        assert result.reason_code != "file_in_flight", (
+            f"Different file should not trigger file_in_flight, got: {result.reason_code}"
+        )
 
     def test_canonical_path_used_for_lock_key(self, tmp_path):
         """Symlink and real path produce same canonical key (resolve() applied)."""
