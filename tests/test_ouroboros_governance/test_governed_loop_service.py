@@ -92,7 +92,7 @@ class TestGovernedLoopConfig:
         assert config.generation_timeout_s == 120.0
         assert config.approval_timeout_s == 600.0
         assert config.max_concurrent_ops == 2
-        assert config.initial_canary_slices == ("tests/",)
+        assert config.initial_canary_slices == ("tests/", "docs/")
         assert config.claude_daily_budget == 10.00
 
     def test_frozen(self) -> None:
