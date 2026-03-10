@@ -950,3 +950,90 @@ class TestFileScopeLock:
         assert canonical_real == canonical_link, (
             "Symlink and target should resolve to same canonical path"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestFrozenTierStamping
+# ---------------------------------------------------------------------------
+
+
+class TestFrozenTierStamping:
+    """GovernedLoopService.submit() stamps frozen_autonomy_tier onto ctx."""
+
+    async def test_observe_tier_stamped_for_core_file(self, tmp_path):
+        """Files under backend/core/ get frozen_autonomy_tier='observe'."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext,
+            OperationPhase,
+        )
+
+        config = GovernedLoopConfig(project_root=tmp_path)
+        stack = _mock_stack()
+        svc = GovernedLoopService(stack=stack, prime_client=None, config=config)
+        await svc.start()
+
+        captured_ctx = []
+
+        async def capturing_run(ctx):
+            captured_ctx.append(ctx)
+            return ctx.advance(OperationPhase.CANCELLED)
+
+        svc._orchestrator = MagicMock()
+        svc._orchestrator.run = capturing_run
+
+        ctx = OperationContext.create(
+            target_files=("backend/core/some_module.py",),
+            description="refactor core",
+        )
+        await svc.submit(ctx, trigger_source="backlog")
+
+        assert len(captured_ctx) >= 1
+        assert captured_ctx[0].frozen_autonomy_tier == "observe", (
+            f"Expected 'observe' for core file, got '{captured_ctx[0].frozen_autonomy_tier}'"
+        )
+        await svc.stop()
+
+    async def test_governed_tier_stamped_for_tests_file(self, tmp_path):
+        """Files under tests/ get frozen_autonomy_tier='governed'."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext,
+            OperationPhase,
+        )
+
+        config = GovernedLoopConfig(project_root=tmp_path)
+        stack = _mock_stack()
+        svc = GovernedLoopService(stack=stack, prime_client=None, config=config)
+        await svc.start()
+
+        captured_ctx = []
+
+        async def capturing_run(ctx):
+            captured_ctx.append(ctx)
+            return ctx.advance(OperationPhase.CANCELLED)
+
+        svc._orchestrator = MagicMock()
+        svc._orchestrator.run = capturing_run
+
+        ctx = OperationContext.create(
+            target_files=("tests/test_foo.py",),
+            description="fix test",
+        )
+        await svc.submit(ctx, trigger_source="test_failure")
+
+        assert len(captured_ctx) >= 1
+        assert captured_ctx[0].frozen_autonomy_tier == "governed", (
+            f"Expected 'governed' for tests/ file, got '{captured_ctx[0].frozen_autonomy_tier}'"
+        )
+        await svc.stop()

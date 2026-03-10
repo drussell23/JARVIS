@@ -819,3 +819,50 @@ class TestTelemetryIntegration:
         assert prime_hashes.get("prime") == "hash_prime_prev"
         assert "prime" not in jarvis_hashes
         assert "jarvis" not in prime_hashes
+
+
+# ---------------------------------------------------------------------------
+# TestFrozenAutonomyTier
+# ---------------------------------------------------------------------------
+
+
+class TestFrozenAutonomyTier:
+    """OperationContext.frozen_autonomy_tier field and with_frozen_autonomy_tier()."""
+
+    def _make_ctx(self):
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        return OperationContext.create(
+            target_files=("tests/test_foo.py",),
+            description="test",
+        )
+
+    def test_default_is_governed(self):
+        """frozen_autonomy_tier defaults to 'governed' (backward compat)."""
+        ctx = self._make_ctx()
+        assert ctx.frozen_autonomy_tier == "governed"
+
+    def test_with_frozen_autonomy_tier_sets_field(self):
+        """with_frozen_autonomy_tier() returns new context with updated tier."""
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_frozen_autonomy_tier("observe")
+        assert ctx2.frozen_autonomy_tier == "observe"
+        assert ctx.frozen_autonomy_tier == "governed"  # original unchanged
+
+    def test_with_frozen_autonomy_tier_updates_hash(self):
+        """Hash changes when frozen_autonomy_tier changes (chain integrity)."""
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_frozen_autonomy_tier("observe")
+        assert ctx2.context_hash != ctx.context_hash
+
+    def test_with_frozen_autonomy_tier_chains_hash(self):
+        """previous_hash of new ctx equals context_hash of old ctx."""
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_frozen_autonomy_tier("observe")
+        assert ctx2.previous_hash == ctx.context_hash
+
+    def test_governed_tier_is_preserved_through_advance(self):
+        """frozen_autonomy_tier is preserved when advancing phase."""
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+        ctx = self._make_ctx().with_frozen_autonomy_tier("observe")
+        ctx2 = ctx.advance(OperationPhase.ROUTE)
+        assert ctx2.frozen_autonomy_tier == "observe"

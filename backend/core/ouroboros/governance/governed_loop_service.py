@@ -196,6 +196,38 @@ def _expected_provider_from_pressure(snap: ResourceSnapshot) -> str:
     return "GCP_PRIME_SPOT"
 
 
+def _infer_canary_slice(target_files: tuple) -> str:
+    """Derive the most restrictive canary slice from target file paths.
+
+    Checks all files and returns the most constrained slice:
+    - "tests/" and "docs/" → GOVERNED (lowest restriction)
+    - "backend/core/" → OBSERVE
+    - "" (root default) → OBSERVE
+
+    When files span multiple slices, returns the most restrictive.
+    """
+    # Ordered from most restrictive to least restrictive
+    _SLICE_ORDER = ["backend/core/", "", "tests/", "docs/"]
+    found: set = set()
+    for fp in target_files:
+        fp_norm = fp.replace("\\", "/").lstrip("./")
+        if fp_norm.startswith("tests/"):
+            found.add("tests/")
+        elif fp_norm.startswith("docs/"):
+            found.add("docs/")
+        elif fp_norm.startswith("backend/core/"):
+            found.add("backend/core/")
+        else:
+            found.add("")
+    if not found:
+        return ""
+    # Return most restrictive: OBSERVE slices (backend/core/, "") beat GOVERNED slices
+    for s in _SLICE_ORDER:
+        if s in found:
+            return s
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # ServiceState
 # ---------------------------------------------------------------------------
@@ -715,6 +747,20 @@ class GovernedLoopService:
             )
             tc = TelemetryContext(local_node=host_tel, routing_intent=intent_tel)
             ctx = ctx.with_telemetry(tc)
+
+            # Freeze autonomy tier at submit time — GATE reads ctx.frozen_autonomy_tier
+            # not live TrustGraduator (prevents promotion races under concurrent ops).
+            _canary_slice = _infer_canary_slice(ctx.target_files)
+            _frozen_tier = "governed"  # default: backward compat
+            if self._trust_graduator is not None:
+                _tier_cfg = self._trust_graduator.get_config(
+                    trigger_source=trigger_source,
+                    repo=ctx.primary_repo,
+                    canary_slice=_canary_slice,
+                )
+                if _tier_cfg is not None:
+                    _frozen_tier = _tier_cfg.current_tier.value.lower()
+            ctx = ctx.with_frozen_autonomy_tier(_frozen_tier)
 
             # Connectivity preflight (spends from deadline budget)
             if self._generator is not None and self._ledger is not None:

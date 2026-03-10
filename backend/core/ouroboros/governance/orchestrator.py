@@ -504,6 +504,16 @@ class GovernedOrchestrator:
             )
             return ctx
 
+        # Autonomy tier gate: frozen at submit() to prevent TrustGraduator race.
+        # "observe" → force APPROVAL_REQUIRED regardless of risk_tier.
+        _frozen_tier = getattr(ctx, "frozen_autonomy_tier", "governed")
+        if _frozen_tier == "observe" and risk_tier is not RiskTier.APPROVAL_REQUIRED:
+            risk_tier = RiskTier.APPROVAL_REQUIRED
+            logger.info(
+                "[Orchestrator] GATE: frozen_tier=observe → APPROVAL_REQUIRED; op=%s",
+                ctx.op_id,
+            )
+
         # ---- Phase 6: APPROVE (conditional) ----
         if risk_tier is RiskTier.APPROVAL_REQUIRED:
             if self._approval_provider is None:

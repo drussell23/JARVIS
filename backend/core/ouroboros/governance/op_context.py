@@ -483,6 +483,9 @@ class OperationContext:
     # e.g. (("jarvis", "abc123..."), ("prime", "def456..."))
     # Frozen-safe representation of Dict[repo_name, last_context_hash]
 
+    # ---- Autonomy tier frozen at submit() — gate reads this, never re-queries TrustGraduator ----
+    frozen_autonomy_tier: str = "governed"  # "governed" | "observe"; default = backward compat
+
     # ------------------------------------------------------------------
     # Post-init
     # ------------------------------------------------------------------
@@ -774,6 +777,28 @@ class OperationContext:
         intermediate = dataclasses.replace(
             self,
             telemetry=updated_tc,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_frozen_autonomy_tier(self, tier: str) -> "OperationContext":
+        """Stamp autonomy tier onto context at submit time (no phase change).
+
+        Called exactly once by GovernedLoopService.submit() before handing ctx
+        to the orchestrator. Gate phase reads ctx.frozen_autonomy_tier instead
+        of querying TrustGraduator live, preventing promotion races.
+
+        Parameters
+        ----------
+        tier:
+            ``"governed"`` (auto-proceed) or ``"observe"`` (requires approval).
+        """
+        intermediate = dataclasses.replace(
+            self,
+            frozen_autonomy_tier=tier,
             previous_hash=self.context_hash,
             context_hash="",
         )

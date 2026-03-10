@@ -897,3 +897,66 @@ class TestOracleIncrementalUpdate:
 
         # Must not raise and must complete instantly (no oracle to call)
         await orch._oracle_incremental_update([Path("/tmp/foo.py")])
+
+
+# ---------------------------------------------------------------------------
+# TestObserveTierGateCheck
+# ---------------------------------------------------------------------------
+
+
+class TestObserveTierGateCheck:
+    """frozen_autonomy_tier='observe' forces APPROVAL_REQUIRED at GATE phase."""
+
+    def _make_orchestrator(self):
+        """Build a GovernedOrchestrator with minimal mocked stack."""
+        stack = _mock_stack(
+            can_write_result=(True, "ok"),
+            risk_tier=RiskTier.SAFE_AUTO,
+        )
+        config = OrchestratorConfig(project_root=Path("/tmp/test"))
+        orch = GovernedOrchestrator(
+            stack=stack,
+            generator=_mock_generator(),
+            approval_provider=None,
+            config=config,
+        )
+        return orch, stack
+
+    async def test_observe_tier_triggers_approval_when_provider_missing(self):
+        """observe tier → APPROVAL_REQUIRED → pipeline exits (no approval provider)."""
+        ctx = _make_context(
+            target_files=("backend/core/some_module.py",),
+        ).with_frozen_autonomy_tier("observe")
+
+        orch, stack = self._make_orchestrator()
+
+        # No approval provider → APPROVAL_REQUIRED path cancels
+        result = await orch.run(ctx)
+
+        assert result.phase in (
+            OperationPhase.CANCELLED,
+            OperationPhase.POSTMORTEM,
+            OperationPhase.COMPLETE,
+        ), (
+            f"Expected non-trivial terminal phase for observe tier, got {result.phase}"
+        )
+        # The key check: it must NOT reach COMPLETE without going through approval
+        # (with approval_provider=None, APPROVAL_REQUIRED path should cancel, not complete)
+        assert result.phase is not OperationPhase.COMPLETE, (
+            "observe tier with no approval provider should not reach COMPLETE"
+        )
+
+    async def test_governed_tier_does_not_force_approval(self):
+        """governed tier with SAFE_AUTO risk does NOT force APPROVAL_REQUIRED at GATE."""
+        ctx = _make_context(
+            target_files=("tests/test_foo.py",),
+        ).with_frozen_autonomy_tier("governed")
+
+        orch, stack = self._make_orchestrator()
+
+        result = await orch.run(ctx)
+
+        # With governed tier + SAFE_AUTO risk + mock change_engine success → COMPLETE
+        assert result.phase is OperationPhase.COMPLETE, (
+            f"Expected COMPLETE for governed tier + SAFE_AUTO, got {result.phase}"
+        )
