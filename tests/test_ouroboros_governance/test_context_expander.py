@@ -302,12 +302,14 @@ class TestContextExpanderNeighborhoodManifest:
     """Tests for the get_file_neighborhood integration in ContextExpander."""
 
     def _make_ctx(self, description="fix the service", target_files=("backend/core/service.py",)):
-        from backend.core.ouroboros.governance.op_context import OperationContext
-        return OperationContext.create(
+        from backend.core.ouroboros.governance.op_context import OperationContext, OperationPhase
+        ctx = OperationContext.create(
             op_id="test-op-1",
             description=description,
             target_files=tuple(target_files),
         )
+        ctx = ctx.advance(OperationPhase.ROUTE).advance(OperationPhase.CONTEXT_EXPANSION)
+        return ctx
 
     def _make_oracle(self, neighborhood=None):
         from backend.core.ouroboros.oracle import FileNeighborhood
@@ -361,7 +363,7 @@ class TestContextExpanderNeighborhoodManifest:
         prompt = expander._build_expansion_prompt(ctx, [], oracle=oracle)
 
         # Exactly 10 callers shown, plus the "and N more" indicator
-        shown = sum(1 for i in range(15) if f"caller_{i}.py" in prompt)
+        shown = sum(1 for line in prompt.splitlines() if "caller_" in line and line.strip().startswith("- "))
         assert shown == 10
         assert "and 5 more" in prompt
 

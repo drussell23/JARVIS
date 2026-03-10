@@ -132,7 +132,6 @@ class ContextExpander:
         self,
         ctx: OperationContext,
         already_fetched: List[str],
-        oracle_files: Optional[List[str]] = None,
         oracle: Optional[Any] = None,
     ) -> str:
         """Build a lightweight prompt — filenames only, no file contents."""
@@ -154,13 +153,6 @@ class ContextExpander:
                     available_section = self._render_neighborhood_section(neighborhood)
             except Exception:
                 available_section = ""  # fall back silently
-        elif oracle_files:
-            # Legacy fallback: flat file list from keyword query
-            available_section = (
-                "\nAvailable files related to this task (real paths — choose from these):\n"
-                + "".join(f"  - {f}\n" for f in oracle_files)
-                + "\nWhich of these (if any) would help you generate a correct patch?\n"
-            )
         return (
             f"Task: {ctx.description}\n\n"
             f"Target files to be modified:\n{target_list}\n\n"
