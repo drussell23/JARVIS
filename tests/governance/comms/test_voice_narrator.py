@@ -150,7 +150,6 @@ class TestSeverityAwareDebounce:
 
     def _make_msg(self, msg_type, op_id: str = "op-1"):
         from unittest.mock import MagicMock
-        from backend.core.ouroboros.governance.comm_protocol import MessageType
         msg = MagicMock()
         msg.msg_type = msg_type
         msg.op_id = op_id
