@@ -60,6 +60,24 @@ PRESSURE_THRESHOLDS: Dict[str, float] = {
 }
 
 
+def _cpu_emergency_for_load(active_ops: int) -> float:
+    """Scale CPU emergency threshold by active operation count.
+
+    Higher load → higher threshold before declaring EMERGENCY.
+    Prevents false-positive shutdown when concurrent ops legitimately drive CPU high.
+
+    active_ops 0-1 → base threshold (95%)
+    active_ops 2-5 → base + 2% (97%)
+    active_ops >5  → base + 4% (99%)
+    """
+    base = PRESSURE_THRESHOLDS["cpu_emergency"]
+    if active_ops > 5:
+        return min(99.0, base + 4.0)
+    if active_ops >= 2:
+        return min(99.0, base + 2.0)
+    return base
+
+
 # ---------------------------------------------------------------------------
 # ResourceSnapshot
 # ---------------------------------------------------------------------------
@@ -103,6 +121,48 @@ class ResourceSnapshot:
             level = max(level, PressureLevel.ELEVATED)
 
         # Event loop latency
+        if self.event_loop_latency_ms >= PRESSURE_THRESHOLDS["latency_critical_ms"]:
+            level = max(level, PressureLevel.CRITICAL)
+        elif self.event_loop_latency_ms >= PRESSURE_THRESHOLDS["latency_elevated_ms"]:
+            level = max(level, PressureLevel.ELEVATED)
+
+        # Disk IO
+        if self.disk_io_busy:
+            level = max(level, PressureLevel.ELEVATED)
+
+        return level
+
+    def pressure_for_load(self, active_ops: int) -> "PressureLevel":
+        """Compute pressure level with CPU emergency threshold scaled by active op count.
+
+        Use instead of ``overall_pressure`` when making routing/shutdown decisions
+        during high concurrent load to prevent false-positive EMERGENCY classification.
+
+        Parameters
+        ----------
+        active_ops:
+            Number of operations currently in-flight (e.g. ``len(svc._active_ops)``).
+        """
+        level = PressureLevel.NORMAL
+
+        # RAM pressure (same as overall_pressure — no scaling for RAM)
+        if self.ram_percent >= PRESSURE_THRESHOLDS["ram_emergency"]:
+            level = max(level, PressureLevel.EMERGENCY)
+        elif self.ram_percent >= PRESSURE_THRESHOLDS["ram_critical"]:
+            level = max(level, PressureLevel.CRITICAL)
+        elif self.ram_percent >= PRESSURE_THRESHOLDS["ram_elevated"]:
+            level = max(level, PressureLevel.ELEVATED)
+
+        # CPU pressure — threshold scaled by load
+        cpu_emergency = _cpu_emergency_for_load(active_ops)
+        if self.cpu_percent >= cpu_emergency:
+            level = max(level, PressureLevel.EMERGENCY)
+        elif self.cpu_percent >= PRESSURE_THRESHOLDS["cpu_critical"]:
+            level = max(level, PressureLevel.CRITICAL)
+        elif self.cpu_percent >= PRESSURE_THRESHOLDS["cpu_elevated"]:
+            level = max(level, PressureLevel.ELEVATED)
+
+        # Event loop latency (no scaling)
         if self.event_loop_latency_ms >= PRESSURE_THRESHOLDS["latency_critical_ms"]:
             level = max(level, PressureLevel.CRITICAL)
         elif self.event_loop_latency_ms >= PRESSURE_THRESHOLDS["latency_elevated_ms"]:

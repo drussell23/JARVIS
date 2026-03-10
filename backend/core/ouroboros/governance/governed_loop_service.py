@@ -185,13 +185,16 @@ async def _record_ledger(
         )
 
 
-def _expected_provider_from_pressure(snap: ResourceSnapshot) -> str:
+def _expected_provider_from_pressure(snap: ResourceSnapshot, active_ops: int = 0) -> str:
     """Derive the expected provider string from the snapshot's pressure level.
 
     NORMAL / ELEVATED  → GCP_PRIME_SPOT  (cloud inference preferred)
     CRITICAL / EMERGENCY → LOCAL_CLAUDE  (local fallback under resource pressure)
+
+    Uses ``pressure_for_load(active_ops)`` so that legitimate concurrent load does not
+    falsely elevate the routing decision to LOCAL_CLAUDE.
     """
-    if snap.overall_pressure >= PressureLevel.CRITICAL:
+    if snap.pressure_for_load(active_ops) >= PressureLevel.CRITICAL:
         return "LOCAL_CLAUDE"
     return "GCP_PRIME_SPOT"
 
@@ -666,7 +669,7 @@ class GovernedLoopService:
                 arch=snap.platform_arch,
                 cpu_percent=snap.cpu_percent,           # already quantized
                 ram_available_gb=snap.ram_available_gb, # already quantized
-                pressure=snap.overall_pressure.name,
+                pressure=snap.pressure_for_load(len(self._active_ops)).name,
                 sampled_at_utc=datetime.now(tz=timezone.utc).isoformat(),
                 sampled_monotonic_ns=snap.sampled_monotonic_ns,
                 collector_status=snap.collector_status,
@@ -736,8 +739,8 @@ class GovernedLoopService:
                 )
 
             intent_tel = RoutingIntentTelemetry(
-                expected_provider=_expected_provider_from_pressure(snap),
-                policy_reason=snap.overall_pressure.name,
+                expected_provider=_expected_provider_from_pressure(snap, len(self._active_ops)),
+                policy_reason=snap.pressure_for_load(len(self._active_ops)).name,
                 brain_id=brain.brain_id,
                 brain_model=brain.model_name,
                 routing_reason=brain.routing_reason,

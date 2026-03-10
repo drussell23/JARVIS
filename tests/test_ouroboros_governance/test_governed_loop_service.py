@@ -1106,3 +1106,68 @@ class TestCooldownSymlinkResolution:
         assert result.phase is OperationPhase.CANCELLED, (
             f"Expected CANCELLED, got {result.phase}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestPressureForLoadRouting
+# ---------------------------------------------------------------------------
+
+
+class TestPressureForLoadRouting:
+    """GLS routing uses pressure_for_load(active_ops) not overall_pressure."""
+
+    def test_expected_provider_uses_load_aware_pressure(self):
+        """_expected_provider_from_pressure scales CPU emergency threshold by active_ops.
+
+        96% CPU is EMERGENCY at 0 ops (>= 95% base threshold) and CRITICAL at 6 ops
+        (below 99% scaled emergency threshold, but still above 80% critical threshold).
+        Both EMERGENCY and CRITICAL route to LOCAL_CLAUDE — the load-aware scaling
+        prevents false-positive EMERGENCY classification but does not suppress CRITICAL.
+
+        A CPU reading between CRITICAL (80%) and base EMERGENCY (95%) is used to
+        demonstrate that GCP_PRIME_SPOT is preferred under light load.
+        """
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _expected_provider_from_pressure,
+        )
+        from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot, PressureLevel
+
+        # CPU at 96% — EMERGENCY at 0 ops, CRITICAL (not EMERGENCY) at 6 ops
+        # Both CRITICAL and EMERGENCY still route to LOCAL_CLAUDE (expected: no change in provider)
+        snap_high = ResourceSnapshot(
+            ram_percent=10.0,
+            cpu_percent=96.0,
+            event_loop_latency_ms=5.0,
+            disk_io_busy=False,
+        )
+        assert snap_high.pressure_for_load(0) == PressureLevel.EMERGENCY, (
+            "Sanity: 96% CPU at 0 ops should be EMERGENCY"
+        )
+        assert snap_high.pressure_for_load(6) == PressureLevel.CRITICAL, (
+            "Sanity: 96% CPU at 6 ops should be CRITICAL (scaled emergency=99%, still >= 80% critical)"
+        )
+        # With 0 active ops: 96% >= 95% emergency → LOCAL_CLAUDE
+        assert _expected_provider_from_pressure(snap_high, active_ops=0) == "LOCAL_CLAUDE", (
+            "96% CPU + 0 ops: EMERGENCY → LOCAL_CLAUDE"
+        )
+        # With 6 active ops: 96% CRITICAL (not EMERGENCY) → LOCAL_CLAUDE (CRITICAL still falls back)
+        assert _expected_provider_from_pressure(snap_high, active_ops=6) == "LOCAL_CLAUDE", (
+            "96% CPU + 6 ops: CRITICAL → LOCAL_CLAUDE (CRITICAL still falls back)"
+        )
+
+        # CPU at 72% — below CRITICAL threshold: ELEVATED at any load count → GCP_PRIME_SPOT
+        snap_mod = ResourceSnapshot(
+            ram_percent=10.0,
+            cpu_percent=72.0,
+            event_loop_latency_ms=5.0,
+            disk_io_busy=False,
+        )
+        assert snap_mod.pressure_for_load(0) == PressureLevel.ELEVATED, (
+            "Sanity: 72% CPU should be ELEVATED"
+        )
+        assert _expected_provider_from_pressure(snap_mod, active_ops=0) == "GCP_PRIME_SPOT", (
+            "72% CPU + 0 ops: ELEVATED → GCP_PRIME_SPOT"
+        )
+        assert _expected_provider_from_pressure(snap_mod, active_ops=6) == "GCP_PRIME_SPOT", (
+            "72% CPU + 6 ops: ELEVATED → GCP_PRIME_SPOT"
+        )

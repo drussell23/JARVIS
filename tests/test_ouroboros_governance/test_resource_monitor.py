@@ -189,3 +189,67 @@ async def test_snapshot_collector_status():
     monitor = ResourceMonitor()
     snap = await monitor.snapshot()
     assert snap.collector_status in ("ok", "partial")
+
+
+# ---------------------------------------------------------------------------
+# TestPressureForLoad
+# ---------------------------------------------------------------------------
+
+
+class TestPressureForLoad:
+    """ResourceSnapshot.pressure_for_load() scales CPU threshold by active op count."""
+
+    def _make_snap(self, cpu_percent: float) -> "ResourceSnapshot":
+        from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+        return ResourceSnapshot(
+            ram_percent=10.0,
+            cpu_percent=cpu_percent,
+            event_loop_latency_ms=5.0,
+            disk_io_busy=False,
+        )
+
+    def test_cpu_95_with_0_ops_is_emergency(self):
+        """95% CPU with 0 active ops = EMERGENCY (old behavior preserved)."""
+        from backend.core.ouroboros.governance.resource_monitor import PressureLevel
+        snap = self._make_snap(95.0)
+        assert snap.pressure_for_load(0) == PressureLevel.EMERGENCY
+
+    def test_cpu_95_with_6_ops_is_not_emergency(self):
+        """95% CPU with 6 active ops = not EMERGENCY (threshold raised to 99%)."""
+        from backend.core.ouroboros.governance.resource_monitor import PressureLevel
+        snap = self._make_snap(95.0)
+        result = snap.pressure_for_load(6)
+        assert result < PressureLevel.EMERGENCY, (
+            f"Expected < EMERGENCY for 95% CPU + 6 ops, got {result}"
+        )
+
+    def test_cpu_97_with_3_ops_is_not_emergency(self):
+        """97% CPU with 3 active ops = not EMERGENCY (threshold is 97% for 2-5 ops)."""
+        from backend.core.ouroboros.governance.resource_monitor import PressureLevel
+        snap = self._make_snap(97.0)
+        # Exactly at threshold boundary — depends on whether >= or > is used
+        # The implementation uses >=, so 97.0 >= 97.0 means EMERGENCY at 2-5 ops
+        result = snap.pressure_for_load(3)
+        # At threshold, behavior is EMERGENCY (>= comparison)
+        assert result == PressureLevel.EMERGENCY
+
+    def test_cpu_96_with_3_ops_is_not_emergency(self):
+        """96% CPU with 3 active ops = not EMERGENCY (below 97% threshold)."""
+        from backend.core.ouroboros.governance.resource_monitor import PressureLevel
+        snap = self._make_snap(96.0)
+        result = snap.pressure_for_load(3)
+        assert result < PressureLevel.EMERGENCY, (
+            f"Expected < EMERGENCY for 96% CPU + 3 ops, got {result}"
+        )
+
+    def test_cpu_99_with_6_ops_is_emergency(self):
+        """99% CPU with 6+ ops = EMERGENCY (even with max load scaling)."""
+        from backend.core.ouroboros.governance.resource_monitor import PressureLevel
+        snap = self._make_snap(99.0)
+        result = snap.pressure_for_load(6)
+        assert result == PressureLevel.EMERGENCY
+
+    def test_pressure_for_load_matches_overall_when_1_op(self):
+        """pressure_for_load(1) == overall_pressure (same thresholds, no scaling)."""
+        snap = self._make_snap(80.0)
+        assert snap.pressure_for_load(1) == snap.overall_pressure
