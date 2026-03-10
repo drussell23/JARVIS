@@ -32,6 +32,11 @@ from backend.core.ouroboros.governance.op_context import (
     OperationContext,
 )
 
+try:
+    from backend.core.prime_client import TaskProfile as _TaskProfile
+except ImportError:
+    _TaskProfile = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("Ouroboros.Providers")
 
 
@@ -58,8 +63,10 @@ _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
 _MAX_TEST_FILES = 2                # hard cap on discovered test files
 _SCHEMA_VERSION = "2b.1"
 _SCHEMA_VERSION_MULTI = "2c.1"
+_SCHEMA_VERSION_DIFF = "2b.1-diff"   # Task 4: unified-diff output for single-file tasks
 _SCHEMA_TOP_LEVEL_KEYS = frozenset({"schema_version", "candidates", "provider_metadata"})
 _CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "rationale"})
+_DIFF_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "unified_diff", "rationale"})
 
 # ── Tool-use interface ────────────────────────────────────────────────
 _TOOL_SCHEMA_VERSION = "2b.2-tool"
@@ -103,6 +110,77 @@ def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -
 def _file_source_hash(content: str) -> str:
     """Return hex SHA-256 of file content."""
     return hashlib.sha256(content.encode()).hexdigest()
+
+
+def _apply_unified_diff(original: str, diff_text: str) -> str:
+    """Apply a unified diff to *original*, returning patched content.
+
+    Supports standard GNU unified-diff format:
+      @@ -start[,count] +start[,count] @@
+      ' ' context line
+      '-' removed line
+      '+' added line
+
+    Hunks are applied in reverse order so earlier-hunk indices remain valid
+    after later-hunk edits.
+
+    Raises
+    ------
+    ValueError
+        If a hunk's context lines do not match the original at the expected
+        position, indicating a stale or malformed diff.
+    """
+    orig_lines = original.splitlines(keepends=True)
+    result: List[str] = list(orig_lines)
+
+    _hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+    diff_lines = diff_text.splitlines(keepends=True)
+
+    # Skip --- / +++ header lines
+    i = 0
+    while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
+        i += 1
+
+    hunks: List[Tuple[int, List[str], List[str]]] = []
+    while i < len(diff_lines):
+        m = _hunk_re.match(diff_lines[i])
+        if m is None:
+            i += 1
+            continue
+
+        orig_start = int(m.group(1)) - 1  # 0-indexed
+        i += 1
+
+        hunk_orig: List[str] = []
+        hunk_new: List[str] = []
+        while i < len(diff_lines) and not _hunk_re.match(diff_lines[i]):
+            line = diff_lines[i]
+            if line.startswith("-"):
+                hunk_orig.append(line[1:])
+            elif line.startswith("+"):
+                hunk_new.append(line[1:])
+            elif line.startswith(" "):
+                hunk_orig.append(line[1:])
+                hunk_new.append(line[1:])
+            # Ignore "\\ No newline at end of file" and stray lines
+            i += 1
+
+        hunks.append((orig_start, hunk_orig, hunk_new))
+
+    # Apply hunks bottom-to-top so earlier indices stay valid
+    for orig_start, hunk_orig, hunk_new in reversed(hunks):
+        end = orig_start + len(hunk_orig)
+        actual = result[orig_start:end]
+        # Normalise line endings for comparison only
+        if [ln.rstrip("\n\r") for ln in actual] != [ln.rstrip("\n\r") for ln in hunk_orig]:
+            raise ValueError(
+                f"Diff hunk at line {orig_start + 1} does not match source — "
+                f"expected {hunk_orig[:2]!r}, got {actual[:2]!r}"
+            )
+        result[orig_start:end] = hunk_new
+
+    return "".join(result)
 
 
 def _find_context_files(
@@ -365,7 +443,8 @@ def _build_codegen_prompt(
         )
 
     # ── 3. Output schema instruction ────────────────────────────────────
-    if ctx.cross_repo and repo_roots:
+    _single_file_task = len(ctx.target_files) == 1 and not getattr(ctx, "cross_repo", False)
+    if getattr(ctx, "cross_repo", False) and repo_roots:
         repos_listed = "\n".join(
             f'        "{r}": [{{"file_path": "...", "full_content": "...", "op": "modify"}}]'
             for r in ctx.repo_scope
@@ -403,6 +482,39 @@ Rules:
 - `full_content` must be the **complete** file (not a diff or patch).
 - Python files must be syntactically valid.
 - Only include repos that actually require changes. Omit unchanged repos.
+- No extra keys at any level. Return ONLY the JSON object."""
+    elif _single_file_task:
+        # Task 4: ask for a unified diff — more token-efficient for focused edits
+        schema_instruction = f"""## Output Schema
+
+Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_DIFF}"):
+
+```json
+{{
+  "schema_version": "{_SCHEMA_VERSION_DIFF}",
+  "candidates": [
+    {{
+      "candidate_id": "c1",
+      "file_path": "<repo-relative path matching the target file>",
+      "unified_diff": "@@ -5,3 +5,4 @@\\n context\\n-old line\\n+new line\\n context",
+      "rationale": "<one sentence, max 200 chars>"
+    }}
+  ],
+  "provider_metadata": {{
+    "model_id": "<your model identifier>",
+    "reasoning_summary": "<max 200 chars>"
+  }}
+}}
+```
+
+Rules:
+- Return 1–3 candidates. c1 = primary approach, c2 = alternative.
+- `unified_diff` must be a valid GNU unified diff (no --- / +++ header needed).
+  - @@ hunk headers: `@@ -start[,count] +start[,count] @@`
+  - Prefix context lines with a space, removed lines with `-`, added lines with `+`.
+  - Include 3 lines of unchanged context around each change.
+- The diff must apply cleanly to the source file shown above.
+- Python changes must result in syntactically valid code.
 - No extra keys at any level. Return ONLY the JSON object."""
     else:
         schema_instruction = f"""## Output Schema
@@ -689,12 +801,17 @@ def _parse_generation_response(
     source_path: str,
     repo_roots: Optional[Dict[str, Path]] = None,
 ) -> "GenerationResult":
-    """Parse and strictly validate a schema_version 2b.1 or 2c.1 generation response.
+    """Parse and strictly validate a generation response.
+
+    Handles schema_version 2b.1, 2b.1-diff (Task 4), and 2c.1.
 
     Validation sequence (fail-fast):
       1. JSON parse
       2. Top-level type = dict
-      3. schema_version routing: 2c.1 → _parse_multi_repo_response; other → fail-fast
+      3. schema_version routing:
+         2c.1       → _parse_multi_repo_response
+         2b.1-diff  → apply unified diffs → rewrite as 2b.1 candidates
+         other      → fail-fast
       4. No extra top-level keys (2b.1 only)
       5. candidates: non-empty list, len 1-3 (>3 → normalize + continue)
       6. Per-candidate: required fields, no extras, AST check for .py files
@@ -715,12 +832,54 @@ def _parse_generation_response(
     if not isinstance(data, dict):
         raise RuntimeError(f"{pfx}_schema_invalid:expected_object")
 
-    # Step 3: schema_version — route multi-repo schema to dedicated parser
+    # Step 3: schema_version — route to dedicated parsers
     actual_version = data.get("schema_version", "__missing__")
     if actual_version == _SCHEMA_VERSION_MULTI:
         if not repo_roots:
             raise RuntimeError(f"{pfx}_schema_invalid:2c1_requires_repo_roots")
         return _parse_multi_repo_response(data, provider_name, duration_s, repo_roots)
+
+    # Task 4: reconstruct full_content from unified diff before normal validation
+    if actual_version == _SCHEMA_VERSION_DIFF:
+        orig_content = ""
+        if source_path:
+            sp = Path(source_path) if Path(source_path).is_absolute() else Path.cwd() / source_path
+            try:
+                orig_content = sp.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                pass
+        raw_cands = data.get("candidates", [])
+        if not isinstance(raw_cands, list) or not raw_cands:
+            raise RuntimeError(f"{pfx}_schema_invalid:candidates_empty")
+        rewritten: List[Dict[str, Any]] = []
+        for cand in raw_cands:
+            if not isinstance(cand, dict):
+                continue
+            unified_diff = cand.get("unified_diff", "")
+            if not unified_diff or not orig_content:
+                # No diff or no source — skip
+                logger.warning("[%s] Skipping diff candidate %s: no diff/source", pfx, cand.get("candidate_id"))
+                continue
+            try:
+                patched = _apply_unified_diff(orig_content, unified_diff)
+            except ValueError as exc:
+                logger.warning("[%s] Diff application failed for %s: %s", pfx, cand.get("candidate_id"), exc)
+                continue
+            rewritten.append({
+                "candidate_id": cand.get("candidate_id", "c1"),
+                "file_path": cand.get("file_path", source_path),
+                "full_content": patched,
+                "rationale": cand.get("rationale", ""),
+            })
+        if not rewritten:
+            raise RuntimeError(f"{pfx}_schema_invalid:diff_apply_failed_all_candidates")
+        # Overwrite data so the rest of the function validates normally as 2b.1
+        data = {
+            "schema_version": _SCHEMA_VERSION,
+            "candidates": rewritten,
+            "provider_metadata": data.get("provider_metadata", {}),
+        }
+        actual_version = _SCHEMA_VERSION
 
     if actual_version != _SCHEMA_VERSION:
         raise RuntimeError(
@@ -951,10 +1110,25 @@ class PrimeProvider:
         tool_rounds = 0
         start = time.monotonic()
 
-        # Phase 4: extract brain model name from routing telemetry
+        # Task 3: build TaskProfile from routing telemetry for J-Prime dispatch
         _brain_model: Optional[str] = None
+        _task_profile: Optional[Any] = None
         if context.telemetry and context.telemetry.routing_intent:
-            _brain_model = context.telemetry.routing_intent.brain_model or None
+            ri = context.telemetry.routing_intent
+            _brain_model = ri.brain_model or None
+            if _TaskProfile is not None and ri.brain_id and ri.brain_model:
+                raw_reason = ri.routing_reason or "unknown"
+                intent = (
+                    raw_reason.removeprefix("cai_intent_")
+                    if raw_reason.startswith("cai_intent_")
+                    else raw_reason
+                )
+                _task_profile = _TaskProfile(
+                    intent=intent,
+                    complexity=ri.task_complexity or "unknown",
+                    brain_id=ri.brain_id,
+                    model=ri.brain_model,
+                )
 
         while True:
             response = await self._client.generate(
@@ -963,6 +1137,7 @@ class PrimeProvider:
                 max_tokens=self._max_tokens,
                 temperature=0.2,
                 model_name=_brain_model,
+                task_profile=_task_profile,
             )
             raw = response.content
 

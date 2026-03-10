@@ -439,11 +439,37 @@ class ContextAwarenessIntelligence:
             "automation_request": {"keywords": ["automate", "schedule", "run", "workflow", "pipeline"]},
             "preference_setting": {"keywords": ["prefer", "default", "always", "voice", "setting"]},
             "conversation": {"keywords": ["hello", "hi", "thanks", "good", "chat"]},
+            # Ouroboros codegen intents
+            "code_generation": {
+                "keywords": ["implement", "write", "create", "add feature", "generate", "scaffold"],
+                "patterns": [r"\bimplement\b", r"\bcreate.*class\b", r"\badd.*method\b"],
+            },
+            "bug_fix": {
+                "keywords": ["fix", "bug", "error", "broken", "wrong", "incorrect", "failing", "crash"],
+                "patterns": [r"\bfix\b", r"\bresolve.*error\b", r"\bdebug\b"],
+            },
+            "segfault_analysis": {
+                "keywords": ["segfault", "segmentation fault", "null pointer", "sigsegv", "crash"],
+                "patterns": [r"\bsegfault\b", r"\bnull.*pointer\b", r"\bsigsegv\b"],
+            },
+            "heavy_refactor": {
+                "keywords": ["refactor", "restructure", "rewrite", "extract", "rename", "move", "reorganize"],
+                "patterns": [r"\brefactor\b", r"\bextract.*class\b", r"\brewrite\b"],
+            },
+            "architecture_design": {
+                "keywords": ["design", "architecture", "system", "cross-repo", "migrate", "plan", "analyze codebase"],
+                "patterns": [r"\barchitecture\b", r"\bcross.repo\b", r"\bsystem design\b"],
+            },
+            "single_line_change": {
+                "keywords": ["append", "add line", "comment", "marker", "monitored", "single line", "at the end"],
+                "patterns": [r"\bappend\b", r"\badd.*line\b", r"\bsingle.*line\b"],
+            },
         }
 
     def _score_intent(self, lowered: str, profile: Dict[str, Any]) -> float:
-        """Compute intent score from keyword profile."""
+        """Compute intent score from keyword and pattern profile."""
         keywords = profile.get("keywords", [])
+        patterns = profile.get("patterns", [])
         score = 0.01
 
         for keyword in keywords:
@@ -455,6 +481,13 @@ class ContextAwarenessIntelligence:
                 continue
             if re.search(r"\b" + re.escape(token) + r"\b", lowered):
                 score += 0.8
+
+        for pattern in patterns:
+            try:
+                if re.search(pattern, lowered, re.IGNORECASE):
+                    score += 1.2
+            except re.error:
+                pass
 
         if lowered.endswith("?"):
             score += 0.25
@@ -490,6 +523,13 @@ class ContextAwarenessIntelligence:
             "automation_request": "Generate a reproducible plan with checkpoints and rollback hooks.",
             "preference_setting": "Persist preference update and confirm effective scope.",
             "conversation": "Respond naturally while keeping system state unchanged.",
+            # Ouroboros codegen intents
+            "code_generation": "Plan the implementation with file paths, class/method signatures, and test stubs before writing code.",
+            "bug_fix": "Identify the root cause with minimal reproduction, then apply the targeted fix with regression test.",
+            "segfault_analysis": "Capture stack trace, inspect memory layout, and apply bounds/null-check guards before patching.",
+            "heavy_refactor": "Map all call sites and dependents, stage incremental commits, and validate with full test suite at each step.",
+            "architecture_design": "Produce a cross-repo dependency graph and phased migration plan before any code changes.",
+            "single_line_change": "Confirm exact insertion point and line content, then apply atomic single-line patch.",
         }
         return mapping.get(intent, "Request clarification and refine intent classification.")
 

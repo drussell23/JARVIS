@@ -224,6 +224,83 @@ class BrainSelector:
         reason = f"complexity_match_{complexity.value}"
         return self._result_for(brain_id, brains, reason, complexity, est_tokens)
 
+    def _apply_resource_and_cost_gates(
+        self,
+        brain_id: str,
+        complexity: TaskComplexity,
+        description: str,
+        target_files: Tuple[str, ...],
+        snapshot: ResourceSnapshot,
+        blast_radius: int,
+        routing_reason: str,
+    ) -> BrainSelectionResult:
+        """Apply Layers 2+3 (resource + cost gates) given a pre-classified complexity/brain.
+
+        Called by RouteDecisionService after CAI has already determined the
+        (complexity, brain_id) in Layer 1, bypassing the regex Task Gate.
+        """
+        self._maybe_reload_policy()
+        self._maybe_reset_daily_spend()
+
+        gate_cfg = self._policy.get("gates", {})
+        brains = self._policy.get("brains", {})
+        # Rough token estimate
+        n_files = max(blast_radius, len(target_files))
+        est_tokens = max(100, len(description) // 4 + n_files * 200)
+
+        # ── Layer 2: Resource Gate ────────────────────────────────────────────
+        rg_cfg = gate_cfg.get("resource_gate", {})
+        threshold_name = rg_cfg.get("local_pressure_redirect_threshold", "ELEVATED")
+        try:
+            threshold = PressureLevel[threshold_name]
+        except KeyError:
+            threshold = PressureLevel.ELEVATED
+
+        if snapshot.overall_pressure >= threshold:
+            reason = f"{routing_reason}_resource_{snapshot.overall_pressure.name.lower()}"
+            logger.info(
+                "[BrainSelector] Resource gate fired (%s) → %s (via RouteDecisionService)",
+                snapshot.overall_pressure.name, brain_id,
+            )
+            return self._result_for(brain_id, brains, reason, complexity, est_tokens)
+
+        # ── Layer 3: Cost Gate ────────────────────────────────────────────────
+        cost_cfg = gate_cfg.get("cost_gate", {})
+        daily_budget = float(
+            os.environ.get("OUROBOROS_GCP_DAILY_BUDGET", None)
+            or cost_cfg.get("daily_budget_usd", 0.50)
+        )
+        total_spend = self._daily_spend_gcp + self._daily_spend_claude
+
+        if total_spend >= daily_budget:
+            exceeded_action = cost_cfg.get("budget_exceeded_action", "queue")
+            if complexity in (TaskComplexity.HEAVY_CODE, TaskComplexity.COMPLEX):
+                if exceeded_action == "queue":
+                    logger.warning(
+                        "[BrainSelector] Cost gate: %.4f >= %.4f — queuing heavy task (via RouteDecisionService)",
+                        total_spend, daily_budget,
+                    )
+                    return BrainSelectionResult(
+                        brain_id="queued",
+                        model_name="queued",
+                        fallback_model="queued",
+                        routing_reason="cost_gate_triggered_queue",
+                        task_complexity=complexity.value,
+                        estimated_prompt_tokens=est_tokens,
+                        provider_tier="queued",
+                    )
+            logger.info(
+                "[BrainSelector] Cost gate: %.4f >= %.4f — downgrade to phi3 (via RouteDecisionService)",
+                total_spend, daily_budget,
+            )
+            return self._result_for(
+                "phi3_lightweight", brains,
+                "cost_gate_triggered_fallback_to_phi3",
+                complexity, est_tokens,
+            )
+
+        return self._result_for(brain_id, brains, routing_reason, complexity, est_tokens)
+
     def record_cost(self, provider: str, cost_usd: float) -> None:
         """Record actual generation cost.  Persists to disk atomically."""
         if cost_usd <= 0.0:
