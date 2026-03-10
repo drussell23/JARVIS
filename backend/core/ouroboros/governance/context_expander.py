@@ -20,7 +20,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List
+from typing import Any, List, Optional
 
 from backend.core.ouroboros.governance.op_context import OperationContext, OperationPhase
 
@@ -44,9 +44,15 @@ class ContextExpander:
         Root path for resolving and safety-checking additional files.
     """
 
-    def __init__(self, generator: Any, repo_root: Path) -> None:
+    def __init__(
+        self,
+        generator: Any,
+        repo_root: Path,
+        oracle: Optional[Any] = None,
+    ) -> None:
         self._generator = generator
         self._repo_root = repo_root
+        self._oracle = oracle
 
     async def expand(
         self,
@@ -74,8 +80,23 @@ class ContextExpander:
         """
         accumulated: List[str] = []
 
+        # Oracle manifest — real file paths for J-Prime to choose from
+        oracle_files: List[str] = []
+        if self._oracle is not None:
+            try:
+                if self._oracle.get_status().get("running", False):
+                    raw_paths = await self._oracle.get_relevant_files_for_query(
+                        ctx.description, limit=20
+                    )
+                    oracle_files = [
+                        str(p.relative_to(self._repo_root)) if hasattr(p, "relative_to") else str(p)
+                        for p in raw_paths
+                    ]
+            except Exception:
+                oracle_files = []  # fall back silently
+
         for round_num in range(MAX_ROUNDS):
-            prompt = self._build_expansion_prompt(ctx, accumulated)
+            prompt = self._build_expansion_prompt(ctx, accumulated, oracle_files)
 
             try:
                 raw = await self._generator.plan(prompt, deadline)
@@ -125,6 +146,7 @@ class ContextExpander:
         self,
         ctx: OperationContext,
         already_fetched: List[str],
+        oracle_files: Optional[List[str]] = None,
     ) -> str:
         """Build a lightweight prompt — filenames only, no file contents."""
         target_list = "\n".join(f"  - {f}" for f in ctx.target_files)
@@ -133,10 +155,18 @@ class ContextExpander:
             if already_fetched
             else "  (none yet)"
         )
+        available_section = ""
+        if oracle_files:
+            available_section = (
+                "\nAvailable files related to this task (real paths — choose from these):\n"
+                + "".join(f"  - {f}\n" for f in oracle_files)
+                + "\nWhich of these (if any) would help you generate a correct patch?\n"
+            )
         return (
             f"Task: {ctx.description}\n\n"
             f"Target files to be modified:\n{target_list}\n\n"
             f"Context files already fetched:\n{fetched_list}\n\n"
+            f"{available_section}"
             f"Which additional files (if any) would help understand the context for this task?\n"
             f"List only files that exist in the codebase. Do NOT request the target files themselves.\n\n"
             f"Return ONLY this JSON:\n"

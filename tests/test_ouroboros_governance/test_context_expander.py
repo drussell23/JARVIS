@@ -208,3 +208,82 @@ class TestContextExpanderExpand:
 
         result = await expander.expand(ctx, deadline)
         assert result.expanded_context_files.count("shared.py") == 1
+
+
+class TestContextExpanderOracleManifest:
+    """Oracle manifest injection into planning prompt."""
+
+    async def test_oracle_manifest_injected_when_ready(self, tmp_path):
+        """When oracle is ready, planning prompt includes available files list."""
+        from unittest.mock import AsyncMock, MagicMock
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        from datetime import datetime, timezone, timedelta
+
+        oracle = MagicMock()
+        oracle.get_status = MagicMock(return_value={"running": True})
+        oracle.get_relevant_files_for_query = AsyncMock(
+            return_value=[tmp_path / "foo.py", tmp_path / "bar.py"]
+        )
+
+        captured_prompts = []
+        mock_gen = MagicMock()
+        async def fake_plan(prompt, deadline):
+            captured_prompts.append(prompt)
+            return '{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "ok"}'
+        mock_gen.plan = fake_plan
+
+        expander = ContextExpander(generator=mock_gen, repo_root=tmp_path, oracle=oracle)
+        ctx = OperationContext.create(
+            target_files=("foo.py",), description="fix async timeout"
+        )
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
+        await expander.expand(ctx, deadline)
+
+        assert len(captured_prompts) > 0
+        assert "Available files" in captured_prompts[0]
+        assert "foo.py" in captured_prompts[0] or "bar.py" in captured_prompts[0]
+
+    async def test_oracle_fallback_when_not_ready(self, tmp_path):
+        """When oracle.get_status() returns running=False, expand() runs without raising."""
+        from unittest.mock import AsyncMock, MagicMock
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        from datetime import datetime, timezone, timedelta
+
+        oracle = MagicMock()
+        oracle.get_status = MagicMock(return_value={"running": False})
+        oracle.get_relevant_files_for_query = AsyncMock(return_value=[])
+
+        mock_gen = MagicMock()
+        mock_gen.plan = AsyncMock(
+            return_value='{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "ok"}'
+        )
+
+        expander = ContextExpander(generator=mock_gen, repo_root=tmp_path, oracle=oracle)
+        ctx = OperationContext.create(
+            target_files=("foo.py",), description="fix async timeout"
+        )
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
+        result = await expander.expand(ctx, deadline)
+        # Must not raise; oracle.get_relevant_files_for_query must NOT have been called
+        oracle.get_relevant_files_for_query.assert_not_called()
+
+    async def test_oracle_fallback_when_none(self, tmp_path):
+        """When oracle=None, expand() runs exactly as before."""
+        from unittest.mock import AsyncMock, MagicMock
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        from datetime import datetime, timezone, timedelta
+
+        mock_gen = MagicMock()
+        mock_gen.plan = AsyncMock(
+            return_value='{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "ok"}'
+        )
+
+        expander = ContextExpander(generator=mock_gen, repo_root=tmp_path)  # no oracle
+        ctx = OperationContext.create(
+            target_files=("foo.py",), description="fix async timeout"
+        )
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
+        result = await expander.expand(ctx, deadline)  # must not raise

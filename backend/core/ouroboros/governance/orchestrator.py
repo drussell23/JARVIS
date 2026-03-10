@@ -285,6 +285,7 @@ class GovernedOrchestrator:
                 expander = ContextExpander(
                     generator=self._generator,
                     repo_root=self._config.project_root,
+                    oracle=getattr(self._stack, "oracle", None),
                 )
                 ctx = await asyncio.wait_for(
                     expander.expand(ctx, expansion_deadline),
