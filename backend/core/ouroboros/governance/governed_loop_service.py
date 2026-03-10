@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, Optional, Set, Tuple
 
 from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider
 from backend.core.ouroboros.governance.candidate_generator import (
@@ -53,6 +53,17 @@ from backend.core.ouroboros.governance.orchestrator import (
 from backend.core.ouroboros.governance.curriculum_publisher import CurriculumPublisher
 from backend.core.ouroboros.governance.model_attribution_recorder import ModelAttributionRecorder
 from backend.core.ouroboros.integration import get_performance_persistence
+from backend.core.ouroboros.governance.preemption_fsm import (
+    PreemptionFsmEngine,
+    PreemptionFsmExecutor,
+    build_transition_input,
+)
+from backend.core.ouroboros.governance.contracts.fsm_contract import (
+    LoopEvent,
+    LoopRuntimeContext,
+    LoopState,
+    RetryBudget,
+)
 
 try:
     from backend.core.ouroboros.oracle import TheOracle as TheOracle
@@ -68,6 +79,76 @@ logger = logging.getLogger("Ouroboros.GovernedLoop")
 MIN_GENERATION_BUDGET_S: float = float(
     os.getenv("JARVIS_MIN_GENERATION_BUDGET_S", "30.0")
 )
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: FSM infrastructure adapters
+# ---------------------------------------------------------------------------
+
+
+class _FsmLedgerAdapter:
+    """Adapts OperationLedger to the FSM Ledger protocol.
+
+    Converts FSM checkpoint appends to OperationLedger LedgerEntry writes.
+    Idempotency guard uses an in-memory set (resets on restart, which is
+    acceptable because each LoopRuntimeContext begins from RUNNING on startup).
+    """
+
+    def __init__(self, ledger: Any) -> None:
+        self._ledger = ledger
+        self._seen: Set[Tuple[str, int]] = set()
+
+    async def checkpoint_exists(self, *, op_id: str, checkpoint_seq: int) -> bool:
+        return (op_id, checkpoint_seq) in self._seen
+
+    async def append_checkpoint(
+        self,
+        *,
+        op_id: str,
+        checkpoint_seq: int,
+        state: Any,
+        event: Any,
+        reason_code: Optional[str],
+        payload: Dict[str, Any],
+    ) -> None:
+        from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
+
+        self._seen.add((op_id, checkpoint_seq))
+        try:
+            await self._ledger.append(
+                LedgerEntry(
+                    op_id=op_id,
+                    state=OperationState.BLOCKED,
+                    data={
+                        "type": "preemption_fsm_checkpoint",
+                        "loop_state": state.value,
+                        "loop_event": event.value,
+                        "reason_code": reason_code,
+                        "checkpoint_seq": checkpoint_seq,
+                        **payload,
+                    },
+                )
+            )
+        except Exception:
+            pass  # ledger failure must never block an FSM transition
+
+
+class _CommTelemetrySink:
+    """Wraps CommProtocol to satisfy the FSM TelemetrySink protocol."""
+
+    def __init__(self, comm: Any) -> None:
+        self._comm = comm
+
+    async def emit_transition(self, decision: Any, payload: Dict[str, Any]) -> None:
+        op_id = payload.get("op_id", "unknown")
+        try:
+            await self._comm.emit_heartbeat(
+                op_id=op_id,
+                phase=f"preemption_fsm:{decision.to_state.value}",
+                progress_pct=0.0,
+            )
+        except Exception:
+            pass  # telemetry is best-effort
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +351,7 @@ class GovernedLoopService:
         stack: Any = None,
         prime_client: Any = None,
         config: Optional[GovernedLoopConfig] = None,
+        active_brain_set: FrozenSet[str] = frozenset(),
     ) -> None:
         self._stack = stack
         self._prime_client = prime_client
@@ -277,6 +359,16 @@ class GovernedLoopService:
         self._state = ServiceState.INACTIVE
         self._started_at: Optional[float] = None
         self._failure_reason: Optional[str] = None
+
+        # Phase 4: admitted active brain set (published by supervisor post-handshake)
+        # Empty frozenset = gate disabled (backward-compatible default)
+        self._active_brain_set: FrozenSet[str] = active_brain_set
+
+        # Phase 4: preemption FSM — initialized after ledger in start()
+        self._fsm_engine: Optional[PreemptionFsmEngine] = None
+        self._fsm_executor: Optional[PreemptionFsmExecutor] = None
+        self._fsm_contexts: Dict[str, LoopRuntimeContext] = {}
+        self._fsm_checkpoint_seq: Dict[str, int] = {}
 
         # Built during start()
         self._orchestrator: Optional[GovernedOrchestrator] = None
@@ -311,6 +403,25 @@ class GovernedLoopService:
     def state(self) -> ServiceState:
         return self._state
 
+    @property
+    def active_brain_set(self) -> FrozenSet[str]:
+        """Immutable snapshot of the supervisor-admitted brain set."""
+        return self._active_brain_set
+
+    def set_active_brain_set(self, brain_set: FrozenSet[str]) -> None:
+        """Update the admitted active brain set.
+
+        Called by unified_supervisor after a successful boot handshake.
+        The frozenset assignment is atomic under the GIL.
+        """
+        old = self._active_brain_set
+        self._active_brain_set = brain_set
+        logger.info(
+            "[GovernedLoop] ActiveBrainSet updated: %s → %s",
+            sorted(old),
+            sorted(brain_set),
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -327,6 +438,19 @@ class GovernedLoopService:
         self._state = ServiceState.STARTING
         try:
             await self._build_components()
+
+            # Phase 4: initialize preemption FSM executor (ledger available after _build_components)
+            self._fsm_engine = PreemptionFsmEngine()
+            if self._ledger is not None:
+                comm = getattr(self._stack, "comm", None) if self._stack else None
+                _sink = _CommTelemetrySink(comm) if comm is not None else None
+                self._fsm_executor = PreemptionFsmExecutor(
+                    engine=self._fsm_engine,
+                    ledger=_FsmLedgerAdapter(self._ledger),
+                    telemetry=_sink,
+                )
+                logger.debug("[GovernedLoop] Preemption FSM executor initialized")
+
             await self._reconcile_on_boot()  # boot reconciliation
             self._register_canary_slices()
             self._seed_autonomy_policies()
@@ -523,6 +647,24 @@ class GovernedLoopService:
                 brain.task_complexity, self._brain_selector.daily_spend,
             )
 
+            # Phase 4: ActiveBrainSet gate — reject brains not admitted by supervisor
+            if self._active_brain_set and brain.brain_id not in self._active_brain_set:
+                logger.warning(
+                    "[GovernedLoop] Brain %r not in admitted set %s — rejecting op %s",
+                    brain.brain_id, sorted(self._active_brain_set), ctx.op_id,
+                )
+                return OperationResult(
+                    op_id=ctx.op_id,
+                    terminal_phase=OperationPhase.CANCELLED,
+                    reason_code="brain_not_admitted",
+                    trigger_source=trigger_source,
+                )
+
+            # Phase 4: create per-op FSM context (starts in RUNNING)
+            _fsm_ctx = LoopRuntimeContext(op_id=ctx.op_id)
+            self._fsm_contexts[ctx.op_id] = _fsm_ctx
+            self._fsm_checkpoint_seq[ctx.op_id] = 0
+
             # Emit routing narration via CommProtocol
             try:
                 await self._stack.comm.emit_heartbeat(
@@ -613,6 +755,9 @@ class GovernedLoopService:
 
         finally:
             self._active_ops.discard(dedupe_key)
+            # Phase 4: clean up per-op FSM context
+            self._fsm_contexts.pop(ctx.op_id, None)
+            self._fsm_checkpoint_seq.pop(ctx.op_id, None)
 
     # ------------------------------------------------------------------
     # Health
@@ -727,6 +872,29 @@ class GovernedLoopService:
         if primary_ok:
             # Primary healthy — proceed normally
             return None
+
+        # Phase 4: fire EV_CONNECTION_LOSS through preemption FSM for audit trail
+        if self._fsm_executor is not None:
+            _fsm_ctx = self._fsm_contexts.get(ctx.op_id)
+            if _fsm_ctx is not None and _fsm_ctx.state == LoopState.RUNNING:
+                _seq = self._fsm_checkpoint_seq.get(ctx.op_id, 0) + 1
+                self._fsm_checkpoint_seq[ctx.op_id] = _seq
+                _ti = build_transition_input(
+                    op_id=ctx.op_id,
+                    phase="PREFLIGHT",
+                    event=LoopEvent.EV_CONNECTION_LOSS,
+                    ctx=_fsm_ctx,
+                    checkpoint_seq=_seq,
+                    metadata={"source": "preflight_probe_failure"},
+                )
+                try:
+                    await self._fsm_executor.apply(_fsm_ctx, _ti)
+                    logger.info(
+                        "[GovernedLoop] Preemption FSM: op=%s → %s (connection loss)",
+                        ctx.op_id, _fsm_ctx.state.value,
+                    )
+                except Exception as _exc:
+                    logger.debug("[GovernedLoop] FSM apply skipped: %s", _exc)
 
         # Primary unavailable: decide based on FSM state
         # CandidateGenerator.fsm is a FailbackStateMachine; .state is a FailbackState enum.
