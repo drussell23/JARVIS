@@ -130,6 +130,25 @@ class TestParseToolCallResponse:
         })
         assert _parse_tool_call_response(raw) is None
 
+    def test_empty_name_returns_none(self) -> None:
+        from backend.core.ouroboros.governance.providers import _parse_tool_call_response
+        raw = json.dumps({
+            "schema_version": "2b.2-tool",
+            "tool_call": {"name": "", "arguments": {}},
+        })
+        assert _parse_tool_call_response(raw) is None
+
+    def test_wrong_type_arguments_normalizes_to_empty_dict(self) -> None:
+        from backend.core.ouroboros.governance.providers import _parse_tool_call_response
+        raw = json.dumps({
+            "schema_version": "2b.2-tool",
+            "tool_call": {"name": "read_file", "arguments": "not-a-dict"},
+        })
+        tc = _parse_tool_call_response(raw)
+        assert tc is not None
+        assert tc.name == "read_file"
+        assert tc.arguments == {}
+
 
 class TestToolPromptInjection:
     """_build_codegen_prompt with tools_enabled=True."""
