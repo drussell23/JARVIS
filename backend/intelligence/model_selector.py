@@ -81,6 +81,16 @@ class IntelligentModelSelector:
         self.registry = get_model_registry()
         self.lifecycle_manager = get_lifecycle_manager()
 
+        # Cached CAI instance — avoid re-opening SQLite on every _classify_intent call
+        try:
+            from backend.intelligence.context_awareness_intelligence import (
+                ContextAwarenessIntelligence,
+            )
+
+            self._cai: Optional["ContextAwarenessIntelligence"] = ContextAwarenessIntelligence()
+        except Exception:
+            self._cai = None
+
         # Scoring weights (from config or defaults)
         self.weights = {"quality": 0.35, "latency": 0.25, "cost": 0.25, "ram_efficiency": 0.15}
 
@@ -228,29 +238,26 @@ class IntelligentModelSelector:
         """
         Classify query intent using CAI with keyword-matching fallback.
 
-        Tries ContextAwarenessIntelligence.predict_intent() first (lazy import
-        to avoid circular dependencies). Falls back to local keyword rules when
-        CAI is unavailable or returns low confidence (< 0.3).
+        Uses the cached CAI instance (self._cai) initialised in __init__ to
+        avoid opening a new SQLite connection on every call.  Falls back to
+        local keyword rules when CAI is unavailable or returns low confidence
+        (< 0.3).
         """
-        # --- Primary: CAI intent prediction ---
+        # --- Primary: cached CAI intent prediction ---
         try:
-            from backend.intelligence.context_awareness_intelligence import (
-                ContextAwarenessIntelligence,
-            )
-
-            cai = ContextAwarenessIntelligence()
-            result = cai.predict_intent(query)
-            confidence = result.get("confidence", 0.0)
-            intent = result.get("intent", "")
-            if intent and confidence >= 0.3:
+            if self._cai is not None:
+                result = self._cai.predict_intent(query)
+                confidence = result.get("confidence", 0.0)
+                intent = result.get("intent", "")
+                if intent and confidence >= 0.3:
+                    logger.debug(
+                        "[ModelSelector] CAI intent=%s confidence=%.3f", intent, confidence
+                    )
+                    return intent
                 logger.debug(
-                    "[ModelSelector] CAI intent=%s confidence=%.3f", intent, confidence
+                    "[ModelSelector] CAI confidence too low (%.3f), falling back to keywords",
+                    confidence,
                 )
-                return intent
-            logger.debug(
-                "[ModelSelector] CAI confidence too low (%.3f), falling back to keywords",
-                confidence,
-            )
         except Exception as exc:
             logger.debug("[ModelSelector] CAI unavailable, using keyword fallback: %s", exc)
 
@@ -321,8 +328,8 @@ class IntelligentModelSelector:
             "nlp_analysis": {"response_generation"},
             # Ouroboros codegen intents
             "code_generation": {"response_generation"},
-            "bug_fix": {"code_generation", "response_generation"},
-            "segfault_analysis": {"complex_reasoning", "code_generation"},
+            "bug_fix": {"response_generation"},
+            "segfault_analysis": {"complex_reasoning"},
             "heavy_refactor": {"code_generation"},
             "architecture_design": {"code_generation", "response_generation"},
             "single_line_change": {"trivial_ops", "code_generation"},

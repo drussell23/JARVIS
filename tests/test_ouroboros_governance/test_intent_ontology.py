@@ -12,7 +12,6 @@ Covers:
 
 from __future__ import annotations
 
-import asyncio
 from typing import Set, Tuple
 from unittest.mock import MagicMock, patch
 
@@ -96,16 +95,15 @@ CLASSIFY_INTENT_CASES = [
 ]
 
 
+@pytest.mark.asyncio
 @pytest.mark.parametrize("query,expected_intent", CLASSIFY_INTENT_CASES)
-def test_intelligent_model_selector_classify_intent(query, expected_intent):
+async def test_intelligent_model_selector_classify_intent(query, expected_intent):
     """_classify_intent() must return the correct intent via keyword fallback."""
     selector = _make_selector()
 
     # Force CAI to be unavailable so the keyword fallback path is exercised
-    with patch.dict("sys.modules", {"backend.intelligence.context_awareness_intelligence": None}):
-        result = asyncio.get_event_loop().run_until_complete(
-            selector._classify_intent(query)
-        )
+    selector._cai = None
+    result = await selector._classify_intent(query)
 
     assert result == expected_intent, (
         f"Query={query!r}: expected intent={expected_intent!r}, got {result!r}"
@@ -118,8 +116,8 @@ def test_intelligent_model_selector_classify_intent(query, expected_intent):
 
 CAPABILITY_CASES: list[tuple[str, Set[str], Set[str]]] = [
     ("code_generation",    {"code_generation"},                   {"response_generation"}),
-    ("bug_fix",            {"code_generation"},                   {"code_generation", "response_generation"}),
-    ("segfault_analysis",  {"code_generation"},                   {"complex_reasoning", "code_generation"}),
+    ("bug_fix",            {"code_generation"},                   {"response_generation"}),
+    ("segfault_analysis",  {"code_generation"},                   {"complex_reasoning"}),
     ("heavy_refactor",     {"code_generation", "code_refactor"},  {"code_generation"}),
     ("architecture_design",{"complex_reasoning"},                 {"code_generation", "response_generation"}),
     ("single_line_change", {"chat"},                              {"trivial_ops", "code_generation"}),

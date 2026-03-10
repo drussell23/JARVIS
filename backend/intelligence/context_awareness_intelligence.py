@@ -449,7 +449,7 @@ class ContextAwarenessIntelligence:
                 "patterns": [r"\bfix\b", r"\bresolve.*error\b", r"\bdebug\b"],
             },
             "segfault_analysis": {
-                "keywords": ["segfault", "segmentation fault", "null pointer", "memory", "sigsegv", "crash"],
+                "keywords": ["segfault", "segmentation fault", "null pointer", "sigsegv", "crash"],
                 "patterns": [r"\bsegfault\b", r"\bnull.*pointer\b", r"\bsigsegv\b"],
             },
             "heavy_refactor": {
