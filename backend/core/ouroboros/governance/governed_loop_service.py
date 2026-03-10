@@ -414,9 +414,9 @@ class GovernedLoopService:
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
         self._trust_graduator: Optional[Any] = None
 
-        # Phase 4: Brain selector — deterministic 3-layer escalation gate
-        from backend.core.ouroboros.governance.brain_selector import BrainSelector
-        self._brain_selector = BrainSelector()
+        # Phase 4: Brain selector — CAI-intent-aware async router (wraps BrainSelector)
+        from backend.core.ouroboros.governance.route_decision_service import RouteDecisionService
+        self._brain_selector = RouteDecisionService()
 
         # Sliding-window cooldown: maps file_path -> deque of touch timestamps (monotonic)
         self._file_touch_cache: Dict[str, Any] = {}  # str -> collections.deque[float]
@@ -694,7 +694,7 @@ class GovernedLoopService:
                 sample_age_ms=(now_ns - snap.sampled_monotonic_ns) // 1_000_000,
             )
             # Phase 4: 3-layer brain selection gate (task → resource → cost)
-            brain = self._brain_selector.select(
+            brain = await self._brain_selector.select(
                 description=ctx.description,
                 target_files=ctx.target_files,
                 snapshot=snap,
