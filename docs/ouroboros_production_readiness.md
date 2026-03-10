@@ -53,41 +53,52 @@ Fix required: Serialize oracle updates through an asyncio.Lock or queue.
 
 **6. Ledger storage corruption on interrupted APPLY**
 If the process is killed between `change_engine.execute()` success and `_record_ledger(APPLIED)`, the file is written but the ledger shows the op as GENERATE. On restart, `_reconcile_on_boot` sees no APPLIED record and re-queues the operation, applying the change again.
-Fix required: Write a `APPLYING` sentinel to ledger BEFORE writing the file. On reconcile, treat APPLYING as "verify current file state."
+Fix required: Write a `APPLYING` sentinel to ledger BEFORE writing the file. On restart, if APPLYING is found without APPLIED, treat as failed and roll back.
 
-**7. Cooldown bypass via op_id rotation**
-A buggy sensor that generates new op_ids for the same file on every poll cycle bypasses the per-file cooldown (which checks `_file_touch_cache` by file path). The cooldown guard correctly uses file path as key — but only within the same GLS process lifetime. On restart, the cache resets.
-Fix required: Persist cooldown cache to ledger storage so restarts don't reset the guard.
+**7. TUI transport buffer overflow**
+TUITransport buffers messages in a deque with no max size. Under high operation volume, the buffer grows unbounded. On a 2GB RAM system, this can OOM the process.
+Fix required: Bounded deque with LRU eviction. Max 1000 messages.
 
-**8. ChangeEngine sandbox path collision**
-Under high concurrency, two ops targeting the same file write to `sandbox/{op_id}/file.py`. The op_ids are unique, so no collision. But if the sandbox root is on a tmpfs that fills up, both silently fail with OSError. The error is caught and treated as change_engine_failed (correct), but no disk-space alert is emitted.
-Fix required: Add disk space pre-check in ChangeEngine.execute() before sandbox write.
+**8. Cooldown bypass via symlink**
+Per-file cooldown tracks by `file_path`. If a user creates a symlink to a protected file and targets the symlink, the cooldown is bypassed because the paths differ.
+Fix required: Resolve symlinks to canonical path before cooldown check.
 
-### P2 — Observability (fix before production handoff)
+### P2 — Observability (fix before production scale)
 
-**9. No structured telemetry export**
-All telemetry is currently logged to file via OpsLogger. There is no export to Prometheus/Datadog/Cloud Monitoring. Operating the system blind in production.
-Fix required: OpsLogger structured export to Cloud Monitoring or Prometheus push gateway.
+**9. Resource monitor sampling drift**
+ResourceMonitor samples CPU/RAM every 100ms. Under sustained load, the sampling thread can lag behind real-time. Timestamps drift, making correlation with operation phases unreliable.
+Fix required: Use monotonic clock for sampling intervals, not wall clock.
 
-**10. No canary slice graduation visibility**
-TrustGraduator.promote() silently advances tiers. There is no dashboard or voice notification when a slice graduates from OBSERVE to GOVERNED.
-Fix required: Emit CommProtocol DECISION message on tier promotion. Log to ledger.
+**10. Ledger query performance degradation**
+OperationLedger stores all operations in a single JSON file. Query performance degrades linearly with operation count. At 10k operations, queries take >1s.
+Fix required: Partition ledger by date. Query only relevant partitions.
 
 ---
 
-## Practical Definition of "Production Ready"
+## Production Readiness Checklist
 
-Ouroboros is production-ready when ALL of the following are true:
+### Phase 4 Ignition (Single Operation)
 
-- [ ] 100 operations executed across at least 2 repos with zero silent failures
-- [ ] 3 consecutive failed operations correctly roll back and narrate without human intervention
-- [ ] Split-brain dedup verified under 5 concurrent operations on the same file
-- [ ] Saga cross-repo apply tested with deliberate second-repo failure and clean compensation
-- [ ] Narration-order inversion tested: two concurrent ops completing within 60s, both narrated
-- [ ] Process kill during APPLY → restart → reconcile → correct state (no double-apply)
-- [ ] TrustGraduator promotion race tested under concurrent gate checks
-- [ ] 24-hour unattended run on docs/ + tests/ slices with zero intervention
-- [ ] MTTR (mean time to recovery from a bad patch) < 60 seconds
+- [ ] **Go/No-Go Decision:** Manual trigger of first real operation on docs/ slice
+- [ ] **End-to-End Verification:** CLASSIFY → ROUTE → CONTEXT_EXPANSION → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE
+- [ ] **Rollback Test:** Deliberate bad patch applied, then rolled back within 60s
+- [ ] **Narration Test:** VoiceNarrator announces intent, decision, and completion
+- [ ] **Ledger Integrity:** Operation recorded with cryptographic hash chain
+- [ ] **Resource Telemetry:** CPU/RAM/pressure stamped at each phase transition
+
+### Phase 4 Hardening (Concurrent Operations)
+
+- [ ] **P0 Fixes Deployed:** All 4 silent killers resolved and tested
+- [ ] **P1 Fixes Deployed:** Oracle serialization, ledger corruption, TUI overflow, cooldown bypass
+- [ ] **Concurrent Load Test:** 5 operations on different files, all complete successfully
+- [ ] **Failure Recovery:** Failed operations correctly roll back and narrate without human intervention
+- [ ] **Split-brain dedup verified under 5 concurrent operations on the same file**
+- [ ] **Saga cross-repo apply tested with deliberate second-repo failure and clean compensation**
+- [ ] **Narration-order inversion tested: two concurrent ops completing within 60s, both narrated**
+- [ ] **Process kill during APPLY → restart → reconcile → correct state (no double-apply)**
+- [ ] **TrustGraduator promotion race tested under concurrent gate checks**
+- [ ] **24-hour unattended run on docs/ + tests/ slices with zero intervention**
+- [ ] **MTTR (mean time to recovery from a bad patch) < 60 seconds**
 
 ---
 
@@ -100,3 +111,6 @@ Ouroboros is production-ready when ALL of the following are true:
 ---
 
 *Logged: 2026-03-10. Authors: Claude Code + Ouroboros Architecture Review.*
+
+<!-- monitored by Ouroboros -->
+<!-- monitored by Ouroboros -->

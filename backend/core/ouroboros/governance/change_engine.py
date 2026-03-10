@@ -264,7 +264,11 @@ class ChangeEngine:
             await self._comm.emit_heartbeat(
                 op_id=op_id, phase="validate", progress_pct=40.0
             )
-            valid = await self._validate_in_sandbox(request.proposed_content)
+            _RUNNABLE_EXTS = {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}
+            if Path(request.target_file).suffix in _RUNNABLE_EXTS:
+                valid = await self._validate_in_sandbox(request.proposed_content)
+            else:
+                valid = True  # non-code files skip AST syntax validation
             await self._ledger.append(
                 LedgerEntry(
                     op_id=op_id,
@@ -423,8 +427,8 @@ class ChangeEngine:
             verify_passed = True
             if request.verify_fn is not None:
                 verify_passed = await request.verify_fn()
-            else:
-                # Default: AST parse check on the applied file
+            elif Path(request.target_file).suffix in {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}:
+                # Default: AST parse check on the applied file (code files only)
                 verify_passed = await self._validate_in_sandbox(
                     target.read_text(encoding="utf-8")
                 )

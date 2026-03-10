@@ -260,10 +260,10 @@ async def ignite() -> None:
     # ------------------------------------------------------------------ #
     try:
         ledger_dir = gov_config.ledger_dir
-        op_files = list(ledger_dir.glob(f"{ctx.op_id}*.json")) if ledger_dir.exists() else []
+        op_files = list(ledger_dir.glob(f"{ctx.op_id}*.jsonl")) if ledger_dir.exists() else []
         if not op_files:
             # Try scanning all ledger files for this op_id
-            op_files = [f for f in ledger_dir.glob("*.json") if ctx.op_id in f.read_text()]
+            op_files = [f for f in ledger_dir.glob("*.jsonl") if ctx.op_id in f.read_text()]
         if op_files:
             log.info("  Ledger entry found: %s", op_files[0].name)
             check(5)

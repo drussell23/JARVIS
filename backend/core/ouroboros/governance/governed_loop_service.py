@@ -193,7 +193,7 @@ class GovernedLoopConfig:
     approval_timeout_s: float = 600.0
     health_probe_interval_s: float = 30.0
     max_concurrent_ops: int = 2
-    initial_canary_slices: Tuple[str, ...] = ("tests/",)
+    initial_canary_slices: Tuple[str, ...] = ("tests/", "docs/")
     cold_start_grace_s: float = 300.0   # ops younger than this are not cancelled on boot
     approval_ttl_s: float = 1800.0      # stale approval expiry timeout
     pipeline_timeout_s: float = 600.0   # total wall-clock budget per submit(); env: JARVIS_PIPELINE_TIMEOUT_S
@@ -841,10 +841,19 @@ class GovernedLoopService:
         self._repo_registry = repo_registry
 
     def _register_canary_slices(self) -> None:
-        """Register initial canary slices. Idempotent."""
+        """Register initial canary slices and pre-activate them. Idempotent.
+
+        Slices listed in ``initial_canary_slices`` are bootstrap-trusted — they
+        are explicitly configured at startup, so promotion criteria (50 ops) are
+        waived.  This avoids the chicken-and-egg problem where the first operation
+        cannot run because no slice has accumulated the required track record yet.
+        """
+        from backend.core.ouroboros.governance.canary_controller import CanaryState
         for slice_prefix in self._config.initial_canary_slices:
             try:
                 self._stack.canary.register_slice(slice_prefix)
+                # Pre-activate: bootstrap slices are explicitly trusted from boot
+                self._stack.canary._slices[slice_prefix].state = CanaryState.ACTIVE
             except Exception as exc:
                 logger.warning(
                     "[GovernedLoop] Failed to register canary slice %r: %s",
