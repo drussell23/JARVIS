@@ -638,7 +638,6 @@ class TestExpectedProviderFromPressure:
         from backend.core.ouroboros.governance.governed_loop_service import (
             GovernedLoopConfig,
             GovernedLoopService,
-            ServiceState,
         )
 
         captured: Dict[str, OperationContext] = {}
