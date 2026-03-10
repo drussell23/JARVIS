@@ -853,7 +853,7 @@ class TestSeedAutonomyPolicies:
 class TestFileScopeLock:
     """Second op for a file already in-flight is rejected before generation."""
 
-    def _make_service(self) -> "GovernedLoopService":
+    def _make_service(self):
         from pathlib import Path
         from backend.core.ouroboros.governance.governed_loop_service import (
             GovernedLoopConfig,
@@ -872,10 +872,6 @@ class TestFileScopeLock:
 
     async def test_preflight_rejects_in_flight_file(self, tmp_path):
         """_preflight_check returns CANCELLED when a target file is already in _active_file_ops."""
-        from backend.core.ouroboros.governance.governed_loop_service import (
-            GovernedLoopConfig,
-            GovernedLoopService,
-        )
         from backend.core.ouroboros.governance.op_context import (
             OperationContext,
             OperationPhase,
@@ -907,10 +903,6 @@ class TestFileScopeLock:
 
     async def test_preflight_passes_for_different_file(self, tmp_path):
         """_preflight_check does NOT cancel when target file is not in _active_file_ops."""
-        from backend.core.ouroboros.governance.governed_loop_service import (
-            GovernedLoopConfig,
-            GovernedLoopService,
-        )
         from backend.core.ouroboros.governance.op_context import OperationContext
         from pathlib import Path
 
