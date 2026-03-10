@@ -324,6 +324,7 @@ class GovernanceStack:
     shadow_harness: Optional[Any] = None
     governed_loop_service: Optional[Any] = None
     performance_persistence: Optional[Any] = None
+    oracle: Optional[Any] = None
 
     _started: bool = False
 

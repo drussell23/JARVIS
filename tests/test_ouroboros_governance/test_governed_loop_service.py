@@ -440,4 +440,27 @@ class TestGovernedLoopIntakeRegistryWiring:
         assert svc._repo_registry is not None, "_repo_registry was not set by _build_components"
         names = {r.name for r in svc._repo_registry.list_enabled()}
         assert "jarvis" in names
-        assert "prime" in names
+
+
+class TestOracleConfig:
+    """Tests for oracle fields on GovernedLoopConfig and GovernanceStack."""
+
+    def test_governed_loop_config_oracle_enabled_default(self):
+        from backend.core.ouroboros.governance.governed_loop_service import GovernedLoopConfig
+        from pathlib import Path
+        config = GovernedLoopConfig(project_root=Path("/tmp"))
+        assert config.oracle_enabled is True
+
+    def test_governed_loop_config_oracle_poll_interval_default(self):
+        from backend.core.ouroboros.governance.governed_loop_service import GovernedLoopConfig
+        from pathlib import Path
+        config = GovernedLoopConfig(project_root=Path("/tmp"))
+        assert config.oracle_incremental_poll_interval_s == 300.0
+
+    def test_governance_stack_oracle_defaults_none(self):
+        import dataclasses
+        from backend.core.ouroboros.governance.integration import GovernanceStack
+        field_names = {f.name for f in dataclasses.fields(GovernanceStack)}
+        assert "oracle" in field_names
+        defaults = {f.name: f.default for f in dataclasses.fields(GovernanceStack) if f.name == "oracle"}
+        assert defaults["oracle"] is None

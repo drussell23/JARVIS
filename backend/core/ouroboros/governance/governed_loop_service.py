@@ -187,6 +187,8 @@ class GovernedLoopConfig:
     model_attribution_lookback_n: int = 20
     model_attribution_min_sample_size: int = 3
     reactor_event_poll_interval_s: float = 30.0
+    oracle_enabled: bool = True
+    oracle_incremental_poll_interval_s: float = 300.0
 
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
