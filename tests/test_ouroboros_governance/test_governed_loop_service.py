@@ -676,3 +676,170 @@ class TestExpectedProviderFromPressure:
             "GCP_PRIME_SPOT",
             "LOCAL_CLAUDE",
         )
+
+
+# ---------------------------------------------------------------------------
+# TestSeedAutonomyPolicies
+# ---------------------------------------------------------------------------
+
+
+class TestSeedAutonomyPolicies:
+    """Unit tests for GovernedLoopService._seed_autonomy_policies()."""
+
+    def _make_service_with_registry(self, repos: list):
+        """Build a GovernedLoopService with a mock registry containing named repos."""
+        from unittest.mock import MagicMock
+        from pathlib import Path
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        service = GovernedLoopService(stack=stack, prime_client=None, config=config)
+
+        mock_registry = MagicMock()
+        mock_repos = []
+        for name in repos:
+            r = MagicMock()
+            r.name = name
+            mock_repos.append(r)
+        mock_registry.list_enabled.return_value = mock_repos
+        service._repo_registry = mock_registry
+        return service
+
+    def test_seeds_governed_for_tests_slice(self):
+        """tests/ canary slice seeds GOVERNED tier for all trigger sources."""
+        from backend.core.ouroboros.governance.autonomy.tiers import AutonomyTier
+
+        service = self._make_service_with_registry(["jarvis"])
+        service._seed_autonomy_policies()
+
+        assert service._trust_graduator is not None
+        for trigger in ("voice_command", "backlog", "test_failure", "opportunity_miner"):
+            cfg = service._trust_graduator.get_config(
+                trigger_source=trigger, repo="jarvis", canary_slice="tests/"
+            )
+            assert cfg is not None, f"No config for trigger={trigger}, slice=tests/"
+            assert cfg.current_tier is AutonomyTier.GOVERNED
+
+    def test_seeds_governed_for_docs_slice(self):
+        """docs/ canary slice seeds GOVERNED tier for all trigger sources."""
+        from backend.core.ouroboros.governance.autonomy.tiers import AutonomyTier
+
+        service = self._make_service_with_registry(["jarvis"])
+        service._seed_autonomy_policies()
+
+        for trigger in ("voice_command", "backlog", "test_failure", "opportunity_miner"):
+            cfg = service._trust_graduator.get_config(
+                trigger_source=trigger, repo="jarvis", canary_slice="docs/"
+            )
+            assert cfg is not None
+            assert cfg.current_tier is AutonomyTier.GOVERNED
+
+    def test_seeds_observe_for_core_slice(self):
+        """backend/core/ seeds OBSERVE tier for all trigger sources."""
+        from backend.core.ouroboros.governance.autonomy.tiers import AutonomyTier
+
+        service = self._make_service_with_registry(["jarvis"])
+        service._seed_autonomy_policies()
+
+        for trigger in ("voice_command", "backlog", "test_failure", "opportunity_miner"):
+            cfg = service._trust_graduator.get_config(
+                trigger_source=trigger,
+                repo="jarvis",
+                canary_slice="backend/core/",
+            )
+            assert cfg is not None
+            assert cfg.current_tier is AutonomyTier.OBSERVE
+
+    def test_seeds_observe_for_unclassified_root(self):
+        """Empty canary_slice (root default) seeds OBSERVE tier."""
+        from backend.core.ouroboros.governance.autonomy.tiers import AutonomyTier
+
+        service = self._make_service_with_registry(["jarvis"])
+        service._seed_autonomy_policies()
+
+        for trigger in ("voice_command", "backlog", "test_failure", "opportunity_miner"):
+            cfg = service._trust_graduator.get_config(
+                trigger_source=trigger, repo="jarvis", canary_slice=""
+            )
+            assert cfg is not None
+            assert cfg.current_tier is AutonomyTier.OBSERVE
+
+    def test_seeds_all_registered_repos(self):
+        """All repos in registry get policies seeded."""
+        repos = ["jarvis", "prime", "reactor-core"]
+        service = self._make_service_with_registry(repos)
+        service._seed_autonomy_policies()
+
+        all_configs = service._trust_graduator.all_configs()
+        repos_covered = {cfg.repo for cfg in all_configs}
+        assert repos_covered == set(repos)
+
+    def test_seeds_all_trigger_sources(self):
+        """All four trigger sources are seeded per slice per repo."""
+        service = self._make_service_with_registry(["jarvis"])
+        service._seed_autonomy_policies()
+
+        triggers_covered = {cfg.trigger_source for cfg in service._trust_graduator.all_configs()}
+        assert triggers_covered == {"voice_command", "backlog", "test_failure", "opportunity_miner"}
+
+    def test_seed_count_is_deterministic(self):
+        """4 repos * 4 triggers * 4 slices = 64 configs."""
+        repos = ["jarvis", "prime", "reactor-core", "extra"]
+        service = self._make_service_with_registry(repos)
+        service._seed_autonomy_policies()
+
+        # 4 slices: "tests/", "docs/", "backend/core/", ""
+        # 4 trigger sources, 4 repos
+        assert len(service._trust_graduator.all_configs()) == 64
+
+    def test_fallback_to_jarvis_when_no_registry(self):
+        """When _repo_registry is None, seeds policies for 'jarvis' only."""
+        from pathlib import Path
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        service = GovernedLoopService(stack=stack, prime_client=None, config=config)
+        service._repo_registry = None
+
+        service._seed_autonomy_policies()
+
+        repos_covered = {cfg.repo for cfg in service._trust_graduator.all_configs()}
+        assert repos_covered == {"jarvis"}
+
+    async def test_seed_called_during_start(self):
+        """_seed_autonomy_policies() is called during start(), populating _trust_graduator."""
+        from pathlib import Path
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        service = GovernedLoopService(stack=stack, prime_client=None, config=config)
+
+        assert service._trust_graduator is None
+
+        await service.start()
+        assert service._trust_graduator is not None
+        assert len(service._trust_graduator.all_configs()) > 0
+        await service.stop()
+
+    def test_seeding_is_idempotent(self):
+        """Calling _seed_autonomy_policies() twice produces the same count (fresh graduator each time)."""
+        service = self._make_service_with_registry(["jarvis"])
+        service._seed_autonomy_policies()
+        count_first = len(service._trust_graduator.all_configs())
+
+        service._seed_autonomy_policies()
+        count_second = len(service._trust_graduator.all_configs())
+
+        assert count_first == count_second

@@ -281,6 +281,7 @@ class GovernedLoopService:
         self._health_probe_task: Optional[asyncio.Task] = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
+        self._trust_graduator: Optional[Any] = None
 
         # Background task handles (curriculum + reactor event loop)
         self._curriculum_task: Optional[asyncio.Task] = None
@@ -317,6 +318,7 @@ class GovernedLoopService:
             await self._build_components()
             await self._reconcile_on_boot()  # boot reconciliation
             self._register_canary_slices()
+            self._seed_autonomy_policies()
             self._attach_to_stack()
             self._started_at = time.monotonic()
 
@@ -821,6 +823,70 @@ class GovernedLoopService:
                     slice_prefix,
                     exc,
                 )
+
+    def _seed_autonomy_policies(self) -> None:
+        """Seed baseline SignalAutonomyConfig per repo x trigger_source x canary_slice.
+
+        Default tiers:
+          tests/            -> GOVERNED  (test-only changes run without human approval)
+          docs/             -> GOVERNED  (doc patches run without human approval)
+          backend/core/     -> OBSERVE   (infrastructure changes require voice confirmation)
+          "" (root default) -> OBSERVE   (unclassified root-level changes default to safe)
+
+        Tiers are seeded conservatively; TrustGraduator.promote() advances them
+        automatically as operational track record accumulates.
+        """
+        from backend.core.ouroboros.governance.autonomy.graduator import TrustGraduator
+        from backend.core.ouroboros.governance.autonomy.tiers import (
+            AutonomyTier,
+            GraduationMetrics,
+            SignalAutonomyConfig,
+            WorkContext,
+            CognitiveLoad,
+        )
+
+        _TRIGGER_SOURCES = (
+            "voice_command",
+            "backlog",
+            "test_failure",
+            "opportunity_miner",
+        )
+        # canary_slice -> (tier, defer_during_work_context)
+        _SLICE_POLICIES = {
+            "tests/":        (AutonomyTier.GOVERNED, (WorkContext.MEETINGS,)),
+            "docs/":         (AutonomyTier.GOVERNED, (WorkContext.MEETINGS,)),
+            "backend/core/": (AutonomyTier.OBSERVE,  (WorkContext.MEETINGS, WorkContext.CODING)),
+            "":              (AutonomyTier.OBSERVE,   (WorkContext.MEETINGS, WorkContext.CODING)),
+        }
+
+        graduator = TrustGraduator()
+        repos = (
+            [r.name for r in self._repo_registry.list_enabled()]
+            if self._repo_registry is not None
+            else ["jarvis"]
+        )
+
+        for repo in repos:
+            for trigger_source in _TRIGGER_SOURCES:
+                for canary_slice, (tier, defer_ctxs) in _SLICE_POLICIES.items():
+                    config = SignalAutonomyConfig(
+                        trigger_source=trigger_source,
+                        repo=repo,
+                        canary_slice=canary_slice,
+                        current_tier=tier,
+                        graduation_metrics=GraduationMetrics(),
+                        defer_during_cognitive_load=CognitiveLoad.HIGH,
+                        defer_during_work_context=tuple(defer_ctxs),
+                        require_user_active=False,
+                    )
+                    graduator.register(config)
+
+        self._trust_graduator = graduator
+        logger.info(
+            "[GovernedLoop] Autonomy policies seeded: %d configs across %d repos",
+            len(graduator.all_configs()),
+            len(repos),
+        )
 
     def _attach_to_stack(self) -> None:
         """Attach governed loop components to GovernanceStack."""
