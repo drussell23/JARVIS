@@ -87,34 +87,31 @@ class ContextExpander:
 
         # Pre-fetch fused neighborhood once (async, fault-isolated)
         fused_neighborhood: Optional[Any] = None
-        if self._oracle is not None:
-            try:
-                status = self._oracle.get_status()
-                if status.get("running", False):
-                    target_abs = [self._repo_root / f for f in ctx.target_files]
-                    if hasattr(self._oracle, "get_fused_neighborhood"):
-                        try:
-                            fused_neighborhood = await self._oracle.get_fused_neighborhood(
-                                target_abs, ctx.description
-                            )
-                        except Exception as exc:
-                            logger.warning(
-                                "[ContextExpander] op=%s oracle neighborhood failed: %s; continuing without",
-                                ctx.op_id, exc,
-                            )
-                            # Fallback to synchronous structural neighborhood
-                            try:
-                                fused_neighborhood = self._oracle.get_file_neighborhood(target_abs)
-                            except Exception:
-                                fused_neighborhood = None
-                    else:
+        try:
+            target_abs = [self._repo_root / f for f in ctx.target_files]
+            if hasattr(self._oracle, "get_fused_neighborhood"):
+                try:
+                    fused_neighborhood = await self._oracle.get_fused_neighborhood(
+                        target_abs, ctx.description
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[ContextExpander] op=%s oracle neighborhood failed: %s; continuing without",
+                        ctx.op_id, exc,
+                    )
+                    # Fallback to synchronous structural neighborhood
+                    try:
                         fused_neighborhood = self._oracle.get_file_neighborhood(target_abs)
-            except Exception as exc:
-                logger.warning(
-                    "[ContextExpander] op=%s oracle neighborhood failed: %s; continuing without",
-                    ctx.op_id, exc,
-                )
-                fused_neighborhood = None
+                    except Exception:
+                        fused_neighborhood = None
+            else:
+                fused_neighborhood = self._oracle.get_file_neighborhood(target_abs)
+        except Exception as exc:
+            logger.warning(
+                "[ContextExpander] op=%s oracle neighborhood failed: %s; continuing without",
+                ctx.op_id, exc,
+            )
+            fused_neighborhood = None
 
         for round_num in range(MAX_ROUNDS):
             prompt = self._build_expansion_prompt(ctx, accumulated, neighborhood=fused_neighborhood)

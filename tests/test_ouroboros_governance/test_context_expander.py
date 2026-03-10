@@ -264,14 +264,14 @@ class TestContextExpanderOracleManifest:
         assert "jarvis:bar.py" in captured_prompts[0]
 
     async def test_oracle_fallback_when_not_ready(self, tmp_path):
-        """When oracle.get_status() returns running=False, expand() runs without raising."""
+        """When oracle.is_ready() returns False, expand() returns ctx unchanged without calling neighborhood."""
         from unittest.mock import AsyncMock, MagicMock
         from backend.core.ouroboros.governance.context_expander import ContextExpander
         from backend.core.ouroboros.governance.op_context import OperationContext
         from datetime import datetime, timezone, timedelta
 
         oracle = MagicMock()
-        oracle.get_status = MagicMock(return_value={"running": False})
+        oracle.is_ready.return_value = False
         oracle.get_relevant_files_for_query = AsyncMock(return_value=[])
 
         mock_gen = MagicMock()
@@ -406,7 +406,7 @@ class TestContextExpanderOracleGuard:
 
         expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=None)
         ctx = _make_ctx()
-        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
 
         result = await expander.expand(ctx, deadline)
         assert result is ctx
@@ -424,7 +424,7 @@ class TestContextExpanderOracleGuard:
 
         expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=oracle)
         ctx = _make_ctx()
-        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
 
         result = await expander.expand(ctx, deadline)
         assert result is ctx
@@ -443,7 +443,7 @@ class TestContextExpanderOracleGuard:
 
         expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=oracle)
         ctx = _make_ctx()
-        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
 
         with caplog.at_level(logging.INFO, logger="Ouroboros.ContextExpander"):
             await expander.expand(ctx, deadline)
@@ -466,7 +466,7 @@ class TestContextExpanderOracleGuard:
 
         expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=oracle)
         ctx = _make_ctx()
-        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
 
         result = await expander.expand(ctx, deadline)
         # generator.plan must have been called — proving we did not short-circuit
