@@ -95,6 +95,19 @@ class OracleConfig:
     GRAPH_CACHE_FILE = ORACLE_CACHE_DIR / "codebase_graph.pkl"
     INDEX_CACHE_FILE = ORACLE_CACHE_DIR / "file_index.json"
 
+    # Semantic index (ChromaDB)
+    CHROMA_PERSIST_DIR: Path = Path(os.getenv(
+        "ORACLE_CHROMA_DIR",
+        str(Path.home() / ".jarvis/oracle/chroma"),
+    ))
+    CHROMA_COLLECTION_NAME: str = os.getenv(
+        "ORACLE_CHROMA_COLLECTION", "jarvis_oracle_symbols"
+    )
+    SEMANTIC_EMBED_MODEL: str = os.getenv(
+        "ORACLE_EMBED_MODEL", "all-MiniLM-L6-v2"
+    )
+    SEMANTIC_EMBED_BATCH_SIZE: int = int(os.getenv("ORACLE_EMBED_BATCH", "128"))
+
     # Indexing settings
     MAX_PARALLEL_FILES = int(os.getenv("ORACLE_MAX_PARALLEL", "50"))
     EXCLUDE_PATTERNS = [
@@ -1093,6 +1106,200 @@ class CodebaseKnowledgeGraph:
             "last_full_index": 0.0,
             "last_incremental_update": 0.0,
         }
+
+
+# =============================================================================
+# ORACLE SEMANTIC INDEX — ChromaDB + SentenceTransformer
+# =============================================================================
+
+class OracleSemanticIndex:
+    """Manages ChromaDB embeddings for code symbols (functions, methods, classes).
+
+    Embedded text per node: ``"{name} {signature} {docstring}"`` (truncated to 512 chars).
+    Indexed node types: CLASS, FUNCTION, METHOD only.
+
+    **Fault isolation guarantee:** ``__init__`` never raises.  All public methods
+    return empty results silently when ``_available`` is ``False``.
+    """
+
+    # Node types worth embedding — others carry no useful semantic content
+    _EMBEDDABLE_TYPES = {NodeType.CLASS, NodeType.FUNCTION, NodeType.METHOD}
+    # Max chars fed to the embedding model per node
+    _MAX_EMBED_CHARS: int = 512
+
+    def __init__(
+        self,
+        persist_dir: Optional[Path] = None,
+        collection_name: Optional[str] = None,
+    ) -> None:
+        self._available: bool = False
+        self._collection: Optional[Any] = None
+        self._embedder: Optional[Any] = None
+        self._persist_dir = persist_dir or OracleConfig.CHROMA_PERSIST_DIR
+        self._collection_name = collection_name or OracleConfig.CHROMA_COLLECTION_NAME
+
+        try:
+            import chromadb  # type: ignore[import]
+            self._persist_dir.mkdir(parents=True, exist_ok=True)
+            client = chromadb.PersistentClient(
+                path=str(self._persist_dir),
+                settings=chromadb.Settings(
+                    anonymized_telemetry=False,
+                    allow_reset=True,
+                ),
+            )
+            self._collection = client.get_or_create_collection(
+                name=self._collection_name,
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:construction_ef": 200,
+                    "hnsw:M": 16,
+                },
+            )
+        except Exception as exc:
+            logger.warning(
+                "[OracleSemanticIndex] ChromaDB unavailable: %s; semantic search disabled", exc
+            )
+            return
+
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore[import]
+
+            class _STEmbedder:
+                def __init__(self, model_name: str) -> None:
+                    self._model = SentenceTransformer(model_name)
+
+                async def embed(self, text: str) -> Any:
+                    import asyncio as _asyncio
+                    loop = _asyncio.get_event_loop()
+                    return await loop.run_in_executor(
+                        None, lambda: self._model.encode(text, normalize_embeddings=True)
+                    )
+
+                async def embed_batch(self, texts: List[str]) -> List[Any]:
+                    import asyncio as _asyncio
+                    loop = _asyncio.get_event_loop()
+                    results = await loop.run_in_executor(
+                        None,
+                        lambda: self._model.encode(
+                            texts, normalize_embeddings=True, show_progress_bar=False
+                        ),
+                    )
+                    return list(results)
+
+            self._embedder = _STEmbedder(OracleConfig.SEMANTIC_EMBED_MODEL)
+            self._available = True
+            logger.info(
+                "[OracleSemanticIndex] Ready — collection '%s' at %s",
+                self._collection_name, self._persist_dir,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[OracleSemanticIndex] sentence-transformers unavailable: %s; semantic search disabled",
+                exc,
+            )
+
+    def is_ready(self) -> bool:
+        """Return True if ChromaDB and embedder are both available."""
+        return self._available
+
+    def _build_embed_text(self, node: "NodeData") -> Optional[str]:
+        """Build the text to embed for a node. Returns None if nothing to embed."""
+        parts: List[str] = [node.node_id.name]
+        if node.signature:
+            parts.append(node.signature)
+        if node.docstring:
+            parts.append(node.docstring)
+        if len(parts) == 1:
+            # Only the name — not worth embedding
+            return None
+        return " ".join(parts)[: self._MAX_EMBED_CHARS]
+
+    async def embed_nodes(self, nodes: List["NodeData"]) -> None:
+        """Embed a batch of nodes into ChromaDB.
+
+        Silently skips nodes with no embeddable content.
+        Silently returns if not available.
+        Never raises.
+        """
+        if not self._available or self._collection is None or self._embedder is None:
+            return
+
+        try:
+            embeddable = [
+                n for n in nodes
+                if n.node_id.node_type in self._EMBEDDABLE_TYPES
+                and self._build_embed_text(n) is not None
+            ]
+            if not embeddable:
+                return
+
+            batch_size = OracleConfig.SEMANTIC_EMBED_BATCH_SIZE
+            for i in range(0, len(embeddable), batch_size):
+                batch = embeddable[i : i + batch_size]
+                texts = [self._build_embed_text(n) for n in batch]  # type: ignore[misc]
+                embeddings = await self._embedder.embed_batch(texts)
+
+                ids = [str(n.node_id) for n in batch]
+                metadatas: List[Dict[str, Any]] = [
+                    {
+                        "repo": n.node_id.repo,
+                        "file_path": n.node_id.file_path,
+                        "name": n.node_id.name,
+                        "node_type": n.node_id.node_type.value,
+                    }
+                    for n in batch
+                ]
+
+                self._collection.upsert(
+                    ids=ids,
+                    embeddings=[e.tolist() for e in embeddings],
+                    metadatas=metadatas,
+                )
+
+            logger.debug("[OracleSemanticIndex] Embedded %d nodes", len(embeddable))
+        except Exception as exc:
+            logger.warning("[OracleSemanticIndex] embed_nodes failed: %s", exc)
+
+    async def semantic_search(
+        self, query: str, k: int = 5
+    ) -> List[Tuple[str, float]]:
+        """Search for semantically similar code symbols.
+
+        Returns ``("repo:file_path", similarity_score)`` tuples sorted by
+        similarity descending.  Deduplicates to unique file paths.
+        Returns empty list if not available or on any error.
+        """
+        if not self._available or self._collection is None or self._embedder is None:
+            return []
+
+        try:
+            query_embedding = await self._embedder.embed(query)
+
+            results = self._collection.query(
+                query_embeddings=[query_embedding.tolist()],
+                n_results=min(k * 4, 100),  # over-fetch to allow file-level dedup
+                include=["metadatas", "distances"],
+            )
+
+            distances: List[float] = results.get("distances", [[]])[0]
+            metadatas: List[Dict[str, Any]] = results.get("metadatas", [[]])[0]
+
+            # Deduplicate to file level, keep best score per file
+            best: Dict[str, float] = {}
+            for dist, meta in zip(distances, metadatas):
+                file_key = f"{meta['repo']}:{meta['file_path']}"
+                # ChromaDB cosine distance in [0, 2]; similarity = 1 - distance (clamped)
+                similarity = max(0.0, min(1.0, 1.0 - dist))
+                if file_key not in best or similarity > best[file_key]:
+                    best[file_key] = similarity
+
+            # Sort by similarity desc, return top-k unique files
+            return sorted(best.items(), key=lambda x: x[1], reverse=True)[:k]
+
+        except Exception as exc:
+            logger.warning("[OracleSemanticIndex] semantic_search failed: %s", exc)
+            return []
 
 
 # =============================================================================
