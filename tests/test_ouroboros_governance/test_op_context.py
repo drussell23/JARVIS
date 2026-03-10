@@ -687,3 +687,135 @@ def test_telemetry_context_with_routing_actual():
         routing_actual=ra,
     )
     assert tc.routing_actual is ra
+
+
+# ---------------------------------------------------------------------------
+# Task 2: OperationContext telemetry fields + with_* helpers
+# ---------------------------------------------------------------------------
+
+import pytest
+
+
+class TestTelemetryIntegration:
+    """Tests for OperationContext telemetry fields and with_* helpers."""
+
+    def _make_tc(self) -> "TelemetryContext":
+        return TelemetryContext(
+            local_node=_make_host_telemetry(),
+            routing_intent=RoutingIntentTelemetry(
+                expected_provider="GCP_PRIME_SPOT", policy_reason="NORMAL"
+            ),
+        )
+
+    def test_telemetry_default_none(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        assert ctx.telemetry is None
+
+    def test_previous_op_hash_by_scope_default_empty(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        assert ctx.previous_op_hash_by_scope == ()
+
+    def test_create_with_previous_op_hash_by_scope(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+            previous_op_hash_by_scope=(("jarvis", "abc123"),),
+        )
+        assert ctx.previous_op_hash_by_scope == (("jarvis", "abc123"),)
+
+    def test_with_telemetry_advances_hash(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        ctx2 = ctx.with_telemetry(self._make_tc())
+        assert ctx2.context_hash != ctx.context_hash
+
+    def test_with_telemetry_sets_previous_hash(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        ctx2 = ctx.with_telemetry(self._make_tc())
+        assert ctx2.previous_hash == ctx.context_hash
+
+    def test_with_telemetry_sets_field(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        tc = self._make_tc()
+        ctx2 = ctx.with_telemetry(tc)
+        assert ctx2.telemetry is tc
+        assert ctx2.phase == ctx.phase  # no phase change
+
+    def test_with_telemetry_hash_stability(self):
+        """Same inputs → same hash (deterministic)."""
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        tc = self._make_tc()
+        h1 = ctx.with_telemetry(tc).context_hash
+        h2 = ctx.with_telemetry(tc).context_hash
+        assert h1 == h2
+
+    def test_with_routing_actual_advances_hash(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        ctx2 = ctx.with_telemetry(self._make_tc())
+        ra = RoutingActualTelemetry(
+            provider_name="GCP_PRIME_SPOT",
+            endpoint_class="gcp_spot",
+            fallback_chain=(),
+            was_degraded=False,
+        )
+        ctx3 = ctx2.with_routing_actual(ra)
+        assert ctx3.context_hash != ctx2.context_hash
+        assert ctx3.telemetry is not None
+        assert ctx3.telemetry.routing_actual is ra
+
+    def test_with_routing_actual_requires_existing_telemetry(self):
+        ctx = OperationContext.create(
+            target_files=("backend/foo.py",),
+            description="test",
+        )
+        ra = RoutingActualTelemetry(
+            provider_name="GCP_PRIME_SPOT",
+            endpoint_class="gcp_spot",
+            fallback_chain=(),
+            was_degraded=False,
+        )
+        with pytest.raises(ValueError, match="telemetry"):
+            ctx.with_routing_actual(ra)
+
+    def test_concurrent_scope_chains_independent(self):
+        """Two ops on different repo scopes have independent hash chains."""
+        ctx_jarvis = OperationContext.create(
+            target_files=("jarvis/foo.py",),
+            description="jarvis op",
+            primary_repo="jarvis",
+            repo_scope=("jarvis",),
+            previous_op_hash_by_scope=(("jarvis", "hash_jarvis_prev"),),
+        )
+        ctx_prime = OperationContext.create(
+            target_files=("prime/bar.py",),
+            description="prime op",
+            primary_repo="prime",
+            repo_scope=("prime",),
+            previous_op_hash_by_scope=(("prime", "hash_prime_prev"),),
+        )
+        jarvis_hashes = dict(ctx_jarvis.previous_op_hash_by_scope)
+        prime_hashes = dict(ctx_prime.previous_op_hash_by_scope)
+        assert jarvis_hashes.get("jarvis") == "hash_jarvis_prev"
+        assert prime_hashes.get("prime") == "hash_prime_prev"
+        assert "prime" not in jarvis_hashes
+        assert "jarvis" not in prime_hashes

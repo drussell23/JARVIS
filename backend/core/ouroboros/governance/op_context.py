@@ -470,6 +470,12 @@ class OperationContext:
     benchmark_result: Optional["BenchmarkResult"] = None
     pre_apply_snapshots: Dict[str, str] = field(default_factory=dict)
 
+    # ---- Telemetry (stamped at intake and COMPLETE) ----
+    telemetry: Optional[TelemetryContext] = None
+    previous_op_hash_by_scope: Tuple[Tuple[str, str], ...] = ()
+    # e.g. (("jarvis", "abc123..."), ("prime", "def456..."))
+    # Frozen-safe representation of Dict[repo_name, last_context_hash]
+
     # ------------------------------------------------------------------
     # Post-init
     # ------------------------------------------------------------------
@@ -500,6 +506,7 @@ class OperationContext:
         saga_id: str = "",
         saga_state: Tuple[RepoSagaStatus, ...] = (),
         schema_version: str = "3.0",
+        previous_op_hash_by_scope: Tuple[Tuple[str, str], ...] = (),
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
 
@@ -555,6 +562,8 @@ class OperationContext:
             "expanded_context_files": (),
             "benchmark_result": None,
             "pre_apply_snapshots": {},
+            "telemetry": None,
+            "previous_op_hash_by_scope": previous_op_hash_by_scope,
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -584,6 +593,7 @@ class OperationContext:
             saga_id=saga_id,
             saga_state=saga_state,
             schema_version=schema_version,
+            previous_op_hash_by_scope=previous_op_hash_by_scope,
         )
 
     # ------------------------------------------------------------------
@@ -714,6 +724,49 @@ class OperationContext:
         intermediate = dataclasses.replace(
             self,
             pre_apply_snapshots=dict(snapshots),  # shallow copy for immutability
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_telemetry(self, tc: TelemetryContext) -> "OperationContext":
+        """Stamp TelemetryContext onto the context (no phase change).
+
+        Called exactly once by GovernedLoopService.submit() at intake,
+        after concurrency/dedup gates and pipeline_deadline stamping.
+        Uses the same hash-chain mechanics as with_pipeline_deadline().
+        """
+        intermediate = dataclasses.replace(
+            self,
+            telemetry=tc,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_routing_actual(self, ra: RoutingActualTelemetry) -> "OperationContext":
+        """Stamp actual routing outcome onto the existing TelemetryContext (no phase change).
+
+        Called at COMPLETE or POSTMORTEM when the actual provider is known.
+
+        Raises
+        ------
+        ValueError
+            If ``telemetry`` has not been set yet (with_telemetry must precede this).
+        """
+        if self.telemetry is None:
+            raise ValueError(
+                "with_routing_actual() called before telemetry was set; "
+                "call with_telemetry() first."
+            )
+        updated_tc = dataclasses.replace(self.telemetry, routing_actual=ra)
+        intermediate = dataclasses.replace(
+            self,
+            telemetry=updated_tc,
             previous_hash=self.context_hash,
             context_hash="",
         )
