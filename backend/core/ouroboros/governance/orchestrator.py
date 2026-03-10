@@ -758,7 +758,8 @@ class GovernedOrchestrator:
         if oracle is None:
             return
         try:
-            async with self._oracle_update_lock:
+            lock = getattr(self, "_oracle_update_lock", None) or asyncio.Lock()
+            async with lock:
                 await oracle.incremental_update(applied_files)
         except asyncio.CancelledError:
             pass  # swallow — oracle update is non-blocking; don't abort COMPLETE
