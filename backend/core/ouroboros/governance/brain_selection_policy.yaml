@@ -1,4 +1,4 @@
-version: "1.0"
+version: "1.1"
 updated: "2026-03-10"
 # =============================================================================
 # Ouroboros Brain Selection Policy
@@ -6,19 +6,28 @@ updated: "2026-03-10"
 # Maps task complexity tiers to specific models on the GCP Golden Image.
 # BrainSelector loads this at startup and hot-reloads on mtime change.
 #
-# fallback_model is used when the primary model is not yet loaded on j-prime.
-# Currently the golden image only carries Mistral 7B variants; additional
-# models (phi-3.5-mini, qwen-2.5-coder-7b, deepseek-r1-qwen-7b) will be
-# baked into a future golden image rebuild.
+# model_name must match the canonical name recognized by MultiModelPool
+# (see multi_model_pool._CANONICAL_PATTERNS for the full mapping table).
+#
+# Golden Image v2 carries:
+#   mistral-7b            → mistral-7b-instruct-v0.2.Q4_K_M.gguf    (4.1 GB)
+#   phi-3.5-mini          → Phi-3.5-mini-instruct-Q4_K_M.gguf        (2.3 GB)
+#   qwen-2.5-coder-7b     → qwen2.5-coder-7b-instruct-q4_k_m.gguf   (4.4 GB)
+#   deepseek-r1-qwen-7b   → DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf (4.4 GB)
+#   llama-3.2-1b          → Llama-3.2-1B-Instruct-Q4_K_M.gguf        (0.8 GB)
+#
+# max_loaded: j-prime keeps at most 2 models hot-loaded simultaneously (LRU).
 # =============================================================================
 
 brains:
   # ─────────────────────────────────────────────────────────────────────────
   # TIER 0: Lightweight — docs, comments, trivial appends
+  # Uses llama-3.2-1b for near-instant (<1s) load; phi-3.5-mini if needed.
   # ─────────────────────────────────────────────────────────────────────────
   phi3_lightweight:
-    model_name: "phi-3.5-mini"
-    fallback_model: "mistral-7b"          # always available on golden image
+    model_name: "phi-3.5-mini"            # MultiModelPool canonical name
+    fallback_model: "mistral-7b"          # hot_swap default if pool miss
+    gguf_file: "Phi-3.5-mini-instruct-Q4_K_M.gguf"
     max_prompt_tokens: 4096
     max_output_tokens: 512
     temperature: 0.1
@@ -35,6 +44,7 @@ brains:
   mistral_planning:
     model_name: "mistral-7b"
     fallback_model: "mistral-7b"
+    gguf_file: "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
     max_prompt_tokens: 8192
     max_output_tokens: 1024
     temperature: 0.2
@@ -51,6 +61,7 @@ brains:
   qwen_coder:
     model_name: "qwen-2.5-coder-7b"
     fallback_model: "mistral-7b"
+    gguf_file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
     max_prompt_tokens: 8192
     max_output_tokens: 2048
     temperature: 0.2
@@ -68,6 +79,7 @@ brains:
   deepseek_r1:
     model_name: "deepseek-r1-qwen-7b"
     fallback_model: "mistral-7b"
+    gguf_file: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
     max_prompt_tokens: 8192
     max_output_tokens: 2048
     temperature: 0.0                      # deterministic for reasoning

@@ -289,6 +289,8 @@ class PrimeRequest:
     stop: Optional[List[str]] = None  # v237.0: Stop sequences for generation
     metadata: Dict[str, Any] = field(default_factory=dict)
     request_id: Optional[str] = None
+    # Phase 4: Brain routing — set by GovernedLoopService from BrainSelectionResult
+    model_name: Optional[str] = None
 
     def __post_init__(self):
         if self.request_id is None:
@@ -1077,6 +1079,7 @@ class PrimeClient:
         context: Optional[List[Dict[str, str]]] = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        model_name: Optional[str] = None,
         **kwargs
     ) -> PrimeResponse:
         """
@@ -1106,6 +1109,7 @@ class PrimeClient:
             temperature=temperature,
             stop=stop,
             metadata=kwargs,
+            model_name=model_name,
         )
 
         return await self._execute_request(request)
@@ -1432,11 +1436,14 @@ class PrimeClient:
             "content": request.prompt
         })
 
+        # Phase 4: use BrainSelector-provided model name if set, else default
+        model_id = request.model_name or "jarvis-prime"
+
         payload = {
             "messages": messages,
             "max_tokens": request.max_tokens,
             "temperature": request.temperature,
-            "model": "jarvis-prime",  # Required by OpenAI format
+            "model": model_id,
         }
 
         if request.metadata:

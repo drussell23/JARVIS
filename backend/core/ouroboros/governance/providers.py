@@ -815,12 +815,18 @@ class PrimeProvider:
         tool_rounds = 0
         start = time.monotonic()
 
+        # Phase 4: extract brain model name from routing telemetry
+        _brain_model: Optional[str] = None
+        if context.telemetry and context.telemetry.routing_intent:
+            _brain_model = context.telemetry.routing_intent.brain_model or None
+
         while True:
             response = await self._client.generate(
                 prompt=prompt,
                 system_prompt=_CODEGEN_SYSTEM_PROMPT,
                 max_tokens=self._max_tokens,
                 temperature=0.2,
+                model_name=_brain_model,
             )
             raw = response.content
 
