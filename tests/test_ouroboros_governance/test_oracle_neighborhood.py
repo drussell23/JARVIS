@@ -243,3 +243,54 @@ class TestGetFileNeighborhood:
 
         assert "jarvis:tests/test_foo.py" in result.test_counterparts
         assert "jarvis:tests/test_bar.py" not in result.test_counterparts
+
+
+class TestFileNeighborhoodEndToEnd:
+    """Smoke-check: FileNeighborhood flows through ContextExpander._build_expansion_prompt."""
+
+    async def test_neighborhood_flows_into_expansion_prompt(self, tmp_path):
+        """Full pipeline: oracle.get_file_neighborhood → _render_neighborhood_section → prompt."""
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.governance.op_context import OperationContext, OperationPhase
+        from backend.core.ouroboros.oracle import FileNeighborhood
+        from unittest.mock import MagicMock
+
+        # Build a neighborhood with multiple categories
+        neighborhood = FileNeighborhood(
+            target_files=["jarvis:backend/core/service.py"],
+            imports=["jarvis:backend/core/base_service.py"],
+            importers=["jarvis:backend/core/main.py"],
+            callers=["jarvis:backend/core/handler.py"],
+            callees=[],
+            inheritors=[],
+            base_classes=["jarvis:backend/core/abstract.py"],
+            test_counterparts=["jarvis:tests/test_service.py"],
+        )
+
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": True}
+        oracle.get_file_neighborhood.return_value = neighborhood
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+
+        ctx = OperationContext.create(
+            op_id="e2e-test",
+            description="refactor the service layer",
+            target_files=("backend/core/service.py",),
+        ).advance(OperationPhase.ROUTE).advance(OperationPhase.CONTEXT_EXPANSION)
+
+        prompt = expander._build_expansion_prompt(ctx, [], oracle=oracle)
+
+        # All categories with data should appear in the prompt
+        assert "jarvis:backend/core/base_service.py" in prompt
+        assert "jarvis:backend/core/main.py" in prompt
+        assert "jarvis:backend/core/handler.py" in prompt
+        assert "jarvis:backend/core/abstract.py" in prompt
+        assert "jarvis:tests/test_service.py" in prompt
+
+        # Empty categories (callees, inheritors) should NOT appear
+        assert "callees" not in prompt.lower()
+        assert "inheritors" not in prompt.lower()
+
+        # Structural section header present
+        assert "Structural file neighborhood" in prompt
