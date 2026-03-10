@@ -397,6 +397,7 @@ class GovernedLoopService:
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
+        self._active_file_ops: Set[str] = set()  # canonical file paths currently in-flight
         self._completed_ops: Dict[str, OperationResult] = {}
 
     @property
@@ -613,6 +614,11 @@ class GovernedLoopService:
 
         # Execute pipeline
         self._active_ops.add(dedupe_key)
+        _locked_files: list = []
+        for _fp in ctx.target_files:
+            _canonical = str(__import__("pathlib").Path(_fp).resolve())
+            self._active_file_ops.add(_canonical)
+            _locked_files.append(_canonical)
         try:
             assert self._orchestrator is not None
             # Stamp pipeline_deadline exactly once — shared budget for all downstream phases
@@ -755,6 +761,8 @@ class GovernedLoopService:
 
         finally:
             self._active_ops.discard(dedupe_key)
+            for _canonical in _locked_files:
+                self._active_file_ops.discard(_canonical)
             # Phase 4: clean up per-op FSM context
             self._fsm_contexts.pop(ctx.op_id, None)
             self._fsm_checkpoint_seq.pop(ctx.op_id, None)
@@ -801,6 +809,19 @@ class GovernedLoopService:
             None                 — preflight passed; caller should proceed.
             OperationContext     — early-exit ctx (CANCELLED); caller returns it.
         """
+        # --- File-scope in-flight lock: prevent split-brain concurrent applies ---
+        import pathlib as _pathlib
+        for _fp in ctx.target_files:
+            _canonical = str(_pathlib.Path(_fp).resolve())
+            if _canonical in self._active_file_ops:
+                logger.warning(
+                    "[GovernedLoop] File-scope lock: %r already in-flight — "
+                    "rejecting op %s to prevent split-brain apply",
+                    _canonical,
+                    ctx.op_id,
+                )
+                return ctx.advance(OperationPhase.CANCELLED)
+
         # --- Cooldown guard: block if same file touched >3 times in 10 min ---
         import collections as _collections
         import time as _time

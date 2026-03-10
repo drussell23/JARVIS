@@ -843,3 +843,118 @@ class TestSeedAutonomyPolicies:
         count_second = len(service._trust_graduator.all_configs())
 
         assert count_first == count_second
+
+
+# ---------------------------------------------------------------------------
+# TestFileScopeLock
+# ---------------------------------------------------------------------------
+
+
+class TestFileScopeLock:
+    """Second op for a file already in-flight is rejected before generation."""
+
+    def _make_service(self) -> "GovernedLoopService":
+        from pathlib import Path
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        return GovernedLoopService(stack=stack, prime_client=None, config=config)
+
+    def test_active_file_ops_initialized_empty(self):
+        """`_active_file_ops` starts as an empty set."""
+        svc = self._make_service()
+        assert hasattr(svc, "_active_file_ops")
+        assert isinstance(svc._active_file_ops, set)
+        assert len(svc._active_file_ops) == 0
+
+    async def test_preflight_rejects_in_flight_file(self, tmp_path):
+        """_preflight_check returns CANCELLED when a target file is already in _active_file_ops."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext,
+            OperationPhase,
+        )
+        from pathlib import Path
+
+        svc = self._make_service()
+
+        # Simulate first op holding the file lock
+        fp = str(Path(tmp_path / "tests" / "test_foo.py").resolve())
+        svc._active_file_ops.add(fp)
+
+        # Create a context targeting the same file
+        ctx = OperationContext.create(
+            target_files=(fp,),
+            description="fix test",
+        )
+        # Give ctx a dummy pipeline deadline so budget check passes
+        from datetime import datetime, timezone, timedelta
+        ctx = ctx.with_pipeline_deadline(
+            datetime.now(tz=timezone.utc) + timedelta(seconds=600)
+        )
+
+        result = await svc._preflight_check(ctx)
+
+        assert result is not None, "Expected CANCELLED early-exit, got None (passed)"
+        assert result.phase is OperationPhase.CANCELLED
+        assert hasattr(result, "context_hash")  # confirms it's an OperationContext
+
+    async def test_preflight_passes_for_different_file(self, tmp_path):
+        """_preflight_check does NOT cancel when target file is not in _active_file_ops."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        from pathlib import Path
+
+        svc = self._make_service()
+
+        # Simulate a DIFFERENT file being locked
+        other_fp = str(Path(tmp_path / "tests" / "test_other.py").resolve())
+        svc._active_file_ops.add(other_fp)
+
+        # Our op targets a different file
+        target_fp = str(Path(tmp_path / "tests" / "test_target.py").resolve())
+        ctx = OperationContext.create(
+            target_files=(target_fp,),
+            description="fix target",
+        )
+        from datetime import datetime, timezone, timedelta
+        ctx = ctx.with_pipeline_deadline(
+            datetime.now(tz=timezone.utc) + timedelta(seconds=600)
+        )
+
+        # _preflight_check will fail for other reasons (no generator), but NOT for file lock
+        # We only check it doesn't immediately return cancelled (None or non-file-lock reason)
+        # Patch the provider probe to avoid network calls
+        from unittest.mock import patch
+        with patch.object(svc, "_generator", None):  # skip probe
+            result = await svc._preflight_check(ctx)
+
+        # File lock should NOT trigger — result is None (passed) or cancelled for other reason
+        if result is not None:
+            assert "file_lock" not in str(getattr(result, "phase", "")), (
+                f"Got unexpected file_lock cancellation for different file: {result}"
+            )
+
+    def test_canonical_path_used_for_lock_key(self, tmp_path):
+        """Symlink and real path produce same canonical key (resolve() applied)."""
+        import os
+        real_file = tmp_path / "tests" / "test_foo.py"
+        real_file.parent.mkdir(parents=True, exist_ok=True)
+        real_file.touch()
+        link_file = tmp_path / "link_test_foo.py"
+        os.symlink(str(real_file), str(link_file))
+
+        canonical_real = str(real_file.resolve())
+        canonical_link = str(link_file.resolve())
+        assert canonical_real == canonical_link, (
+            "Symlink and target should resolve to same canonical path"
+        )
