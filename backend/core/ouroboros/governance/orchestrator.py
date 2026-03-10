@@ -201,6 +201,7 @@ class GovernedOrchestrator:
         self._approval_provider = approval_provider
         self._config = config
         self._validation_runner = validation_runner
+        self._oracle_update_lock: asyncio.Lock = asyncio.Lock()
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
@@ -757,7 +758,8 @@ class GovernedOrchestrator:
         if oracle is None:
             return
         try:
-            await oracle.incremental_update(applied_files)
+            async with self._oracle_update_lock:
+                await oracle.incremental_update(applied_files)
         except asyncio.CancelledError:
             pass  # swallow — oracle update is non-blocking; don't abort COMPLETE
         except Exception as exc:

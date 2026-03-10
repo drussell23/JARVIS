@@ -960,3 +960,66 @@ class TestObserveTierGateCheck:
         assert result.phase is OperationPhase.COMPLETE, (
             f"Expected COMPLETE for governed tier + SAFE_AUTO, got {result.phase}"
         )
+
+
+# ---------------------------------------------------------------------------
+# TestOracleUpdateLock
+# ---------------------------------------------------------------------------
+
+
+class TestOracleUpdateLock:
+    """_oracle_incremental_update serializes concurrent oracle updates via asyncio.Lock."""
+
+    async def test_oracle_update_lock_exists(self):
+        """GovernedOrchestrator.__init__ creates _oracle_update_lock."""
+        from unittest.mock import MagicMock, AsyncMock
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+        from pathlib import Path
+        import asyncio
+
+        stack = MagicMock()
+        config = OrchestratorConfig(project_root=Path("/tmp/test"))
+        orch = GovernedOrchestrator(stack=stack, generator=None, approval_provider=None, config=config)
+
+        assert hasattr(orch, "_oracle_update_lock")
+        assert isinstance(orch._oracle_update_lock, asyncio.Lock)
+
+    async def test_oracle_updates_serialized(self):
+        """Concurrent _oracle_incremental_update calls are serialized (not concurrent)."""
+        from unittest.mock import MagicMock, AsyncMock
+        from backend.core.ouroboros.governance.orchestrator import (
+            GovernedOrchestrator,
+            OrchestratorConfig,
+        )
+        from pathlib import Path
+        import asyncio
+
+        stack = MagicMock()
+        config = OrchestratorConfig(project_root=Path("/tmp/test"))
+        orch = GovernedOrchestrator(stack=stack, generator=None, approval_provider=None, config=config)
+
+        call_order = []
+        async def mock_incremental_update(files):
+            call_order.append("start")
+            await asyncio.sleep(0)  # yield control
+            call_order.append("end")
+
+        oracle = MagicMock()
+        oracle.incremental_update = mock_incremental_update
+        stack.oracle = oracle
+        orch._stack = stack
+
+        # Launch two concurrent update calls
+        from pathlib import Path as P
+        await asyncio.gather(
+            orch._oracle_incremental_update([P("/tmp/a.py")]),
+            orch._oracle_incremental_update([P("/tmp/b.py")]),
+        )
+
+        # With a lock, calls are serialized: start-end-start-end (not start-start-end-end)
+        assert call_order == ["start", "end", "start", "end"], (
+            f"Oracle updates were not serialized. Order: {call_order}"
+        )
