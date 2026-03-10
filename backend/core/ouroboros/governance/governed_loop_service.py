@@ -581,6 +581,14 @@ class GovernedLoopService:
 
             terminal_ctx = await self._orchestrator.run(ctx)
 
+            # Phase 4: record actual generation cost for cost gate persistence
+            if terminal_ctx.generation:
+                _gen = terminal_ctx.generation
+                _provider_name = getattr(_gen, "provider_name", "unknown")
+                _cost = getattr(_gen, "cost_usd", 0.0) or 0.0
+                if _cost > 0.0:
+                    self._brain_selector.record_cost(_provider_name, _cost)
+
             duration = time.monotonic() - start_time
             result = OperationResult(
                 op_id=ctx.op_id,
