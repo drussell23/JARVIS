@@ -145,7 +145,10 @@ class GovernanceConfig:
         Raises ValueError on invalid config (e.g. unknown governance mode).
         """
         skip = getattr(args, "skip_governance", False)
-        mode_str = getattr(args, "governance_mode", "sandbox")
+        mode_str = (
+            getattr(args, "governance_mode", None)
+            or os.environ.get("JARVIS_GOVERNANCE_MODE", "sandbox")
+        )
 
         if skip:
             initial_mode = GovernanceMode.READ_ONLY_PLANNING
