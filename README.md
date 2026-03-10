@@ -37397,6 +37397,10 @@ The script:
 9. Governance validators pass (GOVERNED tier, docs target, minimal blast radius)
 10. File written to disk, committed to git
 
+**Provider participation**: J-Prime (Mistral 7B, routed by `phi3_lightweight` brain under Mac resource pressure) generated a syntactically valid schema response containing the correct `<!-- monitored by Ouroboros -->` content. However, Mistral 7B produced a diff with context lines from the wrong section of the file (a known 7B model quality limitation on code-generation tasks). The `CandidateGenerator` fallback FSM activated, and Claude API completed the operation on the second attempt.
+
+**Diff robustness fix**: During this test run, a fuzzy context search was added to `_apply_unified_diff()` in `providers.py`. Previously, the diff applicator required exact line-number matches. LLMs (including Claude Sonnet) consistently generate unified diffs with ±1–2 line offsets relative to the actual file. The fix uses a ±3 line window (`_find_hunk_start()`) to locate the hunk context if the exact position doesn't match — mirroring the behavior of GNU patch. This fix enabled Claude's fallback diff to apply successfully.
+
 **6-Point Checklist result**:
 
 ```
@@ -37404,7 +37408,7 @@ The script:
   OUROBOROS GO/NO-GO CHECKLIST
 ============================================================
   ✅  [1] Governance mode + repo roots printed
-  ✅  [2] Provider route logged
+  ✅  [2] Provider route logged (claude-api fallback)
   ✅  [3] Full lifecycle reached COMPLETE
   ✅  [4] Voice/TUI narration emitted
   ✅  [5] Ledger contains op record
@@ -37412,6 +37416,17 @@ The script:
 ============================================================
   🟢  IGNITION: GO — organism's first heartbeat confirmed.
 ============================================================
+```
+
+**File modification confirmed**: Last line of `docs/ouroboros_production_readiness.md` after pipeline: `<!-- monitored by Ouroboros -->`.
+
+**Pipeline trace observed**:
+```
+brain_routing (J-Prime/Mistral-7B) → context_expansion (Oracle 124K nodes)
+→ generate (J-Prime primary: diff context mismatch)
+→ fallback (Claude API: diff applied via fuzzy match)
+→ sandbox → validate → gate (SAFE_AUTO passed) → apply → ledger → verify
+→ COMPLETE
 ```
 
 To reproduce:
@@ -37423,6 +37438,8 @@ python3 trigger_ignition.py
 ```
 
 The script requires `JARVIS_PRIME_API_URL` in `.env` pointing to the running J-Prime VM. It will wait up to 300 seconds for the model to load, then fall back to Claude API if J-Prime is unreachable.
+
+**Key finding**: J-Prime (Mistral 7B) successfully routes through the full governance pipeline. For code-generation tasks requiring precise unified diffs, the BrainSelector should prefer `qwen-2.5-coder-7b` (TIER 2, heavy coding) over `mistral-7b` (general purpose). The resource gate on the Mac's 16 GB RAM currently forces `phi3_lightweight → mistral-7b`; running on the 64 GB GCP VM would allow the full `qwen-2.5-coder-7b` model to be used as the primary brain.
 
 ---
 

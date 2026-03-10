@@ -168,16 +168,40 @@ def _apply_unified_diff(original: str, diff_text: str) -> str:
 
         hunks.append((orig_start, hunk_orig, hunk_new))
 
+    def _normalize(lines: List[str]) -> List[str]:
+        return [ln.rstrip("\n\r") for ln in lines]
+
+    def _find_hunk_start(result: List[str], orig_start: int, hunk_orig: List[str], window: int = 3) -> int:
+        """Search for hunk_orig within a ±window line window of orig_start.
+
+        Returns the best matching start index, or -1 if not found.
+        This tolerates off-by-N line numbers that LLMs commonly generate.
+        """
+        norm_hunk = _normalize(hunk_orig)
+        hunk_len = len(hunk_orig)
+        lo = max(0, orig_start - window)
+        hi = min(len(result) - hunk_len + 1, orig_start + window + 1)
+        for candidate in range(lo, hi):
+            if _normalize(result[candidate:candidate + hunk_len]) == norm_hunk:
+                return candidate
+        return -1
+
     # Apply hunks bottom-to-top so earlier indices stay valid
     for orig_start, hunk_orig, hunk_new in reversed(hunks):
         end = orig_start + len(hunk_orig)
         actual = result[orig_start:end]
         # Normalise line endings for comparison only
-        if [ln.rstrip("\n\r") for ln in actual] != [ln.rstrip("\n\r") for ln in hunk_orig]:
-            raise ValueError(
-                f"Diff hunk at line {orig_start + 1} does not match source — "
-                f"expected {hunk_orig[:2]!r}, got {actual[:2]!r}"
-            )
+        if _normalize(actual) != _normalize(hunk_orig):
+            # Exact match failed — try fuzzy search within ±3 lines (LLMs commonly
+            # generate diffs with off-by-1 or off-by-2 line numbers)
+            found = _find_hunk_start(result, orig_start, hunk_orig, window=3)
+            if found == -1:
+                raise ValueError(
+                    f"Diff hunk at line {orig_start + 1} does not match source — "
+                    f"expected {hunk_orig[:2]!r}, got {actual[:2]!r}"
+                )
+            orig_start = found
+            end = orig_start + len(hunk_orig)
         result[orig_start:end] = hunk_new
 
     return "".join(result)
