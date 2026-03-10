@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time as _time
 from datetime import datetime, timezone
 from typing import Dict, Tuple
 from unittest.mock import AsyncMock, MagicMock, PropertyMock
@@ -561,10 +562,6 @@ class TestBuildCodegenPromptExpandedContext:
 # ---------------------------------------------------------------------------
 # Task 4: System Context block injection
 # ---------------------------------------------------------------------------
-
-import time as _time
-from datetime import datetime, timezone
-
 
 def _make_telemetry_context_for_prompt() -> "TelemetryContext":
     from backend.core.ouroboros.governance.op_context import (

@@ -187,9 +187,8 @@ def _build_system_context_block(ctx: "OperationContext") -> Optional[str]:
     ]
     if tc.routing_actual is not None:
         ra = tc.routing_actual
-        degraded = "True" if ra.was_degraded else "False"
         lines.append(
-            f"Actual: {ra.provider_name} ({ra.endpoint_class}) | Degraded: {degraded}"
+            f"Actual: {ra.provider_name} ({ra.endpoint_class}) | Degraded: {ra.was_degraded}"
         )
     return "\n".join(lines)
 
