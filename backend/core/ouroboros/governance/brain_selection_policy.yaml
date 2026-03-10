@@ -1,109 +1,189 @@
-version: "1.2"
-updated: "2026-03-10"
-# =============================================================================
-# Ouroboros Brain Selection Policy
-# =============================================================================
-# Maps task complexity tiers to specific models on the GCP Golden Image.
-# BrainSelector loads this at startup and hot-reloads on mtime change.
-#
-# model_name must match the canonical name recognized by MultiModelPool
-# (see multi_model_pool._CANONICAL_PATTERNS for the full mapping table).
-#
-# Golden Image v2 carries:
-#   mistral-7b            → mistral-7b-instruct-v0.2.Q4_K_M.gguf    (4.1 GB)
-#   phi-3.5-mini          → Phi-3.5-mini-instruct-Q4_K_M.gguf        (2.3 GB)
-#   qwen-2.5-coder-7b     → qwen2.5-coder-7b-instruct-q4_k_m.gguf   (4.4 GB)
-#   deepseek-r1-qwen-7b   → DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf (4.4 GB)
-#   llama-3.2-1b          → Llama-3.2-1B-Instruct-Q4_K_M.gguf        (0.8 GB)
-#
-# max_loaded: j-prime keeps at most 2 models hot-loaded simultaneously (LRU).
-# =============================================================================
+schema_version: "1.0.0"
+contract_version: "1.0.0"
+policy_id: "brain-selection-policy-v1"
+generated_at_utc: "2026-03-10T00:00:00Z"
+
+# Supervisor enforces this policy against runtime inventory at boot.
+handshake:
+  enabled: true
+  fail_mode: "hard_fail"   # hard_fail | degraded
+  runtime_inventory:
+    source: "jprime_endpoint"
+    endpoint: "http://127.0.0.1:8000/v1/brains"
+    freshness_ttl_seconds: 30
+    require_signature: false
+  compatibility:
+    min_runtime_contract_version: "1.0.0"
+    max_runtime_contract_version: "1.0.999"
+
+# Immutable authority constraints
+authority_boundaries:
+  supervisor_owns:
+    - "contract_validation"
+    - "active_brain_admission"
+    - "active_brain_withdrawal"
+    - "infra_lifecycle_control"
+  governed_loop_owns:
+    - "task_execution"
+    - "brain_selection_within_active_set_only"
+  prohibited_for_governed_loop:
+    - "admit_brain"
+    - "start_stop_vm"
+    - "override_contract_gate"
 
 brains:
-  # ─────────────────────────────────────────────────────────────────────────
-  # TIER 0: Lightweight — docs, comments, trivial appends
-  # Uses llama-3.2-1b (0.8 GB): ~50 tok/s on CPU — 10× faster than 7B models.
-  # Cold-load time < 2s. Fits in RAM alongside mistral-7b (pool max_loaded=2).
-  # mistral-7b is still the hot_swap default; llama-3.2-1b is loaded on demand
-  # for trivial tasks and stays hot after first use (LRU keeps both in memory).
-  # ─────────────────────────────────────────────────────────────────────────
-  phi3_lightweight:
-    model_name: "llama-3.2-1b"           # ultra-light, fast CPU inference
-    fallback_model: "mistral-7b"          # hot_swap default if pool miss
-    gguf_file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
-    max_prompt_tokens: 4096
-    max_output_tokens: 512
-    temperature: 0.1
-    handles:
-      - docs_edit
-      - comment_append
-      - single_line_change
-      - monitored_by_marker
-      - trivial_annotation
+  required:
+    - brain_id: "phi3_lightweight"
+      provider: "gcp_prime"
+      model_name: "llama-3.2-1b"
+      gguf_file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+      required_capabilities: ["chat", "trivial_ops"]
+      routable: true
+      allowed_task_classes: ["tier0", "tier1"]
+      cost_class: "free"
+      latency_class: "low"
+      max_prompt_tokens: 4096
+      max_output_tokens: 512
+      temperature: 0.1
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # TIER 1: Planning — single-file fixes, light multi-file
-  # ─────────────────────────────────────────────────────────────────────────
-  mistral_planning:
-    model_name: "mistral-7b"
-    fallback_model: "mistral-7b"
-    gguf_file: "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
-    max_prompt_tokens: 8192
-    max_output_tokens: 1024
-    temperature: 0.2
-    handles:
-      - single_file_fix
-      - bug_fix
-      - test_update
-      - config_change
-      - multi_file_light
+    - brain_id: "qwen_coder"
+      provider: "gcp_prime"
+      model_name: "qwen-2.5-coder-7b"
+      gguf_file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+      required_capabilities: ["code_generation", "code_refactor"]
+      routable: true
+      allowed_task_classes: ["tier2", "tier3"]
+      cost_class: "low"
+      latency_class: "medium"
+      max_prompt_tokens: 8192
+      max_output_tokens: 2048
+      temperature: 0.2
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # TIER 2: Heavy coding — refactors, new features, multi-file rewrites
-  # ─────────────────────────────────────────────────────────────────────────
-  qwen_coder:
-    model_name: "qwen-2.5-coder-7b"
-    fallback_model: "mistral-7b"
-    gguf_file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
-    max_prompt_tokens: 8192
-    max_output_tokens: 2048
-    temperature: 0.2
-    handles:
-      - heavy_refactor
-      - feature_implementation
-      - multi_file_heavy
-      - api_redesign
-      - class_extraction
-      - performance_optimization
+    - brain_id: "deepseek_r1"
+      provider: "gcp_prime"
+      model_name: "deepseek-r1-qwen-7b"
+      gguf_file: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
+      required_capabilities: ["complex_reasoning", "architecture_analysis"]
+      routable: true
+      allowed_task_classes: ["tier3"]
+      cost_class: "low"
+      latency_class: "medium"
+      max_prompt_tokens: 8192
+      max_output_tokens: 2048
+      temperature: 0.0
 
-  # ─────────────────────────────────────────────────────────────────────────
-  # TIER 3: Complex reasoning — architecture, cross-repo, deep analysis
-  # ─────────────────────────────────────────────────────────────────────────
-  deepseek_r1:
-    model_name: "deepseek-r1-qwen-7b"
-    fallback_model: "mistral-7b"
-    gguf_file: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
-    max_prompt_tokens: 8192
-    max_output_tokens: 2048
-    temperature: 0.0                      # deterministic for reasoning
-    handles:
-      - architecture_design
-      - cross_repo_planning
-      - complex_reasoning
-      - system_migration
-      - root_cause_analysis
-      - dependency_graph_analysis
+  optional:
+    - brain_id: "mistral_7b_fallback"
+      provider: "gcp_prime"
+      model_name: "mistral-7b"
+      gguf_file: "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+      required_capabilities: ["chat", "general_reasoning"]
+      routable: true
+      allowed_task_classes: ["tier1", "tier2"]
+      cost_class: "low"
+      latency_class: "medium"
+      max_prompt_tokens: 8192
+      max_output_tokens: 1024
+      temperature: 0.2
 
-# =============================================================================
-# 3-Layer Escalation Gate Configuration
-# =============================================================================
+allowlist:
+  allow_unlisted_runtime_brains: false
+  allowed_brain_ids:
+    - "phi3_lightweight"
+    - "qwen_coder"
+    - "deepseek_r1"
+    - "mistral_7b_fallback"
+
+routing:
+  precedence:
+    - "task_intent"
+    - "complexity"
+    - "latency_budget"
+    - "cost_budget"
+    - "health"
+
+  task_class_map:
+    tier0: ["phi3_lightweight"]
+    tier1: ["phi3_lightweight", "mistral_7b_fallback"]
+    tier2: ["qwen_coder", "mistral_7b_fallback"]
+    tier3: ["deepseek_r1", "qwen_coder"]
+
+  fallback_chain:
+    phi3_lightweight: ["mistral_7b_fallback"]
+    qwen_coder: ["mistral_7b_fallback"]
+    deepseek_r1: ["qwen_coder", "mistral_7b_fallback"]
+
+  # Legacy tier-based brain selection (used by existing BrainSelector until wired to new schema)
+  legacy_tier_map:
+    trivial: "phi3_lightweight"
+    planning: "mistral_7b_fallback"
+    heavy_code: "qwen_coder"
+    complex_reasoning: "deepseek_r1"
+
+  # Legacy brain definitions for BrainSelector backward compatibility
+  legacy_brains:
+    phi3_lightweight:
+      model_name: "llama-3.2-1b"
+      fallback_model: "mistral-7b"
+      max_prompt_tokens: 4096
+      max_output_tokens: 512
+      temperature: 0.1
+      handles:
+        - docs_edit
+        - comment_append
+        - single_line_change
+        - monitored_by_marker
+        - trivial_annotation
+
+    mistral_planning:
+      model_name: "mistral-7b"
+      fallback_model: "mistral-7b"
+      max_prompt_tokens: 8192
+      max_output_tokens: 1024
+      temperature: 0.2
+      handles:
+        - single_file_fix
+        - bug_fix
+        - test_update
+        - config_change
+        - multi_file_light
+
+    qwen_coder:
+      model_name: "qwen-2.5-coder-7b"
+      fallback_model: "mistral-7b"
+      max_prompt_tokens: 8192
+      max_output_tokens: 2048
+      temperature: 0.2
+      handles:
+        - heavy_refactor
+        - feature_implementation
+        - multi_file_heavy
+        - api_redesign
+        - class_extraction
+        - performance_optimization
+
+    deepseek_r1:
+      model_name: "deepseek-r1-qwen-7b"
+      fallback_model: "mistral-7b"
+      max_prompt_tokens: 8192
+      max_output_tokens: 2048
+      temperature: 0.0
+      handles:
+        - architecture_design
+        - cross_repo_planning
+        - complex_reasoning
+        - system_migration
+        - root_cause_analysis
+        - dependency_graph_analysis
+
+runtime_drift:
+  reconcile_interval_seconds: 30
+  on_required_brain_loss: "degraded_or_fail_by_policy"
+  on_optional_brain_loss: "degraded"
+  atomic_route_table_updates: true
 
 gates:
-
-  # ── Layer 1: Task Gate ─────────────────────────────────────────────────────
-  # Classify task complexity from description + target_files before any LLM call
   task_gate:
-    # Patterns that guarantee TRIVIAL classification (regex, case-insensitive)
     trivial_patterns:
       - "append.*line"
       - "add.*comment"
@@ -112,7 +192,6 @@ gates:
       - "single.*line"
       - "at the.*end of"
       - "^append"
-    # Patterns that guarantee HEAVY_CODE classification
     heavy_patterns:
       - "refactor"
       - "\\bimplement\\b"
@@ -122,29 +201,25 @@ gates:
       - "extract.*class"
       - "rewrite"
       - "add.*feature"
-    # Target file count thresholds
     trivial_max_files: 1
     heavy_min_files: 3
-    # Line count hint: if target file < N lines, downgrade to lighter tier
     trivial_max_target_lines: 200
 
-  # ── Layer 2: Resource Gate ─────────────────────────────────────────────────
-  # If local M1 is under pressure, prefer GCP to avoid OOM / paging
   resource_gate:
-    # Redirect non-trivial tasks to GCP when pressure >= this level
     local_pressure_redirect_threshold: "ELEVATED"
-    # Minimum local RAM (GB) before we stop preferring local planning mode
     local_planning_min_ram_gb: 2.0
 
-  # ── Layer 3: Cost Gate ─────────────────────────────────────────────────────
-  # Enforce strict daily budget. GCP CPU inference is currently free;
-  # this gate guards Claude API fallback spend.
   cost_gate:
-    # Combined daily budget across all providers ($)
     daily_budget_usd: 0.50
-    # Within that, max allocated to Claude API fallback
     claude_fallback_budget_usd: 0.40
-    # Action when budget exceeded for heavy/complex tasks
-    budget_exceeded_action: "queue"       # "queue" | "local_planning_mode"
-    # Path for persisted daily spend state (atomic JSON)
+    budget_exceeded_action: "queue"
     persist_path: "~/.jarvis/ouroboros/cost_state.json"
+
+error_codes:
+  - "CONTRACT_SCHEMA_INVALID"
+  - "CONTRACT_VERSION_INCOMPATIBLE"
+  - "CONTRACT_REQUIRED_BRAIN_MISSING"
+  - "CONTRACT_CAPABILITY_MISMATCH"
+  - "RUNTIME_INVENTORY_STALE"
+  - "FSM_SUSPENDED_PREEMPTED"
+  - "FSM_REHYDRATE_BUDGET_EXHAUSTED"
