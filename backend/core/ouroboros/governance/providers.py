@@ -770,10 +770,8 @@ class PrimeProvider:
             exceeds ``MAX_TOOL_LOOP_CHARS``.
             ``gcp-jprime_schema_invalid:...`` on patch schema validation failure.
         """
-        from backend.core.ouroboros.governance.tool_executor import ToolExecutor
-
         repo_root = self._repo_root or Path.cwd()
-        executor = ToolExecutor(repo_root=repo_root)
+        executor = None  # created lazily on first tool call
 
         prompt = _build_codegen_prompt(
             context,
@@ -802,6 +800,10 @@ class PrimeProvider:
                         raise RuntimeError(
                             f"gcp-jprime_tool_loop_max_iterations:{MAX_TOOL_ITERATIONS}"
                         )
+                    # Lazily create executor on first tool call
+                    if executor is None:
+                        from backend.core.ouroboros.governance.tool_executor import ToolExecutor
+                        executor = ToolExecutor(repo_root=repo_root)
                     # Execute the tool
                     tool_result = executor.execute(tool_call)
                     result_text = (
@@ -811,12 +813,13 @@ class PrimeProvider:
                         "Now continue. Either call another tool or return the patch JSON."
                     )
                     # Append tool exchange to prompt (single-turn Prime)
+                    old_prompt_len = len(prompt)
                     prompt = (
                         f"{prompt}\n\n"
                         f"[You called: {tool_call.name}({json.dumps(tool_call.arguments)})]\n"
                         f"{result_text}"
                     )
-                    accumulated_chars += len(result_text)
+                    accumulated_chars += len(prompt) - old_prompt_len
                     if accumulated_chars > MAX_TOOL_LOOP_CHARS:
                         raise RuntimeError(
                             f"gcp-jprime_tool_loop_budget_exceeded:{accumulated_chars}"

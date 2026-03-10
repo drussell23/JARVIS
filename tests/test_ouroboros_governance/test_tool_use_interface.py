@@ -234,6 +234,8 @@ class TestPrimeProviderToolLoop:
             mock_resp.content = responses[i]
             return mock_resp
         client.generate = _generate
+        # Expose counter so tests can assert exact call counts
+        client._call_count = call_count
         return client
 
     async def test_tool_loop_disabled_by_default(self, tmp_path: Path) -> None:
@@ -273,6 +275,10 @@ class TestPrimeProviderToolLoop:
         deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
         with pytest.raises(RuntimeError, match="tool_loop_max_iterations"):
             await provider.generate(ctx, deadline)
+        # The guard fires after the (MAX_TOOL_ITERATIONS+1)th client call:
+        # rounds 0..4 each call client then execute; round 5 calls client, sees
+        # tool_rounds==5 >= MAX_TOOL_ITERATIONS, raises before any execution.
+        assert client._call_count[0] == MAX_TOOL_ITERATIONS + 1
 
     async def test_tool_loop_token_budget_wall(self, tmp_path: Path) -> None:
         """When accumulated prompt exceeds MAX_TOOL_LOOP_CHARS, raise RuntimeError."""
