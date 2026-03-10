@@ -1035,3 +1035,75 @@ class TestFrozenTierStamping:
             f"Expected 'governed' for tests/ file, got '{captured_ctx[0].frozen_autonomy_tier}'"
         )
         await svc.stop()
+
+
+# ---------------------------------------------------------------------------
+# TestCooldownSymlinkResolution
+# ---------------------------------------------------------------------------
+
+
+class TestCooldownSymlinkResolution:
+    """Cooldown guard uses canonical (resolved) path so symlinks share the same counter."""
+
+    def _make_service(self):
+        from pathlib import Path
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+        )
+        stack = _mock_stack()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        return GovernedLoopService(stack=stack, prime_client=None, config=config)
+
+    def test_cooldown_key_is_canonical(self, tmp_path):
+        """Symlink and real path produce the same cooldown key after resolve()."""
+        import os
+        real_file = tmp_path / "tests" / "test_foo.py"
+        real_file.parent.mkdir(parents=True, exist_ok=True)
+        real_file.touch()
+        link_file = tmp_path / "link_test_foo.py"
+        os.symlink(str(real_file), str(link_file))
+
+        canonical_real = str(real_file.resolve())
+        canonical_link = str(link_file.resolve())
+        assert canonical_real == canonical_link, (
+            "Symlink and real path must resolve to the same canonical path"
+        )
+
+    async def test_cooldown_counts_symlink_and_target_together(self, tmp_path):
+        """Touches via symlink and real path are counted against the same counter."""
+        import os
+        from pathlib import Path
+        from datetime import datetime, timezone, timedelta
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext,
+            OperationPhase,
+        )
+
+        real_file = tmp_path / "tests" / "test_foo.py"
+        real_file.parent.mkdir(parents=True, exist_ok=True)
+        real_file.touch()
+        link_file = tmp_path / "link_test_foo.py"
+        os.symlink(str(real_file), str(link_file))
+
+        canonical = str(real_file.resolve())
+
+        svc = self._make_service()
+
+        def _make_ctx(fp: str) -> OperationContext:
+            ctx = OperationContext.create(target_files=(fp,), description="fix")
+            return ctx.with_pipeline_deadline(
+                datetime.now(tz=timezone.utc) + timedelta(seconds=600)
+            )
+
+        # Directly prime the cache with the CANONICAL path to simulate 3 previous touches
+        import collections
+        svc._file_touch_cache[canonical] = collections.deque([0.0, 1.0, 2.0])
+
+        # Op via symlink path should also hit the canonical counter
+        result = await svc._preflight_check(_make_ctx(str(link_file)))
+
+        assert result is not None, "Expected cooldown block for symlink path"
+        assert result.phase is OperationPhase.CANCELLED, (
+            f"Expected CANCELLED, got {result.phase}"
+        )

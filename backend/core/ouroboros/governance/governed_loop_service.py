@@ -871,13 +871,15 @@ class GovernedLoopService:
         # --- Cooldown guard: block if same file touched >3 times in 10 min ---
         import collections as _collections
         import time as _time
+        import pathlib as _pathlib_cooldown
         _COOLDOWN_WINDOW_S = 600.0   # 10 minutes
         _COOLDOWN_MAX_HITS = 3
         _now = _time.monotonic()
         for _fp in ctx.target_files:
-            if _fp not in self._file_touch_cache:
-                self._file_touch_cache[_fp] = _collections.deque()
-            _dq = self._file_touch_cache[_fp]
+            _canonical_fp = str(_pathlib_cooldown.Path(_fp).resolve())
+            if _canonical_fp not in self._file_touch_cache:
+                self._file_touch_cache[_canonical_fp] = _collections.deque()
+            _dq = self._file_touch_cache[_canonical_fp]
             # Evict timestamps older than the window
             while _dq and (_now - _dq[0]) > _COOLDOWN_WINDOW_S:
                 _dq.popleft()
@@ -886,7 +888,7 @@ class GovernedLoopService:
                 logger.warning(
                     "[GovernedLoop] Cooldown triggered for file %r "
                     "(%d touches in %.0fs window) — blocking op %s",
-                    _fp,
+                    _canonical_fp,
                     len(_dq),
                     _COOLDOWN_WINDOW_S,
                     ctx.op_id,
