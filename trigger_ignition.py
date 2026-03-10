@@ -181,7 +181,22 @@ async def ignite() -> None:
     except Exception as exc:
         log.warning("  Could not patch VoiceNarrator: %s", exc)
 
-    gls = GovernedLoopService(stack=stack, prime_client=None, config=loop_config)
+    # ------------------------------------------------------------------ #
+    # Build PrimeClient for GCP j-prime (golden-image)
+    # ------------------------------------------------------------------ #
+    prime_client = None
+    try:
+        from backend.core.prime_client import PrimeClient, PrimeClientConfig
+        prime_cfg = PrimeClientConfig()
+        log.info("  prime endpoint : %s", prime_cfg.base_url)
+        prime_client = PrimeClient(config=prime_cfg)
+        await prime_client.initialize()
+        log.info("  prime status   : %s", prime_client._status.value)
+    except Exception as exc:
+        log.warning("  PrimeClient init failed (%s) — falling back to Claude", exc)
+        prime_client = None
+
+    gls = GovernedLoopService(stack=stack, prime_client=prime_client, config=loop_config)
     await gls.start()
     log.info("  GLS state   : %s", gls.state.name)
     log.info("  GLS health  : %s", gls.health())
@@ -301,6 +316,11 @@ async def ignite() -> None:
     # Teardown
     # ------------------------------------------------------------------ #
     await gls.stop()
+    if prime_client is not None:
+        try:
+            await prime_client.close()
+        except Exception:
+            pass
     await stack.stop()
     log.info("--- Stack torn down cleanly ---")
 

@@ -53,45 +53,42 @@ Fix required: Serialize oracle updates through an asyncio.Lock or queue.
 
 **6. Ledger storage corruption on interrupted APPLY**
 If the process is killed between `change_engine.execute()` success and `_record_ledger(APPLIED)`, the file is written but the ledger shows the op as GENERATE. On restart, `_reconcile_on_boot` sees no APPLIED record and re-queues the operation, applying the change again.
-Fix required: Write a `APPLYING` sentinel to ledger BEFORE writing the file. On restart, if APPLYING is found without APPLIED, treat as failed and roll back.
+Fix required: Write a `APPLYING` sentinel to ledger BEFORE write, then update to `APPLIED` after success.
 
-**7. TUI transport buffer overflow**
-TUITransport buffers messages in a deque with no max size. Under high operation volume, the buffer grows unbounded. On a 2GB RAM system, this can OOM the process.
-Fix required: Bounded deque with LRU eviction. Max 1000 messages.
+**7. Resource monitor false-positive shutdown**
+ResourceMonitor triggers emergency shutdown if CPU > 95% for 30s. But if the system is under legitimate load (e.g., 10 concurrent operations), this is expected. False-positive shutdown kills operations mid-flight.
+Fix required: Scale CPU threshold by active operation count. 95% for 1 op, 98% for >5 ops.
 
 **8. Cooldown bypass via symlink**
-Per-file cooldown tracks by `file_path`. If a user creates a symlink to a protected file and targets the symlink, the cooldown is bypassed because the paths differ.
-Fix required: Resolve symlinks to canonical path before cooldown check.
+Per-file cooldown tracks by canonical path. If a file is symlinked, operations on the symlink and the target are counted separately. An attacker can bypass cooldown by creating symlinks.
+Fix required: Resolve symlinks in cooldown key computation.
 
 ### P2 — Observability (fix before production scale)
 
-**9. Resource monitor sampling drift**
-ResourceMonitor samples CPU/RAM every 100ms. Under sustained load, the sampling thread can lag behind real-time. Timestamps drift, making correlation with operation phases unreliable.
-Fix required: Use monotonic clock for sampling intervals, not wall clock.
+**9. Ledger query performance degradation**
+OperationLedger stores all operations in a single JSON file. Query performance degrades linearly with operation count. At 10,000 ops, ledger queries take >1s.
+Fix required: Migrate to SQLite with indexed queries.
 
-**10. Ledger query performance degradation**
-OperationLedger stores all operations in a single JSON file. Query performance degrades linearly with operation count. At 10k operations, queries take >1s.
-Fix required: Partition ledger by date. Query only relevant partitions.
+**10. Oracle memory leak on large repos**
+TheOracle loads the entire repo graph into memory. On large repos (>10k files), memory usage grows unbounded. The graph is never pruned.
+Fix required: Implement LRU eviction for unused graph nodes.
 
 ---
 
 ## Production Readiness Checklist
 
-### Phase 4 Ignition (Single Operation)
+### Phase 3 Ignition (current)
 
-- [ ] **Go/No-Go Decision:** Manual trigger of first real operation on docs/ slice
-- [ ] **End-to-End Verification:** CLASSIFY → ROUTE → CONTEXT_EXPANSION → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE
-- [ ] **Rollback Test:** Deliberate bad patch applied, then rolled back within 60s
-- [ ] **Narration Test:** VoiceNarrator announces intent, decision, and completion
-- [ ] **Ledger Integrity:** Operation recorded with cryptographic hash chain
-- [ ] **Resource Telemetry:** CPU/RAM/pressure stamped at each phase transition
+- [x] **GovernedLoopService FSM wired end-to-end**
+- [x] **AutonomyGate routing: docs/tests autonomous, backend/core gated**
+- [x] **TrustGraduator seeded with 4×4×N canary matrix**
+- [x] **CommProtocol narration + TUI + logging active**
+- [x] **ChangeEngine rollback artifacts + file locking**
+- [x] **OperationLedger hash chain integrity**
+- [ ] **First successful end-to-end operation (Go/No-Go gate)**
 
-### Phase 4 Hardening (Concurrent Operations)
+### Phase 4 Production Hardening
 
-- [ ] **P0 Fixes Deployed:** All 4 silent killers resolved and tested
-- [ ] **P1 Fixes Deployed:** Oracle serialization, ledger corruption, TUI overflow, cooldown bypass
-- [ ] **Concurrent Load Test:** 5 operations on different files, all complete successfully
-- [ ] **Failure Recovery:** Failed operations correctly roll back and narrate without human intervention
 - [ ] **Split-brain dedup verified under 5 concurrent operations on the same file**
 - [ ] **Saga cross-repo apply tested with deliberate second-repo failure and clean compensation**
 - [ ] **Narration-order inversion tested: two concurrent ops completing within 60s, both narrated**
@@ -112,5 +109,6 @@ Fix required: Partition ledger by date. Query only relevant partitions.
 
 *Logged: 2026-03-10. Authors: Claude Code + Ouroboros Architecture Review.*
 
+<!-- monitored by Ouroboros -->
 <!-- monitored by Ouroboros -->
 <!-- monitored by Ouroboros -->
