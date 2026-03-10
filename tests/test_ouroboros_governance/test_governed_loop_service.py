@@ -38,7 +38,10 @@ def _make_context(
 
 
 def _mock_stack(can_write_result: Tuple[bool, str] = (True, "ok")) -> MagicMock:
-    """Build a mock GovernanceStack."""
+    """Build a mock GovernanceStack including resource_monitor."""
+    import time as _time
+    from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+
     stack = MagicMock()
     stack.can_write.return_value = can_write_result
     stack._started = True
@@ -57,6 +60,18 @@ def _mock_stack(can_write_result: Tuple[bool, str] = (True, "ok")) -> MagicMock:
         success=True, rolled_back=False, op_id="op-test-001"
     ))
     stack.policy_version = "test-v1"
+    snap = ResourceSnapshot(
+        ram_percent=42.10,
+        cpu_percent=14.20,
+        event_loop_latency_ms=2.50,
+        disk_io_busy=False,
+        sampled_monotonic_ns=_time.monotonic_ns(),
+        ram_available_gb=6.80,
+        platform_arch="arm64",
+        collector_status="ok",
+    )
+    stack.resource_monitor = MagicMock()
+    stack.resource_monitor.snapshot = AsyncMock(return_value=snap)
     return stack
 
 
@@ -554,24 +569,12 @@ class TestOracleIndexerLifecycle:
 def _mock_stack_with_resource_monitor(
     can_write_result: Tuple[bool, str] = (True, "ok"),
 ) -> MagicMock:
-    """Build a mock GovernanceStack that includes resource_monitor."""
-    import time as _time
-    from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+    """Thin wrapper around _mock_stack() for backward compatibility.
 
-    stack = _mock_stack(can_write_result)
-    snap = ResourceSnapshot(
-        ram_percent=42.10,
-        cpu_percent=14.20,
-        event_loop_latency_ms=2.50,
-        disk_io_busy=False,
-        sampled_monotonic_ns=_time.monotonic_ns(),
-        ram_available_gb=6.80,
-        platform_arch="arm64",
-        collector_status="ok",
-    )
-    stack.resource_monitor = MagicMock()
-    stack.resource_monitor.snapshot = AsyncMock(return_value=snap)
-    return stack
+    _mock_stack() already includes resource_monitor; this alias exists so
+    existing test call-sites don't need to be updated.
+    """
+    return _mock_stack(can_write_result)
 
 
 # ---------------------------------------------------------------------------
@@ -623,3 +626,54 @@ class TestExpectedProviderFromPressure:
         )
         snap = self._make_snap(ram_percent=92.0, cpu_percent=30.0)  # EMERGENCY RAM (>=90%)
         assert _expected_provider_from_pressure(snap) == "LOCAL_CLAUDE"
+
+    @pytest.mark.asyncio
+    async def test_submit_stamps_telemetry_on_orchestrator_ctx(self):
+        """submit() must stamp ctx.telemetry before calling orchestrator.run().
+
+        This exercises the full submit() code path and verifies that the
+        TelemetryContext (including HostTelemetry and RoutingIntentTelemetry)
+        is attached to the OperationContext received by the orchestrator.
+        """
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopConfig,
+            GovernedLoopService,
+            ServiceState,
+        )
+
+        captured: Dict[str, OperationContext] = {}
+
+        async def fake_orchestrator_run(ctx: OperationContext) -> OperationContext:
+            captured["ctx"] = ctx
+            # CLASSIFY -> CANCELLED is the only valid terminal shortcut from the
+            # initial phase, so we use it here.  The test only cares that
+            # ctx.telemetry was stamped before orchestrator.run() was called.
+            return ctx.advance(OperationPhase.CANCELLED)
+
+        stack = _mock_stack_with_resource_monitor()
+        config = GovernedLoopConfig(project_root=Path("/tmp/test"))
+        service = GovernedLoopService(stack=stack, prime_client=None, config=config)
+        await service.start()
+
+        # Replace the real orchestrator with a mock that captures the context.
+        mock_orch = MagicMock()
+        mock_orch.run = AsyncMock(side_effect=fake_orchestrator_run)
+        service._orchestrator = mock_orch
+
+        ctx = _make_context(op_id="op-telemetry-001")
+        await service.submit(ctx, trigger_source="test")
+
+        assert "ctx" in captured, "orchestrator.run() was never called — submit() did not reach the orchestrator"
+        received_ctx = captured["ctx"]
+
+        # Telemetry must have been stamped by submit() before calling run().
+        assert received_ctx.telemetry is not None, "ctx.telemetry was None — stamping did not occur"
+
+        # HostTelemetry fields must reflect the mock snapshot (platform_arch="arm64").
+        assert received_ctx.telemetry.local_node.arch == "arm64"
+
+        # RoutingIntentTelemetry must carry one of the two valid provider strings.
+        assert received_ctx.telemetry.routing_intent.expected_provider in (
+            "GCP_PRIME_SPOT",
+            "LOCAL_CLAUDE",
+        )
