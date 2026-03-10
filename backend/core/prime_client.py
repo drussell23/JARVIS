@@ -278,6 +278,29 @@ class PrimeStatus(Enum):
 
 
 @dataclass
+class TaskProfile:
+    """Routing metadata forwarded to J-Prime for dynamic model dispatch (Task 3).
+
+    Populated by PrimeProvider from RoutingIntentTelemetry and serialised into
+    the HTTP payload so J-Prime's model-routing layer (Task 6) can dispatch the
+    right GGUF without hardcoding model names in the client.
+    """
+
+    intent: str      # CAI intent: "code_generation", "segfault_analysis", …
+    complexity: str  # TaskComplexity value: "trivial"|"light"|"heavy_code"|"complex"
+    brain_id: str    # e.g. "qwen_coder", "deepseek_r1", "phi3_lightweight"
+    model: str       # exact model alias: "qwen-2.5-coder-7b", "deepseek-r1-qwen-7b", …
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "intent": self.intent,
+            "complexity": self.complexity,
+            "brain_id": self.brain_id,
+            "model": self.model,
+        }
+
+
+@dataclass
 class PrimeRequest:
     """Request to Prime."""
     prompt: str
@@ -291,6 +314,8 @@ class PrimeRequest:
     request_id: Optional[str] = None
     # Phase 4: Brain routing — set by GovernedLoopService from BrainSelectionResult
     model_name: Optional[str] = None
+    # Task 3: Rich routing metadata for J-Prime model dispatch
+    task_profile: Optional[TaskProfile] = None
 
     def __post_init__(self):
         if self.request_id is None:
@@ -1080,6 +1105,7 @@ class PrimeClient:
         max_tokens: int = 4096,
         temperature: float = 0.7,
         model_name: Optional[str] = None,
+        task_profile: Optional[TaskProfile] = None,
         **kwargs
     ) -> PrimeResponse:
         """
@@ -1110,6 +1136,7 @@ class PrimeClient:
             stop=stop,
             metadata=kwargs,
             model_name=model_name,
+            task_profile=task_profile,
         )
 
         return await self._execute_request(request)
@@ -1436,8 +1463,12 @@ class PrimeClient:
             "content": request.prompt
         })
 
-        # Phase 4: use BrainSelector-provided model name if set, else default
-        model_id = request.model_name or "jarvis-prime"
+        # Task 3: model priority — explicit model_name > task_profile.model > default
+        model_id = (
+            request.model_name
+            or (request.task_profile.model if request.task_profile else None)
+            or "jarvis-prime"
+        )
 
         payload = {
             "messages": messages,
@@ -1452,6 +1483,10 @@ class PrimeClient:
         # v237.0: Stop sequences for generation control
         if request.stop:
             payload["stop"] = request.stop
+
+        # Task 3: forward task_profile so J-Prime can dispatch the right GGUF
+        if request.task_profile is not None:
+            payload["task_profile"] = request.task_profile.as_dict()
 
         return payload
 

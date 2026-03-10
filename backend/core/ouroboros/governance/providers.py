@@ -32,6 +32,11 @@ from backend.core.ouroboros.governance.op_context import (
     OperationContext,
 )
 
+try:
+    from backend.core.prime_client import TaskProfile as _TaskProfile
+except ImportError:
+    _TaskProfile = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("Ouroboros.Providers")
 
 
@@ -951,10 +956,25 @@ class PrimeProvider:
         tool_rounds = 0
         start = time.monotonic()
 
-        # Phase 4: extract brain model name from routing telemetry
+        # Task 3: build TaskProfile from routing telemetry for J-Prime dispatch
         _brain_model: Optional[str] = None
+        _task_profile: Optional[Any] = None
         if context.telemetry and context.telemetry.routing_intent:
-            _brain_model = context.telemetry.routing_intent.brain_model or None
+            ri = context.telemetry.routing_intent
+            _brain_model = ri.brain_model or None
+            if _TaskProfile is not None and ri.brain_id and ri.brain_model:
+                raw_reason = ri.routing_reason or "unknown"
+                intent = (
+                    raw_reason.removeprefix("cai_intent_")
+                    if raw_reason.startswith("cai_intent_")
+                    else raw_reason
+                )
+                _task_profile = _TaskProfile(
+                    intent=intent,
+                    complexity=ri.task_complexity or "unknown",
+                    brain_id=ri.brain_id,
+                    model=ri.brain_model,
+                )
 
         while True:
             response = await self._client.generate(
@@ -963,6 +983,7 @@ class PrimeProvider:
                 max_tokens=self._max_tokens,
                 temperature=0.2,
                 model_name=_brain_model,
+                task_profile=_task_profile,
             )
             raw = response.content
 
