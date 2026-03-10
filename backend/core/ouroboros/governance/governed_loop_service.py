@@ -283,6 +283,9 @@ class GovernedLoopService:
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
         self._trust_graduator: Optional[Any] = None
 
+        # Sliding-window cooldown: maps file_path -> deque of touch timestamps (monotonic)
+        self._file_touch_cache: Dict[str, Any] = {}  # str -> collections.deque[float]
+
         # Background task handles (curriculum + reactor event loop)
         self._curriculum_task: Optional[asyncio.Task] = None
         self._reactor_event_task: Optional[asyncio.Task] = None
@@ -586,6 +589,31 @@ class GovernedLoopService:
             None                 — preflight passed; caller should proceed.
             OperationContext     — early-exit ctx (CANCELLED); caller returns it.
         """
+        # --- Cooldown guard: block if same file touched >3 times in 10 min ---
+        import collections as _collections
+        import time as _time
+        _COOLDOWN_WINDOW_S = 600.0   # 10 minutes
+        _COOLDOWN_MAX_HITS = 3
+        _now = _time.monotonic()
+        for _fp in ctx.target_files:
+            if _fp not in self._file_touch_cache:
+                self._file_touch_cache[_fp] = _collections.deque()
+            _dq = self._file_touch_cache[_fp]
+            # Evict timestamps older than the window
+            while _dq and (_now - _dq[0]) > _COOLDOWN_WINDOW_S:
+                _dq.popleft()
+            _dq.append(_now)
+            if len(_dq) > _COOLDOWN_MAX_HITS:
+                logger.warning(
+                    "[GovernedLoop] Cooldown triggered for file %r "
+                    "(%d touches in %.0fs window) — blocking op %s",
+                    _fp,
+                    len(_dq),
+                    _COOLDOWN_WINDOW_S,
+                    ctx.op_id,
+                )
+                return ctx.advance(OperationPhase.CANCELLED)
+
         now = datetime.now(tz=timezone.utc)
         remaining_s = (
             (ctx.pipeline_deadline - now).total_seconds()
