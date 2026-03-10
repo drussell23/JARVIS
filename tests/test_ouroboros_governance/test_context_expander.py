@@ -287,3 +287,86 @@ class TestContextExpanderOracleManifest:
         )
         deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
         result = await expander.expand(ctx, deadline)  # must not raise
+
+
+class TestContextExpanderNeighborhoodManifest:
+    """Tests for the get_file_neighborhood integration in ContextExpander."""
+
+    def _make_ctx(self, description="fix the service", target_files=("backend/core/service.py",)):
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        return OperationContext.create(
+            op_id="test-op-1",
+            description=description,
+            target_files=tuple(target_files),
+        )
+
+    def _make_oracle(self, neighborhood=None):
+        from backend.core.ouroboros.oracle import FileNeighborhood
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": True}
+        default_nh = neighborhood or FileNeighborhood(
+            target_files=["jarvis:backend/core/service.py"],
+            imports=["jarvis:backend/core/base.py"],
+            importers=[],
+            callers=["jarvis:backend/core/main.py"],
+            callees=[],
+            inheritors=[],
+            base_classes=[],
+            test_counterparts=["jarvis:tests/test_service.py"],
+        )
+        oracle.get_file_neighborhood.return_value = default_nh
+        return oracle
+
+    async def test_neighborhood_section_appears_in_prompt(self, tmp_path):
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+
+        oracle = self._make_oracle()
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+
+        ctx = self._make_ctx()
+        prompt = expander._build_expansion_prompt(ctx, [], oracle=oracle)
+
+        # Neighborhood section must reference known file
+        assert "jarvis:backend/core/base.py" in prompt
+
+    async def test_neighborhood_section_truncates_at_10(self, tmp_path):
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.oracle import FileNeighborhood
+
+        # 15 callers — should be truncated to 10 with indicator
+        callers = [f"jarvis:backend/core/caller_{i}.py" for i in range(15)]
+        neighborhood = FileNeighborhood(
+            target_files=["jarvis:backend/core/service.py"],
+            imports=[],
+            importers=[],
+            callers=callers,
+            callees=[],
+            inheritors=[],
+            base_classes=[],
+            test_counterparts=[],
+        )
+        oracle = self._make_oracle(neighborhood=neighborhood)
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+        ctx = self._make_ctx()
+        prompt = expander._build_expansion_prompt(ctx, [], oracle=oracle)
+
+        # Exactly 10 callers shown, plus the "and N more" indicator
+        shown = sum(1 for i in range(15) if f"caller_{i}.py" in prompt)
+        assert shown == 10
+        assert "and 5 more" in prompt
+
+    async def test_no_neighborhood_section_when_oracle_not_running(self, tmp_path):
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": False}
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+        ctx = self._make_ctx()
+        prompt = expander._build_expansion_prompt(ctx, [], oracle=oracle)
+
+        # get_file_neighborhood should NOT be called when not running
+        oracle.get_file_neighborhood.assert_not_called()
+        # No neighborhood paths in prompt
+        assert "jarvis:" not in prompt
