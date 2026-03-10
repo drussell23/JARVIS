@@ -62,3 +62,33 @@ class TestToolExecutor:
         result = executor.execute(ToolCall(name="nonexistent_tool", arguments={}))
         assert result.error is not None
         assert "unknown tool" in result.error.lower()
+
+    def test_search_code_finds_pattern(self, tmp_path):
+        (tmp_path / "utils.py").write_text("def score_formula(x):\n    return x * 0.55\n")
+        executor = ToolExecutor(repo_root=tmp_path)
+        result = executor.execute(ToolCall(
+            name="search_code",
+            arguments={"pattern": "score_formula"},
+        ))
+        assert result.error is None
+        assert "score_formula" in result.output
+
+    def test_run_tests_returns_string_output(self, tmp_path):
+        # Pass a nonexistent path — pytest will report an error, but output is still a string
+        executor = ToolExecutor(repo_root=tmp_path)
+        result = executor.execute(ToolCall(
+            name="run_tests",
+            arguments={"paths": ["nonexistent_test.py"]},
+        ))
+        # Output is a string (may contain error message from pytest)
+        assert isinstance(result.output, str)
+
+    def test_get_callers_finds_call_sites(self, tmp_path):
+        (tmp_path / "caller.py").write_text("result = my_function(42)\n")
+        executor = ToolExecutor(repo_root=tmp_path)
+        result = executor.execute(ToolCall(
+            name="get_callers",
+            arguments={"function_name": "my_function"},
+        ))
+        assert result.error is None
+        assert "my_function" in result.output

@@ -107,24 +107,21 @@ class ToolExecutor:
         Raises BlockedPathError if the resolved path escapes repo_root or
         is a symbolic link.
         """
-        p = Path(path_str)
-        if p.is_absolute():
-            resolved = p.resolve()
+        raw = Path(path_str)
+        if raw.is_absolute():
+            pre_resolve = raw
         else:
-            resolved = (self._repo_root / path_str).resolve()
-
+            pre_resolve = self._repo_root / raw
+        # Check for symlink BEFORE resolving (resolve() follows symlinks)
+        if pre_resolve.exists() and pre_resolve.is_symlink():
+            raise BlockedPathError(f"blocked symlink: {path_str!r}")
+        resolved = pre_resolve.resolve()
         try:
             resolved.relative_to(self._repo_root.resolve())
         except ValueError:
             raise BlockedPathError(
-                f"path {path_str!r} resolves outside repo_root"
+                f"blocked path traversal: {path_str!r} escapes repo_root"
             )
-
-        if resolved.is_symlink():
-            raise BlockedPathError(
-                f"path {path_str!r} is a symbolic link"
-            )
-
         return resolved
 
     # ------------------------------------------------------------------
