@@ -29,6 +29,7 @@ logger = logging.getLogger("Ouroboros.ContextExpander")
 # ── Governor limits (Engineering Mandate — hardcoded, not configurable) ──
 MAX_ROUNDS: int = 2
 MAX_FILES_PER_ROUND: int = 5
+MAX_FILES_PER_CATEGORY: int = 10          # Token Explosion Trap limit per category
 
 _EXPANSION_SCHEMA_VERSION = "expansion.1"
 
@@ -80,23 +81,8 @@ class ContextExpander:
         """
         accumulated: List[str] = []
 
-        # Oracle manifest — real file paths for J-Prime to choose from
-        oracle_files: List[str] = []
-        if self._oracle is not None:
-            try:
-                if self._oracle.get_status().get("running", False):
-                    raw_paths = await self._oracle.get_relevant_files_for_query(
-                        ctx.description, limit=20
-                    )
-                    oracle_files = [
-                        str(p.relative_to(self._repo_root)) if hasattr(p, "relative_to") else str(p)
-                        for p in raw_paths
-                    ]
-            except Exception:
-                oracle_files = []  # fall back silently
-
         for round_num in range(MAX_ROUNDS):
-            prompt = self._build_expansion_prompt(ctx, accumulated, oracle_files)
+            prompt = self._build_expansion_prompt(ctx, accumulated, oracle=self._oracle)
 
             try:
                 raw = await self._generator.plan(prompt, deadline)
@@ -147,6 +133,7 @@ class ContextExpander:
         ctx: OperationContext,
         already_fetched: List[str],
         oracle_files: Optional[List[str]] = None,
+        oracle: Optional[Any] = None,
     ) -> str:
         """Build a lightweight prompt — filenames only, no file contents."""
         target_list = "\n".join(f"  - {f}" for f in ctx.target_files)
@@ -156,7 +143,19 @@ class ContextExpander:
             else "  (none yet)"
         )
         available_section = ""
-        if oracle_files:
+        if oracle is not None:
+            try:
+                status = oracle.get_status()
+                if status.get("running", False):
+                    target_abs = [
+                        self._repo_root / f for f in ctx.target_files
+                    ]
+                    neighborhood = oracle.get_file_neighborhood(target_abs)
+                    available_section = self._render_neighborhood_section(neighborhood)
+            except Exception:
+                available_section = ""  # fall back silently
+        elif oracle_files:
+            # Legacy fallback: flat file list from keyword query
             available_section = (
                 "\nAvailable files related to this task (real paths — choose from these):\n"
                 + "".join(f"  - {f}\n" for f in oracle_files)
@@ -174,6 +173,35 @@ class ContextExpander:
             f'"additional_files_needed": ["path/relative/to/repo.py", ...], '
             f'"reasoning": "<one sentence max 200 chars>"}}'
         )
+
+    def _render_neighborhood_section(self, neighborhood: Any) -> str:
+        """Render a FileNeighborhood as a labeled multi-section string.
+
+        Each category is limited to MAX_FILES_PER_CATEGORY entries.
+        Truncated categories append ``"  ... (and N more)"``.
+        Returns empty string if neighborhood has no neighbors.
+        """
+        try:
+            categories = neighborhood.to_dict()
+        except Exception:
+            return ""
+        if not categories:
+            return ""
+
+        lines = ["\nStructural file neighborhood (real codebase graph edges):"]
+        for category, paths in categories.items():
+            label = category.replace("_", " ").title()
+            shown = paths[:MAX_FILES_PER_CATEGORY]
+            hidden = len(paths) - len(shown)
+            lines.append(f"  {label}:")
+            for p in shown:
+                lines.append(f"    - {p}")
+            if hidden > 0:
+                lines.append(f"    ... (and {hidden} more)")
+        lines.append(
+            "\nWhich of these (if any) would help you understand the context?\n"
+        )
+        return "\n".join(lines)
 
     def _parse_expansion_response(self, raw: str) -> List[str]:
         """Parse expansion.1 JSON, returning up to MAX_FILES_PER_ROUND paths.

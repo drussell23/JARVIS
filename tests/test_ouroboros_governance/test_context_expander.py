@@ -214,17 +214,26 @@ class TestContextExpanderOracleManifest:
     """Oracle manifest injection into planning prompt."""
 
     async def test_oracle_manifest_injected_when_ready(self, tmp_path):
-        """When oracle is ready, planning prompt includes available files list."""
-        from unittest.mock import AsyncMock, MagicMock
+        """When oracle is ready, planning prompt includes structural neighborhood section."""
+        from unittest.mock import MagicMock
         from backend.core.ouroboros.governance.context_expander import ContextExpander
         from backend.core.ouroboros.governance.op_context import OperationContext
+        from backend.core.ouroboros.oracle import FileNeighborhood
         from datetime import datetime, timezone, timedelta
 
+        neighborhood = FileNeighborhood(
+            target_files=["jarvis:foo.py"],
+            imports=["jarvis:bar.py"],
+            importers=[],
+            callers=[],
+            callees=[],
+            inheritors=[],
+            base_classes=[],
+            test_counterparts=[],
+        )
         oracle = MagicMock()
         oracle.get_status = MagicMock(return_value={"running": True})
-        oracle.get_relevant_files_for_query = AsyncMock(
-            return_value=[tmp_path / "foo.py", tmp_path / "bar.py"]
-        )
+        oracle.get_file_neighborhood = MagicMock(return_value=neighborhood)
 
         captured_prompts = []
         mock_gen = MagicMock()
@@ -241,8 +250,8 @@ class TestContextExpanderOracleManifest:
         await expander.expand(ctx, deadline)
 
         assert len(captured_prompts) > 0
-        assert "Available files" in captured_prompts[0]
-        assert "foo.py" in captured_prompts[0] or "bar.py" in captured_prompts[0]
+        assert "Structural file neighborhood" in captured_prompts[0]
+        assert "jarvis:bar.py" in captured_prompts[0]
 
     async def test_oracle_fallback_when_not_ready(self, tmp_path):
         """When oracle.get_status() returns running=False, expand() runs without raising."""
@@ -266,8 +275,8 @@ class TestContextExpanderOracleManifest:
         )
         deadline = datetime.now(timezone.utc) + timedelta(seconds=30)
         result = await expander.expand(ctx, deadline)
-        # Must not raise; oracle.get_relevant_files_for_query must NOT have been called
-        oracle.get_relevant_files_for_query.assert_not_called()
+        # Must not raise; oracle.get_file_neighborhood must NOT have been called when not running
+        oracle.get_file_neighborhood.assert_not_called()
 
     async def test_oracle_fallback_when_none(self, tmp_path):
         """When oracle=None, expand() runs exactly as before."""
