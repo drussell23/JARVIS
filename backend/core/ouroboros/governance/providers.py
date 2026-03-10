@@ -16,6 +16,7 @@ Components
 from __future__ import annotations
 
 import ast
+import asyncio
 import hashlib
 import json
 import logging
@@ -929,6 +930,7 @@ class ClaudeProvider:
         daily_budget: float = 10.00,
         repo_root: Optional[Path] = None,
         repo_roots: Optional[Dict[str, Path]] = None,
+        tools_enabled: bool = False,
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -940,6 +942,7 @@ class ClaudeProvider:
         self._client: Any = None  # Lazy init
         self._repo_root = repo_root
         self._repo_roots = repo_roots
+        self._tools_enabled = tools_enabled
 
     @property
     def provider_name(self) -> str:
@@ -979,15 +982,24 @@ class ClaudeProvider:
         context: OperationContext,
         deadline: datetime,
     ) -> GenerationResult:
-        """Generate code candidates via Claude API.
+        """Generate code candidates via Claude API with optional tool-call loop.
 
-        Checks budget before calling, estimates cost after, and records
-        spend for daily tracking.
+        When ``tools_enabled=True``, the model may respond with a 2b.2-tool
+        schema response to request tool execution. The loop re-sends the
+        conversation with tool results appended until the model returns a patch
+        response or the iteration/budget limits are reached.
+
+        Checks budget before calling, estimates cost after, and records spend
+        for daily tracking.
 
         Raises
         ------
         RuntimeError
             ``claude_budget_exhausted`` if daily budget exceeded.
+            ``claude-api_tool_loop_max_iterations`` if the model exceeds
+            ``MAX_TOOL_ITERATIONS`` consecutive tool calls.
+            ``claude-api_tool_loop_budget_exceeded`` if the accumulated prompt
+            exceeds ``MAX_TOOL_LOOP_CHARS``.
             ``claude-api_schema_invalid:...`` on schema validation failure.
         """
         self._maybe_reset_daily_budget()
@@ -996,64 +1008,94 @@ class ClaudeProvider:
             raise RuntimeError("claude_budget_exhausted")
 
         client = self._ensure_client()
-        prompt = _build_codegen_prompt(
-            context, repo_root=self._repo_root, repo_roots=self._repo_roots
+        repo_root = self._repo_root or Path.cwd()
+        executor = None  # lazy init on first tool call
+
+        prompt_text = _build_codegen_prompt(
+            context,
+            repo_root=self._repo_root,
+            repo_roots=self._repo_roots,
+            tools_enabled=self._tools_enabled,
         )
+        # Build messages array for multi-turn conversation
+        messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt_text}]
+        accumulated_chars = len(prompt_text)
+        tool_rounds = 0
         start = time.monotonic()
 
-        message = await client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=_CODEGEN_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-        )
+        while True:
+            timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+            msg = await asyncio.wait_for(
+                client.messages.create(
+                    model=self._model,
+                    max_tokens=min(self._max_tokens, 8192),
+                    temperature=0.2,
+                    system=_CODEGEN_SYSTEM_PROMPT,
+                    messages=messages,
+                ),
+                timeout=timeout_s,
+            )
+            raw = msg.content[0].text if msg.content else ""
+            input_tokens = getattr(msg.usage, "input_tokens", 0)
+            output_tokens = getattr(msg.usage, "output_tokens", 0)
+            cost = self._estimate_cost(input_tokens, output_tokens)
+            self._record_cost(cost)
 
-        duration = time.monotonic() - start
-        raw_content = message.content[0].text
+            # Attempt tool call parse when tools are enabled
+            if self._tools_enabled:
+                tool_call = _parse_tool_call_response(raw)
+                if tool_call is not None:
+                    if tool_rounds >= MAX_TOOL_ITERATIONS:
+                        raise RuntimeError(
+                            f"claude-api_tool_loop_max_iterations:{MAX_TOOL_ITERATIONS}"
+                        )
+                    if executor is None:
+                        from backend.core.ouroboros.governance.tool_executor import ToolExecutor
+                        executor = ToolExecutor(repo_root=repo_root)
+                    tool_result = executor.execute(tool_call)
+                    result_text = (
+                        f"Tool result for {tool_call.name}:\n"
+                        f"{tool_result.output if not tool_result.error else 'ERROR: ' + tool_result.error}\n"
+                        "Now either call another tool or return the patch JSON."
+                    )
+                    # Append assistant + user turns for multi-turn conversation
+                    messages.append({"role": "assistant", "content": raw})
+                    messages.append({"role": "user", "content": result_text})
+                    accumulated_chars += len(raw) + len(result_text)
+                    if accumulated_chars > MAX_TOOL_LOOP_CHARS:
+                        raise RuntimeError(
+                            f"claude-api_tool_loop_budget_exceeded:{accumulated_chars}"
+                        )
+                    tool_rounds += 1
+                    continue
 
-        # Track cost
-        input_tokens = getattr(message.usage, "input_tokens", 0)
-        output_tokens = getattr(message.usage, "output_tokens", 0)
-        cost = self._estimate_cost(input_tokens, output_tokens)
-        self._record_cost(cost)
+            # Not a tool call (or tools disabled) — parse as patch response
+            duration = time.monotonic() - start
+            source_hash = ""
+            source_path = context.target_files[0] if context.target_files else ""
+            if source_path:
+                abs_path = (repo_root / source_path) if repo_root else Path(source_path)
+                try:
+                    content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                    source_hash = _file_source_hash(content_bytes)
+                except OSError:
+                    pass
 
-        # Compute source_hash for the first target file
-        source_hash = ""
-        source_path = ""
-        if context.target_files:
-            source_path = context.target_files[0]
-            abs_path = (self._repo_root / source_path) if self._repo_root else Path(source_path)
-            try:
-                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
-                source_hash = _file_source_hash(content_bytes)
-            except OSError:
-                pass
+            result = _parse_generation_response(
+                raw,
+                self.provider_name,
+                duration,
+                context,
+                source_hash,
+                source_path,
+                repo_roots=self._repo_roots,
+            )
 
-        result = _parse_generation_response(
-            raw_content,
-            self.provider_name,
-            duration,
-            context,
-            source_hash,
-            source_path,
-            repo_roots=self._repo_roots,
-        )
-
-        logger.info(
-            "[ClaudeProvider] Generated %d candidates in %.1fs, "
-            "model=%s, tokens=%d+%d, cost=$%.4f, daily_spend=$%.4f/$%.2f",
-            len(result.candidates),
-            duration,
-            getattr(message, "model", self._model),
-            input_tokens,
-            output_tokens,
-            cost,
-            self._daily_spend,
-            self._daily_budget,
-        )
-
-        return result
+            logger.info(
+                "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f",
+                len(result.candidates), duration, tool_rounds, cost,
+            )
+            return result
 
     async def health_probe(self) -> bool:
         """Lightweight API ping. Returns True if API responds."""

@@ -299,3 +299,56 @@ class TestPrimeProviderToolLoop:
             deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
             with pytest.raises(RuntimeError, match="tool_loop_budget_exceeded"):
                 await provider.generate(ctx, deadline)
+
+
+class TestClaudeProviderToolLoop:
+    """ClaudeProvider: multi-turn tool-call loop using messages API."""
+
+    def _mock_claude_client(self, responses: list[str]) -> MagicMock:
+        """Build a mock anthropic client cycling through response texts."""
+        call_count = [0]
+        async def _create(**kwargs):
+            i = min(call_count[0], len(responses) - 1)
+            call_count[0] += 1
+            msg = MagicMock()
+            msg.content = [MagicMock(text=responses[i])]
+            msg.usage = MagicMock(input_tokens=100, output_tokens=100)
+            msg.model = "claude-sonnet-4-6"
+            return msg
+        client = MagicMock()
+        client.messages = MagicMock()
+        client.messages.create = _create
+        return client
+
+    async def test_tool_loop_disabled_by_default(self, tmp_path: Path) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        provider = ClaudeProvider(api_key="test-key", repo_root=tmp_path)
+        provider._client = self._mock_claude_client([_prime_response()])
+        ctx = _make_ctx("op-claude-001")
+        deadline = datetime(2026, 3, 9, 12, 5, 0, tzinfo=timezone.utc)
+        result = await provider.generate(ctx, deadline)
+        assert isinstance(result, GenerationResult)
+
+    async def test_tool_loop_single_tool_then_patch(self, tmp_path: Path) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        responses = [
+            _prime_response("2b.2-tool", tool_call={"name": "list_symbols", "arguments": {"module_path": "utils.py"}}),
+            _prime_response("2b.1"),
+        ]
+        provider = ClaudeProvider(api_key="test-key", repo_root=tmp_path, tools_enabled=True)
+        provider._client = self._mock_claude_client(responses)
+        ctx = _make_ctx("op-claude-002")
+        deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
+        result = await provider.generate(ctx, deadline)
+        assert isinstance(result, GenerationResult)
+        assert len(result.candidates) == 1
+
+    async def test_tool_loop_exhausts_max_iterations(self, tmp_path: Path) -> None:
+        from backend.core.ouroboros.governance.providers import ClaudeProvider, MAX_TOOL_ITERATIONS
+        responses = [_prime_response("2b.2-tool")] * (MAX_TOOL_ITERATIONS + 2)
+        provider = ClaudeProvider(api_key="test-key", repo_root=tmp_path, tools_enabled=True)
+        provider._client = self._mock_claude_client(responses)
+        ctx = _make_ctx("op-claude-003")
+        deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
+        with pytest.raises(RuntimeError, match="tool_loop_max_iterations"):
+            await provider.generate(ctx, deadline)
