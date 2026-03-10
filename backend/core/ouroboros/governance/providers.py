@@ -165,6 +165,35 @@ def _find_context_files(
     return import_files, test_files
 
 
+def _build_system_context_block(ctx: "OperationContext") -> Optional[str]:
+    """Build '## System Context' block from ctx.telemetry, or return None.
+
+    Returns None (silently omitted) when telemetry is not set —
+    zero behavior change for existing tests and callers.
+    """
+    tc = ctx.telemetry
+    if tc is None:
+        return None
+    h = tc.local_node
+    ri = tc.routing_intent
+    lines = [
+        "## System Context",
+        (
+            f"Host  : {h.arch} | CPU: {h.cpu_percent:.2f}% "
+            f"| RAM: {h.ram_available_gb:.2f} GB avail | Pressure: {h.pressure}"
+        ),
+        f"Sample: {h.sampled_at_utc} | Age: {h.sample_age_ms}ms | Status: {h.collector_status}",
+        f"Route : {ri.expected_provider} | Reason: {ri.policy_reason}",
+    ]
+    if tc.routing_actual is not None:
+        ra = tc.routing_actual
+        degraded = "True" if ra.was_degraded else "False"
+        lines.append(
+            f"Actual: {ra.provider_name} ({ra.endpoint_class}) | Degraded: {degraded}"
+        )
+    return "\n".join(lines)
+
+
 def _build_tool_section() -> str:
     """Return the 'Available Tools' block injected into the generation prompt."""
     return (
@@ -409,6 +438,11 @@ Rules:
     file_block = "\n\n".join(file_sections) if file_sections else "_No target files._"
     parts = [
         f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}",
+    ]
+    sys_ctx_block = _build_system_context_block(ctx)
+    if sys_ctx_block is not None:
+        parts.append(sys_ctx_block)
+    parts += [
         f"## Source Snapshot\n\n{file_block}",
         context_block,
     ]

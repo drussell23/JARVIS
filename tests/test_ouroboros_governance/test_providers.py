@@ -556,3 +556,131 @@ class TestBuildCodegenPromptExpandedContext:
 
         prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
         assert "UNIQUE_MARKER_XYZ" in prompt
+
+
+# ---------------------------------------------------------------------------
+# Task 4: System Context block injection
+# ---------------------------------------------------------------------------
+
+import time as _time
+from datetime import datetime, timezone
+
+
+def _make_telemetry_context_for_prompt() -> "TelemetryContext":
+    from backend.core.ouroboros.governance.op_context import (
+        HostTelemetry,
+        RoutingIntentTelemetry,
+        TelemetryContext,
+    )
+    ht = HostTelemetry(
+        schema_version="1.0",
+        arch="arm64",
+        cpu_percent=14.20,
+        ram_available_gb=6.80,
+        pressure="NORMAL",
+        sampled_at_utc=datetime.now(tz=timezone.utc).isoformat(),
+        sampled_monotonic_ns=_time.monotonic_ns(),
+        collector_status="ok",
+        sample_age_ms=3,
+    )
+    ri = RoutingIntentTelemetry(expected_provider="GCP_PRIME_SPOT", policy_reason="NORMAL")
+    return TelemetryContext(local_node=ht, routing_intent=ri)
+
+
+class TestSystemContextBlock:
+    """Tests for ## System Context block injection in _build_codegen_prompt."""
+
+    def test_absent_when_telemetry_none(self, tmp_path):
+        """Default ctx (telemetry=None) → no ## System Context in prompt."""
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "## System Context" not in prompt
+
+    def test_present_when_telemetry_set(self, tmp_path):
+        """ctx.telemetry set → ## System Context block appears in prompt."""
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        ctx = ctx.with_telemetry(_make_telemetry_context_for_prompt())
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "## System Context" in prompt
+
+    def test_block_contains_host_fields(self, tmp_path):
+        """Block contains arch, CPU%, RAM, pressure from HostTelemetry."""
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        ctx = ctx.with_telemetry(_make_telemetry_context_for_prompt())
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "arm64" in prompt
+        assert "14.20" in prompt
+        assert "6.80" in prompt
+        assert "NORMAL" in prompt
+
+    def test_block_contains_route_intent(self, tmp_path):
+        """Block contains expected_provider and policy_reason."""
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        ctx = ctx.with_telemetry(_make_telemetry_context_for_prompt())
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "GCP_PRIME_SPOT" in prompt
+
+    def test_block_includes_routing_actual_when_set(self, tmp_path):
+        """If routing_actual is set, the Actual: line appears."""
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import (
+            OperationContext,
+            RoutingActualTelemetry,
+        )
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        ctx = ctx.with_telemetry(_make_telemetry_context_for_prompt())
+        ra = RoutingActualTelemetry(
+            provider_name="GCP_PRIME_SPOT",
+            endpoint_class="gcp_spot",
+            fallback_chain=(),
+            was_degraded=False,
+        )
+        ctx = ctx.with_routing_actual(ra)
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "Actual:" in prompt
+        assert "gcp_spot" in prompt
+        assert "Degraded: False" in prompt
+
+    def test_block_position_after_task_before_snapshot(self, tmp_path):
+        """## System Context appears after ## Task and before ## Source Snapshot."""
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        ctx = ctx.with_telemetry(_make_telemetry_context_for_prompt())
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        task_pos = prompt.index("## Task")
+        sys_ctx_pos = prompt.index("## System Context")
+        snapshot_pos = prompt.index("## Source Snapshot")
+        assert task_pos < sys_ctx_pos < snapshot_pos
