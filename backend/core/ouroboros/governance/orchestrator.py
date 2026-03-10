@@ -618,6 +618,8 @@ class GovernedOrchestrator:
         self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
         await self._publish_outcome(ctx, OperationState.APPLIED)
         await self._persist_performance_record(ctx)
+        applied_files = [Path(p).resolve() for p in ctx.target_files]
+        await self._oracle_incremental_update(applied_files)
         return ctx
 
     # ------------------------------------------------------------------
@@ -722,6 +724,23 @@ class GovernedOrchestrator:
             logger.warning(
                 "[Orchestrator] PerformanceRecord persist failed for op=%s: %s",
                 ctx.op_id, exc,
+            )
+
+    async def _oracle_incremental_update(
+        self,
+        applied_files: Sequence[Path],
+    ) -> None:
+        """Notify Oracle of changed files after successful COMPLETE. Fault-isolated — never raises."""
+        oracle = getattr(self._stack, "oracle", None)
+        if oracle is None:
+            return
+        try:
+            await oracle.incremental_update(applied_files)
+        except asyncio.CancelledError:
+            pass  # swallow — oracle update is non-blocking; don't abort COMPLETE
+        except Exception as exc:
+            logger.warning(
+                "[Orchestrator] Oracle incremental_update failed: %s", exc
             )
 
     def _build_profile(self, ctx: OperationContext) -> OperationProfile:
@@ -1050,6 +1069,15 @@ class GovernedOrchestrator:
             self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_saga)
             await self._publish_outcome(ctx, OperationState.APPLIED)
             await self._persist_performance_record(ctx)
+            try:
+                saga_applied: Sequence[Path] = [
+                    (Path(self._config.repo_registry.get(repo).local_path) / rel_path).resolve()
+                    for repo, patch in patch_map.items()
+                    for rel_path, _ in patch.new_content
+                ] if self._config.repo_registry is not None else []
+            except Exception:
+                saga_applied = []
+            await self._oracle_incremental_update(saga_applied)
             return ctx
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_STUCK:

@@ -829,3 +829,66 @@ class TestBenchmarkWiring:
         )
         await orch._persist_performance_record(ctx)
         stack.performance_persistence.save_record.assert_called_once()
+
+
+class TestOracleIncrementalUpdate:
+    """_oracle_incremental_update is fault-isolated and calls oracle correctly."""
+
+    async def test_incremental_update_called_with_resolved_paths(self):
+        """_oracle_incremental_update calls oracle.incremental_update with the given paths."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator, OrchestratorConfig
+        from pathlib import Path
+
+        config = MagicMock(spec=OrchestratorConfig)
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = config
+
+        mock_oracle = MagicMock()
+        mock_oracle.incremental_update = AsyncMock()
+        stack = MagicMock()
+        stack.oracle = mock_oracle
+        orch._stack = stack
+
+        applied = [Path("/tmp/foo.py"), Path("/tmp/bar.py")]
+        await orch._oracle_incremental_update(applied)
+
+        mock_oracle.incremental_update.assert_called_once_with(applied)
+
+    async def test_oracle_update_exception_does_not_raise(self):
+        """RuntimeError from incremental_update is caught and never re-raised."""
+        import asyncio
+        from unittest.mock import AsyncMock, MagicMock
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator, OrchestratorConfig
+        from pathlib import Path
+
+        config = MagicMock(spec=OrchestratorConfig)
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = config
+
+        mock_oracle = MagicMock()
+        mock_oracle.incremental_update = AsyncMock(side_effect=RuntimeError("oracle exploded"))
+        stack = MagicMock()
+        stack.oracle = mock_oracle
+        orch._stack = stack
+
+        applied = [Path("/tmp/foo.py")]
+        # Must not raise
+        await orch._oracle_incremental_update(applied)
+
+    async def test_oracle_update_noop_when_oracle_is_none(self):
+        """When stack.oracle is None, _oracle_incremental_update is a no-op."""
+        from unittest.mock import MagicMock
+        from backend.core.ouroboros.governance.orchestrator import Orchestrator, OrchestratorConfig
+        from pathlib import Path
+
+        config = MagicMock(spec=OrchestratorConfig)
+        orch = Orchestrator.__new__(Orchestrator)
+        orch._config = config
+        stack = MagicMock()
+        stack.oracle = None
+        orch._stack = stack
+
+        # Must not raise and must complete instantly (no oracle to call)
+        await orch._oracle_incremental_update([Path("/tmp/foo.py")])
