@@ -36,9 +36,13 @@ from backend.core.ouroboros.governance.candidate_generator import (
 )
 from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
 from backend.core.ouroboros.governance.op_context import (
+    HostTelemetry,
     OperationContext,
     OperationPhase,
+    RoutingIntentTelemetry,
+    TelemetryContext,
 )
+from backend.core.ouroboros.governance.resource_monitor import PressureLevel, ResourceSnapshot
 # IntakeLayerService is started by the supervisor (Zone 6.9); GLS only stores
 # the resolved RepoRegistry on self._repo_registry for Zone 6.9 to reuse.
 from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
@@ -98,6 +102,17 @@ async def _record_ledger(
             entry.state.value,
             exc,
         )
+
+
+def _expected_provider_from_pressure(snap: ResourceSnapshot) -> str:
+    """Derive the expected provider string from the snapshot's pressure level.
+
+    NORMAL / ELEVATED  → GCP_PRIME_SPOT  (cloud inference preferred)
+    CRITICAL / EMERGENCY → LOCAL_CLAUDE  (local fallback under resource pressure)
+    """
+    if snap.overall_pressure >= PressureLevel.CRITICAL:
+        return "LOCAL_CLAUDE"
+    return "GCP_PRIME_SPOT"
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +482,27 @@ class GovernedLoopService:
             ctx = ctx.with_pipeline_deadline(
                 datetime.now(tz=timezone.utc) + timedelta(seconds=self._config.pipeline_timeout_s)
             )
+
+            # Stamp TelemetryContext exactly once at intake
+            snap = await self._stack.resource_monitor.snapshot()
+            now_ns = time.monotonic_ns()
+            host_tel = HostTelemetry(
+                schema_version="1.0",
+                arch=snap.platform_arch,
+                cpu_percent=snap.cpu_percent,           # already quantized
+                ram_available_gb=snap.ram_available_gb, # already quantized
+                pressure=snap.overall_pressure.name,
+                sampled_at_utc=datetime.now(tz=timezone.utc).isoformat(),
+                sampled_monotonic_ns=snap.sampled_monotonic_ns,
+                collector_status=snap.collector_status,
+                sample_age_ms=(now_ns - snap.sampled_monotonic_ns) // 1_000_000,
+            )
+            intent_tel = RoutingIntentTelemetry(
+                expected_provider=_expected_provider_from_pressure(snap),
+                policy_reason=snap.overall_pressure.name,
+            )
+            tc = TelemetryContext(local_node=host_tel, routing_intent=intent_tel)
+            ctx = ctx.with_telemetry(tc)
 
             # Connectivity preflight (spends from deadline budget)
             if self._generator is not None and self._ledger is not None:

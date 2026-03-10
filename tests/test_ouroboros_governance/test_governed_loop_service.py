@@ -223,7 +223,7 @@ class TestGovernedLoopServiceSubmit:
             GovernedLoopService,
         )
 
-        stack = _mock_stack()
+        stack = _mock_stack_with_resource_monitor()
         config = GovernedLoopConfig(project_root=Path("/tmp/test"))
         service = GovernedLoopService(stack=stack, prime_client=None, config=config)
         await service.start()
@@ -544,3 +544,82 @@ class TestOracleIndexerLifecycle:
             oracle_task = service._oracle_indexer_task
             await service.stop()
             assert oracle_task.done()
+
+
+# ---------------------------------------------------------------------------
+# Helpers for telemetry tests
+# ---------------------------------------------------------------------------
+
+
+def _mock_stack_with_resource_monitor(
+    can_write_result: Tuple[bool, str] = (True, "ok"),
+) -> MagicMock:
+    """Build a mock GovernanceStack that includes resource_monitor."""
+    import time as _time
+    from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+
+    stack = _mock_stack(can_write_result)
+    snap = ResourceSnapshot(
+        ram_percent=42.10,
+        cpu_percent=14.20,
+        event_loop_latency_ms=2.50,
+        disk_io_busy=False,
+        sampled_monotonic_ns=_time.monotonic_ns(),
+        ram_available_gb=6.80,
+        platform_arch="arm64",
+        collector_status="ok",
+    )
+    stack.resource_monitor = MagicMock()
+    stack.resource_monitor.snapshot = AsyncMock(return_value=snap)
+    return stack
+
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+
+
+class TestExpectedProviderFromPressure:
+    """Tests for _expected_provider_from_pressure() module-level helper."""
+
+    def _make_snap(self, ram_percent: float = 50.0, cpu_percent: float = 30.0) -> "ResourceSnapshot":
+        import time as _time
+        from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+        return ResourceSnapshot(
+            ram_percent=ram_percent,
+            cpu_percent=cpu_percent,
+            event_loop_latency_ms=5.0,
+            disk_io_busy=False,
+            sampled_monotonic_ns=_time.monotonic_ns(),
+            ram_available_gb=8.0,
+            platform_arch="arm64",
+            collector_status="ok",
+        )
+
+    def test_normal_pressure_routes_gcp(self):
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _expected_provider_from_pressure,
+        )
+        snap = self._make_snap(ram_percent=50.0, cpu_percent=30.0)
+        assert _expected_provider_from_pressure(snap) == "GCP_PRIME_SPOT"
+
+    def test_elevated_pressure_routes_gcp(self):
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _expected_provider_from_pressure,
+        )
+        snap = self._make_snap(ram_percent=82.0, cpu_percent=30.0)  # ELEVATED RAM
+        assert _expected_provider_from_pressure(snap) == "GCP_PRIME_SPOT"
+
+    def test_critical_pressure_routes_local(self):
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _expected_provider_from_pressure,
+        )
+        snap = self._make_snap(ram_percent=87.0, cpu_percent=30.0)  # CRITICAL RAM (>=85%)
+        assert _expected_provider_from_pressure(snap) == "LOCAL_CLAUDE"
+
+    def test_emergency_pressure_routes_local(self):
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _expected_provider_from_pressure,
+        )
+        snap = self._make_snap(ram_percent=92.0, cpu_percent=30.0)  # EMERGENCY RAM (>=90%)
+        assert _expected_provider_from_pressure(snap) == "LOCAL_CLAUDE"

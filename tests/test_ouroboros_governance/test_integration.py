@@ -1069,6 +1069,21 @@ def _make_e2e_stack() -> MagicMock:
     stack.change_engine.execute = AsyncMock(
         return_value=MagicMock(success=True, rolled_back=False, op_id="test")
     )
+    # resource_monitor — needed by GovernedLoopService.submit() for telemetry stamping
+    import time as _time
+    from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+    _snap = ResourceSnapshot(
+        ram_percent=42.10,
+        cpu_percent=14.20,
+        event_loop_latency_ms=2.50,
+        disk_io_busy=False,
+        sampled_monotonic_ns=_time.monotonic_ns(),
+        ram_available_gb=6.80,
+        platform_arch="arm64",
+        collector_status="ok",
+    )
+    stack.resource_monitor = MagicMock()
+    stack.resource_monitor.snapshot = AsyncMock(return_value=_snap)
     return stack
 
 
