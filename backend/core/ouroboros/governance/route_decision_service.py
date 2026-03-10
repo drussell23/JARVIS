@@ -21,6 +21,13 @@ logger = logging.getLogger("Ouroboros.RouteDecisionService")
 
 
 # Maps CAI intent → (TaskComplexity, brain_id)
+#
+# NOTE on brain_id namespace: these identifiers ("phi3_lightweight", "mistral_planning",
+# "qwen_coder", "deepseek_r1") match BrainSelector's internal brain registry, NOT the
+# J-Prime model_catalogue.yaml brain_id field (which uses separate identifiers such as
+# "mistral_7b_fallback").  The authoritative bridge between the two namespaces is the
+# TaskProfile.model field (e.g. "mistral-7b"), which BrainSelector populates via its
+# model_name map and which ModelDispatcher uses for GGUF catalogue lookup.
 _INTENT_TO_BRAIN: Dict[str, Tuple[TaskComplexity, str]] = {
     "single_line_change":   (TaskComplexity.TRIVIAL,    "phi3_lightweight"),
     "docs_edit":            (TaskComplexity.TRIVIAL,    "phi3_lightweight"),
