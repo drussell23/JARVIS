@@ -1,10 +1,6 @@
 # tests/test_ouroboros_governance/test_resource_monitor.py
 """Tests for the governance resource monitor."""
 
-import asyncio
-import pytest
-from unittest.mock import patch, MagicMock
-
 from backend.core.ouroboros.governance.resource_monitor import (
     ResourceMonitor,
     ResourceSnapshot,
@@ -105,7 +101,6 @@ class TestResourceSnapshot:
 
 
 class TestResourceMonitor:
-    @pytest.mark.asyncio
     async def test_snapshot_returns_resource_data(self):
         """snapshot() returns a valid ResourceSnapshot."""
         monitor = ResourceMonitor()
@@ -115,7 +110,6 @@ class TestResourceMonitor:
         assert 0.0 <= snap.cpu_percent <= 100.0
         assert snap.event_loop_latency_ms >= 0.0
 
-    @pytest.mark.asyncio
     async def test_snapshot_with_injected_values(self):
         """Monitor accepts injected values for testing."""
         monitor = ResourceMonitor()
@@ -130,7 +124,6 @@ class TestResourceMonitor:
         assert snap.event_loop_latency_ms == 50.0
         assert snap.disk_io_busy is True
 
-    @pytest.mark.asyncio
     async def test_thresholds_configurable_via_env(self):
         """Thresholds are read from environment variables."""
         assert "ram_elevated" in PRESSURE_THRESHOLDS

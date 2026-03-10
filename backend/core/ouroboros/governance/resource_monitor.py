@@ -251,8 +251,5 @@ class ResourceMonitor:
 
     def _get_collector_status(self) -> str:
         """Return 'ok' if psutil is importable, 'partial' otherwise."""
-        try:
-            import psutil  # noqa: F401
-            return "ok"
-        except ImportError:
-            return "partial"
+        import importlib.util
+        return "ok" if importlib.util.find_spec("psutil") is not None else "partial"
