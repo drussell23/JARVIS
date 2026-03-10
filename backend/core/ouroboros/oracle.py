@@ -254,6 +254,60 @@ class BlastRadius:
         }
 
 
+@dataclass
+class FileNeighborhood:
+    """Structural neighborhood of a set of files in the codebase graph.
+
+    All paths are formatted as ``"{repo}:{relative_path}"``, e.g.
+    ``"jarvis:backend/core/foo.py"`` or ``"reactor:interfaces/base.py"``.
+    """
+
+    target_files: List[str]           # normalized "repo:path" of input files
+    imports: List[str]                # outgoing IMPORTS / IMPORTS_FROM edges
+    importers: List[str]              # incoming IMPORTS / IMPORTS_FROM edges
+    callers: List[str]                # incoming CALLS edges (who calls us)
+    callees: List[str]                # outgoing CALLS edges (who we call)
+    inheritors: List[str]             # incoming INHERITS edges
+    base_classes: List[str]           # outgoing INHERITS edges
+    test_counterparts: List[str]      # heuristic: test_{basename}.py match
+    local_repo: str = "jarvis"        # repo of input files (for rendering)
+
+    def to_dict(self) -> Dict[str, List[str]]:
+        """Return non-empty categories only."""
+        return {
+            k: v
+            for k, v in {
+                "imports": self.imports,
+                "importers": self.importers,
+                "callers": self.callers,
+                "callees": self.callees,
+                "inheritors": self.inheritors,
+                "base_classes": self.base_classes,
+                "test_counterparts": self.test_counterparts,
+            }.items()
+            if v
+        }
+
+    def all_unique_files(self) -> List[str]:
+        """Flat deduplicated list of all neighbor files, excluding targets."""
+        target_set = set(self.target_files)
+        seen: set = set()
+        result: List[str] = []
+        for path in (
+            self.imports
+            + self.importers
+            + self.callers
+            + self.callees
+            + self.inheritors
+            + self.base_classes
+            + self.test_counterparts
+        ):
+            if path not in target_set and path not in seen:
+                seen.add(path)
+                result.append(path)
+        return result
+
+
 # =============================================================================
 # AST VISITOR FOR CODE EXTRACTION
 # =============================================================================
