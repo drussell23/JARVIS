@@ -179,3 +179,117 @@ class TestToolPromptInjection:
         ctx = self._make_ctx()
         prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
         assert "Available Tools" not in prompt
+
+
+from backend.core.ouroboros.governance.op_context import (
+    GenerationResult,
+    OperationContext,
+)
+from datetime import datetime, timezone
+
+
+def _make_ctx(op_id: str = "op-test-tool-001") -> OperationContext:
+    return OperationContext.create(
+        target_files=("tests/test_utils.py",),
+        description="Add test for edge case",
+        op_id=op_id,
+    )
+
+
+def _prime_response(schema: str = "2b.1", **extra) -> str:
+    """Build a minimal valid prime response JSON string."""
+    if schema == "2b.2-tool":
+        return json.dumps({
+            "schema_version": "2b.2-tool",
+            "tool_call": extra.get("tool_call", {"name": "search_code", "arguments": {"pattern": "foo"}}),
+        })
+    return json.dumps({
+        "schema_version": "2b.1",
+        "candidates": [
+            {
+                "candidate_id": "c1",
+                "file_path": extra.get("file_path", "tests/test_utils.py"),
+                "full_content": extra.get("content", "def test_edge():\n    assert True\n"),
+                "rationale": "test",
+            }
+        ],
+    })
+
+
+class TestPrimeProviderToolLoop:
+    """PrimeProvider: multi-turn tool-call loop."""
+
+    def _mock_prime_client(self, responses: list[str]) -> MagicMock:
+        client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.model = "prime-7b"
+        mock_resp.latency_ms = 100.0
+        mock_resp.tokens_used = 100
+        mock_resp.metadata = {}
+        # Cycle through responses on each generate() call
+        call_count = [0]
+        async def _generate(**kwargs):
+            i = min(call_count[0], len(responses) - 1)
+            call_count[0] += 1
+            mock_resp.content = responses[i]
+            return mock_resp
+        client.generate = _generate
+        return client
+
+    async def test_tool_loop_disabled_by_default(self, tmp_path: Path) -> None:
+        """With tools_enabled=False (default), generate() returns first response."""
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        client = self._mock_prime_client([_prime_response()])
+        provider = PrimeProvider(client, repo_root=tmp_path)
+        ctx = _make_ctx()
+        deadline = datetime(2026, 3, 9, 12, 5, 0, tzinfo=timezone.utc)
+        result = await provider.generate(ctx, deadline)
+        assert isinstance(result, GenerationResult)
+        assert len(result.candidates) == 1
+
+    async def test_tool_loop_single_tool_then_patch(self, tmp_path: Path) -> None:
+        """One tool call then patch: generate() calls client twice, returns patch."""
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        responses = [
+            _prime_response("2b.2-tool", tool_call={"name": "read_file", "arguments": {"path": "tests/test_utils.py"}}),
+            _prime_response("2b.1"),
+        ]
+        client = self._mock_prime_client(responses)
+        provider = PrimeProvider(client, repo_root=tmp_path, tools_enabled=True)
+        ctx = _make_ctx()
+        deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
+        result = await provider.generate(ctx, deadline)
+        assert isinstance(result, GenerationResult)
+        assert len(result.candidates) == 1
+
+    async def test_tool_loop_exhausts_max_iterations(self, tmp_path: Path) -> None:
+        """If model keeps calling tools past MAX_TOOL_ITERATIONS, raise RuntimeError."""
+        from backend.core.ouroboros.governance.providers import PrimeProvider, MAX_TOOL_ITERATIONS
+        # All responses are tool calls (never produces a patch)
+        responses = [_prime_response("2b.2-tool")] * (MAX_TOOL_ITERATIONS + 2)
+        client = self._mock_prime_client(responses)
+        provider = PrimeProvider(client, repo_root=tmp_path, tools_enabled=True)
+        ctx = _make_ctx()
+        deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
+        with pytest.raises(RuntimeError, match="tool_loop_max_iterations"):
+            await provider.generate(ctx, deadline)
+
+    async def test_tool_loop_token_budget_wall(self, tmp_path: Path) -> None:
+        """When accumulated prompt exceeds MAX_TOOL_LOOP_CHARS, raise RuntimeError."""
+        from backend.core.ouroboros.governance.providers import PrimeProvider
+        # First response is a tool call for search_code
+        responses = [
+            _prime_response("2b.2-tool", tool_call={"name": "search_code", "arguments": {"pattern": "foo"}}),
+        ]
+        client = self._mock_prime_client(responses)
+        provider = PrimeProvider(client, repo_root=tmp_path, tools_enabled=True)
+        # Mock executor to return huge output
+        from backend.core.ouroboros.governance.tool_executor import ToolExecutor, ToolResult, ToolCall as TC
+        with patch.object(ToolExecutor, "execute", return_value=ToolResult(
+            tool_call=TC(name="search_code", arguments={"pattern": "foo"}),
+            output="x" * 40_000,
+        )):
+            ctx = _make_ctx()
+            deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
+            with pytest.raises(RuntimeError, match="tool_loop_budget_exceeded"):
+                await provider.generate(ctx, deadline)

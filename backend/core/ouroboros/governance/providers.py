@@ -737,11 +737,13 @@ class PrimeProvider:
         max_tokens: int = 8192,
         repo_root: Optional[Path] = None,
         repo_roots: Optional[Dict[str, Path]] = None,
+        tools_enabled: bool = False,
     ) -> None:
         self._client = prime_client
         self._max_tokens = max_tokens
         self._repo_root = repo_root
         self._repo_roots = repo_roots
+        self._tools_enabled = tools_enabled
 
     @property
     def provider_name(self) -> str:
@@ -752,62 +754,110 @@ class PrimeProvider:
         context: OperationContext,
         deadline: datetime,
     ) -> GenerationResult:
-        """Generate code candidates via PrimeClient.
+        """Generate code candidates via PrimeClient with optional tool-call loop.
 
-        Builds a structured prompt, calls PrimeClient.generate() with
-        low temperature, and parses the response with strict schema
-        validation.
+        When ``tools_enabled=True``, the model may respond with a 2b.2-tool
+        schema response to request tool execution. The loop re-sends the prompt
+        with tool results appended until the model returns a patch response or
+        the iteration/budget limits are reached.
 
         Raises
         ------
         RuntimeError
-            On schema validation failure (``gcp-jprime_schema_invalid:...``).
+            ``gcp-jprime_tool_loop_max_iterations`` if the model exceeds
+            ``MAX_TOOL_ITERATIONS`` consecutive tool calls.
+            ``gcp-jprime_tool_loop_budget_exceeded`` if the accumulated prompt
+            exceeds ``MAX_TOOL_LOOP_CHARS``.
+            ``gcp-jprime_schema_invalid:...`` on patch schema validation failure.
         """
+        from backend.core.ouroboros.governance.tool_executor import ToolExecutor
+
+        repo_root = self._repo_root or Path.cwd()
+        executor = ToolExecutor(repo_root=repo_root)
+
         prompt = _build_codegen_prompt(
-            context, repo_root=self._repo_root, repo_roots=self._repo_roots
+            context,
+            repo_root=self._repo_root,
+            repo_roots=self._repo_roots,
+            tools_enabled=self._tools_enabled,
         )
+        accumulated_chars = len(prompt)
+        tool_rounds = 0
         start = time.monotonic()
 
-        response = await self._client.generate(
-            prompt=prompt,
-            system_prompt=_CODEGEN_SYSTEM_PROMPT,
-            max_tokens=self._max_tokens,
-            temperature=0.2,
-        )
+        while True:
+            response = await self._client.generate(
+                prompt=prompt,
+                system_prompt=_CODEGEN_SYSTEM_PROMPT,
+                max_tokens=self._max_tokens,
+                temperature=0.2,
+            )
+            raw = response.content
 
-        duration = time.monotonic() - start
+            # Attempt to parse as tool call
+            if self._tools_enabled:
+                tool_call = _parse_tool_call_response(raw)
+                if tool_call is not None:
+                    if tool_rounds >= MAX_TOOL_ITERATIONS:
+                        raise RuntimeError(
+                            f"gcp-jprime_tool_loop_max_iterations:{MAX_TOOL_ITERATIONS}"
+                        )
+                    # Execute the tool
+                    tool_result = executor.execute(tool_call)
+                    result_text = (
+                        f"--- Tool Result: {tool_call.name} ---\n"
+                        f"{tool_result.output if not tool_result.error else 'ERROR: ' + tool_result.error}\n"
+                        "--- End Tool Result ---\n"
+                        "Now continue. Either call another tool or return the patch JSON."
+                    )
+                    # Append tool exchange to prompt (single-turn Prime)
+                    prompt = (
+                        f"{prompt}\n\n"
+                        f"[You called: {tool_call.name}({json.dumps(tool_call.arguments)})]\n"
+                        f"{result_text}"
+                    )
+                    accumulated_chars += len(result_text)
+                    if accumulated_chars > MAX_TOOL_LOOP_CHARS:
+                        raise RuntimeError(
+                            f"gcp-jprime_tool_loop_budget_exceeded:{accumulated_chars}"
+                        )
+                    tool_rounds += 1
+                    continue  # re-send to model
 
-        # Compute source_hash for the first target file
-        source_hash = ""
-        source_path = ""
-        if context.target_files:
-            source_path = context.target_files[0]
-            abs_path = (self._repo_root / source_path) if self._repo_root else Path(source_path)
-            try:
-                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
-                source_hash = _file_source_hash(content_bytes)
-            except OSError:
-                pass
+            # Not a tool call (or tools disabled) — parse as patch
+            duration = time.monotonic() - start
 
-        result = _parse_generation_response(
-            response.content,
-            self.provider_name,
-            duration,
-            context,
-            source_hash,
-            source_path,
-            repo_roots=self._repo_roots,
-        )
+            source_hash = ""
+            source_path = ""
+            if context.target_files:
+                source_path = context.target_files[0]
+                abs_path = (repo_root / source_path) if repo_root else Path(source_path)
+                try:
+                    content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                    source_hash = _file_source_hash(content_bytes)
+                except OSError:
+                    pass
 
-        logger.info(
-            "[PrimeProvider] Generated %d candidates in %.1fs, model=%s, tokens=%d",
-            len(result.candidates),
-            duration,
-            getattr(response, "model", "unknown"),
-            getattr(response, "tokens_used", 0),
-        )
+            result = _parse_generation_response(
+                raw,
+                self.provider_name,
+                duration,
+                context,
+                source_hash,
+                source_path,
+                repo_roots=self._repo_roots,
+            )
 
-        return result
+            logger.info(
+                "[PrimeProvider] Generated %d candidates in %.1fs (tool_rounds=%d), "
+                "model=%s, tokens=%d",
+                len(result.candidates),
+                duration,
+                tool_rounds,
+                getattr(response, "model", "unknown"),
+                getattr(response, "tokens_used", 0),
+            )
+            return result
 
     async def health_probe(self) -> bool:
         """Check PrimeClient health. Returns True only if AVAILABLE."""
