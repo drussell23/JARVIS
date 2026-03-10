@@ -186,14 +186,56 @@ async def ignite() -> None:
     # ------------------------------------------------------------------ #
     prime_client = None
     try:
+        import aiohttp as _aiohttp
         from backend.core.prime_client import PrimeClient, PrimeClientConfig
         prime_cfg = PrimeClientConfig()
         log.info("  prime endpoint : %s", prime_cfg.base_url)
-        prime_client = PrimeClient(config=prime_cfg)
-        await prime_client.initialize()
-        log.info("  prime status   : %s", prime_client._status.value)
+
+        # Wait for the model to be fully loaded — not just HTTP 200.
+        # J-Prime health response includes "model_loaded" and "phase" fields.
+        # The server starts immediately but model load can take 2-5 minutes.
+        _health_url = prime_cfg.health_url
+        _POLL_INTERVAL = 10  # seconds
+        _MAX_WAIT = int(os.environ.get("JARVIS_PRIME_MODEL_READY_TIMEOUT", "300"))
+        log.info("  Waiting for model-ready at %s (max %ds) ...", _health_url, _MAX_WAIT)
+        _waited = 0
+        _model_ready = False
+        async with _aiohttp.ClientSession(
+            timeout=_aiohttp.ClientTimeout(total=8.0)
+        ) as _sess:
+            while _waited < _MAX_WAIT:
+                try:
+                    async with _sess.get(_health_url) as _r:
+                        if _r.status == 200:
+                            try:
+                                _hdata = await _r.json(content_type=None)
+                            except Exception:
+                                _hdata = {}
+                            _phase = _hdata.get("phase", "")
+                            _loaded = _hdata.get("model_loaded", False)
+                            log.info(
+                                "  J-Prime health: phase=%s model_loaded=%s (%ds elapsed)",
+                                _phase, _loaded, _waited,
+                            )
+                            if _phase == "ready" or _loaded:
+                                _model_ready = True
+                                break
+                        else:
+                            log.info("  J-Prime health HTTP %s (%ds elapsed)", _r.status, _waited)
+                except Exception as _poll_exc:
+                    log.info("  J-Prime not reachable yet (%s) (%ds elapsed)", type(_poll_exc).__name__, _waited)
+                await asyncio.sleep(_POLL_INTERVAL)
+                _waited += _POLL_INTERVAL
+
+        if not _model_ready:
+            log.warning("  J-Prime model not ready after %ds — falling back to Claude", _MAX_WAIT)
+        else:
+            log.info("  J-Prime model ready ✓")
+            prime_client = PrimeClient(config=prime_cfg)
+            await prime_client.initialize()
+            log.info("  prime status   : %s", prime_client._status.value)
     except Exception as exc:
-        log.warning("  PrimeClient init failed (%s) — falling back to Claude", exc)
+        log.warning("  PrimeClient init failed (%s: %s) — falling back to Claude", type(exc).__name__, exc)
         prime_client = None
 
     gls = GovernedLoopService(stack=stack, prime_client=prime_client, config=loop_config)

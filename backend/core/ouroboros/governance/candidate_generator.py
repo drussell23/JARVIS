@@ -408,7 +408,8 @@ class CandidateGenerator:
                     )
             except (Exception, asyncio.CancelledError) as exc:
                 logger.warning(
-                    "[CandidateGenerator] Primary plan() failed (%s), trying fallback",
+                    "[CandidateGenerator] Primary plan() failed (%s: %s), trying fallback",
+                    type(exc).__name__,
                     exc,
                 )
 
