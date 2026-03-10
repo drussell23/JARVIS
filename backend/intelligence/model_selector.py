@@ -226,32 +226,61 @@ class IntelligentModelSelector:
 
     async def _classify_intent(self, query: str) -> str:
         """
-        Classify query intent using CAI
+        Classify query intent using CAI with keyword-matching fallback.
 
-        TODO: Integrate with actual CAI when available
-        For now, use simple keyword matching
+        Tries ContextAwarenessIntelligence.predict_intent() first (lazy import
+        to avoid circular dependencies). Falls back to local keyword rules when
+        CAI is unavailable or returns low confidence (< 0.3).
         """
-        query_lower = query.lower()
+        # --- Primary: CAI intent prediction ---
+        try:
+            from backend.intelligence.context_awareness_intelligence import (
+                ContextAwarenessIntelligence,
+            )
 
-        # Vision-related
-        if any(
-            kw in query_lower for kw in ["screen", "see", "look", "show", "what's on", "display"]
-        ):
+            cai = ContextAwarenessIntelligence()
+            result = cai.predict_intent(query)
+            confidence = result.get("confidence", 0.0)
+            intent = result.get("intent", "")
+            if intent and confidence >= 0.3:
+                logger.debug(
+                    "[ModelSelector] CAI intent=%s confidence=%.3f", intent, confidence
+                )
+                return intent
+            logger.debug(
+                "[ModelSelector] CAI confidence too low (%.3f), falling back to keywords",
+                confidence,
+            )
+        except Exception as exc:
+            logger.debug("[ModelSelector] CAI unavailable, using keyword fallback: %s", exc)
+
+        # --- Fallback: keyword matching ---
+        q = query.lower()
+
+        # Codegen intents (checked before generic ones)
+        if any(kw in q for kw in ("segfault", "null pointer", "sigsegv", "memory fault")):
+            return "segfault_analysis"
+        if any(kw in q for kw in ("architecture", "cross-repo", "system design", "migrate all")):
+            return "architecture_design"
+        if any(kw in q for kw in ("refactor", "restructure", "extract class", "rewrite")):
+            return "heavy_refactor"
+        if any(kw in q for kw in ("fix", "bug", "error", "broken", "failing", "crash")):
+            return "bug_fix"
+        if any(kw in q for kw in ("implement", "create", "add feature", "generate", "scaffold")):
+            return "code_generation"
+        if any(kw in q for kw in ("append", "add line", "single line", "comment", "marker", "at the end")):
+            return "single_line_change"
+
+        # Voice/chat intents
+        if any(kw in q for kw in ("screen", "see", "look", "show", "what's on", "display")):
             return "vision_analysis"
-
-        # Code-related
-        if any(kw in query_lower for kw in ["code", "function", "explain", "debug", "fix"]):
+        if any(kw in q for kw in ("explain", "what does", "how does")):
             return "code_explanation"
-
-        # Conversation/chat
-        if any(kw in query_lower for kw in ["chat", "talk", "discuss", "tell me about"]):
+        if any(kw in q for kw in ("chat", "talk", "discuss", "tell me about")):
             return "conversational_ai"
-
-        # Search/lookup
-        if any(kw in query_lower for kw in ["find", "search", "when did", "what did i"]):
+        if any(kw in q for kw in ("find", "search", "when did", "what did i")):
             return "semantic_search"
 
-        # General NLP
         return "nlp_analysis"
 
     def _intent_to_capabilities(self, intent: str) -> Set[str]:
@@ -276,6 +305,13 @@ class IntelligentModelSelector:
             "intent_classification": {"intent_classification"},
             "text_summarization": {"text_summarization"},
             "query_expansion": {"query_expansion"},
+            # Ouroboros codegen intents
+            "code_generation": {"code_generation"},
+            "bug_fix": {"code_generation"},
+            "segfault_analysis": {"code_generation"},
+            "heavy_refactor": {"code_generation", "code_refactor"},
+            "architecture_design": {"complex_reasoning"},
+            "single_line_change": {"chat"},
         }
         _preferred_map = {
             "vision_analysis": {"object_detection", "vision_analyze_heavy", "screen_analysis"},
@@ -283,6 +319,13 @@ class IntelligentModelSelector:
             "conversational_ai": {"chatbot_inference", "response_generation"},
             "semantic_search": {"similarity_search"},
             "nlp_analysis": {"response_generation"},
+            # Ouroboros codegen intents
+            "code_generation": {"response_generation"},
+            "bug_fix": {"code_generation", "response_generation"},
+            "segfault_analysis": {"complex_reasoning", "code_generation"},
+            "heavy_refactor": {"code_generation"},
+            "architecture_design": {"code_generation", "response_generation"},
+            "single_line_change": {"trivial_ops", "code_generation"},
         }
         required = set(_required_map.get(intent, {"nlp_analysis"}))
         preferred = set(_preferred_map.get(intent, set()))
@@ -290,7 +333,21 @@ class IntelligentModelSelector:
 
     def _estimate_complexity(self, query: str, intent: str) -> str:
         """Estimate query complexity"""
-        # Simple heuristics
+        # Codegen-aware complexity rules (evaluated before generic word-count heuristics)
+        if intent == "segfault_analysis":
+            return "complex"
+        if intent == "architecture_design":
+            return "complex"
+        if intent == "heavy_refactor":
+            return "complex"
+        if intent == "bug_fix":
+            return "medium"
+        if intent == "code_generation":
+            return "medium"
+        if intent == "single_line_change":
+            return "simple"
+
+        # Generic word-count heuristics
         if len(query.split()) < 5:
             return "simple"
         elif len(query.split()) > 20:
