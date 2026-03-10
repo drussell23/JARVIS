@@ -92,3 +92,71 @@ class TestToolExecutor:
         ))
         assert result.error is None
         assert "my_function" in result.output
+
+
+class TestParseToolCallResponse:
+    """Parsing 2b.2-tool schema from raw model output."""
+
+    def test_valid_tool_call_parsed(self) -> None:
+        from backend.core.ouroboros.governance.providers import _parse_tool_call_response
+        raw = json.dumps({
+            "schema_version": "2b.2-tool",
+            "tool_call": {"name": "read_file", "arguments": {"path": "utils.py"}},
+        })
+        tc = _parse_tool_call_response(raw)
+        assert tc is not None
+        assert tc.name == "read_file"
+        assert tc.arguments == {"path": "utils.py"}
+
+    def test_patch_response_returns_none(self) -> None:
+        from backend.core.ouroboros.governance.providers import _parse_tool_call_response
+        raw = json.dumps({
+            "schema_version": "2b.1",
+            "candidates": [
+                {"candidate_id": "c1", "file_path": "x.py", "full_content": "pass\n", "rationale": "ok"}
+            ],
+        })
+        assert _parse_tool_call_response(raw) is None
+
+    def test_invalid_json_returns_none(self) -> None:
+        from backend.core.ouroboros.governance.providers import _parse_tool_call_response
+        assert _parse_tool_call_response("not json") is None
+
+    def test_tool_call_missing_name_returns_none(self) -> None:
+        from backend.core.ouroboros.governance.providers import _parse_tool_call_response
+        raw = json.dumps({
+            "schema_version": "2b.2-tool",
+            "tool_call": {"arguments": {"path": "x.py"}},
+        })
+        assert _parse_tool_call_response(raw) is None
+
+
+class TestToolPromptInjection:
+    """_build_codegen_prompt with tools_enabled=True."""
+
+    def _make_ctx(self):
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        return OperationContext.create(
+            target_files=("backend/core/utils.py",),
+            description="Add helper function",
+        )
+
+    def test_tools_section_present_when_enabled(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        ctx = self._make_ctx()
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path, tools_enabled=True)
+        assert "Available Tools" in prompt
+        assert "search_code" in prompt
+        assert "2b.2-tool" in prompt
+
+    def test_tools_section_absent_when_disabled(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        ctx = self._make_ctx()
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path, tools_enabled=False)
+        assert "Available Tools" not in prompt
+
+    def test_tools_section_absent_by_default(self, tmp_path) -> None:
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        ctx = self._make_ctx()
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "Available Tools" not in prompt

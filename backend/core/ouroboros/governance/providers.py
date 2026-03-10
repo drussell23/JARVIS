@@ -60,6 +60,13 @@ _SCHEMA_VERSION_MULTI = "2c.1"
 _SCHEMA_TOP_LEVEL_KEYS = frozenset({"schema_version", "candidates", "provider_metadata"})
 _CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "rationale"})
 
+# ── Tool-use interface ────────────────────────────────────────────────
+_TOOL_SCHEMA_VERSION = "2b.2-tool"
+_TOOL_SCHEMA_KEYS    = frozenset({"schema_version", "tool_call"})
+_TOOL_CALL_KEYS      = frozenset({"name", "arguments"})
+MAX_TOOL_ITERATIONS  = 5
+MAX_TOOL_LOOP_CHARS  = 32_000   # hard accumulated-prompt budget
+
 
 def _safe_context_path(repo_root: Path, target: Path) -> Path:
     """Resolve target path and verify it stays within repo_root.
@@ -159,10 +166,36 @@ def _find_context_files(
     return import_files, test_files
 
 
+def _build_tool_section() -> str:
+    """Return the 'Available Tools' block injected into the generation prompt."""
+    return (
+        "## Available Tools\n\n"
+        "If you need more information before writing the patch, respond with ONLY a\n"
+        "tool_call JSON (no other text):\n\n"
+        "```json\n"
+        "{\n"
+        f'  "schema_version": "{_TOOL_SCHEMA_VERSION}",\n'
+        '  "tool_call": {\n'
+        '    "name": "<tool_name>",\n'
+        '    "arguments": {...}\n'
+        "  }\n"
+        "}\n"
+        "```\n\n"
+        "Available tools:\n"
+        '- `search_code(pattern, file_glob="*.py")` — search the codebase with a regex pattern\n'
+        "- `read_file(path, lines_from=1, lines_to=200)` — read file content (repo-relative path)\n"
+        "- `list_symbols(module_path)` — list functions and classes in a Python file\n"
+        "- `run_tests(paths)` — run pytest for the given test paths (list of strings), returns summary\n"
+        "- `get_callers(function_name, file_path=None)` — find call sites of a function\n\n"
+        f"Max {MAX_TOOL_ITERATIONS} tool calls total. After gathering info, respond with the patch JSON."
+    )
+
+
 def _build_codegen_prompt(
     ctx: "OperationContext",
     repo_root: Optional[Path] = None,
     repo_roots: Optional[Dict[str, Path]] = None,
+    tools_enabled: bool = False,
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
@@ -382,6 +415,8 @@ Rules:
     ]
     if expanded_context_block:
         parts.append(expanded_context_block)
+    if tools_enabled:
+        parts.append(_build_tool_section())
     parts.append(schema_instruction)
     return "\n\n".join(parts)
 
@@ -407,6 +442,33 @@ def _extract_json_block(raw: str) -> str:
         return match.group(1)
 
     return stripped
+
+
+def _parse_tool_call_response(raw: str) -> Optional["ToolCall"]:
+    """Parse a 2b.2-tool response into a ToolCall, or return None.
+
+    Returns None for any parse/validation failure (including patch responses),
+    so callers can treat None as "not a tool call".
+    """
+    try:
+        data = json.loads(_extract_json_block(raw))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema_version") != _TOOL_SCHEMA_VERSION:
+        return None
+    tc = data.get("tool_call")
+    if not isinstance(tc, dict):
+        return None
+    name = tc.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    arguments = tc.get("arguments", {})
+    if not isinstance(arguments, dict):
+        arguments = {}
+    from backend.core.ouroboros.governance.tool_executor import ToolCall
+    return ToolCall(name=name, arguments=arguments)
 
 
 def _parse_multi_repo_response(
