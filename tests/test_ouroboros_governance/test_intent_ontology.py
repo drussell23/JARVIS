@@ -12,7 +12,7 @@ Covers:
 
 from __future__ import annotations
 
-from typing import Set, Tuple
+from typing import Set
 from unittest.mock import MagicMock, patch
 
 import pytest

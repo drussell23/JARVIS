@@ -22,7 +22,7 @@ Zero hardcoding - all policies and scoring from config
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from backend.intelligence.model_lifecycle_manager import get_lifecycle_manager
 from backend.intelligence.model_registry import ModelDefinition, ModelState, get_model_registry
@@ -82,14 +82,14 @@ class IntelligentModelSelector:
         self.lifecycle_manager = get_lifecycle_manager()
 
         # Cached CAI instance — avoid re-opening SQLite on every _classify_intent call
+        self._cai: Optional[Any] = None
         try:
             from backend.intelligence.context_awareness_intelligence import (
                 ContextAwarenessIntelligence,
             )
-
-            self._cai: Optional["ContextAwarenessIntelligence"] = ContextAwarenessIntelligence()
+            self._cai = ContextAwarenessIntelligence()
         except Exception:
-            self._cai = None
+            pass
 
         # Scoring weights (from config or defaults)
         self.weights = {"quality": 0.35, "latency": 0.25, "cost": 0.25, "ram_efficiency": 0.15}
