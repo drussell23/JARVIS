@@ -1,0 +1,135 @@
+version: "1.0"
+updated: "2026-03-10"
+# =============================================================================
+# Ouroboros Brain Selection Policy
+# =============================================================================
+# Maps task complexity tiers to specific models on the GCP Golden Image.
+# BrainSelector loads this at startup and hot-reloads on mtime change.
+#
+# fallback_model is used when the primary model is not yet loaded on j-prime.
+# Currently the golden image only carries Mistral 7B variants; additional
+# models (phi-3.5-mini, qwen-2.5-coder-7b, deepseek-r1-qwen-7b) will be
+# baked into a future golden image rebuild.
+# =============================================================================
+
+brains:
+  # ─────────────────────────────────────────────────────────────────────────
+  # TIER 0: Lightweight — docs, comments, trivial appends
+  # ─────────────────────────────────────────────────────────────────────────
+  phi3_lightweight:
+    model_name: "phi-3.5-mini"
+    fallback_model: "mistral-7b"          # always available on golden image
+    max_prompt_tokens: 4096
+    max_output_tokens: 512
+    temperature: 0.1
+    handles:
+      - docs_edit
+      - comment_append
+      - single_line_change
+      - monitored_by_marker
+      - trivial_annotation
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # TIER 1: Planning — single-file fixes, light multi-file
+  # ─────────────────────────────────────────────────────────────────────────
+  mistral_planning:
+    model_name: "mistral-7b"
+    fallback_model: "mistral-7b"
+    max_prompt_tokens: 8192
+    max_output_tokens: 1024
+    temperature: 0.2
+    handles:
+      - single_file_fix
+      - bug_fix
+      - test_update
+      - config_change
+      - multi_file_light
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # TIER 2: Heavy coding — refactors, new features, multi-file rewrites
+  # ─────────────────────────────────────────────────────────────────────────
+  qwen_coder:
+    model_name: "qwen-2.5-coder-7b"
+    fallback_model: "mistral-7b"
+    max_prompt_tokens: 8192
+    max_output_tokens: 2048
+    temperature: 0.2
+    handles:
+      - heavy_refactor
+      - feature_implementation
+      - multi_file_heavy
+      - api_redesign
+      - class_extraction
+      - performance_optimization
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # TIER 3: Complex reasoning — architecture, cross-repo, deep analysis
+  # ─────────────────────────────────────────────────────────────────────────
+  deepseek_r1:
+    model_name: "deepseek-r1-qwen-7b"
+    fallback_model: "mistral-7b"
+    max_prompt_tokens: 8192
+    max_output_tokens: 2048
+    temperature: 0.0                      # deterministic for reasoning
+    handles:
+      - architecture_design
+      - cross_repo_planning
+      - complex_reasoning
+      - system_migration
+      - root_cause_analysis
+      - dependency_graph_analysis
+
+# =============================================================================
+# 3-Layer Escalation Gate Configuration
+# =============================================================================
+
+gates:
+
+  # ── Layer 1: Task Gate ─────────────────────────────────────────────────────
+  # Classify task complexity from description + target_files before any LLM call
+  task_gate:
+    # Patterns that guarantee TRIVIAL classification (regex, case-insensitive)
+    trivial_patterns:
+      - "append.*line"
+      - "add.*comment"
+      - "add.*marker"
+      - "monitored by"
+      - "single.*line"
+      - "at the.*end of"
+      - "^append"
+    # Patterns that guarantee HEAVY_CODE classification
+    heavy_patterns:
+      - "refactor"
+      - "\\bimplement\\b"
+      - "redesign"
+      - "migrate"
+      - "optimize.*performance"
+      - "extract.*class"
+      - "rewrite"
+      - "add.*feature"
+    # Target file count thresholds
+    trivial_max_files: 1
+    heavy_min_files: 3
+    # Line count hint: if target file < N lines, downgrade to lighter tier
+    trivial_max_target_lines: 200
+
+  # ── Layer 2: Resource Gate ─────────────────────────────────────────────────
+  # If local M1 is under pressure, prefer GCP to avoid OOM / paging
+  resource_gate:
+    # Redirect non-trivial tasks to GCP when pressure >= this level
+    local_pressure_redirect_threshold: "ELEVATED"
+    # Minimum local RAM (GB) before we stop preferring local planning mode
+    local_planning_min_ram_gb: 2.0
+
+  # ── Layer 3: Cost Gate ─────────────────────────────────────────────────────
+  # Enforce strict daily budget. GCP CPU inference is currently free;
+  # this gate guards Claude API fallback spend.
+  cost_gate:
+    # Combined daily budget across all providers ($)
+    daily_budget_usd: 0.50
+    # Within that, max allocated to Claude API fallback
+    claude_fallback_budget_usd: 0.40
+    # Action when budget exceeded for heavy/complex tasks
+    budget_exceeded_action: "queue"       # "queue" | "local_planning_mode"
+    # Path for persisted daily spend state (atomic JSON)
+    persist_path: "~/.jarvis/ouroboros/cost_state.json"

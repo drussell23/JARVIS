@@ -283,6 +283,10 @@ class GovernedLoopService:
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
         self._trust_graduator: Optional[Any] = None
 
+        # Phase 4: Brain selector — deterministic 3-layer escalation gate
+        from backend.core.ouroboros.governance.brain_selector import BrainSelector
+        self._brain_selector = BrainSelector()
+
         # Sliding-window cooldown: maps file_path -> deque of touch timestamps (monotonic)
         self._file_touch_cache: Dict[str, Any] = {}  # str -> collections.deque[float]
 
@@ -502,9 +506,60 @@ class GovernedLoopService:
                 collector_status=snap.collector_status,
                 sample_age_ms=(now_ns - snap.sampled_monotonic_ns) // 1_000_000,
             )
+            # Phase 4: 3-layer brain selection gate (task → resource → cost)
+            brain = self._brain_selector.select(
+                description=ctx.description,
+                target_files=ctx.target_files,
+                snapshot=snap,
+                blast_radius=len(ctx.target_files),
+            )
+            logger.info(
+                "[GovernedLoop] Brain selected: %s (%s) reason=%s complexity=%s spend=$%.4f",
+                brain.brain_id, brain.model_name, brain.routing_reason,
+                brain.task_complexity, self._brain_selector.daily_spend,
+            )
+
+            # Emit routing narration via CommProtocol
+            try:
+                await self._stack.comm.emit_heartbeat(
+                    op_id=ctx.op_id,
+                    phase="brain_routing",
+                    progress_pct=3.0,
+                )
+                # Narrate to voice — uses VoiceNarrator transport if active
+                narration = brain.narration()
+                await self._stack.comm.emit_intent(
+                    op_id=ctx.op_id,
+                    goal=narration,
+                    target_files=list(ctx.target_files),
+                    risk_tier="routing",
+                    blast_radius=len(ctx.target_files),
+                )
+            except Exception:
+                pass  # narration is best-effort
+
+            # Short-circuit: cost gate queued heavy task
+            if brain.provider_tier == "queued":
+                logger.warning(
+                    "[GovernedLoop] Cost gate queued op %s (daily_spend=$%.4f)",
+                    ctx.op_id, self._brain_selector.daily_spend,
+                )
+                return OperationResult(
+                    op_id=ctx.op_id,
+                    terminal_phase=OperationPhase.CANCELLED,
+                    reason_code="cost_gate_triggered_queue",
+                    trigger_source=trigger_source,
+                )
+
             intent_tel = RoutingIntentTelemetry(
                 expected_provider=_expected_provider_from_pressure(snap),
                 policy_reason=snap.overall_pressure.name,
+                brain_id=brain.brain_id,
+                brain_model=brain.model_name,
+                routing_reason=brain.routing_reason,
+                task_complexity=brain.task_complexity,
+                estimated_prompt_tokens=brain.estimated_prompt_tokens,
+                daily_spend_usd=self._brain_selector.daily_spend,
             )
             tc = TelemetryContext(local_node=host_tel, routing_intent=intent_tel)
             ctx = ctx.with_telemetry(tc)
