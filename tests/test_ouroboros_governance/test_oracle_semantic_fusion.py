@@ -139,3 +139,173 @@ class TestOracleEmbeddingLifecycle:
         TheOracle.__init__(oracle)
         assert hasattr(oracle, "_semantic_index")
         assert isinstance(oracle._semantic_index, OracleSemanticIndex)
+
+
+class TestFileNeighborhoodSemanticSupport:
+    """Tests for FileNeighborhood.semantic_support field."""
+
+    def test_semantic_support_included_in_to_dict(self):
+        from backend.core.ouroboros.oracle import FileNeighborhood
+        nh = FileNeighborhood(
+            target_files=["jarvis:core/foo.py"],
+            imports=[], importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=["prime:services/auth.py"],
+        )
+        d = nh.to_dict()
+        assert "semantic_support" in d
+        assert d["semantic_support"] == ["prime:services/auth.py"]
+
+    def test_semantic_support_omitted_when_empty(self):
+        from backend.core.ouroboros.oracle import FileNeighborhood
+        nh = FileNeighborhood(
+            target_files=["jarvis:core/foo.py"],
+            imports=["jarvis:core/bar.py"], importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=[],
+        )
+        d = nh.to_dict()
+        assert "semantic_support" not in d
+
+    def test_all_unique_files_includes_semantic_support(self):
+        from backend.core.ouroboros.oracle import FileNeighborhood
+        nh = FileNeighborhood(
+            target_files=["jarvis:core/foo.py"],
+            imports=["jarvis:core/bar.py"], importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=["prime:services/auth.py"],
+        )
+        unique = nh.all_unique_files()
+        assert "prime:services/auth.py" in unique
+        assert "jarvis:core/bar.py" in unique
+
+
+class TestGetFusedNeighborhood:
+    """Tests for TheOracle.get_fused_neighborhood()."""
+
+    def _make_oracle_with_mocks(self):
+        from backend.core.ouroboros.oracle import TheOracle, FileNeighborhood
+        oracle = object.__new__(TheOracle)
+        oracle._running = True
+        oracle._repos = {"jarvis": Path("/repo/jarvis"), "prime": Path("/repo/prime")}
+        oracle._graph = MagicMock()
+        oracle._semantic_index = MagicMock()
+        oracle._semantic_index.is_ready = MagicMock(return_value=True)
+        oracle._semantic_index.semantic_search = AsyncMock(return_value=[])
+        return oracle
+
+    async def test_returns_empty_when_not_running(self):
+        from backend.core.ouroboros.oracle import TheOracle, FileNeighborhood
+        oracle = object.__new__(TheOracle)
+        oracle._running = False
+        oracle._repos = {}
+        oracle._graph = MagicMock()
+        oracle._semantic_index = MagicMock()
+        oracle._semantic_index.is_ready = MagicMock(return_value=False)
+
+        result = await oracle.get_fused_neighborhood([], "some query")
+        assert isinstance(result, FileNeighborhood)
+        assert result.all_unique_files() == []
+
+    async def test_structural_files_go_into_structural_categories(self, tmp_path):
+        from backend.core.ouroboros.oracle import TheOracle, FileNeighborhood
+
+        oracle = self._make_oracle_with_mocks()
+        oracle._repos = {"jarvis": tmp_path}
+
+        target = tmp_path / "core" / "service.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# service")
+
+        structural_nh = FileNeighborhood(
+            target_files=["jarvis:core/service.py"],
+            imports=["jarvis:core/base.py"],
+            importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+        )
+        oracle.get_file_neighborhood = MagicMock(return_value=structural_nh)
+        oracle._semantic_index.semantic_search = AsyncMock(return_value=[])
+
+        result = await oracle.get_fused_neighborhood([target], "fix the service")
+
+        assert "jarvis:core/base.py" in result.imports
+        assert result.semantic_support == []
+
+    async def test_semantic_seeds_go_into_semantic_support(self, tmp_path):
+        from backend.core.ouroboros.oracle import TheOracle, FileNeighborhood
+
+        oracle = self._make_oracle_with_mocks()
+        oracle._repos = {"jarvis": tmp_path}
+
+        target = tmp_path / "core" / "service.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# service")
+
+        empty_nh = FileNeighborhood(
+            target_files=[], imports=[], importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+        )
+        oracle.get_file_neighborhood = MagicMock(return_value=empty_nh)
+        oracle._semantic_index.semantic_search = AsyncMock(
+            return_value=[("prime:services/auth.py", 0.91)]
+        )
+
+        result = await oracle.get_fused_neighborhood([target], "authentication logic")
+
+        assert "prime:services/auth.py" in result.semantic_support
+
+    async def test_semantic_failure_degrades_to_structural_only(self, tmp_path):
+        from backend.core.ouroboros.oracle import TheOracle, FileNeighborhood
+
+        oracle = self._make_oracle_with_mocks()
+        oracle._repos = {"jarvis": tmp_path}
+
+        target = tmp_path / "core" / "service.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# service")
+
+        structural_nh = FileNeighborhood(
+            target_files=["jarvis:core/service.py"],
+            imports=["jarvis:core/base.py"],
+            importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+        )
+        oracle.get_file_neighborhood = MagicMock(return_value=structural_nh)
+        oracle._semantic_index.semantic_search = AsyncMock(
+            side_effect=RuntimeError("chroma connection failed")
+        )
+
+        result = await oracle.get_fused_neighborhood([target], "fix service")
+
+        assert "jarvis:core/base.py" in result.imports
+        assert result.semantic_support == []
+
+    async def test_fusion_score_ranks_structural_above_low_semantic(self, tmp_path):
+        """Structural files (graph_proximity=1.0) must outscore low-similarity seeds."""
+        from backend.core.ouroboros.oracle import TheOracle, FileNeighborhood
+
+        oracle = self._make_oracle_with_mocks()
+        oracle._repos = {"jarvis": tmp_path}
+
+        target = tmp_path / "core" / "service.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("# service")
+
+        structural_nh = FileNeighborhood(
+            target_files=["jarvis:core/service.py"],
+            imports=["jarvis:core/base.py"],
+            importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+        )
+        oracle.get_file_neighborhood = MagicMock(return_value=structural_nh)
+        oracle._semantic_index.semantic_search = AsyncMock(
+            return_value=[("prime:utils/misc.py", 0.10)]
+        )
+
+        result = await oracle.get_fused_neighborhood([target], "fix service")
+
+        # structural base.py score: 0.55*1.0 + 0.35*0.0 + 0.10*1.0 = 0.65
+        # semantic misc.py score:   0.55*0.5 + 0.35*0.10 + 0.10*1.0 = 0.375
+        # base.py in structural, misc.py in semantic_support
+        assert "jarvis:core/base.py" in result.imports
+        assert "prime:utils/misc.py" in result.semantic_support

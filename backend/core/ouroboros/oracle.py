@@ -283,6 +283,8 @@ class FileNeighborhood:
     inheritors: List[str]             # incoming INHERITS edges
     base_classes: List[str]           # outgoing INHERITS edges
     test_counterparts: List[str]      # heuristic: test_{basename}.py match
+    semantic_support: List[str] = field(default_factory=list)
+    # Cross-repo files discovered via semantic similarity seeding (same repo:path format)
     local_repo: str = "jarvis"        # repo of input files (for rendering)
 
     def to_dict(self) -> Dict[str, List[str]]:
@@ -297,6 +299,7 @@ class FileNeighborhood:
                 "inheritors": self.inheritors,
                 "base_classes": self.base_classes,
                 "test_counterparts": self.test_counterparts,
+                "semantic_support": self.semantic_support,
             }.items()
             if v
         }
@@ -314,6 +317,7 @@ class FileNeighborhood:
             + self.inheritors
             + self.base_classes
             + self.test_counterparts
+            + self.semantic_support
         ):
             if path not in target_set and path not in seen:
                 seen.add(path)
@@ -2029,6 +2033,124 @@ class TheOracle:
             base_classes=sorted(base_classes_set),
             test_counterparts=sorted(set(test_counterparts)),
             local_repo=local_repo,
+        )
+
+    async def get_fused_neighborhood(
+        self,
+        file_paths: List[Path],
+        query: str,
+        k_semantic: int = 5,
+    ) -> "FileNeighborhood":
+        """Return a fused depth-1 structural + semantic neighborhood.
+
+        **Algorithm (Engineering Mandate — Fuse Strategy):**
+
+        1. Structural expansion: depth-1 graph neighborhood from ``file_paths``.
+        2. Semantic seeds: top-K files from ChromaDB semantic search on ``query``.
+        3. Seed expansion: depth-1 graph neighborhood from seed files.
+        4. Scoring: ``final = 0.55 * graph_proximity + 0.35 * semantic_sim + 0.10 * recency``
+           - Structural-origin files: ``graph_proximity=1.0``
+           - Seed-origin files: ``graph_proximity=0.5``
+        5. Partition: structural-origin → structural categories;
+           seed-origin → ``semantic_support``.
+
+        **Degradation:**
+        - Semantic search fails → return structural neighborhood only.
+        - Graph fails → return semantic seeds in ``semantic_support`` only.
+        - Both fail → return empty ``FileNeighborhood``.
+        """
+        empty = FileNeighborhood(
+            target_files=[],
+            imports=[], importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=[],
+        )
+
+        if not getattr(self, "_running", False):
+            return empty
+
+        # ── Step 1: Structural expansion ──────────────────────────────────
+        structural_nh: "FileNeighborhood" = empty
+        structural_set: set = set()
+        try:
+            structural_nh = self.get_file_neighborhood(file_paths)
+            structural_set = set(structural_nh.all_unique_files())
+        except Exception as exc:
+            logger.warning("[Oracle] Structural expansion failed: %s", exc)
+
+        # ── Step 2: Semantic seeds ─────────────────────────────────────────
+        raw_seeds: List[Tuple[str, float]] = []
+        semantic_index = getattr(self, "_semantic_index", None)
+        if semantic_index is not None and semantic_index.is_ready():
+            try:
+                raw_seeds = await semantic_index.semantic_search(query, k=k_semantic)
+            except Exception as exc:
+                logger.warning(
+                    "[Oracle] Semantic search failed: %s; degrading to structural-only", exc
+                )
+
+        if not raw_seeds and not structural_set:
+            return empty
+
+        # Build seed_score lookup: file_key → semantic_similarity
+        seed_scores: Dict[str, float] = {fk: sc for fk, sc in raw_seeds}
+
+        # ── Step 3: Seed graph expansion ──────────────────────────────────
+        seed_nh: "FileNeighborhood" = empty
+        if raw_seeds:
+            try:
+                seed_abs: List[Path] = []
+                for file_key, _ in raw_seeds:
+                    parts = file_key.split(":", 1)
+                    if len(parts) == 2:
+                        repo_name, rel_path = parts
+                        repo_root = self._repos.get(repo_name)
+                        if repo_root:
+                            seed_abs.append(repo_root / rel_path)
+                if seed_abs:
+                    seed_nh = self.get_file_neighborhood(seed_abs)
+            except Exception as exc:
+                logger.warning("[Oracle] Seed graph expansion failed: %s", exc)
+
+        # ── Step 4: Score helper ───────────────────────────────────────────
+        def _score(file_key: str, is_structural: bool) -> float:
+            graph_prox = 1.0 if is_structural else 0.5
+            semantic_sim = seed_scores.get(file_key, 0.0)
+            recency = 1.0  # not yet tracked
+            return 0.55 * graph_prox + 0.35 * semantic_sim + 0.10 * recency
+
+        # ── Step 5: Partition ─────────────────────────────────────────────
+        target_key_set = set(structural_nh.target_files)
+
+        # Semantic-support: seed-derived files NOT in structural
+        semantic_candidates: List[str] = []
+        seen_semantic: set = set()
+        for fk in seed_nh.all_unique_files():
+            if fk not in structural_set and fk not in target_key_set and fk not in seen_semantic:
+                semantic_candidates.append(fk)
+                seen_semantic.add(fk)
+        for fk, _ in raw_seeds:
+            if fk not in structural_set and fk not in target_key_set and fk not in seen_semantic:
+                semantic_candidates.append(fk)
+                seen_semantic.add(fk)
+
+        semantic_candidates_scored = sorted(
+            semantic_candidates,
+            key=lambda fk: _score(fk, is_structural=False),
+            reverse=True,
+        )
+
+        return FileNeighborhood(
+            target_files=structural_nh.target_files,
+            imports=structural_nh.imports,
+            importers=structural_nh.importers,
+            callers=structural_nh.callers,
+            callees=structural_nh.callees,
+            inheritors=structural_nh.inheritors,
+            base_classes=structural_nh.base_classes,
+            test_counterparts=structural_nh.test_counterparts,
+            semantic_support=semantic_candidates_scored,
+            local_repo=structural_nh.local_repo,
         )
 
     async def get_relevant_files_for_query(
