@@ -798,7 +798,29 @@ class GovernedLoopService:
                     self._completed_ops[dedupe_key] = result
                     return result
 
-            terminal_ctx = await self._orchestrator.run(ctx)
+            _pipeline_timeout = (
+                self._config.pipeline_timeout_s + 60.0
+            )  # +60s grace beyond deadline for post-COMPLETE bookkeeping
+            try:
+                terminal_ctx = await asyncio.wait_for(
+                    self._orchestrator.run(ctx),
+                    timeout=_pipeline_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[GovernedLoop] orchestrator.run() exceeded %.0fs hard timeout for op=%s",
+                    _pipeline_timeout, ctx.op_id,
+                )
+                duration = time.monotonic() - start_time
+                result = OperationResult(
+                    op_id=ctx.op_id,
+                    terminal_phase=OperationPhase.CANCELLED,
+                    total_duration_s=duration,
+                    reason_code="pipeline_timeout",
+                    trigger_source=trigger_source,
+                )
+                self._completed_ops[dedupe_key] = result
+                return result
 
             # Phase 4: record actual generation cost for cost gate persistence
             if terminal_ctx.generation:
@@ -1422,7 +1444,7 @@ class GovernedLoopService:
                             )
                             if ok:
                                 try:
-                                    self._generator.fsm.record_primary_success()
+                                    self._generator.fsm.record_probe_success()
                                 except Exception:
                                     pass
                             else:

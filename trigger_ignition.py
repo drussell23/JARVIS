@@ -37,14 +37,16 @@ REPO_ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "backend"))
 
-# Load .env manually (no python-dotenv dependency required)
+# Load .env — always apply .env values so the correct API key is used.
+# Do NOT use setdefault: a stale shell env var (e.g. an expired ANTHROPIC_API_KEY)
+# would otherwise shadow the value in .env and cause 401 on Claude fallback.
 _env_file = REPO_ROOT / ".env"
 if _env_file.exists():
     for _line in _env_file.read_text().splitlines():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _key, _, _val = _line.partition("=")
-            os.environ.setdefault(_key.strip(), _val.strip())
+            os.environ[_key.strip()] = _val.strip()
 
 # Force governed mode for this test
 os.environ["JARVIS_GOVERNANCE_MODE"] = "governed"

@@ -49,9 +49,9 @@ _CODEGEN_SYSTEM_PROMPT = (
 )
 
 # ── Phase 2B: size/security constants ────────────────────────────────────
-_MAX_TARGET_FILE_CHARS = 6000      # full content below this
-_TARGET_FILE_HEAD_CHARS = 4000     # head kept on truncation
-_TARGET_FILE_TAIL_CHARS = 1000     # tail kept on truncation
+_MAX_TARGET_FILE_CHARS = 12000     # full content below this (increased from 6000)
+_TARGET_FILE_HEAD_CHARS = 8000     # head kept on truncation
+_TARGET_FILE_TAIL_CHARS = 2000     # tail kept on truncation
 _MAX_IMPORT_CONTEXT_CHARS = 1500   # total across all discovered import files
 _MAX_TEST_CONTEXT_CHARS = 1500     # total across all discovered test files
 _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
@@ -454,6 +454,78 @@ Rules:
 
 
 # ---------------------------------------------------------------------------
+# Shared: Response Parser helpers
+# ---------------------------------------------------------------------------
+
+
+def _try_reconstruct_from_ellipsis(
+    full_content: str,
+    source_path: str,
+    max_change_chars: int = 500,
+) -> Optional[str]:
+    """Reconstruct full file content when a small model outputs '...\\n[change]\\n...'
+
+    Small models (e.g. Mistral 7B) commonly abbreviate unchanged file sections
+    with '...' rather than emitting the full content verbatim.  When the content
+    is short AND starts with '...', we attempt to recover by:
+
+      1. Extracting the meaningful *change* that sits between the ellipsis tokens.
+      2. Reading the original source file from disk.
+      3. Appending the extracted change to the original (append-to-end only).
+
+    Safety guard: reconstruction is skipped when the extracted change already
+    appears verbatim in the first 90 % of the original file — that would indicate
+    a mid-file edit whose position cannot be determined from the placeholder alone.
+
+    Returns the reconstructed content string, or None when reconstruction is
+    unsafe or impossible.
+    """
+    stripped = full_content.strip()
+
+    # Must start with '...' and be short relative to a real file
+    if not stripped.startswith("...") or len(stripped) > max_change_chars:
+        return None
+
+    # Strip leading '...' and surrounding whitespace / newlines
+    remainder = stripped[3:].lstrip("\n")
+
+    # Strip optional trailing '...' and any preceding whitespace
+    if remainder.endswith("..."):
+        remainder = remainder[:-3].rstrip()
+
+    remainder = remainder.strip("\n").strip()
+    if not remainder:
+        return None
+
+    # Read the original source file
+    if not source_path:
+        return None
+    try:
+        abs_path = (
+            Path(source_path)
+            if Path(source_path).is_absolute()
+            else Path.cwd() / source_path
+        )
+        if not abs_path.exists():
+            return None
+        original = abs_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    # Safety: only append when the change is genuinely new (not already in the
+    # first 90 % of the file — that would indicate a mid-file edit we can't
+    # safely reconstruct without knowing the insert position).
+    head_90pct = original[: int(len(original) * 0.9)]
+    if remainder.strip() in head_90pct:
+        return None
+
+    # Reconstruct: append change to original
+    if not original.endswith("\n"):
+        original += "\n"
+    return original + remainder + "\n"
+
+
+# ---------------------------------------------------------------------------
 # Shared: Response Parser
 # ---------------------------------------------------------------------------
 
@@ -716,6 +788,70 @@ def _parse_generation_response(
                 )
                 continue  # skip this candidate; try next
 
+        # Placeholder / truncation guard — reject content that looks like the
+        # model summarised the file rather than producing it.
+        _PLACEHOLDER_PATTERNS = (
+            "...<the entire",
+            "<the entire file",
+            "...<complete file",
+            "<complete file content",
+            "...<rest of",
+            "# ... rest of file",
+            "# (rest of file unchanged)",
+            "<the complete modified file",
+            "<the complete file",
+            "<insert the",
+            "<full file content",
+        )
+        _content_lower = full_content.lower()
+        if any(p.lower() in _content_lower for p in _PLACEHOLDER_PATTERNS):
+            logger.warning(
+                "Skipping candidate %s: full_content contains placeholder text",
+                cand["candidate_id"],
+            )
+            continue
+
+        # Length sanity: if we know the original file, the candidate must be at
+        # least 50% of the original byte-length (catches silent truncation).
+        # When short content starts with '...' (small-model ellipsis), attempt
+        # to reconstruct the full file before rejecting.
+        if source_path:
+            try:
+                _orig_path = (
+                    Path(source_path) if Path(source_path).is_absolute()
+                    else Path.cwd() / source_path
+                )
+                if _orig_path.exists():
+                    _orig_len = _orig_path.stat().st_size
+                    _cand_len = len(full_content.encode())
+                    if _orig_len > 200 and _cand_len < _orig_len * 0.5:
+                        # Attempt ellipsis reconstruction before discarding
+                        _reconstructed = _try_reconstruct_from_ellipsis(
+                            full_content, source_path
+                        )
+                        if _reconstructed:
+                            logger.info(
+                                "[Parser] Reconstructed full_content from ellipsis "
+                                "placeholder for %s (%d → %d bytes)",
+                                cand["candidate_id"],
+                                _cand_len,
+                                len(_reconstructed.encode()),
+                            )
+                            full_content = _reconstructed
+                            cand = dict(cand)
+                            cand["full_content"] = full_content
+                        else:
+                            logger.warning(
+                                "Skipping candidate %s: full_content too short "
+                                "(%d bytes vs original %d bytes)",
+                                cand["candidate_id"],
+                                _cand_len,
+                                _orig_len,
+                            )
+                            continue
+            except OSError:
+                pass  # can't stat — skip length check
+
         # Step 7: compute hashes and attach provenance
         candidate_hash = hashlib.sha256(full_content.encode()).hexdigest()
         enriched = dict(cand)
@@ -829,6 +965,13 @@ class PrimeProvider:
                 model_name=_brain_model,
             )
             raw = response.content
+
+            # Log raw response for diagnosis (truncated at 2000 chars)
+            logger.warning(
+                "[PrimeProvider] J-Prime raw response (len=%d bytes, first 2000): %r",
+                len(raw.encode()) if raw else 0,
+                raw[:2000] if raw else "",
+            )
 
             # Attempt to parse as tool call
             if self._tools_enabled:

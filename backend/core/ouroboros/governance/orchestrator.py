@@ -758,9 +758,15 @@ class GovernedOrchestrator:
         if oracle is None:
             return
         try:
-            lock = getattr(self, "_oracle_update_lock", None) or asyncio.Lock()
-            async with lock:
-                await oracle.incremental_update(applied_files)
+            await asyncio.wait_for(
+                oracle.incremental_update(applied_files),
+                timeout=30.0,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Orchestrator] Oracle incremental_update timed out (>30s); "
+                "background oracle loop still running"
+            )
         except asyncio.CancelledError:
             pass  # swallow — oracle update is non-blocking; don't abort COMPLETE
         except Exception as exc:
@@ -1033,6 +1039,7 @@ class GovernedOrchestrator:
             target_file=target_file,
             proposed_content=proposed_content,
             profile=profile,
+            op_id=ctx.op_id,
         )
 
     async def _execute_saga_apply(
