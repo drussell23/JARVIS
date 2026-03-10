@@ -270,6 +270,18 @@ class GovernedOrchestrator:
             )
             return ctx
 
+        # Announce operation start — VoiceNarrator fires here (INTENT type)
+        try:
+            await self._stack.comm.emit_intent(
+                op_id=ctx.op_id,
+                goal=ctx.description,
+                target_files=list(ctx.target_files),
+                risk_tier=risk_tier.name,
+                blast_radius=len(ctx.target_files),
+            )
+        except Exception:
+            logger.debug("emit_intent failed for op=%s", ctx.op_id, exc_info=True)
+
         # Advance to ROUTE with risk_tier set
         ctx = ctx.advance(OperationPhase.ROUTE, risk_tier=risk_tier)
 
