@@ -229,12 +229,21 @@ class TestBuildCodegenPrompt:
     def test_includes_file_content_constraint(self) -> None:
         from backend.core.ouroboros.governance.providers import (
             _build_codegen_prompt,
+            _SCHEMA_VERSION_DIFF,
         )
 
-        ctx = _make_context()
-        prompt = _build_codegen_prompt(ctx)
-        assert "file" in prompt
-        assert "content" in prompt
+        # Single-file context → diff schema (Task 4)
+        ctx_single = _make_context(target_files=("tests/test_utils.py",))
+        prompt_single = _build_codegen_prompt(ctx_single)
+        assert "file" in prompt_single
+        assert _SCHEMA_VERSION_DIFF in prompt_single
+        assert "unified_diff" in prompt_single
+
+        # Multi-file context → full_content schema
+        ctx_multi = _make_context(target_files=("tests/test_a.py", "tests/test_b.py"))
+        prompt_multi = _build_codegen_prompt(ctx_multi)
+        assert "file" in prompt_multi
+        assert "full_content" in prompt_multi
 
 
 # ---------------------------------------------------------------------------
