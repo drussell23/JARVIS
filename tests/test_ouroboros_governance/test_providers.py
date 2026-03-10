@@ -52,16 +52,21 @@ class TestParseGenerationResponse:
         )
 
         raw = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "tests/test_utils.py", "content": "def test_edge():\n    assert True\n"}
+                {
+                    "candidate_id": "c1",
+                    "file_path": "tests/test_utils.py",
+                    "full_content": "def test_edge():\n    assert True\n",
+                    "rationale": "Added edge case test",
+                }
             ],
-            "model_id": "jarvis-prime-7b",
-            "reasoning_summary": "Added edge case test",
+            "provider_metadata": {"model_id": "jarvis-prime-7b"},
         })
-        result = _parse_generation_response(raw, "test-provider", 1.5)
+        result = _parse_generation_response(raw, "test-provider", 1.5, _make_context(), "abc123", "tests/test_utils.py")
         assert isinstance(result, GenerationResult)
         assert len(result.candidates) == 1
-        assert result.candidates[0]["file"] == "tests/test_utils.py"
+        assert result.candidates[0]["file_path"] == "tests/test_utils.py"
         assert result.provider_name == "test-provider"
         assert result.generation_duration_s == 1.5
 
@@ -71,13 +76,13 @@ class TestParseGenerationResponse:
         )
 
         raw = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "tests/test_a.py", "content": "def test_a():\n    pass\n"},
-                {"file": "tests/test_b.py", "content": "def test_b():\n    pass\n"},
+                {"candidate_id": "c1", "file_path": "tests/test_a.py", "full_content": "def test_a():\n    pass\n", "rationale": "a"},
+                {"candidate_id": "c2", "file_path": "tests/test_b.py", "full_content": "def test_b():\n    pass\n", "rationale": "b"},
             ],
-            "model_id": "prime",
         })
-        result = _parse_generation_response(raw, "test-provider", 2.0)
+        result = _parse_generation_response(raw, "test-provider", 2.0, _make_context(), "abc123", "tests/test_a.py")
         assert len(result.candidates) == 2
 
     def test_rejects_non_json(self) -> None:
@@ -86,25 +91,25 @@ class TestParseGenerationResponse:
         )
 
         with pytest.raises(RuntimeError, match="schema_invalid"):
-            _parse_generation_response("not json at all", "test-provider", 0.0)
+            _parse_generation_response("not json at all", "test-provider", 0.0, _make_context(), "abc123", "test.py")
 
     def test_rejects_missing_candidates_key(self) -> None:
         from backend.core.ouroboros.governance.providers import (
             _parse_generation_response,
         )
 
-        raw = json.dumps({"model_id": "prime"})
+        raw = json.dumps({"schema_version": "2b.1"})
         with pytest.raises(RuntimeError, match="schema_invalid"):
-            _parse_generation_response(raw, "test-provider", 0.0)
+            _parse_generation_response(raw, "test-provider", 0.0, _make_context(), "abc123", "test.py")
 
     def test_rejects_empty_candidates(self) -> None:
         from backend.core.ouroboros.governance.providers import (
             _parse_generation_response,
         )
 
-        raw = json.dumps({"candidates": []})
+        raw = json.dumps({"schema_version": "2b.1", "candidates": []})
         with pytest.raises(RuntimeError, match="schema_invalid"):
-            _parse_generation_response(raw, "test-provider", 0.0)
+            _parse_generation_response(raw, "test-provider", 0.0, _make_context(), "abc123", "test.py")
 
     def test_rejects_candidate_missing_file(self) -> None:
         from backend.core.ouroboros.governance.providers import (
@@ -112,10 +117,11 @@ class TestParseGenerationResponse:
         )
 
         raw = json.dumps({
-            "candidates": [{"content": "def f(): pass\n"}]
+            "schema_version": "2b.1",
+            "candidates": [{"candidate_id": "c1", "full_content": "def f(): pass\n", "rationale": "x"}],  # missing file_path
         })
         with pytest.raises(RuntimeError, match="schema_invalid"):
-            _parse_generation_response(raw, "test-provider", 0.0)
+            _parse_generation_response(raw, "test-provider", 0.0, _make_context(), "abc123", "test.py")
 
     def test_rejects_candidate_missing_content(self) -> None:
         from backend.core.ouroboros.governance.providers import (
@@ -123,10 +129,11 @@ class TestParseGenerationResponse:
         )
 
         raw = json.dumps({
-            "candidates": [{"file": "test.py"}]
+            "schema_version": "2b.1",
+            "candidates": [{"candidate_id": "c1", "file_path": "test.py", "rationale": "x"}],  # missing full_content
         })
         with pytest.raises(RuntimeError, match="schema_invalid"):
-            _parse_generation_response(raw, "test-provider", 0.0)
+            _parse_generation_response(raw, "test-provider", 0.0, _make_context(), "abc123", "test.py")
 
     def test_rejects_invalid_python_syntax(self) -> None:
         from backend.core.ouroboros.governance.providers import (
@@ -134,12 +141,13 @@ class TestParseGenerationResponse:
         )
 
         raw = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "test.py", "content": "def broken(\n"}
-            ]
+                {"candidate_id": "c1", "file_path": "test.py", "full_content": "def broken(\n", "rationale": "test"}
+            ],
         })
         with pytest.raises(RuntimeError, match="schema_invalid"):
-            _parse_generation_response(raw, "test-provider", 0.0)
+            _parse_generation_response(raw, "test-provider", 0.0, _make_context(), "abc123", "test.py")
 
     def test_non_python_file_skips_ast_validation(self) -> None:
         from backend.core.ouroboros.governance.providers import (
@@ -147,11 +155,12 @@ class TestParseGenerationResponse:
         )
 
         raw = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "config.yaml", "content": "key: value\n"}
-            ]
+                {"candidate_id": "c1", "file_path": "config.yaml", "full_content": "key: value\n", "rationale": "config"},
+            ],
         })
-        result = _parse_generation_response(raw, "test-provider", 0.5)
+        result = _parse_generation_response(raw, "test-provider", 0.5, _make_context(), "abc123", "config.yaml")
         assert len(result.candidates) == 1
 
     def test_extracts_json_from_markdown_fences(self) -> None:
@@ -160,11 +169,12 @@ class TestParseGenerationResponse:
         )
 
         raw = "Some preamble\n```json\n" + json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "test.py", "content": "def f():\n    pass\n"}
+                {"candidate_id": "c1", "file_path": "test.py", "full_content": "def f():\n    pass\n", "rationale": "test"},
             ],
         }) + "\n```\nSome postamble"
-        result = _parse_generation_response(raw, "test-provider", 1.0)
+        result = _parse_generation_response(raw, "test-provider", 1.0, _make_context(), "abc123", "test.py")
         assert len(result.candidates) == 1
 
     def test_metadata_preserved(self) -> None:
@@ -173,13 +183,13 @@ class TestParseGenerationResponse:
         )
 
         raw = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "test.py", "content": "def f():\n    pass\n"}
+                {"candidate_id": "c1", "file_path": "test.py", "full_content": "def f():\n    pass\n", "rationale": "test"},
             ],
-            "model_id": "prime-7b",
-            "reasoning_summary": "test reasoning",
+            "provider_metadata": {"model_id": "prime-7b", "reasoning_summary": "test reasoning"},
         })
-        result = _parse_generation_response(raw, "test-provider", 1.0)
+        result = _parse_generation_response(raw, "test-provider", 1.0, _make_context(), "abc123", "test.py")
         # Metadata should be available via candidates or generation result
         assert result.provider_name == "test-provider"
 
@@ -281,11 +291,16 @@ class TestPrimeProvider:
     async def test_generate_success(self) -> None:
         from backend.core.ouroboros.governance.providers import PrimeProvider
         valid_response = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "tests/test_foo.py", "content": "def test_foo():\n    assert True\n"}
+                {
+                    "candidate_id": "c1",
+                    "file_path": "tests/test_foo.py",
+                    "full_content": "def test_foo():\n    assert True\n",
+                    "rationale": "Added test",
+                }
             ],
-            "model_id": "prime-7b",
-            "reasoning_summary": "Added test",
+            "provider_metadata": {"model_id": "prime-7b"},
         })
         client = _mock_prime_client(content=valid_response)
         provider = PrimeProvider(client)
@@ -308,8 +323,9 @@ class TestPrimeProvider:
     async def test_generate_uses_low_temperature(self) -> None:
         from backend.core.ouroboros.governance.providers import PrimeProvider
         valid_response = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "test.py", "content": "def f():\n    pass\n"}
+                {"candidate_id": "c1", "file_path": "test.py", "full_content": "def f():\n    pass\n", "rationale": "test"},
             ],
         })
         client = _mock_prime_client(content=valid_response)
@@ -362,10 +378,16 @@ class TestClaudeProvider:
     async def test_generate_success(self) -> None:
         from backend.core.ouroboros.governance.providers import ClaudeProvider
         valid_response = json.dumps({
+            "schema_version": "2b.1",
             "candidates": [
-                {"file": "tests/test_foo.py", "content": "def test_foo():\n    assert True\n"}
+                {
+                    "candidate_id": "c1",
+                    "file_path": "tests/test_foo.py",
+                    "full_content": "def test_foo():\n    assert True\n",
+                    "rationale": "Added test",
+                }
             ],
-            "model_id": "claude-sonnet",
+            "provider_metadata": {"model_id": "claude-sonnet"},
         })
         mock_message = MagicMock()
         mock_message.content = [MagicMock(text=valid_response)]

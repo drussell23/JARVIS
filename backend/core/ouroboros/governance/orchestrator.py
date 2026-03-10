@@ -886,6 +886,18 @@ class GovernedOrchestrator:
                 adapter_names_run=(),
             )
 
+        # When no runner is configured, skip test execution (dry-run / test mode)
+        if self._validation_runner is None:
+            return ValidationResult(
+                passed=True,
+                best_candidate=candidate,
+                validation_duration_s=0.0,
+                error=None,
+                failure_class=None,
+                short_summary="validation skipped: no runner configured",
+                adapter_names_run=(),
+            )
+
         # Step 2: Budget guard
         if remaining_s <= 0.0:
             return ValidationResult(

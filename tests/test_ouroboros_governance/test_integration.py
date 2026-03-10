@@ -1056,9 +1056,12 @@ def _make_e2e_stack() -> MagicMock:
             tier=RiskTier.SAFE_AUTO, reason_code="test_default",
         )
     )
-    # ledger — async
+    # ledger — async (but _storage_dir must be a sync Path-like for _reconcile_on_boot)
     stack.ledger = AsyncMock()
     stack.ledger.append = AsyncMock(return_value=True)
+    storage_dir_mock = MagicMock()
+    storage_dir_mock.glob.return_value = iter([])  # no orphaned ops on boot
+    stack.ledger._storage_dir = storage_dir_mock
     # comm — async
     stack.comm = AsyncMock()
     # change_engine — async

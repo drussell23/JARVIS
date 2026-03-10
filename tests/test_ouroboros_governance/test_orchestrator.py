@@ -103,7 +103,12 @@ def _mock_generator(
     else:
         if candidates is None:
             candidates = (
-                {"file": "backend/core/utils.py", "content": "def hello():\n    pass\n"},
+                {
+                    "candidate_id": "c1",
+                    "file_path": "backend/core/utils.py",
+                    "full_content": "def hello():\n    pass\n",
+                    "rationale": "default mock",
+                },
             )
         result = GenerationResult(
             candidates=candidates,
@@ -426,7 +431,7 @@ class TestValidationRetries:
         # Provide a candidate with invalid Python syntax
         generator = _mock_generator(
             candidates=(
-                {"file": "utils.py", "content": "def broken(\n"},
+                {"candidate_id": "c1", "file_path": "utils.py", "full_content": "def broken(\n", "rationale": "broken"},
             )
         )
         config = _default_config()
@@ -447,7 +452,7 @@ class TestValidationRetries:
         stack = _mock_stack()
         generator = _mock_generator(
             candidates=(
-                {"file": "utils.py", "content": "def hello():\n    return 42\n"},
+                {"candidate_id": "c1", "file_path": "utils.py", "full_content": "def hello():\n    return 42\n", "rationale": "valid"},
             )
         )
         config = _default_config()
