@@ -131,3 +131,76 @@ class TestVoiceNarratorFailure:
             "goal": "fix", "target_files": ["a.py"],
         })
         await narrator.send(msg)  # should not raise
+
+
+# ---------------------------------------------------------------------------
+# TestSeverityAwareDebounce
+# ---------------------------------------------------------------------------
+
+
+class TestSeverityAwareDebounce:
+    """DECISION and POSTMORTEM bypass debounce; INTENT is rate-limited."""
+
+    def _make_narrator(self, debounce_s: float = 60.0):
+        from unittest.mock import AsyncMock
+        from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+        say = AsyncMock(return_value=True)
+        narrator = VoiceNarrator(say_fn=say, debounce_s=debounce_s, source="test")
+        return narrator, say
+
+    def _make_msg(self, msg_type, op_id: str = "op-1"):
+        from unittest.mock import MagicMock
+        from backend.core.ouroboros.governance.comm_protocol import MessageType
+        msg = MagicMock()
+        msg.msg_type = msg_type
+        msg.op_id = op_id
+        msg.payload = {"outcome": "applied"}
+        return msg
+
+    async def test_postmortem_bypasses_debounce(self):
+        """POSTMORTEM narrates even within debounce window."""
+        from backend.core.ouroboros.governance.comm_protocol import MessageType
+        narrator, say = self._make_narrator(debounce_s=3600.0)
+
+        # First INTENT narrates and sets _last_narration
+        await narrator.send(self._make_msg(MessageType.INTENT, "op-1"))
+        assert say.call_count == 1
+
+        # POSTMORTEM for a different op must narrate despite debounce window
+        await narrator.send(self._make_msg(MessageType.POSTMORTEM, "op-2"))
+        assert say.call_count == 2, (
+            f"POSTMORTEM was suppressed by debounce (call_count={say.call_count})"
+        )
+
+    async def test_decision_bypasses_debounce(self):
+        """DECISION narrates even within debounce window."""
+        from backend.core.ouroboros.governance.comm_protocol import MessageType
+        narrator, say = self._make_narrator(debounce_s=3600.0)
+
+        await narrator.send(self._make_msg(MessageType.INTENT, "op-1"))
+        assert say.call_count == 1
+
+        await narrator.send(self._make_msg(MessageType.DECISION, "op-2"))
+        assert say.call_count == 2, (
+            f"DECISION was suppressed by debounce (call_count={say.call_count})"
+        )
+
+    async def test_intent_is_debounced(self):
+        """INTENT respects debounce window (second INTENT within window is dropped)."""
+        from backend.core.ouroboros.governance.comm_protocol import MessageType
+        narrator, say = self._make_narrator(debounce_s=3600.0)
+
+        await narrator.send(self._make_msg(MessageType.INTENT, "op-1"))
+        assert say.call_count == 1
+
+        await narrator.send(self._make_msg(MessageType.INTENT, "op-2"))
+        assert say.call_count == 1, "Second INTENT within window should be debounced"
+
+    async def test_idempotency_still_blocks_duplicate_postmortem(self):
+        """Same op_id + same msg_type is idempotent even without debounce."""
+        from backend.core.ouroboros.governance.comm_protocol import MessageType
+        narrator, say = self._make_narrator(debounce_s=0.0)
+
+        await narrator.send(self._make_msg(MessageType.POSTMORTEM, "op-1"))
+        await narrator.send(self._make_msg(MessageType.POSTMORTEM, "op-1"))  # duplicate
+        assert say.call_count == 1, "Idempotency guard should block duplicate op_id+type"

@@ -53,10 +53,12 @@ class VoiceNarrator:
         if notification_id in self._narrated_ids:
             return
 
-        # Debounce: max 1 narration per debounce_s
+        # Debounce: only throttle INTENT — DECISION and POSTMORTEM always narrate
+        # (a suppressed failure is a P0 silent-killer)
         now = time.monotonic()
-        if (now - self._last_narration) < self._debounce_s:
-            return
+        if msg.msg_type == MessageType.INTENT:
+            if (now - self._last_narration) < self._debounce_s:
+                return
 
         # Build narration text
         phase = self._map_phase(msg)
