@@ -309,3 +309,139 @@ class TestGetFusedNeighborhood:
         # base.py in structural, misc.py in semantic_support
         assert "jarvis:core/base.py" in result.imports
         assert "prime:utils/misc.py" in result.semantic_support
+
+
+class TestContextExpanderFusedRendering:
+    """Tests for dual-section rendering of fused neighborhood."""
+
+    def _make_ctx(self, description="fix the auth service", target_files=("backend/core/service.py",)):
+        from backend.core.ouroboros.governance.op_context import OperationContext, OperationPhase
+        return OperationContext.create(
+            op_id="fusion-test",
+            description=description,
+            target_files=tuple(target_files),
+        ).advance(OperationPhase.ROUTE).advance(OperationPhase.CONTEXT_EXPANSION)
+
+    async def test_expand_calls_get_fused_neighborhood(self, tmp_path):
+        """expand() must await get_fused_neighborhood, NOT get_file_neighborhood."""
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.oracle import FileNeighborhood
+
+        fused_nh = FileNeighborhood(
+            target_files=["jarvis:backend/core/service.py"],
+            imports=["jarvis:backend/core/base.py"],
+            importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=["prime:services/auth_service.py"],
+        )
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": True}
+        oracle.get_fused_neighborhood = AsyncMock(return_value=fused_nh)
+        oracle.get_file_neighborhood = MagicMock()
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+        expander._generator = MagicMock()
+        expander._generator.plan = AsyncMock(
+            return_value='{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "none"}'
+        )
+
+        from datetime import datetime, timedelta
+        deadline = datetime.now() + timedelta(seconds=30)
+        ctx = self._make_ctx()
+        await expander.expand(ctx, deadline)
+
+        oracle.get_fused_neighborhood.assert_called_once()
+        oracle.get_file_neighborhood.assert_not_called()
+
+    async def test_structural_section_labeled_in_prompt(self, tmp_path):
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.oracle import FileNeighborhood
+
+        fused_nh = FileNeighborhood(
+            target_files=["jarvis:backend/core/service.py"],
+            imports=["jarvis:backend/core/base.py"],
+            importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=["prime:services/auth_service.py"],
+        )
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": True}
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+        ctx = self._make_ctx()
+        prompt = expander._build_expansion_prompt(ctx, [], neighborhood=fused_nh)
+
+        assert "Structural" in prompt or "structural" in prompt
+        assert "jarvis:backend/core/base.py" in prompt
+
+    async def test_semantic_support_section_labeled_in_prompt(self, tmp_path):
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.oracle import FileNeighborhood
+
+        fused_nh = FileNeighborhood(
+            target_files=["jarvis:backend/core/service.py"],
+            imports=[], importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=["prime:services/auth_service.py", "reactor:handlers/base.py"],
+        )
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": True}
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+        ctx = self._make_ctx()
+        prompt = expander._build_expansion_prompt(ctx, [], neighborhood=fused_nh)
+
+        assert "Semantic" in prompt or "semantic" in prompt
+        assert "prime:services/auth_service.py" in prompt
+        assert "reactor:handlers/base.py" in prompt
+
+    async def test_semantic_support_truncated_at_10(self, tmp_path):
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.oracle import FileNeighborhood
+
+        semantic = [f"prime:services/svc_{i:02d}.py" for i in range(15)]
+        fused_nh = FileNeighborhood(
+            target_files=[], imports=[], importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+            semantic_support=semantic,
+        )
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": True}
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+        ctx = self._make_ctx()
+        prompt = expander._build_expansion_prompt(ctx, [], neighborhood=fused_nh)
+
+        shown = sum(1 for line in prompt.splitlines() if "svc_" in line and line.strip().startswith("- "))
+        assert shown == 10
+        assert "and 5 more" in prompt
+
+    async def test_fused_neighborhood_failure_falls_back_to_structural(self, tmp_path):
+        """If get_fused_neighborhood raises, falls back to get_file_neighborhood."""
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from backend.core.ouroboros.oracle import FileNeighborhood
+
+        structural_nh = FileNeighborhood(
+            target_files=["jarvis:backend/core/service.py"],
+            imports=["jarvis:backend/core/base.py"],
+            importers=[], callers=[], callees=[],
+            inheritors=[], base_classes=[], test_counterparts=[],
+        )
+        oracle = MagicMock()
+        oracle.get_status.return_value = {"running": True}
+        oracle.get_fused_neighborhood = AsyncMock(side_effect=RuntimeError("chroma down"))
+        oracle.get_file_neighborhood = MagicMock(return_value=structural_nh)
+
+        expander = ContextExpander(generator=MagicMock(), repo_root=tmp_path, oracle=oracle)
+        expander._generator = MagicMock()
+        expander._generator.plan = AsyncMock(
+            return_value='{"schema_version": "expansion.1", "additional_files_needed": [], "reasoning": "none"}'
+        )
+
+        from datetime import datetime, timedelta
+        deadline = datetime.now() + timedelta(seconds=30)
+        ctx = self._make_ctx()
+
+        # Must not raise — fallback to structural
+        await expander.expand(ctx, deadline)
+        oracle.get_file_neighborhood.assert_called_once()

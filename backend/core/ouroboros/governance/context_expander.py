@@ -81,8 +81,39 @@ class ContextExpander:
         """
         accumulated: List[str] = []
 
+        # Pre-fetch fused neighborhood once (async, fault-isolated)
+        fused_neighborhood: Optional[Any] = None
+        if self._oracle is not None:
+            try:
+                status = self._oracle.get_status()
+                if status.get("running", False):
+                    target_abs = [self._repo_root / f for f in ctx.target_files]
+                    if hasattr(self._oracle, "get_fused_neighborhood"):
+                        try:
+                            fused_neighborhood = await self._oracle.get_fused_neighborhood(
+                                target_abs, ctx.description
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "[ContextExpander] op=%s oracle neighborhood failed: %s; continuing without",
+                                ctx.op_id, exc,
+                            )
+                            # Fallback to synchronous structural neighborhood
+                            try:
+                                fused_neighborhood = self._oracle.get_file_neighborhood(target_abs)
+                            except Exception:
+                                fused_neighborhood = None
+                    else:
+                        fused_neighborhood = self._oracle.get_file_neighborhood(target_abs)
+            except Exception as exc:
+                logger.warning(
+                    "[ContextExpander] op=%s oracle neighborhood failed: %s; continuing without",
+                    ctx.op_id, exc,
+                )
+                fused_neighborhood = None
+
         for round_num in range(MAX_ROUNDS):
-            prompt = self._build_expansion_prompt(ctx, accumulated, oracle=self._oracle)
+            prompt = self._build_expansion_prompt(ctx, accumulated, neighborhood=fused_neighborhood)
 
             try:
                 raw = await self._generator.plan(prompt, deadline)
@@ -133,6 +164,7 @@ class ContextExpander:
         ctx: OperationContext,
         already_fetched: List[str],
         oracle: Optional[Any] = None,
+        neighborhood: Optional[Any] = None,
     ) -> str:
         """Build a lightweight prompt — filenames only, no file contents."""
         target_list = "\n".join(f"  - {f}" for f in ctx.target_files)
@@ -142,15 +174,18 @@ class ContextExpander:
             else "  (none yet)"
         )
         available_section = ""
-        if oracle is not None:
+        if neighborhood is not None:
+            # Pre-computed fused neighborhood passed in directly
+            available_section = self._render_neighborhood_section(neighborhood)
+        elif oracle is not None:
             try:
                 status = oracle.get_status()
                 if status.get("running", False):
                     target_abs = [
                         self._repo_root / f for f in ctx.target_files
                     ]
-                    neighborhood = oracle.get_file_neighborhood(target_abs)
-                    available_section = self._render_neighborhood_section(neighborhood)
+                    sync_nh = oracle.get_file_neighborhood(target_abs)
+                    available_section = self._render_neighborhood_section(sync_nh)
             except Exception:
                 available_section = ""  # fall back silently
         return (
@@ -167,11 +202,17 @@ class ContextExpander:
         )
 
     def _render_neighborhood_section(self, neighborhood: Any) -> str:
-        """Render a FileNeighborhood as a labeled multi-section string.
+        """Render a FileNeighborhood as two labeled sections.
 
-        Each category is limited to MAX_FILES_PER_CATEGORY entries.
+        Section 1 — Structural file neighborhood: edge-typed categories
+          (imports, importers, callers, callees, inheritors, base_classes,
+          test_counterparts). Each capped at MAX_FILES_PER_CATEGORY.
+
+        Section 2 — Semantic support: flat list of cross-repo similar code,
+          also capped at MAX_FILES_PER_CATEGORY.
+
         Truncated categories append ``"  ... (and N more)"``.
-        Returns empty string if neighborhood has no neighbors.
+        Returns empty string if no neighbors at all.
         """
         try:
             categories = neighborhood.to_dict()
@@ -180,19 +221,39 @@ class ContextExpander:
         if not categories:
             return ""
 
-        lines = ["\nStructural file neighborhood (real codebase graph edges):"]
-        for category, paths in categories.items():
-            label = category.replace("_", " ").title()
-            shown = paths[:MAX_FILES_PER_CATEGORY]
-            hidden = len(paths) - len(shown)
-            lines.append(f"  {label}:")
-            for p in shown:
+        # Pop semantic_support before structural rendering
+        semantic_support: List[str] = categories.pop("semantic_support", [])
+        structural_categories = categories
+
+        lines: List[str] = []
+
+        # ── Structural section ────────────────────────────────────────────
+        if structural_categories:
+            lines.append("\nStructural file neighborhood (real codebase graph edges):")
+            for category, paths in structural_categories.items():
+                label = category.replace("_", " ").title()
+                shown = paths[:MAX_FILES_PER_CATEGORY]
+                hidden = len(paths) - len(shown)
+                lines.append(f"  {label}:")
+                for p in shown:
+                    lines.append(f"    - {p}")
+                if hidden > 0:
+                    lines.append(f"    ... (and {hidden} more)")
+
+        # ── Semantic support section ──────────────────────────────────────
+        if semantic_support:
+            lines.append("\nSemantic support (cross-repo similar code):")
+            shown_s = semantic_support[:MAX_FILES_PER_CATEGORY]
+            hidden_s = len(semantic_support) - len(shown_s)
+            for p in shown_s:
                 lines.append(f"    - {p}")
-            if hidden > 0:
-                lines.append(f"    ... (and {hidden} more)")
-        lines.append(
-            "\nWhich of these (if any) would help you understand the context?\n"
-        )
+            if hidden_s > 0:
+                lines.append(f"    ... (and {hidden_s} more)")
+
+        if not lines:
+            return ""
+
+        lines.append("\nWhich of these (if any) would help you understand the context?\n")
         return "\n".join(lines)
 
     def _parse_expansion_response(self, raw: str) -> List[str]:
