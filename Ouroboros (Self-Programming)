@@ -2053,3 +2053,264 @@ so what do we need to focus on next to where JARVIS can genuinely 100% autonomou
   research_artifact_manifest.json contract Gemini described to propagate discoveries back. This is the right blueprint — just not the right time.
 
   The push/PR step is still pending from the finishing skill — want me to push this branch and create the PR first, then start on supervisor wiring?
+
+
+=======================================================================================================================================================
+=======================================================================================================================================================
+=======================================================================================================================================================
+
+
+⏺ Good — now I have the full picture. Here's the honest assessment.                                                                                          
+   
+  ---                                                                                                                                                        
+  Where Ouroboros Stands Now                                           
+                                                                                                                                                             
+  What the 4 activation tasks actually changed                         
+
+  ┌──────────────────────┬────────────────────────────────────────────┬─────────────────────────────────────────────────────────────────────────────────┐
+  │         Task         │                What it did                 │                                   Real impact                                   │
+  ├──────────────────────┼────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ .env.example section │ Documents all vars                         │ Operators can now configure without reading source                              │
+  ├──────────────────────┼────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ Zone 6.8/6.9 fix     │ Re-raises CancelledError, logs CRITICAL    │ Failures are now visible. Before: silent swallow. Now: full traceback in logs.  │
+  ├──────────────────────┼────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ CommProtocol INFO    │ DEBUG→INFO, configurable debounce          │ Transport stack is visible at startup; voice debounce tunable                   │
+  │ logs                 │                                            │                                                                                 │
+  ├──────────────────────┼────────────────────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────┤
+  │ TrustGraduator       │ Populates baseline tier policies at GLS    │ First real runtime change. Tier map (GOVERNED/OBSERVE per repo×trigger×slice)   │
+  │ seeding              │ startup                                    │ now exists                                                                      │
+  └──────────────────────┴────────────────────────────────────────────┴─────────────────────────────────────────────────────────────────────────────────┘
+
+  What actually gates GLS startup today
+
+  GLS does start at Zone 6.8. But it boots into SANDBOX mode by default (the --governance-mode CLI arg defaults to "sandbox"). In SANDBOX mode it can plan
+  operations but won't write files or commit. To get real patching you need:
+
+  jarvis --governance-mode governed
+
+  or to set it in your launch config.
+
+  What still needs to happen before you see self-development
+
+  1. Launch with --governance-mode governed ← single biggest gate right now
+
+  2. Set JARVIS_REPO_PATH in your .env (Prime and Reactor paths are already there, JARVIS itself defaults to ".")
+
+  3. Set operational vars that aren't in .env yet:
+  OUROBOROS_LEDGER_DIR=~/.jarvis/ouroboros/ledger
+  OUROBOROS_STARTUP_TIMEOUT=30
+  JARVIS_GOVERNED_CLAUDE_MODEL=claude-sonnet-4-6
+  JARVIS_GOVERNED_MAX_CONCURRENT_OPS=2
+
+  4. Live GCP endpoint — PrimeProvider will fall back to Claude API if JARVIS_PRIME_URL isn't set to a live J-Prime VM. It still works, just uses Claude instead of the golden image.
+
+  5. An operation trigger — currently nothing auto-generates work items. The intake layer needs a trigger source (voice command, backlog item, or test
+  failure event) to feed the first operation.
+
+  Honest current state
+
+  Before these 4 tasks:  GLS wired but failures silent, no autonomy tiers, hardcoded debounce
+  After these 4 tasks:   GLS starts + tier map populated + failures visible + transport observable
+
+  Still missing for live patching:
+    - governance_mode=governed in launch args
+    - operational env vars in .env
+    - a trigger to kick off first operation
+    - (optional) live GCP endpoint for J-Prime
+
+  The architecture is complete. You're now one config step + one launch flag away from the loop being live. The voice back-channel will fire once an
+  operation runs — the CommProtocol is wired, it just needs something to narrate.
+
+
+=======================================================================================================================================================
+=======================================================================================================================================================
+=======================================================================================================================================================
+
+
+⏺ Now I have everything for a complete, honest answer.                                                                                                       
+   
+  ---                                                                                                                                                        
+  Honest Status: Ouroboros Today                                       
+                                                                                                                                                             
+  The gap has closed significantly — here's the exact delta                                                                                                
+
+  Before these sessions:
+  - GLS not started at boot (no entry point)
+  - No autonomy tiers configured
+  - Zone 6.8 silently swallowed failures
+  - Transport stack invisible at DEBUG
+  - No env-var documentation
+
+  After everything we've built:
+  - ✅ GLS does start at Zone 6.8 on boot (this was already wired, we confirmed + hardened it)
+  - ✅ Zone 6.8 + 6.9: failures now log CRITICAL with full traceback (no more silent death)
+  - ✅ Autonomy tier map seeded at startup (GOVERNED for tests/docs, OBSERVE for core/root)
+  - ✅ All env vars documented, Prime + Reactor paths already in your .env
+  - ✅ CommProtocol transport stack visible at INFO on startup
+  - ✅ Voice debounce configurable via env
+
+  What still gates live self-development:
+
+  ┌─────────────────────────┬─────────────────────────────────────────────────────────────────────────────────────────────────────┬──────────────────────┐
+  │           Gap           │                                            What's needed                                            │        Effort        │
+  ├─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────┤
+  │ Mode is sandbox by      │ Launch JARVIS with --governance-mode governed                                                       │ 1 line config        │
+  │ default                 │                                                                                                     │                      │
+  ├─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────┤
+  │ Operational vars not in │ Add OUROBOROS_LEDGER_DIR, JARVIS_GOVERNED_* vars                                                    │ 5 minutes            │
+  │  .env                   │                                                                                                     │                      │
+  ├─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────┤
+  │ No trigger source       │ Nothing generates work items yet. Intake layer needs a voice command, backlog item, or test-failure │ Next build           │
+  │                         │  event to start the first op                                                                        │                      │
+  ├─────────────────────────┼─────────────────────────────────────────────────────────────────────────────────────────────────────┼──────────────────────┤
+  │ GCP endpoint            │ PrimeProvider falls back to Claude API if JARVIS_PRIME_URL not set. Will work, just not using       │ Config once VM is    │
+  │                         │ J-Prime golden image                                                                                │ running              │
+  └─────────────────────────┴─────────────────────────────────────────────────────────────────────────────────────────────────────┴──────────────────────┘
+
+  So: not yet autonomous, but 2 config lines away from the first operation being possible.
+
+  ---
+  Does Ouroboros have Claude Code capabilities?
+
+  Short answer: Ouroboros is a parallel implementation of the same concept — built independently, before we could use the Claude Code SDK.
+
+  Here's the comparison:
+
+  ┌──────────────────────┬──────────────────────┬──────────────────────────────────────────────────┐
+  │      Capability      │     Claude Code      │              Ouroboros ToolExecutor              │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Read files           │ ✅ Read tool         │ ✅ read_file                                     │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Search code          │ ✅ Grep/Glob         │ ✅ search_code                                   │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Run tests            │ ✅ Bash              │ ✅ run_tests                                     │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Find callers/callees │ ✅ Code intelligence │ ✅ get_callers + TheOracle                       │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Write files          │ ✅ Edit/Write        │ ❌ Missing — ToolExecutor is read-only           │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Execute shell        │ ✅ Bash              │ ❌ Missing                                       │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Web search/fetch     │ ✅                   │ ❌ Missing                                       │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Agent loop           │ ✅ Built-in          │ ✅ Custom FSM (INTAKE→GENERATE→APPLY→COMPLETE)   │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Context management   │ ✅ Auto-compaction   │ ✅ Hash-chained OperationContext + FUSE expander │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Safety gates         │ ✅ Checkpoints       │ ✅ TrustGraduator tiers + Ledger                 │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Voice narration      │ ❌                   │ ✅ CommProtocol + VoiceNarrator                  │
+  ├──────────────────────┼──────────────────────┼──────────────────────────────────────────────────┤
+  │ Cryptographic audit  │ ❌                   │ ✅ Ledger with hash chains                       │
+  └──────────────────────┴──────────────────────┴──────────────────────────────────────────────────┘
+
+  The critical gap: Ouroboros cannot write files. ToolExecutor is intentionally read-only right now — it can read and plan but the apply() step in the
+  pipeline is what executes file writes, and that's gated behind GOVERNED mode + approval. So the write path exists in the FSM but isn't in the tool loop.
+
+  What the Claude Code SDK could give us: Instead of building the write/bash/web tools from scratch, we could embed Claude Code as the generation engine
+  inside ClaudeProvider. When Ouroboros picks up a task, instead of calling the Anthropic API raw with a custom tool loop, it would spin up a Claude Code
+  agent with full file-write + bash access, governed by our FSM. That's a compelling upgrade path — but it's not blocking anything today.
+
+  ---
+  Priority sequence (unchanged, with updated status)
+
+  1. ~~Supervisor wiring~~ ✅ Done
+  2. ~~Multi-repo registry~~ ✅ .env has Prime + Reactor paths
+  3. ~~Autonomy gate~~ ✅ Tier map seeded
+  4. --governance-mode governed + operational env vars ← you're here
+  5. Trigger source — something that generates the first work item (voice command integration into intake layer)
+  6. ToolExecutor write tools — file_write + bash_execute for the apply step
+  7. Live GCP endpoint — inject J-Prime URL when VM is provisioned
+
+
+=======================================================================================================================================================
+=======================================================================================================================================================
+=======================================================================================================================================================
+
+
+⏺ ---                                                                                                                                                        
+  What just shipped                                                    
+                                                                                                                                                             
+  6 commits pushed to origin/main:                                     
+                                                                                                                                                             
+  ┌──────────┬───────────────────────────────────────────────────────────┬───────────────────────────────────────────────────────────────┐                   
+  │  Commit  │                          Change                           │                            Effect                             │
+  ├──────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ 80a76cfe │ JARVIS_GOVERNANCE_MODE=governed in .env + env var support │ JARVIS boots in governed mode immediately                     │
+  ├──────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ 3930c122 │ Ignition banner + oracle freshness                        │ You'll see mode + repo paths on every boot; stale index warns │
+  ├──────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ 81512520 │ Per-file cooldown guard (3 hits / 10 min → hard block)    │ Infinite generation loops can't happen                        │
+  ├──────────┼───────────────────────────────────────────────────────────┼───────────────────────────────────────────────────────────────┤
+  │ 4e2925ae │ emit_intent at FSM entry                                  │ Voice fires the moment an operation starts                    │
+  └──────────┴───────────────────────────────────────────────────────────┴───────────────────────────────────────────────────────────────┘
+
+  ---
+  What happens when you restart JARVIS now
+
+  On boot you'll see in logs:
+  [Kernel] Governance gate: mode=governed ...
+  [Kernel] *** OUROBOROS IGNITION *** mode=governed repos={'jarvis': '/Users/.../JARVIS-AI-Agent', 'prime': '...', ...}
+  [GovernedLoop] Autonomy policies seeded: 48 configs across 3 repos
+
+  When an operation runs, voice will say something at INTENT (start), DECISION (gate/approval), and POSTMORTEM (complete/fail).
+
+  ---
+  The one remaining gap: trigger source
+
+  Ouroboros is armed and waiting. Nothing feeds it work yet. The intake layer is wired at Zone 6.9, but it needs a trigger — the next logical step is
+  connecting one of:
+
+  1. Voice command — "Hey JARVIS, add a docstring to resource_monitor.py" → submit() → full governed pipeline
+  2. Backlog sensor — auto-detect TODO/FIXME comments and queue them as low-priority ops
+  3. Test failure sensor — failed pytest run → auto-generate a fix candidate
+
+  Which trigger do you want to build first? Voice command is the most direct for the Go/No-Go test Gemini described.
+
+=======================================================================================================================================================
+=======================================================================================================================================================
+=======================================================================================================================================================
+
+⏺ Phase 4 is complete. Here's a summary of everything that was done:                                                                              
+                                                                                                                                                  
+  ---                                                                                                                                             
+  Phase 4 Complete: Economic & Inference Routing Hardening                                                                                      
+                                                                                                                                                  
+  Golden Image v2 (jarvis-prime-golden-v2) is live with:                                                                                          
+
+  What's on the image
+
+  ┌──────────────────┬─────────────────────────────────────────┬────────┬─────────────┐
+  │      Brain       │                  Model                  │  Size  │    Tier     │
+  ├──────────────────┼─────────────────────────────────────────┼────────┼─────────────┤
+  │ phi3_lightweight │ Phi-3.5-mini-instruct-Q4_K_M.gguf       │ 2.3 GB │ TRIVIAL     │
+  ├──────────────────┼─────────────────────────────────────────┼────────┼─────────────┤
+  │ mistral_planning │ mistral-7b-instruct-v0.2.Q4_K_M.gguf    │ 4.1 GB │ LIGHT       │
+  ├──────────────────┼─────────────────────────────────────────┼────────┼─────────────┤
+  │ qwen_coder       │ qwen2.5-coder-7b-instruct-q4_k_m.gguf   │ 4.4 GB │ HEAVY       │
+  ├──────────────────┼─────────────────────────────────────────┼────────┼─────────────┤
+  │ deepseek_r1      │ DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf │ 4.4 GB │ COMPLEX     │
+  ├──────────────────┼─────────────────────────────────────────┼────────┼─────────────┤
+  │ (backup)         │ Llama-3.2-1B-Instruct-Q4_K_M.gguf       │ 0.8 GB │ ultra-light │
+  └──────────────────┴─────────────────────────────────────────┴────────┴─────────────┘
+
+  Freed 47 GB by removing 11 redundant Mistral quantizations. 70 GB free on disk.
+
+  End-to-end routing chain
+
+  BrainSelector.select() → BrainSelectionResult.model_name
+    ↓
+  PrimeProvider.generate(context) → extracts context.telemetry.routing_intent.brain_model
+    ↓
+  prime_client.generate(model_name="qwen-2.5-coder-7b")
+    ↓
+  _build_payload() → { "model": "qwen-2.5-coder-7b", ... }
+    ↓
+  j-prime _execute_tier_0() → MultiModelPool.get_executor("qwen-2.5-coder-7b")
+    ↓
+  LRU pool loads/returns correct LlamaCppExecutor
+
+  New j-prime endpoints
+
+  - GET /v1/models — lists all 5 indexed brain models with GGUF filenames
+  - Pool is LRU with max_loaded=2 (configurable via JARVIS_PRIME_MAX_LOADED_MODELS)

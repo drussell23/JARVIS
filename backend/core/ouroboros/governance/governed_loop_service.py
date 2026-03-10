@@ -190,6 +190,7 @@ class GovernedLoopConfig:
     claude_max_cost_per_op: float = 0.50
     claude_daily_budget: float = 10.00
     generation_timeout_s: float = 120.0
+    context_expansion_timeout_s: float = 30.0
     approval_timeout_s: float = 600.0
     health_probe_interval_s: float = 30.0
     max_concurrent_ops: int = 2
@@ -232,6 +233,9 @@ class GovernedLoopConfig:
             ),
             generation_timeout_s=float(
                 os.getenv("JARVIS_GOVERNED_GENERATION_TIMEOUT", "120.0")
+            ),
+            context_expansion_timeout_s=float(
+                os.getenv("JARVIS_GOVERNED_EXPANSION_TIMEOUT", "30.0")
             ),
             approval_timeout_s=float(
                 os.getenv("JARVIS_GOVERNED_APPROVAL_TIMEOUT", "600.0")
@@ -888,6 +892,7 @@ class GovernedLoopService:
             project_root=self._config.project_root,
             repo_registry=repo_registry,
             generation_timeout_s=self._config.generation_timeout_s,
+            context_expansion_timeout_s=self._config.context_expansion_timeout_s,
             approval_timeout_s=self._config.approval_timeout_s,
         )
         self._orchestrator = GovernedOrchestrator(

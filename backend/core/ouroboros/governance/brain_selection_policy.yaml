@@ -1,4 +1,4 @@
-version: "1.1"
+version: "1.2"
 updated: "2026-03-10"
 # =============================================================================
 # Ouroboros Brain Selection Policy
@@ -22,12 +22,15 @@ updated: "2026-03-10"
 brains:
   # ─────────────────────────────────────────────────────────────────────────
   # TIER 0: Lightweight — docs, comments, trivial appends
-  # Uses llama-3.2-1b for near-instant (<1s) load; phi-3.5-mini if needed.
+  # Uses llama-3.2-1b (0.8 GB): ~50 tok/s on CPU — 10× faster than 7B models.
+  # Cold-load time < 2s. Fits in RAM alongside mistral-7b (pool max_loaded=2).
+  # mistral-7b is still the hot_swap default; llama-3.2-1b is loaded on demand
+  # for trivial tasks and stays hot after first use (LRU keeps both in memory).
   # ─────────────────────────────────────────────────────────────────────────
   phi3_lightweight:
-    model_name: "phi-3.5-mini"            # MultiModelPool canonical name
+    model_name: "llama-3.2-1b"           # ultra-light, fast CPU inference
     fallback_model: "mistral-7b"          # hot_swap default if pool miss
-    gguf_file: "Phi-3.5-mini-instruct-Q4_K_M.gguf"
+    gguf_file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
     max_prompt_tokens: 4096
     max_output_tokens: 512
     temperature: 0.1
