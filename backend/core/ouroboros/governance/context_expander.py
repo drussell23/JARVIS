@@ -79,6 +79,10 @@ class ContextExpander:
         Returns ctx.with_expanded_files(tuple) otherwise.
         Never raises — all errors produce the unmodified ctx.
         """
+        if self._oracle is None or not self._oracle.is_ready():
+            logger.info("[ContextExpander] Oracle not ready \u2014 using blind baseline")
+            return ctx
+
         accumulated: List[str] = []
 
         # Pre-fetch fused neighborhood once (async, fault-isolated)

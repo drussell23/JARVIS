@@ -26,6 +26,16 @@ def _make_generator(response: str) -> MagicMock:
     return gen
 
 
+def _make_ready_oracle() -> MagicMock:
+    """Return a MagicMock oracle that reports is_ready()=True."""
+    oracle = MagicMock()
+    oracle.is_ready.return_value = True
+    oracle.get_status.return_value = {"running": True}
+    oracle.get_fused_neighborhood = AsyncMock(side_effect=Exception("no fused neighborhood"))
+    oracle.get_file_neighborhood.side_effect = Exception("no structural neighborhood")
+    return oracle
+
+
 class TestContextExpanderConstants:
     def test_max_rounds_is_2(self):
         from backend.core.ouroboros.governance.context_expander import MAX_ROUNDS
@@ -77,7 +87,7 @@ class TestContextExpanderExpand:
             "additional_files_needed": ["helpers.py"],
             "reasoning": "need helper context",
         }))
-        expander = ContextExpander(generator=gen, repo_root=tmp_path)
+        expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=_make_ready_oracle())
         ctx = _make_ctx()
         deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
 
@@ -202,7 +212,7 @@ class TestContextExpanderExpand:
         gen = MagicMock()
         gen.plan = dup_plan
 
-        expander = ContextExpander(generator=gen, repo_root=tmp_path)
+        expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=_make_ready_oracle())
         ctx = _make_ctx()
         deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=30)
 
@@ -381,3 +391,83 @@ class TestContextExpanderNeighborhoodManifest:
         oracle.get_file_neighborhood.assert_not_called()
         # No neighborhood paths in prompt
         assert "jarvis:" not in prompt
+
+
+class TestContextExpanderOracleGuard:
+    """Oracle readiness guard at expand() entry — single location, no drift."""
+
+    async def test_oracle_none_returns_ctx_unchanged(self, tmp_path):
+        """When oracle is None, expand() returns ctx unchanged immediately."""
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from unittest.mock import AsyncMock, MagicMock
+
+        gen = MagicMock()
+        gen.plan = AsyncMock(return_value='{"schema_version":"expansion.1","additional_files_needed":[],"reasoning":"x"}')
+
+        expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=None)
+        ctx = _make_ctx()
+        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+
+        result = await expander.expand(ctx, deadline)
+        assert result is ctx
+
+    async def test_oracle_not_ready_returns_ctx_unchanged(self, tmp_path):
+        """When oracle.is_ready() returns False, expand() returns ctx unchanged."""
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from unittest.mock import AsyncMock, MagicMock
+
+        oracle = MagicMock()
+        oracle.is_ready.return_value = False
+
+        gen = MagicMock()
+        gen.plan = AsyncMock(return_value='{"schema_version":"expansion.1","additional_files_needed":[],"reasoning":"x"}')
+
+        expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=oracle)
+        ctx = _make_ctx()
+        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+
+        result = await expander.expand(ctx, deadline)
+        assert result is ctx
+
+    async def test_oracle_not_ready_logs_info(self, tmp_path, caplog):
+        """When oracle not ready, logs INFO with the blind baseline message."""
+        import logging
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from unittest.mock import AsyncMock, MagicMock
+
+        oracle = MagicMock()
+        oracle.is_ready.return_value = False
+
+        gen = MagicMock()
+        gen.plan = AsyncMock(return_value='{"schema_version":"expansion.1","additional_files_needed":[],"reasoning":"x"}')
+
+        expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=oracle)
+        ctx = _make_ctx()
+        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+
+        with caplog.at_level(logging.INFO, logger="Ouroboros.ContextExpander"):
+            await expander.expand(ctx, deadline)
+
+        assert "[ContextExpander] Oracle not ready \u2014 using blind baseline" in caplog.text
+
+    async def test_oracle_ready_proceeds_to_expand(self, tmp_path):
+        """When oracle.is_ready() returns True, expand() proceeds normally (not short-circuited)."""
+        from backend.core.ouroboros.governance.context_expander import ContextExpander
+        from unittest.mock import AsyncMock, MagicMock
+
+        oracle = MagicMock()
+        oracle.is_ready.return_value = True
+        oracle.get_fused_neighborhood = AsyncMock(side_effect=AttributeError("not present"))
+
+        (tmp_path / "extra.py").write_text("# extra\n")
+
+        gen = MagicMock()
+        gen.plan = AsyncMock(return_value='{"schema_version":"expansion.1","additional_files_needed":["extra.py"],"reasoning":"need it"}')
+
+        expander = ContextExpander(generator=gen, repo_root=tmp_path, oracle=oracle)
+        ctx = _make_ctx()
+        deadline = __import__("datetime").datetime.now(__import__("datetime").timezone.utc) + __import__("datetime").timedelta(seconds=30)
+
+        result = await expander.expand(ctx, deadline)
+        # generator.plan must have been called — proving we did not short-circuit
+        gen.plan.assert_called()

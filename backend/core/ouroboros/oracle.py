@@ -1762,6 +1762,10 @@ class TheOracle:
             ],
         }
 
+    def is_ready(self) -> bool:
+        """Return True when the oracle has completed initialisation and is running."""
+        return self._running
+
     def get_status(self) -> Dict[str, Any]:
         """Get Oracle status."""
         return {
