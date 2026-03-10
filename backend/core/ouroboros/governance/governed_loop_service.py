@@ -50,6 +50,11 @@ from backend.core.ouroboros.governance.curriculum_publisher import CurriculumPub
 from backend.core.ouroboros.governance.model_attribution_recorder import ModelAttributionRecorder
 from backend.core.ouroboros.integration import get_performance_persistence
 
+try:
+    from backend.core.ouroboros.oracle import TheOracle as TheOracle
+except ImportError:
+    TheOracle = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger("Ouroboros.GovernedLoop")
 
 # ---------------------------------------------------------------------------
@@ -268,6 +273,8 @@ class GovernedLoopService:
         self._curriculum_publisher: Optional[CurriculumPublisher] = None
         self._model_attribution_recorder: Optional[ModelAttributionRecorder] = None
         self._event_dir: Optional[Path] = None
+        self._oracle_indexer_task: Optional[asyncio.Task] = None
+        self._oracle: Optional[Any] = None
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
@@ -326,6 +333,11 @@ class GovernedLoopService:
                     self._reactor_event_loop(), name="reactor_event_loop"
                 )
 
+            if self._config.oracle_enabled:
+                self._oracle_indexer_task = asyncio.create_task(
+                    self._oracle_index_loop(), name="oracle_index_loop"
+                )
+
             # Start health probe background task
             self._health_probe_task = asyncio.create_task(
                 self._health_probe_loop(), name="health_probe_loop"
@@ -375,7 +387,7 @@ class GovernedLoopService:
                 pass
 
         # Cancel curriculum and reactor event background tasks
-        for task_attr in ("_curriculum_task", "_reactor_event_task"):
+        for task_attr in ("_curriculum_task", "_reactor_event_task", "_oracle_indexer_task"):
             task: Optional[asyncio.Task] = getattr(self, task_attr, None)
             if task and not task.done():
                 task.cancel()
@@ -998,6 +1010,46 @@ class GovernedLoopService:
                 return
             except Exception as exc:
                 logger.warning("[GovernedLoop] reactor_event_loop error: %s", exc)
+
+    async def _oracle_index_loop(self) -> None:
+        """Index all repos into TheOracle graph on boot, then poll for incremental changes.
+
+        Non-blocking: start() never awaits this. Fault-isolated: any exception in
+        initialization sets self._oracle = None, logs a structured warning, and exits
+        the task without impacting service state or any operation's terminal phase.
+        """
+        try:
+            if TheOracle is None:
+                raise ImportError("TheOracle not available")
+            oracle = TheOracle()
+            await oracle.initialize()
+            self._oracle = oracle
+            if self._stack is not None:
+                self._stack.oracle = oracle
+            logger.info(
+                "[GovernedLoop] Oracle indexed %s nodes across all repos",
+                oracle.get_metrics().get("total_nodes", "?"),
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.warning(
+                "[GovernedLoop] Oracle initialization failed: %s; codebase graph unavailable",
+                exc,
+            )
+            self._oracle = None
+            return
+
+        # Incremental update loop — polls every oracle_incremental_poll_interval_s
+        while True:
+            try:
+                await asyncio.sleep(self._config.oracle_incremental_poll_interval_s)
+                await self._oracle.incremental_update([])
+            except asyncio.CancelledError:
+                await self._oracle.shutdown()
+                return
+            except Exception as exc:
+                logger.warning("[GovernedLoop] Oracle incremental update failed: %s", exc)
 
     async def _handle_event_files(self, seen: Set[str]) -> None:
         """Process new JSON files in event_dir. Extracted for testability."""

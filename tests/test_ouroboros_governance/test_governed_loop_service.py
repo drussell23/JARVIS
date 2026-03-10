@@ -464,3 +464,83 @@ class TestOracleConfig:
         assert "oracle" in field_names
         defaults = {f.name: f.default for f in dataclasses.fields(GovernanceStack) if f.name == "oracle"}
         assert defaults["oracle"] is None
+
+
+class TestOracleIndexerLifecycle:
+    """Oracle indexer task starts non-blocking and failure never fails the service."""
+
+    async def test_oracle_indexer_failure_does_not_fail_service_start(self):
+        """If oracle.initialize() raises, service still becomes ACTIVE/DEGRADED."""
+        from unittest.mock import AsyncMock, patch
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopService, GovernedLoopConfig,
+        )
+        from pathlib import Path
+        config = GovernedLoopConfig(
+            project_root=Path("/tmp"),
+            oracle_enabled=True,
+            curriculum_enabled=False,
+        )
+        service = GovernedLoopService(config=config)
+        with (
+            patch.object(service, "_build_components", new=AsyncMock()),
+            patch.object(service, "_reconcile_on_boot", new=AsyncMock()),
+            patch.object(service, "_register_canary_slices"),
+            patch.object(service, "_attach_to_stack"),
+            patch.object(service, "_health_probe_loop", new=AsyncMock()),
+            patch(
+                "backend.core.ouroboros.governance.governed_loop_service.TheOracle",
+                side_effect=RuntimeError("oracle boom"),
+            ),
+        ):
+            service._generator = None
+            await service.start()
+            # Service must have started despite oracle failure
+            assert service._oracle_indexer_task is not None
+            # Wait briefly for the background task to run and fail
+            import asyncio
+            await asyncio.sleep(0.05)
+            # Task should have exited (done) after the exception
+            assert service._oracle_indexer_task.done()
+            # oracle must be None (not set)
+            assert service._oracle is None
+            await service.stop()
+
+    async def test_oracle_indexer_task_cancelled_on_stop(self):
+        """oracle_indexer_task is cancelled when service stops."""
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            GovernedLoopService, GovernedLoopConfig,
+        )
+        from pathlib import Path
+        import asyncio
+        config = GovernedLoopConfig(
+            project_root=Path("/tmp"),
+            oracle_enabled=True,
+            oracle_incremental_poll_interval_s=9999.0,  # never polls during test
+            curriculum_enabled=False,
+        )
+        service = GovernedLoopService(config=config)
+        mock_oracle = MagicMock()
+        mock_oracle.initialize = AsyncMock()
+        mock_oracle.incremental_update = AsyncMock()
+        mock_oracle.shutdown = AsyncMock()
+        mock_oracle.get_status = MagicMock(return_value={"running": True})
+        mock_oracle.get_metrics = MagicMock(return_value={"total_nodes": 42})
+        with (
+            patch.object(service, "_build_components", new=AsyncMock()),
+            patch.object(service, "_reconcile_on_boot", new=AsyncMock()),
+            patch.object(service, "_register_canary_slices"),
+            patch.object(service, "_attach_to_stack"),
+            patch.object(service, "_health_probe_loop", new=AsyncMock()),
+            patch(
+                "backend.core.ouroboros.governance.governed_loop_service.TheOracle",
+                return_value=mock_oracle,
+            ),
+        ):
+            service._generator = None
+            await service.start()
+            await asyncio.sleep(0.05)  # let oracle initialize
+            oracle_task = service._oracle_indexer_task
+            await service.stop()
+            assert oracle_task.done()
