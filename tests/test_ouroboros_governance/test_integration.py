@@ -1140,3 +1140,69 @@ class TestGovernedLoopServiceEndToEnd:
 
         await service.stop()
         assert service.state is ServiceState.INACTIVE
+
+
+# ---------------------------------------------------------------------------
+# TestBuildCommProtocolTransportWiring
+# ---------------------------------------------------------------------------
+
+
+class TestBuildCommProtocolTransportWiring:
+    """Tests for _build_comm_protocol() transport stack wiring."""
+
+    def test_voice_narrator_debounce_from_env(self, monkeypatch):
+        """OUROBOROS_VOICE_DEBOUNCE_S env var controls VoiceNarrator debounce."""
+        from unittest.mock import MagicMock, patch
+
+        monkeypatch.setenv("OUROBOROS_VOICE_DEBOUNCE_S", "5")
+        mock_voice_narrator_cls = MagicMock()
+        mock_safe_say = MagicMock()
+
+        with patch.dict("sys.modules", {
+            "backend.core.ouroboros.governance.comms.voice_narrator": MagicMock(
+                VoiceNarrator=mock_voice_narrator_cls
+            ),
+            "backend.core.supervisor.unified_voice_orchestrator": MagicMock(
+                safe_say=mock_safe_say
+            ),
+            "backend.core.ouroboros.governance.tui_transport": MagicMock(
+                TUITransport=MagicMock
+            ),
+            "backend.core.ouroboros.governance.comms.ops_logger": MagicMock(
+                OpsLogger=MagicMock
+            ),
+        }):
+            import importlib
+            import backend.core.ouroboros.governance.integration as _int_mod
+            importlib.reload(_int_mod)
+            _int_mod._build_comm_protocol()
+
+        mock_voice_narrator_cls.assert_called_once_with(
+            say_fn=mock_safe_say, debounce_s=5.0, source="ouroboros"
+        )
+
+    def test_log_transport_always_first(self, monkeypatch):
+        """LogTransport is always the first transport regardless of others."""
+        from unittest.mock import MagicMock, patch
+        from backend.core.ouroboros.governance.comm_protocol import LogTransport
+
+        with patch.dict("sys.modules", {
+            "backend.core.ouroboros.governance.tui_transport": MagicMock(
+                TUITransport=MagicMock
+            ),
+            "backend.core.ouroboros.governance.comms.ops_logger": MagicMock(
+                OpsLogger=MagicMock
+            ),
+            "backend.core.ouroboros.governance.comms.voice_narrator": MagicMock(
+                VoiceNarrator=MagicMock
+            ),
+            "backend.core.supervisor.unified_voice_orchestrator": MagicMock(
+                safe_say=MagicMock()
+            ),
+        }):
+            import importlib
+            import backend.core.ouroboros.governance.integration as _int_mod
+            importlib.reload(_int_mod)
+            protocol = _int_mod._build_comm_protocol()
+
+        assert isinstance(protocol._transports[0], LogTransport)

@@ -249,7 +249,7 @@ def _build_comm_protocol(
         logger.warning("[Integration] TUITransport skipped: module not available")
     else:
         transports.append(TUITransport())
-        logger.debug("[Integration] TUITransport added to CommProtocol")
+        logger.info("[Integration] TUITransport added to CommProtocol")
 
     # VoiceNarrator — requires safe_say; skip gracefully if unavailable
     try:
@@ -258,8 +258,9 @@ def _build_comm_protocol(
     except ImportError as exc:
         logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
     else:
-        transports.append(VoiceNarrator(say_fn=safe_say, debounce_s=60.0, source="ouroboros"))
-        logger.debug("[Integration] VoiceNarrator added to CommProtocol")
+        _debounce = float(os.environ.get("OUROBOROS_VOICE_DEBOUNCE_S", "60.0"))
+        transports.append(VoiceNarrator(say_fn=safe_say, debounce_s=_debounce, source="ouroboros"))
+        logger.info("[Integration] VoiceNarrator added to CommProtocol")
 
     # OpsLogger — always add; uses env var JARVIS_OPS_LOG_DIR or default
     try:
@@ -268,12 +269,16 @@ def _build_comm_protocol(
         logger.warning("[Integration] OpsLogger skipped: module not available")
     else:
         transports.append(OpsLogger())
-        logger.debug("[Integration] OpsLogger added to CommProtocol")
+        logger.info("[Integration] OpsLogger added to CommProtocol")
 
     # Extra transports (for testing / future extension)
     if extra_transports:
         transports.extend(extra_transports)
 
+    logger.info(
+        "[Integration] CommProtocol transport stack: %s",
+        [type(t).__name__ for t in transports],
+    )
     return CommProtocol(transports=transports)
 
 
