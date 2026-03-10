@@ -1073,7 +1073,6 @@ class TestCooldownSymlinkResolution:
     async def test_cooldown_counts_symlink_and_target_together(self, tmp_path):
         """Touches via symlink and real path are counted against the same counter."""
         import os
-        from pathlib import Path
         from datetime import datetime, timezone, timedelta
         from backend.core.ouroboros.governance.op_context import (
             OperationContext,

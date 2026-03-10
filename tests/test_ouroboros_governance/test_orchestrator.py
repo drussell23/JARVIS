@@ -972,7 +972,7 @@ class TestOracleUpdateLock:
 
     async def test_oracle_update_lock_exists(self):
         """GovernedOrchestrator.__init__ creates _oracle_update_lock."""
-        from unittest.mock import MagicMock, AsyncMock
+        from unittest.mock import MagicMock
         from backend.core.ouroboros.governance.orchestrator import (
             GovernedOrchestrator,
             OrchestratorConfig,
@@ -989,7 +989,7 @@ class TestOracleUpdateLock:
 
     async def test_oracle_updates_serialized(self):
         """Concurrent _oracle_incremental_update calls are serialized (not concurrent)."""
-        from unittest.mock import MagicMock, AsyncMock
+        from unittest.mock import MagicMock
         from backend.core.ouroboros.governance.orchestrator import (
             GovernedOrchestrator,
             OrchestratorConfig,
@@ -1002,7 +1002,7 @@ class TestOracleUpdateLock:
         orch = GovernedOrchestrator(stack=stack, generator=None, approval_provider=None, config=config)
 
         call_order = []
-        async def mock_incremental_update(files):
+        async def mock_incremental_update(_):
             call_order.append("start")
             await asyncio.sleep(0)  # yield control
             call_order.append("end")
