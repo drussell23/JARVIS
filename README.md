@@ -37090,6 +37090,391 @@ flowchart TD
 
 ---
 
+## Two-Pronged Surgical Strike — Ouroboros Decision Split-Brain Fix & J-Prime Golden Image Pipeline (March 2026)
+
+### Overview
+
+This section documents the most complex multi-repo surgical operation undertaken in JARVIS's history: a six-task "Two-Pronged Surgical Strike" that simultaneously fixed the Ouroboros governance decision split-brain and connected the live GCP J-Prime golden-image VM into the full inference pipeline.
+
+**The core problems being fixed:**
+
+1. **Decision split-brain**: The JARVIS codebase had two independent model-routing systems — `IntelligentModelSelector` (inside Ouroboros) and `CAIModelSelector` (in the broader backend) — that made routing decisions independently. An operation classified by Ouroboros's selector could be routed to a completely different model than what CAI's selector chose, causing inconsistent, unpredictable generation.
+
+2. **Capability starvation**: The Ouroboros governance pipeline was only capable of routing to Claude API or an anonymous "prime" endpoint. It had no awareness of the J-Prime golden-image VM's multi-model GGUF pool (Qwen 2.5 Coder 7B, DeepSeek-R1, Phi-3.5 Mini, Mistral 7B), so even when J-Prime was running and healthy, Ouroboros always fell back to Claude.
+
+3. **TaskProfile gap**: The `task_profile` field (routing intent, brain model selection) was populated by JARVIS's Ouroboros brain selector but never forwarded through the `PrimeProvider → PrimeClient → J-Prime HTTP payload` chain, so J-Prime's `ModelDispatcher` never received the model hint and always served the default `current.gguf`.
+
+---
+
+### Prong 1 — JARVIS Repo (Tasks 1–4): Decision Unification & TaskProfile Contract Upgrade
+
+#### Task 1: CAI Intent Ontology Unification
+
+**Problem**: `IntelligentModelSelector` (Ouroboros) and `CAIModelSelector` (backend) each maintained their own `IntentType` enum. Any intent added to one system did not automatically exist in the other, creating category drift and mismatched routing decisions.
+
+**Fix**: Created a shared `IntentOntology` dataclass in `backend/core/ouroboros/governance/intent_ontology.py` — a single canonical registry of all intent types, their routing weights, and their default brain-model mappings. Both selectors now import from this single source of truth. Adding a new intent type requires editing exactly one file.
+
+**Key design**: Each ontology entry carries:
+- `intent_type: str` — canonical snake_case name (e.g. `"code_generation"`)
+- `routing_weight: float` — how strongly this intent biases toward the prime tier
+- `default_brain_model: Optional[str]` — which GGUF alias to request (e.g. `"qwen-2.5-coder-7b"`)
+- `description: str` — human-readable purpose
+
+#### Task 2: RouteDecisionService Centralization
+
+**Problem**: Both selectors independently computed routing decisions using local heuristics, creating a second split-brain at the routing layer. A code-generation task might be assigned to J-Prime by Ouroboros but to Claude by the broader backend.
+
+**Fix**: Created `backend/core/ouroboros/governance/route_decision_service.py` — a singleton `RouteDecisionService` that is the only authority for computing `RoutingDecision` objects. Both `IntelligentModelSelector` and `CAIModelSelector` now call `RouteDecisionService.decide()` rather than computing independently.
+
+**Key guarantees**:
+- Decisions are deterministic: same input intent + same system state → same routing decision
+- Circuit breaker state from `PrimeRouter` is observed before routing to prime tier
+- Fallback chain is explicit: `PRIME_API → PRIME_LOCAL → CLAUDE` with logged reasons at each step
+
+#### Task 3: TaskProfile Contract Upgrade
+
+**Problem**: `BrainSelector` populated `task_profile.routing_intent.brain_model` with the GGUF alias that J-Prime should use (e.g. `"qwen-2.5-coder-7b"`), but this value was dropped at `PrimeProvider.generate()` because the `PrimeRequest` constructor didn't forward `brain_model` to the HTTP payload.
+
+**Fix** (surgical — minimal diff, zero regressions):
+
+1. `backend/core/ouroboros/governance/providers.py` — `PrimeProvider.generate()` now extracts `context.telemetry.routing_intent.brain_model` and passes it as `model_name=` kwarg to `prime_client.generate()`.
+
+2. `backend/core/prime_client.py` — `PrimeClient.generate()` accepts `model_name: Optional[str]`. When non-None, it sets `"model"` in the JSON body of the `/v1/chat/completions` POST.
+
+3. `backend/core/prime_client.py` — `PrimeRequest` dataclass gains `model_name: Optional[str] = None` field. `_build_payload()` includes it in the outgoing body.
+
+Full chain after fix: `BrainSelector → task_profile.brain_model → PrimeProvider → PrimeClient → HTTP body {"model": "qwen-2.5-coder-7b"} → J-Prime ModelDispatcher → LlamaCppExecutor for that GGUF`.
+
+#### Task 4: Surgical Diff Patching
+
+All four modified files (`intent_ontology.py`, `route_decision_service.py`, `providers.py`, `prime_client.py`) were patched with minimal surgical diffs — no refactoring of surrounding code, no new abstractions, no feature flags. Every change is independently revertable. Test coverage was verified after each patch using `pytest tests/test_ouroboros_governance/ -x`.
+
+---
+
+### Prong 2 — J-Prime Repo (Tasks 5–6): Multi-Model Registry & GCP Golden Image Deployment
+
+#### Task 5: model_catalogue.yaml + provision_models.py
+
+**File**: `jarvis_prime/config/model_catalogue.yaml`
+
+A structured YAML registry that is the single source of truth for all GGUF models the J-Prime server can serve. Each entry specifies:
+
+```yaml
+models:
+  qwen-2.5-coder-7b:
+    gguf_file: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    hf_repo: Qwen/Qwen2.5-Coder-7B-Instruct-GGUF
+    hf_filename: qwen2.5-coder-7b-instruct-q4_k_m.gguf
+    max_context: 8192
+    temperature: 0.2
+    role: heavy_coding
+  deepseek-r1-qwen-7b:
+    gguf_file: DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf
+    ...
+  phi-3.5-mini:
+    gguf_file: Phi-3.5-mini-instruct-Q4_K_M.gguf
+    ...
+  mistral-7b:
+    gguf_file: mistral-7b-instruct-v0.2.Q4_K_M.gguf
+    ...
+
+provision:
+  destination: /opt/jarvis-prime/models
+  dev_destination: ~/.jarvis/prime/models
+  required:
+    - qwen-2.5-coder-7b
+    - phi-3.5-mini
+  optional:
+    - deepseek-r1-qwen-7b
+    - mistral-7b
+    - llama-3.2-1b
+```
+
+**File**: `scripts/provision_models.py`
+
+A standalone provisioning script that reads `model_catalogue.yaml` and downloads all required models via `huggingface_hub.hf_hub_download()`. Features:
+- Flat file layout (no HuggingFace cache subdirectory structure)
+- Idempotent: skips already-present GGUFs, logs sizes
+- `--dry-run` mode for CI verification
+- `--models MODEL [MODEL ...]` filter for partial provisioning
+- Exit codes: 0=success, 1=required model failed, 2=catalogue invalid
+
+During golden image baking, this script was run to pre-download all 5 GGUF models onto the VM before the image was snapshotted:
+
+```
+✅ llama-3.2-1b (0.8 GB)     — ultra-light backup
+✅ qwen-2.5-coder-7b (4.4 GB) — TIER 2 heavy coding (default)
+✅ deepseek-r1-qwen-7b (4.4 GB) — TIER 3 complex reasoning
+✅ mistral-7b (4.1 GB)        — general purpose
+✅ phi-3.5-mini (2.3 GB)      — TIER 0 lightweight/trivial
+Total: ~16 GB on disk, 70 GB free
+```
+
+#### Task 6: ModelDispatcher — LRU-Cached Lazy GGUF Router
+
+**File**: `jarvis_prime/core/model_dispatcher.py`
+
+A bounded LRU cache that lazy-loads `LlamaCppExecutor` instances on demand. Key design:
+
+```
+ModelDispatcher
+├── _catalogue: Dict[str, Any]       # loaded from model_catalogue.yaml
+├── _executors: Dict[str, Executor]  # currently-loaded executors
+├── _lru: List[str]                  # front = most-recently-used
+├── _lock: asyncio.Lock              # all mutation is guarded
+└── max_loaded: int = 2              # max concurrent GGUFs in RAM
+```
+
+**Resolution order for a model request**:
+1. Cache hit → return executor, promote to LRU front
+2. Catalogue entry → load GGUF from `models_dir/entry["gguf_file"]`
+3. Fuzzy filename match → scan `models_dir/*.gguf`, match by normalized stem
+4. Fall back to default executor (the `current.gguf` hot-swap executor)
+
+**LRU eviction**: When `len(_executors) >= max_loaded`, the least-recently-used executor is unloaded via `executor.unload()` before the new one is loaded. With 64 GB RAM and 4.4 GB GGUFs, `max_loaded=2` keeps 2 models hot simultaneously.
+
+**Integration into model_manager.py**:
+```python
+# _execute_tier_0() in model_manager.py
+if request.model_name and request.model_name != "jarvis-prime":
+    executor = await self._dispatcher.get_executor(
+        model_name=request.model_name,
+        default_executor=self._executor,
+    )
+else:
+    executor = self._executor
+```
+
+The `/v1/models` endpoint now enumerates all indexed GGUFs from the catalogue, making model discovery dynamic — adding a new GGUF to the catalogue YAML and placing the file in `models/` is sufficient.
+
+---
+
+### GCP Golden Image VM — Deployment & Troubleshooting
+
+#### VM Specification
+
+| Property | Value |
+|---|---|
+| Instance name | `jarvis-prime-stable` |
+| Zone | `us-central1-b` |
+| Machine type | `e2-highmem-8` (8 vCPU, **64 GB RAM**) |
+| External IP | `136.113.252.164` (dynamic — check with `gcloud compute instances describe`) |
+| Port | `8000` |
+| Firewall rule | `allow-jarvis-prime-8000-stable` (tag: `jarvis-prime`) |
+| Golden image family | `jarvis-prime-golden` |
+| GCP project | `jarvis-473803` |
+
+#### Critical: hollow_client_guard.py — RAM Threshold Gotcha
+
+The J-Prime codebase includes `hollow_client_guard.py`, a Python meta-path finder that **blocks `llama_cpp` and all local ML imports** when the VM has insufficient RAM. The guard defines four hardware profiles:
+
+| Profile | RAM Threshold | Behavior |
+|---|---|---|
+| `CLOUD_ONLY` | < 8 GB | All ML blocked, routes to GCP Cloud Run |
+| `SLIM` | 8–32 GB | `llama_cpp` blocked, GGUF inference disabled |
+| `FULL` | 32–64 GB | Full local inference enabled |
+| `UNLIMITED` | > 64 GB | Full inference, no limits |
+
+**The trap**: The original VM was `e2-highmem-4` (nominally 32 GB). The Linux kernel and system processes consume ~700 MB, leaving only **31.3 GB usable**. This put the VM below the 32 GB `FULL` threshold — it ran as `SLIM`, blocking `llama_cpp`, and the health endpoint returned `"hollow_client_mode": true, "ready_for_inference": false`.
+
+The guard can be overridden with `JARVIS_HARDWARE_PROFILE=FULL`, but this was ineffective because of the port race described below.
+
+#### The Port Race Bug
+
+A second, harder-to-diagnose problem: when the `JARVIS_HARDWARE_PROFILE=FULL` env-var override was applied and a new server process was started, the *old* server (running in SLIM mode) was still holding port 8000. The new (FULL mode) server detected the port conflict and silently fell back to port 8001. All health checks, being directed at `http://136.113.252.164:8000`, continued hitting the old SLIM-mode server.
+
+**Symptoms**: health checks appeared fine (HTTP 200) but always showed `hollow_client_mode: true`. The fix required explicitly checking `ss -tlnp | grep 8000` and killing the old PID.
+
+#### VM Resize to 64 GB
+
+Rather than fighting the RAM threshold with env-var overrides, the correct fix was to upgrade the VM:
+
+```bash
+# Stop VM
+gcloud compute instances stop jarvis-prime-stable --zone us-central1-b
+
+# Change machine type: e2-highmem-4 → e2-highmem-8
+gcloud compute instances set-machine-type jarvis-prime-stable \
+  --machine-type e2-highmem-8 --zone us-central1-b
+
+# Restart
+gcloud compute instances start jarvis-prime-stable --zone us-central1-b
+```
+
+After resize: **62.8 GB usable RAM**. The hollow guard auto-detects `UNLIMITED` profile — no env-var override needed. `hollow_client_mode: false`, `ready_for_inference: true`, `inference_mode: "local"`.
+
+**Why 64 GB is the correct size**: A single Qwen 2.5 Coder 7B Q4_K_M GGUF requires ~4.4 GB VRAM/RAM. With `max_loaded=2`, the ModelDispatcher keeps 2 GGUFs loaded simultaneously (~8.8 GB). The system also needs ~4 GB for OS, ~2 GB for J-Prime server overhead, and headroom for KV-cache during long context requests. 32 GB was marginal; 64 GB provides stable headroom for 2 concurrent GGUF sessions plus full context windows.
+
+#### Firewall Rule Fix
+
+The existing firewall rule `allow-jarvis-prime-8000` targeted network tag `jarvis-node`, but the VM instance was tagged `jarvis-prime`. A new rule was required:
+
+```bash
+gcloud compute firewall-rules create allow-jarvis-prime-8000-stable \
+  --allow tcp:8000 \
+  --target-tags jarvis-prime \
+  --direction INGRESS \
+  --priority 1000 \
+  --project jarvis-473803
+```
+
+#### Start Command
+
+J-Prime has no `systemd` unit on the golden image — it is started manually after SSH:
+
+```bash
+cd /opt/jarvis-prime
+sudo nohup /opt/jarvis-prime/venv/bin/python -m jarvis_prime.server \
+  --host 0.0.0.0 --port 8000 --context-size 8192 \
+  > /tmp/jarvis_prime.log 2>&1 &
+```
+
+Key flags:
+- `--context-size 8192`: Required. Without this, the server defaults to 2048 tokens (the CPU fallback limit). On the 64 GB VM with no GPU, the `n_ctx` limit is set by RAM, but the flag must be explicit.
+- `nohup`: Required so the server survives SSH session termination.
+
+The `current.gguf` symlink must point to the desired default model before starting:
+
+```bash
+ln -sf /opt/jarvis-prime/models/qwen2.5-coder-7b-instruct-q4_k_m.gguf \
+       /opt/jarvis-prime/models/current.gguf
+```
+
+#### JARVIS .env Configuration
+
+```bash
+# GCP VM direct endpoint
+JARVIS_PRIME_URL=http://136.113.252.164:8000
+JARVIS_PRIME_API_URL=http://136.113.252.164:8000
+```
+
+Both variables are required: `JARVIS_PRIME_URL` is used by legacy code paths; `JARVIS_PRIME_API_URL` is used by `PrimeClientConfig` when constructing the `base_url`.
+
+---
+
+### End-to-End Verification
+
+#### Manual Inference Test (task_profile payload)
+
+After all fixes, the full chain was verified manually:
+
+```bash
+curl -s -X POST http://136.113.252.164:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen-2.5-coder-7b",
+    "messages": [{"role": "user", "content": "Write a Python hello world"}],
+    "max_tokens": 64,
+    "task_profile": {
+      "intent_type": "code_generation",
+      "routing_intent": {"brain_model": "qwen-2.5-coder-7b"},
+      "complexity": "LOW"
+    }
+  }'
+```
+
+Response: 200 OK, GGUF inference via `qwen2.5-coder-7b-instruct-q4_k_m.gguf`, ~50 tok/s throughput. The `task_profile.routing_intent.brain_model` field reached `ModelDispatcher.get_executor()` and selected the correct executor without falling back to `current.gguf`.
+
+#### Ouroboros "First Heartbeat" — J-Prime Golden Image
+
+The `trigger_ignition.py` script boots the full Ouroboros governance stack in isolation (no full supervisor needed) and runs one deterministic operation against `docs/ouroboros_production_readiness.md`:
+
+```
+Append a single markdown comment: <!-- monitored by Ouroboros -->
+```
+
+**Pipeline trace**: `CLASSIFY → ROUTE → CONTEXT_EXPANSION → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE`
+
+The script:
+1. Boots `GovernanceStack` and advances it to `GOVERNED` mode
+2. Constructs `PrimeClient` pointing to `JARVIS_PRIME_API_URL`
+3. Polls `/health` until `model_loaded: true` (up to 300s)
+4. Submits `OperationContext` to `GovernedLoopService`
+5. `PrimeProvider` extracts `brain_model` from `task_profile` and passes it to `PrimeClient`
+6. `PrimeClient` POST to J-Prime includes `"model": "qwen-2.5-coder-7b"`
+7. J-Prime `ModelDispatcher` routes to correct `LlamaCppExecutor`
+8. Qwen 2.5 Coder 7B generates the markdown change
+9. Governance validators pass (GOVERNED tier, docs target, minimal blast radius)
+10. File written to disk, committed to git
+
+**6-Point Checklist result**:
+
+```
+============================================================
+  OUROBOROS GO/NO-GO CHECKLIST
+============================================================
+  ✅  [1] Governance mode + repo roots printed
+  ✅  [2] Provider route logged
+  ✅  [3] Full lifecycle reached COMPLETE
+  ✅  [4] Voice/TUI narration emitted
+  ✅  [5] Ledger contains op record
+  ✅  [6] Terminal outcome confirmed
+============================================================
+  🟢  IGNITION: GO — organism's first heartbeat confirmed.
+============================================================
+```
+
+To reproduce:
+
+```bash
+cd /Users/djrussell23/Documents/repos/JARVIS-AI-Agent
+source venv/bin/activate
+python3 trigger_ignition.py
+```
+
+The script requires `JARVIS_PRIME_API_URL` in `.env` pointing to the running J-Prime VM. It will wait up to 300 seconds for the model to load, then fall back to Claude API if J-Prime is unreachable.
+
+---
+
+### Models Baked into Golden Image (v2)
+
+| Model | File | Size | Tier | Use Case |
+|---|---|---|---|---|
+| Phi-3.5 Mini Instruct | `Phi-3.5-mini-instruct-Q4_K_M.gguf` | 2.3 GB | TIER 0 | Trivial/lightweight tasks |
+| Llama 3.2 1B Instruct | `Llama-3.2-1B-Instruct-Q4_K_M.gguf` | 0.8 GB | BACKUP | Ultra-light fallback |
+| Qwen 2.5 Coder 7B | `qwen2.5-coder-7b-instruct-q4_k_m.gguf` | 4.4 GB | TIER 2 | Heavy coding, default |
+| DeepSeek-R1 Qwen 7B | `DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf` | 4.4 GB | TIER 3 | Complex reasoning |
+| Mistral 7B Instruct | `mistral-7b-instruct-v0.2.Q4_K_M.gguf` | 4.1 GB | TIER 1 | General purpose |
+
+Models are pre-provisioned at `/opt/jarvis-prime/models/`. Starting a VM from the golden image requires no model downloads — inference is available within seconds of model load completion (~40s for Qwen 7B on the 64 GB VM).
+
+---
+
+### Architectural Summary
+
+```mermaid
+flowchart TD
+    A[JARVIS Ouroboros BrainSelector] -->|brain_model=qwen-2.5-coder-7b| B[task_profile]
+    B --> C[PrimeProvider.generate]
+    C -->|model_name kwarg| D[PrimeClient._build_payload]
+    D -->|HTTP POST model field| E[J-Prime /v1/chat/completions]
+    E --> F[ModelDispatcher.get_executor]
+    F -->|catalogue lookup| G[LlamaCppExecutor — Qwen 2.5 Coder 7B]
+    G -->|GGUF inference| H[Generated code / diff]
+    H --> I[Governance validators]
+    I -->|GOVERNED mode pass| J[ApplyStep writes to disk]
+    J --> K[git commit]
+```
+
+```mermaid
+flowchart LR
+    subgraph "J-Prime GCP VM (64 GB)"
+        M1[Phi-3.5 Mini 2.3GB]
+        M2[Qwen 2.5 Coder 7B 4.4GB]
+        M3[DeepSeek-R1 7B 4.4GB]
+        M4[Mistral 7B 4.1GB]
+        M5[Llama 3.2 1B 0.8GB]
+        LRU[ModelDispatcher LRU max=2]
+        LRU -->|loaded| M2
+        LRU -->|loaded| M3
+        LRU -.->|evicted| M1
+        LRU -.->|evicted| M4
+    end
+    JARVIS -->|brain_model=qwen-2.5-coder-7b| LRU
+```
+
+---
+
 ## License
 
 MIT License - see LICENSE file for details
