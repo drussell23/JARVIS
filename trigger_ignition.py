@@ -155,6 +155,11 @@ async def ignite() -> None:
 
     stack = await create_governance_stack(gov_config)
     await stack.start()
+    # Advance controller from SANDBOX → GOVERNED (initial_mode in config is the target,
+    # but start() always enters SANDBOX; gates must be marked then governed mode enabled)
+    await stack.controller.mark_gates_passed()
+    await stack.controller.enable_governed_autonomy()
+    log.info("  controller mode: %s", stack.controller.mode.value)
     log.info("  stack health: %s", stack.health())
 
     # ------------------------------------------------------------------ #
@@ -187,7 +192,7 @@ async def ignite() -> None:
     try:
         repo_reg = getattr(gls, "_repo_registry", None)
         repo_roots = (
-            {r.name: str(r.path) for r in repo_reg.list_enabled()}
+            {r.name: str(r.local_path) for r in repo_reg.list_enabled()}
             if repo_reg is not None else {}
         )
         log.info("  *** OUROBOROS IGNITION *** mode=%s repos=%s",
