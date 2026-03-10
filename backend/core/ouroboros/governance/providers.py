@@ -1021,6 +1021,7 @@ class ClaudeProvider:
         messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt_text}]
         accumulated_chars = len(prompt_text)
         tool_rounds = 0
+        total_cost = 0.0
         start = time.monotonic()
 
         while True:
@@ -1040,6 +1041,9 @@ class ClaudeProvider:
             output_tokens = getattr(msg.usage, "output_tokens", 0)
             cost = self._estimate_cost(input_tokens, output_tokens)
             self._record_cost(cost)
+            total_cost += cost
+            if total_cost >= self._max_cost_per_op:
+                raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
 
             # Attempt tool call parse when tools are enabled
             if self._tools_enabled:
@@ -1061,6 +1065,8 @@ class ClaudeProvider:
                     # Append assistant + user turns for multi-turn conversation
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({"role": "user", "content": result_text})
+                    # Multi-turn: track delta as assistant response + user follow-up (no
+                    # full-string re-measurement — messages array grows, not a flat string).
                     accumulated_chars += len(raw) + len(result_text)
                     if accumulated_chars > MAX_TOOL_LOOP_CHARS:
                         raise RuntimeError(
@@ -1093,7 +1099,7 @@ class ClaudeProvider:
 
             logger.info(
                 "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f",
-                len(result.candidates), duration, tool_rounds, cost,
+                len(result.candidates), duration, tool_rounds, total_cost,
             )
             return result
 

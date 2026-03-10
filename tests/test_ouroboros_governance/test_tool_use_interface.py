@@ -318,6 +318,7 @@ class TestClaudeProviderToolLoop:
         client = MagicMock()
         client.messages = MagicMock()
         client.messages.create = _create
+        client._call_count = call_count
         return client
 
     async def test_tool_loop_disabled_by_default(self, tmp_path: Path) -> None:
@@ -352,3 +353,24 @@ class TestClaudeProviderToolLoop:
         deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
         with pytest.raises(RuntimeError, match="tool_loop_max_iterations"):
             await provider.generate(ctx, deadline)
+        # guard fires on iteration MAX_TOOL_ITERATIONS (0-indexed), after the client
+        # is called but before any tool execution — total API calls == MAX + 1
+        assert provider._client._call_count[0] == MAX_TOOL_ITERATIONS + 1
+
+    async def test_tool_loop_budget_exceeded(self, tmp_path: Path) -> None:
+        """When accumulated prompt exceeds MAX_TOOL_LOOP_CHARS, raise RuntimeError."""
+        from backend.core.ouroboros.governance.providers import ClaudeProvider
+        responses = [
+            _prime_response("2b.2-tool", tool_call={"name": "search_code", "arguments": {"pattern": "foo"}}),
+        ]
+        provider = ClaudeProvider(api_key="test-key", repo_root=tmp_path, tools_enabled=True)
+        provider._client = self._mock_claude_client(responses)
+        from backend.core.ouroboros.governance.tool_executor import ToolExecutor, ToolResult, ToolCall as TC
+        with patch.object(ToolExecutor, "execute", return_value=ToolResult(
+            tool_call=TC(name="search_code", arguments={"pattern": "foo"}),
+            output="x" * 40_000,
+        )):
+            ctx = _make_ctx("op-claude-budget")
+            deadline = datetime(2026, 3, 9, 12, 30, 0, tzinfo=timezone.utc)
+            with pytest.raises(RuntimeError, match="tool_loop_budget_exceeded"):
+                await provider.generate(ctx, deadline)
