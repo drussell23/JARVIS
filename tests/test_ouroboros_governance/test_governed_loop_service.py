@@ -962,7 +962,6 @@ class TestFrozenTierStamping:
 
     async def test_observe_tier_stamped_for_core_file(self, tmp_path):
         """Files under backend/core/ get frozen_autonomy_tier='observe'."""
-        from pathlib import Path
         from unittest.mock import MagicMock
         from backend.core.ouroboros.governance.governed_loop_service import (
             GovernedLoopConfig,
@@ -1001,7 +1000,6 @@ class TestFrozenTierStamping:
 
     async def test_governed_tier_stamped_for_tests_file(self, tmp_path):
         """Files under tests/ get frozen_autonomy_tier='governed'."""
-        from pathlib import Path
         from unittest.mock import MagicMock
         from backend.core.ouroboros.governance.governed_loop_service import (
             GovernedLoopConfig,

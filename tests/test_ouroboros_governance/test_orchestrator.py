@@ -928,7 +928,7 @@ class TestObserveTierGateCheck:
             target_files=("backend/core/some_module.py",),
         ).with_frozen_autonomy_tier("observe")
 
-        orch, stack = self._make_orchestrator()
+        orch, _ = self._make_orchestrator()
 
         # No approval provider → APPROVAL_REQUIRED path cancels
         result = await orch.run(ctx)
@@ -952,7 +952,7 @@ class TestObserveTierGateCheck:
             target_files=("tests/test_foo.py",),
         ).with_frozen_autonomy_tier("governed")
 
-        orch, stack = self._make_orchestrator()
+        orch, _ = self._make_orchestrator()
 
         result = await orch.run(ctx)
 
