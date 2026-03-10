@@ -1634,6 +1634,145 @@ class TheOracle:
 
         return result
 
+    def get_file_neighborhood(
+        self,
+        file_paths: List[Path],
+    ) -> "FileNeighborhood":
+        """Return the depth-1 structural neighborhood for a set of files.
+
+        Traverses the codebase graph and classifies edges into semantic
+        categories: imports, importers, callers, callees, inheritors,
+        base_classes, test_counterparts.
+
+        All returned paths are formatted as ``"{repo}:{relative_path}"``.
+
+        This method is **synchronous** — it performs only in-memory graph
+        traversal with no I/O.  It is safe to call from any context.
+
+        Returns an empty ``FileNeighborhood`` if the oracle is not running
+        or the graph is not yet indexed.
+        """
+        empty = FileNeighborhood(
+            target_files=[],
+            imports=[],
+            importers=[],
+            callers=[],
+            callees=[],
+            inheritors=[],
+            base_classes=[],
+            test_counterparts=[],
+        )
+
+        if not getattr(self, "_running", False):
+            return empty
+
+        # ── Resolve each abs_path to (repo_name, relative_path) ──────────
+        resolved: List[tuple] = []  # (repo_name, relative_path_str, "repo:rel" key)
+        for abs_path in file_paths:
+            try:
+                abs_path = Path(abs_path).resolve()
+            except Exception:
+                continue
+            for repo_name, repo_root in self._repos.items():
+                try:
+                    rel = abs_path.relative_to(repo_root)
+                    rel_str = str(rel)
+                    resolved.append((repo_name, rel_str, f"{repo_name}:{rel_str}"))
+                    break
+                except ValueError:
+                    continue
+
+        if not resolved:
+            return empty
+
+        target_keys = {key for _, _, key in resolved}
+
+        # ── Collect edge-classified neighbors ─────────────────────────────
+        imports_set: set = set()
+        importers_set: set = set()
+        callers_set: set = set()
+        callees_set: set = set()
+        inheritors_set: set = set()
+        base_classes_set: set = set()
+
+        _import_edges = {"imports", "imports_from"}
+        _call_edges = {"calls"}
+        _inherit_edges = {"inherits"}
+
+        for repo_name, rel_path, _ in resolved:
+            try:
+                nodes = self._graph.find_nodes_in_file(rel_path)
+            except Exception:
+                nodes = []
+
+            for node in nodes:
+                # Outgoing edges: imports→imports, calls→callees, inherits→base_classes
+                try:
+                    for target_key, edge_data in self._graph.get_edges_from(node):
+                        edge_type = edge_data.get("edge_type", "")
+                        target_node = self._graph._node_index.get(target_key)
+                        if target_node is None:
+                            continue
+                        path_key = f"{target_node.repo}:{target_node.file_path}"
+                        if path_key in target_keys:
+                            continue
+                        if edge_type in _import_edges:
+                            imports_set.add(path_key)
+                        elif edge_type in _call_edges:
+                            callees_set.add(path_key)
+                        elif edge_type in _inherit_edges:
+                            base_classes_set.add(path_key)
+                except Exception:
+                    pass
+
+                # Incoming edges: imports→importers, calls→callers, inherits→inheritors
+                try:
+                    for source_key, edge_data in self._graph.get_edges_to(node):
+                        edge_type = edge_data.get("edge_type", "")
+                        source_node = self._graph._node_index.get(source_key)
+                        if source_node is None:
+                            continue
+                        path_key = f"{source_node.repo}:{source_node.file_path}"
+                        if path_key in target_keys:
+                            continue
+                        if edge_type in _import_edges:
+                            importers_set.add(path_key)
+                        elif edge_type in _call_edges:
+                            callers_set.add(path_key)
+                        elif edge_type in _inherit_edges:
+                            inheritors_set.add(path_key)
+                except Exception:
+                    pass
+
+        # ── Test counterpart detection (basename heuristic) ───────────────
+        test_counterparts: List[str] = []
+        try:
+            for repo_name, rel_path, _ in resolved:
+                basename = Path(rel_path).name          # e.g. "foo.py"
+                test_name = f"test_{basename}"          # e.g. "test_foo.py"
+                for file_index_key in self._graph._file_index.keys():
+                    if Path(file_index_key).name == test_name:
+                        candidate_key = f"{repo_name}:{file_index_key}"
+                        if candidate_key not in target_keys:
+                            test_counterparts.append(candidate_key)
+        except Exception:
+            pass
+
+        # ── Determine local_repo for rendering ────────────────────────────
+        local_repo = resolved[0][0] if resolved else "jarvis"
+
+        return FileNeighborhood(
+            target_files=sorted(target_keys),
+            imports=sorted(imports_set),
+            importers=sorted(importers_set),
+            callers=sorted(callers_set),
+            callees=sorted(callees_set),
+            inheritors=sorted(inheritors_set),
+            base_classes=sorted(base_classes_set),
+            test_counterparts=sorted(set(test_counterparts)),
+            local_repo=local_repo,
+        )
+
     async def get_relevant_files_for_query(
         self,
         query: str,
