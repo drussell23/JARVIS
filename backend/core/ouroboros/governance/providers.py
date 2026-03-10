@@ -63,8 +63,6 @@ _CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "ratio
 
 # ── Tool-use interface ────────────────────────────────────────────────
 _TOOL_SCHEMA_VERSION = "2b.2-tool"
-_TOOL_SCHEMA_KEYS    = frozenset({"schema_version", "tool_call"})  # reserved for strict validation
-_TOOL_CALL_KEYS      = frozenset({"name", "arguments"})             # reserved for strict validation
 MAX_TOOL_ITERATIONS  = 5
 MAX_TOOL_LOOP_CHARS  = 32_000   # hard accumulated-prompt budget
 

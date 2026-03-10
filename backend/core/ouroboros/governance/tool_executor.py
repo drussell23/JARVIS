@@ -106,6 +106,10 @@ class ToolExecutor:
 
         Raises BlockedPathError if the resolved path escapes repo_root or
         is a symbolic link.
+
+        Both relative and absolute paths are accepted; absolute paths are
+        validated against repo_root exactly like relative ones — the
+        ``relative_to`` containment check below will block anything outside.
         """
         raw = Path(path_str)
         if raw.is_absolute():
