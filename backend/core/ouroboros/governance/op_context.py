@@ -291,6 +291,53 @@ class RepoSagaStatus:
 
 
 # ---------------------------------------------------------------------------
+# Telemetry Types
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HostTelemetry:
+    """Snapshot of local hardware state at operation intake."""
+
+    schema_version: str           # "1.0"
+    arch: str                     # platform.machine() → "arm64"
+    cpu_percent: float            # quantized to 2dp
+    ram_available_gb: float       # quantized to 2dp
+    pressure: str                 # PressureLevel.name: "NORMAL"|"ELEVATED"|"CRITICAL"|"EMERGENCY"
+    sampled_at_utc: str           # datetime.now(utc).isoformat()
+    sampled_monotonic_ns: int     # time.monotonic_ns() at sample time
+    collector_status: str         # "ok" | "partial" | "stale"
+    sample_age_ms: int            # (now_ns - sampled_monotonic_ns) // 1_000_000
+
+
+@dataclass(frozen=True)
+class RoutingIntentTelemetry:
+    """Routing decision EXPECTED at FSM intake (before any execution)."""
+
+    expected_provider: str        # e.g. "GCP_PRIME_SPOT", "LOCAL_CLAUDE"
+    policy_reason: str            # e.g. "PRIMARY_AVAILABLE", "NORMAL"
+
+
+@dataclass(frozen=True)
+class RoutingActualTelemetry:
+    """Routing outcome AFTER execution (stamped at COMPLETE or POSTMORTEM)."""
+
+    provider_name: str
+    endpoint_class: str           # "gcp_spot" | "local" | "cloud_api"
+    fallback_chain: Tuple[str, ...]
+    was_degraded: bool
+
+
+@dataclass(frozen=True)
+class TelemetryContext:
+    """Root telemetry envelope stamped once at intake, updated once at completion."""
+
+    local_node: HostTelemetry
+    routing_intent: RoutingIntentTelemetry
+    routing_actual: Optional[RoutingActualTelemetry] = None
+
+
+# ---------------------------------------------------------------------------
 # Hash helper
 # ---------------------------------------------------------------------------
 

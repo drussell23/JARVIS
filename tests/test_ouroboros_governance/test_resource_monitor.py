@@ -137,3 +137,55 @@ class TestResourceMonitor:
         assert "ram_emergency" in PRESSURE_THRESHOLDS
         assert "cpu_critical" in PRESSURE_THRESHOLDS
         assert "latency_elevated_ms" in PRESSURE_THRESHOLDS
+
+
+# ---------------------------------------------------------------------------
+# ResourceSnapshot quantization + new fields (Task 1)
+# ---------------------------------------------------------------------------
+
+async def test_snapshot_quantizes_floats():
+    """All float fields in snapshot are rounded to 2 decimal places."""
+    monitor = ResourceMonitor()
+    snap = await monitor.snapshot(
+        ram_override=77.777,
+        cpu_override=12.345,
+        latency_override=3.999,
+    )
+    assert snap.ram_percent == round(77.777, 2)
+    assert snap.cpu_percent == round(12.345, 2)
+    assert snap.event_loop_latency_ms == round(3.999, 2)
+
+
+async def test_snapshot_has_monotonic_ns():
+    """sampled_monotonic_ns is a positive integer set by snapshot()."""
+    import time
+    monitor = ResourceMonitor()
+    before = time.monotonic_ns()
+    snap = await monitor.snapshot()
+    after = time.monotonic_ns()
+    assert isinstance(snap.sampled_monotonic_ns, int)
+    assert before <= snap.sampled_monotonic_ns <= after
+
+
+async def test_snapshot_ram_available_gb():
+    """ram_available_gb is a non-negative float quantized to 2dp."""
+    monitor = ResourceMonitor()
+    snap = await monitor.snapshot()
+    assert isinstance(snap.ram_available_gb, float)
+    assert snap.ram_available_gb >= 0.0
+    assert snap.ram_available_gb == round(snap.ram_available_gb, 2)
+
+
+async def test_snapshot_platform_arch():
+    """platform_arch is a non-empty string (e.g. 'arm64', 'x86_64')."""
+    monitor = ResourceMonitor()
+    snap = await monitor.snapshot()
+    assert isinstance(snap.platform_arch, str)
+    assert len(snap.platform_arch) > 0
+
+
+async def test_snapshot_collector_status():
+    """collector_status is 'ok' or 'partial' depending on psutil availability."""
+    monitor = ResourceMonitor()
+    snap = await monitor.snapshot()
+    assert snap.collector_status in ("ok", "partial")

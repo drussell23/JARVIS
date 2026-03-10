@@ -22,6 +22,7 @@ from __future__ import annotations
 import enum
 import logging
 import os
+import platform
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -72,6 +73,10 @@ class ResourceSnapshot:
     cpu_percent: float
     event_loop_latency_ms: float
     disk_io_busy: bool
+    sampled_monotonic_ns: int = 0          # set by snapshot(); enables age computation
+    ram_available_gb: float = 0.0          # psutil.virtual_memory().available / 1e9, quantized
+    platform_arch: str = ""                # platform.machine()
+    collector_status: str = "ok"           # "ok" if psutil fully available, "partial" otherwise
 
     @property
     def overall_pressure(self) -> PressureLevel:
@@ -129,17 +134,21 @@ class ResourceMonitor:
         latency_override: Optional[float] = None,
         io_override: Optional[bool] = None,
     ) -> ResourceSnapshot:
-        """Collect a resource snapshot."""
+        """Collect a resource snapshot with all floats quantized to 2dp."""
         ram = ram_override if ram_override is not None else self._get_ram_percent()
         cpu = cpu_override if cpu_override is not None else self._get_cpu_percent()
         latency = latency_override if latency_override is not None else await self._get_event_loop_latency()
         io_busy = io_override if io_override is not None else False
 
         snap = ResourceSnapshot(
-            ram_percent=ram,
-            cpu_percent=cpu,
-            event_loop_latency_ms=latency,
+            ram_percent=round(ram, 2),
+            cpu_percent=round(cpu, 2),
+            event_loop_latency_ms=round(latency, 2),
             disk_io_busy=io_busy,
+            sampled_monotonic_ns=time.monotonic_ns(),
+            ram_available_gb=round(self._get_ram_available_gb(), 2),
+            platform_arch=self._get_platform_arch(),
+            collector_status=self._get_collector_status(),
         )
         self._last_snapshot = snap
         self._last_snapshot_time = time.monotonic()
@@ -167,3 +176,23 @@ class ResourceMonitor:
         start = time.monotonic()
         await asyncio.sleep(0)
         return (time.monotonic() - start) * 1000
+
+    def _get_ram_available_gb(self) -> float:
+        """Get available RAM in gigabytes."""
+        try:
+            import psutil
+            return psutil.virtual_memory().available / 1e9
+        except ImportError:
+            return 0.0
+
+    def _get_platform_arch(self) -> str:
+        """Get CPU architecture string."""
+        return platform.machine()
+
+    def _get_collector_status(self) -> str:
+        """Return 'ok' if psutil is importable, 'partial' otherwise."""
+        try:
+            import psutil  # noqa: F401
+            return "ok"
+        except ImportError:
+            return "partial"

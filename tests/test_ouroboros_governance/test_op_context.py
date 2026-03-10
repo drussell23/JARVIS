@@ -599,3 +599,91 @@ class TestOperationContextBenchmarkFields:
         ctx2 = ctx.with_pre_apply_snapshots(snapshots)
         assert ctx2.context_hash != ctx.context_hash
         assert ctx2.previous_hash == ctx.context_hash
+
+
+# ---------------------------------------------------------------------------
+# Telemetry dataclasses (Task 1)
+# ---------------------------------------------------------------------------
+
+from backend.core.ouroboros.governance.op_context import (
+    HostTelemetry,
+    RoutingIntentTelemetry,
+    RoutingActualTelemetry,
+    TelemetryContext,
+)
+
+
+def _make_host_telemetry(**overrides) -> HostTelemetry:
+    import time
+    from datetime import datetime, timezone
+    defaults = dict(
+        schema_version="1.0",
+        arch="arm64",
+        cpu_percent=14.20,
+        ram_available_gb=6.80,
+        pressure="NORMAL",
+        sampled_at_utc=datetime.now(tz=timezone.utc).isoformat(),
+        sampled_monotonic_ns=time.monotonic_ns(),
+        collector_status="ok",
+        sample_age_ms=3,
+    )
+    return HostTelemetry(**{**defaults, **overrides})
+
+
+def test_host_telemetry_is_frozen():
+    ht = _make_host_telemetry()
+    with pytest.raises((TypeError, AttributeError)):
+        ht.cpu_percent = 99.0  # type: ignore[misc]
+
+
+def test_host_telemetry_stores_fields():
+    ht = _make_host_telemetry(cpu_percent=14.20, ram_available_gb=6.80)
+    assert ht.cpu_percent == 14.20
+    assert ht.ram_available_gb == 6.80
+    assert ht.schema_version == "1.0"
+    assert ht.pressure == "NORMAL"
+    assert ht.sample_age_ms == 3
+
+
+def test_routing_intent_telemetry_frozen():
+    ri = RoutingIntentTelemetry(expected_provider="GCP_PRIME_SPOT", policy_reason="NORMAL")
+    with pytest.raises((TypeError, AttributeError)):
+        ri.expected_provider = "LOCAL"  # type: ignore[misc]
+
+
+def test_routing_actual_telemetry_stores_fallback_chain():
+    ra = RoutingActualTelemetry(
+        provider_name="LOCAL_CLAUDE",
+        endpoint_class="local",
+        fallback_chain=("GCP_PRIME_SPOT", "LOCAL_CLAUDE"),
+        was_degraded=True,
+    )
+    assert ra.fallback_chain == ("GCP_PRIME_SPOT", "LOCAL_CLAUDE")
+    assert ra.was_degraded is True
+
+
+def test_telemetry_context_routing_actual_optional():
+    tc = TelemetryContext(
+        local_node=_make_host_telemetry(),
+        routing_intent=RoutingIntentTelemetry(
+            expected_provider="GCP_PRIME_SPOT", policy_reason="NORMAL"
+        ),
+    )
+    assert tc.routing_actual is None
+
+
+def test_telemetry_context_with_routing_actual():
+    ra = RoutingActualTelemetry(
+        provider_name="GCP_PRIME_SPOT",
+        endpoint_class="gcp_spot",
+        fallback_chain=(),
+        was_degraded=False,
+    )
+    tc = TelemetryContext(
+        local_node=_make_host_telemetry(),
+        routing_intent=RoutingIntentTelemetry(
+            expected_provider="GCP_PRIME_SPOT", policy_reason="NORMAL"
+        ),
+        routing_actual=ra,
+    )
+    assert tc.routing_actual is ra
