@@ -885,8 +885,8 @@ class GovernedOrchestrator:
             str(ctx.target_files[0]) if ctx.target_files else "unknown.py",
         )
 
-        # Step 1: AST preflight — fast gate, no subprocess
-        syntax_error = self._ast_preflight(content)
+        # Step 1: AST preflight — fast gate, no subprocess (Python files only)
+        syntax_error = self._ast_preflight(content) if target_file_str.endswith(".py") else None
         if syntax_error:
             return ValidationResult(
                 passed=False,
