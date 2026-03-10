@@ -898,6 +898,19 @@ class GovernedOrchestrator:
                 adapter_names_run=(),
             )
 
+        # Non-code files (docs, configs, etc.) need no test/syntax runner
+        _RUNNABLE_EXTENSIONS = {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}
+        if Path(target_file_str).suffix not in _RUNNABLE_EXTENSIONS:
+            return ValidationResult(
+                passed=True,
+                best_candidate=candidate,
+                validation_duration_s=0.0,
+                error=None,
+                failure_class=None,
+                short_summary="validation skipped: non-code file",
+                adapter_names_run=(),
+            )
+
         # When no runner is configured, skip test execution (dry-run / test mode)
         if self._validation_runner is None:
             return ValidationResult(
