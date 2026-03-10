@@ -83,3 +83,59 @@ class TestOracleSemanticIndex:
         # distance 0.1 → similarity 0.9; distance 0.3 → similarity 0.7
         assert abs(results[0][1] - 0.9) < 0.01
         assert abs(results[1][1] - 0.7) < 0.01
+
+
+class TestOracleEmbeddingLifecycle:
+    """Tests that embedding is called during oracle indexing."""
+
+    def _make_oracle(self):
+        import asyncio
+        from backend.core.ouroboros.oracle import TheOracle
+        oracle = object.__new__(TheOracle)
+        oracle._running = False
+        oracle._lock = asyncio.Lock()
+        oracle._file_hashes = {}
+        oracle._graph = MagicMock()
+        oracle._graph._metrics = {
+            "total_nodes": 0, "total_edges": 0,
+            "files_indexed": 0, "last_full_index": 0.0,
+            "last_incremental_update": 0.0,
+        }
+        oracle._repos = {}
+        oracle._semantic_index = MagicMock()
+        oracle._semantic_index.embed_nodes = AsyncMock(return_value=None)
+        oracle._semantic_index.is_ready = MagicMock(return_value=True)
+        return oracle
+
+    async def test_full_index_calls_embed_nodes(self):
+        """full_index() must call _semantic_index.embed_nodes after indexing."""
+        oracle = self._make_oracle()
+
+        oracle._index_repository = AsyncMock(return_value=None)
+        oracle._save_cache = AsyncMock(return_value=None)
+        oracle._graph.get_all_nodes = MagicMock(return_value=[MagicMock(), MagicMock()])
+
+        await oracle.full_index()
+
+        oracle._semantic_index.embed_nodes.assert_called_once()
+        nodes_arg = oracle._semantic_index.embed_nodes.call_args[0][0]
+        assert len(nodes_arg) == 2
+
+    async def test_full_index_embed_failure_does_not_raise(self):
+        """embed_nodes failure during full_index must not propagate."""
+        oracle = self._make_oracle()
+        oracle._index_repository = AsyncMock(return_value=None)
+        oracle._save_cache = AsyncMock(return_value=None)
+        oracle._graph.get_all_nodes = MagicMock(return_value=[MagicMock()])
+        oracle._semantic_index.embed_nodes = AsyncMock(side_effect=RuntimeError("chroma down"))
+
+        # Must not raise
+        await oracle.full_index()
+
+    async def test_semantic_index_initialized_in_constructor(self):
+        """TheOracle.__init__ must create _semantic_index attribute."""
+        from backend.core.ouroboros.oracle import TheOracle, OracleSemanticIndex
+        oracle = object.__new__(TheOracle)
+        TheOracle.__init__(oracle)
+        assert hasattr(oracle, "_semantic_index")
+        assert isinstance(oracle._semantic_index, OracleSemanticIndex)

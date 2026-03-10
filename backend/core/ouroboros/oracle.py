@@ -800,6 +800,27 @@ class CodebaseKnowledgeGraph:
             for key in self._file_index[file_path]
         ]
 
+    def get_all_nodes(self) -> List["NodeData"]:
+        """Return all NodeData objects stored in the graph.
+
+        Used by the semantic index to embed all nodes after a full index.
+        """
+        result: List[NodeData] = []
+        for node_key, node_id in self._node_index.items():
+            attrs = self._graph.nodes.get(node_key, {})
+            result.append(NodeData(
+                node_id=node_id,
+                docstring=attrs.get("docstring"),
+                signature=attrs.get("signature"),
+                decorators=attrs.get("decorators", []),
+                base_classes=attrs.get("base_classes", []),
+                complexity=attrs.get("complexity", 0),
+                line_count=attrs.get("line_count", 0),
+                last_modified=attrs.get("last_modified", 0.0),
+                source_hash=attrs.get("source_hash", ""),
+            ))
+        return result
+
     def find_nodes_in_repo(self, repo: str) -> List[NodeID]:
         """Find all nodes in a specific repository."""
         return [
@@ -1330,6 +1351,9 @@ class TheOracle:
         # Ensure cache directory exists
         OracleConfig.ORACLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+        # Semantic index — fault isolated, never raises in __init__
+        self._semantic_index: "OracleSemanticIndex" = OracleSemanticIndex()
+
         logger.info("The Oracle initialized")
 
     async def initialize(self) -> bool:
@@ -1382,6 +1406,13 @@ class TheOracle:
 
         await self._save_cache()
 
+        # Embed all nodes into semantic index (fault-isolated)
+        try:
+            all_nodes = self._graph.get_all_nodes()
+            await self._semantic_index.embed_nodes(all_nodes)
+        except Exception as exc:
+            logger.warning("[Oracle] Semantic embedding after full_index failed: %s", exc)
+
     async def incremental_update(self, changed_files: Optional[List[Path]] = None) -> None:
         """
         Incrementally update the index for changed files.
@@ -1403,6 +1434,26 @@ class TheOracle:
                         await self._scan_for_changes(repo_name, repo_path)
 
             self._graph._metrics["last_incremental_update"] = time.time()
+
+        # Embed changed nodes into semantic index (fault-isolated)
+        try:
+            if changed_files:
+                changed_rel_paths: set = set()
+                for fp in changed_files:
+                    for _repo_name, repo_root in self._repos.items():
+                        try:
+                            changed_rel_paths.add(str(Path(fp).relative_to(repo_root)))
+                        except ValueError:
+                            pass
+                changed_nodes = [
+                    n for n in self._graph.get_all_nodes()
+                    if n.node_id.file_path in changed_rel_paths
+                ]
+            else:
+                changed_nodes = self._graph.get_all_nodes()
+            await self._semantic_index.embed_nodes(changed_nodes)
+        except Exception as exc:
+            logger.warning("[Oracle] Semantic embedding after incremental_update failed: %s", exc)
 
         elapsed = time.time() - start_time
         logger.info(f"Incremental update complete in {elapsed:.2f}s")
