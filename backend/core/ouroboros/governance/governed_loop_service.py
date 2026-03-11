@@ -344,6 +344,69 @@ def _infer_canary_slice(target_files: tuple) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Terminal classification helpers
+# ---------------------------------------------------------------------------
+
+
+def _classify_terminal(
+    terminal_phase: "OperationPhase",
+    provider_used: "str | None",
+    reason_code: str,
+    is_noop: bool,
+) -> str:
+    """Classify operation outcome into the terminal taxonomy.
+
+    Returns one of: PRIMARY_SUCCESS, FALLBACK_SUCCESS, DEGRADED, TIMEOUT, NOOP
+    """
+    from backend.core.ouroboros.governance.op_context import OperationPhase
+    if is_noop:
+        return "NOOP"
+    if "timeout" in reason_code.lower() or "deadline" in reason_code.lower():
+        return "TIMEOUT"
+    if terminal_phase == OperationPhase.COMPLETE:
+        if provider_used and "prime" in provider_used.lower():
+            return "PRIMARY_SUCCESS"
+        elif provider_used:
+            return "FALLBACK_SUCCESS"
+        return "PRIMARY_SUCCESS"  # default for COMPLETE with no provider info
+    return "DEGRADED"
+
+
+def _build_proof_artifact(
+    op_id: str,
+    terminal_phase: "OperationPhase",
+    terminal_class: str,
+    provider_used: "str | None",
+    model_id: "str | None",
+    compute_class: "str | None",
+    execution_host: "str | None",
+    fallback_active: bool,
+    phase_trail: "list[str]",
+    generation_duration_s: float,
+    total_duration_s: float,
+) -> dict:
+    """Build a structured proof artifact for a completed operation.
+
+    This is written to the ledger and consumed by the observability layer.
+    """
+    import time as _time
+    return {
+        "op_id": op_id,
+        "terminal_phase": terminal_phase.name if hasattr(terminal_phase, "name") else str(terminal_phase),
+        "terminal_class": terminal_class,
+        "provider_used": provider_used,
+        "model_id": model_id,
+        "compute_class": compute_class,
+        "execution_host": execution_host,
+        "fallback_active": fallback_active,
+        "phase_trail": phase_trail,
+        "generation_duration_s": round(generation_duration_s, 3),
+        "total_duration_s": round(total_duration_s, 3),
+        "proof_ts_utc": _time.time(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # ServiceState
 # ---------------------------------------------------------------------------
 
@@ -380,6 +443,7 @@ class OperationResult:
     reason_code: str = ""
     trigger_source: str = "unknown"
     routing_reason: str = ""  # BrainSelectionResult.routing_reason; empty before brain selection
+    terminal_class: str = "UNKNOWN"  # PRIMARY_SUCCESS | FALLBACK_SUCCESS | DEGRADED | TIMEOUT | NOOP
 
 
 # ---------------------------------------------------------------------------
@@ -966,15 +1030,33 @@ class GovernedLoopService:
                 early_exit = await self._preflight_check(ctx)
                 if early_exit is not None:
                     duration = time.monotonic() - start_time
+                    _reason = early_exit.phase.name.lower()
+                    _tc = _classify_terminal(early_exit.phase, None, _reason, is_noop=False)
                     result = OperationResult(
                         op_id=ctx.op_id,
                         terminal_phase=early_exit.phase,
                         total_duration_s=duration,
-                        reason_code=early_exit.phase.name.lower(),
+                        reason_code=_reason,
                         trigger_source=trigger_source,
                         routing_reason=brain.routing_reason,
+                        terminal_class=_tc,
                     )
                     self._completed_ops[dedupe_key] = result
+                    if self._ledger is not None:
+                        _proof = _build_proof_artifact(
+                            op_id=ctx.op_id,
+                            terminal_phase=result.terminal_phase,
+                            terminal_class=result.terminal_class,
+                            provider_used=result.provider_used,
+                            model_id=None,
+                            compute_class=self._vm_capability.get("compute_class") if self._vm_capability else None,
+                            execution_host=self._vm_capability.get("host") if self._vm_capability else None,
+                            fallback_active=(result.terminal_class == "FALLBACK_SUCCESS"),
+                            phase_trail=[p.name for p in getattr(ctx, "phase_trail", []) if hasattr(p, "name")],
+                            generation_duration_s=result.generation_duration_s or 0.0,
+                            total_duration_s=result.total_duration_s or 0.0,
+                        )
+                        await _record_ledger(ctx, self._ledger, OperationState.FAILED, _proof)
                     return result
 
             _pipeline_timeout = (
@@ -998,8 +1080,26 @@ class GovernedLoopService:
                     reason_code="pipeline_timeout",
                     trigger_source=trigger_source,
                     routing_reason=brain.routing_reason,
+                    terminal_class=_classify_terminal(
+                        OperationPhase.CANCELLED, None, "pipeline_timeout", is_noop=False
+                    ),
                 )
                 self._completed_ops[dedupe_key] = result
+                if self._ledger is not None:
+                    _proof = _build_proof_artifact(
+                        op_id=ctx.op_id,
+                        terminal_phase=result.terminal_phase,
+                        terminal_class=result.terminal_class,
+                        provider_used=result.provider_used,
+                        model_id=None,
+                        compute_class=self._vm_capability.get("compute_class") if self._vm_capability else None,
+                        execution_host=self._vm_capability.get("host") if self._vm_capability else None,
+                        fallback_active=False,
+                        phase_trail=[p.name for p in getattr(ctx, "phase_trail", []) if hasattr(p, "name")],
+                        generation_duration_s=0.0,
+                        total_duration_s=result.total_duration_s or 0.0,
+                    )
+                    await _record_ledger(ctx, self._ledger, OperationState.FAILED, _proof)
                 return result
 
             # Phase 4: record actual generation cost for cost gate persistence
@@ -1011,22 +1111,55 @@ class GovernedLoopService:
                     self._brain_selector.record_cost(_provider_name, _cost)
 
             duration = time.monotonic() - start_time
+            _provider_used = (
+                getattr(terminal_ctx.generation, "provider_name", None)
+                if terminal_ctx.generation else None
+            )
+            _is_noop = bool(
+                terminal_ctx.generation and getattr(terminal_ctx.generation, "is_noop", False)
+            )
+            _gen_duration = (
+                getattr(terminal_ctx.generation, "generation_duration_s", None)
+                if terminal_ctx.generation else None
+            )
+            _model_id = (
+                getattr(terminal_ctx.generation, "model_id", None)
+                if terminal_ctx.generation else None
+            )
+            _reason_code = terminal_ctx.phase.name.lower()
+            _tc = _classify_terminal(terminal_ctx.phase, _provider_used, _reason_code, is_noop=_is_noop)
             result = OperationResult(
                 op_id=ctx.op_id,
                 terminal_phase=terminal_ctx.phase,
-                provider_used=getattr(
-                    terminal_ctx.generation, "provider_name", None
-                ) if terminal_ctx.generation else None,
-                generation_duration_s=getattr(
-                    terminal_ctx.generation, "generation_duration_s", None
-                ) if terminal_ctx.generation else None,
+                provider_used=_provider_used,
+                generation_duration_s=_gen_duration,
                 total_duration_s=duration,
-                reason_code=terminal_ctx.phase.name.lower(),
+                reason_code=_reason_code,
                 trigger_source=trigger_source,
                 routing_reason=brain.routing_reason,  # Phase 1 P0: causal code in ledger
+                terminal_class=_tc,
             )
 
             self._completed_ops[dedupe_key] = result
+            if self._ledger is not None:
+                _proof = _build_proof_artifact(
+                    op_id=ctx.op_id,
+                    terminal_phase=result.terminal_phase,
+                    terminal_class=result.terminal_class,
+                    provider_used=result.provider_used,
+                    model_id=_model_id,
+                    compute_class=self._vm_capability.get("compute_class") if self._vm_capability else None,
+                    execution_host=self._vm_capability.get("host") if self._vm_capability else None,
+                    fallback_active=(result.terminal_class == "FALLBACK_SUCCESS"),
+                    phase_trail=[p.name for p in getattr(ctx, "phase_trail", []) if hasattr(p, "name")],
+                    generation_duration_s=result.generation_duration_s or 0.0,
+                    total_duration_s=result.total_duration_s or 0.0,
+                )
+                await _record_ledger(
+                    ctx, self._ledger,
+                    OperationState.APPLIED if not _is_noop else OperationState.BLOCKED,
+                    _proof,
+                )
             return result
 
         finally:
