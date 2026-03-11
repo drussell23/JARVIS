@@ -64,6 +64,17 @@ from backend.core.ouroboros.governance.contracts.fsm_contract import (
     LoopState,
     RetryBudget,
 )
+from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
+from backend.core.ouroboros.governance.autonomy.feedback_engine import (
+    AutonomyFeedbackEngine,
+    FeedbackEngineConfig,
+)
+from backend.core.ouroboros.governance.autonomy.autonomy_types import (
+    CommandType as AutonomyCommandType,
+    EventEnvelope as AutonomyEventEnvelope,
+    EventType as AutonomyEventType,
+)
 
 try:
     from backend.core.ouroboros.oracle import TheOracle as TheOracle
@@ -606,6 +617,13 @@ class GovernedLoopService:
         self._oracle_indexer_task: Optional[asyncio.Task] = None
         self._oracle: Optional[Any] = None
 
+        # C+ autonomy infrastructure
+        self._command_bus: Optional[CommandBus] = None
+        self._event_emitter: Optional[EventEmitter] = None
+        self._feedback_engine: Optional[AutonomyFeedbackEngine] = None
+        self._command_consumer_task: Optional[asyncio.Task] = None
+        self._feedback_loop_task: Optional[asyncio.Task] = None
+
         # Compute-class admission gate (set externally after fetching /v1/capability;
         # None = gate disabled — backward-compatible default)
         self._vm_capability: Optional[dict] = None
@@ -775,6 +793,29 @@ class GovernedLoopService:
                 self._health_probe_loop(), name="health_probe_loop"
             )
 
+            # C+ L2: FeedbackEngine + CommandBus + EventEmitter
+            self._command_bus = CommandBus(maxsize=1000)
+            self._event_emitter = EventEmitter()
+            fe_config = FeedbackEngineConfig(
+                event_dir=self._event_dir or Path.home() / ".jarvis" / "reactor_events",
+                state_dir=Path(os.environ.get(
+                    "JARVIS_AUTONOMY_STATE_DIR",
+                    str(Path.home() / ".jarvis" / "ouroboros" / "state"),
+                )),
+            )
+            self._feedback_engine = AutonomyFeedbackEngine(
+                command_bus=self._command_bus,
+                config=fe_config,
+                event_emitter=self._event_emitter,
+            )
+            self._feedback_engine.register_event_handlers(self._event_emitter)
+            self._feedback_loop_task = asyncio.create_task(
+                self._feedback_loop(), name="feedback_loop"
+            )
+            self._command_consumer_task = asyncio.create_task(
+                self._command_consumer_loop(), name="command_consumer_loop"
+            )
+
             # Determine state based on provider availability
             if self._generator is not None:
                 fsm_state = self._generator.fsm.state
@@ -819,7 +860,8 @@ class GovernedLoopService:
                 pass
 
         # Cancel curriculum and reactor event background tasks
-        for task_attr in ("_curriculum_task", "_reactor_event_task", "_oracle_indexer_task"):
+        for task_attr in ("_curriculum_task", "_reactor_event_task", "_oracle_indexer_task",
+                         "_feedback_loop_task", "_command_consumer_task"):
             task: Optional[asyncio.Task] = getattr(self, task_attr, None)
             if task and not task.done():
                 task.cancel()
@@ -1174,6 +1216,26 @@ class GovernedLoopService:
                     OperationState.APPLIED,
                     _proof,
                 )
+
+            # C+ L1: Emit op_completed event to advisory layers
+            if self._event_emitter is not None:
+                try:
+                    await self._event_emitter.emit(AutonomyEventEnvelope(
+                        source_layer="L1",
+                        event_type=AutonomyEventType.OP_COMPLETED,
+                        payload={
+                            "op_id": ctx.op_id,
+                            "brain_id": brain.brain_id,
+                            "model_name": brain.model_name,
+                            "terminal_phase": result.terminal_phase.name,
+                            "provider": result.provider_used or "",
+                            "duration_s": result.total_duration_s or 0.0,
+                            "rollback": False,
+                        },
+                    ))
+                except Exception:
+                    pass  # fault-isolated
+
             return result
 
         finally:
@@ -1942,3 +2004,50 @@ class GovernedLoopService:
             )
         except Exception as exc:
             logger.warning("[GovernedLoop] _handle_model_promoted failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # C+ Autonomy: background loops
+    # ------------------------------------------------------------------
+
+    async def _feedback_loop(self) -> None:
+        """Periodically run FeedbackEngine consumption loops."""
+        while True:
+            try:
+                await asyncio.sleep(60.0)
+                if self._feedback_engine:
+                    await self._feedback_engine.consume_curriculum_once()
+                    await self._feedback_engine.consume_reactor_events_once()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("[GovernedLoop] feedback_loop error: %s", exc)
+
+    async def _command_consumer_loop(self) -> None:
+        """Consume commands from advisory layers and route to L1 handlers."""
+        while True:
+            try:
+                if self._command_bus is None:
+                    await asyncio.sleep(5.0)
+                    continue
+                cmd = await asyncio.wait_for(self._command_bus.get(), timeout=5.0)
+                await self._handle_advisory_command(cmd)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.warning("[GovernedLoop] command_consumer error: %s", exc)
+
+    async def _handle_advisory_command(self, cmd) -> None:
+        """Route a command envelope to the appropriate L1 handler."""
+        ct = cmd.command_type
+        if ct == AutonomyCommandType.GENERATE_BACKLOG_ENTRY:
+            logger.info("[GovernedLoop] L2 backlog: %s", cmd.payload.get("description", "")[:80])
+        elif ct == AutonomyCommandType.ADJUST_BRAIN_HINT:
+            logger.info("[GovernedLoop] L2 brain hint: brain=%s delta=%s",
+                        cmd.payload.get("brain_id"), cmd.payload.get("weight_delta"))
+        elif ct == AutonomyCommandType.REQUEST_MODE_SWITCH:
+            logger.warning("[GovernedLoop] L3 mode switch: %s (reason: %s)",
+                           cmd.payload.get("target_mode"), cmd.payload.get("reason"))
+        else:
+            logger.debug("[GovernedLoop] Unhandled command: %s", ct)
