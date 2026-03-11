@@ -1,6 +1,5 @@
 """Phase D: observability — terminal_class and per-op proof artifact tests."""
 import dataclasses
-import pytest
 
 
 class TestTerminalClass:
@@ -25,8 +24,6 @@ class TestTerminalClass:
     def test_operation_result_terminal_class_defaults_to_unknown(self):
         """Default terminal_class should be 'UNKNOWN', not None."""
         from backend.core.ouroboros.governance.governed_loop_service import OperationResult
-        from backend.core.ouroboros.governance.op_context import OperationPhase
-        # Build with minimal required fields — read OperationResult dataclass to find them
         # Use introspection to find required (non-default) fields
         required_fields = {
             f.name: None
