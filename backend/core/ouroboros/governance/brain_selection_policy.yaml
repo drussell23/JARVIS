@@ -36,7 +36,7 @@ brains:
     - brain_id: "phi3_lightweight"
       provider: "gcp_prime"
       model_name: "llama-3.2-1b"
-      gguf_file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf"
+      gguf_file: "Llama-3.2-1B-Instruct-Q4_K_M.gguf"   # legacy: use model_artifact (canonical for admission gate)
       required_capabilities: ["chat", "trivial_ops"]
       routable: true
       allowed_task_classes: ["tier0", "tier1"]
@@ -52,7 +52,7 @@ brains:
     - brain_id: "qwen_coder"
       provider: "gcp_prime"
       model_name: "qwen-2.5-coder-7b"
-      gguf_file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
+      gguf_file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"   # legacy: use model_artifact (canonical for admission gate)
       required_capabilities: ["code_generation", "code_refactor"]
       routable: true
       allowed_task_classes: ["tier2", "tier3"]
@@ -68,7 +68,7 @@ brains:
     - brain_id: "deepseek_r1"
       provider: "gcp_prime"
       model_name: "deepseek-r1-qwen-7b"
-      gguf_file: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"
+      gguf_file: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"   # legacy: use model_artifact (canonical for admission gate)
       required_capabilities: ["complex_reasoning", "architecture_analysis"]
       routable: true
       allowed_task_classes: ["tier3"]
@@ -85,7 +85,7 @@ brains:
     - brain_id: "mistral_7b_fallback"
       provider: "gcp_prime"
       model_name: "mistral-7b"
-      gguf_file: "mistral-7b-instruct-v0.2.Q4_K_M.gguf"
+      gguf_file: "mistral-7b-instruct-v0.2.Q4_K_M.gguf"   # legacy: use model_artifact (canonical for admission gate)
       required_capabilities: ["chat", "general_reasoning"]
       routable: true
       allowed_task_classes: ["tier1", "tier2"]
@@ -236,6 +236,8 @@ error_codes:
   - "FSM_SUSPENDED_PREEMPTED"
   - "FSM_REHYDRATE_BUDGET_EXHAUSTED"
 
+# compute_class_rank: used by the admission gate to compare VM compute_class against brain min_compute_class.
+# Higher rank = more capable. A VM must satisfy rank(vm_class) >= rank(min_compute_class).
 compute_class_rank:
   cpu: 0
   gpu_t4: 1

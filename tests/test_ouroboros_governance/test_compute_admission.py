@@ -49,27 +49,42 @@ class TestBrainPolicyComputeClass:
             return {entry["brain_id"]: entry for entry in raw}
         return raw  # already a dict-keyed layout
 
+    @staticmethod
+    def _all_brains_as_dict(doc) -> dict:
+        """Return all brains (required + optional) as {brain_id: cfg} dict."""
+        result = {}
+        for section in ("required", "optional"):
+            entries = doc.get("brains", {}).get(section, [])
+            if isinstance(entries, list):
+                for entry in entries:
+                    bid = entry.get("brain_id") or entry.get("id")
+                    if bid:
+                        result[bid] = {k: v for k, v in entry.items() if k not in ("brain_id", "id")}
+            elif isinstance(entries, dict):
+                result.update(entries)
+        return result
+
     def test_policy_has_compute_class_per_brain(self):
-        """Every brain entry must have compute_class and min_compute_class."""
+        """Every brain entry (required + optional) must have compute_class and min_compute_class."""
         doc = yaml.safe_load(POLICY_PATH.read_text())
-        brains = self._required_brains_as_dict(doc)
+        brains = self._all_brains_as_dict(doc)
         assert brains, "No brains defined in policy"
         for brain_id, cfg in brains.items():
             assert "compute_class" in cfg, f"Brain {brain_id!r} missing compute_class"
             assert "min_compute_class" in cfg, f"Brain {brain_id!r} missing min_compute_class"
 
     def test_policy_has_model_artifact_per_brain(self):
-        """Every brain entry must have model_artifact for integrity check."""
+        """Every brain entry (required + optional) must have model_artifact for integrity check."""
         doc = yaml.safe_load(POLICY_PATH.read_text())
-        brains = self._required_brains_as_dict(doc)
+        brains = self._all_brains_as_dict(doc)
         for brain_id, cfg in brains.items():
             assert "model_artifact" in cfg, f"Brain {brain_id!r} missing model_artifact"
 
     def test_compute_class_order_is_respected(self):
-        """min_compute_class=gpu_t4 must not route to cpu."""
+        """min_compute_class=gpu_t4 must not route to cpu — checked for all brains (required + optional)."""
         compute_rank = {"cpu": 0, "gpu_t4": 1, "gpu_l4": 2, "gpu_v100": 3, "gpu_a100": 4}
         doc = yaml.safe_load(POLICY_PATH.read_text())
-        brains = self._required_brains_as_dict(doc)
+        brains = self._all_brains_as_dict(doc)
         for brain_id, cfg in brains.items():
             cc = cfg.get("compute_class", "cpu")
             min_cc = cfg.get("min_compute_class", "cpu")
