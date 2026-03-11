@@ -1,3 +1,4 @@
+# DEPRECATED: superseded by governance/governed_loop_service.py. Quarantine date: 2026-03-11
 """
 Brain Orchestrator - LLM Infrastructure Manager
 ================================================

@@ -1,3 +1,4 @@
+# DEPRECATED: superseded by governance/preemption_fsm.py. Quarantine date: 2026-03-11
 #!/usr/bin/env python3
 """
 System States and Transitions for JARVIS Autonomous System
