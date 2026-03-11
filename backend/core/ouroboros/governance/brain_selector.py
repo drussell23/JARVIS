@@ -72,6 +72,22 @@ class BrainSelectionResult:
     estimated_prompt_tokens: int = 0
     provider_tier: str = "gcp_prime"  # "gcp_prime" | "claude_api" | "queued"
 
+
+@dataclass(frozen=True)
+class BrainSelection:
+    """Pure intent/complexity routing result — no resource fields.
+
+    BrainSelector is a pure intent+complexity classifier.  Resource gating
+    is the responsibility of RouteDecisionService (which receives pre-fetched
+    ResourceState from TelemetryContextualizer).
+    """
+
+    brain_id: str        # e.g. "qwen_coder", "mistral_planning"
+    model_alias: str     # e.g. "qwen-2.5-coder-7b"
+    reason_code: str     # causal code for ledger
+    complexity: str      # TaskComplexity.value
+    intent_type: str     # CAI intent string e.g. "code_generation"
+
     def narration(self) -> str:
         """Human-readable routing announcement for VoiceNarrator."""
         if self.provider_tier == "queued":

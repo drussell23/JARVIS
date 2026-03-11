@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from backend.core.ouroboros.governance.brain_selector import (
     BrainSelector,
+    BrainSelection,
     BrainSelectionResult,
     TaskComplexity,
 )
@@ -118,6 +119,44 @@ class RouteDecisionService:
         except Exception as exc:
             logger.warning("[RouteDecision] Intent classification failed: %s", exc)
             return "unknown", None, None
+
+    def decide(
+        self,
+        intent_type: str,
+        complexity: str,
+        resource_state: Any,
+    ) -> BrainSelection:
+        """Synchronous route decision using pre-fetched resource state.
+
+        Parameters
+        ----------
+        intent_type:
+            CAI intent string e.g. "code_generation", "bug_fix".
+        complexity:
+            Complexity tier string e.g. "trivial", "heavy".
+        resource_state:
+            ResourceState from TelemetryContextualizer — the caller is
+            responsible for fetching this before calling decide().
+            RouteDecisionService does NOT query local resource APIs directly.
+            All resource data must be pre-fetched via TelemetryContextualizer.
+        """
+        row = _INTENT_TO_BRAIN.get(intent_type)
+        if row:
+            task_complexity, brain_id = row
+        else:
+            task_complexity, brain_id = TaskComplexity.LIGHT, "mistral_planning"
+
+        brains = self._brain_selector._policy.get("brains", {}) if self._brain_selector._policy else {}
+        brain_cfg = brains.get(brain_id, {})
+        model_alias = brain_cfg.get("model_name", "mistral-7b") if isinstance(brain_cfg, dict) else "mistral-7b"
+
+        return BrainSelection(
+            brain_id=brain_id,
+            model_alias=model_alias,
+            reason_code=f"intent_{intent_type}",
+            complexity=complexity,
+            intent_type=intent_type,
+        )
 
     @property
     def daily_spend(self) -> float:
