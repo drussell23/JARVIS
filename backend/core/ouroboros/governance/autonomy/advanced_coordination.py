@@ -380,3 +380,30 @@ class AdvancedAutonomyService:
         )
 
         return result
+
+    def recommend_tier_change(
+        self,
+        repo: str,
+        canary_slice: str,
+        recommended_tier: str,
+        evidence: Dict[str, Any],
+    ) -> bool:
+        """Recommend a trust tier change. Requires non-empty evidence."""
+        if not evidence:
+            logger.warning("[AdvancedCoord] Tier recommendation rejected: empty evidence")
+            return False
+
+        cmd = CommandEnvelope(
+            source_layer="L4",
+            target_layer="L1",
+            command_type=CommandType.RECOMMEND_TIER_CHANGE,
+            payload={
+                "trigger_source": "l4_dynamic_override",
+                "repo": repo,
+                "canary_slice": canary_slice,
+                "recommended_tier": recommended_tier,
+                "evidence": evidence,
+            },
+            ttl_s=300.0,
+        )
+        return self._bus.try_put(cmd)
