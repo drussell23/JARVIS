@@ -152,3 +152,28 @@ class TestPrimeClientCapability:
         with patch("aiohttp.ClientSession", return_value=mock_session):
             with pytest.raises(CapabilityFetchError):
                 await client.fetch_capability()
+
+    @pytest.mark.asyncio
+    async def test_fetch_capability_raises_on_json_parse_error(self):
+        """fetch_capability() raises CapabilityFetchError on JSON parse failure."""
+        from backend.core.prime_client import PrimeClient, PrimeClientConfig, CapabilityFetchError
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(side_effect=Exception("not valid json"))
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        config = PrimeClientConfig()
+        client = PrimeClient(config=config)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            with pytest.raises(CapabilityFetchError) as exc_info:
+                await client.fetch_capability()
+        assert "parse" in str(exc_info.value).lower() or "json" in str(exc_info.value).lower()

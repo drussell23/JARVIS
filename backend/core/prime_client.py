@@ -1111,7 +1111,9 @@ class PrimeClient:
 
     @property
     def capability_url(self) -> str:
-        return f"{self._config.base_url}/capability"
+        # Use host/port primitives directly (same pattern as health_url) so the URL
+        # is stable regardless of prime_api_version being empty or changed.
+        return f"http://{self._config.prime_host}:{self._config.prime_port}/v1/capability"
 
     async def fetch_capability(self) -> dict:
         """Fetch compute contract from /v1/capability.

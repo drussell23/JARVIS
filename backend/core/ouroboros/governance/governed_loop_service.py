@@ -614,6 +614,49 @@ class GovernedLoopService:
                         cap.get("compute_class"), cap.get("model_id"),
                         cap.get("host"), cap.get("gpu_layers"), cap.get("tok_s_estimate"),
                     )
+
+                    # Boot-time hard-fail: verify VM compute_class satisfies the
+                    # default (tier-1) brain's requirements before completing startup.
+                    # Attribute path confirmed from per-op gate at ~line 1079:
+                    #   self._brain_selector           -> RouteDecisionService
+                    #   ._brain_selector               -> BrainSelector
+                    #   ._policy                       -> dict loaded from brain_selection_policy.yaml
+                    try:
+                        _boot_policy = getattr(
+                            getattr(self._brain_selector, "_brain_selector", None),
+                            "_policy", {},
+                        ) or {}
+                        _tier1_brains = (
+                            _boot_policy.get("routing", {})
+                            .get("task_class_map", {})
+                            .get("tier1", [])
+                        )
+                        _default_brain_id = _tier1_brains[0] if _tier1_brains else None
+                        if _default_brain_id:
+                            _all_entries = (
+                                _boot_policy.get("brains", {}).get("required", [])
+                                + _boot_policy.get("brains", {}).get("optional", [])
+                            )
+                            _boot_brain_cfg: dict = {}
+                            for _e in _all_entries:
+                                if isinstance(_e, dict):
+                                    _bid = _e.get("brain_id") or _e.get("id")
+                                    if _bid == _default_brain_id:
+                                        _boot_brain_cfg = {k: v for k, v in _e.items() if k not in ("brain_id", "id")}
+                                        break
+                            if _boot_brain_cfg:
+                                _check_compute_admission(_boot_brain_cfg, cap)
+                                _check_artifact_integrity(_boot_brain_cfg, cap)
+                                logger.info(
+                                    "[GLS] Boot-time capability validation passed for brain=%s",
+                                    _default_brain_id,
+                                )
+                    except (ComputeClassMismatch, ModelArtifactMismatch) as exc:
+                        logger.error("[GLS] Boot-time capability validation FAILED: %s", exc)
+                        raise  # hard fail — do not complete startup with wrong compute class
+
+                except (ComputeClassMismatch, ModelArtifactMismatch):
+                    raise  # propagate hard-fail boot validation errors
                 except Exception as exc:
                     logger.warning("[GLS] Could not fetch capability (non-fatal): %s", exc)
                     self._vm_capability = None
