@@ -1,5 +1,6 @@
 """Phase D: observability — terminal_class and per-op proof artifact tests."""
 import dataclasses
+import pytest
 
 
 class TestTerminalClass:
@@ -14,26 +15,33 @@ class TestTerminalClass:
         )
 
     def test_terminal_class_valid_taxonomy(self):
-        """Known taxonomy values are defined."""
-        valid = {"PRIMARY_SUCCESS", "FALLBACK_SUCCESS", "DEGRADED", "TIMEOUT", "NOOP", "UNKNOWN"}
-        assert "PRIMARY_SUCCESS" in valid
-        assert "FALLBACK_SUCCESS" in valid
-        assert "NOOP" in valid
-        assert "BANANA" not in valid
+        """_classify_terminal() only returns values from the defined taxonomy."""
+        from backend.core.ouroboros.governance.governed_loop_service import _classify_terminal
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+        valid = {"PRIMARY_SUCCESS", "FALLBACK_SUCCESS", "DEGRADED", "TIMEOUT", "NOOP"}
+        # Test all branch paths
+        cases = [
+            (OperationPhase.COMPLETE, "gcp-jprime", "ok", False),
+            (OperationPhase.COMPLETE, "claude-api", "ok", False),
+            (OperationPhase.COMPLETE, "gcp-jprime", "noop", True),
+            (OperationPhase.CANCELLED, None, "pipeline_timeout", False),
+            (OperationPhase.CANCELLED, None, "error", False),
+        ]
+        for phase, provider, reason, is_noop in cases:
+            result = _classify_terminal(phase, provider, reason, is_noop)
+            assert result in valid, f"_classify_terminal returned {result!r} not in taxonomy"
 
     def test_operation_result_terminal_class_defaults_to_unknown(self):
         """Default terminal_class should be 'UNKNOWN', not None."""
         from backend.core.ouroboros.governance.governed_loop_service import OperationResult
-        # Use introspection to find required (non-default) fields
-        required_fields = {
-            f.name: None
-            for f in dataclasses.fields(OperationResult)
-            if f.default is dataclasses.MISSING and f.default_factory is dataclasses.MISSING
-        }
-        # terminal_class should have a default so it's not in required_fields
-        assert "terminal_class" not in required_fields, (
-            "terminal_class must have a default value ('UNKNOWN')"
-        )
+        for field in dataclasses.fields(OperationResult):
+            if field.name == "terminal_class":
+                assert field.default == "UNKNOWN", (
+                    f"terminal_class default is {field.default!r}, expected 'UNKNOWN'"
+                )
+                break
+        else:
+            pytest.fail("terminal_class field not found on OperationResult")
 
 
 class TestClassifyTerminal:

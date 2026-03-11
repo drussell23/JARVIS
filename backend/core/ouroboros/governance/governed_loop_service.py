@@ -361,14 +361,14 @@ def _classify_terminal(
     from backend.core.ouroboros.governance.op_context import OperationPhase
     if is_noop:
         return "NOOP"
-    if "timeout" in reason_code.lower() or "deadline" in reason_code.lower():
-        return "TIMEOUT"
     if terminal_phase == OperationPhase.COMPLETE:
         if provider_used and "prime" in provider_used.lower():
             return "PRIMARY_SUCCESS"
         elif provider_used:
             return "FALLBACK_SUCCESS"
         return "PRIMARY_SUCCESS"  # default for COMPLETE with no provider info
+    if "timeout" in reason_code.lower() or "deadline" in reason_code.lower():
+        return "TIMEOUT"
     return "DEGRADED"
 
 
@@ -389,7 +389,6 @@ def _build_proof_artifact(
 
     This is written to the ledger and consumed by the observability layer.
     """
-    import time as _time
     return {
         "op_id": op_id,
         "terminal_phase": terminal_phase.name if hasattr(terminal_phase, "name") else str(terminal_phase),
@@ -402,7 +401,7 @@ def _build_proof_artifact(
         "phase_trail": phase_trail,
         "generation_duration_s": round(generation_duration_s, 3),
         "total_duration_s": round(total_duration_s, 3),
-        "proof_ts_utc": _time.time(),
+        "proof_ts_utc": datetime.now(tz=timezone.utc).isoformat(),
     }
 
 
@@ -857,6 +856,7 @@ class GovernedLoopService:
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code=f"service_not_active:{self._state.name}",
                 trigger_source=trigger_source,
+                terminal_class="DEGRADED",
             )
 
         # Gate: concurrency limit
@@ -866,6 +866,7 @@ class GovernedLoopService:
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code="busy",
                 trigger_source=trigger_source,
+                terminal_class="DEGRADED",
             )
 
         # Gate: dedup
@@ -876,6 +877,7 @@ class GovernedLoopService:
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code="duplicate:in_flight",
                 trigger_source=trigger_source,
+                terminal_class="DEGRADED",
             )
         if dedupe_key in self._completed_ops:
             return OperationResult(
@@ -883,6 +885,7 @@ class GovernedLoopService:
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code="duplicate:already_completed",
                 trigger_source=trigger_source,
+                terminal_class="DEGRADED",
             )
 
         # Gate: file-scope in-flight lock (before acquiring — prevents self-cancel)
@@ -901,6 +904,7 @@ class GovernedLoopService:
                     terminal_phase=OperationPhase.CANCELLED,
                     reason_code="file_in_flight",
                     trigger_source=trigger_source,
+                    terminal_class="DEGRADED",
                 )
 
         # Execute pipeline
@@ -955,6 +959,7 @@ class GovernedLoopService:
                     terminal_phase=OperationPhase.CANCELLED,
                     reason_code="brain_not_admitted",
                     trigger_source=trigger_source,
+                    terminal_class="DEGRADED",
                 )
 
             # Phase 4: create per-op FSM context (starts in RUNNING)
@@ -993,6 +998,7 @@ class GovernedLoopService:
                     reason_code="cost_gate_triggered_queue",
                     trigger_source=trigger_source,
                     routing_reason=brain.routing_reason,
+                    terminal_class="DEGRADED",
                 )
 
             intent_tel = RoutingIntentTelemetry(
@@ -1157,7 +1163,7 @@ class GovernedLoopService:
                 )
                 await _record_ledger(
                     ctx, self._ledger,
-                    OperationState.APPLIED if not _is_noop else OperationState.BLOCKED,
+                    OperationState.APPLIED,
                     _proof,
                 )
             return result
