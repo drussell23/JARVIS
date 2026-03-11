@@ -552,6 +552,14 @@ class PrimeConnectionPool:
 
 
 # =============================================================================
+# EXCEPTIONS
+# =============================================================================
+
+class CapabilityFetchError(RuntimeError):
+    """Raised when /v1/capability fetch fails or returns non-200."""
+
+
+# =============================================================================
 # PRIME CLIENT
 # =============================================================================
 
@@ -1096,6 +1104,46 @@ class PrimeClient:
             except ImportError:
                 pass
             return self._status
+
+    # -----------------------------------------------------------------
+    # Capability contract fetch
+    # -----------------------------------------------------------------
+
+    @property
+    def capability_url(self) -> str:
+        return f"{self._config.base_url}/capability"
+
+    async def fetch_capability(self) -> dict:
+        """Fetch compute contract from /v1/capability.
+
+        Returns dict with: compute_class, model_id, model_artifact, gpu_layers,
+        tok_s_estimate, host, schema_version.
+
+        Raises:
+            CapabilityFetchError: on HTTP error or JSON parse failure
+        """
+        import aiohttp
+        timeout = aiohttp.ClientTimeout(total=10.0)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(self.capability_url) as resp:
+                    if resp.status != 200:
+                        raise CapabilityFetchError(
+                            f"capability fetch failed: HTTP {resp.status} from {self.capability_url}"
+                        )
+                    try:
+                        data = await resp.json(content_type=None)
+                    except Exception as exc:
+                        raise CapabilityFetchError(
+                            f"capability JSON parse error: {exc}"
+                        ) from exc
+        except CapabilityFetchError:
+            raise
+        except Exception as exc:
+            raise CapabilityFetchError(
+                f"capability fetch error ({type(exc).__name__}): {exc}"
+            ) from exc
+        return data
 
     async def generate(
         self,

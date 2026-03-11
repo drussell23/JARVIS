@@ -88,3 +88,67 @@ class TestHostBindingInvariant:
         else:
             # If running on the VM itself, skip this assertion
             pytest.skip("Test machine hostname matches VM hostname")
+
+
+class TestPrimeClientCapability:
+    """PrimeClient.fetch_capability() fetches and validates the compute contract."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_capability_parses_response(self):
+        """fetch_capability() returns dict with compute_class on HTTP 200."""
+        from backend.core.prime_client import PrimeClient, PrimeClientConfig
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        fake_response = {
+            "compute_class": "gpu_t4",
+            "model_id": "Qwen2.5-Coder-7B",
+            "model_artifact": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+            "gpu_layers": -1,
+            "tok_s_estimate": 40,
+            "host": "jarvis-prime-stable",
+            "schema_version": "1.0",
+        }
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value=fake_response)
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_get = MagicMock(return_value=mock_response)
+        mock_session = AsyncMock()
+        mock_session.get = mock_get
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        config = PrimeClientConfig()
+        client = PrimeClient(config=config)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            cap = await client.fetch_capability()
+
+        assert cap["compute_class"] == "gpu_t4"
+        assert cap["host"] == "jarvis-prime-stable"
+
+    @pytest.mark.asyncio
+    async def test_fetch_capability_raises_on_http_error(self):
+        """fetch_capability() raises CapabilityFetchError if HTTP status != 200."""
+        from backend.core.prime_client import PrimeClient, PrimeClientConfig, CapabilityFetchError
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        mock_response = AsyncMock()
+        mock_response.status = 503
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        config = PrimeClientConfig()
+        client = PrimeClient(config=config)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            with pytest.raises(CapabilityFetchError):
+                await client.fetch_capability()

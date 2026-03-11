@@ -604,6 +604,20 @@ class GovernedLoopService:
                 )
                 logger.debug("[GovernedLoop] Preemption FSM executor initialized")
 
+            # Fetch and cache VM capability contract
+            if self._prime_client is not None:
+                try:
+                    cap = await self._prime_client.fetch_capability()
+                    self._vm_capability = cap
+                    logger.info(
+                        "[GLS] VM capability: compute_class=%s model=%s host=%s gpu_layers=%s tok_s=%s",
+                        cap.get("compute_class"), cap.get("model_id"),
+                        cap.get("host"), cap.get("gpu_layers"), cap.get("tok_s_estimate"),
+                    )
+                except Exception as exc:
+                    logger.warning("[GLS] Could not fetch capability (non-fatal): %s", exc)
+                    self._vm_capability = None
+
             await self._reconcile_on_boot()  # boot reconciliation
             self._register_canary_slices()
             self._seed_autonomy_policies()
