@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -113,6 +114,10 @@ class AutonomyFeedbackEngine:
         self._config = config
         self._event_emitter = event_emitter
         self._seen_files: Set[str] = set()
+
+        # Canary -> brain feedback tracking (Task 7)
+        self._rollback_counts: Dict[str, int] = defaultdict(int)
+        self._brain_hint_threshold: int = 3
 
         # Load persisted cursor on construction
         self._load_cursor()
@@ -309,6 +314,120 @@ class AutonomyFeedbackEngine:
                 success_rate,
                 sample_size,
             )
+
+    # ------------------------------------------------------------------
+    # Public API — canary -> brain feedback (Task 7)
+    # ------------------------------------------------------------------
+
+    def register_event_handlers(self, emitter: Any) -> None:
+        """Subscribe to L1 outcome events for canary -> brain feedback.
+
+        Subscribes to:
+        - ``OP_ROLLED_BACK`` -> :meth:`_on_op_rolled_back`
+        - ``OP_COMPLETED`` -> :meth:`_on_op_completed`
+
+        Parameters
+        ----------
+        emitter:
+            An :class:`EventEmitter` (or duck-typed equivalent with a
+            ``subscribe(event_type, handler)`` method).
+        """
+        emitter.subscribe(EventType.OP_ROLLED_BACK, self._on_op_rolled_back)
+        emitter.subscribe(EventType.OP_COMPLETED, self._on_op_completed)
+        logger.info(
+            "FeedbackEngine: registered canary->brain event handlers "
+            "(threshold=%d)",
+            self._brain_hint_threshold,
+        )
+
+    def _on_op_rolled_back(self, event: EventEnvelope) -> None:
+        """Handle an ``OP_ROLLED_BACK`` event (sync handler).
+
+        Increments the rollback count for the brain identified in the event
+        payload.  When the count reaches the threshold, emits an
+        ``ADJUST_BRAIN_HINT`` command advising L1 to reduce the brain's
+        routing weight.
+        """
+        brain_id: str = event.payload.get("brain_id", "")
+        if not brain_id:
+            logger.warning(
+                "FeedbackEngine: OP_ROLLED_BACK event missing brain_id — "
+                "ignoring (event_id=%s)",
+                event.event_id,
+            )
+            return
+
+        self._rollback_counts[brain_id] += 1
+        count = self._rollback_counts[brain_id]
+
+        logger.debug(
+            "FeedbackEngine: rollback count for brain_id=%s is now %d "
+            "(threshold=%d)",
+            brain_id,
+            count,
+            self._brain_hint_threshold,
+        )
+
+        if count >= self._brain_hint_threshold and count % self._brain_hint_threshold == 0:
+            cmd = CommandEnvelope(
+                source_layer="L2",
+                target_layer="L1",
+                command_type=CommandType.ADJUST_BRAIN_HINT,
+                payload={
+                    "brain_id": brain_id,
+                    "weight_delta": -0.1,
+                    "evidence_window_ops": count,
+                    "canary_slice": "tests/",
+                    "reason": (
+                        f"Brain {brain_id!r} has accumulated {count} rollback(s) "
+                        f"(threshold={self._brain_hint_threshold}) — "
+                        f"advising weight reduction"
+                    ),
+                },
+                ttl_s=_DEFAULT_CMD_TTL_S,
+            )
+
+            accepted = self._bus.try_put(cmd)
+            if accepted:
+                logger.info(
+                    "FeedbackEngine: emitted ADJUST_BRAIN_HINT for brain_id=%s "
+                    "(rollback_count=%d)",
+                    brain_id,
+                    count,
+                )
+            else:
+                logger.warning(
+                    "FeedbackEngine: bus rejected ADJUST_BRAIN_HINT for "
+                    "brain_id=%s (dedup or backpressure)",
+                    brain_id,
+                )
+
+    def _on_op_completed(self, event: EventEnvelope) -> None:
+        """Handle an ``OP_COMPLETED`` event (sync handler).
+
+        Decays the rollback count for the brain identified in the event
+        payload by 1, flooring at zero.  This rewards successful operations
+        and prevents stale rollback counts from triggering hints
+        indefinitely.
+        """
+        brain_id: str = event.payload.get("brain_id", "")
+        if not brain_id:
+            logger.debug(
+                "FeedbackEngine: OP_COMPLETED event missing brain_id — "
+                "ignoring (event_id=%s)",
+                event.event_id,
+            )
+            return
+
+        current = self._rollback_counts.get(brain_id, 0)
+        self._rollback_counts[brain_id] = max(0, current - 1)
+
+        logger.debug(
+            "FeedbackEngine: decayed rollback count for brain_id=%s: %d -> %d",
+            brain_id,
+            current,
+            self._rollback_counts[brain_id],
+        )
 
     # ------------------------------------------------------------------
     # Internals — curriculum processing
