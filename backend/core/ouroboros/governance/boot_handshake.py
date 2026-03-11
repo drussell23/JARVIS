@@ -32,9 +32,13 @@ __all__ = [
     "YamlPolicyLoader",
     "JprimeRuntimeInventoryProvider",
     "run_boot_handshake",
+    "assert_capability_contract",
+    "_fetch_capability_json",   # exposed for test-patching
 ]
 
 _log = logging.getLogger(__name__)
+
+_POLICY_PATH = Path(__file__).parent / "brain_selection_policy.yaml"
 
 
 # ---------------------------------------------------------------------------
@@ -454,3 +458,164 @@ async def run_boot_handshake(
         )
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# 5. _fetch_capability_json — module-level for test patching
+# ---------------------------------------------------------------------------
+
+async def _fetch_capability_json(base_url: str, timeout_s: float = 5.0) -> dict:
+    """GET {base_url}/v1/capability and return the JSON dict.
+
+    Raises RuntimeError("CAPABILITY_ENDPOINT_UNREACHABLE: ...") on any
+    network failure or timeout.  This function is module-level so that
+    tests can patch it directly.
+    """
+    url = f"{base_url.rstrip('/')}/v1/capability"
+    _log.debug("_fetch_capability_json: GET %s", url)
+
+    try:
+        import aiohttp  # type: ignore[import]
+        timeout = aiohttp.ClientTimeout(total=timeout_s)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                return await resp.json(content_type=None)
+    except ImportError:
+        pass  # fall through to urllib
+    except Exception as exc:
+        raise RuntimeError(
+            f"CAPABILITY_ENDPOINT_UNREACHABLE: GET {url} failed — {exc}"
+        ) from exc
+
+    # urllib fallback
+    import urllib.error
+    import urllib.request
+
+    def _blocking() -> dict:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_s) as resp:
+                return json.loads(resp.read())
+        except (urllib.error.URLError, OSError) as exc:
+            raise RuntimeError(
+                f"CAPABILITY_ENDPOINT_UNREACHABLE: GET {url} failed — {exc}"
+            ) from exc
+
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(None, _blocking)
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(
+            f"CAPABILITY_ENDPOINT_UNREACHABLE: GET {url} unexpected error — {exc}"
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# 6. assert_capability_contract — boot-time contract_version assertion
+# ---------------------------------------------------------------------------
+
+def _parse_semver_str(version: str) -> tuple[int, ...]:
+    """Parse semver string into tuple. Raises ValueError on bad input."""
+    parts = version.split(".")
+    while len(parts) < 3:
+        parts.append("0")
+    return tuple(int(p) for p in parts[:3])
+
+
+async def assert_capability_contract(
+    jprime_base_url: str,
+    compat: Optional[dict] = None,
+    *,
+    timeout_s: float = 5.0,
+    logger: Optional[logging.Logger] = None,
+) -> dict:
+    """Assert that the J-Prime /v1/capability endpoint exists and that its
+    contract_version falls within the policy compatibility window.
+
+    This is a HARD FAIL function: any network error or version mismatch
+    raises RuntimeError with a structured reason code.  There is NO silent
+    fallback.
+
+    Parameters
+    ----------
+    jprime_base_url:
+        Base URL of J-Prime, e.g. "http://127.0.0.1:8000".
+    compat:
+        Dict with keys ``min_runtime_contract_version`` and
+        ``max_runtime_contract_version`` (semver strings).  When None,
+        defaults are loaded from the standard policy YAML.
+    timeout_s:
+        HTTP timeout for the capability fetch.
+
+    Returns
+    -------
+    The raw capability response dict on success.
+
+    Raises
+    ------
+    RuntimeError
+        ``CAPABILITY_ENDPOINT_UNREACHABLE`` — endpoint unreachable.
+        ``CONTRACT_SCHEMA_INVALID``         — contract_version field missing.
+        ``CONTRACT_VERSION_INCOMPATIBLE``   — version outside [min, max].
+    """
+    _logger = logger or _log
+
+    # Resolve compat bounds
+    if compat is None:
+        try:
+            _policy = await YamlPolicyLoader(_POLICY_PATH).load_policy()
+            compat = {
+                "min_runtime_contract_version": _policy.min_runtime_contract_version,
+                "max_runtime_contract_version": _policy.max_runtime_contract_version,
+            }
+        except Exception as exc:
+            _logger.warning(
+                "assert_capability_contract: could not load policy compat bounds (%s) "
+                "— using defaults 1.0.0 / 1.0.999",
+                exc,
+            )
+            compat = {
+                "min_runtime_contract_version": "1.0.0",
+                "max_runtime_contract_version": "1.0.999",
+            }
+
+    min_ver_str: str = compat.get("min_runtime_contract_version", "1.0.0")
+    max_ver_str: str = compat.get("max_runtime_contract_version", "1.0.999")
+
+    # Fetch — hard fail on any error (no swallowing)
+    raw = await _fetch_capability_json(jprime_base_url, timeout_s=timeout_s)
+
+    # Assert contract_version field is present
+    runtime_ver_str: str = raw.get("contract_version", "")
+    if not runtime_ver_str:
+        raise RuntimeError(
+            f"CONTRACT_SCHEMA_INVALID: /v1/capability response from "
+            f"{jprime_base_url!r} missing 'contract_version' field"
+        )
+
+    # Parse and range-check
+    try:
+        runtime_v = _parse_semver_str(runtime_ver_str)
+        min_v = _parse_semver_str(min_ver_str)
+        max_v = _parse_semver_str(max_ver_str)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"CONTRACT_SCHEMA_INVALID: unparseable semver in capability response "
+            f"from {jprime_base_url!r} — {exc}"
+        ) from exc
+
+    if runtime_v < min_v or runtime_v > max_v:
+        raise RuntimeError(
+            f"CONTRACT_VERSION_INCOMPATIBLE: runtime={runtime_ver_str!r} "
+            f"not in [{min_ver_str}, {max_ver_str}] "
+            f"(from {jprime_base_url}/v1/capability)"
+        )
+
+    _logger.info(
+        "assert_capability_contract: PASSED — endpoint=%s contract_version=%s "
+        "within [%s, %s]",
+        jprime_base_url, runtime_ver_str, min_ver_str, max_ver_str,
+    )
+    return raw
