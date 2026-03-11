@@ -63,6 +63,7 @@ def _make_orch_with_drift(source_hash_matches: bool, tmp_path: Path):
     mock_gen.generate = AsyncMock(return_value=MagicMock(
         candidates=(candidate,),
         provider_name="test", generation_duration_s=0.1, model_id="llama-3",
+        is_noop=False,
     ))
 
     config = OrchestratorConfig(project_root=tmp_path, max_validate_retries=0)

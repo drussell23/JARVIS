@@ -90,6 +90,7 @@ def _make_orch(runner: MagicMock) -> tuple[GovernedOrchestrator, MagicMock]:
             candidates=({"file_path": "backend/core/foo.py", "full_content": "x = 1\n"},),
             provider_name="test",
             generation_duration_s=0.1,
+            is_noop=False,
         )
     )
 
@@ -154,6 +155,7 @@ async def test_ac1_testrunner_not_called_on_syntax_error():
             candidates=({"file_path": "backend/core/foo.py", "full_content": "def broken(:\n    pass"},),
             provider_name="test",
             generation_duration_s=0.1,
+            is_noop=False,
         )
     )
 

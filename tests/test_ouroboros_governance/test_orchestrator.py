@@ -849,6 +849,7 @@ class TestOracleIncrementalUpdate:
         config = MagicMock(spec=OrchestratorConfig)
         orch = Orchestrator.__new__(Orchestrator)
         orch._config = config
+        orch._oracle_update_lock = asyncio.Lock()
 
         mock_oracle = MagicMock()
         mock_oracle.incremental_update = AsyncMock()
@@ -871,6 +872,7 @@ class TestOracleIncrementalUpdate:
         config = MagicMock(spec=OrchestratorConfig)
         orch = Orchestrator.__new__(Orchestrator)
         orch._config = config
+        orch._oracle_update_lock = asyncio.Lock()
 
         mock_oracle = MagicMock()
         mock_oracle.incremental_update = AsyncMock(side_effect=RuntimeError("oracle exploded"))

@@ -88,6 +88,7 @@ class TestOperationPhase:
             OperationPhase.VALIDATE,
             OperationPhase.GENERATE_RETRY,
             OperationPhase.CANCELLED,
+            OperationPhase.COMPLETE,  # noop fast-path: model signals change already present
         }
 
     def test_generate_retry_transitions(self) -> None:

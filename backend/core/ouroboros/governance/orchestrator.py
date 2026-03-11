@@ -778,10 +778,11 @@ class GovernedOrchestrator:
         if oracle is None:
             return
         try:
-            await asyncio.wait_for(
-                oracle.incremental_update(applied_files),
-                timeout=30.0,
-            )
+            async with self._oracle_update_lock:
+                await asyncio.wait_for(
+                    oracle.incremental_update(applied_files),
+                    timeout=30.0,
+                )
         except asyncio.TimeoutError:
             logger.warning(
                 "[Orchestrator] Oracle incremental_update timed out (>30s); "

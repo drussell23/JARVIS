@@ -47,6 +47,12 @@ def _make_service(fsm_state: FailbackState = FailbackState.PRIMARY_READY, primar
     mock_ledger.append = AsyncMock()
     svc._ledger = mock_ledger
 
+    # Attributes initialised by __init__ that _preflight_check reads
+    import collections as _coll
+    svc._file_touch_cache = _coll.defaultdict(_coll.deque)
+    svc._vm_capability = None  # no GPU VM in unit tests
+    svc._fsm_executor = None   # FSM not started in unit tests
+
     return svc
 
 

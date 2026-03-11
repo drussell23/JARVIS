@@ -36,6 +36,7 @@ async def test_submit_stamps_pipeline_deadline_in_ctx():
         pipeline_timeout_s=300.0,
     )
     stack = MagicMock()
+    stack.resource_monitor.snapshot = AsyncMock(return_value=MagicMock())
     prime_client = MagicMock()
     svc = GovernedLoopService(stack=stack, prime_client=prime_client, config=config)
     svc._state = ServiceState.ACTIVE

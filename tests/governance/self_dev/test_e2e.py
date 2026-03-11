@@ -44,6 +44,7 @@ def _make_service(tmp_path: Path, max_concurrent_ops: int = 2) -> GovernedLoopSe
         max_concurrent_ops=max_concurrent_ops,
     )
     stack = MagicMock()
+    stack.resource_monitor.snapshot = AsyncMock(return_value=MagicMock())
     svc = GovernedLoopService(stack=stack, prime_client=None, config=config)
     svc._state = ServiceState.ACTIVE
     return svc

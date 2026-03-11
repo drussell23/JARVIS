@@ -75,6 +75,7 @@ def _make_orch(validation_runner=None, max_retries=0):
         candidates=({"file_path": "backend/core/foo.py", "full_content": "x = 1\n"},),
         provider_name="test",
         generation_duration_s=0.1,
+        is_noop=False,
     ))
     return GovernedOrchestrator(
         stack=mock_stack,

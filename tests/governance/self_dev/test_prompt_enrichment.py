@@ -108,7 +108,8 @@ def test_prompt_includes_candidate_id_field(tmp_path):
     ctx = _ctx([str(target.relative_to(tmp_path))], repo_root=tmp_path)
     prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
     assert "candidate_id" in prompt
-    assert "full_content" in prompt
+    # Single-file tasks use unified_diff schema (2b.1-diff); multi-file tasks use full_content
+    assert ("unified_diff" in prompt or "full_content" in prompt)
     assert "file_path" in prompt
     assert "rationale" in prompt
 

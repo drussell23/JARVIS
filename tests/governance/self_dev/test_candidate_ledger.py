@@ -71,6 +71,7 @@ def _make_orch(runner):
     mock_gen.generate = AsyncMock(return_value=MagicMock(
         candidates=(_make_candidate("c1"),),
         provider_name="test", generation_duration_s=0.1, model_id="llama-3",
+        is_noop=False,
     ))
 
     config = OrchestratorConfig(project_root=REPO_ROOT, max_validate_retries=0)

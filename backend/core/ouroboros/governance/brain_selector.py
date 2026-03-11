@@ -182,7 +182,7 @@ class BrainSelector:
 
         # ── Layer 2: Resource Gate — REMOVED (Phase 1 P0) ────────────────────
         # Host-binding invariant: telemetry_host == selector_host == execution_host.
-        # Local Mac psutil pressure MUST NOT influence GCP routing decisions.
+        # Local host memory pressure MUST NOT influence GCP routing decisions.
         # Resource-pressure routing is now handled by TelemetryContextualizer,
         # which fetches telemetry from the remote execution host only.
         # snapshot is retained in the signature for caller compatibility but

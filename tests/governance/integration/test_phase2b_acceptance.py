@@ -78,6 +78,7 @@ def _make_orch(candidates, runner, project_root=REPO_ROOT):
         provider_name="gcp-jprime",
         generation_duration_s=0.5,
         model_id="llama-3.3-70b",
+        is_noop=False,
     ))
 
     config = OrchestratorConfig(project_root=project_root, max_validate_retries=0)
