@@ -40,6 +40,7 @@ class SafetyNetConfig:
     rollback_pattern_threshold: int = 2
     rollback_pattern_window_s: float = 3600.0
     human_presence_defer_s: float = 300.0
+    incident_rollback_threshold: int = 3
 
 
 class ProductionSafetyNet:
@@ -64,6 +65,7 @@ class ProductionSafetyNet:
         self._escalated_reduced: bool = False
         self._escalated_readonly: bool = False
         self._rollback_history: List[Dict[str, Any]] = []
+        self._incident_triggered: bool = False
 
     # ------------------------------------------------------------------
     # Event handler registration
@@ -199,6 +201,24 @@ class ProductionSafetyNet:
             ttl_s=300.0,
         )
         self._bus.try_put(cmd)
+
+        # Incident detection: too many rollbacks in window
+        if (len(self._rollback_history) >= self._config.incident_rollback_threshold
+                and not self._incident_triggered):
+            self._incident_triggered = True
+            incident_cmd = CommandEnvelope(
+                source_layer="L3",
+                target_layer="L1",
+                command_type=CommandType.REQUEST_MODE_SWITCH,
+                payload={
+                    "target_mode": "READ_ONLY_PLANNING",
+                    "reason": f"Incident: {len(self._rollback_history)} rollbacks in {self._config.rollback_pattern_window_s}s",
+                    "evidence_count": len(self._rollback_history),
+                    "probe_failure_streak": 0,
+                },
+                ttl_s=300.0,
+            )
+            self._bus.try_put(incident_cmd)
 
     @staticmethod
     def _classify_root_cause(reason: str) -> str:
