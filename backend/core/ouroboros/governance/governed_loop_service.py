@@ -1286,13 +1286,19 @@ class GovernedLoopService:
                     raise
 
                 # ── Model artifact integrity check ───────────────────────────────────
-                try:
-                    _check_artifact_integrity(_brain_cfg, self._vm_capability)
-                except ModelArtifactMismatch as exc:
-                    logger.error(
-                        "[GLS] Artifact integrity DENIED for op=%s: %s", ctx.op_id, exc
-                    )
-                    raise
+                # Only enforce for brains that target J-Prime (GPU brains).
+                # CPU brains (phi3_lightweight etc.) route to Claude fallback and
+                # never consume the GPU VM's model — checking them against the VM's
+                # loaded artifact would produce false mismatches.
+                _brain_compute = _brain_cfg.get("compute_class", "cpu")
+                if _brain_compute != "cpu":
+                    try:
+                        _check_artifact_integrity(_brain_cfg, self._vm_capability)
+                    except ModelArtifactMismatch as exc:
+                        logger.error(
+                            "[GLS] Artifact integrity DENIED for op=%s: %s", ctx.op_id, exc
+                        )
+                        raise
 
         now = datetime.now(tz=timezone.utc)
         remaining_s = (
