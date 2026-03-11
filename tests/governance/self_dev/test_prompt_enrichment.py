@@ -151,3 +151,48 @@ def test_find_context_files_cap_test_files(tmp_path):
     target.write_text("x = 1\n")
     _, test_files = _find_context_files(target, tmp_path)
     assert len(test_files) <= 2
+
+
+# ── force_full_content (7B model schema selection) ─────────────────────────
+
+
+def test_force_full_content_uses_full_schema_for_single_file(tmp_path):
+    """When force_full_content=True, single-file tasks get 2b.1 (full_content)
+    instead of 2b.1-diff (unified diff).  This is the structural fix for 7B
+    models that hallucinate diff context lines from training data."""
+    target = tmp_path / "mymod.py"
+    target.write_text("x = 1\n")
+    ctx = _ctx([str(target.relative_to(tmp_path))], repo_root=tmp_path)
+
+    # Default (force_full_content=False) → 2b.1-diff for single-file
+    prompt_diff = _build_codegen_prompt(ctx, repo_root=tmp_path, force_full_content=False)
+    assert "2b.1-diff" in prompt_diff
+    assert "unified_diff" in prompt_diff
+
+    # force_full_content=True → 2b.1 (full_content) for single-file
+    prompt_full = _build_codegen_prompt(ctx, repo_root=tmp_path, force_full_content=True)
+    assert "2b.1-diff" not in prompt_full
+    assert "unified_diff" not in prompt_full
+    assert "full_content" in prompt_full
+    assert '"2b.1"' in prompt_full or "'2b.1'" in prompt_full
+
+
+def test_force_full_content_no_effect_on_multi_file(tmp_path):
+    """force_full_content has no effect on multi-file tasks — they already
+    use full_content schema."""
+    f1 = tmp_path / "a.py"
+    f2 = tmp_path / "b.py"
+    f1.write_text("x = 1\n")
+    f2.write_text("y = 2\n")
+    ctx = _ctx(
+        [str(f1.relative_to(tmp_path)), str(f2.relative_to(tmp_path))],
+        repo_root=tmp_path,
+    )
+
+    prompt_default = _build_codegen_prompt(ctx, repo_root=tmp_path)
+    prompt_forced = _build_codegen_prompt(ctx, repo_root=tmp_path, force_full_content=True)
+
+    # Both should use 2b.1 (full_content) — no unified_diff
+    for p in (prompt_default, prompt_forced):
+        assert "full_content" in p
+        assert "unified_diff" not in p

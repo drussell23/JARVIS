@@ -476,6 +476,7 @@ def _build_codegen_prompt(
     repo_roots: Optional[Dict[str, Path]] = None,
     tools_enabled: bool = False,
     max_prompt_tokens: Optional[int] = None,
+    force_full_content: bool = False,
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
@@ -494,6 +495,12 @@ def _build_codegen_prompt(
         Mapping of repo name -> root path for cross-repo operations. When
         provided alongside a cross-repo ctx, each file section is labelled with
         the repo it belongs to and the 2c.1 schema is emitted.
+    force_full_content:
+        When True, always use schema 2b.1 (full_content) even for single-file
+        tasks, bypassing the 2b.1-diff (unified diff) path.  Required for
+        smaller models (≤13B) that lack the precision to generate verbatim
+        context lines in unified diffs — they reconstruct from parametric
+        memory instead of copying from the in-context source snapshot.
     """
     from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
@@ -618,7 +625,13 @@ def _build_codegen_prompt(
         )
 
     # ── 3. Output schema instruction ────────────────────────────────────
-    _single_file_task = len(ctx.target_files) == 1 and not getattr(ctx, "cross_repo", False)
+    # force_full_content disables the diff schema — smaller models (≤13B) can't
+    # generate verbatim context lines; they hallucinate from training data.
+    _single_file_task = (
+        len(ctx.target_files) == 1
+        and not getattr(ctx, "cross_repo", False)
+        and not force_full_content
+    )
     if getattr(ctx, "cross_repo", False) and repo_roots:
         repos_listed = "\n".join(
             f'        "{r}": [{{"file_path": "...", "full_content": "...", "op": "modify"}}]'
@@ -1455,6 +1468,7 @@ class PrimeProvider:
             repo_root=self._repo_root,
             repo_roots=self._repo_roots,
             tools_enabled=self._tools_enabled,
+            force_full_content=True,  # 7B models can't generate verbatim diff context lines
         )
         accumulated_chars = len(prompt)
         tool_rounds = 0
