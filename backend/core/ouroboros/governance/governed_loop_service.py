@@ -186,17 +186,43 @@ async def _record_ledger(
 
 
 def _expected_provider_from_pressure(snap: ResourceSnapshot, active_ops: int = 0) -> str:
-    """Derive the expected provider string from the snapshot's pressure level.
+    """DEPRECATED — retained for backward compat only. Do not use for routing.
 
-    NORMAL / ELEVATED  → GCP_PRIME_SPOT  (cloud inference preferred)
-    CRITICAL / EMERGENCY → LOCAL_CLAUDE  (local fallback under resource pressure)
-
-    Uses ``pressure_for_load(active_ops)`` so that legitimate concurrent load does not
-    falsely elevate the routing decision to LOCAL_CLAUDE.
+    Use _expected_provider_from_brain() instead, which derives expected_provider
+    from the BrainSelectionResult, not from local Mac resource pressure.
     """
+    # Phase 1 P0: local Mac pressure must not influence GCP routing telemetry.
+    # This function is kept so callers that haven't been migrated don't break at
+    # import time; all call sites inside GLS now use _expected_provider_from_brain.
     if snap.pressure_for_load(active_ops) >= PressureLevel.CRITICAL:
         return "LOCAL_CLAUDE"
     return "GCP_PRIME_SPOT"
+
+
+def _expected_provider_from_brain(brain: "BrainSelectionResult") -> str:  # type: ignore[name-defined]
+    """Derive expected_provider from the BrainSelectionResult, NOT from local psutil.
+
+    Respects the host-binding invariant: routing-authority fields in telemetry
+    must reflect the actual brain selection outcome, not local Mac resource state.
+    """
+    tier = getattr(brain, "provider_tier", "gcp_prime").upper()
+    # Normalise known tiers to a canonical form
+    if tier.startswith("GCP"):
+        return "GCP_PRIME_SPOT"
+    if tier.startswith("CLAUDE") or tier == "CLAUDE_API":
+        return "CLAUDE_API"
+    if tier == "QUEUED":
+        return "QUEUED"
+    return tier
+
+
+def _policy_reason_from_brain(brain: "BrainSelectionResult") -> str:  # type: ignore[name-defined]
+    """Return the causal routing_reason from BrainSelectionResult.
+
+    Replaces the pattern of using snap.pressure_for_load().name as policy_reason,
+    which incorrectly stamped LOCAL Mac pressure as the routing policy authority.
+    """
+    return getattr(brain, "routing_reason", "unknown")
 
 
 def _infer_canary_slice(target_files: tuple) -> str:
@@ -267,6 +293,7 @@ class OperationResult:
     total_duration_s: float = 0.0
     reason_code: str = ""
     trigger_source: str = "unknown"
+    routing_reason: str = ""  # BrainSelectionResult.routing_reason; empty before brain selection
 
 
 # ---------------------------------------------------------------------------
@@ -754,11 +781,15 @@ class GovernedLoopService:
                     terminal_phase=OperationPhase.CANCELLED,
                     reason_code="cost_gate_triggered_queue",
                     trigger_source=trigger_source,
+                    routing_reason=brain.routing_reason,
                 )
 
             intent_tel = RoutingIntentTelemetry(
-                expected_provider=_expected_provider_from_pressure(snap, len(self._active_ops)),
-                policy_reason=snap.pressure_for_load(len(self._active_ops)).name,
+                # Phase 1 P0: use brain-derived fields, NOT local Mac pressure.
+                # expected_provider and policy_reason now reflect the actual brain
+                # selection outcome (host-binding invariant).
+                expected_provider=_expected_provider_from_brain(brain),
+                policy_reason=_policy_reason_from_brain(brain),
                 brain_id=brain.brain_id,
                 brain_model=brain.model_name,
                 routing_reason=brain.routing_reason,
@@ -794,6 +825,7 @@ class GovernedLoopService:
                         total_duration_s=duration,
                         reason_code=early_exit.phase.name.lower(),
                         trigger_source=trigger_source,
+                        routing_reason=brain.routing_reason,
                     )
                     self._completed_ops[dedupe_key] = result
                     return result
@@ -818,6 +850,7 @@ class GovernedLoopService:
                     total_duration_s=duration,
                     reason_code="pipeline_timeout",
                     trigger_source=trigger_source,
+                    routing_reason=brain.routing_reason,
                 )
                 self._completed_ops[dedupe_key] = result
                 return result
@@ -843,6 +876,7 @@ class GovernedLoopService:
                 total_duration_s=duration,
                 reason_code=terminal_ctx.phase.name.lower(),
                 trigger_source=trigger_source,
+                routing_reason=brain.routing_reason,  # Phase 1 P0: causal code in ledger
             )
 
             self._completed_ops[dedupe_key] = result

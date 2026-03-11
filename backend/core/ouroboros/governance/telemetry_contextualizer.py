@@ -92,6 +92,38 @@ class TelemetryContextualizer:
     # Public API
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _normalize_host(raw: str) -> str:
+        """Normalize a host string to bare IP/hostname for comparison.
+
+        Handles:
+          - URL schemes: "http://10.0.0.5:8000" → "10.0.0.5"
+          - Ports:       "10.0.0.5:8000"        → "10.0.0.5"
+          - Localhost:   "localhost"              → "127.0.0.1"
+
+        Only the host part is compared; ports are routing metadata, not identity.
+        """
+        s = raw.strip()
+        # Strip URL scheme
+        for scheme in ("https://", "http://"):
+            if s.startswith(scheme):
+                s = s[len(scheme):]
+                break
+        # Strip path/query after first slash
+        s = s.split("/")[0]
+        # Strip port
+        # Handle IPv6 [::1]:8000 form
+        if s.startswith("["):
+            bracket_end = s.find("]")
+            if bracket_end != -1:
+                s = s[1:bracket_end]
+        elif ":" in s:
+            s = s.rsplit(":", 1)[0]
+        # Normalize localhost variants
+        if s.lower() in ("localhost", "localhost."):
+            s = "127.0.0.1"
+        return s.lower()
+
     async def assert_host_binding(
         self,
         execution_host: str,
@@ -103,6 +135,12 @@ class TelemetryContextualizer:
         Local routes (execution_host == "local") always pass; they have no
         remote/local split ambiguity.
 
+        Host comparison is done after normalization to prevent false
+        BODY_MISMATCH from equivalent representations:
+          "localhost" == "127.0.0.1"
+          "http://10.0.0.5:8000" == "10.0.0.5"
+          "10.0.0.5:8080" == "10.0.0.5"
+
         Parameters
         ----------
         execution_host:
@@ -111,13 +149,17 @@ class TelemetryContextualizer:
             Where the telemetry snapshot was collected.  Must equal
             execution_host for any remote route.
         """
-        if execution_host == "local":
+        norm_exec = self._normalize_host(execution_host)
+        norm_tel = self._normalize_host(telemetry_host)
+
+        if norm_exec == "local":
             return  # local routes: no cross-host invariant applies
 
-        if telemetry_host != execution_host:
+        if norm_tel != norm_exec:
             raise RuntimeError(
                 f"{REASON_BODY_MISMATCH}: "
-                f"execution_host={execution_host!r} != telemetry_host={telemetry_host!r}. "
+                f"execution_host={execution_host!r} (normalized: {norm_exec!r}) "
+                f"!= telemetry_host={telemetry_host!r} (normalized: {norm_tel!r}). "
                 f"Mac-local telemetry MUST NOT influence GCP routing decisions."
             )
 

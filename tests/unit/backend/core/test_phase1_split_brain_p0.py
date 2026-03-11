@@ -18,6 +18,9 @@ G3  Supervisor boot — hard fail when capability endpoint unreachable
 G4  Remote route uses remote telemetry only (TelemetryContextualizer)
 G5  Remote telemetry disconnect → TELEMETRY_DISCONNECT, no local fallback
 G6  BrainSelector purity — no resource-gate side-effects in select()
+G7  RoutingIntentTelemetry does NOT use local psutil for routing-authority fields
+G8  routing_reason propagates end-to-end into OperationResult (ledger-visible)
+G9  Host identity normalization — no false BODY_MISMATCH on equivalent addresses
 """
 
 from __future__ import annotations
@@ -598,3 +601,219 @@ class TestBrainSelectorPurity:
             f"on local pressure: normal={result_normal.brain_id!r} "
             f"emergency={result_emergency.brain_id!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# G7 — RoutingIntentTelemetry must NOT derive routing-authority fields
+#       from local Mac psutil data
+# ---------------------------------------------------------------------------
+
+class TestRoutingIntentTelemetryPurity:
+    """G7: expected_provider and policy_reason in RoutingIntentTelemetry must
+    come from the BrainSelectionResult, NOT from local Mac resource pressure.
+
+    Root cause: _expected_provider_from_pressure() computed expected_provider
+    from LOCAL psutil snap (GCP route, Mac EMERGENCY pressure → "LOCAL_CLAUDE")
+    which is factually and architecturally wrong.
+    """
+
+    def _make_result(self, brain_id: str = "qwen_coder",
+                     provider_tier: str = "gcp_prime",
+                     routing_reason: str = "complexity_match_heavy_code") -> "BrainSelectionResult":
+        from backend.core.ouroboros.governance.brain_selector import BrainSelectionResult
+        return BrainSelectionResult(
+            brain_id=brain_id,
+            model_name="qwen-2.5-coder-7b",
+            fallback_model="mistral-7b",
+            routing_reason=routing_reason,
+            task_complexity="heavy_code",
+            provider_tier=provider_tier,
+        )
+
+    def _emergency_snapshot(self):
+        from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+        return ResourceSnapshot(
+            ram_percent=95.0, cpu_percent=99.0,
+            event_loop_latency_ms=200.0, disk_io_busy=True,
+        )
+
+    def test_expected_provider_matches_brain_result_not_local_pressure(self):
+        """expected_provider must reflect brain.provider_tier, never local pressure."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _expected_provider_from_brain,
+        )
+        brain = self._make_result(provider_tier="gcp_prime")
+        snap = self._emergency_snapshot()   # EMERGENCY — Mac is at 95% RAM
+
+        provider = _expected_provider_from_brain(brain)
+
+        # Must be GCP_PRIME (from brain selection), never LOCAL_CLAUDE from local pressure
+        assert "gcp" in provider.lower() or "prime" in provider.lower(), (
+            f"expected_provider={provider!r} does not reflect GCP routing — "
+            f"local EMERGENCY pressure must not change expected_provider for GCP ops"
+        )
+
+    def test_policy_reason_comes_from_routing_reason_not_pressure(self):
+        """policy_reason in RoutingIntentTelemetry must be brain.routing_reason."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _policy_reason_from_brain,
+        )
+        brain = self._make_result(routing_reason="complexity_match_heavy_code")
+        snap = self._emergency_snapshot()
+
+        reason = _policy_reason_from_brain(brain)
+
+        assert reason == "complexity_match_heavy_code", (
+            f"policy_reason={reason!r} is not from brain.routing_reason — "
+            f"local pressure level must not be the policy_reason for brain-selected routes"
+        )
+
+    def test_local_pressure_does_not_change_expected_provider(self):
+        """Under EMERGENCY local pressure, expected_provider for GCP op is still GCP."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            _expected_provider_from_brain,
+        )
+        brain_gcp = self._make_result(provider_tier="gcp_prime")
+
+        # EMERGENCY local pressure should NOT flip expected_provider to LOCAL_CLAUDE
+        provider = _expected_provider_from_brain(brain_gcp)
+        assert "local_claude" not in provider.lower(), (
+            f"expected_provider={provider!r} says LOCAL_CLAUDE for a GCP-routed op — "
+            f"local Mac EMERGENCY pressure must not poison GCP routing telemetry"
+        )
+
+
+# ---------------------------------------------------------------------------
+# G8 — routing_reason propagates end-to-end into OperationResult
+# ---------------------------------------------------------------------------
+
+class TestRoutingReasonPropagation:
+    """G8: brain.routing_reason must appear in the terminal OperationResult
+    so callers and ledger consumers can read the causal selection code."""
+
+    def test_operation_result_has_routing_reason_field(self):
+        """OperationResult must declare a routing_reason field."""
+        from backend.core.ouroboros.governance.governed_loop_service import OperationResult
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+        import inspect
+
+        fields = {f.name for f in __import__('dataclasses').fields(OperationResult)}
+        assert "routing_reason" in fields, (
+            "OperationResult missing routing_reason field — "
+            "brain selector's causal code never reaches the ledger"
+        )
+
+    def test_operation_result_routing_reason_defaults_to_empty(self):
+        """routing_reason defaults to empty string for pre-brain-selection exits."""
+        from backend.core.ouroboros.governance.governed_loop_service import OperationResult
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+
+        result = OperationResult(
+            op_id="test-op",
+            terminal_phase=OperationPhase.CANCELLED,
+            reason_code="duplicate:in_flight",
+        )
+        assert result.routing_reason == ""
+
+    def test_operation_result_carries_brain_routing_reason(self):
+        """OperationResult built after brain selection must carry routing_reason."""
+        from backend.core.ouroboros.governance.governed_loop_service import OperationResult
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+
+        result = OperationResult(
+            op_id="test-op",
+            terminal_phase=OperationPhase.COMPLETE,
+            reason_code="complete",
+            routing_reason="complexity_match_heavy_code",
+        )
+        assert result.routing_reason == "complexity_match_heavy_code"
+
+    def test_routing_reason_survives_cost_gate_queue_exit(self):
+        """When cost gate queues a heavy task, routing_reason must still be set."""
+        from backend.core.ouroboros.governance.governed_loop_service import OperationResult
+        from backend.core.ouroboros.governance.op_context import OperationPhase
+
+        result = OperationResult(
+            op_id="test-op-queued",
+            terminal_phase=OperationPhase.CANCELLED,
+            reason_code="cost_gate_triggered_queue",
+            routing_reason="cost_gate_triggered_queue",
+        )
+        assert result.routing_reason == "cost_gate_triggered_queue"
+
+
+# ---------------------------------------------------------------------------
+# G9 — Host identity normalization: no false BODY_MISMATCH
+# ---------------------------------------------------------------------------
+
+class TestHostNormalization:
+    """G9: assert_host_binding must normalize equivalent host representations
+    so localhost/127.0.0.1/http://127.0.0.1:8000 comparisons don't false-fail."""
+
+    def _ctx(self):
+        from backend.core.ouroboros.governance.telemetry_contextualizer import (
+            TelemetryContextualizer,
+        )
+        return TelemetryContextualizer()
+
+    # -- Local-to-local: all forms of localhost must match ---------
+
+    def test_localhost_equals_127_0_0_1(self):
+        """'localhost' and '127.0.0.1' are equivalent — must not raise."""
+        ctx = self._ctx()
+        _run(ctx.assert_host_binding(
+            execution_host="localhost",
+            telemetry_host="127.0.0.1",
+        ))
+
+    def test_127_0_0_1_equals_localhost(self):
+        ctx = self._ctx()
+        _run(ctx.assert_host_binding(
+            execution_host="127.0.0.1",
+            telemetry_host="localhost",
+        ))
+
+    def test_url_form_strips_scheme(self):
+        """'http://10.0.0.5:8000' and '10.0.0.5' must compare equal."""
+        ctx = self._ctx()
+        _run(ctx.assert_host_binding(
+            execution_host="http://10.0.0.5:8000",
+            telemetry_host="10.0.0.5",
+        ))
+
+    def test_port_stripped_before_comparison(self):
+        """'10.0.0.5:8000' and '10.0.0.5' must compare equal (port ignored)."""
+        ctx = self._ctx()
+        _run(ctx.assert_host_binding(
+            execution_host="10.0.0.5:8000",
+            telemetry_host="10.0.0.5",
+        ))
+
+    def test_https_scheme_stripped(self):
+        ctx = self._ctx()
+        _run(ctx.assert_host_binding(
+            execution_host="https://10.0.0.5",
+            telemetry_host="10.0.0.5",
+        ))
+
+    # -- Genuine mismatches must still raise -----------------------
+
+    def test_different_ips_still_raise(self):
+        """10.0.0.5 vs 10.0.0.6 are genuinely different — must raise BODY_MISMATCH."""
+        ctx = self._ctx()
+        with pytest.raises(RuntimeError) as exc_info:
+            _run(ctx.assert_host_binding(
+                execution_host="10.0.0.5",
+                telemetry_host="10.0.0.6",
+            ))
+        assert "BODY_MISMATCH" in str(exc_info.value)
+
+    def test_mac_vs_gcp_raises(self):
+        """Local Mac host vs GCP IP must always raise BODY_MISMATCH."""
+        ctx = self._ctx()
+        with pytest.raises(RuntimeError) as exc_info:
+            _run(ctx.assert_host_binding(
+                execution_host="10.0.0.5",        # GCP
+                telemetry_host="127.0.0.1",       # Mac local
+            ))
+        assert "BODY_MISMATCH" in str(exc_info.value)
