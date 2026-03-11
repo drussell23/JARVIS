@@ -64,6 +64,34 @@ from backend.core.ouroboros.governance.op_context import (
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Content failure classification
+# ---------------------------------------------------------------------------
+
+# Keywords that identify content/model failures vs infrastructure failures.
+# Content failures do NOT trigger FailbackFSM state transitions — the primary
+# provider is still alive; it merely produced bad output (stale diff, invalid
+# schema, etc.).  Infrastructure failures (timeout, connection error) DO
+# trigger state transitions.
+_CONTENT_FAILURE_PATTERNS: frozenset = frozenset({
+    "diff_apply_failed",
+    "stale_diff",
+    "schema_invalid",
+    "no_candidates",
+    "validate_diff",
+    "StaleDiffError",
+})
+
+
+def _is_content_failure(exc: BaseException) -> bool:
+    """Return True if *exc* is a content/model failure (not infrastructure).
+
+    Content failures: wrong diff, stale context, invalid JSON schema.
+    Infrastructure failures: timeout, connection refused, OOM.
+    """
+    msg = str(exc).lower()
+    return any(pattern.lower() in msg for pattern in _CONTENT_FAILURE_PATTERNS)
+
 
 # ---------------------------------------------------------------------------
 # CandidateProvider Protocol
@@ -172,6 +200,7 @@ class FailbackStateMachine:
         self._dwell_time_s: float = dwell_time_s
         self._consecutive_probes: int = 0
         self._first_probe_at: Optional[float] = None  # monotonic timestamp
+        self.content_failure_count: int = 0  # content/model failures (not infra)
 
     @property
     def state(self) -> FailbackState:
@@ -444,7 +473,16 @@ class CandidateGenerator:
                 type(exc).__name__,
                 exc,
             )
-            self.fsm.record_primary_failure()
+            if _is_content_failure(exc):
+                # Content failure: model produced bad output, but primary infra is healthy.
+                # Do NOT penalise the FSM — only count for observability.
+                self.fsm.content_failure_count += 1
+                logger.info(
+                    "[CandidateGenerator] Content failure (count=%d), FSM unchanged",
+                    self.fsm.content_failure_count,
+                )
+            else:
+                self.fsm.record_primary_failure()
             return await self._call_fallback(context, deadline)
 
     async def _call_primary(

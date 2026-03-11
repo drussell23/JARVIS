@@ -175,7 +175,8 @@ class GenerationResult:
     candidates: Tuple[Dict[str, Any], ...]
     provider_name: str
     generation_duration_s: float
-    model_id: str = ""  # provider model identifier; empty = not reported
+    model_id: str = ""      # provider model identifier; empty = not reported
+    is_noop: bool = False   # True when model signals change already present
 
 
 @dataclass(frozen=True)

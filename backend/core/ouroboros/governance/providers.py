@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -110,6 +111,143 @@ def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -
 def _file_source_hash(content: str) -> str:
     """Return hex SHA-256 of file content."""
     return hashlib.sha256(content.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Disease 1 Fix: StaleDiffError + validate_diff_context + is_change_needed
+# ---------------------------------------------------------------------------
+
+class StaleDiffError(ValueError):
+    """Raised when a diff's context lines don't match the actual file content.
+
+    Attributes
+    ----------
+    hunk_line:
+        1-based line number where the mismatch was detected.
+    expected_context:
+        The context lines the diff expected to find.
+    actual_lines:
+        What the file actually contains at that position.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        hunk_line: int,
+        expected_context: List[str],
+        actual_lines: List[str],
+    ) -> None:
+        super().__init__(message)
+        self.hunk_line = hunk_line
+        self.expected_context = expected_context
+        self.actual_lines = actual_lines
+
+
+def validate_diff_context(original: str, diff_text: str) -> None:
+    """Pre-apply validation gate: verify every hunk's context lines are
+    verbatim substrings of *original* BEFORE any file mutation.
+
+    This is a pure read operation — it never writes to disk.
+
+    Raises
+    ------
+    StaleDiffError
+        If any hunk's context lines cannot be located in *original*
+        (indicating the model generated against a stale or hallucinated
+        version of the file).
+    """
+    _hunk_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+    orig_lines = original.splitlines(keepends=True)
+
+    def _norm(lines: List[str]) -> List[str]:
+        return [ln.rstrip("\n\r") for ln in lines]
+
+    diff_lines = diff_text.splitlines(keepends=True)
+    i = 0
+    # Skip --- / +++ header
+    while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
+        i += 1
+
+    while i < len(diff_lines):
+        m = _hunk_re.match(diff_lines[i])
+        if m is None:
+            i += 1
+            continue
+
+        orig_start = int(m.group(1)) - 1  # 0-indexed
+        i += 1
+
+        # Collect context + removed lines (the "original" side of the hunk)
+        hunk_orig: List[str] = []
+        while i < len(diff_lines) and not _hunk_re.match(diff_lines[i]):
+            line = diff_lines[i]
+            if line.startswith("-") or line.startswith(" "):
+                hunk_orig.append(line[1:])
+            i += 1
+
+        if not hunk_orig:
+            continue
+
+        hunk_len = len(hunk_orig)
+        norm_hunk = _norm(hunk_orig)
+
+        # Exact match first
+        actual = orig_lines[orig_start:orig_start + hunk_len]
+        if _norm(actual) == norm_hunk:
+            continue
+
+        # Bounded fuzzy search (±5 lines) to tolerate minor off-by-N from LLM
+        window = int(os.environ.get("OUROBOROS_DIFF_FUZZY_WINDOW", "5"))
+        lo = max(0, orig_start - window)
+        hi = min(len(orig_lines) - hunk_len + 1, orig_start + window + 1)
+        found = -1
+        for candidate in range(lo, hi):
+            if _norm(orig_lines[candidate:candidate + hunk_len]) == norm_hunk:
+                found = candidate
+                break
+
+        if found == -1:
+            raise StaleDiffError(
+                f"Diff hunk at line {orig_start + 1} does not match source — "
+                f"model likely generated against stale/hallucinated content. "
+                f"Expected context: {hunk_orig[:2]!r}, "
+                f"got: {orig_lines[orig_start:orig_start + 2]!r}. "
+                f"Searched ±{window} lines with no match.",
+                hunk_line=orig_start + 1,
+                expected_context=hunk_orig,
+                actual_lines=orig_lines[orig_start:orig_start + hunk_len],
+            )
+
+
+def is_change_needed(file_path: Path, sentinel: str) -> bool:
+    """Return True if *sentinel* (an exact line) is NOT already present in *file_path*.
+
+    Used as a pre-generation idempotency guard: if the change is already present
+    we return a no-op GenerationResult without calling any model.
+
+    Comparison is line-exact (stripped of trailing whitespace).  A substring
+    match inside a longer line does NOT count — the sentinel must appear as a
+    standalone line.
+
+    Parameters
+    ----------
+    file_path:
+        Absolute or relative path to the file to inspect.
+    sentinel:
+        The exact line to search for (without trailing newline).
+    """
+    if not file_path.exists():
+        return True  # File doesn't exist → change definitely needed (create)
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return True  # Can't read → treat as needed
+    sentinel_stripped = sentinel.strip()
+    for line in content.splitlines():
+        if line.strip() == sentinel_stripped:
+            return False  # Exact line match found → no change needed
+    return True
 
 
 def _apply_unified_diff(original: str, diff_text: str) -> str:
@@ -508,14 +646,33 @@ Rules:
 - Only include repos that actually require changes. Omit unchanged repos.
 - No extra keys at any level. Return ONLY the JSON object."""
     elif _single_file_task:
-        # Task 4: ask for a unified diff — more token-efficient for focused edits
+        # Task 4: ask for a unified diff — more token-efficient for focused edits.
+        # Capture the source hash for the primary target file so we can embed it.
+        _primary_sha = ""
+        if ctx.target_files:
+            _ppath = Path(ctx.target_files[0])
+            _pabs = _ppath if _ppath.is_absolute() else ((repo_root or Path.cwd()) / _ppath)
+            try:
+                _primary_sha = _file_source_hash(_pabs.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                pass
+
         schema_instruction = f"""## Output Schema
+
+⚠️  CRITICAL ANCHORING REQUIREMENT ⚠️
+Your unified_diff MUST use verbatim context lines copied EXACTLY from the
+"## Source Snapshot" section above. Do NOT use your trained memory of this file.
+Count actual line numbers from the source provided — not from any cached knowledge.
+
+Idempotency check: If the required change is ALREADY PRESENT in the source shown
+above, return {{"no_op": true, "reason": "<why no change needed>"}} instead of a diff.
 
 Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_DIFF}"):
 
 ```json
 {{
   "schema_version": "{_SCHEMA_VERSION_DIFF}",
+  "source_sha256": "{_primary_sha[:12] if _primary_sha else '<first-12-chars-of-sha256-from-header>'}",
   "candidates": [
     {{
       "candidate_id": "c1",
@@ -533,13 +690,15 @@ Return a JSON object matching **exactly** this structure (schema_version: "{_SCH
 
 Rules:
 - Return 1–3 candidates. c1 = primary approach, c2 = alternative.
+- `source_sha256`: echo back the first 12 chars of the SHA-256 from the Source Snapshot header.
 - `unified_diff` must be a valid GNU unified diff (no --- / +++ header needed).
   - @@ hunk headers: `@@ -start[,count] +start[,count] @@`
   - Prefix context lines with a space, removed lines with `-`, added lines with `+`.
+  - Context lines MUST be verbatim copies from the Source Snapshot shown above.
   - Include 3 lines of unchanged context around each change.
 - The diff must apply cleanly to the source file shown above.
 - Python changes must result in syntactically valid code.
-- No extra keys at any level. Return ONLY the JSON object."""
+- No extra keys at any level. Return ONLY the JSON object (or the no_op object)."""
     else:
         schema_instruction = f"""## Output Schema
 
@@ -824,17 +983,19 @@ def _parse_generation_response(
     source_hash: str,
     source_path: str,
     repo_roots: Optional[Dict[str, Path]] = None,
+    repo_root: Optional[Path] = None,
 ) -> "GenerationResult":
     """Parse and strictly validate a generation response.
 
-    Handles schema_version 2b.1, 2b.1-diff (Task 4), and 2c.1.
+    Handles schema_version 2b.1, 2b.1-diff (Task 4), 2c.1, and no_op.
 
     Validation sequence (fail-fast):
+      0. no_op shortcut: {"no_op": true} → GenerationResult(is_noop=True)
       1. JSON parse
       2. Top-level type = dict
       3. schema_version routing:
          2c.1       → _parse_multi_repo_response
-         2b.1-diff  → apply unified diffs → rewrite as 2b.1 candidates
+         2b.1-diff  → pre-apply validation → apply unified diffs → rewrite as 2b.1
          other      → fail-fast
       4. No extra top-level keys (2b.1 only)
       5. candidates: non-empty list, len 1-3 (>3 → normalize + continue)
@@ -842,9 +1003,29 @@ def _parse_generation_response(
          SyntaxError → skip candidate; all fail → RuntimeError
       7. Compute per-candidate candidate_hash; attach source_hash, source_path
 
+    Parameters
+    ----------
+    repo_root:
+        Root path for resolving relative source_path in the 2b.1-diff branch.
+        Uses repo_root if provided, falls back to cwd only as last resort.
+
     Returns GenerationResult with validated candidates as a tuple of dicts.
     """
     pfx = provider_name
+
+    # Step 0: no_op shortcut — model signals change already present
+    try:
+        _quick = json.loads(_extract_json_block(raw))
+    except (json.JSONDecodeError, ValueError):
+        _quick = {}
+    if isinstance(_quick, dict) and _quick.get("no_op") is True:
+        logger.info("[%s] Model returned no_op: %s", pfx, _quick.get("reason", ""))
+        return GenerationResult(
+            candidates=(),
+            provider_name=pfx,
+            generation_duration_s=duration_s,
+            is_noop=True,
+        )
 
     # Step 1: JSON parse
     try:
@@ -865,13 +1046,27 @@ def _parse_generation_response(
 
     # Task 4: reconstruct full_content from unified diff before normal validation
     if actual_version == _SCHEMA_VERSION_DIFF:
+        # Resolve source path: repo_root takes precedence over cwd (Disease 7 fix)
         orig_content = ""
         if source_path:
-            sp = Path(source_path) if Path(source_path).is_absolute() else Path.cwd() / source_path
+            _sp = Path(source_path)
+            if _sp.is_absolute():
+                _resolved = _sp
+            elif repo_root is not None:
+                _resolved = (repo_root / source_path).resolve()
+            else:
+                _resolved = (Path.cwd() / source_path).resolve()
             try:
-                orig_content = sp.read_text(encoding="utf-8", errors="replace")
+                orig_content = _resolved.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 pass
+
+        if not orig_content and source_path:
+            # Can't apply diff against empty/missing source — guard against silent corruption
+            raise RuntimeError(
+                f"{pfx}_schema_invalid:diff_source_unreadable:{source_path}"
+            )
+
         raw_cands = data.get("candidates", [])
         if not isinstance(raw_cands, list) or not raw_cands:
             raise RuntimeError(f"{pfx}_schema_invalid:candidates_empty")
@@ -881,11 +1076,19 @@ def _parse_generation_response(
                 continue
             unified_diff = cand.get("unified_diff", "")
             if not unified_diff or not orig_content:
-                # No diff or no source — skip
                 logger.warning("[%s] Skipping diff candidate %s: no diff/source", pfx, cand.get("candidate_id"))
                 continue
             try:
+                # Pre-apply validation gate (Disease 1 fix): check context lines
+                # against the ACTUAL file before attempting to mutate anything.
+                validate_diff_context(orig_content, unified_diff)
                 patched = _apply_unified_diff(orig_content, unified_diff)
+            except StaleDiffError as exc:
+                logger.warning(
+                    "[%s] Stale diff rejected for %s at hunk line %d: %s",
+                    pfx, cand.get("candidate_id"), exc.hunk_line, exc,
+                )
+                continue
             except ValueError as exc:
                 logger.warning("[%s] Diff application failed for %s: %s", pfx, cand.get("candidate_id"), exc)
                 continue

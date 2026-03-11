@@ -357,6 +357,21 @@ class GovernedOrchestrator:
 
         assert generation is not None  # guaranteed by loop logic
 
+        # Short-circuit: model signalled the change is already present
+        if generation.is_noop:
+            logger.info(
+                "[Orchestrator] op=%s is_noop=True (provider=%s) — skipping APPLY",
+                ctx.op_id,
+                generation.provider_name,
+            )
+            ctx = ctx.advance(OperationPhase.COMPLETE)
+            await self._record_ledger(
+                ctx,
+                OperationState.APPLIED,
+                {"reason": "noop", "provider": generation.provider_name},
+            )
+            return ctx
+
         # Store generation result in context
         ctx = ctx.advance(OperationPhase.VALIDATE, generation=generation)
 
