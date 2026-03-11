@@ -6,6 +6,10 @@ without requiring a live server.  They are deliberately lightweight so they
 can run in CI without a GPU or a loaded model.
 """
 
+import pytest
+import yaml
+from pathlib import Path
+
 
 class TestCapabilityEndpointSchema:
     def test_capability_response_has_required_fields(self):
@@ -31,9 +35,6 @@ class TestCapabilityEndpointSchema:
         if cap["compute_class"] != "cpu":
             assert cap["gpu_layers"] == -1
 
-
-import yaml
-from pathlib import Path
 
 POLICY_PATH = Path("backend/core/ouroboros/governance/brain_selection_policy.yaml")
 
@@ -105,7 +106,6 @@ class TestComputeAdmissionGate:
         )
         capability = {"compute_class": "cpu", "host": "jarvis-prime-stable"}
         brain_cfg = {"min_compute_class": "gpu_t4", "model_artifact": "qwen.gguf"}
-        import pytest
         with pytest.raises(ComputeClassMismatch) as exc_info:
             _check_compute_admission(brain_cfg, capability)
         assert "cpu" in str(exc_info.value)
