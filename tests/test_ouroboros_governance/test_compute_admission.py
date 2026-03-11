@@ -30,3 +30,50 @@ class TestCapabilityEndpointSchema:
         cap = {"gpu_layers": -1, "compute_class": "gpu_t4"}
         if cap["compute_class"] != "cpu":
             assert cap["gpu_layers"] == -1
+
+
+import yaml
+from pathlib import Path
+
+POLICY_PATH = Path("backend/core/ouroboros/governance/brain_selection_policy.yaml")
+
+
+class TestBrainPolicyComputeClass:
+    """brain_selection_policy.yaml must have compute_class contract fields."""
+
+    @staticmethod
+    def _required_brains_as_dict(doc):
+        """Return required brains as {brain_id: cfg} regardless of list vs dict layout."""
+        raw = doc.get("brains", {}).get("required", [])
+        if isinstance(raw, list):
+            return {entry["brain_id"]: entry for entry in raw}
+        return raw  # already a dict-keyed layout
+
+    def test_policy_has_compute_class_per_brain(self):
+        """Every brain entry must have compute_class and min_compute_class."""
+        doc = yaml.safe_load(POLICY_PATH.read_text())
+        brains = self._required_brains_as_dict(doc)
+        assert brains, "No brains defined in policy"
+        for brain_id, cfg in brains.items():
+            assert "compute_class" in cfg, f"Brain {brain_id!r} missing compute_class"
+            assert "min_compute_class" in cfg, f"Brain {brain_id!r} missing min_compute_class"
+
+    def test_policy_has_model_artifact_per_brain(self):
+        """Every brain entry must have model_artifact for integrity check."""
+        doc = yaml.safe_load(POLICY_PATH.read_text())
+        brains = self._required_brains_as_dict(doc)
+        for brain_id, cfg in brains.items():
+            assert "model_artifact" in cfg, f"Brain {brain_id!r} missing model_artifact"
+
+    def test_compute_class_order_is_respected(self):
+        """min_compute_class=gpu_t4 must not route to cpu."""
+        compute_rank = {"cpu": 0, "gpu_t4": 1, "gpu_l4": 2, "gpu_v100": 3, "gpu_a100": 4}
+        doc = yaml.safe_load(POLICY_PATH.read_text())
+        brains = self._required_brains_as_dict(doc)
+        for brain_id, cfg in brains.items():
+            cc = cfg.get("compute_class", "cpu")
+            min_cc = cfg.get("min_compute_class", "cpu")
+            assert compute_rank.get(cc, 0) >= compute_rank.get(min_cc, 0), (
+                f"Brain {brain_id!r} has compute_class={cc!r} below "
+                f"min_compute_class={min_cc!r}"
+            )
