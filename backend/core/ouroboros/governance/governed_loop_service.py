@@ -708,17 +708,24 @@ class GovernedLoopService:
                                         _boot_brain_cfg = {k: v for k, v in _e.items() if k not in ("brain_id", "id")}
                                         break
                             if _boot_brain_cfg:
+                                # Boot-time: only gate on compute class (does VM have
+                                # the minimum GPU tier?).  Artifact integrity is checked
+                                # per-operation in _preflight_check() where we know
+                                # exactly which brain is being routed to — validating
+                                # the tier-1 default brain's artifact at boot would
+                                # hard-fail whenever the VM has a different model loaded
+                                # (e.g. GPU VM running qwen-7B while tier1 default is
+                                # phi3-1B).
                                 _check_compute_admission(_boot_brain_cfg, cap)
-                                _check_artifact_integrity(_boot_brain_cfg, cap)
                                 logger.info(
-                                    "[GLS] Boot-time capability validation passed for brain=%s",
+                                    "[GLS] Boot-time compute-class validation passed for brain=%s",
                                     _default_brain_id,
                                 )
-                    except (ComputeClassMismatch, ModelArtifactMismatch) as exc:
-                        logger.error("[GLS] Boot-time capability validation FAILED: %s", exc)
-                        raise  # hard fail — do not complete startup with wrong compute class
+                    except ComputeClassMismatch as exc:
+                        logger.error("[GLS] Boot-time compute-class validation FAILED: %s", exc)
+                        raise  # hard fail — do not complete startup below minimum compute class
 
-                except (ComputeClassMismatch, ModelArtifactMismatch):
+                except ComputeClassMismatch:
                     raise  # propagate hard-fail boot validation errors
                 except Exception as exc:
                     logger.warning("[GLS] Could not fetch capability (non-fatal): %s", exc)
