@@ -63,12 +63,28 @@ class TestHostBindingInvariant:
                 execution_host="some-other-host",
             )
 
-    def test_capability_host_is_execution_host(self):
-        """execution_host must come from capability['host'], not local socket.gethostname()."""
+    def test_local_host_not_substituted_for_remote_execution_host(self):
+        """execution_host must come from capability['host'], not local socket.gethostname().
+
+        If the local machine hostname were used instead of the VM's hostname,
+        the host-binding check would incorrectly pass when routing to a remote VM.
+        """
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            HostBindingViolation,
+            _check_host_binding,
+        )
         import socket
         local_hostname = socket.gethostname()
         vm_hostname = "jarvis-prime-stable"
-        capability = {"host": vm_hostname, "compute_class": "gpu_t4"}
-        execution_host = capability["host"]
-        # The invariant: execution_host is derived from capability, not local machine
-        assert execution_host == vm_hostname
+        # Simulate: telemetry and selector agree on VM, but execution_host was incorrectly
+        # set to local hostname (the bug this test guards against)
+        if local_hostname != vm_hostname:
+            with pytest.raises(HostBindingViolation):
+                _check_host_binding(
+                    telemetry_host=vm_hostname,
+                    selector_host=vm_hostname,
+                    execution_host=local_hostname,  # wrong: local host used instead of VM
+                )
+        else:
+            # If running on the VM itself, skip this assertion
+            pytest.skip("Test machine hostname matches VM hostname")

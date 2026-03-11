@@ -1082,6 +1082,15 @@ class GovernedLoopService:
                     )
                     raise
 
+                # ── Model artifact integrity check ───────────────────────────────────
+                try:
+                    _check_artifact_integrity(_brain_cfg, self._vm_capability)
+                except ModelArtifactMismatch as exc:
+                    logger.error(
+                        "[GLS] Artifact integrity DENIED for op=%s: %s", ctx.op_id, exc
+                    )
+                    raise
+
         now = datetime.now(tz=timezone.utc)
         remaining_s = (
             (ctx.pipeline_deadline - now).total_seconds()
