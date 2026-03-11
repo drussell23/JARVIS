@@ -146,27 +146,81 @@ class ProductionSafetyNet:
             self._bus.try_put(cmd)
 
     # ------------------------------------------------------------------
-    # Rollback handler (stub — extended in Task 10)
+    # Rollback handler — L3 root cause analysis (Task 10: P1.6)
     # ------------------------------------------------------------------
 
     def _on_rollback(self, event: EventEnvelope) -> None:
-        """Track rollback events for pattern analysis.
+        """Analyze rollback, emit root cause report, detect patterns.
 
-        This is a minimal implementation that records rollback history.
-        Full root cause analysis is added in Task 10.
+        For every rollback event:
+        1. Record in history and prune entries outside the configured window.
+        2. Check for a pattern: same reason repeated >= threshold times.
+        3. Classify the root cause into a known category.
+        4. Emit a REPORT_ROLLBACK_CAUSE command to L2 for attribution.
         """
-        self._rollback_history.append(
-            {
-                "op_id": event.payload.get("op_id"),
-                "brain_id": event.payload.get("brain_id"),
-                "reason": event.payload.get("rollback_reason"),
-                "ts": time.monotonic(),
-            }
-        )
-        # Prune entries older than the configured window
+        payload = event.payload
+        op_id = payload.get("op_id", "unknown")
+        reason = payload.get("rollback_reason", "unknown")
+        brain_id = payload.get("brain_id", "unknown")
+
         now = time.monotonic()
+        self._rollback_history.append({
+            "op_id": op_id,
+            "brain_id": brain_id,
+            "reason": reason,
+            "ts": now,
+        })
+
+        # Prune old entries outside the configured window
         self._rollback_history = [
-            r
-            for r in self._rollback_history
+            r for r in self._rollback_history
             if now - r["ts"] < self._config.rollback_pattern_window_s
         ]
+
+        # Check for pattern: same reason repeated
+        same_reason = [r for r in self._rollback_history if r["reason"] == reason]
+        pattern_match = len(same_reason) >= self._config.rollback_pattern_threshold
+
+        # Classify root cause
+        root_cause_class = self._classify_root_cause(reason)
+
+        cmd = CommandEnvelope(
+            source_layer="L3",
+            target_layer="L2",
+            command_type=CommandType.REPORT_ROLLBACK_CAUSE,
+            payload={
+                "op_id": op_id,
+                "root_cause_class": root_cause_class,
+                "affected_files": payload.get("affected_files", []),
+                "model_used": brain_id,
+                "pattern_match": pattern_match,
+                "similar_op_ids": [r["op_id"] for r in same_reason if r["op_id"] != op_id],
+            },
+            ttl_s=300.0,
+        )
+        self._bus.try_put(cmd)
+
+    @staticmethod
+    def _classify_root_cause(reason: str) -> str:
+        """Classify rollback reason into root cause category.
+
+        Categories:
+        - validation_failure: validation/verify step failed
+        - timeout: operation timed out
+        - syntax_error: syntax or parse error in generated code
+        - test_failure: test suite failure
+        - permission_error: permission or access denied
+        - unknown: no recognized pattern
+        """
+        reason_lower = reason.lower()
+        if "validation" in reason_lower or "validate" in reason_lower:
+            return "validation_failure"
+        if "timeout" in reason_lower:
+            return "timeout"
+        if "syntax" in reason_lower or "parse" in reason_lower:
+            return "syntax_error"
+        if "test" in reason_lower:
+            return "test_failure"
+        if "permission" in reason_lower or "access" in reason_lower:
+            return "permission_error"
+        return "unknown"
