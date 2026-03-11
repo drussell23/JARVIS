@@ -1,23 +1,27 @@
 """backend/core/ouroboros/governance/autonomy/feedback_engine.py
 
-Autonomy Feedback Engine — L2 Decision Intelligence: Curriculum Consumption.
+Autonomy Feedback Engine — L2 Decision Intelligence: Curriculum & Reactor Consumption.
 
 The FeedbackEngine is the L2 "Decision Intelligence" service.  It consumes
 signals (curriculum files, reactor events, canary outcomes) and emits advisory
 CommandEnvelopes to L1 via the CommandBus.
 
-This module implements the curriculum consumption path.  Tasks 5-7 will add
-reactor consumption, attribution scoring, and canary/brain feedback.
+This module implements the curriculum consumption path and reactor event
+consumption path.  Task 7 will add canary/brain feedback.
 
 **Single-writer invariant**: This module NEVER mutates op_context, ledger,
 filesystem content, or trust tiers directly.  It only reads signal files and
 writes advisory commands to the CommandBus plus its own cursor state.
 
 Design:
-    - Scans event_dir for ``curriculum_*.json`` files.
+    - Scans event_dir for ``curriculum_*.json`` and ``reactor_*.json`` files.
     - Tracks already-processed filenames in an in-memory set + on-disk cursor.
     - For each new curriculum file, parses ``top_k`` entries and creates
       ``GENERATE_BACKLOG_ENTRY`` commands on the CommandBus.
+    - For each new reactor file, parses the event and creates
+      ``GENERATE_BACKLOG_ENTRY`` commands for supported event types
+      (currently: ``model_promoted``).  Unknown event types are silently
+      ignored (debug-logged).
     - Cursor is persisted atomically to ``state_dir/feedback_engine_cursor.json``
       after each successful scan so that restarts skip already-seen files.
     - Malformed files are logged and skipped without crashing.
@@ -159,6 +163,61 @@ class AutonomyFeedbackEngine:
         if total_emitted > 0:
             logger.info(
                 "FeedbackEngine: curriculum scan complete — %d command(s) emitted",
+                total_emitted,
+            )
+
+        return total_emitted
+
+    async def consume_reactor_events_once(self) -> int:
+        """Scan ``event_dir`` for new reactor event files and emit backlog commands.
+
+        Returns the total number of commands successfully put onto the bus.
+
+        Supported reactor event types:
+
+        - ``model_promoted``: A newly-promoted model from the JARVIS-Reactor
+          training pipeline.  Generates a ``GENERATE_BACKLOG_ENTRY`` command so
+          that L1 can schedule validation work for the new model.
+
+        Unknown event types are silently ignored (debug-logged).  Malformed
+        files are skipped without crashing.  The cursor is persisted after
+        scanning so that restarts skip already-seen files.
+        """
+        event_dir = self._config.event_dir
+        if not event_dir.is_dir():
+            logger.warning(
+                "FeedbackEngine: event_dir does not exist: %s", event_dir,
+            )
+            return 0
+
+        # Discover reactor files
+        reactor_files = sorted(event_dir.glob("reactor_*.json"))
+
+        total_emitted = 0
+
+        for reactor_path in reactor_files:
+            filename = reactor_path.name
+
+            if filename in self._seen_files:
+                logger.debug(
+                    "FeedbackEngine: skipping already-seen reactor file %s",
+                    filename,
+                )
+                continue
+
+            emitted = self._process_reactor_file(reactor_path)
+            total_emitted += emitted
+
+            # Mark as seen regardless of whether parsing succeeded — we do not
+            # want to retry a permanently-malformed file every scan cycle.
+            self._seen_files.add(filename)
+
+        # Persist cursor after the full scan
+        self._persist_cursor()
+
+        if total_emitted > 0:
+            logger.info(
+                "FeedbackEngine: reactor scan complete — %d command(s) emitted",
                 total_emitted,
             )
 
@@ -329,6 +388,99 @@ class AutonomyFeedbackEngine:
             payload=payload,
             ttl_s=_DEFAULT_CMD_TTL_S,
         )
+
+    # ------------------------------------------------------------------
+    # Internals — reactor processing
+    # ------------------------------------------------------------------
+
+    # Reactor event types that this engine knows how to handle.
+    _SUPPORTED_REACTOR_EVENTS = frozenset({"model_promoted"})
+
+    def _process_reactor_file(self, path: Path) -> int:
+        """Parse a single reactor event file and put commands on the bus.
+
+        Returns the count of commands successfully enqueued (0 or 1).
+        """
+        try:
+            raw = path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "FeedbackEngine: failed to parse reactor file %s: %s",
+                path.name,
+                exc,
+            )
+            return 0
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "FeedbackEngine: reactor file %s is not a JSON object",
+                path.name,
+            )
+            return 0
+
+        event_type = data.get("event_type", "")
+
+        if event_type not in self._SUPPORTED_REACTOR_EVENTS:
+            logger.debug(
+                "FeedbackEngine: ignoring unknown reactor event_type=%r in %s",
+                event_type,
+                path.name,
+            )
+            return 0
+
+        # Dispatch by event type
+        if event_type == "model_promoted":
+            return self._handle_model_promoted(data, source_file=path.name)
+
+        return 0  # pragma: no cover — defensive fallback
+
+    def _handle_model_promoted(
+        self,
+        data: Dict[str, Any],
+        source_file: str,
+    ) -> int:
+        """Handle a ``model_promoted`` reactor event.
+
+        Creates a ``GENERATE_BACKLOG_ENTRY`` command so that L1 can schedule
+        validation work for the newly promoted model.
+
+        Returns 1 if the command was accepted, 0 otherwise.
+        """
+        payload: Dict[str, Any] = {
+            "description": data.get("description", ""),
+            "task_type": "code_improvement",
+            "source_event": "model_promoted",
+            "model_id": data.get("model_id", ""),
+            "previous_model_id": data.get("previous_model_id", ""),
+            "target_files": data.get("target_files", []),
+            "repo": data.get("repo", "jarvis"),
+        }
+
+        cmd = CommandEnvelope(
+            source_layer="L2",
+            target_layer="L1",
+            command_type=CommandType.GENERATE_BACKLOG_ENTRY,
+            payload=payload,
+            ttl_s=_DEFAULT_CMD_TTL_S,
+        )
+
+        accepted = self._bus.try_put(cmd)
+        if accepted:
+            logger.debug(
+                "FeedbackEngine: reactor model_promoted command enqueued "
+                "(model_id=%s, source=%s)",
+                data.get("model_id", "<unknown>"),
+                source_file,
+            )
+            return 1
+
+        logger.debug(
+            "FeedbackEngine: bus rejected reactor command from %s "
+            "(dedup or backpressure)",
+            source_file,
+        )
+        return 0
 
     # ------------------------------------------------------------------
     # Internals — cursor persistence
