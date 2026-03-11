@@ -114,6 +114,59 @@ def _check_compute_admission(brain_cfg: dict, capability: dict) -> None:
         )
 
 
+class ModelArtifactMismatch(RuntimeError):
+    """Raised when VM model_artifact doesn't match policy model_artifact."""
+
+
+def _check_artifact_integrity(brain_cfg: dict, capability: dict) -> None:
+    """Hard-fail if model loaded on VM doesn't match policy's expected artifact.
+
+    Comparison is case-insensitive to handle filesystem conventions.
+    If either artifact is unknown/empty, skips the check.
+
+    Raises:
+        ModelArtifactMismatch: if filenames don't match (case-insensitive)
+    """
+    policy_artifact = brain_cfg.get("model_artifact", "")
+    vm_artifact = capability.get("model_artifact", "")
+    if not policy_artifact or not vm_artifact:
+        return  # can't check — skip
+    if policy_artifact.lower() != vm_artifact.lower():
+        raise ModelArtifactMismatch(
+            f"Model artifact mismatch: policy expects {policy_artifact!r} "
+            f"but VM reports {vm_artifact!r}. "
+            f"Update policy or reload correct model on VM."
+        )
+
+
+class HostBindingViolation(RuntimeError):
+    """Raised when telemetry_host, selector_host, and execution_host don't all match."""
+
+
+def _check_host_binding(
+    telemetry_host: str,
+    selector_host: str,
+    execution_host: str,
+) -> None:
+    """Enforce the invariant: all three host references must be identical.
+
+    This prevents scenarios where routing selects VM-A but execution reaches VM-B,
+    or where local psutil data is incorrectly used for a remote route.
+
+    Raises:
+        HostBindingViolation: if any host differs from the others
+    """
+    hosts = {telemetry_host, selector_host, execution_host}
+    if len(hosts) > 1:
+        raise HostBindingViolation(
+            f"Host-binding invariant violated: "
+            f"telemetry_host={telemetry_host!r}, "
+            f"selector_host={selector_host!r}, "
+            f"execution_host={execution_host!r}. "
+            f"All three must be identical."
+        )
+
+
 # ---------------------------------------------------------------------------
 # Phase 4: FSM infrastructure adapters
 # ---------------------------------------------------------------------------
