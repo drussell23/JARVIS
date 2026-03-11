@@ -80,6 +80,39 @@ MIN_GENERATION_BUDGET_S: float = float(
     os.getenv("JARVIS_MIN_GENERATION_BUDGET_S", "30.0")
 )
 
+# ---------------------------------------------------------------------------
+# Compute-class admission constants and helpers
+# ---------------------------------------------------------------------------
+
+_COMPUTE_RANK: dict[str, int] = {
+    "cpu": 0,
+    "gpu_t4": 1,
+    "gpu_l4": 2,
+    "gpu_v100": 3,
+    "gpu_a100": 4,
+}
+
+
+class ComputeClassMismatch(RuntimeError):
+    """Raised when VM compute_class is below the brain's min_compute_class."""
+
+
+def _check_compute_admission(brain_cfg: dict, capability: dict) -> None:
+    """Hard-fail if VM compute_class < brain min_compute_class.
+
+    Raises ComputeClassMismatch if VM rank < brain minimum rank.
+    """
+    vm_class = capability.get("compute_class", "cpu")
+    min_class = brain_cfg.get("min_compute_class", "cpu")
+    vm_rank = _COMPUTE_RANK.get(vm_class, 0)
+    min_rank = _COMPUTE_RANK.get(min_class, 0)
+    if vm_rank < min_rank:
+        raise ComputeClassMismatch(
+            f"VM compute_class={vm_class!r} (rank {vm_rank}) is below "
+            f"brain min_compute_class={min_class!r} (rank {min_rank}). "
+            f"Route to J-Prime is denied. Upgrade VM GPU or select a lower-tier brain."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Phase 4: FSM infrastructure adapters
@@ -456,6 +489,10 @@ class GovernedLoopService:
         self._event_dir: Optional[Path] = None
         self._oracle_indexer_task: Optional[asyncio.Task] = None
         self._oracle: Optional[Any] = None
+
+        # Compute-class admission gate (set externally after fetching /v1/capability;
+        # None = gate disabled — backward-compatible default)
+        self._vm_capability: Optional[dict] = None
 
         # Concurrency & dedup
         self._active_ops: Set[str] = set()
@@ -962,6 +999,35 @@ class GovernedLoopService:
                     ctx.op_id,
                 )
                 return ctx.advance(OperationPhase.CANCELLED)
+
+        # ── Compute-class admission gate ──────────────────────────────────────
+        if self._vm_capability is not None:
+            _brain_id = (
+                ctx.telemetry.routing_intent.brain_id
+                if ctx.telemetry is not None and ctx.telemetry.routing_intent is not None
+                else None
+            )
+            if _brain_id:
+                # Policy is stored as a list under brains.required; build a lookup dict.
+                _policy = getattr(
+                    getattr(self._brain_selector, "_brain_selector", None), "_policy", {}
+                ) or {}
+                _all_brain_entries = (
+                    _policy.get("brains", {}).get("required", [])
+                    + _policy.get("brains", {}).get("optional", [])
+                )
+                _brain_cfg: dict = {}
+                for _entry in _all_brain_entries:
+                    if isinstance(_entry, dict) and _entry.get("brain_id") == _brain_id:
+                        _brain_cfg = _entry
+                        break
+                try:
+                    _check_compute_admission(_brain_cfg, self._vm_capability)
+                except ComputeClassMismatch as exc:
+                    logger.error(
+                        "[GLS] Compute admission DENIED for op=%s: %s", ctx.op_id, exc
+                    )
+                    raise
 
         now = datetime.now(tz=timezone.utc)
         remaining_s = (

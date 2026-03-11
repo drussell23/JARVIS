@@ -92,3 +92,42 @@ class TestBrainPolicyComputeClass:
                 f"Brain {brain_id!r} has compute_class={cc!r} below "
                 f"min_compute_class={min_cc!r}"
             )
+
+
+class TestComputeAdmissionGate:
+    """The admission gate enforces compute class hierarchy."""
+
+    def test_cpu_vm_rejected_for_gpu_brain(self):
+        """cpu VM is rejected for a brain requiring gpu_t4."""
+        from backend.core.ouroboros.governance.governed_loop_service import (
+            ComputeClassMismatch,
+            _check_compute_admission,
+        )
+        capability = {"compute_class": "cpu", "host": "jarvis-prime-stable"}
+        brain_cfg = {"min_compute_class": "gpu_t4", "model_artifact": "qwen.gguf"}
+        import pytest
+        with pytest.raises(ComputeClassMismatch) as exc_info:
+            _check_compute_admission(brain_cfg, capability)
+        assert "cpu" in str(exc_info.value)
+        assert "gpu_t4" in str(exc_info.value)
+
+    def test_gpu_vm_accepted_for_gpu_brain(self):
+        """gpu_t4 VM is accepted for a brain requiring gpu_t4."""
+        from backend.core.ouroboros.governance.governed_loop_service import _check_compute_admission
+        capability = {"compute_class": "gpu_t4", "host": "jarvis-prime-stable"}
+        brain_cfg = {"min_compute_class": "gpu_t4", "model_artifact": "qwen.gguf"}
+        _check_compute_admission(brain_cfg, capability)  # must not raise
+
+    def test_cpu_vm_accepted_for_cpu_brain(self):
+        """cpu VM is accepted for a cpu brain."""
+        from backend.core.ouroboros.governance.governed_loop_service import _check_compute_admission
+        capability = {"compute_class": "cpu", "host": "jarvis-prime-stable"}
+        brain_cfg = {"min_compute_class": "cpu", "model_artifact": "llama-1b.gguf"}
+        _check_compute_admission(brain_cfg, capability)  # must not raise
+
+    def test_higher_gpu_class_satisfies_lower_min(self):
+        """gpu_l4 VM satisfies gpu_t4 min_compute_class."""
+        from backend.core.ouroboros.governance.governed_loop_service import _check_compute_admission
+        capability = {"compute_class": "gpu_l4", "host": "jarvis-prime-stable"}
+        brain_cfg = {"min_compute_class": "gpu_t4", "model_artifact": "qwen.gguf"}
+        _check_compute_admission(brain_cfg, capability)  # must not raise
