@@ -33,6 +33,8 @@ from typing import Any, Dict, List, Optional, Set
 from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     CommandEnvelope,
     CommandType,
+    EventEnvelope,
+    EventType,
 )
 from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
 
@@ -43,6 +45,12 @@ _DEFAULT_CMD_TTL_S: float = 1800.0
 
 # Cursor filename (lives in state_dir).
 _CURSOR_FILENAME: str = "feedback_engine_cursor.json"
+
+# Minimum number of records required to score a brain's attribution.
+_MIN_ATTRIBUTION_SAMPLE_SIZE: int = 3
+
+# Default time window (hours) for attribution record queries.
+_DEFAULT_ATTRIBUTION_WINDOW_HOURS: float = 24.0
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +163,93 @@ class AutonomyFeedbackEngine:
             )
 
         return total_emitted
+
+    async def score_attribution_once(self, persistence: Any) -> None:
+        """Score model attribution for each active brain and emit events.
+
+        For each active brain_id returned by ``persistence.get_active_brain_ids()``,
+        fetches outcome records via ``persistence.get_records_by_model_and_task()``,
+        computes a success rate, and emits an ``ATTRIBUTION_SCORED`` event through
+        the event emitter.
+
+        Parameters
+        ----------
+        persistence:
+            Duck-typed object with async methods:
+            - ``get_active_brain_ids() -> List[str]``
+            - ``get_records_by_model_and_task(brain_id, window_hours) -> List[dict]``
+
+        Fault isolation:
+            If *persistence* raises at any point, the error is logged as a
+            warning and does not propagate.  Individual brain failures do not
+            prevent scoring of other brains.
+        """
+        if self._event_emitter is None:
+            return
+
+        try:
+            brain_ids = await persistence.get_active_brain_ids()
+        except Exception:
+            logger.warning(
+                "FeedbackEngine: persistence.get_active_brain_ids() raised — "
+                "skipping attribution scoring",
+                exc_info=True,
+            )
+            return
+
+        window_hours = _DEFAULT_ATTRIBUTION_WINDOW_HOURS
+
+        for brain_id in brain_ids:
+            try:
+                records = await persistence.get_records_by_model_and_task(
+                    brain_id,
+                    window_hours=window_hours,
+                )
+            except Exception:
+                logger.warning(
+                    "FeedbackEngine: failed to fetch records for brain_id=%s — "
+                    "skipping",
+                    brain_id,
+                    exc_info=True,
+                )
+                continue
+
+            sample_size = len(records)
+            if sample_size < _MIN_ATTRIBUTION_SAMPLE_SIZE:
+                logger.debug(
+                    "FeedbackEngine: brain_id=%s has %d record(s), below "
+                    "minimum %d — skipping attribution",
+                    brain_id,
+                    sample_size,
+                    _MIN_ATTRIBUTION_SAMPLE_SIZE,
+                )
+                continue
+
+            success_count = sum(
+                1 for r in records if r.get("outcome") == "success"
+            )
+            success_rate = success_count / sample_size
+
+            event = EventEnvelope(
+                source_layer="L2",
+                event_type=EventType.ATTRIBUTION_SCORED,
+                payload={
+                    "brain_id": brain_id,
+                    "success_rate": success_rate,
+                    "sample_size": sample_size,
+                    "window_hours": window_hours,
+                },
+            )
+
+            await self._event_emitter.emit(event)
+
+            logger.debug(
+                "FeedbackEngine: attribution scored for brain_id=%s — "
+                "success_rate=%.3f sample_size=%d",
+                brain_id,
+                success_rate,
+                sample_size,
+            )
 
     # ------------------------------------------------------------------
     # Internals — curriculum processing
