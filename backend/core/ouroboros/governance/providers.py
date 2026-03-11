@@ -51,7 +51,19 @@ _CODEGEN_SYSTEM_PROMPT = (
     "For cross-repo requests (where the prompt specifies schema_version 2c.1) "
     "respond with schema_version 2c.1 and a patches dict keyed by repo name. "
     "You MUST respond with valid JSON only. "
-    "No markdown preamble, no explanations outside the JSON. Only the JSON object."
+    "No markdown preamble, no explanations outside the JSON. Only the JSON object. "
+    # Diff-anchoring mandate — critical for small models that default to trained memory
+    "DIFF ANCHORING RULES: When generating unified_diff output, context lines MUST be "
+    "verbatim copies of lines from the ## Source Snapshot provided in the prompt. "
+    "Do NOT reconstruct context lines from your training data or memory of what the "
+    "file 'should' contain. Copy them exactly from the provided source. "
+    "If the requested change is already present in the source file, return "
+    '{"schema_version": "2b.1-noop", "reason": "<why already done>"} instead of a diff.'
+    + (
+        " " + os.environ["JARVIS_CODEGEN_SYSTEM_PROMPT_EXTRA"]
+        if os.environ.get("JARVIS_CODEGEN_SYSTEM_PROMPT_EXTRA")
+        else ""
+    )
 )
 
 # ── Phase 2B: size/security constants ────────────────────────────────────
@@ -463,6 +475,7 @@ def _build_codegen_prompt(
     repo_root: Optional[Path] = None,
     repo_roots: Optional[Dict[str, Path]] = None,
     tools_enabled: bool = False,
+    max_prompt_tokens: Optional[int] = None,
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
@@ -745,7 +758,22 @@ Rules:
     if tools_enabled:
         parts.append(_build_tool_section())
     parts.append(schema_instruction)
-    return "\n\n".join(parts)
+    prompt = "\n\n".join(parts)
+
+    # N7: Prompt-size gate — prevent silent context-window truncation.
+    # Estimate: 4 chars ≈ 1 token (conservative for code/text mix).
+    _limit = max_prompt_tokens
+    if _limit is None:
+        _limit = int(os.environ.get("JPRIME_MAX_PROMPT_TOKENS", "0")) or None
+    if _limit is not None:
+        _estimated_tokens = len(prompt) // 4
+        if _estimated_tokens > _limit:
+            raise RuntimeError(
+                f"prompt_too_large:{_estimated_tokens}_tokens_estimated"
+                f"_limit_{_limit}"
+            )
+
+    return prompt
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +785,7 @@ def _try_reconstruct_from_ellipsis(
     full_content: str,
     source_path: str,
     max_change_chars: int = 500,
+    repo_root: Optional[Path] = None,
 ) -> Optional[str]:
     """Reconstruct full file content when a small model outputs '...\\n[change]\\n...'
 
@@ -796,10 +825,11 @@ def _try_reconstruct_from_ellipsis(
     if not source_path:
         return None
     try:
+        _sp = Path(source_path)
         abs_path = (
-            Path(source_path)
-            if Path(source_path).is_absolute()
-            else Path.cwd() / source_path
+            _sp
+            if _sp.is_absolute()
+            else (repo_root or Path.cwd()) / source_path
         )
         if not abs_path.exists():
             return None
@@ -818,6 +848,62 @@ def _try_reconstruct_from_ellipsis(
     if not original.endswith("\n"):
         original += "\n"
     return original + remainder + "\n"
+
+
+# ---------------------------------------------------------------------------
+# Reactor Core feedback — fire-and-forget content failure telemetry
+# ---------------------------------------------------------------------------
+
+
+async def _reactor_http_post(url: str, payload: dict, timeout_s: float = 3.0) -> None:
+    """Low-level HTTP POST to Reactor Core telemetry endpoint.
+
+    Separated from the main emit function so tests can patch it directly.
+    Raises on network errors — callers must swallow exceptions.
+    """
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                url,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status >= 500:
+                    logger.debug("[ReactorFeedback] Server error %d", resp.status)
+    except ImportError:
+        import urllib.request
+        import json as _json
+        data = _json.dumps(payload).encode()
+        req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+        try:
+            urllib.request.urlopen(req, timeout=timeout_s)
+        except Exception:
+            pass
+
+
+async def _emit_content_failure_to_reactor(payload: dict) -> None:
+    """Fire-and-forget telemetry emission to Reactor Core on content failures.
+
+    Never raises — all exceptions are swallowed.  The signal is best-effort:
+    if Reactor Core is offline the failure is logged at DEBUG level only.
+
+    Controlled by OUROBOROS_REACTOR_FEEDBACK_ENABLED env var (default: true).
+    Target URL read from JARVIS_REACTOR_URL (default: http://localhost:8090).
+    Endpoint: OUROBOROS_REACTOR_FEEDBACK_ENDPOINT (overrides default URL+path).
+    """
+    if os.environ.get("OUROBOROS_REACTOR_FEEDBACK_ENABLED", "true").lower() != "true":
+        return
+    reactor_url = os.environ.get("JARVIS_REACTOR_URL", "http://localhost:8090")
+    endpoint = os.environ.get(
+        "OUROBOROS_REACTOR_FEEDBACK_ENDPOINT",
+        f"{reactor_url}/v1/telemetry/events",
+    )
+    timeout_s = float(os.environ.get("OUROBOROS_REACTOR_FEEDBACK_TIMEOUT_S", "3.0"))
+    try:
+        await _reactor_http_post(endpoint, payload, timeout_s=timeout_s)
+    except Exception as exc:
+        logger.debug("[ReactorFeedback] Emission failed (non-fatal): %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -1088,6 +1174,32 @@ def _parse_generation_response(
                     "[%s] Stale diff rejected for %s at hunk line %d: %s",
                     pfx, cand.get("candidate_id"), exc.hunk_line, exc,
                 )
+                # D8: fire-and-forget feedback to Reactor Core for model quality tracking
+                try:
+                    import asyncio as _asyncio
+                    _loop = _asyncio.get_event_loop()
+                    if _loop.is_running():
+                        _loop.create_task(_emit_content_failure_to_reactor({
+                            "event_type": "CUSTOM",
+                            "source": "ouroboros.providers",
+                            "data": {
+                                "failure_type": "content_quality",
+                                "failure_subtype": "stale_diff",
+                                "provider": pfx,
+                                "op_id": getattr(ctx, "op_id", ""),
+                                "source_sha256": source_hash,
+                                "candidate_id": cand.get("candidate_id", ""),
+                                "error": str(exc),
+                                "target_file": source_path,
+                                "hunk_line": exc.hunk_line,
+                            },
+                            "labels": {
+                                "provider": pfx,
+                                "failure_class": "content",
+                            },
+                        }))
+                except Exception:
+                    pass  # never block on feedback emission
                 continue
             except ValueError as exc:
                 logger.warning("[%s] Diff application failed for %s: %s", pfx, cand.get("candidate_id"), exc)
@@ -1203,9 +1315,10 @@ def _parse_generation_response(
         # to reconstruct the full file before rejecting.
         if source_path:
             try:
+                _sp2 = Path(source_path)
                 _orig_path = (
-                    Path(source_path) if Path(source_path).is_absolute()
-                    else Path.cwd() / source_path
+                    _sp2 if _sp2.is_absolute()
+                    else (repo_root or Path.cwd()) / source_path
                 )
                 if _orig_path.exists():
                     _orig_len = _orig_path.stat().st_size
@@ -1213,7 +1326,7 @@ def _parse_generation_response(
                     if _orig_len > 200 and _cand_len < _orig_len * 0.5:
                         # Attempt ellipsis reconstruction before discarding
                         _reconstructed = _try_reconstruct_from_ellipsis(
-                            full_content, source_path
+                            full_content, source_path, repo_root=repo_root
                         )
                         if _reconstructed:
                             logger.info(
@@ -1432,6 +1545,7 @@ class PrimeProvider:
                 source_hash,
                 source_path,
                 repo_roots=self._repo_roots,
+                repo_root=self._repo_root,
             )
 
             logger.info(
@@ -1677,6 +1791,7 @@ class ClaudeProvider:
                 source_hash,
                 source_path,
                 repo_roots=self._repo_roots,
+                repo_root=self._repo_root,
             )
 
             logger.info(

@@ -137,6 +137,27 @@ async def _mock_safe_say(text: str, source: str = "ouroboros") -> bool:
 
 
 async def ignite() -> None:
+    # N5: Save the target file so we can restore it after the run.
+    # This makes the ignition test idempotent — every run starts from the same
+    # baseline and the shared repo file is not permanently mutated.
+    _target_abs = REPO_ROOT / TARGET_FILE
+    _target_original_content: "str | None" = None
+    if _target_abs.exists():
+        _target_original_content = _target_abs.read_text(encoding="utf-8")
+        log.info("  [N5] Saved %s for post-run restore", TARGET_FILE)
+
+    try:
+        await _ignite_inner()
+    finally:
+        if _target_original_content is not None:
+            try:
+                _target_abs.write_text(_target_original_content, encoding="utf-8")
+                log.info("  [N5] Restored %s to baseline (ephemeral fixture)", TARGET_FILE)
+            except OSError as _e:
+                log.warning("  [N5] Could not restore %s: %s", TARGET_FILE, _e)
+
+
+async def _ignite_inner() -> None:
     from backend.core.ouroboros.governance.integration import (
         GovernanceConfig,
         create_governance_stack,
