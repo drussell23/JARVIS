@@ -327,6 +327,11 @@ class GovernedOrchestrator:
                 )
                 generation = await self._generator.generate(ctx, deadline)
 
+                # is_noop=True means the model signalled the change is already present.
+                # Empty candidates is correct in this case — do not treat as a failure.
+                if generation is not None and generation.is_noop:
+                    break
+
                 if generation is None or len(generation.candidates) == 0:
                     generation = None
                     raise RuntimeError("no_candidates_returned")
@@ -364,7 +369,7 @@ class GovernedOrchestrator:
                 ctx.op_id,
                 generation.provider_name,
             )
-            ctx = ctx.advance(OperationPhase.COMPLETE)
+            ctx = ctx.advance(OperationPhase.COMPLETE, generation=generation)
             await self._record_ledger(
                 ctx,
                 OperationState.APPLIED,

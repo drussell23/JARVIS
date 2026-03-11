@@ -522,3 +522,61 @@ class TestReactorCoreFeedback:
             "when a StaleDiffError is caught, so Reactor Core can track content "
             "quality failures for fine-tuning."
         )
+
+
+# ---------------------------------------------------------------------------
+# N8 — schema_version 2b.1-noop not parsed as is_noop=True
+# ---------------------------------------------------------------------------
+
+class TestNoopSchemaVersionParsing:
+    """_parse_generation_response must recognise schema_version '2b.1-noop' as a
+    successful noop result (is_noop=True), NOT raise schema_invalid.
+
+    Root cause: the noop check at step 0 only handles {"no_op": true} (legacy key).
+    J-Prime now emits {"schema_version": "2b.1-noop", "reason": "..."} which falls
+    through to the wrong_schema_version branch and raises RuntimeError.
+    """
+
+    def _call_parse(self, raw: str, provider: str = "gcp-jprime") -> "GenerationResult":
+        from backend.core.ouroboros.governance.providers import _parse_generation_response
+        from backend.core.ouroboros.governance.op_context import OperationContext
+        ctx = OperationContext.create(target_files=("docs/x.md",), description="test", primary_repo="jarvis")
+        return _parse_generation_response(
+            raw, provider_name=provider, duration_s=0.1,
+            ctx=ctx, source_hash="deadbeef", source_path="docs/x.md",
+        )
+
+    def test_noop_schema_version_returns_is_noop_true(self) -> None:
+        """schema_version '2b.1-noop' must yield GenerationResult(is_noop=True)."""
+        raw = json.dumps({
+            "schema_version": "2b.1-noop",
+            "reason": "The comment is already present at the end of the file.",
+        })
+        result = self._call_parse(raw)
+        assert result.is_noop is True, (
+            "_parse_generation_response must return is_noop=True when "
+            "schema_version is '2b.1-noop'. "
+            f"Got: is_noop={result.is_noop}"
+        )
+
+    def test_noop_schema_version_wrapped_in_code_fence(self) -> None:
+        """2b.1-noop inside a markdown code fence (as J-Prime returns) must work."""
+        raw = (
+            "```json\n"
+            '{"schema_version": "2b.1-noop", "reason": "Already done."}\n'
+            "```"
+        )
+        result = self._call_parse(raw)
+        assert result.is_noop is True
+
+    def test_noop_schema_version_has_empty_candidates(self) -> None:
+        """is_noop result must have an empty candidates tuple, not raise."""
+        raw = json.dumps({"schema_version": "2b.1-noop", "reason": "Present."})
+        result = self._call_parse(raw)
+        assert result.candidates == () or result.candidates is None or len(result.candidates) == 0
+
+    def test_noop_schema_version_preserves_provider_name(self) -> None:
+        """provider_name must be propagated into the is_noop GenerationResult."""
+        raw = json.dumps({"schema_version": "2b.1-noop", "reason": "x"})
+        result = self._call_parse(raw, provider="gcp-jprime")
+        assert result.provider_name == "gcp-jprime"

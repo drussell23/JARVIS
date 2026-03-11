@@ -1220,6 +1220,16 @@ def _parse_generation_response(
         }
         actual_version = _SCHEMA_VERSION
 
+    # schema_version "2b.1-noop" — model signals the change is already present
+    if actual_version == "2b.1-noop":
+        logger.info("[%s] Model returned 2b.1-noop: %s", pfx, data.get("reason", ""))
+        return GenerationResult(
+            candidates=(),
+            provider_name=pfx,
+            generation_duration_s=duration_s,
+            is_noop=True,
+        )
+
     if actual_version != _SCHEMA_VERSION:
         raise RuntimeError(
             f"{pfx}_schema_invalid:wrong_schema_version:{actual_version}"

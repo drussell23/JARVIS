@@ -101,6 +101,7 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
         OperationPhase.VALIDATE,
         OperationPhase.GENERATE_RETRY,
         OperationPhase.CANCELLED,
+        OperationPhase.COMPLETE,   # noop fast-path: model signals change already present
     },
     OperationPhase.GENERATE_RETRY: {
         OperationPhase.VALIDATE,
