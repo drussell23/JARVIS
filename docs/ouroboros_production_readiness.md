@@ -108,4 +108,4 @@ Fix required: Implement LRU eviction for unused graph nodes.
 ---
 
 *Logged: 2026-03-10. Authors: Claude Code + Ouroboros Architecture Review.*
-<!-- monitored by Ouroboros -->
+<!-- monitored by Ouroboros --><!-- monitored by Ouroboros -->
