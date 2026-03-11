@@ -21,6 +21,7 @@ from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     CommandType,
     EventEnvelope,
     EventType,
+    _deterministic_key,
 )
 from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
 from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
@@ -219,6 +220,52 @@ class ProductionSafetyNet:
                 ttl_s=300.0,
             )
             self._bus.try_put(incident_cmd)
+
+    # ------------------------------------------------------------------
+    # Human presence signal — L3 → L1 (Task 12: P1.8)
+    # ------------------------------------------------------------------
+
+    def signal_human_presence(self, is_active: bool, activity_type: str = "unknown") -> None:
+        """Signal human presence to L1 submit gate.
+
+        When *is_active* is ``True``, a ``defer_until_ns`` timestamp is
+        included so that L1 can defer autonomous operations while a human
+        is actively working.  When ``False``, ``defer_until_ns`` is ``0``
+        (no deferral).
+
+        Idempotency is keyed on ``(is_active, activity_type)`` so that
+        repeated signals with the same logical state are deduplicated by
+        the :class:`CommandBus`, even though ``defer_until_ns`` varies
+        between calls.
+        """
+        defer_until = (
+            time.monotonic_ns() + int(self._config.human_presence_defer_s * 1e9)
+            if is_active
+            else 0
+        )
+        # Build a stable idempotency key from the logical signal identity
+        # (source, target, type, is_active, activity_type) so that the
+        # volatile defer_until_ns timestamp does not break dedup.
+        stable_payload = {
+            "is_active": is_active,
+            "activity_type": activity_type,
+        }
+        idemp_key = _deterministic_key(
+            "L3", "L1", CommandType.SIGNAL_HUMAN_PRESENCE, stable_payload,
+        )
+        cmd = CommandEnvelope(
+            source_layer="L3",
+            target_layer="L1",
+            command_type=CommandType.SIGNAL_HUMAN_PRESENCE,
+            payload={
+                "is_active": is_active,
+                "activity_type": activity_type,
+                "defer_until_ns": defer_until,
+            },
+            ttl_s=300.0,
+            idempotency_key=idemp_key,
+        )
+        self._bus.try_put(cmd)
 
     @staticmethod
     def _classify_root_cause(reason: str) -> str:
