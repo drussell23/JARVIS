@@ -75,6 +75,10 @@ from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     EventEnvelope as AutonomyEventEnvelope,
     EventType as AutonomyEventType,
 )
+from backend.core.ouroboros.governance.autonomy.safety_net import (
+    ProductionSafetyNet,
+    SafetyNetConfig,
+)
 
 try:
     from backend.core.ouroboros.oracle import TheOracle as TheOracle
@@ -623,6 +627,7 @@ class GovernedLoopService:
         self._feedback_engine: Optional[AutonomyFeedbackEngine] = None
         self._command_consumer_task: Optional[asyncio.Task] = None
         self._feedback_loop_task: Optional[asyncio.Task] = None
+        self._safety_net: Optional[ProductionSafetyNet] = None
 
         # Compute-class admission gate (set externally after fetching /v1/capability;
         # None = gate disabled — backward-compatible default)
@@ -815,6 +820,13 @@ class GovernedLoopService:
             self._command_consumer_task = asyncio.create_task(
                 self._command_consumer_loop(), name="command_consumer_loop"
             )
+
+            # C+ L3: ProductionSafetyNet
+            self._safety_net = ProductionSafetyNet(
+                command_bus=self._command_bus,
+                config=SafetyNetConfig(),
+            )
+            self._safety_net.register_event_handlers(self._event_emitter)
 
             # Determine state based on provider availability
             if self._generator is not None:
@@ -1872,6 +1884,7 @@ class GovernedLoopService:
                 if self._generator is not None:
                     provider = getattr(self._generator, "_primary", None)
                     if provider is not None:
+                        ok = False  # default to failure
                         try:
                             ok = await asyncio.wait_for(
                                 provider.health_probe(), timeout=5.0
@@ -1891,6 +1904,21 @@ class GovernedLoopService:
                                 self._generator.fsm.record_primary_failure()
                             except Exception:
                                 pass
+                        # C+ L1: Emit health probe result to SafetyNet (L3)
+                        if self._event_emitter is not None:
+                            try:
+                                await self._event_emitter.emit(AutonomyEventEnvelope(
+                                    source_layer="L1",
+                                    event_type=AutonomyEventType.HEALTH_PROBE_RESULT,
+                                    payload={
+                                        "provider": "gcp-jprime",
+                                        "success": ok,
+                                        "latency_ms": 0,
+                                        "consecutive_failures": 0,
+                                    },
+                                ))
+                            except Exception:
+                                pass  # fault-isolated
             except asyncio.CancelledError:
                 return
             except Exception as exc:
@@ -2049,5 +2077,12 @@ class GovernedLoopService:
         elif ct == AutonomyCommandType.REQUEST_MODE_SWITCH:
             logger.warning("[GovernedLoop] L3 mode switch: %s (reason: %s)",
                            cmd.payload.get("target_mode"), cmd.payload.get("reason"))
+        elif ct == AutonomyCommandType.REPORT_ROLLBACK_CAUSE:
+            logger.info("[GovernedLoop] L3 rollback analysis: op=%s cause=%s pattern=%s",
+                        cmd.payload.get("op_id"), cmd.payload.get("root_cause_class"),
+                        cmd.payload.get("pattern_match"))
+        elif ct == AutonomyCommandType.SIGNAL_HUMAN_PRESENCE:
+            logger.info("[GovernedLoop] L3 human presence: active=%s type=%s",
+                        cmd.payload.get("is_active"), cmd.payload.get("activity_type"))
         else:
             logger.debug("[GovernedLoop] Unhandled command: %s", ct)
