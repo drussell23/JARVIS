@@ -2135,9 +2135,19 @@ $JARVIS_DIR/venv/bin/python -c "import transformers; print(f'   ✅ Transformers
     BUILD_ERRORS=$((BUILD_ERRORS + 1))
 }}
 
-$JARVIS_DIR/venv/bin/python -c "import llama_cpp; print('   ✅ llama-cpp-python: OK')" 2>&1 | tee -a "$LOG_FILE" || {{
-    log "   ⚠️  llama-cpp-python not importable (optional)"
-}}
+$JARVIS_DIR/venv/bin/python - <<'PYEOF' 2>&1 | tee -a "$LOG_FILE"
+import sys
+try:
+    import llama_cpp
+    m = llama_cpp.llama_cpp
+    lib_path = getattr(m._lib, "_name", None) or str(m._base_path)
+    gpu_offload = bool(m.llama_supports_gpu_offload())
+    print(f"   \u2705 llama-cpp-python {llama_cpp.__version__} | lib: {lib_path} | gpu_offload: {gpu_offload}")
+except ImportError:
+    print("   \u26a0\ufe0f  llama-cpp-python not importable (optional)")
+except Exception as e:
+    print(f"   \u26a0\ufe0f  llama-cpp-python check error: {e}")
+PYEOF
 
 # Check 3: JARVIS-Prime code present
 if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
