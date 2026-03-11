@@ -108,6 +108,36 @@ class SagaState:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class ConsensusResult:
+    """Result of a multi-brain consensus vote.
+
+    Attributes
+    ----------
+    op_id:
+        The operation identifier the vote pertains to.
+    votes:
+        Mapping of ``{brain_name: "approve"|"reject"}``.
+    majority:
+        ``True`` if strictly more than half the votes are ``"approve"``.
+    approved_count:
+        Number of ``"approve"`` votes.
+    total_count:
+        Total number of votes cast.
+    """
+
+    op_id: str
+    votes: Dict[str, str]
+    majority: bool
+    approved_count: int
+    total_count: int
+
+
+# ---------------------------------------------------------------------------
+# AdvancedAutonomyService — L4 advisory coordinator
+# ---------------------------------------------------------------------------
+
+
 class AdvancedAutonomyService:
     """L4 — Advanced Coordination. Advisory only.
 
@@ -288,3 +318,65 @@ class AdvancedAutonomyService:
         logger.info(
             "[AdvancedCoord] Submitted saga %s to command bus", saga_id
         )
+
+    def record_vote(
+        self,
+        op_id: str,
+        candidates: List[str],
+        votes: Dict[str, str],
+    ) -> ConsensusResult:
+        """Record multi-brain votes and emit consensus result.
+
+        Each brain casts an ``"approve"`` or ``"reject"`` vote.  A majority
+        requires strictly more than half the votes to be ``"approve"``.
+        The result is emitted as a ``REPORT_CONSENSUS`` command to L1.
+
+        Parameters
+        ----------
+        op_id:
+            Operation identifier the vote pertains to.
+        candidates:
+            List of candidate identifiers being voted on.
+        votes:
+            Mapping of ``{brain_name: "approve"|"reject"}``.
+
+        Returns
+        -------
+        ConsensusResult
+            Aggregated vote result including majority determination.
+        """
+        approved = sum(1 for v in votes.values() if v == "approve")
+        total = len(votes)
+        majority = approved > total / 2
+
+        result = ConsensusResult(
+            op_id=op_id,
+            votes=votes,
+            majority=majority,
+            approved_count=approved,
+            total_count=total,
+        )
+
+        cmd = CommandEnvelope(
+            source_layer="L4",
+            target_layer="L1",
+            command_type=CommandType.REPORT_CONSENSUS,
+            payload={
+                "op_id": op_id,
+                "candidates": candidates,
+                "votes": votes,
+                "majority": majority,
+            },
+            ttl_s=300.0,
+        )
+        self._bus.try_put(cmd)
+
+        logger.info(
+            "[AdvancedCoord] Consensus for op %s: %d/%d approve, majority=%s",
+            op_id,
+            approved,
+            total,
+            majority,
+        )
+
+        return result
