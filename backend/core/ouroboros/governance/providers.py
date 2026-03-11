@@ -1463,12 +1463,23 @@ class PrimeProvider:
         repo_root = self._repo_root or Path.cwd()
         executor = None  # created lazily on first tool call
 
+        # Determine force_full_content from brain's schema_capability in routing telemetry.
+        # "full_content_only" → True (models ≤14B can't produce verbatim diffs)
+        # "full_content_and_diff" → False (32B+ can produce unified diffs)
+        # Default True (conservative) if telemetry unavailable.
+        _schema_cap = "full_content_only"
+        if context.telemetry and context.telemetry.routing_intent:
+            _schema_cap = getattr(
+                context.telemetry.routing_intent, "schema_capability", "full_content_only"
+            )
+        _force_full = _schema_cap != "full_content_and_diff"
+
         prompt = _build_codegen_prompt(
             context,
             repo_root=self._repo_root,
             repo_roots=self._repo_roots,
             tools_enabled=self._tools_enabled,
-            force_full_content=True,  # 7B models can't generate verbatim diff context lines
+            force_full_content=_force_full,
         )
         accumulated_chars = len(prompt)
         tool_rounds = 0

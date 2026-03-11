@@ -1,7 +1,7 @@
-schema_version: "1.0.0"
-contract_version: "1.0.0"
-policy_id: "brain-selection-policy-v1"
-generated_at_utc: "2026-03-10T00:00:00Z"
+schema_version: "1.1.0"
+contract_version: "1.1.0"
+policy_id: "brain-selection-policy-v2"
+generated_at_utc: "2026-03-11T00:00:00Z"
 
 # Supervisor enforces this policy against runtime inventory at boot.
 handshake:
@@ -54,10 +54,11 @@ brains:
       model_name: "qwen-2.5-coder-7b"
       gguf_file: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"   # legacy: use model_artifact (canonical for admission gate)
       required_capabilities: ["code_generation", "code_refactor"]
+      schema_capability: "full_content_only"   # 7B can't produce verbatim unified diffs
       routable: true
-      allowed_task_classes: ["tier2", "tier3"]
+      allowed_task_classes: ["tier1", "tier2"]
       cost_class: "low"
-      latency_class: "medium"
+      latency_class: "low"
       max_prompt_tokens: 8192
       max_output_tokens: 2048
       temperature: 0.2
@@ -65,11 +66,46 @@ brains:
       min_compute_class: "gpu_t4"
       model_artifact: "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
 
+    - brain_id: "qwen_coder_14b"
+      provider: "gcp_prime"
+      model_name: "qwen-2.5-coder-14b"
+      gguf_file: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf"
+      required_capabilities: ["code_generation", "code_refactor"]
+      schema_capability: "full_content_only"   # 14B still not reliable for verbatim diffs
+      routable: true
+      allowed_task_classes: ["tier2", "tier3"]
+      cost_class: "low"
+      latency_class: "medium"
+      max_prompt_tokens: 12288
+      max_output_tokens: 3072
+      temperature: 0.2
+      compute_class: "gpu_l4"
+      min_compute_class: "gpu_t4"
+      model_artifact: "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf"
+
+    - brain_id: "qwen_coder_32b"
+      provider: "gcp_prime"
+      model_name: "qwen-2.5-coder-32b"
+      gguf_file: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf"
+      required_capabilities: ["code_generation", "code_refactor", "complex_reasoning", "architecture_analysis"]
+      schema_capability: "full_content_and_diff"   # 32B can produce verbatim unified diffs
+      routable: true
+      allowed_task_classes: ["tier2", "tier3"]
+      cost_class: "medium"
+      latency_class: "high"
+      max_prompt_tokens: 16384
+      max_output_tokens: 4096
+      temperature: 0.2
+      compute_class: "gpu_l4"
+      min_compute_class: "gpu_l4"
+      model_artifact: "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf"
+
     - brain_id: "deepseek_r1"
       provider: "gcp_prime"
       model_name: "deepseek-r1-qwen-7b"
       gguf_file: "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf"   # legacy: use model_artifact (canonical for admission gate)
       required_capabilities: ["complex_reasoning", "architecture_analysis"]
+      schema_capability: "full_content_only"   # 7B can't produce verbatim unified diffs
       routable: true
       allowed_task_classes: ["tier3"]
       cost_class: "low"
@@ -103,6 +139,8 @@ allowlist:
   allowed_brain_ids:
     - "phi3_lightweight"
     - "qwen_coder"
+    - "qwen_coder_14b"
+    - "qwen_coder_32b"
     - "deepseek_r1"
     - "mistral_7b_fallback"
 
@@ -116,27 +154,30 @@ routing:
 
   task_class_map:
     tier0: ["phi3_lightweight"]
-    tier1: ["phi3_lightweight", "mistral_7b_fallback"]
-    tier2: ["qwen_coder", "mistral_7b_fallback"]
-    tier3: ["deepseek_r1", "qwen_coder"]
+    tier1: ["phi3_lightweight", "qwen_coder", "mistral_7b_fallback"]
+    tier2: ["qwen_coder_14b", "qwen_coder", "mistral_7b_fallback"]
+    tier3: ["qwen_coder_32b", "qwen_coder_14b", "deepseek_r1"]
 
   fallback_chain:
-    phi3_lightweight: ["mistral_7b_fallback"]
-    qwen_coder: ["mistral_7b_fallback"]
-    deepseek_r1: ["qwen_coder", "mistral_7b_fallback"]
+    phi3_lightweight: ["qwen_coder", "mistral_7b_fallback"]
+    qwen_coder: ["qwen_coder_14b", "mistral_7b_fallback"]
+    qwen_coder_14b: ["qwen_coder", "mistral_7b_fallback"]
+    qwen_coder_32b: ["qwen_coder_14b", "qwen_coder", "mistral_7b_fallback"]
+    deepseek_r1: ["qwen_coder_32b", "qwen_coder", "mistral_7b_fallback"]
 
   # Legacy tier-based brain selection (used by existing BrainSelector until wired to new schema)
   legacy_tier_map:
     trivial: "phi3_lightweight"
-    planning: "mistral_7b_fallback"
-    heavy_code: "qwen_coder"
-    complex_reasoning: "deepseek_r1"
+    planning: "qwen_coder"
+    heavy_code: "qwen_coder_32b"
+    complex_reasoning: "qwen_coder_32b"
 
   # Legacy brain definitions for BrainSelector backward compatibility
   legacy_brains:
     phi3_lightweight:
       model_name: "llama-3.2-1b"
-      fallback_model: "mistral-7b"
+      fallback_model: "qwen-2.5-coder-7b"
+      schema_capability: "full_content_only"
       max_prompt_tokens: 4096
       max_output_tokens: 512
       temperature: 0.1
@@ -149,22 +190,47 @@ routing:
 
     mistral_planning:
       model_name: "mistral-7b"
-      fallback_model: "mistral-7b"
+      fallback_model: "qwen-2.5-coder-7b"
+      schema_capability: "full_content_only"
       max_prompt_tokens: 8192
       max_output_tokens: 1024
       temperature: 0.2
       handles:
         - single_file_fix
-        - bug_fix
-        - test_update
         - config_change
-        - multi_file_light
 
     qwen_coder:
       model_name: "qwen-2.5-coder-7b"
-      fallback_model: "mistral-7b"
+      fallback_model: "qwen-2.5-coder-14b"
+      schema_capability: "full_content_only"
       max_prompt_tokens: 8192
       max_output_tokens: 2048
+      temperature: 0.2
+      handles:
+        - bug_fix
+        - test_update
+        - single_file_fix
+        - multi_file_light
+
+    qwen_coder_14b:
+      model_name: "qwen-2.5-coder-14b"
+      fallback_model: "qwen-2.5-coder-7b"
+      schema_capability: "full_content_only"
+      max_prompt_tokens: 12288
+      max_output_tokens: 3072
+      temperature: 0.2
+      handles:
+        - feature_implementation
+        - multi_file_heavy
+        - api_redesign
+        - performance_optimization
+
+    qwen_coder_32b:
+      model_name: "qwen-2.5-coder-32b"
+      fallback_model: "qwen-2.5-coder-14b"
+      schema_capability: "full_content_and_diff"
+      max_prompt_tokens: 16384
+      max_output_tokens: 4096
       temperature: 0.2
       handles:
         - heavy_refactor
@@ -173,20 +239,23 @@ routing:
         - api_redesign
         - class_extraction
         - performance_optimization
-
-    deepseek_r1:
-      model_name: "deepseek-r1-qwen-7b"
-      fallback_model: "mistral-7b"
-      max_prompt_tokens: 8192
-      max_output_tokens: 2048
-      temperature: 0.0
-      handles:
         - architecture_design
         - cross_repo_planning
         - complex_reasoning
         - system_migration
         - root_cause_analysis
         - dependency_graph_analysis
+
+    deepseek_r1:
+      model_name: "deepseek-r1-qwen-7b"
+      fallback_model: "qwen-2.5-coder-32b"
+      schema_capability: "full_content_only"
+      max_prompt_tokens: 8192
+      max_output_tokens: 2048
+      temperature: 0.0
+      handles:
+        - complex_reasoning
+        - root_cause_analysis
 
 runtime_drift:
   reconcile_interval_seconds: 30

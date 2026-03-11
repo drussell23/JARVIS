@@ -1020,6 +1020,7 @@ class GovernedLoopService:
                 task_complexity=brain.task_complexity,
                 estimated_prompt_tokens=brain.estimated_prompt_tokens,
                 daily_spend_usd=self._brain_selector.daily_spend,
+                schema_capability=getattr(brain, "schema_capability", "full_content_only"),
             )
             tc = TelemetryContext(local_node=host_tel, routing_intent=intent_tel)
             ctx = ctx.with_telemetry(tc)

@@ -63,13 +63,28 @@ class TaskComplexity(Enum):
 class BrainSelectionResult:
     """Immutable output of the 3-layer gate."""
 
-    brain_id: str           # "phi3_lightweight" | "mistral_planning" | "qwen_coder" | "deepseek_r1"
-    model_name: str         # exact name passed to j-prime (may fall back to mistral-7b)
+    brain_id: str           # "phi3_lightweight" | "qwen_coder" | "qwen_coder_14b" | "qwen_coder_32b" | "deepseek_r1"
+    model_name: str         # exact name passed to j-prime
     fallback_model: str     # j-prime uses this if primary model not loaded
     routing_reason: str     # causal code for ledger + narration
     task_complexity: str    # TaskComplexity.value
     estimated_prompt_tokens: int = 0
     provider_tier: str = "gcp_prime"  # "gcp_prime" | "claude_api" | "queued"
+    schema_capability: str = "full_content_only"  # "full_content_only" | "full_content_and_diff"
+
+    def narration(self) -> str:
+        """Human-readable routing announcement for VoiceNarrator."""
+        if self.provider_tier == "queued":
+            return (
+                "Task queued. Daily budget reached — "
+                "resuming when budget resets at midnight."
+            )
+        model_display = self.model_name.replace("-", " ").title()
+        reason_display = self.routing_reason.replace("_", " ")
+        return (
+            f"Routing {self.task_complexity} task to {model_display} on G-C-P. "
+            f"Reason: {reason_display}."
+        )
 
 
 @dataclass(frozen=True)
@@ -81,23 +96,18 @@ class BrainSelection:
     ResourceState from TelemetryContextualizer).
     """
 
-    brain_id: str        # e.g. "qwen_coder", "mistral_planning"
-    model_alias: str     # e.g. "qwen-2.5-coder-7b"
+    brain_id: str        # e.g. "qwen_coder_32b", "phi3_lightweight"
+    model_alias: str     # e.g. "qwen-2.5-coder-32b"
     reason_code: str     # causal code for ledger
     complexity: str      # TaskComplexity.value
     intent_type: str     # CAI intent string e.g. "code_generation"
 
     def narration(self) -> str:
         """Human-readable routing announcement for VoiceNarrator."""
-        if self.provider_tier == "queued":
-            return (
-                f"Task queued. Daily budget reached — "
-                f"resuming when budget resets at midnight."
-            )
-        model_display = self.model_name.replace("-", " ").title()
-        reason_display = self.routing_reason.replace("_", " ")
+        model_display = self.model_alias.replace("-", " ").title()
+        reason_display = self.reason_code.replace("_", " ")
         return (
-            f"Routing {self.task_complexity} task to {model_display} on G-C-P. "
+            f"Routing {self.complexity} task to {model_display} on G-C-P. "
             f"Reason: {reason_display}."
         )
 
@@ -168,7 +178,7 @@ class BrainSelector:
         self._maybe_reset_daily_spend()
 
         gate_cfg: Dict = self._policy.get("gates", {})
-        brains: Dict = self._policy.get("brains", {})
+        brains: Dict = self._resolve_brains_dict()
 
         # ── Layer 1: Task Gate ────────────────────────────────────────────────
         complexity, est_tokens = self._classify_task(
@@ -327,6 +337,31 @@ class BrainSelector:
         }
 
     # -------------------------------------------------------------------------
+    # Internal — Brain Dict Resolution
+    # -------------------------------------------------------------------------
+
+    def _resolve_brains_dict(self) -> Dict:
+        """Resolve the flat brain_id→config dict from the policy.
+
+        The YAML policy stores brains in two formats:
+          1. ``routing.legacy_brains`` — flat dict keyed by brain_id (preferred)
+          2. ``brains`` — flat dict (used by _DEFAULT_POLICY)
+        The structured ``brains.required`` / ``brains.optional`` lists are NOT
+        used here; they are consumed by the admission gate in the supervisor.
+        """
+        # Prefer routing.legacy_brains (YAML format)
+        legacy = self._policy.get("routing", {}).get("legacy_brains", {})
+        if legacy and isinstance(legacy, dict):
+            return legacy
+        # Fallback: flat brains dict (default policy format)
+        brains = self._policy.get("brains", {})
+        if isinstance(brains, dict) and not any(
+            k in brains for k in ("required", "optional")
+        ):
+            return brains
+        return {}
+
+    # -------------------------------------------------------------------------
     # Internal — Task Classification
     # -------------------------------------------------------------------------
 
@@ -380,10 +415,10 @@ class BrainSelector:
     def _brain_for_complexity(self, complexity: TaskComplexity) -> str:
         return {
             TaskComplexity.TRIVIAL: "phi3_lightweight",
-            TaskComplexity.LIGHT: "mistral_planning",
-            TaskComplexity.HEAVY_CODE: "qwen_coder",
-            TaskComplexity.COMPLEX: "deepseek_r1",
-        }.get(complexity, "mistral_planning")
+            TaskComplexity.LIGHT: "qwen_coder",
+            TaskComplexity.HEAVY_CODE: "qwen_coder_32b",
+            TaskComplexity.COMPLEX: "qwen_coder_32b",
+        }.get(complexity, "qwen_coder")
 
     def _result_for(
         self,
@@ -394,11 +429,12 @@ class BrainSelector:
         est_tokens: int,
     ) -> BrainSelectionResult:
         cfg = brains.get(brain_id, {})
-        model_name = cfg.get("model_name", "mistral-7b")
-        fallback = cfg.get("fallback_model", "mistral-7b")
+        model_name = cfg.get("model_name", "qwen-2.5-coder-7b")
+        fallback = cfg.get("fallback_model", "qwen-2.5-coder-7b")
+        schema_cap = cfg.get("schema_capability", "full_content_only")
         logger.info(
-            "[BrainSelector] Selected: brain=%s model=%s reason=%s complexity=%s",
-            brain_id, model_name, routing_reason, complexity.value,
+            "[BrainSelector] Selected: brain=%s model=%s reason=%s complexity=%s schema=%s",
+            brain_id, model_name, routing_reason, complexity.value, schema_cap,
         )
         return BrainSelectionResult(
             brain_id=brain_id,
@@ -408,6 +444,7 @@ class BrainSelector:
             task_complexity=complexity.value,
             estimated_prompt_tokens=est_tokens,
             provider_tier="gcp_prime",
+            schema_capability=schema_cap,
         )
 
     # -------------------------------------------------------------------------
@@ -494,12 +531,32 @@ class BrainSelector:
 # ---------------------------------------------------------------------------
 
 _DEFAULT_POLICY: Dict = {
-    "version": "default",
+    "version": "default-v2",
     "brains": {
-        "phi3_lightweight": {"model_name": "phi-3.5-mini", "fallback_model": "mistral-7b"},
-        "mistral_planning": {"model_name": "mistral-7b", "fallback_model": "mistral-7b"},
-        "qwen_coder": {"model_name": "qwen-2.5-coder-7b", "fallback_model": "mistral-7b"},
-        "deepseek_r1": {"model_name": "deepseek-r1-qwen-7b", "fallback_model": "mistral-7b"},
+        "phi3_lightweight": {
+            "model_name": "llama-3.2-1b", "fallback_model": "qwen-2.5-coder-7b",
+            "schema_capability": "full_content_only",
+        },
+        "mistral_planning": {
+            "model_name": "mistral-7b", "fallback_model": "qwen-2.5-coder-7b",
+            "schema_capability": "full_content_only",
+        },
+        "qwen_coder": {
+            "model_name": "qwen-2.5-coder-7b", "fallback_model": "qwen-2.5-coder-14b",
+            "schema_capability": "full_content_only",
+        },
+        "qwen_coder_14b": {
+            "model_name": "qwen-2.5-coder-14b", "fallback_model": "qwen-2.5-coder-7b",
+            "schema_capability": "full_content_only",
+        },
+        "qwen_coder_32b": {
+            "model_name": "qwen-2.5-coder-32b", "fallback_model": "qwen-2.5-coder-14b",
+            "schema_capability": "full_content_and_diff",
+        },
+        "deepseek_r1": {
+            "model_name": "deepseek-r1-qwen-7b", "fallback_model": "qwen-2.5-coder-32b",
+            "schema_capability": "full_content_only",
+        },
     },
     "gates": {
         "task_gate": {

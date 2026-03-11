@@ -319,12 +319,13 @@ class RoutingIntentTelemetry:
     expected_provider: str        # e.g. "GCP_PRIME_SPOT", "LOCAL_CLAUDE"
     policy_reason: str            # e.g. "PRIMARY_AVAILABLE", "NORMAL"
     # Brain selector causal fields (Phase 4 — default "" for backwards compat)
-    brain_id: str = ""            # e.g. "qwen_coder", "phi3_lightweight"
+    brain_id: str = ""            # e.g. "qwen_coder_32b", "phi3_lightweight"
     brain_model: str = ""         # exact model name passed to j-prime
     routing_reason: str = ""      # causal code: "task_gate_trivial", "cost_gate_triggered_queue"
     task_complexity: str = ""     # "trivial" | "light" | "heavy_code" | "complex"
     estimated_prompt_tokens: int = 0
     daily_spend_usd: float = 0.0  # snapshot of daily spend at intake
+    schema_capability: str = "full_content_only"  # "full_content_only" | "full_content_and_diff"
 
 
 @dataclass(frozen=True)
