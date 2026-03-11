@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -148,14 +148,11 @@ class AutonomyFeedbackEngine:
         # Persist cursor after the full scan
         self._persist_cursor()
 
-        logger.info(
-            "FeedbackEngine: curriculum scan complete — %d commands emitted from %d new file(s)",
-            total_emitted,
-            len(curriculum_files) - (len(curriculum_files) - len([
-                f for f in curriculum_files if f.name not in self._seen_files
-                or f.name in self._seen_files  # they're all seen now
-            ])),
-        )
+        if total_emitted > 0:
+            logger.info(
+                "FeedbackEngine: curriculum scan complete — %d command(s) emitted",
+                total_emitted,
+            )
 
         return total_emitted
 
