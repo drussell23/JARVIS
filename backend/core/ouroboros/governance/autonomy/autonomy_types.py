@@ -19,14 +19,11 @@ from __future__ import annotations
 import enum
 import hashlib
 import json
-import logging
 import time
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Optional
-
-logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Schema version constant
