@@ -181,7 +181,8 @@ class GenerationResult:
     # L1: audit records from tool-use loop (empty when tools disabled)
     tool_execution_records: Tuple[Any, ...] = ()
 
-    def with_tool_records(self, records: tuple) -> "GenerationResult":
+    def with_tool_records(self, records: Tuple[Any, ...]) -> "GenerationResult":
+        """Return a new GenerationResult with tool_execution_records set (called by provider after tool loop)."""
         return dataclasses.replace(self, tool_execution_records=records)
 
 
