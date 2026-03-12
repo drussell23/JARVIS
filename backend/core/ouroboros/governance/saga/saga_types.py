@@ -77,6 +77,7 @@ class SagaTerminalState(str, Enum):
     SAGA_SUCCEEDED = "saga_succeeded"                # VERIFY passed; op complete
     SAGA_VERIFY_FAILED = "saga_verify_failed"        # VERIFY failed; triggers compensation
     SAGA_ABORTED = "saga_aborted"                    # pre-flight drift check failed
+    SAGA_PARTIAL_PROMOTE = "saga_partial_promote"    # some repos promoted before failure
 
 
 @dataclass  # intentionally NOT frozen: strategy builds this incrementally
@@ -88,3 +89,24 @@ class SagaApplyResult:
     error: Optional[str]
     reason_code: str = ""
     saga_state: Tuple["RepoSagaStatus", ...] = field(default_factory=tuple)  # updated RepoSagaStatus entries for idempotent resume
+
+
+@dataclass(frozen=True)
+class SagaLedgerArtifact:
+    """Frozen artifact emitted with every saga ledger entry for audit trail."""
+
+    saga_id: str
+    op_id: str
+    event: str                          # "prepare" | "apply_repo" | "promote_repo" | etc.
+    repo: str                           # "*" for saga-wide events
+    original_ref: str                   # branch name or "HEAD" (detached)
+    original_sha: str                   # SHA at saga start
+    base_sha: str                       # pinned base SHA for this repo
+    saga_branch: str                    # ouroboros/saga-<op_id>/<repo>
+    promoted_sha: str                   # SHA after ff-only merge ("" if not promoted)
+    promote_order_index: int            # position in promotion sequence (-1 if N/A)
+    rollback_reason: str                # "" on success, reason code on failure
+    partial_promote_boundary_repo: str  # repo where promotion failed ("" if clean)
+    kept_forensics_branches: bool       # True if saga branches retained for debug
+    skipped_no_diff: bool               # True if repo had no actual changes
+    timestamp_ns: int                   # time.monotonic_ns()
