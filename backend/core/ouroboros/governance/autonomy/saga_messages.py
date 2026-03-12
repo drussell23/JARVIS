@@ -48,6 +48,9 @@ class SagaMessageType(str, Enum):
     SAGA_COMPLETED = "saga_completed"
     SAGA_FAILED = "saga_failed"
     SAGA_ROLLED_BACK = "saga_rolled_back"
+    SAGA_PARTIAL_PROMOTE = "saga_partial_promote"
+    TARGET_MOVED = "target_moved"
+    ANCESTRY_VIOLATION = "ancestry_violation"
 
     # Repo coordination
     REPO_APPLY_REQUEST = "repo_apply_request"

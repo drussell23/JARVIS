@@ -315,6 +315,7 @@ class IntakeLayerService:
             TestFailureSensor,
             VoiceCommandSensor,
         )
+        from backend.core.ouroboros.governance.intent.test_watcher import TestWatcher
 
         router_config = IntakeRouterConfig(
             project_root=self._config.project_root,
@@ -350,8 +351,17 @@ class IntakeLayerService:
                 )
                 for rc in enabled_repos
             ]
+            _test_poll_s = float(os.environ.get("JARVIS_INTENT_TEST_INTERVAL_S", "300"))
             test_failure_sensors = [
-                TestFailureSensor(repo=rc.name, router=self._router)
+                TestFailureSensor(
+                    repo=rc.name,
+                    router=self._router,
+                    test_watcher=TestWatcher(
+                        repo=rc.name,
+                        repo_path=str(rc.local_path),
+                        poll_interval_s=_test_poll_s,
+                    ),
+                )
                 for rc in enabled_repos
             ]
             miner_sensors = [
@@ -374,7 +384,18 @@ class IntakeLayerService:
                     poll_interval_s=self._config.backlog_scan_interval_s,
                 )
             ]
-            test_failure_sensors = [TestFailureSensor(repo="jarvis", router=self._router)]
+            _test_poll_s = float(os.environ.get("JARVIS_INTENT_TEST_INTERVAL_S", "300"))
+            test_failure_sensors = [
+                TestFailureSensor(
+                    repo="jarvis",
+                    router=self._router,
+                    test_watcher=TestWatcher(
+                        repo="jarvis",
+                        repo_path=str(self._config.project_root),
+                        poll_interval_s=_test_poll_s,
+                    ),
+                )
+            ]
             miner_sensors = [
                 OpportunityMinerSensor(
                     repo_root=self._config.project_root,
