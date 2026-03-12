@@ -1135,6 +1135,41 @@ class GovernedOrchestrator:
                 await self._publish_outcome(ctx, OperationState.FAILED, verify_result.reason_code)
                 return ctx
 
+            # B+ mode: promote ephemeral branches before declaring success
+            promote_state, promoted_shas = await strategy.promote_all(
+                apply_order=list(ctx.repo_scope),
+                saga_id=apply_result.saga_id,
+                op_id=ctx.op_id,
+            )
+
+            if promote_state == SagaTerminalState.SAGA_PARTIAL_PROMOTE:
+                try:
+                    await self._stack.comm.emit_postmortem(
+                        op_id=ctx.op_id,
+                        root_cause="saga_partial_promote",
+                        failed_phase="PROMOTE",
+                        next_safe_action="human_intervention_required",
+                    )
+                except Exception:
+                    pass
+                try:
+                    await self._stack.controller.pause(scope="cross_repo_saga")
+                except TypeError:
+                    await self._stack.controller.pause()
+                except Exception:
+                    logger.exception(
+                        "[Orchestrator] controller.pause() failed for partial promote %s",
+                        ctx.op_id,
+                    )
+                ctx = ctx.advance(OperationPhase.POSTMORTEM)
+                await self._record_ledger(
+                    ctx, OperationState.FAILED,
+                    {"reason": "saga_partial_promote", "saga_id": apply_result.saga_id, "promoted_repos": promoted_shas},
+                )
+                self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_saga)
+                await self._publish_outcome(ctx, OperationState.FAILED, "saga_partial_promote")
+                return ctx
+
             # SAGA_SUCCEEDED
             ctx = ctx.advance(OperationPhase.VERIFY)
             await self._record_ledger(
