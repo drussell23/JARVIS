@@ -390,3 +390,79 @@ class TestBusFailureIsolation:
             op_id=ctx.op_id,
         )
         assert terminal == SagaTerminalState.SAGA_SUCCEEDED
+
+
+# ---------------------------------------------------------------------------
+# TestDifferentiatedPromoteFailureEvents
+# ---------------------------------------------------------------------------
+
+
+class TestDifferentiatedPromoteFailureEvents:
+    """Verify that promote_all emits differentiated TARGET_MOVED and
+    ANCESTRY_VIOLATION bus events alongside the catch-all saga_partial_promote."""
+
+    async def test_target_moved_emits_differentiated_event(
+        self, git_repos: Tuple[Dict[str, Path], Dict[str, str]]
+    ) -> None:
+        """When target branch moves, both saga_partial_promote AND target_moved fire."""
+        roots, shas = git_repos
+        bus = SagaMessageBus()
+
+        strategy = SagaApplyStrategy(
+            repo_roots=roots,
+            ledger=None,
+            branch_isolation=True,
+            message_bus=bus,
+        )
+        ctx = _make_ctx(
+            repo_scope=("jarvis", "prime"),
+            repo_snapshots=(("jarvis", shas["jarvis"]), ("prime", shas["prime"])),
+            op_id="test-target-moved",
+        )
+        patch_map = {
+            "jarvis": _make_patch("jarvis"),
+            "prime": _make_patch("prime"),
+        }
+        result = await strategy.execute(ctx, patch_map)
+        assert result.terminal_state == SagaTerminalState.SAGA_APPLY_COMPLETED
+
+        # Record the saga branch for jarvis so we can re-checkout later
+        saga_branch = strategy._saga_branches["jarvis"]
+
+        # Simulate TARGET_MOVED: advance main in jarvis behind the saga's back
+        subprocess.run(
+            ["git", "checkout", "main"],
+            cwd=str(roots["jarvis"]), check=True, capture_output=True,
+        )
+        (roots["jarvis"] / "external_change.py").write_text("# external\n")
+        subprocess.run(
+            ["git", "add", "external_change.py"],
+            cwd=str(roots["jarvis"]), check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "external push", "--no-verify"],
+            cwd=str(roots["jarvis"]), check=True, capture_output=True,
+        )
+
+        # Switch back to saga branch so promote_all finds us in the right state
+        subprocess.run(
+            ["git", "checkout", saga_branch],
+            cwd=str(roots["jarvis"]), check=True, capture_output=True,
+        )
+
+        terminal, promoted = await strategy.promote_all(
+            apply_order=["jarvis", "prime"],
+            saga_id=result.saga_id,
+            op_id=ctx.op_id,
+        )
+        assert terminal == SagaTerminalState.SAGA_PARTIAL_PROMOTE
+        assert "jarvis" not in promoted  # jarvis failed to promote
+
+        # Verify catch-all event fired
+        partial_msgs = bus.get_messages(message_type=SagaMessageType.SAGA_PARTIAL_PROMOTE)
+        assert len(partial_msgs) >= 1, "Expected saga_partial_promote event"
+
+        # Verify differentiated target_moved event also fired
+        moved_msgs = bus.get_messages(message_type=SagaMessageType.TARGET_MOVED)
+        assert len(moved_msgs) >= 1, "Expected target_moved event"
+        assert "TARGET_MOVED" in moved_msgs[0].payload.get("reason_code", "")

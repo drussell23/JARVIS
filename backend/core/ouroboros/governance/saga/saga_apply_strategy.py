@@ -799,6 +799,18 @@ class SagaApplyStrategy:
                     repo=repo, reason=str(exc), boundary_repo=repo,
                 )
                 self._bus_emit("saga_partial_promote", saga_id, op_id, repo=repo, reason_code=str(exc))
+                # Emit differentiated event for specific failure types
+                exc_str = str(exc)
+                if "TARGET_MOVED" in exc_str:
+                    self._bus_emit(
+                        "target_moved", saga_id, op_id,
+                        repo=repo, reason_code=exc_str,
+                    )
+                elif "ANCESTRY" in exc_str:
+                    self._bus_emit(
+                        "ancestry_violation", saga_id, op_id,
+                        repo=repo, reason_code=exc_str,
+                    )
                 return SagaTerminalState.SAGA_PARTIAL_PROMOTE, promoted
         self._bus_emit("saga_completed", saga_id, op_id)
         return SagaTerminalState.SAGA_SUCCEEDED, promoted
