@@ -88,3 +88,22 @@ class TestGoverningToolPolicy:
         result = policy.evaluate(tc, _ctx(tmp_path, tool="search_code"))
         assert result.decision == PolicyDecision.DENY
         assert result.reason_code == "tool.denied.path_outside_repo"
+
+    def test_policy_deny_read_file_missing_path(self, tmp_path):
+        policy = _policy(tmp_path)
+        tc = ToolCall(name="read_file", arguments={})
+        result = policy.evaluate(tc, _ctx(tmp_path))
+        assert result.decision == PolicyDecision.DENY
+        assert result.reason_code == "tool.denied.path_outside_repo"
+
+    def test_policy_deny_list_symbols_missing_module_path(self, tmp_path):
+        policy = _policy(tmp_path)
+        tc = ToolCall(name="list_symbols", arguments={})
+        result = policy.evaluate(tc, _ctx(tmp_path, tool="list_symbols"))
+        assert result.decision == PolicyDecision.DENY
+        assert result.reason_code == "tool.denied.path_outside_repo"
+
+    def test_policy_repo_root_for_unknown_repo_raises(self, tmp_path):
+        policy = _policy(tmp_path, repo="jarvis")
+        with pytest.raises(KeyError, match="unknown-repo"):
+            policy.repo_root_for("unknown-repo")
