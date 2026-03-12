@@ -733,3 +733,132 @@ class AsyncProcessToolBackend:
                 proc.kill()
                 await proc.wait()
             raise
+
+
+# ---------------------------------------------------------------------------
+# L1 Tool-Use: ToolLoopCoordinator
+# ---------------------------------------------------------------------------
+
+_MAX_PROMPT_CHARS = 32_768
+
+
+class ToolLoopCoordinator:
+    # Stateless per-run multi-turn tool loop coordinator.
+    # No mutable instance state — safe to reuse across concurrent ops.
+
+    def __init__(
+        self,
+        backend: Any,
+        policy: Any,
+        max_rounds: int,
+        tool_timeout_s: float,
+    ) -> None:
+        self._backend = backend
+        self._policy = policy
+        self._max_rounds = max_rounds
+        self._tool_timeout_s = tool_timeout_s
+
+    async def run(
+        self,
+        prompt: str,
+        generate_fn: Callable[[str], Awaitable[str]],
+        parse_fn: Callable[[str], Optional[ToolCall]],
+        repo: str,
+        op_id: str,
+        deadline: float,
+    ) -> Tuple[str, List[ToolExecutionRecord]]:
+        if time.monotonic() >= deadline:
+            raise RuntimeError("tool_loop_deadline_exceeded")
+
+        records: List[ToolExecutionRecord] = []
+        current_prompt = prompt
+        repo_root = self._policy.repo_root_for(repo)
+
+        for round_index in range(self._max_rounds):
+            raw: str = await generate_fn(current_prompt)
+            tc = parse_fn(raw)
+            if tc is None:
+                return raw, records   # Final non-tool response
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError("tool_loop_deadline_exceeded")
+            per_tool_deadline = time.monotonic() + min(self._tool_timeout_s, max(1.0, remaining))
+
+            call_id = f"{op_id}:r{round_index}:{tc.name}"
+            manifest = _L1_MANIFESTS.get(tc.name)
+            tool_version = manifest.version if manifest else "unknown"
+
+            policy_ctx = PolicyContext(repo=repo, repo_root=repo_root,
+                op_id=op_id, call_id=call_id, round_index=round_index)
+            policy_result = self._policy.evaluate(tc, policy_ctx)
+
+            if policy_result.decision == PolicyDecision.DENY:
+                records.append(ToolExecutionRecord(
+                    schema_version="tool.exec.v1",
+                    op_id=op_id, call_id=call_id, round_index=round_index,
+                    tool_name=tc.name, tool_version=tool_version,
+                    arguments_hash=_compute_args_hash(tc.arguments),
+                    repo=repo,
+                    policy_decision=PolicyDecision.DENY.value,
+                    policy_reason_code=policy_result.reason_code,
+                    started_at_ns=None, ended_at_ns=None, duration_ms=None,
+                    output_bytes=0, error_class=None, status=ToolExecStatus.POLICY_DENIED,
+                ))
+                current_prompt += _format_denial(tc.name, policy_result)
+            else:
+                started_ns = time.time_ns()
+                _rec_status = ToolExecStatus.SUCCESS
+                _rec_error_class: Optional[str] = None
+                _rec_output_bytes = 0
+                tool_result: Optional[ToolResult] = None
+                try:
+                    tool_result = await asyncio.wait_for(
+                        self._backend.execute_async(tc, policy_ctx, per_tool_deadline),
+                        timeout=self._tool_timeout_s,
+                    )
+                    _rec_status = tool_result.status
+                    _rec_output_bytes = len((tool_result.output or "").encode())
+                    _rec_error_class = (
+                        type(tool_result.error).__name__ if tool_result.error else None
+                    )
+                except asyncio.TimeoutError:
+                    _rec_status = ToolExecStatus.TIMEOUT
+                    _rec_error_class = "TimeoutError"
+                    tool_result = ToolResult(tool_call=tc, output="", error="TIMEOUT",
+                        status=ToolExecStatus.TIMEOUT)
+                except asyncio.CancelledError:
+                    ended_ns = time.time_ns()
+                    records.append(ToolExecutionRecord(
+                        schema_version="tool.exec.v1",
+                        op_id=op_id, call_id=call_id, round_index=round_index,
+                        tool_name=tc.name, tool_version=tool_version,
+                        arguments_hash=_compute_args_hash(tc.arguments),
+                        repo=repo,
+                        policy_decision=PolicyDecision.ALLOW.value, policy_reason_code="",
+                        started_at_ns=started_ns, ended_at_ns=ended_ns,
+                        duration_ms=(ended_ns - started_ns) / 1_000_000,
+                        output_bytes=0, error_class="CancelledError",
+                        status=ToolExecStatus.CANCELLED,
+                    ))
+                    raise
+                ended_ns = time.time_ns()
+                records.append(ToolExecutionRecord(
+                    schema_version="tool.exec.v1",
+                    op_id=op_id, call_id=call_id, round_index=round_index,
+                    tool_name=tc.name, tool_version=tool_version,
+                    arguments_hash=_compute_args_hash(tc.arguments),
+                    repo=repo,
+                    policy_decision=PolicyDecision.ALLOW.value, policy_reason_code="",
+                    started_at_ns=started_ns, ended_at_ns=ended_ns,
+                    duration_ms=(ended_ns - started_ns) / 1_000_000,
+                    output_bytes=_rec_output_bytes,
+                    error_class=_rec_error_class,
+                    status=_rec_status,
+                ))
+                current_prompt += _format_tool_result(tc, tool_result)
+
+            if len(current_prompt) > _MAX_PROMPT_CHARS:
+                raise RuntimeError(f"tool_loop_budget_exceeded:{len(current_prompt)}")
+
+        raise RuntimeError(f"tool_loop_max_rounds_exceeded:{self._max_rounds}")
