@@ -129,6 +129,10 @@ class OrchestratorConfig:
     # Reactor event polling
     reactor_event_poll_interval_s: float = 30.0
 
+    # L2 self-repair engine (disabled by default)
+    # Set by GovernedLoopService._build_components() when JARVIS_L2_ENABLED=true.
+    repair_engine: Optional[Any] = None
+
     def resolve_repo_roots(
         self,
         repo_scope: Tuple[str, ...],
@@ -485,6 +489,19 @@ class GovernedOrchestrator:
             # All candidates failed this attempt
             validate_retries_remaining -= 1
             if validate_retries_remaining < 0:
+                # ── L2 self-repair dispatch ───────────────────────────────────
+                if self._config.repair_engine is not None and best_validation is not None:
+                    _pl_deadline = ctx.pipeline_deadline or (
+                        datetime.now(timezone.utc) + timedelta(seconds=self._config.generation_timeout_s)
+                    )
+                    directive = await self._l2_hook(ctx, best_validation, _pl_deadline)
+                    if directive[0] == "break":
+                        best_candidate, best_validation = directive[1], directive[2]
+                        break  # fall through to GATE
+                    elif directive[0] in ("cancel", "fatal"):
+                        return directive[1]  # ctx was advanced inside _l2_hook
+                # ── end L2 dispatch ───────────────────────────────────────────
+
                 ctx = ctx.advance(OperationPhase.CANCELLED)
                 await self._record_ledger(
                     ctx,
@@ -910,6 +927,69 @@ class GovernedOrchestrator:
             return None  # file not found — let APPLY handle
         current_hash = _hl.sha256(current_content.encode()).hexdigest()
         return current_hash if current_hash != source_hash else None
+
+    async def _l2_hook(
+        self,
+        ctx: "OperationContext",
+        best_validation: "ValidationResult",
+        deadline: datetime,
+    ) -> tuple:
+        """Run the L2 repair engine; return a directive tuple to the caller.
+
+        Returns:
+            ("break", candidate, canonical_val)  → L2 converged; caller breaks to GATE
+            ("cancel", ctx)                      → L2 stopped or canonical validate failed; ctx is advanced
+            ("fatal", ctx)                       → non-CancelledError exception; ctx is advanced
+        Raises:
+            asyncio.CancelledError — if engine.run() was cancelled (POSTMORTEM recorded first)
+        """
+        try:
+            l2_result = await self._config.repair_engine.run(ctx, best_validation, deadline)
+        except asyncio.CancelledError:
+            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            await self._record_ledger(ctx, OperationState.FAILED, {"reason": "l2_cancelled"})
+            raise
+        except Exception as exc:
+            logger.error("[Orchestrator] L2 engine error: %s", exc, exc_info=True)
+            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            await self._record_ledger(ctx, OperationState.FAILED,
+                {"reason": f"l2_fatal:{type(exc).__name__}"})
+            return ("fatal", ctx)
+
+        if l2_result.terminal == "L2_CONVERGED" and l2_result.candidate is not None:
+            _remaining_s = (deadline - datetime.now(timezone.utc)).total_seconds()
+            canonical_val = await self._run_validation(ctx, l2_result.candidate, _remaining_s)
+            if canonical_val.passed:
+                await self._record_ledger(ctx, OperationState.SANDBOXING, {
+                    "event": "l2_converged",
+                    "iterations": len(l2_result.iterations),
+                    **l2_result.summary,
+                })
+                return ("break", l2_result.candidate, canonical_val)
+            else:
+                ctx = ctx.advance(OperationPhase.CANCELLED)
+                await self._record_ledger(ctx, OperationState.FAILED, {
+                    "reason": "l2_canonical_validate_failed",
+                    **l2_result.summary,
+                })
+                return ("cancel", ctx)
+
+        elif l2_result.terminal == "L2_STOPPED":
+            ctx = ctx.advance(OperationPhase.CANCELLED)
+            await self._record_ledger(ctx, OperationState.FAILED, {
+                "reason": "l2_stopped",
+                "stop_reason": l2_result.stop_reason,
+                **l2_result.summary,
+            })
+            return ("cancel", ctx)
+
+        else:  # L2_CONVERGED with no candidate (shouldn't happen in practice)
+            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            await self._record_ledger(ctx, OperationState.FAILED, {
+                "reason": "l2_no_candidate",
+                **l2_result.summary,
+            })
+            return ("fatal", ctx)
 
     async def _run_validation(
         self,
