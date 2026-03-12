@@ -1,0 +1,12 @@
+{
+  "items": [
+    {
+      "id": "e2e-backlog-001",
+      "description": "Refactor sentinel.py process_command to use dispatch table",
+      "target_files": ["sentinel.py"],
+      "repo_scope": ["jarvis", "prime", "reactor-core"],
+      "priority": "low",
+      "source": "e2e_test"
+    }
+  ]
+}
