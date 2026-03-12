@@ -483,6 +483,22 @@ class ReadyToCommitPayload:
 
 
 # ---------------------------------------------------------------------------
+# Lazy helpers for optional L2 types
+# ---------------------------------------------------------------------------
+
+
+def _lazy_repair_budget_from_env() -> Any:
+    """Lazily import RepairBudget and build it from environment variables.
+
+    Using a module-level function (not a lambda) allows ``field(default_factory=...)``
+    to reference it by name, satisfying frozen-dataclass requirements while
+    avoiding a circular import at module load time.
+    """
+    from backend.core.ouroboros.governance.repair_engine import RepairBudget  # noqa: PLC0415
+    return RepairBudget.from_env()
+
+
+# ---------------------------------------------------------------------------
 # GovernedLoopConfig
 # ---------------------------------------------------------------------------
 
@@ -523,6 +539,9 @@ class GovernedLoopConfig:
     max_tool_rounds: int = 5
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 2
+
+    # L2 self-repair settings (RepairBudget drives the repair loop)
+    repair_budget: Any = field(default_factory=_lazy_repair_budget_from_env)
 
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
@@ -568,6 +587,7 @@ class GovernedLoopConfig:
             max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "5")),
             tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
             max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),
+            repair_budget=_lazy_repair_budget_from_env(),
         )
 
 
@@ -1642,6 +1662,28 @@ class GovernedLoopService:
             )
             self._generator = None
 
+        # Wire L2 RepairEngine if enabled
+        _repair_engine = None
+        if getattr(self._config.repair_budget, "enabled", False):
+            try:
+                from backend.core.ouroboros.governance.repair_engine import RepairEngine  # noqa: PLC0415
+                if primary is not None:
+                    _repair_engine = RepairEngine(
+                        budget=self._config.repair_budget,
+                        prime_provider=primary,
+                        repo_root=self._config.project_root,
+                        ledger=self._ledger,
+                    )
+                    logger.info(
+                        "[GovernedLoop] L2 RepairEngine wired: max_iterations=%d, timebox=%.1fs",
+                        self._config.repair_budget.max_iterations,
+                        self._config.repair_budget.timebox_s,
+                    )
+                else:
+                    logger.warning("[GovernedLoop] L2 disabled: primary provider unavailable")
+            except Exception as exc:
+                logger.warning("[GovernedLoop] L2 RepairEngine build failed: %s", exc)
+
         # Build approval provider
         self._approval_provider = CLIApprovalProvider()
 
@@ -1676,6 +1718,7 @@ class GovernedLoopService:
             context_expansion_timeout_s=self._config.context_expansion_timeout_s,
             approval_timeout_s=self._config.approval_timeout_s,
             message_bus=self._saga_bus,
+            repair_engine=_repair_engine,
         )
         self._orchestrator = GovernedOrchestrator(
             stack=self._stack,
