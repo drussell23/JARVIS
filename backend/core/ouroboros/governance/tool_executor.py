@@ -757,6 +757,7 @@ class ToolLoopCoordinator:
         self._policy = policy
         self._max_rounds = max_rounds
         self._tool_timeout_s = tool_timeout_s
+        self._last_records: List[ToolExecutionRecord] = []
 
     async def run(
         self,
@@ -770,6 +771,7 @@ class ToolLoopCoordinator:
         if time.monotonic() >= deadline:
             raise RuntimeError("tool_loop_deadline_exceeded")
 
+        self._last_records = []
         records: List[ToolExecutionRecord] = []
         current_prompt = prompt
         repo_root = self._policy.repo_root_for(repo)
@@ -805,6 +807,7 @@ class ToolLoopCoordinator:
                     started_at_ns=None, ended_at_ns=None, duration_ms=None,
                     output_bytes=0, error_class=None, status=ToolExecStatus.POLICY_DENIED,
                 ))
+                self._last_records = list(records)
                 current_prompt += _format_denial(tc.name, policy_result)
             else:
                 started_ns = time.time_ns()
@@ -824,6 +827,7 @@ class ToolLoopCoordinator:
                         output_bytes=0, error_class="CancelledError",
                         status=ToolExecStatus.CANCELLED,
                     ))
+                    self._last_records = list(records)
                     raise
                 ended_ns = time.time_ns()
                 records.append(ToolExecutionRecord(
@@ -839,6 +843,7 @@ class ToolLoopCoordinator:
                     error_class=(type(tool_result.error).__name__ if tool_result.error else None),
                     status=tool_result.status,
                 ))
+                self._last_records = list(records)
                 current_prompt += _format_tool_result(tc, tool_result)
 
             if len(current_prompt) > _MAX_PROMPT_CHARS:

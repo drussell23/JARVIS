@@ -186,3 +186,5 @@ async def test_cancelled_op_records_cancellation_event(tmp_path):
     # coordinator's except CancelledError branch ran → CANCELLED record was appended before re-raise.
     assert execute_count[0] == 1
     assert cancel_count[0] == 1
+    # Spec: coordinator must append ToolExecutionRecord(status=CANCELLED) before re-raising.
+    assert any(r.status == ToolExecStatus.CANCELLED for r in coordinator._last_records)
