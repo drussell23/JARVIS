@@ -1094,6 +1094,9 @@ class GovernedOrchestrator:
             repo_roots=repo_roots,
             ledger=self._stack.ledger,
             message_bus=getattr(self._config, "message_bus", None),
+            branch_isolation=os.environ.get(
+                "JARVIS_SAGA_BRANCH_ISOLATION", "false"
+            ).lower() in ("1", "true", "yes"),
             keep_failed_saga_branches=os.environ.get(
                 "JARVIS_SAGA_KEEP_FORENSICS_BRANCHES", "true"
             ).lower() in ("1", "true", "yes"),
