@@ -15,7 +15,10 @@ import asyncio
 import collections
 import dataclasses
 import logging
+import os
+import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,6 +44,18 @@ except ImportError:
 logger = logging.getLogger("Ouroboros.SagaApply")
 
 
+def _safe_branch_name(op_id: str, repo: str) -> str:
+    """Sanitize op_id + repo into a valid git ref name."""
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", op_id)[:64]
+    safe_repo = re.sub(r"[^a-zA-Z0-9_-]", "_", repo)[:32]
+    return f"ouroboros/saga-{safe_id}/{safe_repo}"
+
+
+_BRANCH_ISOLATION_ENABLED = os.getenv(
+    "JARVIS_SAGA_BRANCH_ISOLATION", "false"
+).lower() in ("1", "true", "yes")
+
+
 class SagaApplyStrategy:
     """Executes multi-repo applies in topological order with preimage compensation.
 
@@ -56,9 +71,22 @@ class SagaApplyStrategy:
         self,
         repo_roots: Dict[str, Any],
         ledger: Any,
+        branch_isolation: Optional[bool] = None,
+        keep_failed_saga_branches: bool = True,
     ) -> None:
         self._repo_roots: Dict[str, Path] = {k: Path(v) for k, v in repo_roots.items()}
         self._ledger = ledger
+        self._branch_isolation = (
+            branch_isolation if branch_isolation is not None else _BRANCH_ISOLATION_ENABLED
+        )
+        self._keep_failed_branches = keep_failed_saga_branches
+
+        # B+ branch state (populated during execute)
+        self._saga_branches: Dict[str, str] = {}
+        self._original_branches: Dict[str, str] = {}
+        self._original_shas: Dict[str, str] = {}
+        self._base_shas: Dict[str, str] = {}
+        self._lock_manager: Optional[Any] = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -67,15 +95,34 @@ class SagaApplyStrategy:
     async def execute(
         self, ctx: OperationContext, patch_map: Dict[str, RepoPatch]
     ) -> SagaApplyResult:
-        """Execute the full saga: Phase A → B → C/D."""
+        """Execute the full saga. Dispatches to B+ or legacy path based on feature flag."""
         apply_order = self._resolve_apply_order(ctx)
         saga_id = ctx.saga_id or ctx.op_id
-
-        # Initialise per-repo status tracking from any existing saga_state for idempotent resume
         repo_statuses: Dict[str, RepoSagaStatus] = {
             rss.repo: rss for rss in (ctx.saga_state or ())
         }
 
+        if not self._branch_isolation:
+            return await self._execute_legacy(ctx, patch_map, apply_order, saga_id, repo_statuses)
+
+        from backend.core.ouroboros.governance.saga.repo_lock import RepoLockManager
+        if self._lock_manager is None:
+            self._lock_manager = RepoLockManager()
+
+        await self._lock_manager.acquire(apply_order, self._repo_roots)
+        try:
+            return await self._execute_bplus(ctx, patch_map, apply_order, saga_id, repo_statuses)
+        except BaseException:
+            await self._bplus_compensate_all(apply_order, saga_id, ctx.op_id, "exception_during_execute", repo_statuses)
+            raise
+        finally:
+            await self._lock_manager.release(apply_order)
+
+    async def _execute_legacy(
+        self, ctx: OperationContext, patch_map: Dict[str, RepoPatch],
+        apply_order: List[str], saga_id: str, repo_statuses: Dict[str, RepoSagaStatus],
+    ) -> SagaApplyResult:
+        """Legacy direct-to-HEAD apply path (branch_isolation=False)."""
         # Phase A: Pre-flight drift check
         abort = await self._phase_a_preflight(ctx, apply_order, saga_id)
         if abort is not None:
@@ -178,6 +225,71 @@ class SagaApplyStrategy:
             saga_step_index=step_index,
             error=failure_error,
             reason_code="compensation_failed",
+            saga_state=tuple(repo_statuses.values()),
+        )
+
+    async def _execute_bplus(
+        self, ctx: OperationContext, patch_map: Dict[str, RepoPatch],
+        apply_order: List[str], saga_id: str, repo_statuses: Dict[str, RepoSagaStatus],
+    ) -> SagaApplyResult:
+        """B+ branch-isolated execution path."""
+        for repo in apply_order:
+            await self._assert_clean_worktree(repo)
+            branch_name, sha = await self._capture_original_ref(repo)
+            self._original_branches[repo] = branch_name
+            self._original_shas[repo] = sha
+            self._base_shas[repo] = sha
+            saga_branch = await self._create_ephemeral_branch(repo, ctx.op_id)
+            self._saga_branches[repo] = saga_branch
+
+        await self._emit_sub_event("prepare", saga_id, ctx.op_id)
+
+        applied_repos: List[str] = []
+        step_index = 0
+        failed_repo: Optional[str] = None
+        failure_reason = ""
+        failure_error = ""
+
+        for repo in apply_order:
+            patch = patch_map.get(repo, RepoPatch(repo=repo, files=()))
+            if patch.is_empty():
+                logger.info("[Saga-B+] %s SKIPPED (empty patch)", repo)
+                repo_statuses[repo] = RepoSagaStatus(repo=repo, status=SagaStepStatus.SKIPPED)
+                step_index += 1
+                continue
+            logger.info("[Saga-B+] Applying %s (step %d)", repo, step_index)
+            try:
+                await self._apply_patch_bplus(repo, patch, ctx, saga_id)
+                applied_repos.append(repo)
+                step_index += 1
+                await self._emit_sub_event("apply_repo", saga_id, ctx.op_id, repo=repo)
+                repo_statuses[repo] = RepoSagaStatus(repo=repo, status=SagaStepStatus.APPLIED)
+            except Exception as exc:
+                failed_repo = repo
+                failure_reason = "apply_write_error"
+                failure_error = f"{type(exc).__name__}: {exc}"
+                logger.error("[Saga-B+] Apply failed for %s: %s", repo, exc)
+                repo_statuses[repo] = RepoSagaStatus(
+                    repo=repo, status=SagaStepStatus.FAILED,
+                    last_error=failure_error, reason_code=failure_reason,
+                )
+                break
+
+        if failed_repo is not None:
+            await self._bplus_compensate_all(
+                apply_order, saga_id, ctx.op_id, failure_reason, repo_statuses,
+            )
+            return SagaApplyResult(
+                terminal_state=SagaTerminalState.SAGA_ROLLED_BACK,
+                saga_id=saga_id, saga_step_index=step_index,
+                error=failure_error, reason_code=failure_reason,
+                saga_state=tuple(repo_statuses.values()),
+            )
+
+        await self._emit_sub_event("pre_verify", saga_id, ctx.op_id)
+        return SagaApplyResult(
+            terminal_state=SagaTerminalState.SAGA_APPLY_COMPLETED,
+            saga_id=saga_id, saga_step_index=step_index, error=None,
             saga_state=tuple(repo_statuses.values()),
         )
 
@@ -448,3 +560,223 @@ class SagaApplyStrategy:
             await self._ledger.append(entry)
         except Exception as exc:
             logger.debug("[Saga] sub-event emit failed (%s): %s", event, exc)
+
+    # ------------------------------------------------------------------
+    # B+ Branch Lifecycle Helpers
+    # ------------------------------------------------------------------
+
+    async def _assert_clean_worktree(self, repo: str) -> None:
+        """Raise RuntimeError if the working tree has staged/unstaged changes."""
+        rc = await self._git_rc(repo, ["diff", "--quiet"])
+        staged_rc = await self._git_rc(repo, ["diff", "--cached", "--quiet"])
+        if rc != 0 or staged_rc != 0:
+            raise RuntimeError(f"dirty_worktree:{repo}")
+
+    async def _capture_original_ref(self, repo: str) -> Tuple[str, str]:
+        """Return (branch_name_or_HEAD, sha) for current checkout."""
+        repo_root = self._repo_roots[repo]
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "symbolic-ref", "--short", "HEAD"],
+                cwd=str(repo_root), capture_output=True, text=True, check=True,
+            )
+            branch = result.stdout.strip()
+        except subprocess.CalledProcessError:
+            branch = "HEAD"  # detached
+        sha = await self._get_head_hash(repo)
+        return branch, sha
+
+    async def _create_ephemeral_branch(self, repo: str, op_id: str) -> str:
+        """Create and checkout an ephemeral branch from the base SHA."""
+        branch = _safe_branch_name(op_id, repo)
+        base = self._base_shas[repo]
+        await self._git(repo, ["checkout", "-b", branch, base])
+        return branch
+
+    async def _check_promote_safe(self, repo: str) -> None:
+        """Raise if target branch has advanced since base_sha."""
+        original_branch = self._original_branches[repo]
+        if original_branch == "HEAD":
+            raise RuntimeError(f"TARGET_MOVED:{repo}:detached_head_cannot_promote")
+        base = self._base_shas[repo]
+        repo_root = self._repo_roots[repo]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "rev-parse", original_branch],
+            cwd=str(repo_root), capture_output=True, text=True, check=True,
+        )
+        current_target = result.stdout.strip()
+        if current_target != base:
+            raise RuntimeError(
+                f"TARGET_MOVED:{repo}:expected={base[:12]},actual={current_target[:12]}"
+            )
+        # Ancestry check
+        rc_result = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "merge-base", "--is-ancestor", base, "HEAD"],
+            cwd=str(repo_root), capture_output=True,
+        )
+        if rc_result.returncode != 0:
+            raise RuntimeError(f"TARGET_MOVED:{repo}:ancestry_check_failed")
+
+    async def _promote_ephemeral_branch(self, repo: str) -> str:
+        """FF-only merge ephemeral branch into original branch. Returns promoted SHA."""
+        await self._check_promote_safe(repo)
+        original_branch = self._original_branches[repo]
+        saga_branch = self._saga_branches[repo]
+        repo_root = self._repo_roots[repo]
+
+        # Get current SHA on saga branch
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root), capture_output=True, text=True, check=True,
+        )
+        saga_sha = result.stdout.strip()
+
+        # Checkout original branch and ff-only merge
+        await self._git(repo, ["checkout", original_branch])
+        await self._git(repo, ["merge", "--ff-only", saga_branch])
+
+        # Delete ephemeral branch
+        await self._git(repo, ["branch", "-d", saga_branch])
+        return saga_sha
+
+    async def _cleanup_ephemeral_branch(self, repo: str) -> None:
+        """Restore original branch, optionally delete ephemeral branch."""
+        original_branch = self._original_branches.get(repo, "main")
+        saga_branch = self._saga_branches.get(repo)
+        repo_root = self._repo_roots[repo]
+
+        # Switch back to original branch
+        try:
+            await self._git(repo, ["checkout", original_branch])
+        except Exception:
+            # If checkout fails (e.g., conflicts), force checkout
+            original_sha = self._original_shas.get(repo, "")
+            if original_sha:
+                await self._git(repo, ["checkout", "--force", original_sha])
+
+        if saga_branch and not self._keep_failed_branches:
+            try:
+                await self._git(repo, ["branch", "-D", saga_branch])
+            except Exception:
+                logger.debug("[Saga-B+] Could not delete branch %s", saga_branch)
+
+    async def _bplus_compensate_all(
+        self, apply_order: List[str], saga_id: str, op_id: str,
+        reason: str, repo_statuses: Dict[str, RepoSagaStatus],
+    ) -> None:
+        """Compensate all repos by cleaning up ephemeral branches."""
+        for repo in reversed(apply_order):
+            if repo in self._saga_branches:
+                try:
+                    await self._cleanup_ephemeral_branch(repo)
+                    await self._emit_sub_event(
+                        "compensate_repo", saga_id, op_id, repo=repo, reason=reason
+                    )
+                except Exception as exc:
+                    logger.error("[Saga-B+] Cleanup failed for %s: %s", repo, exc)
+
+    async def _apply_patch_bplus(
+        self, repo: str, patch: RepoPatch, ctx: OperationContext, saga_id: str,
+    ) -> None:
+        """Write files, git add, git commit on ephemeral branch."""
+        repo_root = self._repo_roots[repo]
+        content_map = dict(patch.new_content)
+        written: List[str] = []
+        for pf in patch.files:
+            full_path = repo_root / pf.path
+            new_bytes = content_map.get(pf.path, b"")
+            if pf.op == FileOp.CREATE:
+                full_path.parent.mkdir(parents=True, exist_ok=True)
+                full_path.write_bytes(new_bytes)
+            elif pf.op == FileOp.MODIFY:
+                full_path.write_bytes(new_bytes)
+            elif pf.op == FileOp.DELETE:
+                if full_path.exists():
+                    full_path.unlink()
+                else:
+                    continue
+            written.append(pf.path)
+        if not written:
+            return
+        await self._git(repo, ["add", "--"] + written)
+        rc = await self._git_rc(repo, ["diff", "--cached", "--quiet"])
+        if rc == 0:
+            logger.info("[Saga-B+] %s: no diff after apply, skipping commit", repo)
+            await self._emit_sub_event("skipped_no_diff", saga_id, ctx.op_id, repo=repo)
+            return
+        commit_msg = (
+            f"[ouroboros] {ctx.description[:72]}\n\n"
+            f"op_id: {ctx.op_id}\n"
+            f"saga_id: {saga_id}\n"
+            f"repo: {repo}\n"
+            f"base_sha: {self._base_shas.get(repo, '')}\n"
+            f"phase: apply\n"
+            f"schema_version: {ctx.schema_version}\n"
+        )
+        env = {
+            "GIT_AUTHOR_NAME": "JARVIS Ouroboros",
+            "GIT_AUTHOR_EMAIL": "ouroboros@jarvis.local",
+            "GIT_COMMITTER_NAME": "JARVIS Ouroboros",
+            "GIT_COMMITTER_EMAIL": "ouroboros@jarvis.local",
+        }
+        await self._git(repo, ["commit", "--no-verify", "-m", commit_msg], env=env)
+
+    async def promote_all(
+        self, apply_order: List[str], saga_id: str, op_id: str,
+    ) -> Tuple[SagaTerminalState, Dict[str, str]]:
+        """Promote all ephemeral branches via ff-only merge.
+        Returns (terminal_state, {repo: promoted_sha}).
+        """
+        if not self._branch_isolation:
+            return SagaTerminalState.SAGA_SUCCEEDED, {}
+        promoted: Dict[str, str] = {}
+        for idx, repo in enumerate(apply_order):
+            if repo not in self._saga_branches:
+                continue
+            try:
+                sha = await self._promote_ephemeral_branch(repo)
+                promoted[repo] = sha
+                await self._emit_sub_event(
+                    "promote_repo", saga_id, op_id,
+                    repo=repo, promoted_sha=sha, promote_order_index=idx,
+                )
+            except Exception as exc:
+                logger.error("[Saga-B+] Promote failed for %s: %s", repo, exc)
+                await self._emit_sub_event(
+                    "partial_promote", saga_id, op_id,
+                    repo=repo, reason=str(exc), boundary_repo=repo,
+                )
+                return SagaTerminalState.SAGA_PARTIAL_PROMOTE, promoted
+        return SagaTerminalState.SAGA_SUCCEEDED, promoted
+
+    async def _git(self, repo: str, args: List[str], env: Optional[Dict[str, str]] = None) -> str:
+        """Run a git command in the repo. Returns stdout. Raises on failure."""
+        repo_root = self._repo_roots[repo]
+        full_env = None
+        if env:
+            full_env = {**os.environ, **env}
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["git"] + args,
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=True,
+            env=full_env,
+        )
+        return result.stdout.strip()
+
+    async def _git_rc(self, repo: str, args: List[str]) -> int:
+        """Run a git command and return its return code (no exception on failure)."""
+        repo_root = self._repo_roots[repo]
+        result = await asyncio.to_thread(
+            subprocess.run,
+            ["git"] + args,
+            cwd=str(repo_root),
+            capture_output=True,
+        )
+        return result.returncode
