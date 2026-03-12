@@ -1,11 +1,7 @@
 # tests/test_ouroboros_governance/test_providers_repair.py
 from __future__ import annotations
-import pytest
 from unittest.mock import MagicMock
-from backend.core.ouroboros.governance.providers import (
-    _build_codegen_prompt,
-    _check_diff_budget,
-)
+from backend.core.ouroboros.governance.providers import _build_codegen_prompt
 from backend.core.ouroboros.governance.op_context import RepairContext
 
 
@@ -60,15 +56,16 @@ class TestBuildCodegenPromptRepairContext:
         prompt = _build_codegen_prompt(_ctx(), repo_root=tmp_path, repair_context=rc)
         assert rc.current_candidate_content in prompt
 
+    def test_schema_instruction_in_repair_prompt(self, tmp_path):
+        """The repair prompt must include the schema 2b.1-diff instruction."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "foo.py").write_text("x = 1\n")
+        prompt = _build_codegen_prompt(_ctx(), repo_root=tmp_path, repair_context=_repair_ctx())
+        assert "schema 2b.1-diff" in prompt
 
-class TestCheckDiffBudget:
-    def test_small_diff_within_budget(self):
-        diff = "\n".join(["+new line" for _ in range(10)] + ["-old line" for _ in range(5)])
-        assert _check_diff_budget(diff, max_diff_lines=150, max_files_changed=3) is True
-
-    def test_oversized_diff_rejected(self):
-        diff = "\n".join([f"+line {i}" for i in range(200)])
-        assert _check_diff_budget(diff, max_diff_lines=150, max_files_changed=3) is False
-
-    def test_empty_diff_within_budget(self):
-        assert _check_diff_budget("", max_diff_lines=150, max_files_changed=3) is True
+    def test_do_not_regenerate_instruction_present(self, tmp_path):
+        """The repair prompt must include the 'do not regenerate' constraint."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "foo.py").write_text("x = 1\n")
+        prompt = _build_codegen_prompt(_ctx(), repo_root=tmp_path, repair_context=_repair_ctx())
+        assert "Do not regenerate the whole file" in prompt

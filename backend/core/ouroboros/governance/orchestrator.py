@@ -499,7 +499,7 @@ class GovernedOrchestrator:
                         best_candidate, best_validation = directive[1], directive[2]
                         break  # fall through to GATE
                     elif directive[0] in ("cancel", "fatal"):
-                        return ctx
+                        return directive[1]  # ctx was advanced inside _l2_hook
                 # ── end L2 dispatch ───────────────────────────────────────────
 
                 ctx = ctx.advance(OperationPhase.CANCELLED)
@@ -938,8 +938,8 @@ class GovernedOrchestrator:
 
         Returns:
             ("break", candidate, canonical_val)  → L2 converged; caller breaks to GATE
-            ("cancel",)                          → L2 stopped or canonical validate failed
-            ("fatal",)                           → non-CancelledError exception
+            ("cancel", ctx)                      → L2 stopped or canonical validate failed; ctx is advanced
+            ("fatal", ctx)                       → non-CancelledError exception; ctx is advanced
         Raises:
             asyncio.CancelledError — if engine.run() was cancelled (POSTMORTEM recorded first)
         """
@@ -954,7 +954,7 @@ class GovernedOrchestrator:
             ctx = ctx.advance(OperationPhase.POSTMORTEM)
             await self._record_ledger(ctx, OperationState.FAILED,
                 {"reason": f"l2_fatal:{type(exc).__name__}"})
-            return ("fatal",)
+            return ("fatal", ctx)
 
         if l2_result.terminal == "L2_CONVERGED" and l2_result.candidate is not None:
             _remaining_s = (deadline - datetime.now(timezone.utc)).total_seconds()
@@ -972,7 +972,7 @@ class GovernedOrchestrator:
                     "reason": "l2_canonical_validate_failed",
                     **l2_result.summary,
                 })
-                return ("cancel",)
+                return ("cancel", ctx)
 
         elif l2_result.terminal == "L2_STOPPED":
             ctx = ctx.advance(OperationPhase.CANCELLED)
@@ -981,7 +981,7 @@ class GovernedOrchestrator:
                 "stop_reason": l2_result.stop_reason,
                 **l2_result.summary,
             })
-            return ("cancel",)
+            return ("cancel", ctx)
 
         else:  # L2_CONVERGED with no candidate (shouldn't happen in practice)
             ctx = ctx.advance(OperationPhase.POSTMORTEM)
@@ -989,7 +989,7 @@ class GovernedOrchestrator:
                 "reason": "l2_no_candidate",
                 **l2_result.summary,
             })
-            return ("fatal",)
+            return ("fatal", ctx)
 
     async def _run_validation(
         self,

@@ -186,3 +186,22 @@ class TestRepairEngine:
         result = await engine.run(_mock_ctx(), self._fail_val(), past)
         assert result.terminal == "L2_STOPPED"
         assert result.stop_reason is not None
+
+    @pytest.mark.asyncio
+    async def test_l2_stopped_diff_files_rejected(self):
+        """Patch touching more files than max_files_changed is rejected immediately."""
+        # Build a candidate whose unified_diff touches 5 files (> max_files_changed=3)
+        multi_file_diff = (
+            "+++ b/src/a.py\n@@ -1 +1 @@\n+x=1\n"
+            "+++ b/src/b.py\n@@ -1 +1 @@\n+x=1\n"
+            "+++ b/src/c.py\n@@ -1 +1 @@\n+x=1\n"
+            "+++ b/src/d.py\n@@ -1 +1 @@\n+x=1\n"
+            "+++ b/src/e.py\n@@ -1 +1 @@\n+x=1\n"
+        )
+        ctx = _mock_ctx()
+        ctx.generation.candidates[0]["unified_diff"] = multi_file_diff
+        svr = SandboxValidationResult(True, "1 passed", "", 0, 0.1)
+        engine = self._engine(RepairBudget(enabled=True, max_iterations=3, max_files_changed=3), svr)
+        result = await engine.run(ctx, self._fail_val(), _deadline())
+        assert result.terminal == "L2_STOPPED"
+        assert result.stop_reason == "diff_files_rejected"
