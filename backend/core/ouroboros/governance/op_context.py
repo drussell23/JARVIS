@@ -840,3 +840,46 @@ def _context_to_hash_dict(ctx: OperationContext) -> Dict[str, Any]:
             value = dataclasses.asdict(value)
         d[f.name] = value
     return d
+
+
+# ---------------------------------------------------------------------------
+# RepairContext  (L2 self-repair — typed seam between RepairEngine + providers)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RepairContext:
+    """Failure context injected into the correction prompt for L2 repair iterations.
+
+    Passed from RepairEngine to PrimeProvider.generate() to _build_codegen_prompt()
+    where it triggers the REPAIR MODE section.
+
+    Parameters
+    ----------
+    iteration:
+        1-based current repair iteration number.
+    max_iterations:
+        Budget ceiling from RepairBudget.max_iterations.
+    failure_class:
+        One of "syntax", "test", "env", "flake".
+    failure_signature_hash:
+        SHA-256 of sorted failing test IDs + failure_class (stable across retries).
+    failing_tests:
+        Top-5 failing test node IDs from the most recent sandbox run.
+    failure_summary:
+        300-char human-readable error excerpt for the correction prompt.
+    current_candidate_content:
+        Full text of the failing file as it exists in the sandbox after the
+        last patch was applied. The model is asked to diff against this.
+    current_candidate_file_path:
+        Repo-relative path of the file being repaired.
+    """
+
+    iteration: int
+    max_iterations: int
+    failure_class: str
+    failure_signature_hash: str
+    failing_tests: Tuple[str, ...]
+    failure_summary: str
+    current_candidate_content: str
+    current_candidate_file_path: str
