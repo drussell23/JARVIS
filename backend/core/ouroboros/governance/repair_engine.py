@@ -23,7 +23,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import ClassVar, Dict, Optional
+from typing import Dict
 
 _logger = logging.getLogger(__name__)
 
@@ -105,35 +105,17 @@ class RepairBudget:
         enabled = enabled_str == "true"
 
         # Integer parsing
-        max_iterations = int(
-            os.environ.get("JARVIS_L2_MAX_ITERS", cls.__dataclass_fields__["max_iterations"].default)
-        )
-        max_diff_lines = int(
-            os.environ.get("JARVIS_L2_MAX_DIFF_LINES", cls.__dataclass_fields__["max_diff_lines"].default)
-        )
-        max_files_changed = int(
-            os.environ.get("JARVIS_L2_MAX_FILES_CHANGED", cls.__dataclass_fields__["max_files_changed"].default)
-        )
-        max_total_validation_runs = int(
-            os.environ.get("JARVIS_L2_MAX_VALIDATION_RUNS", cls.__dataclass_fields__["max_total_validation_runs"].default)
-        )
-        no_progress_streak_kill = int(
-            os.environ.get("JARVIS_L2_NO_PROGRESS_KILL", cls.__dataclass_fields__["no_progress_streak_kill"].default)
-        )
-        flake_confirm_reruns = int(
-            os.environ.get("JARVIS_L2_FLAKE_RERUNS", cls.__dataclass_fields__["flake_confirm_reruns"].default)
-        )
+        max_iterations = int(os.environ.get("JARVIS_L2_MAX_ITERS", "5"))
+        max_diff_lines = int(os.environ.get("JARVIS_L2_MAX_DIFF_LINES", "150"))
+        max_files_changed = int(os.environ.get("JARVIS_L2_MAX_FILES_CHANGED", "3"))
+        max_total_validation_runs = int(os.environ.get("JARVIS_L2_MAX_VALIDATION_RUNS", "8"))
+        no_progress_streak_kill = int(os.environ.get("JARVIS_L2_NO_PROGRESS_KILL", "2"))
+        flake_confirm_reruns = int(os.environ.get("JARVIS_L2_FLAKE_RERUNS", "1"))
 
         # Float parsing
-        timebox_s = float(
-            os.environ.get("JARVIS_L2_TIMEBOX_S", cls.__dataclass_fields__["timebox_s"].default)
-        )
-        min_deadline_remaining_s = float(
-            os.environ.get("JARVIS_L2_MIN_DEADLINE_S", cls.__dataclass_fields__["min_deadline_remaining_s"].default)
-        )
-        per_iteration_test_timeout_s = float(
-            os.environ.get("JARVIS_L2_ITER_TEST_TIMEOUT_S", cls.__dataclass_fields__["per_iteration_test_timeout_s"].default)
-        )
+        timebox_s = float(os.environ.get("JARVIS_L2_TIMEBOX_S", "120.0"))
+        min_deadline_remaining_s = float(os.environ.get("JARVIS_L2_MIN_DEADLINE_S", "10.0"))
+        per_iteration_test_timeout_s = float(os.environ.get("JARVIS_L2_ITER_TEST_TIMEOUT_S", "60.0"))
 
         # JSON parsing with fallback to default
         max_class_retries_json = os.environ.get("JARVIS_L2_CLASS_RETRIES_JSON")

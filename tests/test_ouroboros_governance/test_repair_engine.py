@@ -5,8 +5,6 @@ Covers RepairBudget configuration, RepairEngine FSM, and repair workflows.
 
 from __future__ import annotations
 
-import json
-import os
 import pytest
 
 from backend.core.ouroboros.governance.repair_engine import RepairBudget
