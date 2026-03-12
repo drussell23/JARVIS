@@ -28,7 +28,13 @@ from typing import Iterable, Optional, Tuple
 
 
 class FailureClass(str, enum.Enum):
-    """Mutually exclusive failure categories."""
+    """Mutually exclusive failure categories.
+
+    Note: ``FLAKE`` is never returned by :class:`FailureClassifier` directly.
+    Flake detection requires cross-iteration state (same test IDs repeating
+    with no patch change). It is assigned by ``RepairEngine`` after
+    ``flake_confirm_reruns`` confirmatory reruns, not by this classifier.
+    """
 
     SYNTAX = "syntax"
     TEST = "test"
@@ -50,7 +56,7 @@ NON_RETRYABLE_ENV_SUBTYPES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 
 _FAILED_RE = re.compile(
-    r"^FAILED\s+([\w/.\-:]+(?:::[^\s]+)?)",
+    r"^FAILED\s+([\w/.\-:\[\]]+(?:::[^\s]+)?)",
     re.MULTILINE,
 )
 
@@ -203,7 +209,7 @@ class FailureClassifier:
                 return ClassificationResult(
                     failure_class=FailureClass.ENV,
                     env_subtype=subtype,
-                    is_non_retryable=True,
+                    is_non_retryable=subtype in NON_RETRYABLE_ENV_SUBTYPES,
                     failing_test_ids=(),
                     failure_signature_hash=sig,
                 )

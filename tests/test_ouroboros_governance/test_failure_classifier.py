@@ -81,6 +81,26 @@ class TestFailureClassifier:
         assert r.is_non_retryable is True
         assert r.env_subtype == "permission_denied"
 
+    def test_classify_env_port_conflict(self):
+        stderr = "OSError: [Errno 98] address already in use"
+        r = self._make().classify(_SVR(stderr=stderr))
+        assert r.failure_class == FailureClass.ENV
+        assert r.is_non_retryable is True
+        assert r.env_subtype == "port_conflict"
+
+    def test_classify_env_interpreter_mismatch(self):
+        stderr = "interpreter mismatch: expected python3.11, got python3.9"
+        r = self._make().classify(_SVR(stderr=stderr))
+        assert r.failure_class == FailureClass.ENV
+        assert r.is_non_retryable is True
+        assert r.env_subtype == "interpreter_mismatch"
+
+    def test_classify_parametrized_test_id_preserved(self):
+        stdout = "FAILED tests/test_foo.py::test_bar[param1-param2] - AssertionError\n1 failed"
+        r = self._make().classify(_SVR(stdout=stdout))
+        assert r.failure_class == FailureClass.TEST
+        assert r.failing_test_ids == ("tests/test_foo.py::test_bar[param1-param2]",)
+
     def test_classify_fallback_to_test(self):
         r = self._make().classify(_SVR(stdout="some generic failure\n1 failed"))
         assert r.failure_class == FailureClass.TEST
