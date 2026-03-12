@@ -76,7 +76,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
 from backend.core.ouroboros.governance.repair_engine import (
-    RepairBudget, RepairEngine, RepairResult,
+    RepairBudget, RepairEngine,
 )
 from backend.core.ouroboros.governance.repair_sandbox import SandboxValidationResult
 

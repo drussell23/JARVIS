@@ -301,7 +301,7 @@ class RepairEngine:
     async def run(
         self,
         ctx: Any,
-        best_validation: Any,
+        _best_validation: Any,
         pipeline_deadline: datetime,
     ) -> RepairResult:
         """Execute the L2 repair loop.
@@ -310,8 +310,9 @@ class RepairEngine:
         ----------
         ctx:
             OperationContext from the orchestrator.
-        best_validation:
-            The best ValidationResult that failed (has best_candidate and short_summary).
+        _best_validation:
+            The best ValidationResult that failed (reserved for future use;
+            first iteration uses ctx.generation.candidates[0] directly).
         pipeline_deadline:
             UTC datetime after which no new iteration should start.
 
