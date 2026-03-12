@@ -1,7 +1,6 @@
 from __future__ import annotations
-import pytest
+
 from backend.core.ouroboros.governance.failure_classifier import (
-    ClassificationResult,
     FailureClass,
     FailureClassifier,
     failure_signature_hash,
