@@ -20,12 +20,17 @@ import asyncio
 import heapq
 import itertools
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     CommandEnvelope,
     IdempotencyLRU,
 )
+
+if TYPE_CHECKING:
+    from backend.core.ouroboros.governance.autonomy.rate_limiter import (
+        TokenBucketRateLimiter,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +61,7 @@ class CommandBus:
         self,
         maxsize: int = 256,
         dedup_capacity: int | None = None,
-        rate_limiter: Optional[object] = None,
+        rate_limiter: Optional[TokenBucketRateLimiter] = None,
     ) -> None:
         self._maxsize = maxsize
         self._heap: List[_HeapEntry] = []
@@ -65,9 +70,7 @@ class CommandBus:
             capacity=dedup_capacity if dedup_capacity is not None else maxsize * 4
         )
         # Optional rate limiter — when set, async put() consults it before
-        # enqueuing.  Typed as ``object`` to avoid a hard import dependency;
-        # expected to be a ``TokenBucketRateLimiter`` with an async
-        # ``acquire(timeout)`` method and a ``get_status()`` method.
+        # enqueuing.
         self._rate_limiter = rate_limiter
         # Signalled whenever a new item is pushed so that a blocked get()
         # can wake up and try to dequeue.
