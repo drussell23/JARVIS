@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import os
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -1089,6 +1090,10 @@ class GovernedOrchestrator:
         strategy = SagaApplyStrategy(
             repo_roots=repo_roots,
             ledger=self._stack.ledger,
+            message_bus=getattr(self._config, "message_bus", None),
+            keep_failed_saga_branches=os.environ.get(
+                "JARVIS_SAGA_KEEP_FORENSICS_BRANCHES", "true"
+            ).lower() in ("1", "true", "yes"),
         )
         _t_saga = time.monotonic()
         apply_result = await strategy.execute(ctx, patch_map)
@@ -1121,6 +1126,28 @@ class GovernedOrchestrator:
                     op_id=ctx.op_id,
                     reason_code=verify_result.reason_code,
                 )
+                # Emit SAGA_FAILED to bus if available
+                _bus = getattr(strategy, "_bus", None)
+                if _bus is not None:
+                    try:
+                        from backend.core.ouroboros.governance.autonomy.saga_messages import (
+                            SagaMessage, SagaMessageType, MessagePriority,
+                        )
+                        _bus.send(SagaMessage(
+                            message_type=SagaMessageType.SAGA_FAILED,
+                            saga_id=apply_result.saga_id,
+                            correlation_id=apply_result.saga_id,
+                            priority=MessagePriority.HIGH,
+                            payload={
+                                "schema_version": "1.0",
+                                "op_id": ctx.op_id,
+                                "saga_id": apply_result.saga_id,
+                                "reason_code": "verify_failed",
+                                "failed_phase": "VERIFY",
+                            },
+                        ))
+                    except Exception:
+                        pass
                 ctx = ctx.advance(OperationPhase.POSTMORTEM)
                 await self._record_ledger(
                     ctx,
