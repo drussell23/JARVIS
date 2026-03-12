@@ -182,7 +182,6 @@ class GenerationResult:
     tool_execution_records: Tuple[Any, ...] = ()
 
     def with_tool_records(self, records: tuple) -> "GenerationResult":
-        import dataclasses
         return dataclasses.replace(self, tool_execution_records=records)
 
 
