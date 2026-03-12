@@ -124,7 +124,7 @@ class RepairSandbox:
         await self._setup()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+    async def __aexit__(self, _exc_type, _exc_val, _exc_tb) -> None:
         await self._teardown()
         # Do not suppress exceptions.
         return None
@@ -188,13 +188,13 @@ class RepairSandbox:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
+            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
             raise RuntimeError("git worktree add timed out")
 
-        if proc.returncode != 0:
+        if proc.returncode:
             raise RuntimeError(
                 f"git worktree add exited {proc.returncode}: "
                 f"{stderr.decode(errors='replace').strip()}"
@@ -215,13 +215,13 @@ class RepairSandbox:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
+            _stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
         except asyncio.TimeoutError:
             proc.kill()
             await proc.wait()
             raise RuntimeError("rsync timed out")
 
-        if proc.returncode != 0:
+        if proc.returncode:
             raise RuntimeError(
                 f"rsync exited {proc.returncode}: "
                 f"{stderr.decode(errors='replace').strip()}"
@@ -277,7 +277,7 @@ class RepairSandbox:
             stderr=asyncio.subprocess.PIPE,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
+            _stdout, stderr = await asyncio.wait_for(
                 proc.communicate(input=patch_text.encode()),
                 timeout=15.0,
             )
@@ -286,7 +286,7 @@ class RepairSandbox:
             await proc.wait()
             raise RuntimeError(f"patch timed out for {file_path}")
 
-        if proc.returncode != 0:
+        if proc.returncode:
             raise RuntimeError(
                 f"patch failed (exit {proc.returncode}) for {file_path}: "
                 f"{stderr.decode(errors='replace').strip()}"
@@ -392,13 +392,14 @@ class RepairSandbox:
 
             stdout = stdout_b.decode(errors="replace")
             stderr = stderr_b.decode(errors="replace")
-            passed = proc.returncode == 0
+            returncode = proc.returncode if proc.returncode is not None else -1
+            passed = returncode == 0
 
             return SandboxValidationResult(
                 passed=passed,
                 stdout=stdout,
                 stderr=stderr,
-                returncode=proc.returncode,
+                returncode=returncode,
                 duration_s=duration,
             )
 
