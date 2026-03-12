@@ -12,20 +12,31 @@ The repair loop implements:
 
 This module is structured as:
 1. **RepairBudget** - Immutable configuration loaded from environment
-2. **RepairEngine** - FSM executor and repair orchestration (stub, Task 5)
-3. **Repair context & telemetry** - Ledger and audit trail
+2. **L2State / L2Event** - FSM state and event enumerations
+3. **RepairIterationRecord** - Per-iteration ledger payload
+4. **RepairResult** - Terminal outcome returned to the orchestrator
+5. **RepairEngine** - FSM executor and repair orchestration
 """
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import enum
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass
-from typing import Dict
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Set, Tuple
 
 _logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# RepairBudget
+# ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -144,3 +155,406 @@ class RepairBudget:
             max_class_retries=max_class_retries,
             flake_confirm_reruns=flake_confirm_reruns,
         )
+
+
+# ---------------------------------------------------------------------------
+# L2 FSM enumerations
+# ---------------------------------------------------------------------------
+
+
+class L2State(str, enum.Enum):
+    L2_INIT = "L2_INIT"
+    L2_PREPARE_BASELINE = "L2_PREPARE_BASELINE"
+    L2_GENERATE_PATCH = "L2_GENERATE_PATCH"
+    L2_MATERIALIZE_CANDIDATE = "L2_MATERIALIZE_CANDIDATE"
+    L2_RUN_VALIDATION = "L2_RUN_VALIDATION"
+    L2_CLASSIFY_FAILURE = "L2_CLASSIFY_FAILURE"
+    L2_EVALUATE_PROGRESS = "L2_EVALUATE_PROGRESS"
+    L2_DECIDE_RETRY = "L2_DECIDE_RETRY"
+    L2_BUILD_REPAIR_PROMPT = "L2_BUILD_REPAIR_PROMPT"
+    L2_CONVERGED = "L2_CONVERGED"
+    L2_STOPPED = "L2_STOPPED"
+    L2_ABORTED = "L2_ABORTED"
+
+
+class L2Event(str, enum.Enum):
+    EV_START = "EV_START"
+    EV_PATCH_GENERATED = "EV_PATCH_GENERATED"
+    EV_PATCH_INVALID = "EV_PATCH_INVALID"
+    EV_VALIDATION_PASS = "EV_VALIDATION_PASS"
+    EV_VALIDATION_FAIL = "EV_VALIDATION_FAIL"
+    EV_FAILURE_CLASSIFIED_SYNTAX = "EV_FAILURE_CLASSIFIED_SYNTAX"
+    EV_FAILURE_CLASSIFIED_TEST = "EV_FAILURE_CLASSIFIED_TEST"
+    EV_FAILURE_CLASSIFIED_ENV = "EV_FAILURE_CLASSIFIED_ENV"
+    EV_FAILURE_CLASSIFIED_FLAKE = "EV_FAILURE_CLASSIFIED_FLAKE"
+    EV_PROGRESS = "EV_PROGRESS"
+    EV_NO_PROGRESS = "EV_NO_PROGRESS"
+    EV_OSCILLATION_DETECTED = "EV_OSCILLATION_DETECTED"
+    EV_BUDGET_EXHAUSTED = "EV_BUDGET_EXHAUSTED"
+    EV_NON_RETRYABLE_ENV = "EV_NON_RETRYABLE_ENV"
+    EV_RETRY_ALLOWED = "EV_RETRY_ALLOWED"
+    EV_RETRY_DENIED = "EV_RETRY_DENIED"
+    EV_CANCEL = "EV_CANCEL"
+    EV_FATAL_INFRA = "EV_FATAL_INFRA"
+
+
+# ---------------------------------------------------------------------------
+# RepairIterationRecord and RepairResult
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RepairIterationRecord:
+    """Ledger payload for one repair iteration. schema_version: repair.iter.v1"""
+
+    schema_version: str = "repair.iter.v1"
+    op_id: str = ""
+    iteration: int = 0
+    repair_state: str = ""
+    failure_class: str = ""
+    failure_signature_hash: str = ""
+    patch_signature_hash: str = ""
+    diff_lines: int = 0
+    files_changed: int = 0
+    validation_duration_s: float = 0.0
+    outcome: str = ""    # "progress"|"no_progress"|"converged"|"stopped"|"aborted"
+    stop_reason: Optional[str] = None
+    model_id: str = ""
+    provider_name: str = ""
+
+
+@dataclass(frozen=True)
+class RepairResult:
+    """Terminal outcome returned by RepairEngine.run() to the orchestrator."""
+
+    terminal: str                        # "L2_CONVERGED"|"L2_STOPPED"|"L2_ABORTED"
+    candidate: Optional[Dict[str, Any]]  # converged candidate dict, or None
+    stop_reason: Optional[str]           # set when terminal=="L2_STOPPED"
+    summary: Dict[str, Any]              # key metrics for ledger payload
+    iterations: Tuple[RepairIterationRecord, ...]
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _count_diff_lines(diff: str) -> int:
+    """Count changed lines in a unified diff (+ and - lines, excluding +++ / ---)."""
+    return sum(
+        1 for ln in diff.splitlines()
+        if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
+    )
+
+
+def _patch_sig(diff: str) -> str:
+    """SHA-256 hex digest of a unified diff (delegates to failure_classifier)."""
+    from backend.core.ouroboros.governance.failure_classifier import patch_signature_hash
+    return patch_signature_hash(diff)
+
+
+# ---------------------------------------------------------------------------
+# RepairEngine
+# ---------------------------------------------------------------------------
+
+
+class RepairEngine:
+    """L2 iterative self-repair loop executor.
+
+    Drives the bounded generate→sandbox-run→classify→revise loop.
+    Called by the orchestrator after VALIDATE exhaustion when L2 is enabled.
+
+    Parameters
+    ----------
+    budget:
+        Frozen resource limits loaded from env (RepairBudget.from_env()).
+    prime_provider:
+        Provider with async generate(ctx, deadline, repair_context=None).
+    repo_root:
+        Path to the repository root (passed to sandbox_factory).
+    sandbox_factory:
+        Callable(repo_root, test_timeout_s) → async context manager.
+        Defaults to RepairSandbox when None.
+    ledger:
+        Optional OperationLedger for audit trail.
+    """
+
+    def __init__(
+        self,
+        budget: RepairBudget,
+        prime_provider: Any,
+        repo_root: Any,
+        sandbox_factory: Any = None,
+        ledger: Any = None,
+    ) -> None:
+        self._budget = budget
+        self._prime = prime_provider
+        self._repo_root = repo_root
+        self._ledger = ledger
+        if sandbox_factory is None:
+            from backend.core.ouroboros.governance.repair_sandbox import RepairSandbox
+            self._sandbox_factory = RepairSandbox
+        else:
+            self._sandbox_factory = sandbox_factory
+        self._classifier = _lazy_classifier()
+
+    async def run(
+        self,
+        ctx: Any,
+        best_validation: Any,
+        pipeline_deadline: datetime,
+    ) -> RepairResult:
+        """Execute the L2 repair loop.
+
+        Parameters
+        ----------
+        ctx:
+            OperationContext from the orchestrator.
+        best_validation:
+            The best ValidationResult that failed (has best_candidate and short_summary).
+        pipeline_deadline:
+            UTC datetime after which no new iteration should start.
+
+        Returns
+        -------
+        RepairResult
+            terminal == "L2_CONVERGED" if a passing candidate was found,
+            terminal == "L2_STOPPED" otherwise.
+
+        Raises
+        ------
+        asyncio.CancelledError
+            Propagated immediately; never swallowed.
+        """
+        budget = self._budget
+        iteration = 0
+        repair_context = None
+        seen_pairs: Set[Tuple[str, str]] = set()
+        class_retry_counts: Dict[str, int] = {}
+        no_progress_streak = 0
+        prev_failing_count: Optional[int] = None
+        prev_failure_class: Optional[str] = None
+        total_validation_runs = 0
+        t_start = time.monotonic()
+        records: list = []
+
+        def _stopped(reason: str) -> RepairResult:
+            rec = RepairIterationRecord(
+                op_id=ctx.op_id,
+                iteration=iteration,
+                repair_state=L2State.L2_STOPPED.value,
+                outcome="stopped",
+                stop_reason=reason,
+            )
+            self._emit_record(ctx.op_id, rec)
+            return RepairResult(
+                terminal="L2_STOPPED",
+                candidate=None,
+                stop_reason=reason,
+                summary={"iterations": iteration, "total_validation_runs": total_validation_runs},
+                iterations=tuple(records + [rec]),
+            )
+
+        while True:
+            # ----------------------------------------------------------------
+            # Kill conditions (checked BEFORE every iteration)
+            # ----------------------------------------------------------------
+            now = datetime.now(timezone.utc)
+            elapsed = time.monotonic() - t_start
+            remaining_s = (pipeline_deadline - now).total_seconds()
+
+            if remaining_s < budget.min_deadline_remaining_s:
+                return _stopped("deadline_budget_exhausted")
+            if elapsed > budget.timebox_s:
+                return _stopped("timebox_exhausted")
+            if iteration >= budget.max_iterations:
+                return _stopped("max_iterations_exhausted")
+            if total_validation_runs >= budget.max_total_validation_runs:
+                return _stopped("max_validation_runs_exhausted")
+
+            iteration += 1
+
+            # ----------------------------------------------------------------
+            # GENERATE
+            # ----------------------------------------------------------------
+            if repair_context is not None:
+                try:
+                    gen_result = await self._prime.generate(
+                        ctx, pipeline_deadline, repair_context=repair_context
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    return _stopped(f"generate_error:{type(exc).__name__}")
+                if not gen_result.candidates:
+                    return _stopped("empty_candidates")
+                current_candidate = dict(gen_result.candidates[0])
+            else:
+                # First iteration: use candidate from failed L1 generation
+                current_candidate = dict(ctx.generation.candidates[0])
+
+            # ----------------------------------------------------------------
+            # Diff budget check
+            # ----------------------------------------------------------------
+            diff = current_candidate.get("unified_diff", "")
+            if _count_diff_lines(diff) > budget.max_diff_lines:
+                return _stopped("diff_expansion_rejected")
+
+            # ----------------------------------------------------------------
+            # RUN in sandbox
+            # ----------------------------------------------------------------
+            total_validation_runs += 1
+            file_path = current_candidate.get("file_path", "")
+            sandbox_content = ""
+            try:
+                async with self._sandbox_factory(
+                    self._repo_root, budget.per_iteration_test_timeout_s
+                ) as sb:
+                    await sb.apply_patch(diff, file_path)
+                    target = sb.sandbox_root / file_path if file_path else None
+                    if target is not None and hasattr(target, "exists") and target.exists():
+                        try:
+                            sandbox_content = target.read_text(encoding="utf-8", errors="replace")
+                        except Exception:
+                            sandbox_content = ""
+                    svr = await sb.run_tests(
+                        (), budget.per_iteration_test_timeout_s
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                return _stopped(f"sandbox_infra_error:{type(exc).__name__}")
+
+            # ----------------------------------------------------------------
+            # CONVERGED?
+            # ----------------------------------------------------------------
+            if svr.passed:
+                rec = RepairIterationRecord(
+                    op_id=ctx.op_id,
+                    iteration=iteration,
+                    repair_state=L2State.L2_CONVERGED.value,
+                    outcome="converged",
+                    diff_lines=_count_diff_lines(diff),
+                    validation_duration_s=svr.duration_s,
+                )
+                self._emit_record(ctx.op_id, rec)
+                records.append(rec)
+                return RepairResult(
+                    terminal="L2_CONVERGED",
+                    candidate=current_candidate,
+                    stop_reason=None,
+                    summary={
+                        "iterations": iteration,
+                        "total_validation_runs": total_validation_runs,
+                    },
+                    iterations=tuple(records),
+                )
+
+            # ----------------------------------------------------------------
+            # CLASSIFY FAILURE
+            # ----------------------------------------------------------------
+            classification = self._classifier.classify(svr)
+            if classification.is_non_retryable:
+                return _stopped(f"non_retryable_env:{classification.env_subtype}")
+
+            fail_class = classification.failure_class.value
+            fail_sig = classification.failure_signature_hash
+            patch_sig = _patch_sig(diff)
+
+            # ----------------------------------------------------------------
+            # EVALUATE PROGRESS
+            # ----------------------------------------------------------------
+            current_failing_count = len(classification.failing_test_ids)
+            is_progress = (
+                prev_failing_count is None
+                or current_failing_count < prev_failing_count
+                or (
+                    fail_class == "test"
+                    and prev_failure_class is not None
+                    and prev_failure_class in ("syntax", "env")
+                )
+            )
+            prev_failing_count = current_failing_count
+            prev_failure_class = fail_class
+
+            # ----------------------------------------------------------------
+            # OSCILLATION check
+            # ----------------------------------------------------------------
+            pair = (fail_sig, patch_sig)
+            if pair in seen_pairs:
+                return _stopped("oscillation_detected")
+            seen_pairs.add(pair)
+
+            # ----------------------------------------------------------------
+            # NO-PROGRESS streak
+            # ----------------------------------------------------------------
+            if is_progress:
+                no_progress_streak = 0
+            else:
+                no_progress_streak += 1
+                if no_progress_streak >= budget.no_progress_streak_kill:
+                    return _stopped("no_progress_streak")
+
+            # ----------------------------------------------------------------
+            # PER-CLASS retry cap
+            # ----------------------------------------------------------------
+            class_retry_counts[fail_class] = class_retry_counts.get(fail_class, 0) + 1
+            if class_retry_counts[fail_class] > budget.max_class_retries.get(fail_class, 1):
+                return _stopped(f"class_retries_exhausted:{fail_class}")
+
+            # ----------------------------------------------------------------
+            # BUILD REPAIR PROMPT (set repair_context for next iteration)
+            # ----------------------------------------------------------------
+            from backend.core.ouroboros.governance.op_context import RepairContext
+            repair_context = RepairContext(
+                iteration=iteration,
+                max_iterations=budget.max_iterations,
+                failure_class=fail_class,
+                failure_signature_hash=fail_sig,
+                failing_tests=classification.failing_test_ids,
+                failure_summary=(svr.stdout + svr.stderr)[:300],
+                current_candidate_content=sandbox_content,
+                current_candidate_file_path=file_path,
+            )
+
+            outcome = "progress" if is_progress else "no_progress"
+            rec = RepairIterationRecord(
+                op_id=ctx.op_id,
+                iteration=iteration,
+                repair_state=L2State.L2_BUILD_REPAIR_PROMPT.value,
+                failure_class=fail_class,
+                failure_signature_hash=fail_sig,
+                patch_signature_hash=patch_sig,
+                diff_lines=_count_diff_lines(diff),
+                validation_duration_s=svr.duration_s,
+                outcome=outcome,
+            )
+            self._emit_record(ctx.op_id, rec)
+            records.append(rec)
+
+    def _emit_record(self, op_id: str, record: RepairIterationRecord) -> None:
+        """Append a RepairIterationRecord to the ledger (if wired)."""
+        if self._ledger is None:
+            return
+        try:
+            from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
+            entry = LedgerEntry(
+                op_id=op_id,
+                state=OperationState.SANDBOXING,
+                data={"kind": "repair.iter.v1", **dataclasses.asdict(record)},
+                entry_id=f"{op_id}:l2:iter:{record.iteration}",
+            )
+            self._ledger.append(entry)
+        except Exception:
+            _logger.debug("repair_engine: failed to emit ledger record", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Lazy import helper (avoids circular import at module load time)
+# ---------------------------------------------------------------------------
+
+
+def _lazy_classifier():
+    """Import and return a FailureClassifier instance."""
+    from backend.core.ouroboros.governance.failure_classifier import FailureClassifier
+    return FailureClassifier()

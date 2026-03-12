@@ -68,3 +68,118 @@ class TestRepairBudget:
         b = RepairBudget()
         with pytest.raises(Exception):
             b.enabled = True  # type: ignore[misc]
+
+
+# ── append after TestRepairBudget ────────────────────────────────────────────
+import asyncio
+from datetime import datetime, timedelta, timezone
+from unittest.mock import AsyncMock, MagicMock
+
+from backend.core.ouroboros.governance.repair_engine import (
+    RepairBudget, RepairEngine, RepairResult,
+)
+from backend.core.ouroboros.governance.repair_sandbox import SandboxValidationResult
+
+
+def _deadline(seconds: float = 300.0) -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=seconds)
+
+
+def _mock_ctx(op_id="test-op-1"):
+    candidate = {
+        "candidate_id": "c1", "file_path": "src/foo.py",
+        "unified_diff": "@@ -1 +1 @@\n-x = 1\n+x = 2",
+        "full_content": "x = 2\n",
+    }
+    gen = MagicMock()
+    gen.candidates = (candidate,)
+    gen.model_id = "test-model"
+    gen.provider_name = "gcp-jprime"
+    ctx = MagicMock()
+    ctx.op_id = op_id
+    ctx.generation = gen
+    ctx.target_files = ("src/foo.py",)
+    return ctx
+
+
+def _mock_sandbox_factory(svr):
+    class _Mock:
+        def __init__(self, repo_root, test_timeout_s):
+            self.sandbox_root = MagicMock()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): pass
+        async def apply_patch(self, diff, fp): pass
+        async def run_tests(self, targets, timeout_s): return svr
+    return _Mock
+
+
+class TestRepairEngine:
+    def _engine(self, budget, svr):
+        gen = MagicMock()
+        gen.candidates = (_mock_ctx().generation.candidates[0],)
+        gen.model_id = "test-model"
+        gen.provider_name = "gcp-jprime"
+        prime = MagicMock()
+        prime.generate = AsyncMock(return_value=gen)
+        return RepairEngine(
+            budget=budget, prime_provider=prime,
+            repo_root=MagicMock(),
+            sandbox_factory=_mock_sandbox_factory(svr),
+        )
+
+    def _fail_val(self):
+        bv = MagicMock()
+        bv.best_candidate = {
+            "candidate_id": "c1", "file_path": "src/foo.py",
+            "unified_diff": "@@ -1 +1 @@\n-x=1\n+x=2",
+        }
+        bv.short_summary = "FAILED tests/test_foo.py::test_bar\n1 failed"
+        return bv
+
+    @pytest.mark.asyncio
+    async def test_l2_converged_on_passing_first_iteration(self):
+        svr = SandboxValidationResult(True, "1 passed", "", 0, 0.1)
+        engine = self._engine(RepairBudget(enabled=True, max_iterations=3), svr)
+        result = await engine.run(_mock_ctx(), self._fail_val(), _deadline())
+        assert result.terminal == "L2_CONVERGED"
+        assert result.candidate is not None
+
+    @pytest.mark.asyncio
+    async def test_l2_stopped_budget_exhausted(self):
+        svr = SandboxValidationResult(False, "FAILED tests/t.py::x\n1 failed", "", 1, 0.1)
+        engine = self._engine(RepairBudget(enabled=True, max_iterations=2), svr)
+        result = await engine.run(_mock_ctx(), self._fail_val(), _deadline())
+        assert result.terminal == "L2_STOPPED"
+
+    @pytest.mark.asyncio
+    async def test_l2_aborted_on_cancel(self):
+        prime = MagicMock()
+        prime.generate = AsyncMock(side_effect=asyncio.CancelledError())
+        svr = SandboxValidationResult(False, "", "", 1, 0.1)
+        engine = RepairEngine(
+            budget=RepairBudget(enabled=True, max_iterations=5),
+            prime_provider=prime, repo_root=MagicMock(),
+            sandbox_factory=_mock_sandbox_factory(svr),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await engine.run(_mock_ctx(), self._fail_val(), _deadline())
+
+    @pytest.mark.asyncio
+    async def test_emits_iteration_records(self):
+        svr = SandboxValidationResult(False, "FAILED tests/t.py::x\n1 failed", "", 1, 0.1)
+        engine = self._engine(RepairBudget(enabled=True, max_iterations=1), svr)
+        result = await engine.run(_mock_ctx(), self._fail_val(), _deadline())
+        assert len(result.iterations) >= 1
+        assert result.iterations[0].schema_version == "repair.iter.v1"
+
+    @pytest.mark.asyncio
+    async def test_l2_stopped_deadline_expired(self):
+        svr = SandboxValidationResult(False, "", "", 1, 0.1)
+        engine = self._engine(
+            RepairBudget(enabled=True, max_iterations=5, min_deadline_remaining_s=300.0),
+            svr,
+        )
+        past = datetime.now(timezone.utc) - timedelta(seconds=1)
+        result = await engine.run(_mock_ctx(), self._fail_val(), past)
+        assert result.terminal == "L2_STOPPED"
+        assert result.stop_reason is not None
