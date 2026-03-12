@@ -69,6 +69,7 @@ def test_tool_exec_record_is_asdict_serializable() -> None:
 
 def test_multiple_tool_records_have_unique_dedup_keys() -> None:
     """Multiple SANDBOXING records with distinct entry_ids must all be written."""
+    from pathlib import Path
     from backend.core.ouroboros.governance.ledger import (
         LedgerEntry,
         OperationLedger,
@@ -78,7 +79,7 @@ def test_multiple_tool_records_have_unique_dedup_keys() -> None:
     import tempfile
 
     async def _run(tmpdir: str) -> list:
-        ledger = OperationLedger(storage_dir=tmpdir)
+        ledger = OperationLedger(storage_dir=Path(tmpdir))
         entries = [
             LedgerEntry(
                 op_id="op-1",
@@ -96,6 +97,7 @@ def test_multiple_tool_records_have_unique_dedup_keys() -> None:
 
 def test_dedup_without_entry_id_still_works() -> None:
     """Without entry_id the original op+state dedup behaviour is preserved."""
+    from pathlib import Path
     from backend.core.ouroboros.governance.ledger import (
         LedgerEntry,
         OperationLedger,
@@ -105,7 +107,7 @@ def test_dedup_without_entry_id_still_works() -> None:
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        ledger = OperationLedger(storage_dir=tmpdir)
+        ledger = OperationLedger(storage_dir=Path(tmpdir))
         e = LedgerEntry(op_id="op-2", state=OperationState.SANDBOXING)
         r1 = asyncio.run(ledger.append(e))
         r2 = asyncio.run(ledger.append(e))
