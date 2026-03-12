@@ -499,7 +499,12 @@ class GoverningToolPolicy:
 
     def repo_root_for(self, repo: str) -> Path:
         """Return the resolved repo root for the given repo name."""
-        return self._repo_roots.get(repo, Path(".").resolve())
+        try:
+            return self._repo_roots[repo]
+        except KeyError:
+            raise KeyError(
+                f"Unknown repo {repo!r}; known repos: {sorted(self._repo_roots)}"
+            )
 
     def evaluate(self, call: ToolCall, ctx: PolicyContext) -> PolicyResult:  # noqa: C901
         """Evaluate a tool call against policy rules and return a decision."""
@@ -517,11 +522,11 @@ class GoverningToolPolicy:
         # Rule 1: read_file — path must be within repo_root
         if name == "read_file":
             path_arg = call.arguments.get("path", "")
-            if _safe_resolve_policy(path_arg, repo_root) is None:
+            if not path_arg or _safe_resolve_policy(path_arg, repo_root) is None:
                 return PolicyResult(
                     decision=PolicyDecision.DENY,
                     reason_code="tool.denied.path_outside_repo",
-                    detail=f"path {path_arg!r} escapes repo root",
+                    detail=f"path {call.arguments.get('path')!r} escapes repo root",
                 )
 
         # Rule 2: search_code — file_glob must not contain '..'
@@ -570,7 +575,7 @@ class GoverningToolPolicy:
         # Rule 4: list_symbols — module_path must be within repo_root
         elif name == "list_symbols":
             module_path = call.arguments.get("module_path", "")
-            if _safe_resolve_policy(module_path, repo_root) is None:
+            if not module_path or _safe_resolve_policy(module_path, repo_root) is None:
                 return PolicyResult(
                     decision=PolicyDecision.DENY,
                     reason_code="tool.denied.path_outside_repo",
