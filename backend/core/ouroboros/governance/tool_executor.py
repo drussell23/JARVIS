@@ -20,6 +20,8 @@ executor maps to ToolResult.error (never re-raised).
 from __future__ import annotations
 
 import ast
+import asyncio
+import dataclasses as _dc
 import enum
 import hashlib
 import json
@@ -593,3 +595,137 @@ class GoverningToolPolicy:
                 )
 
         return PolicyResult(decision=PolicyDecision.ALLOW, reason_code="")
+
+
+# ---------------------------------------------------------------------------
+# L1 Tool-Use: Pytest Output Parser
+# ---------------------------------------------------------------------------
+
+
+def _parse_pytest_output(stdout: str, stderr: str, exit_code: int) -> TestRunResult:
+    # Exit code mapping: 0=PASS, 1=FAIL (tests ran OK), 5=NO_TESTS, 2/3/4=INFRA_ERROR
+    if exit_code == 0:
+        status = TestRunStatus.PASS
+    elif exit_code == 1:
+        status = TestRunStatus.FAIL
+    elif exit_code == 5:
+        status = TestRunStatus.NO_TESTS
+    else:
+        status = TestRunStatus.INFRA_ERROR
+
+    combined = stdout + stderr
+    passed = failed = errors = 0
+    duration_s = 0.0
+    _summary_re = re.compile(
+        r"(?:(\d+)\s+passed)?(?:[,\s]+)?(?:(\d+)\s+failed)?(?:[,\s]+)?"
+        r"(?:(\d+)\s+error(?:s)?)?[^\n]*?in\s+([\d.]+)s",
+        re.IGNORECASE,
+    )
+    for line in combined.splitlines():
+        m = _summary_re.search(line)
+        if m and any(g is not None for g in m.groups()):
+            passed = int(m.group(1) or 0)
+            failed = int(m.group(2) or 0)
+            errors = int(m.group(3) or 0)
+            try:
+                duration_s = float(m.group(4) or 0.0)
+            except (TypeError, ValueError):
+                duration_s = 0.0
+            break
+
+    failures: List[TestFailure] = []
+    for m in re.finditer(r"^FAILED\s+(\S+)\s+-\s+(.+)$", combined, re.MULTILINE):
+        failures.append(TestFailure(test=m.group(1), message=m.group(2)[:200]))
+
+    return TestRunResult(status=status, passed=passed, failed=failed,
+        errors=errors, duration_s=duration_s, failures=tuple(failures))
+
+
+# ---------------------------------------------------------------------------
+# L1 Tool-Use: AsyncProcessToolBackend
+# ---------------------------------------------------------------------------
+
+class AsyncProcessToolBackend:
+    """Async backend for tool execution.
+
+    Non-test tools run via run_in_executor (thread pool).
+    run_tests runs via asyncio.create_subprocess_exec (cancellation-safe).
+    A semaphore limits concurrency. Deadline is enforced.
+    """
+
+    def __init__(self, semaphore: asyncio.Semaphore,
+                 _executor_instance: Optional["ToolExecutor"] = None) -> None:
+        self._semaphore = semaphore
+        self._executor_instance = _executor_instance
+
+    def _get_executor(self, repo_root: Path) -> "ToolExecutor":
+        return self._executor_instance or ToolExecutor(repo_root=repo_root)
+
+    async def execute_async(
+        self, call: ToolCall, policy_ctx: PolicyContext, deadline: float,
+    ) -> ToolResult:
+        cap = int(os.environ.get("JARVIS_TOOL_OUTPUT_CAP_BYTES", str(_OUTPUT_CAP_DEFAULT)))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            out = (json.dumps(_dc.asdict(TestRunResult(status=TestRunStatus.TIMEOUT)))
+                   if call.name == "run_tests" else "")
+            return ToolResult(tool_call=call, output=out, error="TIMEOUT",
+                status=ToolExecStatus.TIMEOUT)
+        timeout = min(float(os.environ.get("JARVIS_TOOL_TIMEOUT_S", "30")), max(1.0, remaining))
+        async with self._semaphore:
+            if call.name == "run_tests":
+                return await self._run_tests_async(call, policy_ctx, timeout, cap)
+            return await self._run_sync_tool_async(call, policy_ctx.repo_root, timeout, cap)
+
+    async def _run_sync_tool_async(
+        self, call: ToolCall, repo_root: Path, timeout: float, cap: int,
+    ) -> ToolResult:
+        executor = self._get_executor(repo_root)
+        loop = asyncio.get_event_loop()
+        try:
+            result: ToolResult = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: executor.execute(call)), timeout=timeout)
+            if result.error:
+                return ToolResult(tool_call=call, output=result.output[:cap],
+                    error=result.error, status=ToolExecStatus.EXEC_ERROR)
+            return ToolResult(tool_call=call, output=result.output[:cap], status=ToolExecStatus.SUCCESS)
+        except asyncio.TimeoutError:
+            return ToolResult(tool_call=call, output="", error="TIMEOUT", status=ToolExecStatus.TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(tool_call=call, output="", error=str(exc), status=ToolExecStatus.EXEC_ERROR)
+
+    async def _run_tests_async(
+        self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
+    ) -> ToolResult:
+        paths_arg = call.arguments.get("paths", [])
+        if isinstance(paths_arg, str):
+            paths_arg = [paths_arg]
+        cmd = ["python3", "-m", "pytest", "--tb=short", "-q"] + list(paths_arg)
+        proc = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(policy_ctx.repo_root),
+            )
+            stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            run_result = _parse_pytest_output(
+                stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace"), proc.returncode)
+            output = json.dumps(_dc.asdict(run_result))[:cap]
+            exec_status = (ToolExecStatus.SUCCESS
+                if run_result.status in (TestRunStatus.PASS, TestRunStatus.FAIL)
+                else ToolExecStatus.EXEC_ERROR)
+            return ToolResult(tool_call=call, output=output, status=exec_status)
+        except asyncio.TimeoutError:
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
+            run_result = TestRunResult(status=TestRunStatus.TIMEOUT)
+            return ToolResult(tool_call=call, output=json.dumps(_dc.asdict(run_result))[:cap],
+                error="TIMEOUT", status=ToolExecStatus.TIMEOUT)
+        except asyncio.CancelledError:
+            if proc is not None:
+                proc.kill()
+                await proc.wait()
+            raise
