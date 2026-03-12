@@ -20,7 +20,7 @@ import asyncio
 import heapq
 import itertools
 import logging
-from typing import List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     CommandEnvelope,
@@ -56,6 +56,7 @@ class CommandBus:
         self,
         maxsize: int = 256,
         dedup_capacity: int | None = None,
+        rate_limiter: Optional[object] = None,
     ) -> None:
         self._maxsize = maxsize
         self._heap: List[_HeapEntry] = []
@@ -63,6 +64,11 @@ class CommandBus:
         self._dedup = IdempotencyLRU(
             capacity=dedup_capacity if dedup_capacity is not None else maxsize * 4
         )
+        # Optional rate limiter — when set, async put() consults it before
+        # enqueuing.  Typed as ``object`` to avoid a hard import dependency;
+        # expected to be a ``TokenBucketRateLimiter`` with an async
+        # ``acquire(timeout)`` method and a ``get_status()`` method.
+        self._rate_limiter = rate_limiter
         # Signalled whenever a new item is pushed so that a blocked get()
         # can wake up and try to dequeue.
         self._not_empty = asyncio.Event()
@@ -74,9 +80,24 @@ class CommandBus:
     async def put(self, cmd: CommandEnvelope) -> bool:
         """Enqueue *cmd* if it is neither a duplicate nor over capacity.
 
+        When a rate limiter is configured, a token must be acquired before
+        enqueuing.  The limiter is checked with ``timeout=0.0`` (non-blocking)
+        so that callers are never stalled — they simply receive ``False``
+        when the rate limit is exceeded.
+
         Returns ``True`` on success, ``False`` if the command was
-        rejected (duplicate idempotency key **or** bus at capacity).
+        rejected (rate-limited, duplicate idempotency key, **or** bus at
+        capacity).
         """
+        if self._rate_limiter is not None:
+            acquired = await self._rate_limiter.acquire(timeout=0.0)
+            if not acquired:
+                logger.debug(
+                    "CommandBus: rate-limited command %s (type=%s)",
+                    cmd.command_id,
+                    cmd.command_type.value,
+                )
+                return False
         return self._enqueue(cmd)
 
     # ------------------------------------------------------------------
@@ -124,6 +145,16 @@ class CommandBus:
     def qsize(self) -> int:
         """Return the number of pending commands (including possibly expired ones)."""
         return len(self._heap)
+
+    # ------------------------------------------------------------------
+    # rate limiter status
+    # ------------------------------------------------------------------
+
+    def get_rate_limiter_status(self) -> Optional[Dict[str, Any]]:
+        """Return the rate limiter's status dict, or ``None`` if no limiter is configured."""
+        if self._rate_limiter is not None:
+            return self._rate_limiter.get_status()
+        return None
 
     # ------------------------------------------------------------------
     # internals
