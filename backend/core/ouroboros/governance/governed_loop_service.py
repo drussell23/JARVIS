@@ -1282,6 +1282,7 @@ class GovernedLoopService:
                 else "no_generator"
             ),
             "orphan_saga_branches": self._detect_orphan_branches(),
+            "saga_bus": self._saga_bus.to_dict() if getattr(self, "_saga_bus", None) else {},
         }
 
     def _detect_orphan_branches(self) -> List[str]:
@@ -1289,10 +1290,12 @@ class GovernedLoopService:
         try:
             from backend.core.ouroboros.governance.saga.repo_lock import RepoLockManager
             mgr = RepoLockManager()
-            if self._config.repo_registry is not None:
+            # Prefer live registry (self._repo_registry) over config
+            registry = self._repo_registry or getattr(self._config, "repo_registry", None)
+            if registry is not None:
                 roots = {
                     rc.name: rc.local_path
-                    for rc in self._config.repo_registry.list_enabled()
+                    for rc in registry.list_enabled()
                 }
             else:
                 roots = {"jarvis": self._config.project_root}
@@ -1621,6 +1624,15 @@ class GovernedLoopService:
             },
         )
 
+        # Create SagaMessageBus for passive saga observability
+        try:
+            from backend.core.ouroboros.governance.autonomy.saga_messages import SagaMessageBus
+            self._saga_bus = SagaMessageBus(max_messages=500)
+            logger.info("[GovernedLoop] SagaMessageBus created (max_messages=500)")
+        except ImportError:
+            self._saga_bus = None
+            logger.debug("[GovernedLoop] SagaMessageBus unavailable — saga_messages not found")
+
         # Build orchestrator
         orch_config = OrchestratorConfig(
             project_root=self._config.project_root,
@@ -1628,6 +1640,7 @@ class GovernedLoopService:
             generation_timeout_s=self._config.generation_timeout_s,
             context_expansion_timeout_s=self._config.context_expansion_timeout_s,
             approval_timeout_s=self._config.approval_timeout_s,
+            message_bus=self._saga_bus,
         )
         self._orchestrator = GovernedOrchestrator(
             stack=self._stack,

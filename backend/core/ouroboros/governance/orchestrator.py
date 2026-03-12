@@ -107,6 +107,9 @@ class OrchestratorConfig:
     context_expansion_enabled: bool = True
     context_expansion_timeout_s: float = 30.0
 
+    # Saga message bus (passive observability — created by GLS at startup)
+    message_bus: Optional[Any] = None
+
     # Benchmarking
     benchmark_enabled: bool = True
     benchmark_timeout_s: float = 60.0
