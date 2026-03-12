@@ -441,3 +441,150 @@ class ToolExecutor:
 
         n_extra = len(raw_lines) - cap
         return "\n".join(raw_lines[:cap]) + f"\n... ({n_extra} more)"
+
+
+# ---------------------------------------------------------------------------
+# L1 Tool-Use: GoverningToolPolicy
+# ---------------------------------------------------------------------------
+
+def _safe_resolve_policy(path_arg: str, repo_root: Path) -> Optional[Path]:
+    """Return the resolved path if it is contained within repo_root, else None.
+
+    Accepts both relative paths (resolved relative to repo_root) and absolute
+    paths (validated via relative_to containment check).  Returns None on any
+    escape attempt or OS error — never raises.
+    """
+    try:
+        p = Path(path_arg)
+        resolved = (p if p.is_absolute() else repo_root / p).resolve()
+        resolved.relative_to(repo_root.resolve())
+        return resolved
+    except (ValueError, OSError):
+        return None
+
+
+class GoverningToolPolicy:
+    """Deny-by-default tool-use policy enforcing repo containment.
+
+    Rules are evaluated in order; the first matching rule wins.  An ALLOW
+    decision requires a positive match — there is no silent fallthrough to
+    ALLOW.  Callers (e.g. ToolLoopCoordinator) are responsible for acting on
+    the returned :class:`PolicyResult`; this class never raises.
+
+    Parameters
+    ----------
+    repo_roots:
+        Mapping of repo name → absolute Path.  Each :class:`PolicyContext`
+        carries its own ``repo_root``; the policy evaluates containment
+        against *that* root, not against other repos in the dict, which
+        naturally enforces cross-repo isolation.
+    run_tests_allowed:
+        Optional override for the ``JARVIS_TOOL_RUN_TESTS_ALLOWED`` env var.
+        Primarily used in tests to avoid monkeypatching.
+    """
+
+    def __init__(
+        self,
+        repo_roots: Dict[str, Path],
+        run_tests_allowed: Optional[bool] = None,
+    ) -> None:
+        self._repo_roots: Dict[str, Path] = {
+            k: v.resolve() for k, v in repo_roots.items()
+        }
+        self._run_tests_allowed_override = run_tests_allowed
+
+    # ------------------------------------------------------------------
+    # ToolPolicy protocol
+    # ------------------------------------------------------------------
+
+    def repo_root_for(self, repo: str) -> Path:
+        """Return the resolved repo root for the given repo name."""
+        return self._repo_roots.get(repo, Path(".").resolve())
+
+    def evaluate(self, call: ToolCall, ctx: PolicyContext) -> PolicyResult:  # noqa: C901
+        """Evaluate a tool call against policy rules and return a decision."""
+        name = call.name
+        repo_root = ctx.repo_root.resolve()
+
+        # Rule 0: unknown tool → deny immediately
+        if name not in _L1_MANIFESTS:
+            return PolicyResult(
+                decision=PolicyDecision.DENY,
+                reason_code="tool.denied.unknown_tool",
+                detail=f"Unknown tool: {name!r}",
+            )
+
+        # Rule 1: read_file — path must be within repo_root
+        if name == "read_file":
+            path_arg = call.arguments.get("path", "")
+            if _safe_resolve_policy(path_arg, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"path {path_arg!r} escapes repo root",
+                )
+
+        # Rule 2: search_code — file_glob must not contain '..'
+        elif name == "search_code":
+            file_glob = call.arguments.get("file_glob", "*.py")
+            if ".." in Path(file_glob).parts:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"file_glob {file_glob!r} contains '..'",
+                )
+
+        # Rule 3: run_tests — requires env opt-in AND paths inside tests/
+        elif name == "run_tests":
+            if self._run_tests_allowed_override is not None:
+                allowed = self._run_tests_allowed_override
+            else:
+                allowed = (
+                    os.environ.get("JARVIS_TOOL_RUN_TESTS_ALLOWED", "false").lower()
+                    == "true"
+                )
+            if not allowed:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.run_tests_disabled",
+                    detail="JARVIS_TOOL_RUN_TESTS_ALLOWED is not 'true'",
+                )
+            tests_root = repo_root / "tests"
+            for tp in call.arguments.get("paths", []):
+                resolved = _safe_resolve_policy(str(tp), repo_root)
+                if resolved is None:
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason_code="tool.denied.path_outside_test_scope",
+                        detail=f"test path {tp!r} escapes repo root",
+                    )
+                try:
+                    resolved.relative_to(tests_root.resolve())
+                except ValueError:
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason_code="tool.denied.path_outside_test_scope",
+                        detail=f"test path {tp!r} is outside tests/",
+                    )
+
+        # Rule 4: list_symbols — module_path must be within repo_root
+        elif name == "list_symbols":
+            module_path = call.arguments.get("module_path", "")
+            if _safe_resolve_policy(module_path, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail="module_path escapes repo root",
+                )
+
+        # Rule 5: get_callers — optional file_path must be within repo_root
+        elif name == "get_callers":
+            fp = call.arguments.get("file_path")
+            if fp is not None and _safe_resolve_policy(fp, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"file_path {fp!r} escapes repo root",
+                )
+
+        return PolicyResult(decision=PolicyDecision.ALLOW, reason_code="")
