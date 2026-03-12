@@ -2,7 +2,7 @@
 
 **The Body of the AGI OS — macOS integration, computer use, action execution, and unified orchestration**
 
-JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v261.0 (Ouroboros 2c.1)**, JARVIS autonomously self-develops across all three repos in real time: the Ouroboros governance loop (Zones 6.0–6.9) detects improvement opportunities, generates multi-repo patches via GCP J-Prime (schema 2c.1), validates them, applies them with git commits, and narrates every decision via voice and TUI — all without human intervention. Previous milestones include: Memory Control Plane with lease-based memory governance (v260.0), command lifecycle event infrastructure (v243.0/v243.1), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
+JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v262.0 (Ouroboros B+ — Full Activation)**, JARVIS autonomously self-develops across all three repos in real time with production-grade saga safety: the Ouroboros governance loop (Zones 6.0–6.9) detects improvement opportunities, generates multi-repo patches via GCP J-Prime (schema 2c.1), validates them, applies them via **B+ branch-isolated sagas** (ephemeral branches, two-tier locks, ff-only promote gates, rollback-via-branch-delete), and narrates every decision via voice and TUI — all without human intervention. v262.0 activates the full autonomous stack: `JARVIS_SAGA_BRANCH_ISOLATION=true`, `JARVIS_GOVERNANCE_MODE=governed`, SagaMessageBus passive observer, and TestFailureSensor with real TestWatcher per repo. Previous milestones include: schema 2c.1 cross-repo patches (v261.0), Memory Control Plane with lease-based memory governance (v260.0), command lifecycle event infrastructure (v243.0/v243.1), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
 
 ---
 
@@ -282,6 +282,14 @@ JARVIS_INTAKE_TF_MIN_COUNT=2                    # min test failures before narra
 JARVIS_INTAKE_A_NARRATOR_DEBOUNCE_S=10.0        # min seconds between A-layer announcements
 ```
 
+**B+ saga hardening (v262.0 — required for full autonomous apply):**
+```bash
+JARVIS_SAGA_BRANCH_ISOLATION=true         # activate B+ branch-isolated apply path (default false)
+JARVIS_SAGA_KEEP_FORENSICS_BRANCHES=true  # retain failed saga branches for postmortem (default true)
+JARVIS_SAGA_KEEP_FORENSICS_BRANCHES=false # auto-delete failed branches (saves disk space)
+JARVIS_INTENT_TEST_INTERVAL_S=300         # TestWatcher poll interval in seconds (default 300)
+```
+
 **Disable governance entirely (emergency):**
 ```bash
 python3 unified_supervisor.py --skip-governance
@@ -326,6 +334,232 @@ JARVIS polls this file every 30 seconds per repo. Once picked up, the envelope f
 | CrossRepoNarrator comm error | Logged and swallowed; never raises |
 
 The kernel **never crashes** due to governance failures. Self-programming is strictly additive — the system degrades gracefully and continues operating.
+
+---
+
+## v262.0 — B+ Cross-Repo Saga Hardening + Ouroboros Full Activation (March 2026)
+
+This release is the production hardening of the autonomous apply path and the full activation of all Ouroboros components. It spans two implementation sessions (15 tasks total, TDD throughout) and makes JARVIS ready for fully autonomous operation.
+
+### Why B+ Saga Hardening Was Needed
+
+Before v262.0, cross-repo saga applies used a **direct-to-HEAD** path: patches were written and committed directly on `main` of each repo. This was safe for single-repo ops but inadequate for coordinated multi-repo applies because:
+
+- No isolation between concurrent ops (dirty worktree could corrupt a mid-flight apply)
+- No rollback — a partial failure left repos in inconsistent states
+- No promote gates — TARGET_MOVED (another commit landed between apply and promote) went undetected
+- No forensics — failed applies left no diagnostic trail
+- Config values (`keep_failed_saga_branches`) weren't propagated from env to strategy
+
+B+ solves all of this without changing the external contract.
+
+---
+
+### B+ Branch Isolation Architecture
+
+Every cross-repo saga apply now follows this lifecycle:
+
+```
+Per-repo apply (branch_isolation=True):
+│
+├── 1. Preflight: assert clean worktree (uncommitted changes = abort)
+├── 2. Capture original ref + HEAD SHA for rollback
+├── 3. Create ephemeral branch: ouroboros/saga-<op_id>/<repo>
+├── 4. Apply patch files + git add + git commit (author: JARVIS Ouroboros)
+├── 5. Verify commit landed (check git log HEAD)
+│
+└── On failure at any step:
+      └── _bplus_compensate_all() → git checkout original_ref + git branch -D saga_branch
+
+Promote phase (after all repos applied):
+│
+├── Per-repo: check_promote_safe() → raises RuntimeError("TARGET_MOVED:...") if diverged
+├── Per-repo: git merge --ff-only ouroboros/saga-<op_id>/<repo>
+├── Per-repo: git branch -D saga_branch (cleanup)
+│
+└── On partial failure:
+      └── SAGA_PARTIAL_PROMOTE terminal state → scoped pause (cross_repo_saga scope)
+```
+
+**Rollback guarantee:** On any failure, `_bplus_compensate_all()` runs in reverse apply order, restoring each repo to its pre-saga ref. Failed saga branches are retained (configurable via `JARVIS_SAGA_KEEP_FORENSICS_BRANCHES`) for postmortem debugging.
+
+---
+
+### Two-Tier Locking (RepoLockManager)
+
+Cross-repo applies acquire locks in **sorted repo name order** to prevent deadlock across concurrent operations:
+
+```python
+# Always acquired in sorted order: jarvis → prime → reactor-core
+lock_order = sorted(repo_names)  # deterministic, deadlock-free
+
+# Per-repo: two-tier lock
+Tier 1: asyncio.Lock   — in-process mutual exclusion (fast path)
+Tier 2: fcntl.flock    — cross-process mutual exclusion (kernel-level)
+```
+
+`RepoLockManager` also provides:
+- `detect_orphan_branches(repo_roots)` — scans all repos for `ouroboros/saga-*` branches left by crashed ops
+- `cleanup_stale_locks(repo_roots)` — removes lock files whose PID is no longer alive
+
+`GovernedLoopService.health()` surfaces `orphan_saga_branches` in its telemetry dict so the TUI can display pending cleanup.
+
+---
+
+### SAGA_PARTIAL_PROMOTE — New Terminal State
+
+When promotion succeeds for some repos but fails for others (e.g., TARGET_MOVED on repo 2 of 3), the saga enters `SAGA_PARTIAL_PROMOTE` — a distinct terminal state from `SAGA_SUCCEEDED` and `SAGA_FAILED`:
+
+| Terminal State | Meaning |
+|----------------|---------|
+| `SAGA_SUCCEEDED` | All repos applied and promoted cleanly |
+| `SAGA_APPLY_COMPLETED` | All repos applied, promote not yet run |
+| `SAGA_ROLLED_BACK` | Apply failed, all repos compensated to pre-saga ref |
+| `SAGA_PARTIAL_PROMOTE` | Some repos promoted, others failed — **requires scoped pause** |
+| `SAGA_FAILED` | Verify or postmortem failure |
+
+On `SAGA_PARTIAL_PROMOTE`, the orchestrator calls `controller.pause(scope="cross_repo_saga")` to prevent new cross-repo ops from starting until the operator reviews the partial state.
+
+---
+
+### SagaLedgerArtifact — Frozen Audit Trail
+
+Every B+ saga operation emits a `SagaLedgerArtifact` (15-field frozen dataclass) to the durable ledger:
+
+```python
+@dataclass(frozen=True)
+class SagaLedgerArtifact:
+    saga_id: str               # unique per operation
+    op_id: str                 # parent operation id
+    event: str                 # lifecycle event name
+    repo: str                  # which repo this record covers
+    original_ref: str          # HEAD before saga started
+    original_sha: str          # SHA of original_ref
+    base_sha: str              # SHA of branch point
+    saga_branch: str           # ouroboros/saga-<op_id>/<repo>
+    promoted_sha: str          # SHA after ff-only promote (or "" if not promoted)
+    promote_order_index: int   # position in apply order
+    rollback_reason: str       # if rolled back, why
+    partial_promote_boundary_repo: str  # first repo that failed promote
+    kept_forensics_branches: list[str]  # retained for postmortem
+    skipped_no_diff: bool      # True if patch was a no-op
+    timestamp_ns: int          # monotonic nanoseconds
+```
+
+---
+
+### SagaMessageBus — Passive Observer
+
+A `SagaMessageBus` instance is created at GLS startup and passed through the orchestrator to `SagaApplyStrategy`. It passively records every saga lifecycle event for observability and debugging — it has **zero execution authority**.
+
+**6 policy rules (strictly enforced):**
+
+1. No execution authority shift — `orchestrator → SagaApplyStrategy` remains the sole execution route
+2. Emit saga lifecycle events: `SAGA_CREATED`, `SAGA_ADVANCED`, `SAGA_COMPLETED`, `SAGA_FAILED`, `SAGA_ROLLED_BACK`, `SAGA_PARTIAL_PROMOTE`, `TARGET_MOVED`, `ANCESTRY_VIOLATION`
+3. Side-effect-free handlers only — no apply/verify/rollback decisions from bus handlers
+4. Optional/fault-isolated — if bus raises, execution continues with debug log (never fatal)
+5. Rich event payload — every message carries `schema_version: "1.0"`, `op_id`, `saga_id`, `reason_code`
+6. Bounded retention — `max_messages=500`, TTL pruning (default 300s)
+
+**Fault isolation wrapper (fire-and-forget):**
+```python
+def _bus_emit(self, msg_type: str, saga_id: str, op_id: str, **kwargs) -> None:
+    if self._bus is None:
+        return
+    try:
+        self._bus.send(SagaMessage(
+            message_type=SagaMessageType(msg_type),
+            saga_id=saga_id,
+            payload={"schema_version": "1.0", "op_id": op_id, ...kwargs},
+        ))
+    except Exception:
+        logger.debug("[Saga] bus emit failed for %s (non-fatal)", msg_type)
+```
+
+`GLS.health()` now includes `"saga_bus"` telemetry (message count + type breakdown) for TUI display.
+
+---
+
+### TestFailureSensor + TestWatcher — Fully Wired
+
+Before v262.0, `IntakeLayerService` constructed `TestFailureSensor` without a `TestWatcher`, causing `sensor.start()` to no-op — test failures were never polled.
+
+**Fixed (multi-repo and single-repo fallback paths):**
+
+```python
+_test_poll_s = float(os.environ.get("JARVIS_INTENT_TEST_INTERVAL_S", "300"))
+test_failure_sensors = [
+    TestFailureSensor(
+        repo=rc.name,
+        router=self._router,
+        test_watcher=TestWatcher(
+            repo=rc.name,
+            repo_path=str(rc.local_path),
+            poll_interval_s=_test_poll_s,
+        ),
+    )
+    for rc in enabled_repos
+]
+```
+
+`TestWatcher` runs `pytest` in a subprocess every `poll_interval_s` seconds and tracks a **failure streak counter**. It emits a stable `intent:test_failure` envelope only after `streak >= 2` consecutive failures — preventing false alarms from transient flakes.
+
+---
+
+### 4 P0 Activation Blockers Resolved
+
+| # | Blocker | Fix |
+|---|---------|-----|
+| P0-1 | `JARVIS_SAGA_BRANCH_ISOLATION` not set | Added to `.env` after `JARVIS_GOVERNANCE_MODE=governed` |
+| P0-2 | SagaMessageBus not wired into apply path | GLS creates bus at startup, passes to orchestrator config |
+| P0-3 | TestFailureSensor had no TestWatcher | Wired real TestWatcher per repo in IntakeLayerService |
+| P0-4a | `keep_failed_saga_branches` not propagated | Orchestrator reads `JARVIS_SAGA_KEEP_FORENSICS_BRANCHES` at construction time |
+| P0-4b | Orphan detection used wrong registry attribute | `_detect_orphan_branches` now uses live `self._repo_registry` with fallback chain |
+
+---
+
+### GO/NO-GO Criteria — All Green
+
+| # | Criterion | Status |
+|---|-----------|--------|
+| 1 | `SagaApplyStrategy._branch_isolation == True` at runtime | **GO** — env var + explicit constructor arg |
+| 2 | Startup logs `mode=governed` | **GO** — `JARVIS_GOVERNANCE_MODE=governed` in `.env` |
+| 3 | Bus contains ordered lifecycle events after saga run | **GO** — 10 bus observer tests verify this |
+| 4 | Dropping bus handlers doesn't alter terminal state | **GO** — fault isolation + optional bus tests |
+| 5 | `TestFailureSensor._watcher is not None` per repo | **GO** — wired in both multi-repo and fallback paths |
+| 6 | Induced failing test → stable envelope after ≥2 polls | **GO** — TestWatcher streak counter enforces this |
+| 7 | `health().orphan_saga_branches` covers all enabled repos | **GO** — uses live `_repo_registry` |
+| 8 | `keep_failed_saga_branches` configurable via env | **GO** — `JARVIS_SAGA_KEEP_FORENSICS_BRANCHES` |
+
+---
+
+### Test Coverage Added (v262.0)
+
+| Test File | Tests | What |
+|-----------|-------|------|
+| `tests/e2e/test_gate1_sentinel.py` | 10 | E2E: branch creation, ff-only promote, rollback, TARGET_MOVED, dirty tree, lock order, orphan detection, two-repo cycle, feature flag fallback |
+| `tests/e2e/test_gate2_backlog.py` | 3 (stubs) | Gate 2: requires live J-Prime endpoint (`JARVIS_PRIME_ENDPOINT`) |
+| `tests/test_ouroboros_governance/test_saga_bus_observer.py` | 11 | Bus lifecycle events, schema pins, fault isolation, TARGET_MOVED differentiated emit |
+| `tests/test_ouroboros_governance/test_orchestrator_bus_emit.py` | 2 | Orchestrator-level bus smoke tests |
+| `tests/governance/autonomy/test_saga_messages_bplus.py` | 4 | New message type enum values |
+| `tests/governance/intake/test_test_failure_sensor_watcher_wiring.py` | 3 | TestWatcher constructor wiring |
+
+**Total new tests: 33 (30 passing deterministically, 3 require live J-Prime)**
+
+---
+
+### Files Changed (v262.0)
+
+| File | Change |
+|------|--------|
+| `.env` | `JARVIS_SAGA_BRANCH_ISOLATION=true`, `JARVIS_SAGA_KEEP_FORENSICS_BRANCHES=true` |
+| `backend/core/ouroboros/governance/saga/saga_types.py` | `SAGA_PARTIAL_PROMOTE` terminal state, `SagaLedgerArtifact` dataclass |
+| `backend/core/ouroboros/governance/saga/repo_lock.py` | `RepoLockManager` — two-tier lock, orphan detection, stale cleanup |
+| `backend/core/ouroboros/governance/saga/saga_apply_strategy.py` | B+ apply path, `_bus_emit`, `message_bus` param, differentiated TARGET_MOVED/ANCESTRY events |
+| `backend/core/ouroboros/governance/orchestrator.py` | SAGA_PARTIAL_PROMOTE handling, bus + forensics config pass-through, SAGA_FAILED emit on verify failure |
+| `backend/core/ouroboros/governance/governed_loop_service.py` | Orphan branch health, SagaMessageBus creation, live registry fix |
+| `backend/core/ouroboros/governance/autonomy/saga_messages.py` | `SAGA_PARTIAL_PROMOTE`, `TARGET_MOVED`, `ANCESTRY_VIOLATION` message types |
+| `backend/core/ouroboros/governance/intake/intake_layer_service.py` | TestWatcher wired into TestFailureSensor |
 
 ---
 
