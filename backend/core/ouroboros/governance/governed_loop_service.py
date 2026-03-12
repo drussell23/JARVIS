@@ -519,10 +519,10 @@ class GovernedLoopConfig:
     oracle_incremental_poll_interval_s: float = 300.0
 
     # L1 tool-use settings
-    tool_use_enabled:     bool  = False
-    max_tool_rounds:      int   = 5
-    tool_timeout_s:       float = 30.0
-    max_concurrent_tools: int   = 2
+    tool_use_enabled: bool = False
+    max_tool_rounds: int = 5
+    tool_timeout_s: float = 30.0
+    max_concurrent_tools: int = 2
 
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
@@ -565,9 +565,9 @@ class GovernedLoopConfig:
                 os.environ.get("JARVIS_PIPELINE_TIMEOUT_S", "600.0")
             ),
             tool_use_enabled=os.environ.get("JARVIS_GOVERNED_TOOL_USE_ENABLED", "false").lower() == "true",
-            max_tool_rounds=int(os.environ.get("JARVIS_TOOL_MAX_ROUNDS", "5")),
-            tool_timeout_s=float(os.environ.get("JARVIS_TOOL_TIMEOUT_S", "30")),
-            max_concurrent_tools=int(os.environ.get("JARVIS_TOOL_MAX_CONCURRENT", "2")),
+            max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "5")),
+            tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
+            max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),
         )
 
 
@@ -1531,7 +1531,6 @@ class GovernedLoopService:
         # Build ToolLoopCoordinator if tool-use is enabled via config
         _tool_coordinator = None
         if self._config.tool_use_enabled:
-            import asyncio as _asyncio
             from backend.core.ouroboros.governance.tool_executor import (
                 AsyncProcessToolBackend as _AsyncBE,
                 GoverningToolPolicy as _GTP,
@@ -1539,7 +1538,7 @@ class GovernedLoopService:
             )
             _rr = repo_roots_map if repo_roots_map else {"jarvis": Path.cwd()}
             _policy  = _GTP(repo_roots=_rr)
-            _backend = _AsyncBE(semaphore=_asyncio.Semaphore(self._config.max_concurrent_tools))
+            _backend = _AsyncBE(semaphore=asyncio.Semaphore(self._config.max_concurrent_tools))
             _tool_coordinator = _TLC(
                 backend=_backend, policy=_policy,
                 max_rounds=self._config.max_tool_rounds,
