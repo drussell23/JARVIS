@@ -35,6 +35,10 @@ from backend.core.ouroboros.governance.autonomy.execution_monitor import (
     ExecutionOutcome,
     ExecutionStatus,
 )
+from backend.core.ouroboros.governance.autonomy.risk_classifier import (
+    OperationRiskClassifier,
+    RiskAssessment,
+)
 
 logger = logging.getLogger("Ouroboros.SafetyNet")
 
@@ -80,6 +84,7 @@ class ProductionSafetyNet:
         self._incident_triggered: bool = False
         self._health_tracker: ComponentHealthTracker = ComponentHealthTracker()
         self._execution_monitor: ExecutionMonitor = ExecutionMonitor()
+        self._risk_classifier: OperationRiskClassifier = OperationRiskClassifier()
         self._escalated_resource_violation: bool = False
 
     # ------------------------------------------------------------------
@@ -258,12 +263,18 @@ class ProductionSafetyNet:
         1. Record in history and prune entries outside the configured window.
         2. Check for a pattern: same reason repeated >= threshold times.
         3. Classify the root cause into a known category.
-        4. Emit a REPORT_ROLLBACK_CAUSE command to L2 for attribution.
+        4. Classify risk using :class:`OperationRiskClassifier`.
+        5. Emit a REPORT_ROLLBACK_CAUSE command to L2 for attribution
+           (includes ``risk_level`` and ``risk_score``).
+        6. If the count-based incident threshold is reached, trigger incident.
+        7. If risk is actionable and no incident yet triggered, trigger
+           risk-aware early escalation.
         """
         payload = event.payload
         op_id = payload.get("op_id", "unknown")
         reason = payload.get("rollback_reason", "unknown")
         brain_id = payload.get("brain_id", "unknown")
+        affected_files: list = payload.get("affected_files", [])
 
         now = time.monotonic()
         self._rollback_history.append({
@@ -271,6 +282,7 @@ class ProductionSafetyNet:
             "brain_id": brain_id,
             "reason": reason,
             "ts": now,
+            "affected_files": affected_files,
         })
 
         # Prune old entries outside the configured window
@@ -286,6 +298,15 @@ class ProductionSafetyNet:
         # Classify root cause
         root_cause_class = self._classify_root_cause(reason)
 
+        # Classify risk for escalation decisions
+        assessment: RiskAssessment = self._risk_classifier.classify(
+            rollback_count=len(self._rollback_history),
+            window_s=self._config.rollback_pattern_window_s,
+            affected_files=affected_files,
+            root_cause_class=root_cause_class,
+            pattern_match=pattern_match,
+        )
+
         cmd = CommandEnvelope(
             source_layer="L3",
             target_layer="L2",
@@ -293,16 +314,18 @@ class ProductionSafetyNet:
             payload={
                 "op_id": op_id,
                 "root_cause_class": root_cause_class,
-                "affected_files": payload.get("affected_files", []),
+                "affected_files": affected_files,
                 "model_used": brain_id,
                 "pattern_match": pattern_match,
                 "similar_op_ids": [r["op_id"] for r in same_reason if r["op_id"] != op_id],
+                "risk_level": assessment.level.value,
+                "risk_score": assessment.score,
             },
             ttl_s=300.0,
         )
         self._bus.try_put(cmd)
 
-        # Incident detection: too many rollbacks in window
+        # Incident detection: too many rollbacks in window (count-based)
         if (len(self._rollback_history) >= self._config.incident_rollback_threshold
                 and not self._incident_triggered):
             self._incident_triggered = True
@@ -319,6 +342,30 @@ class ProductionSafetyNet:
                 ttl_s=300.0,
             )
             self._bus.try_put(incident_cmd)
+
+        # Risk-aware early escalation: if the classifier flags the
+        # situation as actionable (HIGH or CRITICAL) and no incident
+        # has been triggered yet via the normal count-based path,
+        # escalate proactively.
+        if assessment.is_actionable and not self._incident_triggered:
+            self._incident_triggered = True
+            risk_cmd = CommandEnvelope(
+                source_layer="L3",
+                target_layer="L1",
+                command_type=CommandType.REQUEST_MODE_SWITCH,
+                payload={
+                    "target_mode": "REDUCED_AUTONOMY",
+                    "reason": (
+                        f"Risk-aware escalation: {assessment.level.value} risk "
+                        f"(score={assessment.score:.2f}) — {assessment.reason}"
+                    ),
+                    "evidence_count": len(self._rollback_history),
+                    "risk_level": assessment.level.value,
+                    "risk_score": assessment.score,
+                },
+                ttl_s=300.0,
+            )
+            self._bus.try_put(risk_cmd)
 
     # ------------------------------------------------------------------
     # Human presence signal — L3 → L1 (Task 12: P1.8)
