@@ -842,7 +842,7 @@ class ToolLoopCoordinator:
                     started_at_ns=started_ns, ended_at_ns=ended_ns,
                     duration_ms=(ended_ns - started_ns) / 1_000_000,
                     output_bytes=len((tool_result.output or "").encode()),
-                    error_class=(type(tool_result.error).__name__ if tool_result.error else None),
+                    error_class=(tool_result.error if tool_result.error else None),
                     status=tool_result.status,
                 ))
                 self._last_records = list(records)
