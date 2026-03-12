@@ -20,12 +20,42 @@ executor maps to ToolResult.error (never re-raised).
 from __future__ import annotations
 
 import ast
+import enum
+import hashlib
+import json
+import os
+import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
 
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
+
+
+# ---------------------------------------------------------------------------
+# L1 Tool-Use: Enums
+# ---------------------------------------------------------------------------
+
+class ToolExecStatus(str, enum.Enum):
+    SUCCESS       = "success"
+    TIMEOUT       = "timeout"
+    POLICY_DENIED = "policy_denied"
+    EXEC_ERROR    = "exec_error"
+    CANCELLED     = "cancelled"
+
+class PolicyDecision(str, enum.Enum):
+    ALLOW = "allow"
+    DENY  = "deny"
+
+class TestRunStatus(str, enum.Enum):
+    PASS          = "pass"
+    FAIL          = "fail"
+    INFRA_ERROR   = "infra_error"   # pytest exits 2/3/4
+    NO_TESTS      = "no_tests"      # pytest exit 5
+    TIMEOUT       = "timeout"
+    POLICY_DENIED = "policy_denied"
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +77,73 @@ class ToolResult:
     tool_call: ToolCall
     output: str
     error: Optional[str] = None
+    status: ToolExecStatus = ToolExecStatus.SUCCESS
+
+
+# ---------------------------------------------------------------------------
+# L1 Tool-Use: Typed Contracts
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class ToolManifest:
+    name:           str
+    version:        str
+    description:    str
+    arg_schema:     Mapping[str, Any]
+    capabilities:   FrozenSet[str]
+    schema_version: str = "tool.manifest.v1"
+
+@dataclass(frozen=True)
+class PolicyResult:
+    decision:    PolicyDecision
+    reason_code: str
+    detail:      str = ""
+
+@dataclass(frozen=True)
+class PolicyContext:
+    repo:        str
+    repo_root:   Path
+    op_id:       str
+    call_id:     str   # "{op_id}:r{round_index}:{tool_name}"
+    round_index: int
+
+@dataclass(frozen=True)
+class TestFailure:
+    test:    str   # fully-qualified test ID
+    message: str   # truncated, max 200 chars
+
+@dataclass(frozen=True)
+class TestRunResult:
+    status:     TestRunStatus
+    passed:     int = 0
+    failed:     int = 0
+    errors:     int = 0
+    duration_s: float = 0.0
+    failures:   Tuple["TestFailure", ...] = ()
+
+@dataclass(frozen=True)
+class ToolExecutionRecord:
+    schema_version:     str                 # "tool.exec.v1"
+    op_id:              str
+    call_id:            str                 # "{op_id}:r{round_index}:{tool_name}"
+    round_index:        int
+    tool_name:          str
+    tool_version:       str
+    arguments_hash:     str
+    repo:               str
+    policy_decision:    str
+    policy_reason_code: str
+    started_at_ns:      Optional[int]
+    ended_at_ns:        Optional[int]
+    duration_ms:        Optional[float]
+    output_bytes:       int
+    error_class:        Optional[str]
+    status:             ToolExecStatus
+
+
+def _compute_args_hash(arguments: Dict[str, Any]) -> str:
+    normalized = json.dumps(arguments, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(normalized.encode()).hexdigest()
 
 
 # ---------------------------------------------------------------------------
