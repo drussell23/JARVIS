@@ -31,9 +31,9 @@ def foo(x):
     assert cc >= 4  # if + for + if + elif + while = 5 branches
 
 
-async def test_sensor_produces_envelope_with_confidence_driven_ack(tmp_path):
-    # Phase 2C.4: requires_human_ack is confidence-driven, not hardcoded True.
-    # CC=13, threshold=5 → static_score=1.0, confidence=1.0 ≥ default 0.75 → auto-submit.
+async def test_sensor_always_requires_human_ack(tmp_path):
+    # AC2 safety invariant: miner envelopes ALWAYS require human ACK,
+    # regardless of confidence level.
     src_file = tmp_path / "backend" / "core" / "complex.py"
     src_file.parent.mkdir(parents=True, exist_ok=True)
     lines = ["def foo(x):\n"]
@@ -43,7 +43,7 @@ async def test_sensor_produces_envelope_with_confidence_driven_ack(tmp_path):
     src_file.write_text("".join(lines))
 
     router = MagicMock()
-    router.ingest = AsyncMock(return_value="enqueued")
+    router.ingest = AsyncMock(return_value="pending_ack")
     sensor = OpportunityMinerSensor(
         repo_root=tmp_path,
         router=router,
@@ -55,8 +55,7 @@ async def test_sensor_produces_envelope_with_confidence_driven_ack(tmp_path):
     router.ingest.assert_called()
     for call in router.ingest.call_args_list:
         env = call.args[0]
-        # High CC well above threshold → confidence ≥ auto_submit_threshold → auto-submit
-        assert env.requires_human_ack is False
+        assert env.requires_human_ack is True
         assert env.source == "ai_miner"
 
 

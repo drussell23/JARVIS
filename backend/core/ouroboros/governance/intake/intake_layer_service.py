@@ -361,7 +361,6 @@ class IntakeLayerService:
                     scan_paths=self._config.miner_scan_paths,
                     complexity_threshold=self._config.miner_complexity_threshold,
                     poll_interval_s=self._config.miner_scan_interval_s,
-                    auto_submit_threshold=self._config.miner_auto_submit_threshold,
                     repo=rc.name,
                 )
                 for rc in enabled_repos
@@ -383,7 +382,6 @@ class IntakeLayerService:
                     scan_paths=self._config.miner_scan_paths,
                     complexity_threshold=self._config.miner_complexity_threshold,
                     poll_interval_s=self._config.miner_scan_interval_s,
-                    auto_submit_threshold=self._config.miner_auto_submit_threshold,
                 )
             ]
 

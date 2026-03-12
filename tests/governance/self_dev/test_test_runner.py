@@ -80,25 +80,20 @@ class TestResolveNoMappingPackageFallback:
 class TestResolveEmptyFallsBackToTestsDir:
     """A random file with no nearby tests/ falls back to repo-level tests/."""
 
-    async def test_random_file_falls_back_to_repo_tests(self) -> None:
+    async def test_random_file_falls_back_to_repo_tests(self, tmp_path) -> None:
         runner = TestRunner(repo_root=REPO_ROOT)
         # Use a file that is far from any tests/ directory
-        with tempfile.NamedTemporaryFile(
-            suffix=".py", dir="/tmp", delete=False,
-        ) as f:
-            random_file = Path(f.name)
-        try:
-            result = await runner.resolve_affected_tests(
-                changed_files=(random_file,),
-            )
-            # Should fall back to repo-level tests/
-            assert len(result) > 0, "Expected repo-level fallback"
-            assert any(
-                str(p).endswith("tests") or "tests" in str(p)
-                for p in result
-            ), f"Expected repo tests/ dir in {result}"
-        finally:
-            random_file.unlink(missing_ok=True)
+        random_file = tmp_path / "random_file.py"
+        random_file.write_text("# random file\n")
+        result = await runner.resolve_affected_tests(
+            changed_files=(random_file,),
+        )
+        # Should fall back to repo-level tests/
+        assert len(result) > 0, "Expected repo-level fallback"
+        assert any(
+            str(p).endswith("tests") or "tests" in str(p)
+            for p in result
+        ), f"Expected repo tests/ dir in {result}"
 
 
 # ---------------------------------------------------------------------------
@@ -126,29 +121,19 @@ class TestRunPassingTests:
 class TestRunFailingTests:
     """A test that always fails should return passed=False with failed_tests."""
 
-    async def test_failing_test_reports_failure(self) -> None:
+    async def test_failing_test_reports_failure(self, tmp_path) -> None:
         # Create a temporary failing test file
-        with tempfile.NamedTemporaryFile(
-            suffix=".py",
-            prefix="test_always_fail_",
-            dir="/tmp",
-            mode="w",
-            delete=False,
-        ) as f:
-            f.write("def test_always_fails():\n    assert False, 'intentional failure'\n")
-            fail_path = Path(f.name)
+        fail_path = tmp_path / "test_always_fail.py"
+        fail_path.write_text("def test_always_fails():\n    assert False, 'intentional failure'\n")
 
-        try:
-            runner = TestRunner(repo_root=REPO_ROOT, timeout=30.0)
-            result = await runner.run(test_files=(fail_path,))
-            assert result.passed is False
-            assert result.failed >= 1
-            assert len(result.failed_tests) >= 1
-            # The stdout should contain retry marker
-            assert "--- RETRY ---" in result.stdout
-            assert result.flake_suspected is False
-        finally:
-            fail_path.unlink(missing_ok=True)
+        runner = TestRunner(repo_root=REPO_ROOT, timeout=30.0)
+        result = await runner.run(test_files=(fail_path,))
+        assert result.passed is False
+        assert result.failed >= 1
+        assert len(result.failed_tests) >= 1
+        # The stdout should contain retry marker
+        assert "--- RETRY ---" in result.stdout
+        assert result.flake_suspected is False
 
 
 # ---------------------------------------------------------------------------
@@ -158,24 +143,14 @@ class TestRunFailingTests:
 class TestRunTimeout:
     """A test that sleeps for 60s with a 2s timeout should return passed=False."""
 
-    async def test_timeout_kills_subprocess(self) -> None:
-        with tempfile.NamedTemporaryFile(
-            suffix=".py",
-            prefix="test_slow_",
-            dir="/tmp",
-            mode="w",
-            delete=False,
-        ) as f:
-            f.write("import time\ndef test_sleepy():\n    time.sleep(60)\n")
-            slow_path = Path(f.name)
+    async def test_timeout_kills_subprocess(self, tmp_path) -> None:
+        slow_path = tmp_path / "test_slow.py"
+        slow_path.write_text("import time\ndef test_sleepy():\n    time.sleep(60)\n")
 
-        try:
-            runner = TestRunner(repo_root=REPO_ROOT, timeout=2.0)
-            result = await runner.run(test_files=(slow_path,))
-            assert result.passed is False
-            assert "timed out" in result.stdout.lower()
-        finally:
-            slow_path.unlink(missing_ok=True)
+        runner = TestRunner(repo_root=REPO_ROOT, timeout=2.0)
+        result = await runner.run(test_files=(slow_path,))
+        assert result.passed is False
+        assert "timed out" in result.stdout.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -328,14 +303,11 @@ class TestIsSafePathHelper:
         inside = repo / "backend" / "core" / "foo.py"
         assert _is_safe_path(inside, repo) is True
 
-    def test_tmp_path_is_safe(self) -> None:
-        with tempfile.NamedTemporaryFile(dir="/tmp", delete=False) as f:
-            tmp = Path(f.name)
-        try:
-            repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
-            assert _is_safe_path(tmp, repo) is True
-        finally:
-            tmp.unlink(missing_ok=True)
+    def test_tmp_path_is_safe(self, tmp_path) -> None:
+        tmp = tmp_path / "test_safe_check.py"
+        tmp.write_text("# safe check\n")
+        repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
+        assert _is_safe_path(tmp, repo) is True
 
     def test_outside_path_is_unsafe(self) -> None:
         repo = Path("/Users/djrussell23/Documents/repos/JARVIS-AI-Agent")
