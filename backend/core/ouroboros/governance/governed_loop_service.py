@@ -1537,12 +1537,7 @@ class GovernedLoopService:
                 GoverningToolPolicy as _GTP,
                 ToolLoopCoordinator as _TLC,
             )
-            _registry = getattr(self._config, "repo_registry", None)
-            if _registry is not None:
-                _rr = {k: v for k, v in vars(_registry).items()
-                       if isinstance(v, Path) and v.exists()}
-            else:
-                _rr = {"jarvis": Path.cwd()}
+            _rr = repo_roots_map if repo_roots_map else {"jarvis": Path.cwd()}
             _policy  = _GTP(repo_roots=_rr)
             _backend = _AsyncBE(semaphore=_asyncio.Semaphore(self._config.max_concurrent_tools))
             _tool_coordinator = _TLC(
