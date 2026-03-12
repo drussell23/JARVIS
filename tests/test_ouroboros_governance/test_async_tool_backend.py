@@ -108,3 +108,18 @@ async def test_concurrent_tool_calls_respect_semaphore(tmp_path):
     assert len(start_times) == 2
     # With semaphore=1: first task must end before second starts (+epsilon)
     assert sorted(end_times)[0] <= sorted(start_times)[1] + 0.15
+
+
+def test_parse_pytest_output_ignores_warnings_line():
+    """Regression: a 'N warnings in Xs' line must not be parsed as the summary."""
+    from backend.core.ouroboros.governance.tool_executor import _parse_pytest_output, TestRunStatus
+    stdout = (
+        "tests/test_foo.py::test_bar PASSED\n"
+        "\n"
+        "3 warnings in 0.12s\n"
+        "1 passed in 2.34s\n"
+    )
+    result = _parse_pytest_output(stdout, "", 0)
+    assert result.status == TestRunStatus.PASS
+    assert result.passed == 1
+    assert result.duration_s == pytest.approx(2.34, abs=0.01)
