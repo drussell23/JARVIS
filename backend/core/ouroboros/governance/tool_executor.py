@@ -623,7 +623,7 @@ def _parse_pytest_output(stdout: str, stderr: str, exit_code: int) -> TestRunRes
     )
     for line in combined.splitlines():
         m = _summary_re.search(line)
-        if m and any(g is not None for g in m.groups()):
+        if m and any(g is not None for g in m.groups()[:3]):
             passed = int(m.group(1) or 0)
             failed = int(m.group(2) or 0)
             errors = int(m.group(3) or 0)
@@ -681,8 +681,11 @@ class AsyncProcessToolBackend:
         self, call: ToolCall, repo_root: Path, timeout: float, cap: int,
     ) -> ToolResult:
         executor = self._get_executor(repo_root)
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
+            # NOTE: wait_for cancels the Future but the thread continues running to completion.
+            # This is unavoidable with run_in_executor. For L1 read-only tools (file reads,
+            # searches), the thread holding a pool slot briefly is acceptable.
             result: ToolResult = await asyncio.wait_for(
                 loop.run_in_executor(None, lambda: executor.execute(call)), timeout=timeout)
             if result.error:
@@ -710,8 +713,9 @@ class AsyncProcessToolBackend:
                 cwd=str(policy_ctx.repo_root),
             )
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            exit_code = proc.returncode if proc.returncode is not None else -1
             run_result = _parse_pytest_output(
-                stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace"), proc.returncode)
+                stdout_b.decode(errors="replace"), stderr_b.decode(errors="replace"), exit_code)
             output = json.dumps(_dc.asdict(run_result))[:cap]
             exec_status = (ToolExecStatus.SUCCESS
                 if run_result.status in (TestRunStatus.PASS, TestRunStatus.FAIL)
