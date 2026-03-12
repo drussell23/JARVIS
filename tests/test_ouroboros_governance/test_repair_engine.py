@@ -153,6 +153,9 @@ class TestRepairEngine:
 
     @pytest.mark.asyncio
     async def test_l2_aborted_on_cancel(self):
+        # Iteration 1 uses ctx.generation.candidates[0] directly (no generate call).
+        # After iteration 1 fails with empty stdout/stderr, repair_context is set
+        # and iteration 2 calls prime.generate(), which raises CancelledError here.
         prime = MagicMock()
         prime.generate = AsyncMock(side_effect=asyncio.CancelledError())
         svr = SandboxValidationResult(False, "", "", 1, 0.1)

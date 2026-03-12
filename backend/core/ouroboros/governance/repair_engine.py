@@ -225,9 +225,16 @@ class RepairIterationRecord:
 
 @dataclass(frozen=True)
 class RepairResult:
-    """Terminal outcome returned by RepairEngine.run() to the orchestrator."""
+    """Terminal outcome returned by RepairEngine.run() to the orchestrator.
 
-    terminal: str                        # "L2_CONVERGED"|"L2_STOPPED"|"L2_ABORTED"
+    Note: ``terminal`` is always ``"L2_CONVERGED"`` or ``"L2_STOPPED"``.
+    ``"L2_ABORTED"`` is never returned — ``asyncio.CancelledError`` is
+    re-raised directly so the orchestrator can handle POSTMORTEM itself.
+    Non-CancelledError infra errors are returned as ``"L2_STOPPED"`` with a
+    structured ``stop_reason`` (e.g. ``"sandbox_infra_error:OSError"``).
+    """
+
+    terminal: str                        # "L2_CONVERGED"|"L2_STOPPED"
     candidate: Optional[Dict[str, Any]]  # converged candidate dict, or None
     stop_reason: Optional[str]           # set when terminal=="L2_STOPPED"
     summary: Dict[str, Any]              # key metrics for ledger payload
@@ -245,6 +252,16 @@ def _count_diff_lines(diff: str) -> int:
         1 for ln in diff.splitlines()
         if ln.startswith(("+", "-")) and not ln.startswith(("+++", "---"))
     )
+
+
+def _count_diff_files(diff: str) -> int:
+    """Count distinct files changed in a unified diff.
+
+    Counts ``+++ b/<path>`` headers; falls back to 1 for single-file
+    diffs that lack file headers (schema 2b.1-diff normal case).
+    """
+    paths = {ln[6:].strip() for ln in diff.splitlines() if ln.startswith("+++ b/")}
+    return len(paths) if paths else 1
 
 
 def _patch_sig(diff: str) -> str:
@@ -338,6 +355,8 @@ class RepairEngine:
         total_validation_runs = 0
         t_start = time.monotonic()
         records: list = []
+        model_id: str = getattr(ctx.generation, "model_id", "")
+        provider_name: str = getattr(ctx.generation, "provider_name", "")
 
         def _stopped(reason: str) -> RepairResult:
             rec = RepairIterationRecord(
@@ -348,6 +367,9 @@ class RepairEngine:
                 stop_reason=reason,
             )
             self._emit_record(ctx.op_id, rec)
+            # Note: `rec` is NOT appended to `records` because _stopped() always
+            # returns immediately. The sentinel is included via `records + [rec]`
+            # so that RepairResult.iterations captures it without mutating `records`.
             return RepairResult(
                 terminal="L2_STOPPED",
                 candidate=None,
@@ -390,6 +412,8 @@ class RepairEngine:
                 if not gen_result.candidates:
                     return _stopped("empty_candidates")
                 current_candidate = dict(gen_result.candidates[0])
+                model_id = getattr(gen_result, "model_id", model_id)
+                provider_name = getattr(gen_result, "provider_name", provider_name)
             else:
                 # First iteration: use candidate from failed L1 generation
                 current_candidate = dict(ctx.generation.candidates[0])
@@ -400,6 +424,8 @@ class RepairEngine:
             diff = current_candidate.get("unified_diff", "")
             if _count_diff_lines(diff) > budget.max_diff_lines:
                 return _stopped("diff_expansion_rejected")
+            if _count_diff_files(diff) > budget.max_files_changed:
+                return _stopped("diff_files_rejected")
 
             # ----------------------------------------------------------------
             # RUN in sandbox
@@ -436,7 +462,10 @@ class RepairEngine:
                     repair_state=L2State.L2_CONVERGED.value,
                     outcome="converged",
                     diff_lines=_count_diff_lines(diff),
+                    files_changed=_count_diff_files(diff),
                     validation_duration_s=svr.duration_s,
+                    model_id=model_id,
+                    provider_name=provider_name,
                 )
                 self._emit_record(ctx.op_id, rec)
                 records.append(rec)
@@ -465,6 +494,11 @@ class RepairEngine:
             # ----------------------------------------------------------------
             # EVALUATE PROGRESS
             # ----------------------------------------------------------------
+            # Two of three progress conditions from the design doc are checked:
+            #   1. Fewer failing tests than previous iteration.
+            #   2. Failure severity improved (syntax/env → test).
+            # Condition 3 (sig-hash set narrowing + diff_lines decrease) is
+            # deferred to v1.1 per the implementation plan.
             current_failing_count = len(classification.failing_test_ids)
             is_progress = (
                 prev_failing_count is None
@@ -527,8 +561,11 @@ class RepairEngine:
                 failure_signature_hash=fail_sig,
                 patch_signature_hash=patch_sig,
                 diff_lines=_count_diff_lines(diff),
+                files_changed=_count_diff_files(diff),
                 validation_duration_s=svr.duration_s,
                 outcome=outcome,
+                model_id=model_id,
+                provider_name=provider_name,
             )
             self._emit_record(ctx.op_id, rec)
             records.append(rec)
