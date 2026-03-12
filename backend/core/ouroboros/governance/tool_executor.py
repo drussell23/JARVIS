@@ -808,25 +808,8 @@ class ToolLoopCoordinator:
                 current_prompt += _format_denial(tc.name, policy_result)
             else:
                 started_ns = time.time_ns()
-                _rec_status = ToolExecStatus.SUCCESS
-                _rec_error_class: Optional[str] = None
-                _rec_output_bytes = 0
-                tool_result: Optional[ToolResult] = None
                 try:
-                    tool_result = await asyncio.wait_for(
-                        self._backend.execute_async(tc, policy_ctx, per_tool_deadline),
-                        timeout=self._tool_timeout_s,
-                    )
-                    _rec_status = tool_result.status
-                    _rec_output_bytes = len((tool_result.output or "").encode())
-                    _rec_error_class = (
-                        type(tool_result.error).__name__ if tool_result.error else None
-                    )
-                except asyncio.TimeoutError:
-                    _rec_status = ToolExecStatus.TIMEOUT
-                    _rec_error_class = "TimeoutError"
-                    tool_result = ToolResult(tool_call=tc, output="", error="TIMEOUT",
-                        status=ToolExecStatus.TIMEOUT)
+                    tool_result = await self._backend.execute_async(tc, policy_ctx, per_tool_deadline)
                 except asyncio.CancelledError:
                     ended_ns = time.time_ns()
                     records.append(ToolExecutionRecord(
@@ -852,9 +835,9 @@ class ToolLoopCoordinator:
                     policy_decision=PolicyDecision.ALLOW.value, policy_reason_code="",
                     started_at_ns=started_ns, ended_at_ns=ended_ns,
                     duration_ms=(ended_ns - started_ns) / 1_000_000,
-                    output_bytes=_rec_output_bytes,
-                    error_class=_rec_error_class,
-                    status=_rec_status,
+                    output_bytes=len((tool_result.output or "").encode()),
+                    error_class=(type(tool_result.error).__name__ if tool_result.error else None),
+                    status=tool_result.status,
                 ))
                 current_prompt += _format_tool_result(tc, tool_result)
 

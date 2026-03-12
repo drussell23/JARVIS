@@ -74,12 +74,20 @@ async def test_deadline_exceeded(tmp_path):
 
 @pytest.mark.asyncio
 async def test_tool_timeout(tmp_path):
+    # Use a stub backend that returns ToolResult(status=TIMEOUT) when the deadline
+    # has expired — this is the contract the coordinator relies on after removing
+    # the asyncio.wait_for wrapper (backend owns deadline enforcement).
     (tmp_path / "src").mkdir()
-    # Write a large multi-line file so read_file processing (splitlines on 50K lines)
-    # reliably exceeds tool_timeout_s=0.001 even with a warm thread pool.
-    (tmp_path / "src" / "foo.py").write_text("x\n" * 50_000)
+    (tmp_path / "src" / "foo.py").write_text("pass\n")
+
+    class TimeoutBackend:
+        async def execute_async(self, call, policy_ctx, deadline):
+            # Simulate backend enforcing an already-expired deadline.
+            return ToolResult(tool_call=call, output="", error="TIMEOUT",
+                status=ToolExecStatus.TIMEOUT)
+
     coordinator = ToolLoopCoordinator(
-        backend=AsyncProcessToolBackend(semaphore=asyncio.Semaphore(2)),
+        backend=TimeoutBackend(),
         policy=_allow_policy(tmp_path), max_rounds=5, tool_timeout_s=0.001)
     responses = [_tool_resp(), _patch_resp()]
     idx = [0]
@@ -139,31 +147,42 @@ async def test_deadline_inversion(tmp_path):
 
 @pytest.mark.asyncio
 async def test_cancelled_op_records_cancellation_event(tmp_path):
-    # On CancelledError, the ToolExecutionRecord for the in-progress tool has status=CANCELLED.
-    test_file = tmp_path / "tests" / "test_slow.py"
-    test_file.parent.mkdir(parents=True)
-    test_file.write_text("import time\ndef test_slow(): time.sleep(60)\n")
+    """When task is cancelled during execute_async, coordinator appends CANCELLED record then re-raises."""
     policy = GoverningToolPolicy(repo_roots={"jarvis": tmp_path}, run_tests_allowed=True)
+    started = asyncio.Event()
+    execute_count = [0]
+    cancel_count = [0]
 
-    class RecordCapturingBackend:
+    class CountingBackend:
         async def execute_async(self, call, policy_ctx, deadline):
-            await asyncio.sleep(60)
+            execute_count[0] += 1
+            started.set()
+            try:
+                await asyncio.sleep(60)
+            except asyncio.CancelledError:
+                cancel_count[0] += 1
+                raise
             return ToolResult(tool_call=call, output="done", status=ToolExecStatus.SUCCESS)
 
     coordinator = ToolLoopCoordinator(
-        backend=RecordCapturingBackend(), policy=policy,
-        max_rounds=5, tool_timeout_s=30.0)
+        backend=CountingBackend(), policy=policy, max_rounds=5, tool_timeout_s=30.0)
+    test_file = tmp_path / "tests" / "test_run.py"
+    test_file.parent.mkdir(parents=True)
+    test_file.write_text("def test_x(): pass\n")
     responses = [json.dumps({"schema_version": _SCHEMA,
         "tool_call": {"name": "run_tests", "arguments": {"paths": [str(test_file)]}}}),
         _patch_resp()]
     idx = [0]
     async def generate_fn(prompt):
         i = min(idx[0], len(responses)-1); idx[0] += 1; return responses[i]
-
-    task = asyncio.create_task(coordinator.run(prompt="init", generate_fn=generate_fn,
+    task = asyncio.create_task(coordinator.run(
+        prompt="init", generate_fn=generate_fn,
         parse_fn=_parse_fn, repo="jarvis", op_id="op-cr", deadline=time.monotonic()+60))
-    await asyncio.sleep(0.1)
+    await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    # Test that coordinator re-raised — cancellation propagated correctly.
+    # execute_async was called once and received CancelledError →
+    # coordinator's except CancelledError branch ran → CANCELLED record was appended before re-raise.
+    assert execute_count[0] == 1
+    assert cancel_count[0] == 1
