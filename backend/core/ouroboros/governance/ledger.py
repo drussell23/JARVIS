@@ -138,6 +138,7 @@ def _dict_to_entry(d: Dict[str, Any]) -> LedgerEntry:
         data=d["data"],
         timestamp=d["timestamp"],
         wall_time=d["wall_time"],
+        entry_id=d.get("entry_id"),
     )
 
 
@@ -227,9 +228,11 @@ class OperationLedger:
     async def append(self, entry: LedgerEntry) -> bool:
         """Append a ledger entry, returning ``True`` on success.
 
-        Returns ``False`` (without writing) if the ``(op_id, state)``
-        combination has already been recorded, making the operation
-        idempotent and safe to retry.
+        Returns ``False`` (without writing) if a duplicate is detected.
+        The dedup key is ``(op_id, state)`` when ``entry.entry_id`` is
+        ``None``, or ``(op_id, state, entry_id)`` when ``entry_id`` is
+        set — allowing multiple entries per ``(op_id, state)`` pair when
+        each carries a distinct ``entry_id`` (e.g. tool-exec audit records).
 
         Parameters
         ----------
