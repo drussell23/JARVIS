@@ -1428,12 +1428,14 @@ class PrimeProvider:
         repo_root: Optional[Path] = None,
         repo_roots: Optional[Dict[str, Path]] = None,
         tools_enabled: bool = False,
+        tool_loop: Optional[Any] = None,  # Optional[ToolLoopCoordinator]
     ) -> None:
         self._client = prime_client
         self._max_tokens = max_tokens
         self._repo_root = repo_root
         self._repo_roots = repo_roots
-        self._tools_enabled = tools_enabled
+        self._tools_enabled = tools_enabled or (tool_loop is not None)
+        self._tool_loop = tool_loop
 
     @property
     def provider_name(self) -> str:
@@ -1505,37 +1507,66 @@ class PrimeProvider:
                     model=ri.brain_model,
                 )
 
-        while True:
-            response = await self._client.generate(
-                prompt=prompt,
+        _last_response: list = [None]
+
+        async def _generate_raw(p: str) -> str:
+            resp = await self._client.generate(
+                prompt=p,
                 system_prompt=_CODEGEN_SYSTEM_PROMPT,
                 max_tokens=self._max_tokens,
                 temperature=0.2,
                 model_name=_brain_model,
                 task_profile=_task_profile,
             )
-            raw = response.content
-
-            # Log raw response for diagnosis (truncated at 2000 chars)
+            _last_response[0] = resp
+            raw_content = resp.content or ""
             logger.warning(
                 "[PrimeProvider] J-Prime raw response (len=%d bytes, first 2000): %r",
-                len(raw.encode()) if raw else 0,
-                raw[:2000] if raw else "",
+                len(raw_content.encode()),
+                raw_content[:2000],
             )
+            return raw_content
 
-            # Attempt to parse as tool call
-            if self._tools_enabled:
+        tool_records: tuple = ()
+        if self._tool_loop is not None:
+            import datetime as _dt
+            deadline_mono = (
+                time.monotonic()
+                + max(0.0, (deadline - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+            )
+            raw, tool_records_list = await self._tool_loop.run(
+                prompt=prompt,
+                generate_fn=_generate_raw,
+                parse_fn=_parse_tool_call_response,
+                repo=getattr(context, "primary_repo", "jarvis"),
+                op_id=getattr(context, "op_id", ""),
+                deadline=deadline_mono,
+            )
+            tool_records = tuple(tool_records_list)
+        elif self._tools_enabled:
+            # Legacy inline loop (backward-compat with tools_enabled=True)
+            current_prompt = prompt
+            raw = None
+            while True:
+                resp = await self._client.generate(
+                    prompt=current_prompt,
+                    system_prompt=_CODEGEN_SYSTEM_PROMPT,
+                    max_tokens=self._max_tokens,
+                    temperature=0.2,
+                    model_name=_brain_model,
+                    task_profile=_task_profile,
+                )
+                _last_response[0] = resp
+                raw = resp.content
                 tool_call = _parse_tool_call_response(raw)
                 if tool_call is not None:
                     if tool_rounds >= MAX_TOOL_ITERATIONS:
                         raise RuntimeError(
                             f"gcp-jprime_tool_loop_max_iterations:{MAX_TOOL_ITERATIONS}"
                         )
-                    # Lazily create executor on first tool call
                     if executor is None:
                         from backend.core.ouroboros.governance.tool_executor import ToolExecutor
                         executor = ToolExecutor(repo_root=repo_root)
-                    # Execute the tool
                     tool_result = executor.execute(tool_call)
                     result_text = (
                         f"--- Tool Result: {tool_call.name} ---\n"
@@ -1543,56 +1574,58 @@ class PrimeProvider:
                         "--- End Tool Result ---\n"
                         "Now continue. Either call another tool or return the patch JSON."
                     )
-                    # Append tool exchange to prompt (single-turn Prime)
-                    old_prompt_len = len(prompt)
-                    prompt = (
-                        f"{prompt}\n\n"
+                    old_prompt_len = len(current_prompt)
+                    current_prompt = (
+                        f"{current_prompt}\n\n"
                         f"[You called: {tool_call.name}({json.dumps(tool_call.arguments)})]\n"
                         f"{result_text}"
                     )
-                    accumulated_chars += len(prompt) - old_prompt_len
+                    accumulated_chars += len(current_prompt) - old_prompt_len
                     if accumulated_chars > MAX_TOOL_LOOP_CHARS:
                         raise RuntimeError(
                             f"gcp-jprime_tool_loop_budget_exceeded:{accumulated_chars}"
                         )
                     tool_rounds += 1
-                    continue  # re-send to model
+                    continue
+                break
+        else:
+            raw = await _generate_raw(prompt)
 
-            # Not a tool call (or tools disabled) — parse as patch
-            duration = time.monotonic() - start
+        response = _last_response[0]
+        duration = time.monotonic() - start
 
-            source_hash = ""
-            source_path = ""
-            if context.target_files:
-                source_path = context.target_files[0]
-                abs_path = (repo_root / source_path) if repo_root else Path(source_path)
-                try:
-                    content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
-                    source_hash = _file_source_hash(content_bytes)
-                except OSError:
-                    pass
+        source_hash = ""
+        source_path = ""
+        if context.target_files:
+            source_path = context.target_files[0]
+            abs_path = (repo_root / source_path) if repo_root else Path(source_path)
+            try:
+                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                source_hash = _file_source_hash(content_bytes)
+            except OSError:
+                pass
 
-            result = _parse_generation_response(
-                raw,
-                self.provider_name,
-                duration,
-                context,
-                source_hash,
-                source_path,
-                repo_roots=self._repo_roots,
-                repo_root=self._repo_root,
-            )
+        result = _parse_generation_response(
+            raw,
+            self.provider_name,
+            duration,
+            context,
+            source_hash,
+            source_path,
+            repo_roots=self._repo_roots,
+            repo_root=self._repo_root,
+        )
 
-            logger.info(
-                "[PrimeProvider] Generated %d candidates in %.1fs (tool_rounds=%d), "
-                "model=%s, tokens=%d",
-                len(result.candidates),
-                duration,
-                tool_rounds,
-                getattr(response, "model", "unknown"),
-                getattr(response, "tokens_used", 0),
-            )
-            return result
+        logger.info(
+            "[PrimeProvider] Generated %d candidates in %.1fs (tool_rounds=%d), "
+            "model=%s, tokens=%d",
+            len(result.candidates),
+            duration,
+            tool_rounds,
+            getattr(response, "model", "unknown") if response else "unknown",
+            getattr(response, "tokens_used", 0) if response else 0,
+        )
+        return result.with_tool_records(tool_records)
 
     async def health_probe(self) -> bool:
         """Check PrimeClient health. Returns True only if AVAILABLE."""
@@ -1662,6 +1695,7 @@ class ClaudeProvider:
         repo_root: Optional[Path] = None,
         repo_roots: Optional[Dict[str, Path]] = None,
         tools_enabled: bool = False,
+        tool_loop: Optional[Any] = None,  # Optional[ToolLoopCoordinator]
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -1673,7 +1707,8 @@ class ClaudeProvider:
         self._client: Any = None  # Lazy init
         self._repo_root = repo_root
         self._repo_roots = repo_roots
-        self._tools_enabled = tools_enabled
+        self._tools_enabled = tools_enabled or (tool_loop is not None)
+        self._tool_loop = tool_loop
 
     @property
     def provider_name(self) -> str:
@@ -1755,7 +1790,9 @@ class ClaudeProvider:
         total_cost = 0.0
         start = time.monotonic()
 
-        while True:
+        _last_msg: list = [None]
+
+        async def _generate_raw(p: str) -> str:
             timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
             msg = await asyncio.wait_for(
                 client.messages.create(
@@ -1763,21 +1800,62 @@ class ClaudeProvider:
                     max_tokens=min(self._max_tokens, 8192),
                     temperature=0.2,
                     system=_CODEGEN_SYSTEM_PROMPT,
-                    messages=messages,
+                    messages=[{"role": "user", "content": p}],
                 ),
                 timeout=timeout_s,
             )
-            raw = msg.content[0].text if msg.content else ""
+            _last_msg[0] = msg
+            raw_content = msg.content[0].text if msg.content else ""
             input_tokens = getattr(msg.usage, "input_tokens", 0)
             output_tokens = getattr(msg.usage, "output_tokens", 0)
             cost = self._estimate_cost(input_tokens, output_tokens)
             self._record_cost(cost)
+            nonlocal total_cost
             total_cost += cost
             if total_cost >= self._max_cost_per_op:
                 raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
+            return raw_content
 
-            # Attempt tool call parse when tools are enabled
-            if self._tools_enabled:
+        tool_records: tuple = ()
+        if self._tool_loop is not None:
+            import datetime as _dt
+            deadline_mono = (
+                time.monotonic()
+                + max(0.0, (deadline - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+            )
+            raw, tool_records_list = await self._tool_loop.run(
+                prompt=prompt_text,
+                generate_fn=_generate_raw,
+                parse_fn=_parse_tool_call_response,
+                repo=getattr(context, "primary_repo", "jarvis"),
+                op_id=getattr(context, "op_id", ""),
+                deadline=deadline_mono,
+            )
+            tool_records = tuple(tool_records_list)
+        elif self._tools_enabled:
+            # Legacy inline loop (backward-compat with tools_enabled=True)
+            raw = None
+            while True:
+                timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+                msg = await asyncio.wait_for(
+                    client.messages.create(
+                        model=self._model,
+                        max_tokens=min(self._max_tokens, 8192),
+                        temperature=0.2,
+                        system=_CODEGEN_SYSTEM_PROMPT,
+                        messages=messages,
+                    ),
+                    timeout=timeout_s,
+                )
+                _last_msg[0] = msg
+                raw = msg.content[0].text if msg.content else ""
+                input_tokens = getattr(msg.usage, "input_tokens", 0)
+                output_tokens = getattr(msg.usage, "output_tokens", 0)
+                cost = self._estimate_cost(input_tokens, output_tokens)
+                self._record_cost(cost)
+                total_cost += cost
+                if total_cost >= self._max_cost_per_op:
+                    raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
                 tool_call = _parse_tool_call_response(raw)
                 if tool_call is not None:
                     if tool_rounds >= MAX_TOOL_ITERATIONS:
@@ -1793,11 +1871,8 @@ class ClaudeProvider:
                         f"{tool_result.output if not tool_result.error else 'ERROR: ' + tool_result.error}\n"
                         "Now either call another tool or return the patch JSON."
                     )
-                    # Append assistant + user turns for multi-turn conversation
                     messages.append({"role": "assistant", "content": raw})
                     messages.append({"role": "user", "content": result_text})
-                    # Multi-turn: track delta as assistant response + user follow-up (no
-                    # full-string re-measurement — messages array grows, not a flat string).
                     accumulated_chars += len(raw) + len(result_text)
                     if accumulated_chars > MAX_TOOL_LOOP_CHARS:
                         raise RuntimeError(
@@ -1805,35 +1880,37 @@ class ClaudeProvider:
                         )
                     tool_rounds += 1
                     continue
+                break
+        else:
+            raw = await _generate_raw(prompt_text)
 
-            # Not a tool call (or tools disabled) — parse as patch response
-            duration = time.monotonic() - start
-            source_hash = ""
-            source_path = context.target_files[0] if context.target_files else ""
-            if source_path:
-                abs_path = (repo_root / source_path) if repo_root else Path(source_path)
-                try:
-                    content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
-                    source_hash = _file_source_hash(content_bytes)
-                except OSError:
-                    pass
+        duration = time.monotonic() - start
+        source_hash = ""
+        source_path = context.target_files[0] if context.target_files else ""
+        if source_path:
+            abs_path = (repo_root / source_path) if repo_root else Path(source_path)
+            try:
+                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                source_hash = _file_source_hash(content_bytes)
+            except OSError:
+                pass
 
-            result = _parse_generation_response(
-                raw,
-                self.provider_name,
-                duration,
-                context,
-                source_hash,
-                source_path,
-                repo_roots=self._repo_roots,
-                repo_root=self._repo_root,
-            )
+        result = _parse_generation_response(
+            raw,
+            self.provider_name,
+            duration,
+            context,
+            source_hash,
+            source_path,
+            repo_roots=self._repo_roots,
+            repo_root=self._repo_root,
+        )
 
-            logger.info(
-                "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f",
-                len(result.candidates), duration, tool_rounds, total_cost,
-            )
-            return result
+        logger.info(
+            "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f",
+            len(result.candidates), duration, tool_rounds, total_cost,
+        )
+        return result.with_tool_records(tool_records)
 
     async def health_probe(self) -> bool:
         """Lightweight API ping. Returns True if API responds."""
