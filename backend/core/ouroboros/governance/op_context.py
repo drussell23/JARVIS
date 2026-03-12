@@ -178,6 +178,12 @@ class GenerationResult:
     generation_duration_s: float
     model_id: str = ""      # provider model identifier; empty = not reported
     is_noop: bool = False   # True when model signals change already present
+    # L1: audit records from tool-use loop (empty when tools disabled)
+    tool_execution_records: Tuple[Any, ...] = ()
+
+    def with_tool_records(self, records: tuple) -> "GenerationResult":
+        import dataclasses
+        return dataclasses.replace(self, tool_execution_records=records)
 
 
 @dataclass(frozen=True)
