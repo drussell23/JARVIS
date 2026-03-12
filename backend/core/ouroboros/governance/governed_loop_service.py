@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
 
 from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider
 from backend.core.ouroboros.governance.candidate_generator import (
@@ -1281,7 +1281,24 @@ class GovernedLoopService:
                 if self._generator
                 else "no_generator"
             ),
+            "orphan_saga_branches": self._detect_orphan_branches(),
         }
+
+    def _detect_orphan_branches(self) -> List[str]:
+        """Detect orphaned saga branches across registered repos."""
+        try:
+            from backend.core.ouroboros.governance.saga.repo_lock import RepoLockManager
+            mgr = RepoLockManager()
+            if self._config.repo_registry is not None:
+                roots = {
+                    rc.name: rc.local_path
+                    for rc in self._config.repo_registry.list_enabled()
+                }
+            else:
+                roots = {"jarvis": self._config.project_root}
+            return mgr.detect_orphan_branches(roots)
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     # Private: Preflight
