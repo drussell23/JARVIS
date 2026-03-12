@@ -166,11 +166,13 @@ class ToolBackend(Protocol):
 
 def _format_denial(tool_name: str, policy_result: PolicyResult) -> str:
     safe_name = tool_name.replace("\n", "\\n").replace("\r", "\\r")
+    safe_reason = policy_result.reason_code.replace("\n", "\\n").replace("\r", "\\r")
+    safe_detail = policy_result.detail.replace("\n", "\\n").replace("\r", "\\r")
     return (
         "\n[TOOL POLICY DENIAL]\n"
         f"tool: {safe_name}\n"
-        f"reason: {policy_result.reason_code}\n"
-        f"detail: {policy_result.detail}\n"
+        f"reason: {safe_reason}\n"
+        f"detail: {safe_detail}\n"
         "[END POLICY DENIAL]\n"
     )
 
