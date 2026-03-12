@@ -170,7 +170,7 @@ class RepairSandbox:
         # Both failed — clean up and raise.
         shutil.rmtree(tmpdir, ignore_errors=True)
         raise SandboxSetupError(
-            "Failed to create repair sandbox at {tmpdir}: "
+            f"Failed to create repair sandbox at {tmpdir}: "
             "both git-worktree and rsync strategies failed."
         )
 
@@ -403,6 +403,8 @@ class RepairSandbox:
                 duration_s=duration,
             )
 
+        except asyncio.CancelledError:
+            raise
         except Exception as exc:
             self._active_proc = None
             duration = time.monotonic() - start
