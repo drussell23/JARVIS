@@ -86,13 +86,21 @@ class LedgerEntry:
     wall_time:
         Wall-clock Unix timestamp (``time.time()``).  Used for cross-process
         and human-readable correlation.
+    entry_id:
+        Optional per-record disambiguator.  When set, deduplication uses
+        ``op_id:state:entry_id`` instead of the default ``op_id:state`` key.
+        This allows multiple records with the same ``(op_id, state)`` pair
+        (e.g. multiple tool-execution records all using SANDBOXING) to be
+        written without colliding.  Callers that do not supply ``entry_id``
+        retain the original dedup behaviour.
     """
 
     op_id: str
     state: OperationState
-    data: Dict[str, Any]
+    data: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.monotonic)
     wall_time: float = field(default_factory=time.time)
+    entry_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -110,13 +118,16 @@ def _sanitize_op_id(op_id: str) -> str:
 
 def _entry_to_dict(entry: LedgerEntry) -> Dict[str, Any]:
     """Serialise a :class:`LedgerEntry` to a JSON-compatible dict."""
-    return {
+    d: Dict[str, Any] = {
         "op_id": entry.op_id,
         "state": entry.state.value,
         "data": entry.data,
         "timestamp": entry.timestamp,
         "wall_time": entry.wall_time,
     }
+    if entry.entry_id is not None:
+        d["entry_id"] = entry.entry_id
+    return d
 
 
 def _dict_to_entry(d: Dict[str, Any]) -> LedgerEntry:
@@ -159,7 +170,16 @@ class OperationLedger:
         return self._storage_dir / f"{_sanitize_op_id(op_id)}.jsonl"
 
     def _dedup_key(self, entry: LedgerEntry) -> str:
-        """Return a deduplication key for an entry."""
+        """Return a deduplication key for an entry.
+
+        When ``entry.entry_id`` is set the key includes it, allowing multiple
+        records with the same ``(op_id, state)`` pair to coexist in the ledger
+        (e.g. one tool-execution record per tool call, all sharing SANDBOXING).
+        Without ``entry_id`` the original ``op_id:state`` behaviour is
+        preserved for backward compatibility.
+        """
+        if entry.entry_id:
+            return f"{entry.op_id}:{entry.state.value}:{entry.entry_id}"
         return f"{entry.op_id}:{entry.state.value}"
 
     # ------------------------------------------------------------------

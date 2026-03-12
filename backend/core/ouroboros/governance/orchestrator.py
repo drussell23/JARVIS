@@ -366,6 +366,26 @@ class GovernedOrchestrator:
 
         assert generation is not None  # guaranteed by loop logic
 
+        # L1: emit tool execution audit records to ledger stream.
+        # This runs BEFORE the noop guard so that tool records are always
+        # persisted regardless of whether the response was a noop.
+        for _rec in generation.tool_execution_records:
+            try:
+                _entry = LedgerEntry(
+                    op_id=ctx.op_id,
+                    state=OperationState.SANDBOXING,
+                    data={"kind": "tool_exec.v1", **_dc_asdict(_rec)},
+                    entry_id=_rec.call_id,
+                )
+                await self._stack.ledger.append(_entry)
+            except asyncio.CancelledError:
+                raise
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "tool_exec ledger emit failed op=%s record=%s: %s",
+                    ctx.op_id, getattr(_rec, "call_id", "?"), _exc,
+                )  # ledger failure must never abort governance pipeline
+
         # Short-circuit: model signalled the change is already present
         if generation.is_noop:
             logger.info(
@@ -380,21 +400,6 @@ class GovernedOrchestrator:
                 {"reason": "noop", "provider": generation.provider_name},
             )
             return ctx
-
-        # L1: emit tool execution audit records to ledger stream
-        for _rec in generation.tool_execution_records:
-            try:
-                _entry = LedgerEntry(
-                    op_id=ctx.op_id,
-                    state=OperationState.SANDBOXING,
-                    data={"kind": "tool_exec.v1", **_dc_asdict(_rec)},
-                )
-                await self._stack.ledger.append(_entry)
-            except Exception as _exc:  # noqa: BLE001
-                logger.warning(
-                    "tool_exec ledger emit failed op=%s record=%s: %s",
-                    ctx.op_id, getattr(_rec, "call_id", "?"), _exc,
-                )  # ledger failure must never abort governance pipeline
 
         # Store generation result in context
         ctx = ctx.advance(OperationPhase.VALIDATE, generation=generation)

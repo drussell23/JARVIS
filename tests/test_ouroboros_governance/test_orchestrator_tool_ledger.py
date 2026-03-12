@@ -65,3 +65,49 @@ def test_tool_exec_record_is_asdict_serializable() -> None:
     assert d["schema_version"] == "tool.exec.v1"
     # ToolExecStatus.SUCCESS is a str-enum; asdict preserves the value string
     assert d["status"] == "success"  # ToolExecStatus.SUCCESS.value
+
+
+def test_multiple_tool_records_have_unique_dedup_keys() -> None:
+    """Multiple SANDBOXING records with distinct entry_ids must all be written."""
+    from backend.core.ouroboros.governance.ledger import (
+        LedgerEntry,
+        OperationLedger,
+        OperationState,
+    )
+    import asyncio
+    import tempfile
+
+    async def _run(tmpdir: str) -> list:
+        ledger = OperationLedger(storage_dir=tmpdir)
+        entries = [
+            LedgerEntry(
+                op_id="op-1",
+                state=OperationState.SANDBOXING,
+                entry_id=f"op-1:r0:tool_{i}",
+            )
+            for i in range(3)
+        ]
+        return list(await asyncio.gather(*[ledger.append(e) for e in entries]))
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        results = asyncio.run(_run(tmpdir))
+        assert all(results), "All 3 records should be written (no dedup collision)"
+
+
+def test_dedup_without_entry_id_still_works() -> None:
+    """Without entry_id the original op+state dedup behaviour is preserved."""
+    from backend.core.ouroboros.governance.ledger import (
+        LedgerEntry,
+        OperationLedger,
+        OperationState,
+    )
+    import asyncio
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        ledger = OperationLedger(storage_dir=tmpdir)
+        e = LedgerEntry(op_id="op-2", state=OperationState.SANDBOXING)
+        r1 = asyncio.run(ledger.append(e))
+        r2 = asyncio.run(ledger.append(e))
+        assert r1 is True
+        assert r2 is False  # duplicate — same op+state, no entry_id
