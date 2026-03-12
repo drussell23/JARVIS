@@ -57,6 +57,7 @@ class SafetyNetConfig:
     human_presence_defer_s: float = 300.0
     incident_rollback_threshold: int = 3
     resource_violation_rate_threshold: float = 0.5
+    max_rollback_history: int = 200
 
 
 class ProductionSafetyNet:
@@ -234,7 +235,7 @@ class ProductionSafetyNet:
                         f"Resource violation rate {rv_rate:.1%} exceeds "
                         f"threshold {self._config.resource_violation_rate_threshold:.1%}"
                     ),
-                    "evidence_count": self._execution_monitor._total_recorded,
+                    "evidence_count": self._execution_monitor.total_recorded,
                     "resource_violation_rate": rv_rate,
                 },
                 ttl_s=300.0,
@@ -290,6 +291,9 @@ class ProductionSafetyNet:
             r for r in self._rollback_history
             if now - r["ts"] < self._config.rollback_pattern_window_s
         ]
+        # Hard capacity cap to prevent unbounded growth under rapid failures
+        if len(self._rollback_history) > self._config.max_rollback_history:
+            self._rollback_history = self._rollback_history[-self._config.max_rollback_history:]
 
         # Check for pattern: same reason repeated
         same_reason = [r for r in self._rollback_history if r["reason"] == reason]

@@ -144,6 +144,11 @@ class ExecutionMonitor:
         self._status_counts: Dict[ExecutionStatus, int] = defaultdict(int)
         self._total_recorded: int = 0
 
+    @property
+    def total_recorded(self) -> int:
+        """Lifetime count of recorded outcomes (survives ring buffer pruning)."""
+        return self._total_recorded
+
     # ------------------------------------------------------------------
     # record
     # ------------------------------------------------------------------

@@ -215,20 +215,20 @@ class TestResourceUsage:
         assert usage.disk_free_mb == 50000.0
         assert usage.cpu_percent == 45.2
         assert usage.active_tasks == 3
-        assert usage.timestamp > 0
+        assert usage.timestamp_ns > 0
 
     def test_resource_usage_auto_timestamp(self):
-        """Timestamp should be auto-populated close to current time."""
+        """Timestamp should be auto-populated with monotonic_ns."""
         from backend.core.ouroboros.governance.autonomy.rate_limiter import (
             ResourceUsage,
         )
 
-        before = time.time()
+        before = time.monotonic_ns()
         usage = ResourceUsage(
             memory_mb=0.0, disk_free_mb=0.0, cpu_percent=0.0, active_tasks=0
         )
-        after = time.time()
-        assert before <= usage.timestamp <= after
+        after = time.monotonic_ns()
+        assert before <= usage.timestamp_ns <= after
 
 
 # ---------------------------------------------------------------------------

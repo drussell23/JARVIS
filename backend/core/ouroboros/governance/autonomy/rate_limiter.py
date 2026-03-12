@@ -84,11 +84,14 @@ class TokenBucketRateLimiter:
         Returns ``True`` if a token was acquired, ``False`` if the timeout
         elapsed without a token becoming available.  When *timeout* is
         ``None`` the method blocks indefinitely.
+
+        The lock is released during sleep so that other callers can check
+        token availability concurrently.
         """
         deadline = time.monotonic() + timeout if timeout is not None else None
 
-        async with self._lock:
-            while True:
+        while True:
+            async with self._lock:
                 self._refill()
 
                 if self._tokens >= 1.0:
@@ -103,7 +106,8 @@ class TokenBucketRateLimiter:
                 if deadline is not None:
                     wait_time = min(wait_time, deadline - time.monotonic())
 
-                await asyncio.sleep(max(0.01, wait_time))
+            # Sleep OUTSIDE the lock so other callers are not blocked
+            await asyncio.sleep(max(0.01, wait_time))
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the limiter state.
@@ -209,12 +213,13 @@ class ResourceUsage:
         CPU utilisation percentage (0–100).
     active_tasks:
         Number of active async tasks / operations.
-    timestamp:
-        Wall-clock timestamp (``time.time()``) — auto-populated.
+    timestamp_ns:
+        Monotonic timestamp (``time.monotonic_ns()``) — auto-populated.
+        Consistent with C+ architecture timestamp convention.
     """
 
     memory_mb: float
     disk_free_mb: float
     cpu_percent: float
     active_tasks: int
-    timestamp: float = field(default_factory=time.time)
+    timestamp_ns: int = field(default_factory=time.monotonic_ns)
