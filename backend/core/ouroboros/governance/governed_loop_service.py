@@ -518,6 +518,12 @@ class GovernedLoopConfig:
     oracle_enabled: bool = True
     oracle_incremental_poll_interval_s: float = 300.0
 
+    # L1 tool-use settings
+    tool_use_enabled:     bool  = False
+    max_tool_rounds:      int   = 5
+    tool_timeout_s:       float = 30.0
+    max_concurrent_tools: int   = 2
+
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
         """Build config from environment variables with safe defaults."""
@@ -558,6 +564,10 @@ class GovernedLoopConfig:
             pipeline_timeout_s=float(
                 os.environ.get("JARVIS_PIPELINE_TIMEOUT_S", "600.0")
             ),
+            tool_use_enabled=os.environ.get("JARVIS_GOVERNED_TOOL_USE_ENABLED", "false").lower() == "true",
+            max_tool_rounds=int(os.environ.get("JARVIS_TOOL_MAX_ROUNDS", "5")),
+            tool_timeout_s=float(os.environ.get("JARVIS_TOOL_TIMEOUT_S", "30")),
+            max_concurrent_tools=int(os.environ.get("JARVIS_TOOL_MAX_CONCURRENT", "2")),
         )
 
 
@@ -1518,6 +1528,35 @@ class GovernedLoopService:
         )
         repo_roots_map: Dict[str, Path] = {r.name: r.local_path for r in enabled_repos}
 
+        # Build ToolLoopCoordinator if tool-use is enabled via config
+        _tool_coordinator = None
+        if self._config.tool_use_enabled:
+            import asyncio as _asyncio
+            from backend.core.ouroboros.governance.tool_executor import (
+                AsyncProcessToolBackend as _AsyncBE,
+                GoverningToolPolicy as _GTP,
+                ToolLoopCoordinator as _TLC,
+            )
+            _registry = getattr(self._config, "repo_registry", None)
+            if _registry is not None:
+                _rr = {k: v for k, v in vars(_registry).items()
+                       if isinstance(v, Path) and v.exists()}
+            else:
+                _rr = {"jarvis": Path.cwd()}
+            _policy  = _GTP(repo_roots=_rr)
+            _backend = _AsyncBE(semaphore=_asyncio.Semaphore(self._config.max_concurrent_tools))
+            _tool_coordinator = _TLC(
+                backend=_backend, policy=_policy,
+                max_rounds=self._config.max_tool_rounds,
+                tool_timeout_s=self._config.tool_timeout_s,
+            )
+            logger.info(
+                "[GovernedLoop] ToolLoopCoordinator wired: max_rounds=%d, timeout=%.1fs, concurrency=%d",
+                self._config.max_tool_rounds,
+                self._config.tool_timeout_s,
+                self._config.max_concurrent_tools,
+            )
+
         primary = None
         fallback = None
 
@@ -1533,6 +1572,7 @@ class GovernedLoopService:
                     self._prime_client,
                     repo_root=self._config.project_root,
                     repo_roots=repo_roots_map,
+                    tool_loop=_tool_coordinator,
                 )
                 try:
                     if await primary.health_probe():
@@ -1572,6 +1612,7 @@ class GovernedLoopService:
                     daily_budget=self._config.claude_daily_budget,
                     repo_root=self._config.project_root,
                     repo_roots=repo_roots_map,
+                    tool_loop=_tool_coordinator,
                 )
                 logger.info("[GovernedLoop] ClaudeProvider: configured")
             except Exception as exc:
