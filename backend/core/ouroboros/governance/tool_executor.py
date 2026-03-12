@@ -743,13 +743,15 @@ _MAX_PROMPT_CHARS = 32_768
 
 
 class ToolLoopCoordinator:
-    # Stateless per-run multi-turn tool loop coordinator.
-    # No mutable instance state — safe to reuse across concurrent ops.
+    # Multi-turn tool loop coordinator.
+    # All operation state is local to each run() call.
+    # _last_records captures the final partial record list for post-mortem inspection;
+    # not safe for concurrent reuse of a single coordinator instance.
 
     def __init__(
         self,
-        backend: Any,
-        policy: Any,
+        backend: ToolBackend,
+        policy: ToolPolicy,
         max_rounds: int,
         tool_timeout_s: float,
     ) -> None:
