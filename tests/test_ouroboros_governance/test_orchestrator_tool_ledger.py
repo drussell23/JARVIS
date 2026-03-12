@@ -8,8 +8,6 @@ Verifies that:
 """
 from __future__ import annotations
 
-import pytest
-
 from backend.core.ouroboros.governance.tool_executor import ToolExecStatus, ToolExecutionRecord
 
 

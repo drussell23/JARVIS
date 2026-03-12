@@ -30,7 +30,7 @@ import logging
 import os
 import tempfile
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict as _dc_asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
@@ -384,15 +384,17 @@ class GovernedOrchestrator:
         # L1: emit tool execution audit records to ledger stream
         for _rec in generation.tool_execution_records:
             try:
-                import dataclasses as _dc
                 _entry = LedgerEntry(
                     op_id=ctx.op_id,
                     state=OperationState.SANDBOXING,
-                    data={"kind": "tool_exec.v1", **_dc.asdict(_rec)},
+                    data={"kind": "tool_exec.v1", **_dc_asdict(_rec)},
                 )
                 await self._stack.ledger.append(_entry)
-            except Exception:  # noqa: BLE001
-                pass  # ledger failure must never abort governance pipeline
+            except Exception as _exc:  # noqa: BLE001
+                logger.warning(
+                    "tool_exec ledger emit failed op=%s record=%s: %s",
+                    ctx.op_id, getattr(_rec, "call_id", "?"), _exc,
+                )  # ledger failure must never abort governance pipeline
 
         # Store generation result in context
         ctx = ctx.advance(OperationPhase.VALIDATE, generation=generation)
