@@ -24,7 +24,17 @@ from backend.core.ouroboros.governance.autonomy.autonomy_types import (
     _deterministic_key,
 )
 from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+from backend.core.ouroboros.governance.autonomy.component_health import (
+    ComponentHealthTracker,
+    ComponentState,
+    TransitionReason,
+)
 from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
+from backend.core.ouroboros.governance.autonomy.execution_monitor import (
+    ExecutionMonitor,
+    ExecutionOutcome,
+    ExecutionStatus,
+)
 
 logger = logging.getLogger("Ouroboros.SafetyNet")
 
@@ -42,6 +52,7 @@ class SafetyNetConfig:
     rollback_pattern_window_s: float = 3600.0
     human_presence_defer_s: float = 300.0
     incident_rollback_threshold: int = 3
+    resource_violation_rate_threshold: float = 0.5
 
 
 class ProductionSafetyNet:
@@ -67,6 +78,9 @@ class ProductionSafetyNet:
         self._escalated_readonly: bool = False
         self._rollback_history: List[Dict[str, Any]] = []
         self._incident_triggered: bool = False
+        self._health_tracker: ComponentHealthTracker = ComponentHealthTracker()
+        self._execution_monitor: ExecutionMonitor = ExecutionMonitor()
+        self._escalated_resource_violation: bool = False
 
     # ------------------------------------------------------------------
     # Event handler registration
@@ -75,10 +89,11 @@ class ProductionSafetyNet:
     def register_event_handlers(self, emitter: EventEmitter) -> None:
         """Subscribe to events this service cares about.
 
-        Currently: HEALTH_PROBE_RESULT and OP_ROLLED_BACK.
+        Currently: HEALTH_PROBE_RESULT, OP_ROLLED_BACK, and OP_COMPLETED.
         """
         emitter.subscribe(EventType.HEALTH_PROBE_RESULT, self._on_health_probe)
         emitter.subscribe(EventType.OP_ROLLED_BACK, self._on_rollback)
+        emitter.subscribe(EventType.OP_COMPLETED, self._on_op_completed)
 
     # ------------------------------------------------------------------
     # Health probe handler
@@ -96,13 +111,36 @@ class ProductionSafetyNet:
           - At ``probe_failure_severe_threshold``: READ_ONLY_PLANNING
         """
         payload = event.payload
+        component_name = payload.get("component", "system")
+
         if payload.get("success"):
             self._consecutive_failures = 0
             self._escalated_reduced = False
             self._escalated_readonly = False
+            # Update health tracker: success -> ACTIVE with score from payload or 1.0
+            score = payload.get("health_score", 1.0)
+            self._health_tracker.update(
+                component_name,
+                ComponentState.ACTIVE,
+                health_score=score,
+                reason=TransitionReason.RECOVERY,
+            )
             return
 
         self._consecutive_failures += 1
+
+        # Update health tracker: failure -> ERROR, decrement score by 0.1
+        current = self._health_tracker.get_status(component_name)
+        if current is not None:
+            new_score = max(0.0, current.health_score - 0.1)
+        else:
+            new_score = 0.9  # first failure from implicit 1.0
+        self._health_tracker.update(
+            component_name,
+            ComponentState.ERROR,
+            health_score=new_score,
+            reason=TransitionReason.ERROR,
+        )
 
         # Severe escalation check first (higher threshold)
         if (
@@ -147,6 +185,67 @@ class ProductionSafetyNet:
                 ttl_s=300.0,
             )
             self._bus.try_put(cmd)
+
+    # ------------------------------------------------------------------
+    # Operation completed handler — execution monitoring (Task H3)
+    # ------------------------------------------------------------------
+
+    def _on_op_completed(self, event: EventEnvelope) -> None:
+        """React to an operation completion event.
+
+        Classifies the execution status, records the outcome in the
+        execution monitor, and checks whether the resource violation
+        rate has breached the configured threshold.
+        """
+        payload = event.payload
+        status = self._execution_monitor.classify_from_payload(payload)
+
+        outcome = ExecutionOutcome(
+            op_id=payload.get("op_id", event.op_id or "unknown"),
+            status=status,
+            start_ns=time.monotonic_ns() - int(payload.get("duration_ms", 0) * 1_000_000),
+            end_ns=time.monotonic_ns(),
+            duration_ms=payload.get("duration_ms", 0.0),
+            error_message=payload.get("error", ""),
+            memory_peak_mb=payload.get("memory_peak_mb", 0.0),
+            call_depth=payload.get("call_depth", 0),
+        )
+        self._execution_monitor.record(outcome)
+
+        # Check for resource violation escalation
+        rv_rate = self._execution_monitor.get_resource_violation_rate()
+        if (
+            rv_rate > self._config.resource_violation_rate_threshold
+            and not self._escalated_resource_violation
+        ):
+            self._escalated_resource_violation = True
+            cmd = CommandEnvelope(
+                source_layer="L3",
+                target_layer="L1",
+                command_type=CommandType.REQUEST_MODE_SWITCH,
+                payload={
+                    "target_mode": "REDUCED_AUTONOMY",
+                    "reason": (
+                        f"Resource violation rate {rv_rate:.1%} exceeds "
+                        f"threshold {self._config.resource_violation_rate_threshold:.1%}"
+                    ),
+                    "evidence_count": self._execution_monitor._total_recorded,
+                    "resource_violation_rate": rv_rate,
+                },
+                ttl_s=300.0,
+            )
+            self._bus.try_put(cmd)
+
+    # ------------------------------------------------------------------
+    # Execution summary
+    # ------------------------------------------------------------------
+
+    def get_execution_summary(self) -> Dict[str, Any]:
+        """Return a snapshot of execution monitoring for telemetry.
+
+        Delegates to :meth:`ExecutionMonitor.to_dict`.
+        """
+        return self._execution_monitor.to_dict()
 
     # ------------------------------------------------------------------
     # Rollback handler — L3 root cause analysis (Task 10: P1.6)
@@ -266,6 +365,23 @@ class ProductionSafetyNet:
             idempotency_key=idemp_key,
         )
         self._bus.try_put(cmd)
+
+    # ------------------------------------------------------------------
+    # Component health summary
+    # ------------------------------------------------------------------
+
+    def get_health_summary(self) -> Dict[str, Any]:
+        """Return a snapshot of component health for telemetry/dashboards.
+
+        Includes the full tracker ``to_dict()`` output plus aggregate
+        health and a list of unhealthy component names.
+        """
+        summary = self._health_tracker.to_dict()
+        summary["aggregate_health"] = self._health_tracker.get_aggregate_health()
+        summary["unhealthy_components"] = [
+            c.name for c in self._health_tracker.get_unhealthy()
+        ]
+        return summary
 
     @staticmethod
     def _classify_root_cause(reason: str) -> str:
