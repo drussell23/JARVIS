@@ -381,6 +381,19 @@ class GovernedOrchestrator:
             )
             return ctx
 
+        # L1: emit tool execution audit records to ledger stream
+        for _rec in generation.tool_execution_records:
+            try:
+                import dataclasses as _dc
+                _entry = LedgerEntry(
+                    op_id=ctx.op_id,
+                    state=OperationState.SANDBOXING,
+                    data={"kind": "tool_exec.v1", **_dc.asdict(_rec)},
+                )
+                await self._stack.ledger.append(_entry)
+            except Exception:  # noqa: BLE001
+                pass  # ledger failure must never abort governance pipeline
+
         # Store generation result in context
         ctx = ctx.advance(OperationPhase.VALIDATE, generation=generation)
 
