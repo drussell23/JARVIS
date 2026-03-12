@@ -1529,10 +1529,9 @@ class PrimeProvider:
 
         tool_records: tuple = ()
         if self._tool_loop is not None:
-            import datetime as _dt
             deadline_mono = (
                 time.monotonic()
-                + max(0.0, (deadline - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+                + max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
             )
             raw, tool_records_list = await self._tool_loop.run(
                 prompt=prompt,
@@ -1543,6 +1542,7 @@ class PrimeProvider:
                 deadline=deadline_mono,
             )
             tool_records = tuple(tool_records_list)
+            tool_rounds = len(tool_records_list)
         elif self._tools_enabled:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             current_prompt = prompt
@@ -1818,10 +1818,9 @@ class ClaudeProvider:
 
         tool_records: tuple = ()
         if self._tool_loop is not None:
-            import datetime as _dt
             deadline_mono = (
                 time.monotonic()
-                + max(0.0, (deadline - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+                + max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
             )
             raw, tool_records_list = await self._tool_loop.run(
                 prompt=prompt_text,
@@ -1832,6 +1831,7 @@ class ClaudeProvider:
                 deadline=deadline_mono,
             )
             tool_records = tuple(tool_records_list)
+            tool_rounds = len(tool_records_list)
         elif self._tools_enabled:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             raw = None
