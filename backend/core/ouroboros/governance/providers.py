@@ -1793,6 +1793,7 @@ class ClaudeProvider:
         _last_msg: list = [None]
 
         async def _generate_raw(p: str) -> str:
+            nonlocal total_cost
             timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
             msg = await asyncio.wait_for(
                 client.messages.create(
@@ -1810,7 +1811,6 @@ class ClaudeProvider:
             output_tokens = getattr(msg.usage, "output_tokens", 0)
             cost = self._estimate_cost(input_tokens, output_tokens)
             self._record_cost(cost)
-            nonlocal total_cost
             total_cost += cost
             if total_cost >= self._max_cost_per_op:
                 raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
