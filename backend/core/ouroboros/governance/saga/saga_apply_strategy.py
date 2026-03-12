@@ -41,6 +41,16 @@ except ImportError:
     _ledger_mod = None  # type: ignore[assignment]
     _LEDGER_IMPORTS_OK = False
 
+try:
+    from backend.core.ouroboros.governance.autonomy.saga_messages import (
+        SagaMessage,
+        SagaMessageType,
+        MessagePriority,
+    )
+    _BUS_IMPORTS_OK = True
+except ImportError:
+    _BUS_IMPORTS_OK = False
+
 logger = logging.getLogger("Ouroboros.SagaApply")
 
 
@@ -73,6 +83,7 @@ class SagaApplyStrategy:
         ledger: Any,
         branch_isolation: Optional[bool] = None,
         keep_failed_saga_branches: bool = True,
+        message_bus: Any = None,
     ) -> None:
         self._repo_roots: Dict[str, Path] = {k: Path(v) for k, v in repo_roots.items()}
         self._ledger = ledger
@@ -80,6 +91,7 @@ class SagaApplyStrategy:
             branch_isolation if branch_isolation is not None else _BRANCH_ISOLATION_ENABLED
         )
         self._keep_failed_branches = keep_failed_saga_branches
+        self._bus = message_bus
 
         # B+ branch state (populated during execute)
         self._saga_branches: Dict[str, str] = {}
@@ -128,6 +140,8 @@ class SagaApplyStrategy:
         if abort is not None:
             return abort
 
+        self._bus_emit("saga_created", saga_id, ctx.op_id)
+
         # Phase B: Staged topological apply
         applied_repos: List[str] = []
         step_index = 0
@@ -173,6 +187,7 @@ class SagaApplyStrategy:
                 logger.info("[Saga] %s APPLIED", repo)
                 # Issue 1 fix: emit apply_repo AFTER successful write+git-add
                 await self._emit_sub_event("apply_repo", saga_id, ctx.op_id, repo=repo)
+                self._bus_emit("saga_advanced", saga_id, ctx.op_id, repo=repo)
                 repo_statuses[repo] = RepoSagaStatus(
                     repo=repo,
                     status=SagaStepStatus.APPLIED,
@@ -182,6 +197,7 @@ class SagaApplyStrategy:
                 failure_reason = "apply_write_error"
                 failure_error = f"{type(exc).__name__}: {exc}"
                 logger.error("[Saga] Apply failed for %s: %s", repo, exc)
+                self._bus_emit("saga_failed", saga_id, ctx.op_id, repo=repo, reason_code=str(exc))
                 repo_statuses[repo] = RepoSagaStatus(
                     repo=repo,
                     status=SagaStepStatus.FAILED,
@@ -206,6 +222,7 @@ class SagaApplyStrategy:
         )
 
         if all_compensated:
+            self._bus_emit("saga_rolled_back", saga_id, ctx.op_id, reason_code=failure_reason)
             return SagaApplyResult(
                 terminal_state=SagaTerminalState.SAGA_ROLLED_BACK,
                 saga_id=saga_id,
@@ -243,6 +260,7 @@ class SagaApplyStrategy:
             self._saga_branches[repo] = saga_branch
 
         await self._emit_sub_event("prepare", saga_id, ctx.op_id)
+        self._bus_emit("saga_created", saga_id, ctx.op_id)
 
         applied_repos: List[str] = []
         step_index = 0
@@ -263,12 +281,14 @@ class SagaApplyStrategy:
                 applied_repos.append(repo)
                 step_index += 1
                 await self._emit_sub_event("apply_repo", saga_id, ctx.op_id, repo=repo)
+                self._bus_emit("saga_advanced", saga_id, ctx.op_id, repo=repo)
                 repo_statuses[repo] = RepoSagaStatus(repo=repo, status=SagaStepStatus.APPLIED)
             except Exception as exc:
                 failed_repo = repo
                 failure_reason = "apply_write_error"
                 failure_error = f"{type(exc).__name__}: {exc}"
                 logger.error("[Saga-B+] Apply failed for %s: %s", repo, exc)
+                self._bus_emit("saga_failed", saga_id, ctx.op_id, repo=repo, reason_code=str(exc))
                 repo_statuses[repo] = RepoSagaStatus(
                     repo=repo, status=SagaStepStatus.FAILED,
                     last_error=failure_error, reason_code=failure_reason,
@@ -279,6 +299,7 @@ class SagaApplyStrategy:
             await self._bplus_compensate_all(
                 apply_order, saga_id, ctx.op_id, failure_reason, repo_statuses,
             )
+            self._bus_emit("saga_rolled_back", saga_id, ctx.op_id, reason_code=failure_reason)
             return SagaApplyResult(
                 terminal_state=SagaTerminalState.SAGA_ROLLED_BACK,
                 saga_id=saga_id, saga_step_index=step_index,
@@ -561,6 +582,32 @@ class SagaApplyStrategy:
         except Exception as exc:
             logger.debug("[Saga] sub-event emit failed (%s): %s", event, exc)
 
+    def _bus_emit(self, msg_type: str, saga_id: str, op_id: str, **kwargs: Any) -> None:
+        """Emit a saga lifecycle event to the message bus (fire-and-forget)."""
+        if self._bus is None or not _BUS_IMPORTS_OK:
+            return
+        try:
+            self._bus.send(SagaMessage(
+                message_type=SagaMessageType(msg_type),
+                saga_id=saga_id,
+                source_repo=kwargs.pop("repo", "*"),
+                correlation_id=saga_id,
+                priority=(
+                    MessagePriority.HIGH
+                    if "fail" in msg_type or "partial" in msg_type or "moved" in msg_type
+                    else MessagePriority.NORMAL
+                ),
+                payload={
+                    "schema_version": "1.0",
+                    "op_id": op_id,
+                    "saga_id": saga_id,
+                    "reason_code": kwargs.get("reason_code", ""),
+                    **kwargs,
+                },
+            ))
+        except Exception:
+            logger.debug("[Saga] bus emit failed for %s (non-fatal)", msg_type)
+
     # ------------------------------------------------------------------
     # B+ Branch Lifecycle Helpers
     # ------------------------------------------------------------------
@@ -744,13 +791,16 @@ class SagaApplyStrategy:
                     "promote_repo", saga_id, op_id,
                     repo=repo, promoted_sha=sha, promote_order_index=idx,
                 )
+                self._bus_emit("saga_advanced", saga_id, op_id, repo=repo, promoted_sha=sha)
             except Exception as exc:
                 logger.error("[Saga-B+] Promote failed for %s: %s", repo, exc)
                 await self._emit_sub_event(
                     "partial_promote", saga_id, op_id,
                     repo=repo, reason=str(exc), boundary_repo=repo,
                 )
+                self._bus_emit("saga_partial_promote", saga_id, op_id, repo=repo, reason_code=str(exc))
                 return SagaTerminalState.SAGA_PARTIAL_PROMOTE, promoted
+        self._bus_emit("saga_completed", saga_id, op_id)
         return SagaTerminalState.SAGA_SUCCEEDED, promoted
 
     async def _git(self, repo: str, args: List[str], env: Optional[Dict[str, str]] = None) -> str:
