@@ -37726,6 +37726,178 @@ flowchart LR
 
 ---
 
+## Ouroboros: Honest Capability Assessment (v262.0)
+
+This section documents exactly what Ouroboros can and cannot do, where the gaps are relative to Claude Code-level autonomy, what would close them, and the architectural principles that govern every decision in this system.
+
+---
+
+### What Ouroboros CAN Do Right Now
+
+**Yes** to the complete autonomous code delivery loop:
+
+- Detects opportunities across all 3 repos (test failures, backlog tasks, complexity signals, voice commands)
+- Calls J-Prime on GCP (golden image, `136.113.252.164:8000`), receives a schema 2c.1 multi-repo patch
+- Applies it with B+ saga safety (ephemeral branches, two-tier locks, ff-only promote gates, rollback-via-branch-delete)
+- Narrates every significant decision in real time via voice + TUI
+- Commits and promotes across jarvis + prime + reactor-core without human intervention
+
+This is **real, production-grade autonomous code delivery.** No human touch from detection → commit.
+
+---
+
+### Where Ouroboros Falls Short of Claude Code Level
+
+| Capability | Claude Code | Ouroboros v262.0 |
+|---|---|---|
+| Read arbitrary files during an op | Yes — `Read` tool on any path | Partial — `TheOracle` semantic index + `context_expander` (max 10 files, 2 rounds) |
+| Run bash commands | Yes — full shell | No — no command execution within an op |
+| Search the web | Yes — `WebSearch` tool | No |
+| Edit code iteratively with feedback | Yes — multi-turn, sees results | No — one-shot patch generation + apply |
+| Test generated code before committing | Yes — runs pytest, reads output, fixes | No — applies first, verifies after |
+| Build agents autonomously | Yes — can write, test, debug full systems | No — generates patches but cannot iterate on running code |
+| Strategic understanding of your goal | Deep — full conversation context | Shallow — per-op intent only |
+
+**The core difference:** Claude Code is a **full agentic loop with tool use** — it reads, runs, observes output, revises, runs again, converges. Ouroboros is a **code generation + automated apply pipeline** — J-Prime generates a patch once, the B+ saga applies it. There is no iterative tool-use loop within an operation.
+
+---
+
+### Building AI Agents Across All 3 Repos
+
+Ouroboros **can write agent code** as a patch. What it cannot do:
+
+- Run the new agent and observe whether it works
+- Debug failures interactively and revise
+- Build complex multi-file systems iteratively within a single session
+- Verify behavior beyond static git diffs + pytest streak results
+
+The pattern is: **write → commit → hope the tests pass.** Claude Code's pattern is: **write → run → observe → adjust → run → confirm.** That iterative loop does not yet exist inside an Ouroboros operation.
+
+---
+
+### macOS M1 16GB — What JARVIS Already Owns
+
+The broader JARVIS system has deep macOS control, independent of Ouroboros:
+
+- Swift/ObjC native daemons, Accessibility API, CoreGraphics
+- Ghost Display, computer use (mouse, keyboard, screenshot), multi-space multi-monitor
+- Voice biometric auth (ECAPA-TDNN + Apple Watch), full-duplex audio, wake word
+- Vision (LLaVA + YOLO + OCR), 203 Swift files, 5 Rust crates
+- Claude Computer Use API for autonomous visual workflows
+
+Ouroboros operates at the **git/file level**. It does not drive the macOS layer directly during a code generation operation. JARVIS owns that surface independently.
+
+---
+
+### "Consciousness" of What You're Building
+
+**What exists today:**
+
+- **TheOracle** — semantic index of all 3 repos, `FileNeighborhood` topology (7 edge categories), updated every ~300s
+- **context_expander** — pulls up to 10 files per op based on semantic relevance to the change
+- **TrustGraduator** — tracks trust level per domain (GOVERNED vs OBSERVE) across ops
+- **VoiceNarrator** — announces intent at op start, surfaces decisions in real time
+
+**What does not yet exist:**
+
+- No persistent memory of your strategic goals across sessions
+- No model of "Derek is building an AGI OS to accomplish X" that informs generation
+- J-Prime sees the current op context — not a multi-session narrative
+- No "why are we building this?" reasoning layer
+
+TheOracle provides code-topology awareness. It understands **what the code does**. It does not yet understand **why you are building it** — that is the next evolution.
+
+---
+
+### What Would Close the Gap
+
+To reach Claude Code-level autonomy within an operation:
+
+1. **Tool use in the generation loop** — J-Prime needs to call `read_file`, `run_command`, `run_tests` during generation rather than emitting a static one-shot patch
+2. **Multi-turn op execution** — generate → run → observe output → revise → run → converge (not generate → apply → done)
+3. **Persistent goal memory** — a layer that accumulates your long-running strategic intent across sessions and injects it as context into every op
+4. **Command execution safety layer** — a sandboxed shell within an op so Ouroboros can verify its own changes before committing
+
+The infrastructure for this is partially present (TheOracle, context_expander, the full 10-phase governance pipeline). The missing piece is **interactive tool use inside a live operation.**
+
+---
+
+## Engineering Mandate
+
+### Enterprise-Grade Unification, Hardening & Systemic Reinforcement of the JARVIS Ecosystem
+
+This initiative represents a foundational architectural hardening of the entire JARVIS ecosystem. It is not a refactor for convenience, not a collection of incremental improvements, and not a patch cycle disguised as optimization. The objective is to evolve JARVIS, JARVIS Prime, and Reactor Core into a unified, production-grade AI Operating System capable of deterministic orchestration, autonomous recovery, high-concurrency execution, and long-term evolutionary scalability.
+
+Every modification must be intentional and principled. Surface-level mitigation is unacceptable. If a flaw is understood, it must be corrected at its structural origin rather than wrapped in retries, defensive conditionals, or workaround-driven patches. **The mandate is clear: we cure systemic disease, not its symptoms.**
+
+**Unified Execution Model.** A single command — `python3 unified_supervisor.py` — must deterministically initialize and orchestrate all subsystems across repositories as one cohesive system. The Unified Supervisor must function as the authoritative control plane: coordinating startup and shutdown, validating cross-repository contracts, enforcing lifecycle ordering, restoring system state and user context, managing dependency compatibility, and continuously monitoring health. There can be no ambiguity about system ownership or orchestration authority.
+
+**Deterministic Lifecycle Architecture.** No subsystem may rely on sleep-based assumptions, undocumented side effects, global mutable state, or coincidental initialization order. All lifecycle sequencing must be explicit, declared through formal dependency definitions, and validated before execution proceeds. Startup and shutdown must be modeled as deterministic state machines with explicit transitions, timeouts, rollback logic, and recovery pathways. If partial failure occurs, the system must degrade gracefully or unwind cleanly without leaving corrupted state.
+
+**Concurrency: Advanced but Disciplined.** The architecture must be deeply asynchronous and parallel where beneficial, leveraging structured concurrency rather than ad hoc coroutine spawning. Every asynchronous boundary must define cancellation behavior, cleanup guarantees, failure propagation semantics, and timeout policies. No coroutine may outlive its lifecycle owner. No shared state may be mutated without defined concurrency controls. Concurrency must be observable, measurable, and bounded by backpressure-aware mechanisms to prevent system overload.
+
+**Cross-Repository Contract Hardening.** Integration between Reactor Core, JARVIS Prime, and the JARVIS runtime is the most fragile architectural surface. Each repository must operate within clearly defined ownership boundaries: Reactor Core owns compute primitives and model training; JARVIS Prime owns model registry, capability routing, and selection logic; the JARVIS runtime orchestrates agents, multimodal pipelines, and execution flows; the Unified Supervisor owns global lifecycle, health management, and contract validation. Interface contracts must be versioned, schema-validated, and compatibility-checked during boot. No circular dependencies. No leaked responsibilities.
+
+**State Integrity & Event Orchestration.** Event propagation and system state must be explicit and durable. The architecture must guard against duplicate event execution, lost or reordered events, cross-agent state mutation conflicts, partial persistence during failure, and inconsistent memory restoration after restart. All state that influences runtime behavior must either be reconstructible from authoritative sources or safely snapshot-restorable. Restart logic must maintain invariants and preserve critical context without resurrecting corrupted state.
+
+**Partial Failure & Autonomous Recovery.** Failure must be anticipated, classified, and handled deterministically. The system must tolerate subsystem crashes, model loading failures, GPU memory exhaustion, external dependency unavailability, network instability, and voice/vision pipeline interruptions. Recovery logic must be autonomous wherever feasible. Silent failure paths are unacceptable. Every significant fault must be observable, classified, and surfaced through the unified health layer.
+
+**Configuration & Evolution Without Fragmentation.** Hardcoding, duplicated configuration, environment-specific logic branching, and parallel implementations of the same subsystem are strictly prohibited. Configuration must be schema-validated, dependency-injected, environment-aware, and versioned. Evolution must reinforce and extend existing modules, not fragment the architecture into competing implementations.
+
+**Observability as a First-Class Constraint.** The unified platform must expose lifecycle state visibility, dependency graph status, component readiness indicators, concurrency saturation metrics, resource utilization trends, failure classification, and recovery outcomes. Without visibility, structural flaws remain undiagnosed. Observability must be integral to the design of each subsystem.
+
+**End State.** The completed system must be: deterministic under startup, stable under concurrency, crash-consistent across failure boundaries, version-aware and contract-validated, restart-resilient, state-preserving, architecturally cohesive, and capable of long-term evolution without accumulating hidden fragility. It must behave as an AI Operating System kernel — not a loose collection of scripts stitched together through incidental integration.
+
+**Final Engineering Principle:**
+
+> No brute force. No retry spam. No defensive clutter. No duplication. No implicit timing. No hidden global state. No workaround-based stability illusions. If the flaw is understood, it must be fixed at its structural root. The goal is not temporary stability. The goal is durable correctness.
+
+---
+
+## Engineering Directive
+
+### Enterprise-Grade System Unification
+
+This effort must be executed correctly and without compromise. The objective is to elevate the existing JARVIS ecosystem into a truly enterprise-grade, production-ready architecture built for long-term resilience, autonomy, and continuous evolution. This is not an exercise in incremental fixes or surface-level improvements — it is a foundational hardening of the system itself.
+
+The architecture must be robust, deeply asynchronous, parallel where appropriate, intelligent in coordination, and fully dynamic in behavior. All implementations must explicitly avoid hardcoding, unnecessary file duplication, architectural sprawl, brittle assumptions, shortcuts, brute-force techniques, or workaround-based solutions. Every change must be intentional, principled, and focused on resolving root causes rather than masking symptoms.
+
+The system must be pushed to its architectural limits using the most advanced and appropriate techniques — without sacrificing clarity, maintainability, or correctness. Refactoring, extension, and reinforcement are preferred over duplication or parallel implementations.
+
+A non-negotiable requirement is first-class, native integration across JARVIS, JARVIS Prime, and Reactor Core, forming a cohesive system-of-systems. When a single command is executed — `python3 unified_supervisor.py` — it must deterministically initialize, orchestrate, and manage all subsystems across repositories as one unified, intelligent platform.
+
+Before and during implementation, a deep architectural analysis must identify and eliminate advanced failure vectors including: asynchronous and concurrency failure modes; race conditions, deadlocks, and ordering hazards; improper startup, shutdown, and restart sequencing; cross-repository dependency coupling, version drift, and contract violations; event orchestration flaws and state consistency issues; partial failures, crash recovery gaps, and restart instability; non-obvious edge cases, emergent behaviors, and silent failure paths.
+
+These risks must be resolved at the foundation level, not mitigated through retries, defensive hacks, or patch-based solutions. Any logic dependent on implicit timing, undocumented side effects, or fragile assumptions must be redesigned to be explicit, observable, deterministic, and testable.
+
+All changes must respect clear ownership boundaries and include a principled decision about where responsibility belongs — within JARVIS, JARVIS Prime, Reactor Core, or a well-defined shared orchestration layer — so that accountability remains unambiguous, scalable, and maintainable over time.
+
+The end state: a fully unified, resilient, scalable, and intelligent core system capable of operating reliably under complex, concurrent, and continuously evolving conditions. This foundation must support JARVIS as a true AI Operating System — enabling autonomous behavior, transparent system intelligence, and long-term innovation without accumulating technical debt.
+
+**The guiding principle is simple and non-negotiable: we cure the disease, not apply band-aids. If a flaw is understood, it must be fixed at its root. No shortcuts. No brute force. No workarounds. Only correct, durable engineering.**
+
+---
+
+## Architectural Critique & Advanced Design Considerations
+
+These are the non-obvious failure modes, edge cases, and advanced nuances that the architecture must account for — not theoretical concerns, but the typical failure modes of complex distributed asynchronous systems.
+
+**1. Over-centralization risk.** If `unified_supervisor.py` becomes too large and logic-heavy, it becomes a monolith bottleneck. The architecture should treat it as a control plane with pluggable lifecycle modules rather than embedding all logic directly inside it. The Supervisor coordinates; it does not own implementation detail.
+
+**2. Human operational model.** Enterprise systems fail when they cannot be reasoned about. The architecture must remain debuggable and explainable at every layer. Over-abstracting async orchestration makes it harder to diagnose in production. Every async boundary must have a clear mental model, not just a formal contract.
+
+**3. Testing strategy gap.** Runtime resilience is necessary but not sufficient. A complete testing strategy must define: deterministic integration tests, chaos testing strategy, failure injection harness, restart simulation, and concurrency stress harness. Tests that do not include adversarial scenarios do not validate production readiness.
+
+**4. State ownership clarity.** If state exists in multiple repos, there must be exactly one source of truth for each state domain. Ambiguity about canonical state is the root cause of the most dangerous class of distributed systems bugs. Every mutable piece of system state must have a single authoritative owner.
+
+**5. Upgrade strategy.** How versions migrate without downtime requires explicit design: rolling upgrades, contract negotiation protocols, feature flags for forward/backward compatibility. This must be planned before it is needed, not invented under pressure during a production incident.
+
+**6. Supervisor self-healing paradox.** If the Supervisor fails, what restores it? There must be minimal bootstrap logic separate from runtime orchestration — a watchdog layer that is simpler, more stable, and less coupled than the system it monitors. The system that heals all components cannot itself be a single point of failure.
+
+**7. Performance vs. correctness tradeoff.** Async and parallelism are force multipliers, but over-optimization early can obscure correctness guarantees. The priority order is always: correctness first, then observability, then performance. Introducing parallelism before correctness is established guarantees that bugs become non-deterministic and therefore undiagnosable.
+
+---
+
 ## License
 
 MIT License - see LICENSE file for details
