@@ -494,6 +494,8 @@ class OperationContext:
     strategic_memory_fact_ids: Tuple[str, ...] = ()
     strategic_memory_prompt: str = ""
     strategic_memory_digest: str = ""
+    terminal_reason_code: str = ""
+    rollback_occurred: bool = False
 
     # ---- Telemetry (stamped at intake and COMPLETE) ----
     telemetry: Optional[TelemetryContext] = None
@@ -599,6 +601,8 @@ class OperationContext:
             "strategic_memory_fact_ids": (),
             "strategic_memory_prompt": "",
             "strategic_memory_digest": "",
+            "terminal_reason_code": "",
+            "rollback_occurred": False,
             "telemetry": None,
             "previous_op_hash_by_scope": previous_op_hash_by_scope,
             "frozen_autonomy_tier": "governed",
@@ -635,6 +639,8 @@ class OperationContext:
             strategic_memory_fact_ids=(),
             strategic_memory_prompt="",
             strategic_memory_digest="",
+            terminal_reason_code="",
+            rollback_occurred=False,
             previous_op_hash_by_scope=previous_op_hash_by_scope,
             frozen_autonomy_tier="governed",
         )
@@ -813,6 +819,24 @@ class OperationContext:
             strategic_memory_fact_ids=tuple(strategic_memory_fact_ids),
             strategic_memory_prompt=strategic_memory_prompt,
             strategic_memory_digest=strategic_memory_digest,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_terminal_outcome(
+        self,
+        *,
+        terminal_reason_code: str,
+        rollback_occurred: bool = False,
+    ) -> "OperationContext":
+        """Stamp terminal outcome metadata onto the context."""
+        intermediate = dataclasses.replace(
+            self,
+            terminal_reason_code=terminal_reason_code,
+            rollback_occurred=rollback_occurred,
             previous_hash=self.context_hash,
             context_hash="",
         )

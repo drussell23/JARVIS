@@ -1382,6 +1382,109 @@ async def test_submit_records_verified_outcome_on_complete() -> None:
 
 
 @pytest.mark.asyncio
+async def test_submit_emits_rollback_event_and_supersedes_verified_fact(tmp_path) -> None:
+    import dataclasses
+    from types import SimpleNamespace
+
+    from backend.core.ouroboros.governance.autonomy.advanced_coordination import (
+        AdvancedAutonomyService,
+        AdvancedCoordinationConfig,
+    )
+    from backend.core.ouroboros.governance.autonomy.autonomy_types import EventType
+    from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+    from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+        GovernedLoopService,
+        ServiceState,
+    )
+
+    stack = _mock_stack()
+    service = GovernedLoopService(
+        stack=stack,
+        prime_client=None,
+        config=GovernedLoopConfig(project_root=tmp_path, l4_enabled=True),
+    )
+    service._state = ServiceState.ACTIVE
+    service._ledger = None
+    service._event_emitter = EventEmitter()
+
+    captured_rollbacks = []
+
+    async def _capture(event):
+        captured_rollbacks.append(event)
+
+    service._event_emitter.subscribe(EventType.OP_ROLLED_BACK, _capture)
+    service._advanced_autonomy = AdvancedAutonomyService(
+        command_bus=CommandBus(maxsize=100),
+        config=AdvancedCoordinationConfig(state_dir=tmp_path / "advanced_coordination"),
+    )
+    service._advanced_autonomy.register_event_handlers(service._event_emitter)
+
+    seeded_fact = service._advanced_autonomy.record_verified_outcome(
+        op_id="op-rollback-001",
+        description="Preserve architecture consistency",
+        target_files=("backend/core/utils.py",),
+        repo_scope=("jarvis",),
+        provider_used="gcp-jprime",
+        routing_reason="memory_guided_governance",
+        benchmark_result=None,
+        is_noop=False,
+    )
+    assert seeded_fact is not None
+
+    brain = SimpleNamespace(
+        brain_id="qwen_coder_32b",
+        model_name="qwen-coder-32b",
+        routing_reason="memory_guided_governance",
+        task_complexity="light",
+        estimated_prompt_tokens=512,
+        provider_tier="gcp_prime",
+        schema_capability="full_content_only",
+        narration=lambda: "routing narration",
+    )
+    service._brain_selector = MagicMock()
+    service._brain_selector.select = AsyncMock(return_value=brain)
+    service._brain_selector.daily_spend = 0.0
+
+    async def _rolled_back_ctx(stamped_ctx):
+        generation = GenerationResult(
+            candidates=(),
+            provider_name="gcp-jprime",
+            generation_duration_s=0.25,
+            model_id="qwen-coder-32b",
+        )
+        return dataclasses.replace(
+            stamped_ctx,
+            op_id="op-rollback-001",
+            phase=OperationPhase.POSTMORTEM,
+            generation=generation,
+            terminal_reason_code="change_engine_failed",
+            rollback_occurred=True,
+        )
+
+    service._orchestrator = MagicMock()
+    service._orchestrator.run = AsyncMock(side_effect=_rolled_back_ctx)
+
+    ctx = _make_context(
+        op_id="op-rollback-001",
+        description="Preserve architecture consistency",
+        target_files=("backend/core/utils.py",),
+    )
+    result = await service.submit(ctx, trigger_source="cli")
+
+    assert result.terminal_phase is OperationPhase.POSTMORTEM
+    assert result.reason_code == "change_engine_failed"
+    assert len(captured_rollbacks) == 1
+    assert captured_rollbacks[0].payload["rollback_reason"] == "change_engine_failed"
+    assert captured_rollbacks[0].payload["failure_class"] == "rollback"
+
+    recovered = service._advanced_autonomy.get_memory_fact(seeded_fact.fact_id)
+    assert recovered is not None
+    assert recovered.status == "superseded"
+
+
+@pytest.mark.asyncio
 async def test_feedback_loop_scores_attribution_with_real_persistence_shape() -> None:
     from backend.core.ouroboros.governance.governed_loop_service import (
         GovernedLoopConfig,

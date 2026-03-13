@@ -387,6 +387,36 @@ def _classify_terminal(
     return "DEGRADED"
 
 
+def _classify_failure_signal_class(
+    reason_code: str,
+    *,
+    rollback_occurred: bool = False,
+) -> str:
+    """Map a terminal reason into a coarse failure class for event consumers."""
+    if rollback_occurred:
+        return "rollback"
+    reason = (reason_code or "").lower()
+    if not reason:
+        return "unknown"
+    if any(token in reason for token in ("timeout", "deadline", "expired")):
+        return "timeout"
+    if any(token in reason for token in ("syntax", "indent")):
+        return "syntax"
+    if any(token in reason for token in ("validation", "verify", "test", "candidate", "source_drift")):
+        return "validation"
+    if any(token in reason for token in ("gate_blocked", "approval", "brain_not_admitted", "busy", "duplicate", "file_in_flight", "cost_gate")):
+        return "policy"
+    if any(token in reason for token in ("saga", "promote", "drift_detected")):
+        return "saga"
+    if any(token in reason for token in ("provider", "compute", "artifact", "capability", "host_binding", "dependency", "permission", "disk", "env", "unavailable")):
+        return "env"
+    if "change_engine" in reason or "apply" in reason:
+        return "apply"
+    if "l2_" in reason:
+        return "repair"
+    return "unknown"
+
+
 def _build_proof_artifact(
     op_id: str,
     terminal_phase: "OperationPhase",
@@ -982,42 +1012,50 @@ class GovernedLoopService:
 
         # Gate: service must be active
         if self._state not in (ServiceState.ACTIVE, ServiceState.DEGRADED):
-            return OperationResult(
+            result = OperationResult(
                 op_id=ctx.op_id,
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code=f"service_not_active:{self._state.name}",
                 trigger_source=trigger_source,
                 terminal_class="DEGRADED",
             )
+            await self._emit_terminal_events(ctx=ctx, result=result)
+            return result
 
         # Gate: concurrency limit
         if len(self._active_ops) >= self._config.max_concurrent_ops:
-            return OperationResult(
+            result = OperationResult(
                 op_id=ctx.op_id,
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code="busy",
                 trigger_source=trigger_source,
                 terminal_class="DEGRADED",
             )
+            await self._emit_terminal_events(ctx=ctx, result=result)
+            return result
 
         # Gate: dedup
         dedupe_key = ctx.op_id
         if dedupe_key in self._active_ops:
-            return OperationResult(
+            result = OperationResult(
                 op_id=ctx.op_id,
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code="duplicate:in_flight",
                 trigger_source=trigger_source,
                 terminal_class="DEGRADED",
             )
+            await self._emit_terminal_events(ctx=ctx, result=result)
+            return result
         if dedupe_key in self._completed_ops:
-            return OperationResult(
+            result = OperationResult(
                 op_id=ctx.op_id,
                 terminal_phase=OperationPhase.CANCELLED,
                 reason_code="duplicate:already_completed",
                 trigger_source=trigger_source,
                 terminal_class="DEGRADED",
             )
+            await self._emit_terminal_events(ctx=ctx, result=result)
+            return result
 
         # Gate: file-scope in-flight lock (before acquiring — prevents self-cancel)
         import pathlib as _pl_gate
@@ -1030,13 +1068,15 @@ class GovernedLoopService:
                     _canonical,
                     ctx.op_id,
                 )
-                return OperationResult(
+                result = OperationResult(
                     op_id=ctx.op_id,
                     terminal_phase=OperationPhase.CANCELLED,
                     reason_code="file_in_flight",
                     trigger_source=trigger_source,
                     terminal_class="DEGRADED",
                 )
+                await self._emit_terminal_events(ctx=ctx, result=result)
+                return result
 
         # Execute pipeline
         self._active_ops.add(dedupe_key)
@@ -1085,13 +1125,20 @@ class GovernedLoopService:
                     "[GovernedLoop] Brain %r not in admitted set %s — rejecting op %s",
                     brain.brain_id, sorted(self._active_brain_set), ctx.op_id,
                 )
-                return OperationResult(
+                result = OperationResult(
                     op_id=ctx.op_id,
                     terminal_phase=OperationPhase.CANCELLED,
                     reason_code="brain_not_admitted",
                     trigger_source=trigger_source,
                     terminal_class="DEGRADED",
                 )
+                await self._emit_terminal_events(
+                    ctx=ctx,
+                    result=result,
+                    brain_id=brain.brain_id,
+                    model_name=brain.model_name,
+                )
+                return result
 
             # Phase 4: create per-op FSM context (starts in RUNNING)
             _fsm_ctx = LoopRuntimeContext(op_id=ctx.op_id)
@@ -1123,7 +1170,7 @@ class GovernedLoopService:
                     "[GovernedLoop] Cost gate queued op %s (daily_spend=$%.4f)",
                     ctx.op_id, self._brain_selector.daily_spend,
                 )
-                return OperationResult(
+                result = OperationResult(
                     op_id=ctx.op_id,
                     terminal_phase=OperationPhase.CANCELLED,
                     reason_code="cost_gate_triggered_queue",
@@ -1131,6 +1178,13 @@ class GovernedLoopService:
                     routing_reason=brain.routing_reason,
                     terminal_class="DEGRADED",
                 )
+                await self._emit_terminal_events(
+                    ctx=ctx,
+                    result=result,
+                    brain_id=brain.brain_id,
+                    model_name=brain.model_name,
+                )
+                return result
 
             intent_tel = RoutingIntentTelemetry(
                 # Phase 1 P0: use brain-derived fields, NOT local Mac pressure.
@@ -1193,7 +1247,10 @@ class GovernedLoopService:
                 early_exit = await self._preflight_check(ctx)
                 if early_exit is not None:
                     duration = time.monotonic() - start_time
-                    _reason = early_exit.phase.name.lower()
+                    _reason = (
+                        getattr(early_exit, "terminal_reason_code", "")
+                        or early_exit.phase.name.lower()
+                    )
                     _tc = _classify_terminal(early_exit.phase, None, _reason, is_noop=False)
                     result = OperationResult(
                         op_id=ctx.op_id,
@@ -1220,6 +1277,14 @@ class GovernedLoopService:
                             total_duration_s=result.total_duration_s or 0.0,
                         )
                         await _record_ledger(ctx, self._ledger, OperationState.FAILED, _proof)
+                    await self._emit_terminal_events(
+                        ctx=ctx,
+                        result=result,
+                        brain_id=brain.brain_id,
+                        model_name=brain.model_name,
+                        rollback_occurred=bool(getattr(early_exit, "rollback_occurred", False)),
+                        rollback_reason=_reason,
+                    )
                     return result
 
             _pipeline_timeout = (
@@ -1263,6 +1328,13 @@ class GovernedLoopService:
                         total_duration_s=result.total_duration_s or 0.0,
                     )
                     await _record_ledger(ctx, self._ledger, OperationState.FAILED, _proof)
+                await self._emit_terminal_events(
+                    ctx=ctx,
+                    result=result,
+                    brain_id=brain.brain_id,
+                    model_name=brain.model_name,
+                    rollback_reason="pipeline_timeout",
+                )
                 return result
 
             # Phase 4: record actual generation cost for cost gate persistence
@@ -1289,7 +1361,11 @@ class GovernedLoopService:
                 getattr(terminal_ctx.generation, "model_id", None)
                 if terminal_ctx.generation else None
             )
-            _reason_code = terminal_ctx.phase.name.lower()
+            _reason_code = (
+                getattr(terminal_ctx, "terminal_reason_code", "")
+                or terminal_ctx.phase.name.lower()
+            )
+            _rollback_occurred = bool(getattr(terminal_ctx, "rollback_occurred", False))
             _tc = _classify_terminal(terminal_ctx.phase, _provider_used, _reason_code, is_noop=_is_noop)
             result = OperationResult(
                 op_id=ctx.op_id,
@@ -1344,24 +1420,14 @@ class GovernedLoopService:
                         exc,
                     )
 
-            # C+ L1: Emit op_completed event to advisory layers
-            if self._event_emitter is not None:
-                try:
-                    await self._event_emitter.emit(AutonomyEventEnvelope(
-                        source_layer="L1",
-                        event_type=AutonomyEventType.OP_COMPLETED,
-                        payload={
-                            "op_id": ctx.op_id,
-                            "brain_id": brain.brain_id,
-                            "model_name": brain.model_name,
-                            "terminal_phase": result.terminal_phase.name,
-                            "provider": result.provider_used or "",
-                            "duration_s": result.total_duration_s or 0.0,
-                            "rollback": False,
-                        },
-                    ))
-                except Exception:
-                    pass  # fault-isolated
+            await self._emit_terminal_events(
+                ctx=ctx,
+                result=result,
+                brain_id=brain.brain_id,
+                model_name=brain.model_name,
+                rollback_occurred=_rollback_occurred,
+                rollback_reason=_reason_code,
+            )
 
             return result
 
@@ -1376,6 +1442,68 @@ class GovernedLoopService:
     # ------------------------------------------------------------------
     # Health
     # ------------------------------------------------------------------
+
+    async def _emit_terminal_events(
+        self,
+        *,
+        ctx: OperationContext,
+        result: OperationResult,
+        brain_id: str = "",
+        model_name: str = "",
+        rollback_occurred: bool = False,
+        rollback_reason: str = "",
+        failure_class: str = "",
+    ) -> None:
+        """Emit terminal outcome events to advisory layers with rollback fidelity."""
+        if self._event_emitter is None:
+            return
+
+        reason_code = rollback_reason or result.reason_code
+        resolved_failure_class = (
+            failure_class
+            or _classify_failure_signal_class(
+                reason_code,
+                rollback_occurred=rollback_occurred,
+            )
+        )
+        success = (
+            result.terminal_phase is OperationPhase.COMPLETE
+            and not rollback_occurred
+        )
+        payload = {
+            "op_id": ctx.op_id,
+            "brain_id": brain_id,
+            "model_name": model_name,
+            "terminal_phase": result.terminal_phase.name,
+            "provider": result.provider_used or "",
+            "duration_s": result.total_duration_s or 0.0,
+            "duration_ms": (result.total_duration_s or 0.0) * 1000.0,
+            "rollback": rollback_occurred,
+            "success": success,
+            "error": "" if success else reason_code,
+            "failure_class": resolved_failure_class,
+            "affected_files": list(ctx.target_files),
+        }
+
+        try:
+            await self._event_emitter.emit(AutonomyEventEnvelope(
+                source_layer="L1",
+                event_type=AutonomyEventType.OP_COMPLETED,
+                payload=payload,
+                op_id=ctx.op_id,
+            ))
+            if rollback_occurred:
+                await self._event_emitter.emit(AutonomyEventEnvelope(
+                    source_layer="L1",
+                    event_type=AutonomyEventType.OP_ROLLED_BACK,
+                    payload={
+                        **payload,
+                        "rollback_reason": reason_code,
+                    },
+                    op_id=ctx.op_id,
+                ))
+        except Exception:
+            pass  # fault-isolated
 
     def health(self) -> Dict[str, Any]:
         """Return structured health report."""

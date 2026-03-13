@@ -940,3 +940,36 @@ class TestStrategicMemoryMetadata:
         )
         assert ctx2.context_hash != ctx.context_hash
         assert ctx2.previous_hash == ctx.context_hash
+
+
+class TestTerminalOutcomeMetadata:
+    def _make_ctx(self):
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        return OperationContext.create(
+            target_files=("backend/core/utils.py",),
+            description="terminal outcome metadata",
+        )
+
+    def test_terminal_outcome_defaults_safe(self):
+        ctx = self._make_ctx()
+        assert ctx.terminal_reason_code == ""
+        assert ctx.rollback_occurred is False
+
+    def test_with_terminal_outcome_sets_fields(self):
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_terminal_outcome(
+            terminal_reason_code="saga_rolled_back",
+            rollback_occurred=True,
+        )
+        assert ctx2.terminal_reason_code == "saga_rolled_back"
+        assert ctx2.rollback_occurred is True
+
+    def test_with_terminal_outcome_updates_hash_chain(self):
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_terminal_outcome(
+            terminal_reason_code="change_engine_failed",
+            rollback_occurred=True,
+        )
+        assert ctx2.context_hash != ctx.context_hash
+        assert ctx2.previous_hash == ctx.context_hash

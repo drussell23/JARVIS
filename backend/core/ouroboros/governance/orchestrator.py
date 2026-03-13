@@ -241,12 +241,18 @@ class GovernedOrchestrator:
             # Try to advance to POSTMORTEM from current phase.
             # If we can't (e.g. already terminal), just return ctx.
             try:
-                ctx = ctx.advance(OperationPhase.POSTMORTEM)
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="unhandled_pipeline_exception",
+                )
             except ValueError:
                 # POSTMORTEM not legal from this phase — fall back to CANCELLED
                 # (legal from all non-terminal phases except VERIFY).
                 try:
-                    ctx = ctx.advance(OperationPhase.CANCELLED)
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="unhandled_pipeline_exception",
+                    )
                 except ValueError:
                     pass  # Already terminal — safe to return as-is
             await self._record_ledger(
@@ -269,7 +275,11 @@ class GovernedOrchestrator:
         risk_tier = classification.tier
 
         if risk_tier is RiskTier.BLOCKED:
-            ctx = ctx.advance(OperationPhase.CANCELLED, risk_tier=risk_tier)
+            ctx = ctx.advance(
+                OperationPhase.CANCELLED,
+                risk_tier=risk_tier,
+                terminal_reason_code=classification.reason_code,
+            )
             await self._record_ledger(
                 ctx,
                 OperationState.BLOCKED,
@@ -359,7 +369,10 @@ class GovernedOrchestrator:
                 generate_retries_remaining -= 1
                 if generate_retries_remaining < 0:
                     # All retries exhausted
-                    ctx = ctx.advance(OperationPhase.CANCELLED)
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="generation_failed",
+                    )
                     await self._record_ledger(
                         ctx,
                         OperationState.FAILED,
@@ -398,7 +411,11 @@ class GovernedOrchestrator:
                 ctx.op_id,
                 generation.provider_name,
             )
-            ctx = ctx.advance(OperationPhase.COMPLETE, generation=generation)
+            ctx = ctx.advance(
+                OperationPhase.COMPLETE,
+                generation=generation,
+                terminal_reason_code="noop",
+            )
             await self._record_ledger(
                 ctx,
                 OperationState.APPLIED,
@@ -424,7 +441,10 @@ class GovernedOrchestrator:
                 remaining_s = self._config.validation_timeout_s  # fallback
 
             if remaining_s <= 0.0:
-                ctx = ctx.advance(OperationPhase.CANCELLED)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="validation_budget_exhausted",
+                )
                 await self._record_ledger(
                     ctx,
                     OperationState.FAILED,
@@ -457,7 +477,11 @@ class GovernedOrchestrator:
 
                 # Infra failure: non-retryable — escalate immediately
                 if validation.failure_class == "infra":
-                    ctx = ctx.advance(OperationPhase.POSTMORTEM, validation=validation)
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        validation=validation,
+                        terminal_reason_code="validation_infra_failure",
+                    )
                     await self._record_ledger(
                         ctx,
                         OperationState.FAILED,
@@ -473,7 +497,11 @@ class GovernedOrchestrator:
 
                 # Budget failure: non-retryable
                 if validation.failure_class == "budget":
-                    ctx = ctx.advance(OperationPhase.CANCELLED, validation=validation)
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        validation=validation,
+                        terminal_reason_code="validation_budget_exhausted",
+                    )
                     await self._record_ledger(
                         ctx,
                         OperationState.FAILED,
@@ -503,7 +531,10 @@ class GovernedOrchestrator:
                         return directive[1]  # ctx was advanced inside _l2_hook
                 # ── end L2 dispatch ───────────────────────────────────────────
 
-                ctx = ctx.advance(OperationPhase.CANCELLED)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="no_candidate_valid",
+                )
                 await self._record_ledger(
                     ctx,
                     OperationState.FAILED,
@@ -529,7 +560,10 @@ class GovernedOrchestrator:
         # Source-drift check: file must not have changed since generation
         drift_hash = self._check_source_drift(best_candidate, self._config.project_root)
         if drift_hash is not None:
-            ctx = ctx.advance(OperationPhase.CANCELLED)
+            ctx = ctx.advance(
+                OperationPhase.CANCELLED,
+                terminal_reason_code="source_drift_detected",
+            )
             await self._record_ledger(ctx, OperationState.FAILED, {
                 "reason_code": "source_drift_detected",
                 "file_path": best_candidate.get("file_path"),
@@ -559,7 +593,10 @@ class GovernedOrchestrator:
             {"files": list(ctx.target_files)}
         )
         if not allowed:
-            ctx = ctx.advance(OperationPhase.CANCELLED)
+            ctx = ctx.advance(
+                OperationPhase.CANCELLED,
+                terminal_reason_code=f"gate_blocked:{reason}",
+            )
             await self._record_ledger(
                 ctx,
                 OperationState.BLOCKED,
@@ -581,7 +618,10 @@ class GovernedOrchestrator:
         if risk_tier is RiskTier.APPROVAL_REQUIRED:
             if self._approval_provider is None:
                 # No approval provider available -> CANCELLED
-                ctx = ctx.advance(OperationPhase.CANCELLED)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="approval_required_but_no_provider",
+                )
                 await self._record_ledger(
                     ctx,
                     OperationState.FAILED,
@@ -614,7 +654,10 @@ class GovernedOrchestrator:
             )
 
             if decision.status is ApprovalStatus.EXPIRED:
-                ctx = ctx.advance(OperationPhase.EXPIRED)
+                ctx = ctx.advance(
+                    OperationPhase.EXPIRED,
+                    terminal_reason_code="approval_expired",
+                )
                 await self._record_ledger(
                     ctx,
                     OperationState.FAILED,
@@ -623,7 +666,10 @@ class GovernedOrchestrator:
                 return ctx
 
             if decision.status is ApprovalStatus.REJECTED:
-                ctx = ctx.advance(OperationPhase.CANCELLED)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="approval_rejected",
+                )
                 await self._record_ledger(
                     ctx,
                     OperationState.FAILED,
@@ -669,7 +715,10 @@ class GovernedOrchestrator:
             logger.error(
                 "Change engine raised for %s: %s", ctx.op_id, exc
             )
-            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code="change_engine_error",
+            )
             await self._record_ledger(
                 ctx,
                 OperationState.FAILED,
@@ -680,7 +729,11 @@ class GovernedOrchestrator:
             return ctx
 
         if not change_result.success:
-            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code="change_engine_failed",
+                rollback_occurred=change_result.rolled_back,
+            )
             await self._record_ledger(
                 ctx,
                 OperationState.FAILED,
@@ -704,7 +757,7 @@ class GovernedOrchestrator:
             {"op_id": ctx.op_id},
         )
         ctx = await self._run_benchmark(ctx, [])
-        ctx = ctx.advance(OperationPhase.COMPLETE)
+        ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
         self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
         await self._publish_outcome(ctx, OperationState.APPLIED)
         await self._persist_performance_record(ctx)
@@ -996,12 +1049,18 @@ class GovernedOrchestrator:
         try:
             l2_result = await self._config.repair_engine.run(ctx, best_validation, deadline)
         except asyncio.CancelledError:
-            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code="l2_cancelled",
+            )
             await self._record_ledger(ctx, OperationState.FAILED, {"reason": "l2_cancelled"})
             raise
         except Exception as exc:
             logger.error("[Orchestrator] L2 engine error: %s", exc, exc_info=True)
-            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code=f"l2_fatal:{type(exc).__name__}",
+            )
             await self._record_ledger(ctx, OperationState.FAILED,
                 {"reason": f"l2_fatal:{type(exc).__name__}"})
             return ("fatal", ctx)
@@ -1017,7 +1076,10 @@ class GovernedOrchestrator:
                 })
                 return ("break", l2_result.candidate, canonical_val)
             else:
-                ctx = ctx.advance(OperationPhase.CANCELLED)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="l2_canonical_validate_failed",
+                )
                 await self._record_ledger(ctx, OperationState.FAILED, {
                     "reason": "l2_canonical_validate_failed",
                     **l2_result.summary,
@@ -1025,7 +1087,10 @@ class GovernedOrchestrator:
                 return ("cancel", ctx)
 
         elif l2_result.terminal == "L2_STOPPED":
-            ctx = ctx.advance(OperationPhase.CANCELLED)
+            ctx = ctx.advance(
+                OperationPhase.CANCELLED,
+                terminal_reason_code="l2_stopped",
+            )
             await self._record_ledger(ctx, OperationState.FAILED, {
                 "reason": "l2_stopped",
                 "stop_reason": l2_result.stop_reason,
@@ -1034,7 +1099,10 @@ class GovernedOrchestrator:
             return ("cancel", ctx)
 
         else:  # L2_CONVERGED with no candidate (shouldn't happen in practice)
-            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code="l2_no_candidate",
+            )
             await self._record_ledger(ctx, OperationState.FAILED, {
                 "reason": "l2_no_candidate",
                 **l2_result.summary,
@@ -1266,7 +1334,10 @@ class GovernedOrchestrator:
         apply_result = await strategy.execute(ctx, patch_map)
 
         if apply_result.terminal_state == SagaTerminalState.SAGA_ABORTED:
-            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code=apply_result.reason_code,
+            )
             await self._record_ledger(
                 ctx,
                 OperationState.FAILED,
@@ -1315,7 +1386,11 @@ class GovernedOrchestrator:
                         ))
                     except Exception:
                         pass
-                ctx = ctx.advance(OperationPhase.POSTMORTEM)
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code=verify_result.reason_code,
+                    rollback_occurred=comp_ok,
+                )
                 await self._record_ledger(
                     ctx,
                     OperationState.FAILED,
@@ -1355,7 +1430,10 @@ class GovernedOrchestrator:
                         "[Orchestrator] controller.pause() failed for partial promote %s",
                         ctx.op_id,
                     )
-                ctx = ctx.advance(OperationPhase.POSTMORTEM)
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="saga_partial_promote",
+                )
                 await self._record_ledger(
                     ctx, OperationState.FAILED,
                     {"reason": "saga_partial_promote", "saga_id": apply_result.saga_id, "promoted_repos": promoted_shas},
@@ -1372,7 +1450,7 @@ class GovernedOrchestrator:
                 {"saga_id": apply_result.saga_id},
             )
             ctx = await self._run_benchmark(ctx, [])
-            ctx = ctx.advance(OperationPhase.COMPLETE)
+            ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
             self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_saga)
             await self._publish_outcome(ctx, OperationState.APPLIED)
             await self._persist_performance_record(ctx)
@@ -1412,7 +1490,10 @@ class GovernedOrchestrator:
                     "[Orchestrator] Safe pause triggered after SAGA_STUCK on %s",
                     ctx.op_id,
                 )
-            ctx = ctx.advance(OperationPhase.POSTMORTEM)
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code="saga_stuck",
+            )
             await self._record_ledger(
                 ctx,
                 OperationState.FAILED,
@@ -1423,9 +1504,14 @@ class GovernedOrchestrator:
             return ctx
 
         # SAGA_ROLLED_BACK: clean rollback — change not applied, system is clean
-        # Do NOT advance to POSTMORTEM; record as a cancelled/failed op and return
+        # Advance to CANCELLED so the returned context is terminal and explicit.
+        ctx = ctx.advance(
+            OperationPhase.CANCELLED,
+            terminal_reason_code=apply_result.reason_code,
+            rollback_occurred=True,
+        )
         await self._record_ledger(
-            ctx,  # still in APPLY phase
+            ctx,
             OperationState.FAILED,
             {"reason": apply_result.reason_code, "saga_id": apply_result.saga_id, "rolled_back": True},
         )

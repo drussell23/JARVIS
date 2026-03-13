@@ -402,10 +402,19 @@ class TestPostmortem:
         result = await orch.run(ctx)
 
         assert result.phase is OperationPhase.POSTMORTEM
+        assert result.terminal_reason_code == "change_engine_error"
+        assert result.rollback_occurred is False
 
     async def test_change_engine_returns_failure_goes_to_postmortem(self) -> None:
         """change_engine.execute returns success=False -> POSTMORTEM."""
         stack = _mock_stack(change_success=False)
+        stack.change_engine.execute = AsyncMock(
+            return_value=MagicMock(
+                success=False,
+                rolled_back=True,
+                op_id="op-test-001",
+            )
+        )
         generator = _mock_generator()
         config = _default_config()
         ctx = _make_context()
@@ -419,6 +428,8 @@ class TestPostmortem:
         result = await orch.run(ctx)
 
         assert result.phase is OperationPhase.POSTMORTEM
+        assert result.terminal_reason_code == "change_engine_failed"
+        assert result.rollback_occurred is True
 
 
 @pytest.mark.asyncio
