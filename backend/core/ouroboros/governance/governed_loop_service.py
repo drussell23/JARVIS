@@ -542,6 +542,11 @@ class GovernedLoopConfig:
 
     # L2 self-repair settings (RepairBudget drives the repair loop)
     repair_budget: Any = field(default_factory=_lazy_repair_budget_from_env)
+    l3_enabled: bool = False
+    max_concurrent_execution_graphs: int = 2
+    execution_graph_state_dir: Path = field(
+        default_factory=lambda: Path.home() / ".jarvis" / "ouroboros" / "execution_graphs"
+    )
 
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
@@ -588,6 +593,16 @@ class GovernedLoopConfig:
             tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
             max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),
             repair_budget=_lazy_repair_budget_from_env(),
+            l3_enabled=os.environ.get("JARVIS_GOVERNED_L3_ENABLED", "false").lower() == "true",
+            max_concurrent_execution_graphs=int(
+                os.environ.get("JARVIS_GOVERNED_L3_MAX_CONCURRENT_GRAPHS", "2")
+            ),
+            execution_graph_state_dir=Path(
+                os.environ.get(
+                    "JARVIS_GOVERNED_L3_STATE_DIR",
+                    str(Path.home() / ".jarvis" / "ouroboros" / "execution_graphs"),
+                )
+            ),
         )
 
 
@@ -630,6 +645,7 @@ class GovernedLoopService:
         self._orchestrator: Optional[GovernedOrchestrator] = None
         self._generator: Optional[CandidateGenerator] = None
         self._approval_provider: Optional[CLIApprovalProvider] = None
+        self._validation_runner: Optional[Any] = None
         self._health_probe_task: Optional[asyncio.Task] = None
         self._ledger: Any = None  # set in _build_components from stack.ledger
         self._repo_registry: Optional[Any] = None  # set in _build_components; reused by supervisor Zone 6.9
@@ -658,6 +674,7 @@ class GovernedLoopService:
         self._command_consumer_task: Optional[asyncio.Task] = None
         self._feedback_loop_task: Optional[asyncio.Task] = None
         self._safety_net: Optional[ProductionSafetyNet] = None
+        self._subagent_scheduler: Optional[Any] = None
 
         # Compute-class admission gate (set externally after fetching /v1/capability;
         # None = gate disabled — backward-compatible default)
@@ -828,9 +845,11 @@ class GovernedLoopService:
                 self._health_probe_loop(), name="health_probe_loop"
             )
 
-            # C+ L2: FeedbackEngine + CommandBus + EventEmitter
-            self._command_bus = CommandBus(maxsize=1000)
-            self._event_emitter = EventEmitter()
+            # C+ L2/L3: CommandBus + EventEmitter + optional subagent scheduler
+            if self._command_bus is None:
+                self._command_bus = CommandBus(maxsize=1000)
+            if self._event_emitter is None:
+                self._event_emitter = EventEmitter()
             fe_config = FeedbackEngineConfig(
                 event_dir=self._event_dir or Path.home() / ".jarvis" / "reactor_events",
                 state_dir=Path(os.environ.get(
@@ -857,6 +876,9 @@ class GovernedLoopService:
                 config=SafetyNetConfig(),
             )
             self._safety_net.register_event_handlers(self._event_emitter)
+            if self._subagent_scheduler is not None:
+                await self._subagent_scheduler.start()
+                await self._subagent_scheduler.recover_inflight()
 
             # Determine state based on provider availability
             if self._generator is not None:
@@ -900,6 +922,10 @@ class GovernedLoopService:
                 await self._health_probe_task
             except asyncio.CancelledError:
                 pass
+
+        # Stop L3 scheduler before background loops so no unit outlives GLS
+        if self._subagent_scheduler is not None:
+            await self._subagent_scheduler.stop()
 
         # Cancel curriculum and reactor event background tasks
         for task_attr in ("_curriculum_task", "_reactor_event_task", "_oracle_indexer_task",
@@ -1311,6 +1337,11 @@ class GovernedLoopService:
                 if self._generator
                 else "no_generator"
             ),
+            "execution_graph_scheduler": (
+                self._subagent_scheduler.health()
+                if self._subagent_scheduler is not None
+                else {"running": False, "reason": "disabled"}
+            ),
             "orphan_saga_branches": self._detect_orphan_branches(),
             "saga_bus": self._saga_bus.to_dict() if getattr(self, "_saga_bus", None) else {},
         }
@@ -1700,6 +1731,44 @@ class GovernedLoopService:
                 "cpp": CppAdapter(repo_root=self._config.project_root),
             },
         )
+        self._validation_runner = validation_runner
+
+        if self._command_bus is None:
+            self._command_bus = CommandBus(maxsize=1000)
+        if self._event_emitter is None:
+            self._event_emitter = EventEmitter()
+
+        if self._config.l3_enabled and self._generator is not None:
+            from backend.core.ouroboros.governance.autonomy.execution_graph_store import (
+                ExecutionGraphStore,
+            )
+            from backend.core.ouroboros.governance.autonomy.subagent_scheduler import (
+                GenerationSubagentExecutor,
+                SubagentScheduler,
+            )
+            from backend.core.ouroboros.governance.saga.merge_coordinator import (
+                MergeCoordinator,
+            )
+
+            self._subagent_scheduler = SubagentScheduler(
+                store=ExecutionGraphStore(self._config.execution_graph_state_dir),
+                command_bus=self._command_bus,
+                event_emitter=self._event_emitter,
+                executor=GenerationSubagentExecutor(
+                    generator=self._generator,
+                    validation_runner=validation_runner,
+                    repo_roots=repo_roots_map,
+                ),
+                merge_coordinator=MergeCoordinator(),
+                max_concurrent_graphs=self._config.max_concurrent_execution_graphs,
+            )
+            logger.info(
+                "[GovernedLoop] L3 SubagentScheduler wired: state_dir=%s max_graphs=%d",
+                self._config.execution_graph_state_dir,
+                self._config.max_concurrent_execution_graphs,
+            )
+        else:
+            self._subagent_scheduler = None
 
         # Create SagaMessageBus for passive saga observability
         try:
@@ -1719,6 +1788,7 @@ class GovernedLoopService:
             approval_timeout_s=self._config.approval_timeout_s,
             message_bus=self._saga_bus,
             repair_engine=_repair_engine,
+            execution_graph_scheduler=self._subagent_scheduler,
         )
         self._orchestrator = GovernedOrchestrator(
             stack=self._stack,
@@ -2192,5 +2262,37 @@ class GovernedLoopService:
         elif ct == AutonomyCommandType.SIGNAL_HUMAN_PRESENCE:
             logger.info("[GovernedLoop] L3 human presence: active=%s type=%s",
                         cmd.payload.get("is_active"), cmd.payload.get("activity_type"))
+        elif ct == AutonomyCommandType.SUBMIT_EXECUTION_GRAPH:
+            if self._subagent_scheduler is None:
+                logger.warning("[GovernedLoop] L3 graph submit ignored: scheduler unavailable")
+                return
+            graph = cmd.payload.get("execution_graph")
+            if graph is None:
+                logger.warning("[GovernedLoop] L3 graph submit ignored: missing execution_graph")
+                return
+            accepted = await self._subagent_scheduler.submit(graph)
+            logger.info(
+                "[GovernedLoop] L3 graph submit: graph_id=%s accepted=%s",
+                getattr(graph, "graph_id", "?"),
+                accepted,
+            )
+        elif ct == AutonomyCommandType.REPORT_WORK_UNIT_RESULT:
+            logger.info(
+                "[GovernedLoop] L3 work unit result: graph=%s unit=%s repo=%s status=%s",
+                cmd.payload.get("graph_id"),
+                cmd.payload.get("unit_id"),
+                cmd.payload.get("repo"),
+                cmd.payload.get("status"),
+            )
+        elif ct == AutonomyCommandType.ABORT_EXECUTION_GRAPH:
+            if self._subagent_scheduler is None:
+                logger.warning("[GovernedLoop] L3 graph abort ignored: scheduler unavailable")
+                return
+            graph_id = str(cmd.payload.get("graph_id", ""))
+            if not graph_id:
+                logger.warning("[GovernedLoop] L3 graph abort ignored: missing graph_id")
+                return
+            aborted = await self._subagent_scheduler.abort(graph_id)
+            logger.warning("[GovernedLoop] L3 graph abort: graph_id=%s aborted=%s", graph_id, aborted)
         else:
             logger.debug("[GovernedLoop] Unhandled command: %s", ct)

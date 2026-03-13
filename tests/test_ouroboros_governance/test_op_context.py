@@ -867,3 +867,42 @@ class TestFrozenAutonomyTier:
         ctx = self._make_ctx().with_frozen_autonomy_tier("observe")
         ctx2 = ctx.advance(OperationPhase.ROUTE)
         assert ctx2.frozen_autonomy_tier == "observe"
+
+
+class TestExecutionGraphMetadata:
+    def _make_ctx(self):
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        return OperationContext.create(
+            target_files=("backend/a.py", "prime/router.py"),
+            description="cross-repo graph",
+            primary_repo="jarvis",
+            repo_scope=("jarvis", "prime"),
+        )
+
+    def test_with_execution_graph_metadata_sets_fields(self):
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_execution_graph_metadata(
+            execution_graph_id="graph-001",
+            execution_plan_digest="abc123",
+            subagent_count=2,
+            parallelism_budget=2,
+            causal_trace_id="trace-001",
+        )
+        assert ctx2.execution_graph_id == "graph-001"
+        assert ctx2.execution_plan_digest == "abc123"
+        assert ctx2.subagent_count == 2
+        assert ctx2.parallelism_budget == 2
+        assert ctx2.causal_trace_id == "trace-001"
+
+    def test_with_execution_graph_metadata_updates_hash_chain(self):
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_execution_graph_metadata(
+            execution_graph_id="graph-001",
+            execution_plan_digest="abc123",
+            subagent_count=2,
+            parallelism_budget=2,
+            causal_trace_id="trace-001",
+        )
+        assert ctx2.context_hash != ctx.context_hash
+        assert ctx2.previous_hash == ctx.context_hash

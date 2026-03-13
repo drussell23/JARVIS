@@ -485,6 +485,11 @@ class OperationContext:
     expanded_context_files: Tuple[str, ...] = ()
     benchmark_result: Optional["BenchmarkResult"] = None
     pre_apply_snapshots: Dict[str, str] = field(default_factory=dict)
+    execution_graph_id: str = ""
+    execution_plan_digest: str = ""
+    subagent_count: int = 0
+    parallelism_budget: int = 0
+    causal_trace_id: str = ""
 
     # ---- Telemetry (stamped at intake and COMPLETE) ----
     telemetry: Optional[TelemetryContext] = None
@@ -581,8 +586,14 @@ class OperationContext:
             "expanded_context_files": (),
             "benchmark_result": None,
             "pre_apply_snapshots": {},
+            "execution_graph_id": "",
+            "execution_plan_digest": "",
+            "subagent_count": 0,
+            "parallelism_budget": 0,
+            "causal_trace_id": "",
             "telemetry": None,
             "previous_op_hash_by_scope": previous_op_hash_by_scope,
+            "frozen_autonomy_tier": "governed",
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -613,6 +624,7 @@ class OperationContext:
             saga_state=saga_state,
             schema_version=schema_version,
             previous_op_hash_by_scope=previous_op_hash_by_scope,
+            frozen_autonomy_tier="governed",
         )
 
     # ------------------------------------------------------------------
@@ -743,6 +755,30 @@ class OperationContext:
         intermediate = dataclasses.replace(
             self,
             pre_apply_snapshots=dict(snapshots),  # shallow copy for immutability
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_execution_graph_metadata(
+        self,
+        *,
+        execution_graph_id: str,
+        execution_plan_digest: str,
+        subagent_count: int,
+        parallelism_budget: int,
+        causal_trace_id: str,
+    ) -> "OperationContext":
+        """Stamp execution-graph metadata onto the context (no phase change)."""
+        intermediate = dataclasses.replace(
+            self,
+            execution_graph_id=execution_graph_id,
+            execution_plan_digest=execution_plan_digest,
+            subagent_count=subagent_count,
+            parallelism_budget=parallelism_budget,
+            causal_trace_id=causal_trace_id,
             previous_hash=self.context_hash,
             context_hash="",
         )

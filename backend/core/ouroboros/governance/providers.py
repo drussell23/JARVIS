@@ -50,6 +50,8 @@ _CODEGEN_SYSTEM_PROMPT = (
     "For single-repo requests respond with schema_version 2b.1. "
     "For cross-repo requests (where the prompt specifies schema_version 2c.1) "
     "respond with schema_version 2c.1 and a patches dict keyed by repo name. "
+    "For L3 execution-graph requests (where the prompt specifies schema_version 2d.1) "
+    "respond with schema_version 2d.1 and a top-level execution_graph object. "
     "You MUST respond with valid JSON only. "
     "No markdown preamble, no explanations outside the JSON. Only the JSON object. "
     # Diff-anchoring mandate — critical for small models that default to trained memory
@@ -76,10 +78,25 @@ _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
 _MAX_TEST_FILES = 2                # hard cap on discovered test files
 _SCHEMA_VERSION = "2b.1"
 _SCHEMA_VERSION_MULTI = "2c.1"
+_SCHEMA_VERSION_EXECUTION_GRAPH = "2d.1"
 _SCHEMA_VERSION_DIFF = "2b.1-diff"   # Task 4: unified-diff output for single-file tasks
 _SCHEMA_TOP_LEVEL_KEYS = frozenset({"schema_version", "candidates", "provider_metadata"})
 _CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "full_content", "rationale"})
 _DIFF_CANDIDATE_KEYS = frozenset({"candidate_id", "file_path", "unified_diff", "rationale"})
+
+
+def _resolve_effective_repo_root(
+    ctx: "OperationContext",
+    repo_root: Optional[Path],
+    repo_roots: Optional[Dict[str, Path]],
+) -> Path:
+    """Resolve the filesystem root for the current operation context."""
+    base_root = repo_root or Path.cwd()
+    if repo_roots:
+        primary_repo = getattr(ctx, "primary_repo", "")
+        if primary_repo and primary_repo in repo_roots:
+            return Path(repo_roots[primary_repo])
+    return Path(base_root)
 
 # ── Tool-use interface ────────────────────────────────────────────────
 _TOOL_SCHEMA_VERSION = "2b.2-tool"
@@ -508,13 +525,14 @@ def _build_codegen_prompt(
 
     if repo_root is None:
         repo_root = Path.cwd()
+    effective_single_repo_root = _resolve_effective_repo_root(ctx, repo_root, repo_roots)
 
     # ── 1. Build source snapshot for each target file ──────────────────
     file_sections: List[str] = []
     for raw_path in ctx.target_files:
         # Determine which repo root governs this file and resolve label
         repo_label: Optional[str] = None
-        effective_root = repo_root
+        effective_root = effective_single_repo_root
         if ctx.cross_repo and repo_roots:
             abs_raw = Path(raw_path)
             for rname, rroot in repo_roots.items():
@@ -567,10 +585,10 @@ def _build_codegen_prompt(
     # ── 2. Discover surrounding context (import sources + tests) ────────
     context_parts: List[str] = []
     if ctx.target_files:
-        primary = (repo_root / ctx.target_files[0]).resolve()
+        primary = (effective_single_repo_root / ctx.target_files[0]).resolve()
         try:
-            primary = _safe_context_path(repo_root, primary)
-            import_files, test_files = _find_context_files(primary, repo_root)
+            primary = _safe_context_path(effective_single_repo_root, primary)
+            import_files, test_files = _find_context_files(primary, effective_single_repo_root)
         except BlockedPathError:
             import_files, test_files = [], []
 
@@ -579,7 +597,7 @@ def _build_codegen_prompt(
             try:
                 text = ifile.read_text(encoding="utf-8", errors="replace")
                 snippet = "\n".join(text.splitlines()[:30])[:import_budget]
-                rel = ifile.relative_to(repo_root)
+                rel = ifile.relative_to(effective_single_repo_root)
                 context_parts.append(f"### Import source: {rel}\n```\n{snippet}\n```")
                 import_budget -= len(snippet)
                 if import_budget <= 0:
@@ -592,7 +610,7 @@ def _build_codegen_prompt(
             try:
                 text = tfile.read_text(encoding="utf-8", errors="replace")
                 snippet = "\n".join(text.splitlines()[:50])[:test_budget]
-                rel = tfile.relative_to(repo_root)
+                rel = tfile.relative_to(effective_single_repo_root)
                 context_parts.append(f"### Test context: {rel}\n```\n{snippet}\n```")
                 test_budget -= len(snippet)
                 if test_budget <= 0:
@@ -608,9 +626,13 @@ def _build_codegen_prompt(
     # ── 2b. Expanded context files (pre-generation context expansion result) ──
     expanded_context_parts: List[str] = []
     for raw_exp in getattr(ctx, "expanded_context_files", ()):
-        abs_exp = Path(raw_exp) if Path(raw_exp).is_absolute() else (repo_root / raw_exp).resolve()
+        abs_exp = (
+            Path(raw_exp)
+            if Path(raw_exp).is_absolute()
+            else (effective_single_repo_root / raw_exp).resolve()
+        )
         try:
-            abs_exp = _safe_context_path(repo_root, abs_exp)
+            abs_exp = _safe_context_path(effective_single_repo_root, abs_exp)
         except BlockedPathError:
             continue
         exp_content = _read_with_truncation(abs_exp, max_chars=_MAX_TARGET_FILE_CHARS)
@@ -634,7 +656,53 @@ def _build_codegen_prompt(
         and not getattr(ctx, "cross_repo", False)
         and not force_full_content
     )
-    if getattr(ctx, "cross_repo", False) and repo_roots:
+    if (
+        getattr(ctx, "cross_repo", False)
+        and repo_roots
+        and getattr(ctx, "parallelism_budget", 0) > 1
+    ):
+        units_stub = "\n".join(
+            """      {
+        "unit_id": "jarvis-api",
+        "repo": "jarvis",
+        "goal": "Implement one isolated work unit",
+        "target_files": ["backend/..."],
+        "owned_paths": ["backend/..."],
+        "dependency_ids": [],
+        "barrier_id": "api_contract",
+        "acceptance_tests": ["pytest tests/... -q"]
+      }""".splitlines()
+        )
+        schema_instruction = f"""## Output Schema
+
+Return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION_EXECUTION_GRAPH}"):
+
+```json
+{{
+  "schema_version": "{_SCHEMA_VERSION_EXECUTION_GRAPH}",
+  "execution_graph": {{
+    "graph_id": "<stable graph id>",
+    "planner_id": "<planner identifier>",
+    "concurrency_limit": {max(1, getattr(ctx, "parallelism_budget", 1))},
+    "units": [
+{units_stub}
+    ]
+  }},
+  "provider_metadata": {{
+    "model_id": "<your model identifier>",
+    "reasoning_summary": "<max 200 chars>"
+  }}
+}}
+```
+
+Rules:
+- Each unit must target exactly one repo from `{list(ctx.repo_scope)}`.
+- Use `dependency_ids` to encode ordering constraints. Never rely on implied ordering.
+- `owned_paths` must cover every path the unit is allowed to mutate.
+- Only emit parallel units when their `owned_paths` are disjoint.
+- Use `barrier_id` for interface boundaries that must converge together.
+- No extra keys at any level. Return ONLY the JSON object."""
+    elif getattr(ctx, "cross_repo", False) and repo_roots:
         repos_listed = "\n".join(
             f'        "{r}": [{{"file_path": "...", "full_content": "...", "op": "modify"}}]'
             for r in ctx.repo_scope
@@ -679,7 +747,11 @@ Rules:
         _primary_sha = ""
         if ctx.target_files:
             _ppath = Path(ctx.target_files[0])
-            _pabs = _ppath if _ppath.is_absolute() else ((repo_root or Path.cwd()) / _ppath)
+            _pabs = (
+                _ppath
+                if _ppath.is_absolute()
+                else (effective_single_repo_root / _ppath)
+            )
             try:
                 _primary_sha = _file_source_hash(_pabs.read_text(encoding="utf-8", errors="replace"))
             except OSError:
@@ -1098,6 +1170,79 @@ def _parse_multi_repo_response(
     )
 
 
+def _parse_execution_graph_response(
+    data: dict,
+    provider_name: str,
+    duration_s: float,
+    ctx: "OperationContext",
+) -> "GenerationResult":
+    """Parse schema 2d.1 execution-graph response into a GenerationResult."""
+    from backend.core.ouroboros.governance.autonomy.subagent_types import (
+        ExecutionGraph,
+        WorkUnitSpec,
+    )
+
+    pfx = provider_name
+    graph_raw = data.get("execution_graph")
+    if not isinstance(graph_raw, dict):
+        raise RuntimeError(f"{pfx}_schema_invalid:missing_execution_graph:2d.1")
+
+    units_raw = graph_raw.get("units", [])
+    if not isinstance(units_raw, list) or not units_raw:
+        raise RuntimeError(f"{pfx}_schema_invalid:missing_units:2d.1")
+
+    try:
+        units = tuple(
+            WorkUnitSpec(
+                unit_id=str(unit["unit_id"]),
+                repo=str(unit["repo"]),
+                goal=str(unit["goal"]),
+                target_files=tuple(unit.get("target_files", ())),
+                dependency_ids=tuple(unit.get("dependency_ids", ())),
+                owned_paths=tuple(unit.get("owned_paths", ())),
+                barrier_id=str(unit.get("barrier_id", "")),
+                max_attempts=int(unit.get("max_attempts", 1)),
+                timeout_s=float(unit.get("timeout_s", 180.0)),
+                acceptance_tests=tuple(unit.get("acceptance_tests", ())),
+            )
+            for unit in units_raw
+        )
+        graph = ExecutionGraph(
+            graph_id=str(graph_raw["graph_id"]),
+            op_id=getattr(ctx, "op_id", str(graph_raw.get("op_id", ""))),
+            planner_id=str(graph_raw["planner_id"]),
+            schema_version=_SCHEMA_VERSION_EXECUTION_GRAPH,
+            units=units,
+            concurrency_limit=int(graph_raw.get("concurrency_limit", 1)),
+            plan_digest=str(graph_raw.get("plan_digest", "")),
+            causal_trace_id=str(graph_raw.get("causal_trace_id", "")),
+        )
+    except KeyError as exc:
+        raise RuntimeError(f"{pfx}_schema_invalid:missing_graph_field:{exc.args[0]}:2d.1") from exc
+    except ValueError as exc:
+        raise RuntimeError(f"{pfx}_schema_invalid:{exc}:2d.1") from exc
+
+    model_id = data.get("provider_metadata", {}).get("model_id", provider_name)
+    candidate = {
+        "candidate_id": f"graph:{graph.graph_id}",
+        "execution_graph": graph,
+        "rationale": (
+            data.get("provider_metadata", {}).get("reasoning_summary", "")
+            if isinstance(data.get("provider_metadata"), dict)
+            else ""
+        ),
+        "candidate_hash": graph.plan_digest,
+        "source_hash": "",
+        "source_path": "",
+    }
+    return GenerationResult(
+        candidates=(candidate,),
+        provider_name=provider_name,
+        generation_duration_s=duration_s,
+        model_id=model_id,
+    )
+
+
 def _parse_generation_response(
     raw: str,
     provider_name: str,
@@ -1110,7 +1255,7 @@ def _parse_generation_response(
 ) -> "GenerationResult":
     """Parse and strictly validate a generation response.
 
-    Handles schema_version 2b.1, 2b.1-diff (Task 4), 2c.1, and no_op.
+    Handles schema_version 2b.1, 2b.1-diff (Task 4), 2c.1, 2d.1, and no_op.
 
     Validation sequence (fail-fast):
       0. no_op shortcut: {"no_op": true} → GenerationResult(is_noop=True)
@@ -1166,6 +1311,8 @@ def _parse_generation_response(
         if not repo_roots:
             raise RuntimeError(f"{pfx}_schema_invalid:2c1_requires_repo_roots")
         return _parse_multi_repo_response(data, provider_name, duration_s, repo_roots)
+    if actual_version == _SCHEMA_VERSION_EXECUTION_GRAPH:
+        return _parse_execution_graph_response(data, provider_name, duration_s, ctx)
 
     # Task 4: reconstruct full_content from unified diff before normal validation
     if actual_version == _SCHEMA_VERSION_DIFF:
@@ -1487,7 +1634,11 @@ class PrimeProvider:
             exceeds ``MAX_TOOL_LOOP_CHARS``.
             ``gcp-jprime_schema_invalid:...`` on patch schema validation failure.
         """
-        repo_root = self._repo_root or Path.cwd()
+        repo_root = _resolve_effective_repo_root(
+            context,
+            self._repo_root,
+            self._repo_roots,
+        )
         executor = None  # created lazily on first tool call
 
         # Determine force_full_content from brain's schema_capability in routing telemetry.
@@ -1503,7 +1654,7 @@ class PrimeProvider:
 
         prompt = _build_codegen_prompt(
             context,
-            repo_root=self._repo_root,
+            repo_root=repo_root,
             repo_roots=self._repo_roots,
             tools_enabled=self._tools_enabled,
             force_full_content=_force_full,
@@ -1639,7 +1790,7 @@ class PrimeProvider:
             source_hash,
             source_path,
             repo_roots=self._repo_roots,
-            repo_root=self._repo_root,
+            repo_root=repo_root,
         )
 
         logger.info(
@@ -1801,12 +1952,16 @@ class ClaudeProvider:
             raise RuntimeError("claude_budget_exhausted")
 
         client = self._ensure_client()
-        repo_root = self._repo_root or Path.cwd()
+        repo_root = _resolve_effective_repo_root(
+            context,
+            self._repo_root,
+            self._repo_roots,
+        )
         executor = None  # lazy init on first tool call
 
         prompt_text = _build_codegen_prompt(
             context,
-            repo_root=self._repo_root,
+            repo_root=repo_root,
             repo_roots=self._repo_roots,
             tools_enabled=self._tools_enabled,
             repair_context=repair_context,
@@ -1931,7 +2086,7 @@ class ClaudeProvider:
             source_hash,
             source_path,
             repo_roots=self._repo_roots,
-            repo_root=self._repo_root,
+            repo_root=repo_root,
         )
 
         logger.info(

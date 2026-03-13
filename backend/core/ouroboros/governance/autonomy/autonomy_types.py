@@ -45,6 +45,9 @@ class CommandType(str, enum.Enum):
     REPORT_ROLLBACK_CAUSE = "report_rollback_cause"
     SIGNAL_HUMAN_PRESENCE = "signal_human_presence"
     REQUEST_SAGA_SUBMIT = "request_saga_submit"
+    SUBMIT_EXECUTION_GRAPH = "submit_execution_graph"
+    REPORT_WORK_UNIT_RESULT = "report_work_unit_result"
+    ABORT_EXECUTION_GRAPH = "abort_execution_graph"
     REPORT_CONSENSUS = "report_consensus"
     RECOMMEND_TIER_CHANGE = "recommend_tier_change"
 
@@ -67,6 +70,9 @@ class EventType(str, enum.Enum):
     ROLLBACK_ANALYZED = "rollback_analyzed"
     INCIDENT_DETECTED = "incident_detected"
     SAGA_STATE_CHANGED = "saga_state_changed"
+    EXECUTION_GRAPH_STATE_CHANGED = "execution_graph_state_changed"
+    WORK_UNIT_STATE_CHANGED = "work_unit_state_changed"
+    MERGE_DECISION_RECORDED = "merge_decision_recorded"
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +88,9 @@ FAILURE_PRECEDENCE: Dict[CommandType, int] = {
     CommandType.ADJUST_BRAIN_HINT: 1,
     # 2 = coordination
     CommandType.REQUEST_SAGA_SUBMIT: 2,
+    CommandType.SUBMIT_EXECUTION_GRAPH: 2,
+    CommandType.REPORT_WORK_UNIT_RESULT: 2,
+    CommandType.ABORT_EXECUTION_GRAPH: 2,
     CommandType.REPORT_CONSENSUS: 2,
     CommandType.RECOMMEND_TIER_CHANGE: 2,
     # 3 = learning (lowest priority)

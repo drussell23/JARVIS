@@ -292,6 +292,9 @@ class TestCommandType:
             "REPORT_ROLLBACK_CAUSE",
             "SIGNAL_HUMAN_PRESENCE",
             "REQUEST_SAGA_SUBMIT",
+            "SUBMIT_EXECUTION_GRAPH",
+            "REPORT_WORK_UNIT_RESULT",
+            "ABORT_EXECUTION_GRAPH",
             "REPORT_CONSENSUS",
             "RECOMMEND_TIER_CHANGE",
         }
@@ -323,6 +326,9 @@ class TestEventType:
             "ROLLBACK_ANALYZED",
             "INCIDENT_DETECTED",
             "SAGA_STATE_CHANGED",
+            "EXECUTION_GRAPH_STATE_CHANGED",
+            "WORK_UNIT_STATE_CHANGED",
+            "MERGE_DECISION_RECORDED",
         }
         assert set(EventType.__members__.keys()) == expected
 

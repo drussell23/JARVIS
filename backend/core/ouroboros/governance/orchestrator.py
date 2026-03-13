@@ -132,6 +132,7 @@ class OrchestratorConfig:
     # L2 self-repair engine (disabled by default)
     # Set by GovernedLoopService._build_components() when JARVIS_L2_ENABLED=true.
     repair_engine: Optional[Any] = None
+    execution_graph_scheduler: Optional[Any] = None
 
     def resolve_repo_roots(
         self,
@@ -640,6 +641,11 @@ class GovernedOrchestrator:
 
         # Cross-repo saga path
         if ctx.cross_repo:
+            if "execution_graph" in best_candidate:
+                ctx, best_candidate = await self._materialize_execution_graph_candidate(
+                    ctx,
+                    best_candidate,
+                )
             return await self._execute_saga_apply(ctx, best_candidate)
 
         # Capture pre-apply snapshots for complexity baseline
@@ -928,6 +934,50 @@ class GovernedOrchestrator:
         current_hash = _hl.sha256(current_content.encode()).hexdigest()
         return current_hash if current_hash != source_hash else None
 
+    async def _materialize_execution_graph_candidate(
+        self,
+        ctx: OperationContext,
+        candidate: Dict[str, Any],
+    ) -> Tuple[OperationContext, Dict[str, Any]]:
+        """Execute an L3 execution graph and convert it into saga-ready patches."""
+        graph = candidate.get("execution_graph")
+        if graph is None:
+            return ctx, candidate
+
+        scheduler = self._config.execution_graph_scheduler
+        if scheduler is None:
+            raise RuntimeError("execution_graph_scheduler_unavailable")
+
+        ctx = ctx.with_execution_graph_metadata(
+            execution_graph_id=graph.graph_id,
+            execution_plan_digest=graph.plan_digest,
+            subagent_count=len(graph.units),
+            parallelism_budget=graph.concurrency_limit,
+            causal_trace_id=graph.causal_trace_id,
+        )
+
+        submitted = await scheduler.submit(graph)
+        if not submitted and not scheduler.has_graph(graph.graph_id):
+            raise RuntimeError(f"execution_graph_submit_rejected:{graph.graph_id}")
+
+        if ctx.pipeline_deadline is not None:
+            timeout_s = max(
+                0.1,
+                (ctx.pipeline_deadline - datetime.now(tz=timezone.utc)).total_seconds(),
+            )
+        else:
+            timeout_s = max(sum(unit.timeout_s for unit in graph.units), 1.0)
+
+        state = await scheduler.wait_for_graph(graph.graph_id, timeout_s=timeout_s)
+        if state.phase.value != "completed":
+            raise RuntimeError(
+                f"execution_graph_terminal:{state.phase.value}:{state.last_error or 'unknown'}"
+            )
+
+        updated = dict(candidate)
+        updated["patches"] = scheduler.get_merged_patches(graph.graph_id)
+        return ctx, updated
+
     async def _l2_hook(
         self,
         ctx: "OperationContext",
@@ -1023,6 +1073,17 @@ class GovernedOrchestrator:
         ValidationResult
             Compact, immutable result suitable for embedding in the context.
         """
+        if "execution_graph" in candidate:
+            return ValidationResult(
+                passed=True,
+                best_candidate=candidate,
+                validation_duration_s=0.0,
+                error=None,
+                failure_class=None,
+                short_summary="execution graph accepted for L3 scheduling",
+                adapter_names_run=(),
+            )
+
         content = candidate.get("full_content", "")
         target_file_str = candidate.get(
             "file_path",

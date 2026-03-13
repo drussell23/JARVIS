@@ -110,3 +110,16 @@ class SagaLedgerArtifact:
     kept_forensics_branches: bool       # True if saga branches retained for debug
     skipped_no_diff: bool               # True if repo had no actual changes
     timestamp_ns: int                   # time.monotonic_ns()
+
+
+@dataclass(frozen=True)
+class WorkUnitLedgerArtifact:
+    """Audit artifact emitted for L3 execution-graph work-unit transitions."""
+
+    graph_id: str
+    unit_id: str
+    repo: str
+    state: str
+    barrier_id: str
+    causal_trace_id: str
+    timestamp_ns: int
