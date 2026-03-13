@@ -490,6 +490,10 @@ class OperationContext:
     subagent_count: int = 0
     parallelism_budget: int = 0
     causal_trace_id: str = ""
+    strategic_intent_id: str = ""
+    strategic_memory_fact_ids: Tuple[str, ...] = ()
+    strategic_memory_prompt: str = ""
+    strategic_memory_digest: str = ""
 
     # ---- Telemetry (stamped at intake and COMPLETE) ----
     telemetry: Optional[TelemetryContext] = None
@@ -591,6 +595,10 @@ class OperationContext:
             "subagent_count": 0,
             "parallelism_budget": 0,
             "causal_trace_id": "",
+            "strategic_intent_id": "",
+            "strategic_memory_fact_ids": (),
+            "strategic_memory_prompt": "",
+            "strategic_memory_digest": "",
             "telemetry": None,
             "previous_op_hash_by_scope": previous_op_hash_by_scope,
             "frozen_autonomy_tier": "governed",
@@ -623,6 +631,10 @@ class OperationContext:
             saga_id=saga_id,
             saga_state=saga_state,
             schema_version=schema_version,
+            strategic_intent_id="",
+            strategic_memory_fact_ids=(),
+            strategic_memory_prompt="",
+            strategic_memory_digest="",
             previous_op_hash_by_scope=previous_op_hash_by_scope,
             frozen_autonomy_tier="governed",
         )
@@ -779,6 +791,28 @@ class OperationContext:
             subagent_count=subagent_count,
             parallelism_budget=parallelism_budget,
             causal_trace_id=causal_trace_id,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_strategic_memory_context(
+        self,
+        *,
+        strategic_intent_id: str,
+        strategic_memory_fact_ids: Tuple[str, ...],
+        strategic_memory_prompt: str,
+        strategic_memory_digest: str,
+    ) -> "OperationContext":
+        """Stamp L4 strategic-memory prompt metadata onto the context."""
+        intermediate = dataclasses.replace(
+            self,
+            strategic_intent_id=strategic_intent_id,
+            strategic_memory_fact_ids=tuple(strategic_memory_fact_ids),
+            strategic_memory_prompt=strategic_memory_prompt,
+            strategic_memory_digest=strategic_memory_digest,
             previous_hash=self.context_hash,
             context_hash="",
         )

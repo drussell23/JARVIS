@@ -1243,3 +1243,64 @@ def test_health_exposes_execution_graph_scheduler_state() -> None:
 
     assert health["execution_graph_scheduler"]["running"] is True
     assert health["execution_graph_scheduler"]["active_graphs"] == ["graph-health-001"]
+
+
+@pytest.mark.asyncio
+async def test_submit_stamps_strategic_memory_context_before_orchestrator() -> None:
+    from types import SimpleNamespace
+
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+        GovernedLoopService,
+        ServiceState,
+    )
+
+    stack = _mock_stack()
+    service = GovernedLoopService(
+        stack=stack,
+        prime_client=None,
+        config=GovernedLoopConfig(project_root=Path("/tmp/test"), l4_enabled=True),
+    )
+    service._state = ServiceState.ACTIVE
+    service._ledger = None
+    service._advanced_autonomy = MagicMock()
+    service._advanced_autonomy.build_strategic_memory_context.return_value = SimpleNamespace(
+        fact_ids=("fact-001",),
+        prompt_block="## Strategic Memory (advisory context only)\n- preserve architecture",
+        context_digest="digest-001",
+    )
+    service._advanced_autonomy.remember_user_intent.return_value = SimpleNamespace(
+        intent_id="intent-001"
+    )
+
+    brain = SimpleNamespace(
+        brain_id="qwen_coder_32b",
+        model_name="qwen-coder-32b",
+        routing_reason="memory_guided_governance",
+        task_complexity="light",
+        estimated_prompt_tokens=512,
+        provider_tier="gcp_prime",
+        schema_capability="full_content_only",
+        narration=lambda: "routing narration",
+    )
+    service._brain_selector = MagicMock()
+    service._brain_selector.select = AsyncMock(return_value=brain)
+    service._brain_selector.daily_spend = 0.0
+
+    def _terminal_ctx(ctx):
+        return ctx.advance(OperationPhase.CANCELLED)
+
+    service._orchestrator = MagicMock()
+    service._orchestrator.run = AsyncMock(side_effect=_terminal_ctx)
+
+    ctx = _make_context(
+        description="Preserve architecture across sessions",
+        target_files=("backend/core/utils.py",),
+    )
+    result = await service.submit(ctx, trigger_source="cli")
+
+    assert result.terminal_phase is OperationPhase.CANCELLED
+    submitted_ctx = service._orchestrator.run.await_args.args[0]
+    assert submitted_ctx.strategic_intent_id == "intent-001"
+    assert submitted_ctx.strategic_memory_fact_ids == ("fact-001",)
+    assert "## Strategic Memory" in submitted_ctx.strategic_memory_prompt

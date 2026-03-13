@@ -500,8 +500,9 @@ def _build_codegen_prompt(
     """Build an enriched codegen prompt with file contents, context, and schema.
 
     Reads each target file from disk, hashes it, applies truncation, discovers
-    surrounding import/test context (capped), and injects the appropriate output
-    schema specification: schema_version 2b.1 for single-repo operations and
+    surrounding import/test context (capped), injects any bounded L4
+    strategic-memory block, and emits the appropriate output schema
+    specification: schema_version 2b.1 for single-repo operations and
     schema_version 2c.1 for cross-repo operations.
 
     Parameters
@@ -836,6 +837,11 @@ Rules:
     sys_ctx_block = _build_system_context_block(ctx)
     if sys_ctx_block is not None:
         parts.append(sys_ctx_block)
+    strategic_memory_prompt = getattr(ctx, "strategic_memory_prompt", "")
+    if not isinstance(strategic_memory_prompt, str):
+        strategic_memory_prompt = ""
+    if strategic_memory_prompt.strip():
+        parts.append(strategic_memory_prompt)
     parts += [
         f"## Source Snapshot\n\n{file_block}",
         context_block,

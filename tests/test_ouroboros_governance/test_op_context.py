@@ -906,3 +906,37 @@ class TestExecutionGraphMetadata:
         )
         assert ctx2.context_hash != ctx.context_hash
         assert ctx2.previous_hash == ctx.context_hash
+
+
+class TestStrategicMemoryMetadata:
+    def _make_ctx(self):
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        return OperationContext.create(
+            target_files=("backend/core/utils.py",),
+            description="memory-aware prompt",
+        )
+
+    def test_with_strategic_memory_context_sets_fields(self):
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_strategic_memory_context(
+            strategic_intent_id="intent-001",
+            strategic_memory_fact_ids=("fact-001", "fact-002"),
+            strategic_memory_prompt="## Strategic Memory\n- keep architecture stable",
+            strategic_memory_digest="digest-001",
+        )
+        assert ctx2.strategic_intent_id == "intent-001"
+        assert ctx2.strategic_memory_fact_ids == ("fact-001", "fact-002")
+        assert "## Strategic Memory" in ctx2.strategic_memory_prompt
+        assert ctx2.strategic_memory_digest == "digest-001"
+
+    def test_with_strategic_memory_context_updates_hash_chain(self):
+        ctx = self._make_ctx()
+        ctx2 = ctx.with_strategic_memory_context(
+            strategic_intent_id="intent-001",
+            strategic_memory_fact_ids=("fact-001",),
+            strategic_memory_prompt="## Strategic Memory\n- keep architecture stable",
+            strategic_memory_digest="digest-001",
+        )
+        assert ctx2.context_hash != ctx.context_hash
+        assert ctx2.previous_hash == ctx.context_hash

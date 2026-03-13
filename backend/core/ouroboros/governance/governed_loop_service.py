@@ -547,6 +547,10 @@ class GovernedLoopConfig:
     execution_graph_state_dir: Path = field(
         default_factory=lambda: Path.home() / ".jarvis" / "ouroboros" / "execution_graphs"
     )
+    l4_enabled: bool = False
+    l4_state_dir: Path = field(
+        default_factory=lambda: Path.home() / ".jarvis" / "ouroboros" / "advanced_coordination"
+    )
 
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
@@ -601,6 +605,13 @@ class GovernedLoopConfig:
                 os.environ.get(
                     "JARVIS_GOVERNED_L3_STATE_DIR",
                     str(Path.home() / ".jarvis" / "ouroboros" / "execution_graphs"),
+                )
+            ),
+            l4_enabled=os.environ.get("JARVIS_GOVERNED_L4_ENABLED", "false").lower() == "true",
+            l4_state_dir=Path(
+                os.environ.get(
+                    "JARVIS_GOVERNED_L4_STATE_DIR",
+                    str(Path.home() / ".jarvis" / "ouroboros" / "advanced_coordination"),
                 )
             ),
         )
@@ -675,6 +686,7 @@ class GovernedLoopService:
         self._feedback_loop_task: Optional[asyncio.Task] = None
         self._safety_net: Optional[ProductionSafetyNet] = None
         self._subagent_scheduler: Optional[Any] = None
+        self._advanced_autonomy: Optional[Any] = None
 
         # Compute-class admission gate (set externally after fetching /v1/capability;
         # None = gate disabled — backward-compatible default)
@@ -1149,6 +1161,31 @@ class GovernedLoopService:
                     _frozen_tier = _tier_cfg.current_tier.value.lower()
             ctx = ctx.with_frozen_autonomy_tier(_frozen_tier)
 
+            if self._advanced_autonomy is not None:
+                try:
+                    memory_ctx = self._advanced_autonomy.build_strategic_memory_context(
+                        goal=ctx.description,
+                        target_files=ctx.target_files,
+                    )
+                    active_intent = self._advanced_autonomy.remember_user_intent(
+                        op_id=ctx.op_id,
+                        description=ctx.description,
+                        target_files=ctx.target_files,
+                        repo_scope=ctx.repo_scope,
+                    )
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=active_intent.intent_id,
+                        strategic_memory_fact_ids=memory_ctx.fact_ids,
+                        strategic_memory_prompt=memory_ctx.prompt_block,
+                        strategic_memory_digest=memory_ctx.context_digest,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[GovernedLoop] L4 strategic memory unavailable for op=%s: %s",
+                        ctx.op_id,
+                        exc,
+                    )
+
             # Connectivity preflight (spends from deadline budget)
             if self._generator is not None and self._ledger is not None:
                 early_exit = await self._preflight_check(ctx)
@@ -1341,6 +1378,11 @@ class GovernedLoopService:
                 self._subagent_scheduler.health()
                 if self._subagent_scheduler is not None
                 else {"running": False, "reason": "disabled"}
+            ),
+            "strategic_memory": (
+                self._advanced_autonomy.memory_stats()
+                if self._advanced_autonomy is not None
+                else {"enabled": False, "reason": "disabled"}
             ),
             "orphan_saga_branches": self._detect_orphan_branches(),
             "saga_bus": self._saga_bus.to_dict() if getattr(self, "_saga_bus", None) else {},
@@ -1737,6 +1779,24 @@ class GovernedLoopService:
             self._command_bus = CommandBus(maxsize=1000)
         if self._event_emitter is None:
             self._event_emitter = EventEmitter()
+        if self._config.l4_enabled:
+            from backend.core.ouroboros.governance.autonomy.advanced_coordination import (
+                AdvancedAutonomyService,
+                AdvancedCoordinationConfig,
+            )
+
+            self._advanced_autonomy = AdvancedAutonomyService(
+                command_bus=self._command_bus,
+                config=AdvancedCoordinationConfig(
+                    state_dir=self._config.l4_state_dir,
+                ),
+            )
+            logger.info(
+                "[GovernedLoop] L4 AdvancedAutonomyService wired: state_dir=%s",
+                self._config.l4_state_dir,
+            )
+        else:
+            self._advanced_autonomy = None
 
         if self._config.l3_enabled and self._generator is not None:
             from backend.core.ouroboros.governance.autonomy.execution_graph_store import (

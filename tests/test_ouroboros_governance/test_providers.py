@@ -690,3 +690,58 @@ class TestSystemContextBlock:
         sys_ctx_pos = prompt.index("## System Context")
         snapshot_pos = prompt.index("## Source Snapshot")
         assert task_pos < sys_ctx_pos < snapshot_pos
+
+
+class TestStrategicMemoryPromptBlock:
+    def test_absent_when_not_stamped(self, tmp_path):
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "## Strategic Memory" not in prompt
+
+    def test_present_when_stamped(self, tmp_path):
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        ctx = ctx.with_strategic_memory_context(
+            strategic_intent_id="intent-001",
+            strategic_memory_fact_ids=("fact-001",),
+            strategic_memory_prompt=(
+                "## Strategic Memory (advisory context only)\n"
+                "- [confidence=0.90 | provenance=user:op-1] keep architecture consistent"
+            ),
+            strategic_memory_digest="digest-001",
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        assert "## Strategic Memory" in prompt
+        assert "keep architecture consistent" in prompt
+
+    def test_position_after_system_context_before_snapshot(self, tmp_path):
+        from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+        from backend.core.ouroboros.governance.op_context import OperationContext
+
+        ctx = OperationContext.create(
+            target_files=(),
+            description="test op",
+        )
+        ctx = ctx.with_telemetry(_make_telemetry_context_for_prompt())
+        ctx = ctx.with_strategic_memory_context(
+            strategic_intent_id="intent-001",
+            strategic_memory_fact_ids=("fact-001",),
+            strategic_memory_prompt="## Strategic Memory (advisory context only)\n- preserve architecture",
+            strategic_memory_digest="digest-001",
+        )
+        prompt = _build_codegen_prompt(ctx, repo_root=tmp_path)
+        sys_ctx_pos = prompt.index("## System Context")
+        strategic_pos = prompt.index("## Strategic Memory")
+        snapshot_pos = prompt.index("## Source Snapshot")
+        assert sys_ctx_pos < strategic_pos < snapshot_pos
