@@ -190,6 +190,42 @@ class TestCommandEnvelope:
         after = time.monotonic_ns()
         assert before <= env.issued_at_ns <= after
 
+    def test_typed_execution_graph_payload_is_hashable(self):
+        from backend.core.ouroboros.governance.autonomy.autonomy_types import (
+            CommandEnvelope,
+            CommandType,
+        )
+        from backend.core.ouroboros.governance.autonomy.subagent_types import (
+            ExecutionGraph,
+            WorkUnitSpec,
+        )
+
+        graph = ExecutionGraph(
+            graph_id="graph-autonomy-001",
+            op_id="op-autonomy-001",
+            planner_id="planner-v1",
+            schema_version="2d.1",
+            concurrency_limit=1,
+            units=(
+                WorkUnitSpec(
+                    unit_id="u1",
+                    repo="jarvis",
+                    goal="update file",
+                    target_files=("backend/core/utils.py",),
+                    owned_paths=("backend/core/utils.py",),
+                ),
+            ),
+        )
+        env = CommandEnvelope(
+            source_layer="L3",
+            target_layer="L1",
+            command_type=CommandType.SUBMIT_EXECUTION_GRAPH,
+            payload={"execution_graph": graph},
+            ttl_s=30.0,
+        )
+
+        assert env.idempotency_key
+
 
 # ---------------------------------------------------------------------------
 # EventEnvelope

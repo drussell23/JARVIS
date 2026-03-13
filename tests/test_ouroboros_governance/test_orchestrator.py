@@ -1025,3 +1025,149 @@ class TestOracleUpdateLock:
         assert call_order == ["start", "end", "start", "end"], (
             f"Oracle updates were not serialized. Order: {call_order}"
         )
+
+
+@pytest.mark.asyncio
+async def test_cross_repo_execution_graph_materializes_into_saga_patches() -> None:
+    from backend.core.ouroboros.governance.autonomy.subagent_types import (
+        ExecutionGraph,
+        GraphExecutionPhase,
+        GraphExecutionState,
+        WorkUnitResult,
+        WorkUnitSpec,
+        WorkUnitState,
+    )
+    from backend.core.ouroboros.governance.saga.saga_types import (
+        FileOp,
+        PatchedFile,
+        RepoPatch,
+    )
+
+    class _FakeScheduler:
+        def __init__(self, graph, patches, state):
+            self._graph = graph
+            self._patches = patches
+            self._state = state
+            self.submit = AsyncMock(return_value=True)
+            self.wait_for_graph = AsyncMock(return_value=state)
+
+        def has_graph(self, graph_id):
+            return graph_id == self._graph.graph_id
+
+        def get_merged_patches(self, graph_id):
+            assert graph_id == self._graph.graph_id
+            return dict(self._patches)
+
+    graph = ExecutionGraph(
+        graph_id="graph-l3-001",
+        op_id="op-l3-001",
+        planner_id="planner-v1",
+        schema_version="2d.1",
+        concurrency_limit=2,
+        units=(
+            WorkUnitSpec(
+                unit_id="u1",
+                repo="jarvis",
+                goal="update jarvis file",
+                target_files=("backend/core/utils.py",),
+                owned_paths=("backend/core/utils.py",),
+            ),
+            WorkUnitSpec(
+                unit_id="u2",
+                repo="prime",
+                goal="update prime file",
+                target_files=("prime/router.py",),
+                owned_paths=("prime/router.py",),
+            ),
+        ),
+    )
+    patches = {
+        "jarvis": RepoPatch(
+            repo="jarvis",
+            files=(PatchedFile(path="backend/core/utils.py", op=FileOp.CREATE, preimage=None),),
+            new_content=(("backend/core/utils.py", b"def jarvis_patch():\n    return True\n"),),
+        ),
+        "prime": RepoPatch(
+            repo="prime",
+            files=(PatchedFile(path="prime/router.py", op=FileOp.CREATE, preimage=None),),
+            new_content=(("prime/router.py", b"def route():\n    return 'prime'\n"),),
+        ),
+    }
+    state = GraphExecutionState(
+        graph=graph,
+        phase=GraphExecutionPhase.COMPLETED,
+        completed_units=("u1", "u2"),
+        results={
+            "u1": WorkUnitResult(
+                unit_id="u1",
+                repo="jarvis",
+                status=WorkUnitState.COMPLETED,
+                patch=patches["jarvis"],
+                attempt_count=1,
+                started_at_ns=1,
+                finished_at_ns=2,
+                causal_parent_id=graph.causal_trace_id,
+            ),
+            "u2": WorkUnitResult(
+                unit_id="u2",
+                repo="prime",
+                status=WorkUnitState.COMPLETED,
+                patch=patches["prime"],
+                attempt_count=1,
+                started_at_ns=1,
+                finished_at_ns=2,
+                causal_parent_id=graph.causal_trace_id,
+            ),
+        },
+    )
+    scheduler = _FakeScheduler(graph, patches, state)
+
+    generator = _mock_generator(candidates=(
+        {
+            "candidate_id": "l3-graph",
+            "execution_graph": graph,
+            "rationale": "parallel plan",
+        },
+    ))
+    config = OrchestratorConfig(
+        project_root=Path("/tmp/test-project"),
+        generation_timeout_s=5.0,
+        validation_timeout_s=5.0,
+        approval_timeout_s=5.0,
+        max_generate_retries=1,
+        max_validate_retries=2,
+        execution_graph_scheduler=scheduler,
+    )
+    stack = _mock_stack()
+    orch = GovernedOrchestrator(
+        stack=stack,
+        generator=generator,
+        approval_provider=None,
+        config=config,
+    )
+
+    captured: Dict[str, Dict] = {}
+
+    async def _fake_saga_apply(ctx, candidate):
+        captured["candidate"] = candidate
+        captured["ctx"] = ctx
+        return ctx.advance(OperationPhase.VERIFY).advance(OperationPhase.COMPLETE)
+
+    orch._execute_saga_apply = AsyncMock(side_effect=_fake_saga_apply)
+
+    ctx = OperationContext.create(
+        target_files=("backend/core/utils.py", "prime/router.py"),
+        description="parallel cross-repo patch",
+        op_id="op-l3-001",
+        _timestamp=_FIXED_TS,
+        primary_repo="jarvis",
+        repo_scope=("jarvis", "prime"),
+    )
+    result = await orch.run(ctx)
+
+    assert result.phase is OperationPhase.COMPLETE
+    assert result.execution_graph_id == graph.graph_id
+    assert result.execution_plan_digest == graph.plan_digest
+    scheduler.submit.assert_awaited_once_with(graph)
+    scheduler.wait_for_graph.assert_awaited_once()
+    assert captured["candidate"]["patches"] == patches

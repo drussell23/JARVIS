@@ -1174,3 +1174,72 @@ class TestPressureForLoadRouting:
         assert _expected_provider_from_pressure(snap_mod, active_ops=6) == "GCP_PRIME_SPOT", (
             "72% CPU + 6 ops: ELEVATED → GCP_PRIME_SPOT"
         )
+
+
+@pytest.mark.asyncio
+async def test_handle_submit_execution_graph_routes_to_scheduler() -> None:
+    from backend.core.ouroboros.governance.autonomy.autonomy_types import (
+        CommandEnvelope,
+        CommandType,
+    )
+    from backend.core.ouroboros.governance.autonomy.subagent_types import (
+        ExecutionGraph,
+        WorkUnitSpec,
+    )
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+        GovernedLoopService,
+    )
+
+    service = GovernedLoopService(config=GovernedLoopConfig(project_root=Path("/tmp/test")))
+    service._subagent_scheduler = MagicMock()
+    service._subagent_scheduler.submit = AsyncMock(return_value=True)
+
+    graph = ExecutionGraph(
+        graph_id="graph-route-001",
+        op_id="op-route-001",
+        planner_id="planner-v1",
+        schema_version="2d.1",
+        concurrency_limit=1,
+        units=(
+            WorkUnitSpec(
+                unit_id="u1",
+                repo="jarvis",
+                goal="update file",
+                target_files=("backend/core/utils.py",),
+                owned_paths=("backend/core/utils.py",),
+            ),
+        ),
+    )
+    cmd = CommandEnvelope(
+        source_layer="L3",
+        target_layer="L1",
+        command_type=CommandType.SUBMIT_EXECUTION_GRAPH,
+        payload={"execution_graph": graph},
+        ttl_s=30.0,
+    )
+
+    await service._handle_advisory_command(cmd)
+
+    service._subagent_scheduler.submit.assert_awaited_once_with(graph)
+
+
+def test_health_exposes_execution_graph_scheduler_state() -> None:
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+        GovernedLoopService,
+    )
+
+    service = GovernedLoopService(config=GovernedLoopConfig(project_root=Path("/tmp/test")))
+    service._subagent_scheduler = MagicMock()
+    service._subagent_scheduler.health.return_value = {
+        "running": True,
+        "active_graphs": ["graph-health-001"],
+        "max_concurrent_graphs": 2,
+        "completed_graphs": [],
+    }
+
+    health = service.health()
+
+    assert health["execution_graph_scheduler"]["running"] is True
+    assert health["execution_graph_scheduler"]["active_graphs"] == ["graph-health-001"]

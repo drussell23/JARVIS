@@ -21,8 +21,9 @@ import hashlib
 import json
 import time
 import uuid
+from dataclasses import dataclass, field, fields, is_dataclass
+from pathlib import Path
 from collections import OrderedDict
-from dataclasses import dataclass, field
 from typing import Any, Dict, FrozenSet, Optional
 
 # ---------------------------------------------------------------------------
@@ -119,12 +120,42 @@ def _deterministic_key(
             "source_layer": source_layer,
             "target_layer": target_layer,
             "command_type": command_type.value,
-            "payload": payload,
+            "payload": _canonicalize_payload(payload),
         },
         sort_keys=True,
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _canonicalize_payload(value: Any) -> Any:
+    """Convert typed payload objects into deterministic JSON-compatible values."""
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    if isinstance(value, enum.Enum):
+        return value.value
+    if isinstance(value, bytes):
+        return {"__type__": "bytes", "hex": value.hex()}
+    if isinstance(value, Path):
+        return str(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return {
+            item.name: _canonicalize_payload(getattr(value, item.name))
+            for item in fields(value)
+        }
+    if isinstance(value, dict):
+        return {
+            str(key): _canonicalize_payload(val)
+            for key, val in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonicalize_payload(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        normalized = [_canonicalize_payload(item) for item in value]
+        return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True))
+    if hasattr(value, "_asdict"):
+        return _canonicalize_payload(value._asdict())
+    raise TypeError(f"Unsupported command payload type: {type(value).__name__}")
 
 
 # ---------------------------------------------------------------------------

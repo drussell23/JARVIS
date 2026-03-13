@@ -35,6 +35,12 @@ from backend.core.ouroboros.governance.test_runner import BlockedPathError
 
 logger = logging.getLogger("Ouroboros.SubagentScheduler")
 
+_TERMINAL_GRAPH_PHASES = {
+    GraphExecutionPhase.COMPLETED,
+    GraphExecutionPhase.FAILED,
+    GraphExecutionPhase.CANCELLED,
+}
+
 
 class GenerationSubagentExecutor:
     """Default work-unit executor backed by the existing governed generator."""
@@ -246,6 +252,7 @@ class SubagentScheduler:
         self._graph_tasks: Dict[str, asyncio.Task] = {}
         self._graph_futures: Dict[str, asyncio.Future] = {}
         self._merged_patches: Dict[str, Dict[str, RepoPatch]] = {}
+        self._recovery_queue: List[str] = []
         self._running = False
         self._lock = asyncio.Lock()
 
@@ -265,12 +272,32 @@ class SubagentScheduler:
                 pass
             finally:
                 self._graph_tasks.pop(graph_id, None)
+        self._recovery_queue.clear()
 
     async def submit(self, graph: ExecutionGraph) -> bool:
         """Submit a graph for execution. Idempotent by graph_id."""
         async with self._lock:
             if not self._running:
                 return False
+            existing = self._graphs.get(graph.graph_id) or self._store.get(graph.graph_id)
+            if existing is not None:
+                self._graphs[graph.graph_id] = existing
+                if existing.phase in _TERMINAL_GRAPH_PHASES:
+                    self._set_graph_future_result(graph.graph_id, existing)
+                    return True
+                if graph.graph_id in self._recovery_queue:
+                    self._ensure_graph_future(graph.graph_id)
+                    return True
+                if graph.graph_id in self._graph_tasks:
+                    return True
+                if len(self._graph_tasks) >= self._max_concurrent_graphs:
+                    return False
+                self._graph_tasks[graph.graph_id] = asyncio.create_task(
+                    self._run_graph(graph.graph_id),
+                    name=f"subagent_graph_resume:{graph.graph_id}",
+                )
+                self._ensure_graph_future(graph.graph_id)
+                return True
             if graph.graph_id in self._graph_tasks:
                 return True
             if len(self._graph_tasks) >= self._max_concurrent_graphs:
@@ -282,9 +309,7 @@ class SubagentScheduler:
             self._store.save(state)
             await self._emit_graph_event(graph.op_id, graph.graph_id, GraphExecutionPhase.CREATED, state)
 
-            loop = asyncio.get_running_loop()
-            fut = loop.create_future()
-            self._graph_futures[graph.graph_id] = fut
+            self._ensure_graph_future(graph.graph_id)
             self._graph_tasks[graph.graph_id] = asyncio.create_task(
                 self._run_graph(graph.graph_id),
                 name=f"subagent_graph:{graph.graph_id}",
@@ -300,8 +325,12 @@ class SubagentScheduler:
                 if graph_id in self._graph_tasks:
                     continue
                 self._graphs[graph_id] = state
-                loop = asyncio.get_running_loop()
-                self._graph_futures[graph_id] = loop.create_future()
+                self._ensure_graph_future(graph_id)
+                if graph_id in self._recovery_queue:
+                    continue
+                if len(self._graph_tasks) >= self._max_concurrent_graphs:
+                    self._recovery_queue.append(graph_id)
+                    continue
                 self._graph_tasks[graph_id] = asyncio.create_task(
                     self._run_graph(graph_id),
                     name=f"subagent_graph_recover:{graph_id}",
@@ -348,6 +377,7 @@ class SubagentScheduler:
         return {
             "running": self._running,
             "active_graphs": sorted(self._graph_tasks.keys()),
+            "queued_graphs": list(self._recovery_queue),
             "max_concurrent_graphs": self._max_concurrent_graphs,
             "completed_graphs": sorted(self._merged_patches.keys()),
         }
@@ -427,15 +457,7 @@ class SubagentScheduler:
                     state,
                 )
 
-                tasks: Dict[str, asyncio.Task] = {}
-                async with asyncio.TaskGroup() as tg:
-                    for unit_id in selected:
-                        unit = graph.unit_map[unit_id]
-                        await self._emit_unit_event(graph.op_id, graph.graph_id, unit, WorkUnitState.RUNNING)
-                        tasks[unit_id] = tg.create_task(
-                            self._execute_unit_guarded(graph, unit),
-                            name=f"work_unit:{graph.graph_id}:{unit_id}",
-                        )
+                tasks = await self._run_selected_units(graph, selected)
 
                 failure_seen = False
                 for unit_id in selected:
@@ -656,11 +678,66 @@ class SubagentScheduler:
             last_error=state.last_error if last_error is None else last_error,
         )
 
-    def _finish_graph(self, graph_id: str, state: GraphExecutionState) -> None:
+    async def _run_selected_units(
+        self,
+        graph: ExecutionGraph,
+        selected: Sequence[str],
+    ) -> Dict[str, asyncio.Task]:
+        """Execute one wave of ready work units with cancellation-safe cleanup."""
+        tasks: Dict[str, asyncio.Task] = {}
+        for unit_id in selected:
+            unit = graph.unit_map[unit_id]
+            await self._emit_unit_event(graph.op_id, graph.graph_id, unit, WorkUnitState.RUNNING)
+            tasks[unit_id] = asyncio.create_task(
+                self._execute_unit_guarded(graph, unit),
+                name=f"work_unit:{graph.graph_id}:{unit_id}",
+            )
+
+        try:
+            await asyncio.gather(*(tasks[unit_id] for unit_id in selected))
+            return tasks
+        except asyncio.CancelledError:
+            for task in tasks.values():
+                task.cancel()
+            await asyncio.gather(*tasks.values(), return_exceptions=True)
+            raise
+
+    def _ensure_graph_future(self, graph_id: str) -> asyncio.Future:
         future = self._graph_futures.get(graph_id)
-        if future is not None and not future.done():
+        if future is None:
+            future = asyncio.get_running_loop().create_future()
+            self._graph_futures[graph_id] = future
+        return future
+
+    def _set_graph_future_result(self, graph_id: str, state: GraphExecutionState) -> None:
+        future = self._ensure_graph_future(graph_id)
+        if not future.done():
             future.set_result(state)
+
+    def _finish_graph(self, graph_id: str, state: GraphExecutionState) -> None:
+        self._set_graph_future_result(graph_id, state)
         self._graph_tasks.pop(graph_id, None)
+        if self._running and self._recovery_queue:
+            asyncio.create_task(
+                self._resume_queued_recoveries(),
+                name=f"subagent_recovery_resume:{graph_id}",
+            )
+
+    async def _resume_queued_recoveries(self) -> None:
+        async with self._lock:
+            while self._running and self._recovery_queue:
+                if len(self._graph_tasks) >= self._max_concurrent_graphs:
+                    return
+                graph_id = self._recovery_queue.pop(0)
+                if graph_id in self._graph_tasks:
+                    continue
+                if graph_id not in self._graphs:
+                    continue
+                self._ensure_graph_future(graph_id)
+                self._graph_tasks[graph_id] = asyncio.create_task(
+                    self._run_graph(graph_id),
+                    name=f"subagent_graph_recover:{graph_id}",
+                )
 
     def _emit_result_command(self, graph: ExecutionGraph, result: WorkUnitResult) -> None:
         cmd = CommandEnvelope(
