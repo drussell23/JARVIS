@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.core.ouroboros.governance.op_context import (
+    GenerationResult,
     OperationContext,
     OperationPhase,
 )
@@ -1304,3 +1305,113 @@ async def test_submit_stamps_strategic_memory_context_before_orchestrator() -> N
     assert submitted_ctx.strategic_intent_id == "intent-001"
     assert submitted_ctx.strategic_memory_fact_ids == ("fact-001",)
     assert "## Strategic Memory" in submitted_ctx.strategic_memory_prompt
+
+
+@pytest.mark.asyncio
+async def test_submit_records_verified_outcome_on_complete() -> None:
+    import dataclasses
+    from types import SimpleNamespace
+
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+        GovernedLoopService,
+        ServiceState,
+    )
+
+    stack = _mock_stack()
+    service = GovernedLoopService(
+        stack=stack,
+        prime_client=None,
+        config=GovernedLoopConfig(project_root=Path("/tmp/test"), l4_enabled=True),
+    )
+    service._state = ServiceState.ACTIVE
+    service._ledger = None
+    service._advanced_autonomy = MagicMock()
+    service._advanced_autonomy.build_strategic_memory_context.return_value = SimpleNamespace(
+        fact_ids=("fact-001",),
+        prompt_block="## Strategic Memory (advisory context only)\n- preserve architecture",
+        context_digest="digest-001",
+    )
+    service._advanced_autonomy.remember_user_intent.return_value = SimpleNamespace(
+        intent_id="intent-001"
+    )
+    service._advanced_autonomy.record_verified_outcome = MagicMock()
+
+    brain = SimpleNamespace(
+        brain_id="qwen_coder_32b",
+        model_name="qwen-coder-32b",
+        routing_reason="memory_guided_governance",
+        task_complexity="light",
+        estimated_prompt_tokens=512,
+        provider_tier="gcp_prime",
+        schema_capability="full_content_only",
+        narration=lambda: "routing narration",
+    )
+    service._brain_selector = MagicMock()
+    service._brain_selector.select = AsyncMock(return_value=brain)
+    service._brain_selector.daily_spend = 0.0
+
+    async def _complete_ctx(stamped_ctx):
+        generation = GenerationResult(
+            candidates=(),
+            provider_name="gcp-jprime",
+            generation_duration_s=0.25,
+            model_id="qwen-coder-32b",
+        )
+        return dataclasses.replace(
+            stamped_ctx,
+            phase=OperationPhase.COMPLETE,
+            generation=generation,
+        )
+
+    service._orchestrator = MagicMock()
+    service._orchestrator.run = AsyncMock(side_effect=_complete_ctx)
+
+    ctx = _make_context(
+        description="Preserve architecture across sessions",
+        target_files=("backend/core/utils.py",),
+    )
+    result = await service.submit(ctx, trigger_source="cli")
+
+    assert result.terminal_phase is OperationPhase.COMPLETE
+    service._advanced_autonomy.record_verified_outcome.assert_called_once()
+    kwargs = service._advanced_autonomy.record_verified_outcome.call_args.kwargs
+    assert kwargs["op_id"] == ctx.op_id
+    assert kwargs["strategic_intent_id"] == "intent-001"
+    assert kwargs["provider_used"] == "gcp-jprime"
+
+
+@pytest.mark.asyncio
+async def test_feedback_loop_scores_attribution_with_real_persistence_shape() -> None:
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+        GovernedLoopService,
+    )
+
+    service = GovernedLoopService(
+        config=GovernedLoopConfig(project_root=Path("/tmp/test")),
+    )
+    service._feedback_engine = MagicMock()
+    service._feedback_engine.consume_curriculum_once = AsyncMock()
+    service._feedback_engine.consume_reactor_events_once = AsyncMock()
+    service._feedback_engine.score_attribution_once = AsyncMock()
+
+    fake_persistence = object()
+    sleep_mock = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+    with (
+        patch(
+            "backend.core.ouroboros.governance.governed_loop_service.get_performance_persistence",
+            return_value=fake_persistence,
+        ),
+        patch(
+            "backend.core.ouroboros.governance.governed_loop_service.asyncio.sleep",
+            new=sleep_mock,
+        ),
+    ):
+        await service._feedback_loop()
+
+    service._feedback_engine.consume_curriculum_once.assert_awaited_once()
+    service._feedback_engine.consume_reactor_events_once.assert_awaited_once()
+    service._feedback_engine.score_attribution_once.assert_awaited_once_with(
+        fake_persistence,
+    )

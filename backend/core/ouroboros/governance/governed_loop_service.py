@@ -674,6 +674,7 @@ class GovernedLoopService:
         self._reactor_event_task: Optional[asyncio.Task] = None
         self._curriculum_publisher: Optional[CurriculumPublisher] = None
         self._model_attribution_recorder: Optional[ModelAttributionRecorder] = None
+        self._performance_persistence: Optional[Any] = None
         self._event_dir: Optional[Path] = None
         self._oracle_indexer_task: Optional[asyncio.Task] = None
         self._oracle: Optional[Any] = None
@@ -828,6 +829,7 @@ class GovernedLoopService:
                 event_dir.mkdir(parents=True, exist_ok=True)
                 self._event_dir = event_dir
                 persistence = get_performance_persistence()
+                self._performance_persistence = persistence
                 self._curriculum_publisher = CurriculumPublisher(
                     persistence=persistence,
                     event_dir=event_dir,
@@ -1322,6 +1324,26 @@ class GovernedLoopService:
                     _proof,
                 )
 
+            if self._advanced_autonomy is not None and terminal_ctx.phase is OperationPhase.COMPLETE:
+                try:
+                    self._advanced_autonomy.record_verified_outcome(
+                        op_id=terminal_ctx.op_id,
+                        description=terminal_ctx.description,
+                        target_files=terminal_ctx.target_files,
+                        repo_scope=terminal_ctx.repo_scope,
+                        strategic_intent_id=getattr(terminal_ctx, "strategic_intent_id", ""),
+                        provider_used=_provider_used or "",
+                        routing_reason=brain.routing_reason,
+                        benchmark_result=getattr(terminal_ctx, "benchmark_result", None),
+                        is_noop=_is_noop,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[GovernedLoop] L4 verified outcome write failed for op=%s: %s",
+                        terminal_ctx.op_id,
+                        exc,
+                    )
+
             # C+ L1: Emit op_completed event to advisory layers
             if self._event_emitter is not None:
                 try:
@@ -1791,6 +1813,8 @@ class GovernedLoopService:
                     state_dir=self._config.l4_state_dir,
                 ),
             )
+            if self._event_emitter is not None:
+                self._advanced_autonomy.register_event_handlers(self._event_emitter)
             logger.info(
                 "[GovernedLoop] L4 AdvancedAutonomyService wired: state_dir=%s",
                 self._config.l4_state_dir,
@@ -2283,6 +2307,11 @@ class GovernedLoopService:
                 if self._feedback_engine:
                     await self._feedback_engine.consume_curriculum_once()
                     await self._feedback_engine.consume_reactor_events_once()
+                    if self._performance_persistence is None:
+                        self._performance_persistence = get_performance_persistence()
+                    await self._feedback_engine.score_attribution_once(
+                        self._performance_persistence,
+                    )
             except asyncio.CancelledError:
                 return
             except Exception as exc:

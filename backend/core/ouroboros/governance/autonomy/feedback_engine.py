@@ -32,6 +32,7 @@ import json
 import logging
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -231,10 +232,15 @@ class AutonomyFeedbackEngine:
     async def score_attribution_once(self, persistence: Any) -> None:
         """Score model attribution for each active brain and emit events.
 
-        For each active brain_id returned by ``persistence.get_active_brain_ids()``,
-        fetches outcome records via ``persistence.get_records_by_model_and_task()``,
-        computes a success rate, and emits an ``ATTRIBUTION_SCORED`` event through
-        the event emitter.
+        Supports two persistence shapes:
+
+        - legacy test/dummy shape:
+          ``get_active_brain_ids()`` + ``get_records_by_model_and_task()``
+        - real PerformanceRecordPersistence shape:
+          ``load_records(model_id=None, limit=N, since=datetime)``
+
+        Computes success rate and average quality score, then emits an
+        ``ATTRIBUTION_SCORED`` event through the event emitter.
 
         Parameters
         ----------
@@ -251,6 +257,73 @@ class AutonomyFeedbackEngine:
         if self._event_emitter is None:
             return
 
+        window_hours = _DEFAULT_ATTRIBUTION_WINDOW_HOURS
+        try:
+            records_by_brain = await self._load_attribution_records(
+                persistence,
+                window_hours=window_hours,
+            )
+        except Exception:
+            logger.warning(
+                "FeedbackEngine: failed to load attribution records — "
+                "skipping attribution scoring",
+                exc_info=True,
+            )
+            return
+
+        for brain_id, records in records_by_brain.items():
+            sample_size = len(records)
+            if sample_size < _MIN_ATTRIBUTION_SAMPLE_SIZE:
+                logger.debug(
+                    "FeedbackEngine: brain_id=%s has %d record(s), below "
+                    "minimum %d — skipping attribution",
+                    brain_id,
+                    sample_size,
+                    _MIN_ATTRIBUTION_SAMPLE_SIZE,
+                )
+                continue
+
+            success_count = sum(1 for r in records if self._record_success(r))
+            success_rate = success_count / sample_size
+            avg_quality_score = sum(self._record_quality_score(r) for r in records) / sample_size
+
+            event = EventEnvelope(
+                source_layer="L2",
+                event_type=EventType.ATTRIBUTION_SCORED,
+                payload={
+                    "brain_id": brain_id,
+                    "success_rate": success_rate,
+                    "avg_quality_score": avg_quality_score,
+                    "sample_size": sample_size,
+                    "window_hours": window_hours,
+                },
+            )
+
+            await self._event_emitter.emit(event)
+
+            logger.debug(
+                "FeedbackEngine: attribution scored for brain_id=%s — "
+                "success_rate=%.3f quality=%.3f sample_size=%d",
+                brain_id,
+                success_rate,
+                avg_quality_score,
+                sample_size,
+            )
+
+    async def _load_attribution_records(
+        self,
+        persistence: Any,
+        *,
+        window_hours: float,
+    ) -> Dict[str, List[Any]]:
+        if hasattr(persistence, "load_records"):
+            since = datetime.now(tz=timezone.utc) - timedelta(hours=window_hours)
+            loaded = await persistence.load_records(limit=200, since=since)
+            return {
+                str(brain_id): list(records)
+                for brain_id, records in loaded.items()
+            }
+
         try:
             brain_ids = await persistence.get_active_brain_ids()
         except Exception:
@@ -259,10 +332,9 @@ class AutonomyFeedbackEngine:
                 "skipping attribution scoring",
                 exc_info=True,
             )
-            return
+            return {}
 
-        window_hours = _DEFAULT_ATTRIBUTION_WINDOW_HOURS
-
+        records_by_brain: Dict[str, List[Any]] = {}
         for brain_id in brain_ids:
             try:
                 records = await persistence.get_records_by_model_and_task(
@@ -277,43 +349,33 @@ class AutonomyFeedbackEngine:
                     exc_info=True,
                 )
                 continue
+            records_by_brain[str(brain_id)] = list(records)
+        return records_by_brain
 
-            sample_size = len(records)
-            if sample_size < _MIN_ATTRIBUTION_SAMPLE_SIZE:
-                logger.debug(
-                    "FeedbackEngine: brain_id=%s has %d record(s), below "
-                    "minimum %d — skipping attribution",
-                    brain_id,
-                    sample_size,
-                    _MIN_ATTRIBUTION_SAMPLE_SIZE,
-                )
-                continue
+    @staticmethod
+    def _record_success(record: Any) -> bool:
+        if isinstance(record, dict):
+            if "success" in record:
+                return bool(record["success"])
+            return str(record.get("outcome", "")).lower() == "success"
+        if hasattr(record, "success"):
+            return bool(getattr(record, "success"))
+        return str(getattr(record, "outcome", "")).lower() == "success"
 
-            success_count = sum(
-                1 for r in records if r.get("outcome") == "success"
+    @staticmethod
+    def _record_quality_score(record: Any) -> float:
+        if isinstance(record, dict):
+            value = record.get("avg_quality_score", record.get("quality_score", record.get("code_quality_score", 0.0)))
+        else:
+            value = getattr(
+                record,
+                "code_quality_score",
+                getattr(record, "quality_score", getattr(record, "avg_quality_score", 0.0)),
             )
-            success_rate = success_count / sample_size
-
-            event = EventEnvelope(
-                source_layer="L2",
-                event_type=EventType.ATTRIBUTION_SCORED,
-                payload={
-                    "brain_id": brain_id,
-                    "success_rate": success_rate,
-                    "sample_size": sample_size,
-                    "window_hours": window_hours,
-                },
-            )
-
-            await self._event_emitter.emit(event)
-
-            logger.debug(
-                "FeedbackEngine: attribution scored for brain_id=%s — "
-                "success_rate=%.3f sample_size=%d",
-                brain_id,
-                success_rate,
-                sample_size,
-            )
+        try:
+            return max(0.0, min(1.0, float(value)))
+        except (TypeError, ValueError):
+            return 0.0
 
     # ------------------------------------------------------------------
     # Public API — canary -> brain feedback (Task 7)

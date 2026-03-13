@@ -10,6 +10,9 @@ Covers:
 """
 from __future__ import annotations
 
+from collections import deque
+from datetime import datetime, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock
 
@@ -86,6 +89,32 @@ class PartialFailPersistence:
         if brain_id in self._fail_brains:
             raise RuntimeError(f"fetch failed for {brain_id}")
         return list(self._records.get(brain_id, []))
+
+
+class LoadRecordsPersistence:
+    """Duck-typed persistence matching the real PerformanceRecordPersistence API."""
+
+    def __init__(self, records: Dict[str, List[Any]]) -> None:
+        self._records = records
+        self.calls: List[Dict[str, Any]] = []
+
+    async def load_records(
+        self,
+        model_id: Optional[str] = None,
+        limit: int = 100,
+        since: Optional[datetime] = None,
+    ) -> Dict[str, deque]:
+        self.calls.append(
+            {
+                "model_id": model_id,
+                "limit": limit,
+                "since": since,
+            }
+        )
+        return {
+            brain_id: deque(records, maxlen=limit)
+            for brain_id, records in self._records.items()
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +228,7 @@ class TestScoreAttributionEmitsEvents:
         assert event.event_type == EventType.ATTRIBUTION_SCORED
         assert "brain_id" in event.payload
         assert "success_rate" in event.payload
+        assert "avg_quality_score" in event.payload
         assert "sample_size" in event.payload
         assert "window_hours" in event.payload
 
@@ -367,6 +397,41 @@ class TestScoreAttributionSkipsInsufficientData:
         assert len(captured) == 1
         assert captured[0].payload["sample_size"] == 3
         assert captured[0].payload["success_rate"] == pytest.approx(2.0 / 3.0)
+
+    @pytest.mark.asyncio
+    async def test_real_load_records_shape_is_supported(self, tmp_path):
+        """The real load_records persistence shape should emit attribution events."""
+        from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
+
+        emitter = EventEmitter()
+        captured: List[EventEnvelope] = []
+
+        async def capture(event: EventEnvelope) -> None:
+            captured.append(event)
+
+        emitter.subscribe(EventType.ATTRIBUTION_SCORED, capture)
+
+        engine = _make_engine(tmp_path, event_emitter=emitter)
+
+        persistence = LoadRecordsPersistence(
+            records={
+                "brain-live": [
+                    SimpleNamespace(success=True, code_quality_score=0.9),
+                    SimpleNamespace(success=True, code_quality_score=0.8),
+                    SimpleNamespace(success=False, code_quality_score=0.3),
+                ]
+            }
+        )
+
+        await engine.score_attribution_once(persistence)
+
+        assert len(captured) == 1
+        payload = captured[0].payload
+        assert payload["brain_id"] == "brain-live"
+        assert payload["success_rate"] == pytest.approx(2.0 / 3.0)
+        assert payload["avg_quality_score"] == pytest.approx((0.9 + 0.8 + 0.3) / 3.0)
+        assert persistence.calls[0]["since"] is not None
+        assert persistence.calls[0]["since"].tzinfo == timezone.utc
 
 
 # ---------------------------------------------------------------------------
