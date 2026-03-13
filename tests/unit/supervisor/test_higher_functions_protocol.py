@@ -408,3 +408,44 @@ class TestConstruction:
         assert isinstance(obj, SystemService), (
             f"{class_name} instance is not a SystemService"
         )
+
+
+@pytest.mark.asyncio
+async def test_rollback_coordinator_notifies_governance_aware_manual_rollbacks(ns):
+    RollbackCoordinator = ns["RollbackCoordinator"]
+
+    captured: list[dict[str, Any]] = []
+
+    async def _notify(payload: dict[str, Any]) -> None:
+        captured.append(payload)
+
+    coordinator = RollbackCoordinator(outcome_notifier=_notify)
+
+    async def _handler(_checkpoint) -> bool:
+        return True
+
+    coordinator.register_rollback_handler("jarvis", _handler)
+    await coordinator.create_checkpoint(
+        "jarvis",
+        "v1",
+        {"state": "stable"},
+        metadata={
+            "governance_op_id": "op-manual-rollback-001",
+            "affected_files": ["backend/core/utils.py"],
+            "provider_used": "gcp-jprime",
+            "brain_id": "qwen_coder_32b",
+            "model_name": "qwen-coder-32b",
+        },
+    )
+
+    ok, _ = await coordinator.rollback_to(
+        "jarvis",
+        rollback_reason="manual_rollback",
+    )
+
+    assert ok is True
+    assert len(captured) == 1
+    assert captured[0]["op_id"] == "op-manual-rollback-001"
+    assert captured[0]["rollback_occurred"] is True
+    assert captured[0]["terminal_phase"] == "CANCELLED"
+    assert captured[0]["reason_code"] == "manual_rollback"

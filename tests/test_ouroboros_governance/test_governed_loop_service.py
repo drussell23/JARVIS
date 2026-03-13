@@ -1485,6 +1485,95 @@ async def test_submit_emits_rollback_event_and_supersedes_verified_fact(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_reconcile_on_boot_emits_rollback_event_and_supersedes_verified_fact(
+    tmp_path,
+) -> None:
+    import hashlib
+
+    from backend.core.ouroboros.governance.autonomy.advanced_coordination import (
+        AdvancedAutonomyService,
+        AdvancedCoordinationConfig,
+    )
+    from backend.core.ouroboros.governance.autonomy.autonomy_types import EventType
+    from backend.core.ouroboros.governance.autonomy.command_bus import CommandBus
+    from backend.core.ouroboros.governance.autonomy.event_emitter import EventEmitter
+    from backend.core.ouroboros.governance.governed_loop_service import (
+        GovernedLoopConfig,
+        GovernedLoopService,
+    )
+    from backend.core.ouroboros.governance.ledger import (
+        LedgerEntry,
+        OperationLedger,
+        OperationState,
+    )
+
+    target = tmp_path / "boot_target.py"
+    original = b"print('stable')\n"
+    target.write_bytes(original)
+    rollback_hash = hashlib.sha256(original).hexdigest()
+    op_id = "op-boot-rollback-001"
+
+    ledger = OperationLedger(storage_dir=tmp_path / "ledger")
+    await ledger.append(LedgerEntry(op_id=op_id, state=OperationState.PLANNED, data={}))
+    await ledger.append(LedgerEntry(
+        op_id=op_id,
+        state=OperationState.APPLIED,
+        data={
+            "target_file": str(target),
+            "rollback_hash": rollback_hash,
+        },
+    ))
+
+    stack = _mock_stack()
+    stack.ledger = ledger
+    stack.comm.emit_decision = AsyncMock()
+    stack.approval_store = None
+
+    service = GovernedLoopService(
+        stack=stack,
+        prime_client=None,
+        config=GovernedLoopConfig(project_root=tmp_path, l4_enabled=True),
+    )
+    service._event_emitter = EventEmitter()
+
+    captured_rollbacks = []
+
+    async def _capture(event):
+        captured_rollbacks.append(event)
+
+    service._event_emitter.subscribe(EventType.OP_ROLLED_BACK, _capture)
+    service._advanced_autonomy = AdvancedAutonomyService(
+        command_bus=CommandBus(maxsize=100),
+        config=AdvancedCoordinationConfig(state_dir=tmp_path / "advanced_coordination"),
+    )
+    service._advanced_autonomy.register_event_handlers(service._event_emitter)
+
+    seeded_fact = service._advanced_autonomy.record_verified_outcome(
+        op_id=op_id,
+        description="Preserve boot-time invariants",
+        target_files=(str(target),),
+        repo_scope=("jarvis",),
+        provider_used="gcp-jprime",
+        routing_reason="boot_recovery",
+        benchmark_result=None,
+        is_noop=False,
+    )
+    assert seeded_fact is not None
+
+    await service._reconcile_on_boot()
+
+    latest = await ledger.get_latest_state(op_id)
+    assert latest is OperationState.ROLLED_BACK
+    assert len(captured_rollbacks) == 1
+    assert captured_rollbacks[0].payload["rollback_reason"] == "boot_recovery_already_reverted"
+    assert captured_rollbacks[0].payload["outcome_source"] == "boot_recovery"
+
+    recovered = service._advanced_autonomy.get_memory_fact(seeded_fact.fact_id)
+    assert recovered is not None
+    assert recovered.status == "superseded"
+
+
+@pytest.mark.asyncio
 async def test_feedback_loop_scores_attribution_with_real_persistence_shape() -> None:
     from backend.core.ouroboros.governance.governed_loop_service import (
         GovernedLoopConfig,

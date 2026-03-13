@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Set, Tuple
+from typing import Any, Dict, FrozenSet, List, Optional, Sequence, Set, Tuple
 
 from backend.core.ouroboros.governance.approval_provider import CLIApprovalProvider
 from backend.core.ouroboros.governance.candidate_generator import (
@@ -1443,6 +1443,112 @@ class GovernedLoopService:
     # Health
     # ------------------------------------------------------------------
 
+    async def _emit_outcome_events(
+        self,
+        *,
+        op_id: str,
+        terminal_phase: OperationPhase,
+        provider_used: str,
+        duration_s: float,
+        reason_code: str,
+        rollback_occurred: bool = False,
+        failure_class: str = "",
+        affected_files: Sequence[str] = (),
+        brain_id: str = "",
+        model_name: str = "",
+        outcome_source: str = "governed_loop",
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit a normalized terminal outcome payload to the autonomy event bus."""
+        emitter = getattr(self, "_event_emitter", None)
+        if emitter is None:
+            return
+
+        resolved_failure_class = (
+            failure_class
+            or _classify_failure_signal_class(
+                reason_code,
+                rollback_occurred=rollback_occurred,
+            )
+        )
+        success = (
+            terminal_phase is OperationPhase.COMPLETE
+            and not rollback_occurred
+        )
+        payload = {
+            "op_id": op_id,
+            "brain_id": brain_id,
+            "model_name": model_name,
+            "terminal_phase": terminal_phase.name,
+            "provider": provider_used or "",
+            "duration_s": duration_s or 0.0,
+            "duration_ms": (duration_s or 0.0) * 1000.0,
+            "rollback": rollback_occurred,
+            "success": success,
+            "error": "" if success else reason_code,
+            "failure_class": resolved_failure_class,
+            "affected_files": list(affected_files),
+            "outcome_source": outcome_source,
+        }
+        if extra_payload:
+            payload.update(extra_payload)
+
+        try:
+            await emitter.emit(AutonomyEventEnvelope(
+                source_layer="L1",
+                event_type=AutonomyEventType.OP_COMPLETED,
+                payload=payload,
+                op_id=op_id,
+            ))
+            if rollback_occurred:
+                await emitter.emit(AutonomyEventEnvelope(
+                    source_layer="L1",
+                    event_type=AutonomyEventType.OP_ROLLED_BACK,
+                    payload={
+                        **payload,
+                        "rollback_reason": reason_code,
+                    },
+                    op_id=op_id,
+                ))
+        except Exception:
+            pass  # fault-isolated
+
+    async def report_external_outcome(
+        self,
+        *,
+        op_id: str,
+        terminal_phase: OperationPhase,
+        reason_code: str,
+        rollback_occurred: bool = False,
+        affected_files: Sequence[str] = (),
+        provider_used: str = "",
+        brain_id: str = "",
+        model_name: str = "",
+        duration_s: float = 0.0,
+        failure_class: str = "",
+        outcome_source: str = "external",
+        extra_payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Report a terminal outcome that happened outside submit()/orchestrator.
+
+        Used for boot recovery and supervisor/manual rollback flows so L4,
+        SafetyNet, and Reactor attribution observe the same event contract.
+        """
+        await self._emit_outcome_events(
+            op_id=op_id,
+            terminal_phase=terminal_phase,
+            provider_used=provider_used,
+            duration_s=duration_s,
+            reason_code=reason_code,
+            rollback_occurred=rollback_occurred,
+            failure_class=failure_class,
+            affected_files=affected_files,
+            brain_id=brain_id,
+            model_name=model_name,
+            outcome_source=outcome_source,
+            extra_payload=extra_payload,
+        )
+
     async def _emit_terminal_events(
         self,
         *,
@@ -1455,55 +1561,20 @@ class GovernedLoopService:
         failure_class: str = "",
     ) -> None:
         """Emit terminal outcome events to advisory layers with rollback fidelity."""
-        if self._event_emitter is None:
-            return
-
         reason_code = rollback_reason or result.reason_code
-        resolved_failure_class = (
-            failure_class
-            or _classify_failure_signal_class(
-                reason_code,
-                rollback_occurred=rollback_occurred,
-            )
+        await self._emit_outcome_events(
+            op_id=ctx.op_id,
+            terminal_phase=result.terminal_phase,
+            provider_used=result.provider_used or "",
+            duration_s=result.total_duration_s or 0.0,
+            reason_code=reason_code,
+            rollback_occurred=rollback_occurred,
+            failure_class=failure_class,
+            affected_files=ctx.target_files,
+            brain_id=brain_id,
+            model_name=model_name,
+            outcome_source="governed_loop",
         )
-        success = (
-            result.terminal_phase is OperationPhase.COMPLETE
-            and not rollback_occurred
-        )
-        payload = {
-            "op_id": ctx.op_id,
-            "brain_id": brain_id,
-            "model_name": model_name,
-            "terminal_phase": result.terminal_phase.name,
-            "provider": result.provider_used or "",
-            "duration_s": result.total_duration_s or 0.0,
-            "duration_ms": (result.total_duration_s or 0.0) * 1000.0,
-            "rollback": rollback_occurred,
-            "success": success,
-            "error": "" if success else reason_code,
-            "failure_class": resolved_failure_class,
-            "affected_files": list(ctx.target_files),
-        }
-
-        try:
-            await self._event_emitter.emit(AutonomyEventEnvelope(
-                source_layer="L1",
-                event_type=AutonomyEventType.OP_COMPLETED,
-                payload=payload,
-                op_id=ctx.op_id,
-            ))
-            if rollback_occurred:
-                await self._event_emitter.emit(AutonomyEventEnvelope(
-                    source_layer="L1",
-                    event_type=AutonomyEventType.OP_ROLLED_BACK,
-                    payload={
-                        **payload,
-                        "rollback_reason": reason_code,
-                    },
-                    op_id=ctx.op_id,
-                ))
-        except Exception:
-            pass  # fault-isolated
 
     def health(self) -> Dict[str, Any]:
         """Return structured health report."""
@@ -2201,6 +2272,18 @@ class GovernedLoopService:
                     op_id=op_id, outcome="manual_intervention_required",
                     reason_code="boot_recovery_missing_provenance",
                 )
+                await self.report_external_outcome(
+                    op_id=op_id,
+                    terminal_phase=OperationPhase.POSTMORTEM,
+                    reason_code="boot_recovery_missing_provenance",
+                    affected_files=((target_path_str,) if target_path_str else ()),
+                    failure_class="env",
+                    outcome_source="boot_recovery",
+                    extra_payload={
+                        "recovery_attempt_id": recovery_id,
+                        "recovery_disposition": "manual_intervention_required",
+                    },
+                )
                 continue
 
             import hashlib as _hashlib
@@ -2215,6 +2298,18 @@ class GovernedLoopService:
                     op_id=op_id, outcome="manual_intervention_required",
                     reason_code="boot_recovery_file_missing",
                 )
+                await self.report_external_outcome(
+                    op_id=op_id,
+                    terminal_phase=OperationPhase.POSTMORTEM,
+                    reason_code="boot_recovery_file_missing",
+                    affected_files=(target_path_str,),
+                    failure_class="env",
+                    outcome_source="boot_recovery",
+                    extra_payload={
+                        "recovery_attempt_id": recovery_id,
+                        "recovery_disposition": "manual_intervention_required",
+                    },
+                )
                 continue
 
             current_hash = _hashlib.sha256(target.read_bytes()).hexdigest()
@@ -2225,6 +2320,19 @@ class GovernedLoopService:
                     data={"reason": "boot_recovery_already_reverted",
                           "recovery_attempt_id": recovery_id},
                 ))
+                await self.report_external_outcome(
+                    op_id=op_id,
+                    terminal_phase=OperationPhase.CANCELLED,
+                    reason_code="boot_recovery_already_reverted",
+                    rollback_occurred=True,
+                    affected_files=(target_path_str,),
+                    failure_class="rollback",
+                    outcome_source="boot_recovery",
+                    extra_payload={
+                        "recovery_attempt_id": recovery_id,
+                        "recovery_disposition": "already_reverted",
+                    },
+                )
                 logger.info("[GovernedLoop] Boot recovery: op=%s already reverted externally", op_id)
                 continue
 
@@ -2239,6 +2347,20 @@ class GovernedLoopService:
             await self._stack.comm.emit_decision(
                 op_id=op_id, outcome="manual_intervention_required",
                 reason_code="boot_recovery_needs_manual_rollback",
+            )
+            await self.report_external_outcome(
+                op_id=op_id,
+                terminal_phase=OperationPhase.POSTMORTEM,
+                reason_code="boot_recovery_needs_manual_rollback",
+                affected_files=(target_path_str,),
+                failure_class="env",
+                outcome_source="boot_recovery",
+                extra_payload={
+                    "recovery_attempt_id": recovery_id,
+                    "current_hash": current_hash,
+                    "rollback_hash": rollback_hash,
+                    "recovery_disposition": "manual_intervention_required",
+                },
             )
 
         # Expire stale approvals — batch notify (no per-op comm storm)
