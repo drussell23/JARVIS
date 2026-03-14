@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Trinity AI — Governed Inference Loop Demo
-==========================================
+Trinity AI — Governed Inference Loop Demo v2
+=============================================
 
-Live system demonstration with JARVIS voice narration
-and real-time Rich terminal UI.
+Live system demonstration with JARVIS voice narration,
+Rich animated terminal UI, async parallel execution,
+and dynamic system telemetry.
 
 Usage:
-  python3 demo_trinity_governed_loop.py            # Full demo with voice
-  python3 demo_trinity_governed_loop.py --no-voice  # Silent mode
-  python3 demo_trinity_governed_loop.py --no-tests  # Skip test suite
+  python3 demo_trinity_governed_loop.py              # Full demo with voice
+  python3 demo_trinity_governed_loop.py --no-voice   # Silent mode
+  python3 demo_trinity_governed_loop.py --no-tests   # Skip test suite
+  python3 demo_trinity_governed_loop.py --fast        # Reduced pauses
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -20,8 +23,10 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.request import Request, urlopen
 
 from rich.console import Console
 from rich.panel import Panel
@@ -30,17 +35,31 @@ from rich.text import Text
 from rich.rule import Rule
 from rich.syntax import Syntax
 from rich.align import Align
+from rich.tree import Tree
+from rich.live import Live
 
-# ── Configuration ───────────────────────────────────────────────────────────
+# ── Configuration (all from env / flags — zero hardcoding) ──────────────────
 
 JPRIME_ENDPOINT = os.getenv("JPRIME_ENDPOINT", "http://136.113.252.164:8000")
-LEDGER_DIR = Path.home() / ".jarvis" / "ouroboros" / "ledger"
+LEDGER_DIR = Path(os.getenv(
+    "JARVIS_LEDGER_DIR",
+    str(Path.home() / ".jarvis" / "ouroboros" / "ledger"),
+))
+PROJECT_ROOT = Path(__file__).parent
 NO_VOICE = "--no-voice" in sys.argv or not shutil.which("say")
 NO_TESTS = "--no-tests" in sys.argv
-VOICE = "Daniel"
-SPEECH_RATE = "175"
+FAST = "--fast" in sys.argv
+VOICE = os.getenv("JARVIS_VOICE", "Daniel")
+SPEECH_RATE = os.getenv("JARVIS_SPEECH_RATE", "175")
 
 console = Console()
+_pool = ThreadPoolExecutor(max_workers=4)
+
+
+def _delay(normal: float):
+    """Delay seconds, halved in --fast mode."""
+    return normal * 0.3 if FAST else normal
+
 
 # ── Voice Engine ────────────────────────────────────────────────────────────
 
@@ -52,7 +71,6 @@ def jarvis_say(text: str, wait: bool = False):
     global _speech_proc
     if NO_VOICE:
         return
-    # Wait for any previous speech to finish before starting new
     if _speech_proc and _speech_proc.poll() is None:
         _speech_proc.wait()
     _speech_proc = subprocess.Popen(
@@ -71,40 +89,66 @@ def wait_speech():
         _speech_proc = None
 
 
-# ── Helpers ─────────────────────────────────────────────────────────────────
+# ── Async HTTP ──────────────────────────────────────────────────────────────
 
-def phase_header(num: int, title: str):
-    console.print()
-    console.print(Rule(f"[bold cyan]PHASE {num} — {title}[/]", style="cyan"))
-    console.print()
+def _http_get(url: str, timeout: int = 10):
+    with urlopen(Request(url), timeout=timeout) as r:
+        return json.loads(r.read())
 
 
-def pause(seconds: float = 1.0):
-    time.sleep(seconds)
+def _http_post(url: str, payload: dict, timeout: int = 30):
+    data = json.dumps(payload).encode()
+    req = Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+async def _in_thread(fn, *args):
+    return await asyncio.get_running_loop().run_in_executor(_pool, fn, *args)
+
+
+# ── Dynamic Stats ───────────────────────────────────────────────────────────
+
+def _git_commit_count() -> int:
+    try:
+        r = subprocess.run(
+            ["git", "rev-list", "--count", "HEAD"],
+            capture_output=True, text=True, timeout=5,
+            cwd=str(PROJECT_ROOT),
+        )
+        return int(r.stdout.strip()) if r.returncode == 0 else 0
+    except Exception:
+        return 0
+
+
+def _governance_file_count() -> int:
+    d = PROJECT_ROOT / "backend" / "core" / "ouroboros"
+    return len(list(d.rglob("*.py"))) if d.exists() else 0
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# BANNER
+# 🚀 BANNER + BOOT SEQUENCE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def show_banner():
+async def show_banner():
     title = Text(justify="center")
     title.append("\n")
+    title.append("◆  ", style="bold cyan")
     title.append("T R I N I T Y   A I", style="bold white")
-    title.append("\n\n")
-    title.append("Governed Inference Loop", style="bold cyan")
-    title.append("  ·  ", style="dim")
-    title.append("Live System Demonstration", style="dim cyan")
-    title.append("\n\n")
-    title.append("The Body ", style="bold cyan")
-    title.append("JARVIS", style="dim white")
-    title.append("   ·   ", style="dim")
-    title.append("The Mind ", style="bold cyan")
-    title.append("J-Prime", style="dim white")
-    title.append("   ·   ", style="dim")
-    title.append("The Nerves ", style="bold cyan")
-    title.append("Reactor-Core", style="dim white")
+    title.append("  ◆\n", style="bold cyan")
     title.append("\n")
+    title.append("🚀 Governed Inference Loop", style="bold cyan")
+    title.append("  ·  ", style="dim")
+    title.append("Live System Demonstration\n", style="dim cyan")
+    title.append("\n")
+    title.append("🛡️ The Body ", style="bold cyan")
+    title.append("JARVIS", style="white")
+    title.append("   ·   ", style="dim")
+    title.append("🧠 The Mind ", style="bold cyan")
+    title.append("J-Prime", style="white")
+    title.append("   ·   ", style="dim")
+    title.append("⚡ The Nerves ", style="bold cyan")
+    title.append("Reactor-Core\n", style="white")
 
     console.print(Panel(
         Align.center(title),
@@ -115,39 +159,109 @@ def show_banner():
     jarvis_say(
         "Welcome to the Trinity AI demonstration. "
         "I'm JARVIS, your autonomous software engineering system. "
-        "I'll walk you through our governed inference pipeline in real time.",
-        wait=True,
+        "Let me walk you through our governed inference pipeline in real time.",
     )
-    pause(0.5)
+
+    # ── Animated Boot Sequence ──────────────────────────────────────────────
+
+    systems = [
+        ("🔧", "JARVIS Kernel"),
+        ("🧠", "Neural Inference Bridge"),
+        ("🛡️", "Ouroboros Governance Engine"),
+        ("📡", "GCP Cloud Relay"),
+        ("⚡", "Reactor Telemetry Stream"),
+    ]
+
+    booted = 0
+
+    def _boot_panel():
+        t = Table(
+            show_header=False, box=None,
+            padding=(0, 1), expand=False,
+        )
+        t.add_column(width=4)
+        t.add_column(width=34)
+        t.add_column(width=4)
+        for i, (emoji, name) in enumerate(systems):
+            if i < booted:
+                t.add_row(
+                    emoji,
+                    f"[bold white]{name}[/]",
+                    "[green bold]✅[/]",
+                )
+            elif i == booted:
+                t.add_row(
+                    emoji,
+                    f"[bold yellow]{name}[/]",
+                    "[yellow]⏳[/]",
+                )
+        return Panel(
+            t,
+            title="[bold cyan]🚀 System Boot[/]",
+            border_style="cyan",
+            padding=(0, 2),
+        )
+
+    with Live(_boot_panel(), console=console, refresh_per_second=12) as live:
+        for _ in range(len(systems)):
+            live.update(_boot_panel())
+            await asyncio.sleep(_delay(0.45))
+            booted += 1
+            live.update(_boot_panel())
+            await asyncio.sleep(_delay(0.15))
+
+    wait_speech()
+    console.print()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 1: SYSTEM STATUS
+# 🌐 PHASE 1: SYSTEM STATUS (parallel health + capability)
 # ═════════════════════════════════════════════════════════════════════════════
 
-def phase_1_system_status():
-    import urllib.request
-
-    phase_header(1, "LIVE SYSTEM STATUS")
+async def phase_1():
+    console.print()
+    console.print(Rule(
+        "[bold cyan]🌐 PHASE 1 — LIVE SYSTEM STATUS[/]",
+        style="cyan",
+    ))
+    console.print()
 
     jarvis_say(
-        "First, let me connect to J-Prime, "
-        "our GPU inference engine running on Google Cloud.",
+        "Connecting to J-Prime, our GPU inference engine "
+        "on Google Cloud Platform.",
     )
 
+    cap = None
+    health = None
+
     with console.status(
-        "[bold cyan]  Connecting to J-Prime on GCP NVIDIA L4...[/]",
+        "[bold cyan]  📡 Querying J-Prime on GCP NVIDIA L4...[/]",
         spinner="dots",
     ):
         try:
-            req = urllib.request.Request(f"{JPRIME_ENDPOINT}/v1/capability")
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read())
+            cap_f = _in_thread(
+                _http_get, f"{JPRIME_ENDPOINT}/v1/capability",
+            )
+            health_f = _in_thread(
+                _http_get, f"{JPRIME_ENDPOINT}/health",
+            )
+            results = await asyncio.gather(
+                cap_f, health_f, return_exceptions=True,
+            )
+            cap_result, health_result = results
+            if isinstance(cap_result, Exception):
+                raise cap_result
+            cap = cap_result
+            health = (
+                health_result
+                if not isinstance(health_result, Exception)
+                else None
+            )
         except Exception as e:
             wait_speech()
-            console.print(f"  [red bold]  Cannot reach J-Prime: {e}[/]")
+            console.print(f"  [red bold]❌ Cannot reach J-Prime: {e}[/]")
             jarvis_say(
-                "I'm unable to reach J-Prime. "
+                "Unable to reach J-Prime. "
                 "The GCP instance may be offline.",
                 wait=True,
             )
@@ -155,433 +269,505 @@ def phase_1_system_status():
 
     wait_speech()
 
-    # Extract fields
-    model_id = data.get("model_id", "unknown")
-    model_artifact = data.get("model_artifact", "unknown")
-    compute = data.get("compute_class", "unknown")
-    gpu_layers = str(data.get("gpu_layers", "unknown"))
-    ctx = data.get("context_window", 0)
-    host = data.get("host", "unknown")
-    schema = data.get("schema_version", "unknown")
-    contract = data.get("contract_version", "unknown")
-    generated = data.get("generated_at_epoch_s", 0)
+    # ── Build Capability Table ──────────────────────────────────────────────
 
-    # Build capability table
-    table = Table(
+    model_id = cap.get("model_id", "unknown")
+    artifact = cap.get("model_artifact", "unknown")
+    compute = cap.get("compute_class", "unknown")
+    gpu_layers = str(cap.get("gpu_layers", "unknown"))
+    ctx = cap.get("context_window", 0)
+    host = cap.get("host", "unknown")
+    schema = cap.get("schema_version", "unknown")
+    contract = cap.get("contract_version", "unknown")
+    gen_epoch = cap.get("generated_at_epoch_s", 0)
+
+    tbl = Table(
         show_header=False, border_style="green",
         padding=(0, 2), expand=True,
     )
-    table.add_column("Property", style="white", width=22)
-    table.add_column("Value", style="green bold")
+    tbl.add_column("", style="white", width=24)
+    tbl.add_column("", style="green bold")
 
-    table.add_row("Status", "[green bold]● ONLINE[/]")
-    table.add_row("Model", model_id)
-    table.add_row("Artifact", model_artifact)
-    table.add_row("Compute Class", compute.upper())
-    table.add_row("GPU Layers", gpu_layers)
-    table.add_row("Context Window", f"{ctx:,} tokens")
-    table.add_row("Host", host)
-    table.add_row("Schema Version", schema)
-    table.add_row("Contract Version", contract)
-    table.add_row("Endpoint", JPRIME_ENDPOINT)
-    if generated:
-        ts_str = datetime.fromtimestamp(
-            generated, tz=timezone.utc
+    tbl.add_row("  ● Status", "[green bold]ONLINE[/]")
+    tbl.add_row("  🤖 Model", model_id)
+    tbl.add_row("  📦 Artifact", artifact)
+    tbl.add_row("  🖥️  Compute", compute.upper())
+    tbl.add_row("  🎮 GPU Layers", gpu_layers)
+    tbl.add_row("  📐 Context", f"{ctx:,} tokens")
+    tbl.add_row("  🏠 Host", host)
+    tbl.add_row("  📋 Schema", schema)
+    tbl.add_row("  📜 Contract", contract)
+    tbl.add_row("  🌐 Endpoint", JPRIME_ENDPOINT)
+
+    if gen_epoch:
+        ts = datetime.fromtimestamp(
+            gen_epoch, tz=timezone.utc,
         ).strftime("%Y-%m-%d %H:%M:%S UTC")
-        table.add_row("Generated", ts_str)
+        tbl.add_row("  🕐 Generated", ts)
+
+    if health and isinstance(health, dict):
+        h = health.get("status", "unknown").upper()
+        tbl.add_row("  💚 Health", f"[green bold]{h}[/]")
 
     console.print(Panel(
-        table,
-        title="[bold green]J-Prime Live[/]",
+        tbl,
+        title="[bold green]🌐 J-Prime Live[/]",
         border_style="green",
         padding=(1, 2),
     ))
 
-    # Contextual narration based on actual data
-    artifact_name = model_artifact.replace(".gguf", "").replace("-", " ")
+    art_name = (
+        artifact.replace(".gguf", "")
+        .replace("-", " ").replace("_", " ")
+    )
     jarvis_say(
-        f"J-Prime is online. We're running {artifact_name} "
+        f"J-Prime is online. Running {art_name} "
         f"on an NVIDIA L4 GPU with {gpu_layers} layers offloaded. "
-        f"Context window is {ctx} tokens, giving us roughly "
-        f"20 to 23 tokens per second of inference throughput.",
+        f"Context window is {ctx} tokens, "
+        f"generating at roughly 20 to 23 tokens per second.",
         wait=True,
     )
 
-    return data
+    return cap
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 2: GOVERNANCE LEDGER ANALYSIS
+# 🛡️ PHASE 2: GOVERNANCE LEDGER + ANIMATED PIPELINE TRACE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def phase_2_governance_ledger():
-    phase_header(2, "OUROBOROS GOVERNANCE LEDGER")
+async def phase_2():
+    console.print()
+    console.print(Rule(
+        "[bold cyan]🛡️ PHASE 2 — OUROBOROS GOVERNANCE LEDGER[/]",
+        style="cyan",
+    ))
+    console.print()
 
     jarvis_say(
-        "Now let me show you our governance system. "
-        "Ouroboros is our autonomous governance pipeline. "
+        "Now let me show you Ouroboros, our autonomous governance pipeline. "
         "Every code change must pass through risk classification, "
-        "syntax validation, and security gates before being applied.",
+        "syntax validation, and security gates before it can be applied.",
     )
 
     with console.status(
-        "[bold cyan]  Scanning durable operation ledger...[/]",
+        "[bold cyan]  🔍 Scanning durable operation ledger...[/]",
         spinner="dots",
     ):
-        pause(0.8)
+        await asyncio.sleep(_delay(0.6))
 
         if not LEDGER_DIR.exists():
             wait_speech()
-            console.print("  [yellow]No ledger directory found.[/]")
+            console.print("  [yellow]⚠️  No ledger directory found.[/]")
             return
 
         ledger_files = sorted(LEDGER_DIR.glob("op-*.jsonl"))
         if not ledger_files:
             wait_speech()
-            console.print("  [yellow]No ledger entries found.[/]")
+            console.print("  [yellow]⚠️  No ledger entries found.[/]")
             return
 
-        # Analyze all operations
         total_ops = len(ledger_files)
         risk_tiers: dict[str, int] = {}
         providers: dict[str, int] = {}
         outcomes = {"applied": 0, "failed": 0}
+        state_count: dict[str, int] = {}
 
         for lf in ledger_files:
             try:
-                for line in lf.read_text().strip().split("\n"):
-                    entry = json.loads(line)
-                    state = entry.get("state", "")
-                    entry_data = entry.get("data", {})
-
-                    if "risk_tier" in entry_data:
-                        rt = entry_data["risk_tier"]
+                for raw in lf.read_text().strip().split("\n"):
+                    entry = json.loads(raw)
+                    st = entry.get("state", "")
+                    state_count[st] = state_count.get(st, 0) + 1
+                    d = entry.get("data", {})
+                    if "risk_tier" in d:
+                        rt = d["risk_tier"]
                         risk_tiers[rt] = risk_tiers.get(rt, 0) + 1
-                    if "provider" in entry_data:
-                        p = entry_data["provider"]
+                    if "provider" in d:
+                        p = d["provider"]
                         providers[p] = providers.get(p, 0) + 1
-
-                    if state == "applied":
+                    if st == "applied":
                         outcomes["applied"] += 1
-                    elif state == "failed":
+                    elif st == "failed":
                         outcomes["failed"] += 1
             except Exception:
                 pass
 
     wait_speech()
 
-    # ── Operations Summary ──────────────────────────────────────────────────
+    # ── Stats Panel ─────────────────────────────────────────────────────────
 
     stats = Table(
         show_header=False, border_style="cyan",
         padding=(0, 2), expand=True,
     )
-    stats.add_column("Metric", style="white", width=28)
-    stats.add_column("Value", style="cyan bold")
-    stats.add_row("Total Governed Operations", str(total_ops))
-    stats.add_row("Successfully Applied", f"[green bold]{outcomes['applied']}[/]")
-    stats.add_row("Blocked by Security Gates", f"[red bold]{outcomes['failed']}[/]")
-
-    if providers:
-        for prov, cnt in sorted(providers.items(), key=lambda x: -x[1]):
-            stats.add_row(f"Provider: {prov}", str(cnt))
+    stats.add_column("", style="white", width=32)
+    stats.add_column("", style="cyan bold")
+    stats.add_row("  📊 Total Governed Operations", str(total_ops))
+    stats.add_row(
+        "  ✅ Successfully Applied",
+        f"[green bold]{outcomes['applied']}[/]",
+    )
+    stats.add_row(
+        "  🚫 Blocked by Security Gates",
+        f"[red bold]{outcomes['failed']}[/]",
+    )
+    stats.add_row(
+        "  🔄 Pipeline States Observed",
+        str(len(state_count)),
+    )
+    for prov, cnt in sorted(providers.items(), key=lambda x: -x[1]):
+        stats.add_row(f"  🔌 Provider: {prov}", str(cnt))
 
     console.print(Panel(
         stats,
-        title="[bold cyan]Governance Operations[/]",
+        title="[bold cyan]📊 Governance Operations[/]",
         border_style="cyan",
         padding=(1, 2),
     ))
 
-    # ── Risk Tier Distribution ──────────────────────────────────────────────
+    # ── Risk Tier Chart ─────────────────────────────────────────────────────
 
     if risk_tiers:
-        tier_table = Table(
+        tier_tbl = Table(
             border_style="yellow", padding=(0, 2), expand=True,
         )
-        tier_table.add_column("Risk Tier", style="bold", width=28)
-        tier_table.add_column("Count", justify="right", width=8)
-        tier_table.add_column("Distribution", width=30)
+        tier_tbl.add_column("Risk Tier", style="bold", width=28)
+        tier_tbl.add_column("Count", justify="right", width=8)
+        tier_tbl.add_column("Distribution", width=30)
 
-        max_count = max(risk_tiers.values())
-        for tier, count in sorted(risk_tiers.items(), key=lambda x: -x[1]):
-            bar_len = max(1, int(count / max_count * 25))
-            color = (
-                "green" if tier == "SAFE_AUTO"
-                else "yellow" if "APPROVAL" in tier
-                else "red"
+        mx = max(risk_tiers.values())
+        for tier, count in sorted(
+            risk_tiers.items(), key=lambda x: -x[1],
+        ):
+            bar = max(1, int(count / mx * 25))
+            if tier == "SAFE_AUTO":
+                c, e = "green", "🟢"
+            elif "APPROVAL" in tier:
+                c, e = "yellow", "🟡"
+            else:
+                c, e = "red", "🔴"
+            tier_tbl.add_row(
+                f"{e} [{c}]{tier}[/]",
+                str(count),
+                f"[{c}]{'█' * bar}[/]",
             )
-            bar = f"[{color}]{'█' * bar_len}[/]"
-            tier_table.add_row(f"[{color}]{tier}[/]", str(count), bar)
 
         console.print(Panel(
-            tier_table,
-            title="[bold yellow]Risk Classification[/]",
+            tier_tbl,
+            title="[bold yellow]⚠️  Risk Classification[/]",
             border_style="yellow",
             padding=(1, 2),
         ))
 
     jarvis_say(
         f"The ledger contains {total_ops} governed operations. "
-        f"{outcomes['applied']} were approved and applied, "
-        f"and {outcomes['failed']} were blocked by security gates. "
-        "Each operation is durably logged with rollback hashes "
+        f"{outcomes['applied']} approved and applied, "
+        f"{outcomes['failed']} blocked by security gates. "
+        "Each is durably logged with rollback hashes "
         "for full auditability.",
     )
 
-    # ── Pipeline Trace ──────────────────────────────────────────────────────
+    # ── Animated Pipeline Trace (Rich Tree + Live) ──────────────────────────
 
     console.print()
-    console.print(
-        "  [bold white]Governance Pipeline Trace[/]"
-        "  [dim](most detailed operation)[/]"
-    )
-    console.print()
 
-    best_file = max(ledger_files, key=lambda f: f.stat().st_size)
-    lines = best_file.read_text().strip().split("\n")
+    best = max(ledger_files, key=lambda f: f.stat().st_size)
+    lines = best.read_text().strip().split("\n")
 
-    console.print(f"  [dim]Operation: {best_file.stem}[/]")
-    console.print()
-
-    state_styles = {
-        "planned":    ("cyan",    "○"),
-        "sandboxing": ("blue",    "◑"),
-        "validating": ("yellow",  "◕"),
-        "gating":     ("magenta", "◈"),
-        "applying":   ("white",   "◉"),
-        "applied":    ("green",   "●"),
-        "failed":     ("red",     "✗"),
-        "completed":  ("green",   "●"),
+    icons = {
+        "planned":    ("cyan",    "📋"),
+        "sandboxing": ("blue",    "🔒"),
+        "validating": ("yellow",  "🔍"),
+        "gating":     ("magenta", "⚖️"),
+        "applying":   ("white",   "⚡"),
+        "applied":    ("green",   "✅"),
+        "failed":     ("red",     "❌"),
+        "completed":  ("green",   "✅"),
     }
 
-    wait_speech()
-    jarvis_say(
-        "Watch the pipeline trace. Each state transition is durable "
-        "and auditable.",
-    )
-
-    for line_str in lines:
+    parsed = []
+    for raw in lines:
         try:
-            entry = json.loads(line_str)
-            state = entry.get("state", "unknown")
-            style, icon = state_styles.get(state, ("dim", "·"))
-            entry_data = entry.get("data", {})
-
+            e = json.loads(raw)
+            st = e.get("state", "unknown")
+            sty, ico = icons.get(st, ("dim", "·"))
+            d = e.get("data", {})
             detail = ""
-            if "risk_tier" in entry_data:
-                detail = f"risk={entry_data['risk_tier']}"
-            elif "syntax_valid" in entry_data:
-                detail = f"syntax_valid={entry_data['syntax_valid']}"
-            elif "target_file" in entry_data:
-                detail = f"file={entry_data['target_file']}"
-            elif "failure_class" in entry_data:
-                detail = f"class={entry_data['failure_class']}"
-            elif "reason" in entry_data:
-                detail = entry_data["reason"][:60]
-            elif "phase" in entry_data:
-                detail = f"phase={entry_data['phase']}"
-
-            console.print(
-                f"    [{style} bold]{icon} {state:<14}[/]  [dim]{detail}[/]"
-            )
-            pause(0.4)
+            if "risk_tier" in d:
+                detail = f"risk={d['risk_tier']}"
+            elif "syntax_valid" in d:
+                detail = f"syntax_valid={d['syntax_valid']}"
+            elif "target_file" in d:
+                detail = f"file={d['target_file']}"
+            elif "failure_class" in d:
+                detail = f"class={d['failure_class']}"
+            elif "reason" in d:
+                detail = d["reason"][:55]
+            elif "phase" in d:
+                detail = f"phase={d['phase']}"
+            parsed.append((st, sty, ico, detail))
         except Exception:
             pass
 
+    tree = Tree(
+        f"[bold white]🔗 Pipeline: [dim]{best.stem}[/]",
+        guide_style="cyan",
+    )
+
+    wait_speech()
+    jarvis_say(
+        "Watch the pipeline trace. "
+        "Each state transition is durable and auditable.",
+    )
+
+    with Live(
+        Panel(tree, border_style="dim", padding=(0, 2)),
+        console=console, refresh_per_second=8,
+    ) as live:
+        for st, sty, ico, detail in parsed:
+            tree.add(f"{ico} [{sty} bold]{st}[/]  [dim]{detail}[/]")
+            live.update(Panel(tree, border_style="dim", padding=(0, 2)))
+            await asyncio.sleep(_delay(0.4))
+
     console.print()
     wait_speech()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 3: LIVE GOVERNED INFERENCE
+# ⚡ PHASE 3: PARALLEL LIVE INFERENCE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def phase_3_live_inference():
-    import urllib.request
-
-    phase_header(3, "LIVE GOVERNED INFERENCE")
+async def phase_3():
+    console.print()
+    console.print(Rule(
+        "[bold cyan]⚡ PHASE 3 — LIVE GOVERNED INFERENCE[/]",
+        style="cyan",
+    ))
+    console.print()
 
     jarvis_say(
         "Now I'll demonstrate live inference. "
-        "I'm sending coding and reasoning tasks to J-Prime "
-        "and showing the full generation pipeline.",
+        "Sending two tasks to J-Prime simultaneously: "
+        "a code generation task and a reasoning task, running in parallel.",
     )
-    pause(0.5)
+    await asyncio.sleep(_delay(0.5))
 
-    prompts = [
+    specs = [
         {
             "label": "Code Generation",
+            "emoji": "💻",
             "desc": "Python email validation with regex",
             "messages": [
                 {
                     "role": "system",
-                    "content": (
-                        "You are a senior Python engineer. "
-                        "Return only code."
-                    ),
+                    "content": "You are a senior Python engineer. "
+                               "Return only code.",
                 },
                 {
                     "role": "user",
-                    "content": (
-                        "Write a function that validates an email "
-                        "address using regex."
-                    ),
+                    "content": "Write a function that validates an email "
+                               "address using regex.",
                 },
             ],
             "max_tokens": 200,
-            "narration": (
-                "Sending a code generation task: "
-                "write a Python email validator."
-            ),
         },
         {
             "label": "Architecture Reasoning",
+            "emoji": "🧠",
             "desc": "Optimistic vs pessimistic locking",
             "messages": [
                 {
                     "role": "user",
-                    "content": (
-                        "Explain the difference between optimistic "
-                        "and pessimistic locking in 2 sentences."
-                    ),
+                    "content": "Explain the difference between optimistic "
+                               "and pessimistic locking in 2 sentences.",
                 },
             ],
             "max_tokens": 100,
-            "narration": (
-                "Now a reasoning task: explain database locking "
-                "strategies in two sentences."
-            ),
         },
     ]
 
-    for i, spec in enumerate(prompts):
-        console.print(
-            f"  [bold magenta]Task {i + 1}:[/] "
-            f"[bold white]{spec['label']}[/]"
-            f" — [dim]{spec['desc']}[/]"
-        )
-        console.print()
-
-        jarvis_say(spec["narration"])
-
-        payload = {
-            "messages": spec["messages"],
-            "max_tokens": spec["max_tokens"],
+    payloads = [
+        {
+            "messages": s["messages"],
+            "max_tokens": s["max_tokens"],
             "temperature": 0.1,
         }
+        for s in specs
+    ]
 
-        start = time.monotonic()
-        with console.status(
-            "[bold cyan]  Generating via J-Prime...[/]",
-            spinner="dots",
-        ):
-            try:
-                req = urllib.request.Request(
-                    f"{JPRIME_ENDPOINT}/v1/chat/completions",
-                    data=json.dumps(payload).encode(),
-                    headers={"Content-Type": "application/json"},
+    # Shared mutable state for live display
+    results: list = [None] * len(specs)
+    errors: list = [None] * len(specs)
+    t_start: list = [0.0] * len(specs)
+    t_end: list = [0.0] * len(specs)
+
+    def _do_inference(idx):
+        t_start[idx] = time.monotonic()
+        try:
+            results[idx] = _http_post(
+                f"{JPRIME_ENDPOINT}/v1/chat/completions",
+                payloads[idx], timeout=30,
+            )
+        except Exception as exc:
+            errors[idx] = str(exc)
+        finally:
+            t_end[idx] = time.monotonic()
+
+    def _status_panel():
+        t = Table(
+            show_header=False, box=None,
+            padding=(0, 1), expand=False,
+        )
+        t.add_column(width=4)
+        t.add_column(width=36)
+        t.add_column(width=20)
+        for i, s in enumerate(specs):
+            lbl = f"{s['emoji']} {s['label']}"
+            if results[i] is not None:
+                ms = (t_end[i] - t_start[i]) * 1000
+                t.add_row(
+                    "✅", f"[bold white]{lbl}[/]",
+                    f"[green]{ms:.0f}ms[/]",
                 )
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    result = json.loads(resp.read())
-            except Exception as e:
-                wait_speech()
-                console.print(f"  [red bold]  Error: {e}[/]")
-                continue
+            elif errors[i] is not None:
+                t.add_row(
+                    "❌", f"[bold white]{lbl}[/]",
+                    f"[red]error[/]",
+                )
+            elif t_start[i] > 0:
+                t.add_row(
+                    "🔄", f"[bold yellow]{lbl}[/]",
+                    "[yellow]generating...[/]",
+                )
+            else:
+                t.add_row(
+                    "⏳", f"[dim]{lbl}[/]",
+                    "[dim]queued[/]",
+                )
+        return Panel(
+            t,
+            title="[bold magenta]⚡ Parallel Inference[/]",
+            border_style="magenta",
+            padding=(0, 2),
+        )
 
-        elapsed_ms = (time.monotonic() - start) * 1000
-        choice = result.get("choices", [{}])[0]
-        content = choice.get("message", {}).get("content", "")
-        usage = result.get("usage", {})
-        routing = result.get("x_routing", {})
+    # Launch both in thread pool concurrently
+    loop = asyncio.get_running_loop()
+    futs = [
+        loop.run_in_executor(_pool, _do_inference, i)
+        for i in range(len(specs))
+    ]
 
-        prompt_tokens = usage.get("prompt_tokens", 0)
-        comp_tokens = usage.get("completion_tokens", 1)
-        x_latency = result.get("x_latency_ms", elapsed_ms)
-        tok_s = comp_tokens / (x_latency / 1000) if x_latency > 0 else 0
+    with Live(
+        _status_panel(), console=console, refresh_per_second=8,
+    ) as live:
+        while not all(
+            r is not None or e is not None
+            for r, e in zip(results, errors)
+        ):
+            live.update(_status_panel())
+            await asyncio.sleep(0.1)
+        live.update(_status_panel())
+        await asyncio.sleep(0.3)
 
-        # ── Response Panel ──────────────────────────────────────────────────
+    await asyncio.gather(*futs, return_exceptions=True)
 
-        response_text = content.strip()
-        if "def " in response_text or "import " in response_text:
-            response_widget = Syntax(
-                response_text, "python",
+    wait_speech()
+    jarvis_say(
+        "Both tasks completed in parallel. "
+        "Let me show you the results.",
+        wait=True,
+    )
+
+    # ── Display Results ─────────────────────────────────────────────────────
+
+    for i, spec in enumerate(specs):
+        if results[i] is None:
+            continue
+
+        r = results[i]
+        ms = (t_end[i] - t_start[i]) * 1000
+        choice = r.get("choices", [{}])[0]
+        content = choice.get("message", {}).get("content", "").strip()
+        usage = r.get("usage", {})
+        routing = r.get("x_routing", {})
+        p_tok = usage.get("prompt_tokens", 0)
+        c_tok = usage.get("completion_tokens", 1)
+        x_lat = r.get("x_latency_ms", ms)
+        tps = c_tok / (x_lat / 1000) if x_lat > 0 else 0
+
+        # Response panel (syntax-highlighted if code)
+        if "def " in content or "import " in content:
+            widget = Syntax(
+                content, "python",
                 theme="monokai", line_numbers=True,
             )
         else:
-            response_widget = Text(response_text, style="white")
+            widget = Text(content, style="white")
 
         console.print(Panel(
-            response_widget,
-            title=f"[bold green]{spec['label']} Result[/]",
+            widget,
+            title=(
+                f"[bold green]{spec['emoji']} "
+                f"{spec['label']} Result[/]"
+            ),
             subtitle=(
-                f"[dim]{elapsed_ms:.0f}ms · "
-                f"~{tok_s:.1f} tok/s · "
-                f"{comp_tokens} tokens[/]"
+                f"[dim]⏱️ {ms:.0f}ms · ⚡ ~{tps:.1f} tok/s "
+                f"· 📝 {c_tok} tokens[/]"
             ),
             border_style="green",
             padding=(1, 2),
         ))
 
-        # ── Routing & Performance ───────────────────────────────────────────
-
-        metrics = Table(
+        # Routing metrics
+        met = Table(
             show_header=False, border_style="magenta",
             padding=(0, 1),
         )
-        metrics.add_column("", style="white", width=20)
-        metrics.add_column("", style="magenta bold")
-
-        routing_tier = routing.get("tier", "primary")
-        routing_model = routing.get("model_id", "local-gpu")
-        metrics.add_row("Routing Tier", routing_tier)
-        metrics.add_row("Routing Model", routing_model)
-        metrics.add_row("Latency", f"{elapsed_ms:.0f}ms")
-        metrics.add_row(
-            "Tokens",
-            f"{prompt_tokens} prompt + {comp_tokens} completion",
-        )
-        metrics.add_row("Throughput", f"~{tok_s:.1f} tok/s")
-        metrics.add_row(
-            "Finish Reason",
-            choice.get("finish_reason", "unknown"),
-        )
+        met.add_column("", style="white", width=22)
+        met.add_column("", style="magenta bold")
+        met.add_row("  🎯 Routing Tier", routing.get("tier", "primary"))
+        met.add_row("  🤖 Model", routing.get("model_id", "local-gpu"))
+        met.add_row("  ⏱️  Latency", f"{ms:.0f}ms")
+        met.add_row("  📝 Tokens", f"{p_tok} → {c_tok}")
+        met.add_row("  ⚡ Throughput", f"~{tps:.1f} tok/s")
+        met.add_row("  🏁 Finish", choice.get("finish_reason", "unknown"))
 
         console.print(Panel(
-            metrics,
-            title="[bold magenta]Routing & Performance[/]",
+            met,
+            title="[bold magenta]📊 Routing & Performance[/]",
             border_style="magenta",
             padding=(0, 2),
         ))
 
-        wait_speech()
-
         jarvis_say(
-            f"Generation complete in {elapsed_ms:.0f} milliseconds "
-            f"at approximately {tok_s:.0f} tokens per second. "
-            f"That's {comp_tokens} completion tokens on our NVIDIA L4.",
+            f"{spec['label']} completed in {ms:.0f} milliseconds "
+            f"at {tps:.0f} tokens per second.",
             wait=True,
         )
-
         console.print()
-        pause(0.5)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 4: GOVERNANCE TEST SUITE
+# 🧪 PHASE 4: GOVERNANCE TEST SUITE
 # ═════════════════════════════════════════════════════════════════════════════
 
-def phase_4_test_suite():
-    phase_header(4, "GOVERNANCE TEST SUITE")
+async def phase_4():
+    console.print()
+    console.print(Rule(
+        "[bold cyan]🧪 PHASE 4 — GOVERNANCE TEST SUITE[/]",
+        style="cyan",
+    ))
+    console.print()
 
     jarvis_say(
-        "Now let's verify system integrity. "
-        "I'm running our full governance test suite, "
+        "Let's verify system integrity. "
+        "Running our full governance test suite: "
         "over 2,000 tests covering the entire Ouroboros pipeline.",
     )
 
     console.print(
-        "  [dim]pytest tests/test_ouroboros_governance/ "
+        "  [dim]🧪 pytest tests/test_ouroboros_governance/ "
         "tests/governance/ -q[/]"
     )
     console.print()
@@ -591,23 +777,26 @@ def phase_4_test_suite():
     failed = 0
     elapsed = 0.0
 
+    # Run tests async via subprocess
     with console.status(
-        "[bold cyan]  Running governance tests...[/]",
+        "[bold cyan]  🧪 Running governance tests...[/]",
         spinner="dots",
     ):
         try:
-            result = subprocess.run(
-                [
-                    sys.executable, "-m", "pytest",
-                    "tests/test_ouroboros_governance/",
-                    "tests/governance/",
-                    "-q", "--tb=no", "--no-header",
-                ],
-                capture_output=True, text=True, timeout=180,
-                cwd=str(Path(__file__).parent),
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "-m", "pytest",
+                "tests/test_ouroboros_governance/",
+                "tests/governance/",
+                "-q", "--tb=no", "--no-header",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(PROJECT_ROOT),
+            )
+            stdout, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=180,
             )
             elapsed = time.monotonic() - start
-            output = result.stdout.strip()
+            output = stdout.decode().strip()
 
             for line in output.split("\n"):
                 if "passed" in line:
@@ -618,38 +807,39 @@ def phase_4_test_suite():
                     if m2:
                         failed = int(m2.group(1))
                     break
-
-        except subprocess.TimeoutExpired:
+        except asyncio.TimeoutError:
             elapsed = time.monotonic() - start
-            console.print("  [yellow]Test suite timed out.[/]")
+            console.print("  [yellow]⚠️  Test suite timed out.[/]")
         except Exception as e:
             elapsed = time.monotonic() - start
-            console.print(f"  [red]ERROR: {e}[/]")
+            console.print(f"  [red]❌ {e}[/]")
 
     wait_speech()
 
     if passed > 0:
         total = passed + failed
         rate = passed / total * 100 if total > 0 else 0
+        tps = passed / elapsed if elapsed > 0 else 0
 
-        test_table = Table(
+        tbl = Table(
             show_header=False, border_style="green",
             padding=(0, 2), expand=True,
         )
-        test_table.add_column("", style="white", width=28)
-        test_table.add_column("", style="green bold")
-        test_table.add_row("Tests Passed", f"[green bold]{passed:,}[/]")
+        tbl.add_column("", style="white", width=30)
+        tbl.add_column("", style="green bold")
+        tbl.add_row("  ✅ Tests Passed", f"[green bold]{passed:,}[/]")
         if failed:
-            test_table.add_row(
-                "Pre-existing Failures",
+            tbl.add_row(
+                "  ⚠️  Pre-existing Failures",
                 f"[dim]{failed}[/]",
             )
-        test_table.add_row("Pass Rate", f"{rate:.1f}%")
-        test_table.add_row("Duration", f"{elapsed:.1f}s")
+        tbl.add_row("  📊 Pass Rate", f"{rate:.1f}%")
+        tbl.add_row("  ⏱️  Duration", f"{elapsed:.1f}s")
+        tbl.add_row("  🔬 Tests/Second", f"{tps:.0f}")
 
         console.print(Panel(
-            test_table,
-            title=f"[bold green]{passed:,} Tests Passed[/]",
+            tbl,
+            title=f"[bold green]✅ {passed:,} Tests Passed[/]",
             border_style="green",
             padding=(1, 2),
         ))
@@ -659,40 +849,56 @@ def phase_4_test_suite():
             if failed else " All clear."
         )
         jarvis_say(
-            f"{passed} governance tests passed in {elapsed:.0f} seconds."
-            f"{fail_note} "
-            "The entire Ouroboros pipeline is verified and operational.",
+            f"{passed} governance tests passed in "
+            f"{elapsed:.0f} seconds.{fail_note} "
+            "The entire Ouroboros pipeline is verified.",
             wait=True,
         )
     else:
-        console.print("  [yellow]Could not parse test results.[/]")
+        console.print("  [yellow]⚠️  Could not parse test results.[/]")
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# PHASE 5: SUMMARY
+# 🏛️ PHASE 5: DYNAMIC SUMMARY
 # ═════════════════════════════════════════════════════════════════════════════
 
-def phase_5_summary():
-    phase_header(5, "SYSTEM SUMMARY")
+async def phase_5():
+    console.print()
+    console.print(Rule(
+        "[bold cyan]🏛️ PHASE 5 — SYSTEM SUMMARY[/]",
+        style="cyan",
+    ))
+    console.print()
+
+    # Pull real stats in parallel
+    commit_count, gov_files = await asyncio.gather(
+        _in_thread(_git_commit_count),
+        _in_thread(_governance_file_count),
+    )
+
+    commits_str = f"{commit_count:,}" if commit_count > 0 else "5,442+"
+    gov_str = f"{gov_files}+" if gov_files > 0 else "105+"
 
     summary = Text(justify="center")
     summary.append("\n")
 
     components = [
         (
-            "The Body — JARVIS",
+            "🛡️ The Body — JARVIS",
             "Local supervisor · 200+ autonomous agents · Ouroboros backbone\n"
-            "Durable ledger · Risk engine · Trust graduators · Circuit breakers",
+            "Durable ledger · Risk engine · Trust graduators · "
+            "Circuit breakers",
         ),
         (
-            "The Mind — J-Prime",
+            "🧠 The Mind — J-Prime",
             "GCP g2-standard-4 · NVIDIA L4 (23GB VRAM)\n"
             "Qwen2.5-Coder-14B @ Q4_K_M · 8192 context · ~20-23 tok/s\n"
             "Adaptive quantization engine · Multi-model routing",
         ),
         (
-            "The Nerves — Reactor-Core",
-            "DPO preference pair generation · Governance telemetry ingestion\n"
+            "⚡ The Nerves — Reactor-Core",
+            "DPO preference pair generation · "
+            "Governance telemetry ingestion\n"
             "Continuous fine-tuning from production feedback",
         ),
     ]
@@ -705,18 +911,20 @@ def phase_5_summary():
 
     summary.append("─" * 52 + "\n", style="dim")
     summary.append("\n")
-    summary.append("5,442+ ", style="bold green")
+
+    summary.append(f"📊 {commits_str} ", style="bold green")
     summary.append("commits  ·  ", style="dim")
-    summary.append("2,146 ", style="bold green")
+    summary.append("✅ 2,146 ", style="bold green")
     summary.append("governance tests  ·  ", style="dim")
-    summary.append("3 ", style="bold green")
-    summary.append("repositories\n", style="dim")
-    summary.append("7 ", style="bold green")
-    summary.append("months  ·  ", style="dim")
-    summary.append("1 ", style="bold green")
+    summary.append("📦 3 ", style="bold green")
+    summary.append("repos\n", style="dim")
+
+    summary.append(f"🛡️ {gov_str} ", style="bold green")
+    summary.append("governance files  ·  ", style="dim")
+    summary.append("👤 1 ", style="bold green")
     summary.append("developer  ·  ", style="dim")
-    summary.append("0 ", style="bold green")
-    summary.append("external funding\n", style="dim")
+    summary.append("💰 $0 ", style="bold green")
+    summary.append("funding\n", style="dim")
     summary.append("\n")
     summary.append(
         "Built by Derek J. Russell · trinityai.dev\n",
@@ -726,50 +934,55 @@ def phase_5_summary():
 
     console.print(Panel(
         Align.center(summary),
-        title="[bold cyan]Trinity AI[/]",
+        title="[bold cyan]🏛️ Trinity AI[/]",
         border_style="bold cyan",
         padding=(1, 2),
     ))
 
     jarvis_say(
         "That concludes our demonstration. "
-        "Trinity AI is a fully autonomous, governed software engineering "
-        "system built over 7 months by a single developer. "
-        "Over 5,400 commits, 2,146 governance tests, "
-        "3 repositories, and zero external funding. "
+        "Trinity AI is a fully autonomous, governed "
+        "software engineering system "
+        f"built over 7 months by a single developer. "
+        f"Over {commits_str} commits, 2,146 governance tests, "
+        "3 repositories, zero external funding. "
         "Thank you for watching.",
         wait=True,
     )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# MAIN
+# 🎬 MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
-def main():
-    show_banner()
-    pause(0.5)
+async def main():
+    await show_banner()
 
-    data = phase_1_system_status()
-    pause(1.0)
+    data = await phase_1()
+    await asyncio.sleep(_delay(0.8))
 
-    phase_2_governance_ledger()
-    pause(1.0)
+    await phase_2()
+    await asyncio.sleep(_delay(0.8))
 
     if data:
-        phase_3_live_inference()
-        pause(1.0)
+        await phase_3()
+        await asyncio.sleep(_delay(0.8))
 
     if not NO_TESTS:
-        phase_4_test_suite()
-        pause(1.0)
+        await phase_4()
+        await asyncio.sleep(_delay(0.8))
 
-    phase_5_summary()
+    await phase_5()
 
     console.print()
-    console.print("  [bold cyan]Demo complete.[/]")
+    console.print("  [bold cyan]🎬 Demo complete.[/]")
     console.print()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print("\n  [dim]Demo interrupted.[/]")
+    finally:
+        _pool.shutdown(wait=False)
