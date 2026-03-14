@@ -1784,6 +1784,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -2112,6 +2113,7 @@ class ModelTransitionManager:
         self._active_requests: int = 0
         self._drain_event: Optional[asyncio.Event] = None
         self._event_callbacks: List[Callable[[ModelTransitionEvent], None]] = []
+        self._current_fitness: Optional[float] = None
 
     @property
     def state(self) -> TransitionState:
@@ -2191,12 +2193,14 @@ class ModelTransitionManager:
             old_grant = self._current_grant
 
             try:
-                # PREPARE
+                # PREPARE — use releasing_grant_id for two-grant swap reservation
                 self._state = TransitionState.PREPARE
+                releasing_id = self._current_grant.grant_id if self._current_grant else None
                 new_grant = await self._vram_authority.request(
                     f"model-{proposal.selected_variant.quant_name}",
                     target_size,
                     VRAMPriority.NORMAL,
+                    releasing_grant_id=releasing_id,
                 )
                 if new_grant is None:
                     self._state = TransitionState.IDLE
@@ -2245,6 +2249,7 @@ class ModelTransitionManager:
                 new_epoch = self._epoch.advance_model()
                 self._current_model_path = target_path
                 self._current_grant = new_grant
+                self._current_fitness = proposal.quality_score.fitness_score
                 self._last_swap_time = time.monotonic()
                 self._swap_times.append(time.monotonic())
 
@@ -2391,6 +2396,72 @@ class TestModelTransitionManager:
         fake_proposal.trigger = "pressure"
         result = await mgr.accept(fake_proposal)
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_rollback_on_validation_failure(self, mock_executor, tmp_models_dir, fake_gguf_files):
+        """Validation failure should trigger ROLLBACK and restore previous model."""
+        from jarvis_prime.core.adaptive_model_selector import scan_inventory, propose_optimal
+
+        mock_executor.validate = AsyncMock(return_value=False)
+        auth = VRAMBudgetAuthority(total_vram_bytes=23_034 * 1024 * 1024)
+        mgr = ModelTransitionManager(
+            executor=mock_executor, vram_authority=auth, model_dir=tmp_models_dir,
+        )
+        families = await scan_inventory(tmp_models_dir)
+        proposal = await propose_optimal(
+            families=families, vram_budget_bytes=23_034 * 1024 * 1024,
+            target_context=8192, task_complexity="medium", trigger="startup",
+        )
+        result = await mgr.accept(proposal)
+        assert result is False
+        assert mgr.state == TransitionState.IDLE
+
+    @pytest.mark.asyncio
+    async def test_rollback_on_load_failure(self, mock_executor, tmp_models_dir, fake_gguf_files):
+        """Load failure should trigger ROLLBACK."""
+        from jarvis_prime.core.adaptive_model_selector import scan_inventory, propose_optimal
+
+        mock_executor.load = AsyncMock(side_effect=RuntimeError("OOM"))
+        auth = VRAMBudgetAuthority(total_vram_bytes=23_034 * 1024 * 1024)
+        mgr = ModelTransitionManager(
+            executor=mock_executor, vram_authority=auth, model_dir=tmp_models_dir,
+        )
+        families = await scan_inventory(tmp_models_dir)
+        proposal = await propose_optimal(
+            families=families, vram_budget_bytes=23_034 * 1024 * 1024,
+            target_context=8192, task_complexity="medium", trigger="startup",
+        )
+        result = await mgr.accept(proposal)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_reject_during_cold_start_lockout(self, mock_executor, tmp_models_dir):
+        """Swaps should be rejected during cold start lockout."""
+        auth = VRAMBudgetAuthority(total_vram_bytes=23_034 * 1024 * 1024)
+        mgr = ModelTransitionManager(
+            executor=mock_executor, vram_authority=auth, model_dir=tmp_models_dir,
+        )
+        # Cold start lockout = 120s, just started
+        mgr._started_at = time.monotonic()
+        from unittest.mock import MagicMock
+        fake_proposal = MagicMock()
+        fake_proposal.trigger = "pressure"  # Not "startup" — startup bypasses cooldown
+        result = await mgr.accept(fake_proposal)
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_swap_reservation_same_size(self):
+        """Two-grant swap reservation should allow same-size model swaps."""
+        auth = VRAMBudgetAuthority(total_vram_bytes=23_000_000_000)
+        g1 = await auth.request("model-a", 11_000_000_000, VRAMPriority.NORMAL)
+        assert g1 is not None
+        await g1.commit(11_000_000_000)
+        # Without releasing_grant_id, this would fail (11+11 > 23)
+        g2 = await auth.request(
+            "model-b", 11_000_000_000, VRAMPriority.NORMAL,
+            releasing_grant_id=g1.grant_id,
+        )
+        assert g2 is not None
 ```
 
 - [ ] **Step 6: Run all transition manager tests**
@@ -2769,7 +2840,88 @@ git commit -m "feat: extend /v1/capability with quantization engine v2.0 fields"
 
 ---
 
-### Task 10: Run Full Test Suite
+### Task 10: Wire Modules into run_server.py Startup
+
+**Files:**
+- Modify: `run_server.py`
+
+- [ ] **Step 1: Read current startup flow**
+
+Run: Read `run_server.py` and search for `_load_model` and `_startup_state` to understand wiring points.
+
+- [ ] **Step 2: Add module instantiation to startup**
+
+After the existing model loading code in `run_server.py`, add the adaptive quantization engine wiring. The exact insertion point depends on the current startup flow, but the pattern is:
+
+```python
+# === Adaptive Quantization Engine wiring ===
+# These are lazy-imported to avoid circular dependencies
+try:
+    from jarvis_prime.core.vram_pressure_monitor import VRAMPressureMonitor, VRAMMonitorConfig
+    from jarvis_prime.core.model_transition_manager import (
+        ModelTransitionManager, VRAMBudgetAuthority, TransitionPolicy,
+    )
+    from jarvis_prime.core.adaptive_model_selector import scan_inventory, propose_optimal
+
+    # Detect total VRAM
+    _total_vram = 23_034 * 1024 * 1024  # Default L4
+    try:
+        import subprocess as _sp
+        _nv = _sp.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if _nv.returncode == 0:
+            _total_vram = int(float(_nv.stdout.strip()) * 1024 * 1024)
+    except Exception:
+        pass
+
+    _vram_authority = VRAMBudgetAuthority(total_vram_bytes=_total_vram)
+    _vram_monitor = VRAMPressureMonitor(
+        config=VRAMMonitorConfig(),
+        node_id=os.getenv("JARVIS_HOST_ID", "gcp-jarvis-prime-stable"),
+    )
+    _transition_manager = ModelTransitionManager(
+        executor=_executor,  # The LlamaCppExecutor instance
+        vram_authority=_vram_authority,
+        model_dir=Path(os.getenv("GCP_MODELS_DIR", "models")),
+    )
+
+    # Store on startup state for capability endpoint access
+    if _startup_state:
+        _startup_state.transition_manager = _transition_manager
+        _startup_state.vram_monitor = _vram_monitor
+
+    # Start VRAM monitor background task
+    asyncio.create_task(_vram_monitor.start())
+
+    logger.info("[AQE] Adaptive Quantization Engine wired successfully")
+except ImportError as e:
+    logger.info(f"[AQE] Adaptive Quantization Engine not available: {e}")
+except Exception as e:
+    logger.warning(f"[AQE] Failed to wire Adaptive Quantization Engine: {e}")
+```
+
+**Note:** The exact variable names (`_executor`, `_startup_state`) must match the existing run_server.py code. Read the file first to identify the correct names.
+
+- [ ] **Step 3: Verify syntax**
+
+Run: `cd /Users/djrussell23/Documents/repos/jarvis-prime && python3 -c "import ast; ast.parse(open('run_server.py').read()); print('OK')"`
+Expected: OK
+
+- [ ] **Step 4: Commit**
+
+```bash
+cd /Users/djrussell23/Documents/repos/jarvis-prime
+git add run_server.py
+git commit -m "feat: wire adaptive quantization engine into run_server.py startup"
+```
+
+---
+
+### Task 11: Run Full Test Suite
+
+**Note on deferred scope:** The download trust chain (spec Section 3.2.4 — quarantine pipeline, `DownloadProposal`, `DownloadRegistry`) is intentionally deferred to Phase 2. The current plan covers all 6 modules for model selection, scoring, transitions, and monitoring. Download automation will be added after the core engine is validated in production.
 
 - [ ] **Step 1: Run all new tests**
 
