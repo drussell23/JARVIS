@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 import os
 import re
@@ -38,7 +39,7 @@ from rich.align import Align
 from rich.tree import Tree
 from rich.live import Live
 
-# ── Configuration (all from env / flags — zero hardcoding) ──────────────────
+# ── Configuration (all from env / flags) ────────────────────────────────────
 
 JPRIME_ENDPOINT = os.getenv("JPRIME_ENDPOINT", "http://136.113.252.164:8000")
 LEDGER_DIR = Path(os.getenv(
@@ -56,47 +57,75 @@ console = Console()
 _pool = ThreadPoolExecutor(max_workers=4)
 
 
-def _delay(normal: float):
-    """Delay seconds, halved in --fast mode."""
+def _delay(normal: float) -> float:
     return normal * 0.3 if FAST else normal
 
 
-# ── Voice Engine ────────────────────────────────────────────────────────────
+# ── Voice Engine (robust: no overlap, no cutoff, cleanup) ───────────────────
 
 _speech_proc = None
 
 
-def jarvis_say(text: str, wait: bool = False):
-    """JARVIS speaks via macOS TTS (Daniel voice). Non-blocking by default."""
+def _cleanup_speech():
+    """Kill any running speech process (called on exit)."""
+    global _speech_proc
+    if _speech_proc and _speech_proc.poll() is None:
+        _speech_proc.terminate()
+        try:
+            _speech_proc.wait(timeout=2)
+        except Exception:
+            _speech_proc.kill()
+    _speech_proc = None
+
+
+atexit.register(_cleanup_speech)
+
+
+def _kill_stale_say():
+    """Kill any leftover say processes from previous runs."""
+    if NO_VOICE:
+        return
+    subprocess.run(
+        ["pkill", "-f", f"say -v {VOICE}"],
+        capture_output=True, timeout=3,
+    )
+    time.sleep(0.1)
+
+
+def jarvis_say(text: str, wait: bool = True):
+    """JARVIS speaks via macOS TTS. Blocks by default to prevent cutoff."""
     global _speech_proc
     if NO_VOICE:
         return
-    if _speech_proc and _speech_proc.poll() is None:
+    # ALWAYS wait for previous speech to fully complete (prevents overlap)
+    if _speech_proc is not None:
         _speech_proc.wait()
+        _speech_proc = None
     _speech_proc = subprocess.Popen(
         ["say", "-v", VOICE, "-r", SPEECH_RATE, text],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     if wait:
         _speech_proc.wait()
+        _speech_proc = None
 
 
 def wait_speech():
     """Block until current speech finishes."""
     global _speech_proc
-    if _speech_proc:
+    if _speech_proc is not None:
         _speech_proc.wait()
         _speech_proc = None
 
 
 # ── Async HTTP ──────────────────────────────────────────────────────────────
 
-def _http_get(url: str, timeout: int = 10):
+def _http_get(url: str, timeout: int = 10) -> dict:
     with urlopen(Request(url), timeout=timeout) as r:
         return json.loads(r.read())
 
 
-def _http_post(url: str, payload: dict, timeout: int = 30):
+def _http_post(url: str, payload: dict, timeout: int = 30) -> dict:
     data = json.dumps(payload).encode()
     req = Request(url, data=data, headers={"Content-Type": "application/json"})
     with urlopen(req, timeout=timeout) as r:
@@ -127,7 +156,7 @@ def _governance_file_count() -> int:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 🚀 BANNER + BOOT SEQUENCE
+# 🚀 BANNER + ANIMATED BOOT SEQUENCE
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def show_banner():
@@ -156,10 +185,13 @@ async def show_banner():
         padding=(0, 4),
     ))
 
+    # JARVIS intro speaks WHILE boot sequence animates
     jarvis_say(
         "Welcome to the Trinity AI demonstration. "
         "I'm JARVIS, your autonomous software engineering system. "
-        "Let me walk you through our governed inference pipeline in real time.",
+        "I'll walk you through our governed inference pipeline "
+        "in real time.",
+        wait=False,  # concurrent with boot animation
     )
 
     # ── Animated Boot Sequence ──────────────────────────────────────────────
@@ -175,26 +207,15 @@ async def show_banner():
     booted = 0
 
     def _boot_panel():
-        t = Table(
-            show_header=False, box=None,
-            padding=(0, 1), expand=False,
-        )
+        t = Table(show_header=False, box=None, padding=(0, 1), expand=False)
         t.add_column(width=4)
         t.add_column(width=34)
         t.add_column(width=4)
         for i, (emoji, name) in enumerate(systems):
             if i < booted:
-                t.add_row(
-                    emoji,
-                    f"[bold white]{name}[/]",
-                    "[green bold]✅[/]",
-                )
+                t.add_row(emoji, f"[bold white]{name}[/]", "[green bold]✅[/]")
             elif i == booted:
-                t.add_row(
-                    emoji,
-                    f"[bold yellow]{name}[/]",
-                    "[yellow]⏳[/]",
-                )
+                t.add_row(emoji, f"[bold yellow]{name}[/]", "[yellow]⏳[/]")
         return Panel(
             t,
             title="[bold cyan]🚀 System Boot[/]",
@@ -210,12 +231,13 @@ async def show_banner():
             live.update(_boot_panel())
             await asyncio.sleep(_delay(0.15))
 
+    # Wait for JARVIS to finish intro before proceeding
     wait_speech()
     console.print()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 🌐 PHASE 1: SYSTEM STATUS (parallel health + capability)
+# 🌐 PHASE 1 — LIVE SYSTEM STATUS
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_1():
@@ -226,13 +248,15 @@ async def phase_1():
     ))
     console.print()
 
+    # JARVIS speaks THEN spinner starts
     jarvis_say(
-        "Connecting to J-Prime, our GPU inference engine "
-        "on Google Cloud Platform.",
+        "First, let me connect to J-Prime, "
+        "our GPU inference engine running on Google Cloud Platform.",
+        wait=True,
     )
 
-    cap = None
-    health = None
+    cap: dict = {}
+    health: dict | None = None
 
     with console.status(
         "[bold cyan]  📡 Querying J-Prime on GCP NVIDIA L4...[/]",
@@ -249,16 +273,15 @@ async def phase_1():
                 cap_f, health_f, return_exceptions=True,
             )
             cap_result, health_result = results
-            if isinstance(cap_result, Exception):
+            if isinstance(cap_result, BaseException):
                 raise cap_result
             cap = cap_result
             health = (
                 health_result
-                if not isinstance(health_result, Exception)
+                if isinstance(health_result, dict)
                 else None
             )
         except Exception as e:
-            wait_speech()
             console.print(f"  [red bold]❌ Cannot reach J-Prime: {e}[/]")
             jarvis_say(
                 "Unable to reach J-Prime. "
@@ -267,9 +290,7 @@ async def phase_1():
             )
             return None
 
-    wait_speech()
-
-    # ── Build Capability Table ──────────────────────────────────────────────
+    # ── Capability Table ────────────────────────────────────────────────────
 
     model_id = cap.get("model_id", "unknown")
     artifact = cap.get("model_artifact", "unknown")
@@ -316,15 +337,17 @@ async def phase_1():
         padding=(1, 2),
     ))
 
+    # JARVIS comments on results (blocks until done)
     art_name = (
         artifact.replace(".gguf", "")
         .replace("-", " ").replace("_", " ")
     )
     jarvis_say(
-        f"J-Prime is online. Running {art_name} "
+        f"J-Prime is online. We're running {art_name} "
         f"on an NVIDIA L4 GPU with {gpu_layers} layers offloaded. "
         f"Context window is {ctx} tokens, "
-        f"generating at roughly 20 to 23 tokens per second.",
+        f"giving us roughly 20 to 23 tokens per second "
+        f"of inference throughput.",
         wait=True,
     )
 
@@ -332,7 +355,7 @@ async def phase_1():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 🛡️ PHASE 2: GOVERNANCE LEDGER + ANIMATED PIPELINE TRACE
+# 🛡️ PHASE 2 — OUROBOROS GOVERNANCE LEDGER
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_2():
@@ -343,26 +366,26 @@ async def phase_2():
     ))
     console.print()
 
+    # JARVIS speaks THEN spinner starts
     jarvis_say(
         "Now let me show you Ouroboros, our autonomous governance pipeline. "
         "Every code change must pass through risk classification, "
         "syntax validation, and security gates before it can be applied.",
+        wait=True,
     )
 
     with console.status(
         "[bold cyan]  🔍 Scanning durable operation ledger...[/]",
         spinner="dots",
     ):
-        await asyncio.sleep(_delay(0.6))
+        await asyncio.sleep(_delay(0.8))
 
         if not LEDGER_DIR.exists():
-            wait_speech()
             console.print("  [yellow]⚠️  No ledger directory found.[/]")
             return
 
         ledger_files = sorted(LEDGER_DIR.glob("op-*.jsonl"))
         if not ledger_files:
-            wait_speech()
             console.print("  [yellow]⚠️  No ledger entries found.[/]")
             return
 
@@ -391,8 +414,6 @@ async def phase_2():
                         outcomes["failed"] += 1
             except Exception:
                 pass
-
-    wait_speech()
 
     # ── Stats Panel ─────────────────────────────────────────────────────────
 
@@ -447,8 +468,7 @@ async def phase_2():
             else:
                 c, e = "red", "🔴"
             tier_tbl.add_row(
-                f"{e} [{c}]{tier}[/]",
-                str(count),
+                f"{e} [{c}]{tier}[/]", str(count),
                 f"[{c}]{'█' * bar}[/]",
             )
 
@@ -459,12 +479,14 @@ async def phase_2():
             padding=(1, 2),
         ))
 
+    # JARVIS comments on stats (blocks until done)
     jarvis_say(
         f"The ledger contains {total_ops} governed operations. "
-        f"{outcomes['applied']} approved and applied, "
-        f"{outcomes['failed']} blocked by security gates. "
-        "Each is durably logged with rollback hashes "
+        f"{outcomes['applied']} were approved and applied, "
+        f"and {outcomes['failed']} were blocked by our security gates. "
+        "Every operation is durably logged with rollback hashes "
         "for full auditability.",
+        wait=True,
     )
 
     # ── Animated Pipeline Trace (Rich Tree + Live) ──────────────────────────
@@ -514,10 +536,11 @@ async def phase_2():
         guide_style="cyan",
     )
 
-    wait_speech()
+    # JARVIS narrates WHILE the trace animates
     jarvis_say(
         "Watch the pipeline trace. "
         "Each state transition is durable and auditable.",
+        wait=False,  # concurrent with animation
     )
 
     with Live(
@@ -527,14 +550,15 @@ async def phase_2():
         for st, sty, ico, detail in parsed:
             tree.add(f"{ico} [{sty} bold]{st}[/]  [dim]{detail}[/]")
             live.update(Panel(tree, border_style="dim", padding=(0, 2)))
-            await asyncio.sleep(_delay(0.4))
+            await asyncio.sleep(_delay(0.45))
 
     console.print()
+    # Ensure JARVIS finishes before moving on
     wait_speech()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ⚡ PHASE 3: PARALLEL LIVE INFERENCE
+# ⚡ PHASE 3 — PARALLEL LIVE INFERENCE
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_3():
@@ -545,11 +569,15 @@ async def phase_3():
     ))
     console.print()
 
+    # JARVIS speaks fully THEN parallel inference starts
     jarvis_say(
         "Now I'll demonstrate live inference. "
-        "Sending two tasks to J-Prime simultaneously: "
-        "a code generation task and a reasoning task, running in parallel.",
+        "I'm sending two tasks to J-Prime simultaneously: "
+        "a code generation task and a reasoning task, "
+        "running in parallel on our GPU.",
+        wait=True,
     )
+
     await asyncio.sleep(_delay(0.5))
 
     specs = [
@@ -614,30 +642,28 @@ async def phase_3():
             t_end[idx] = time.monotonic()
 
     def _status_panel():
-        t = Table(
-            show_header=False, box=None,
-            padding=(0, 1), expand=False,
-        )
+        t = Table(show_header=False, box=None, padding=(0, 1), expand=False)
         t.add_column(width=4)
         t.add_column(width=36)
-        t.add_column(width=20)
+        t.add_column(width=22)
         for i, s in enumerate(specs):
             lbl = f"{s['emoji']} {s['label']}"
             if results[i] is not None:
                 ms = (t_end[i] - t_start[i]) * 1000
                 t.add_row(
                     "✅", f"[bold white]{lbl}[/]",
-                    f"[green]{ms:.0f}ms[/]",
+                    f"[green bold]{ms:.0f}ms[/]",
                 )
             elif errors[i] is not None:
                 t.add_row(
                     "❌", f"[bold white]{lbl}[/]",
-                    f"[red]error[/]",
+                    "[red]error[/]",
                 )
             elif t_start[i] > 0:
+                elapsed = (time.monotonic() - t_start[i]) * 1000
                 t.add_row(
                     "🔄", f"[bold yellow]{lbl}[/]",
-                    "[yellow]generating...[/]",
+                    f"[yellow]generating... {elapsed:.0f}ms[/]",
                 )
             else:
                 t.add_row(
@@ -659,20 +685,21 @@ async def phase_3():
     ]
 
     with Live(
-        _status_panel(), console=console, refresh_per_second=8,
+        _status_panel(), console=console, refresh_per_second=4,
     ) as live:
         while not all(
             r is not None or e is not None
             for r, e in zip(results, errors)
         ):
             live.update(_status_panel())
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.15)
+        # Final update showing completion
         live.update(_status_panel())
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.5)
 
     await asyncio.gather(*futs, return_exceptions=True)
 
-    wait_speech()
+    # JARVIS announces completion
     jarvis_say(
         "Both tasks completed in parallel. "
         "Let me show you the results.",
@@ -721,8 +748,7 @@ async def phase_3():
 
         # Routing metrics
         met = Table(
-            show_header=False, border_style="magenta",
-            padding=(0, 1),
+            show_header=False, border_style="magenta", padding=(0, 1),
         )
         met.add_column("", style="white", width=22)
         met.add_column("", style="magenta bold")
@@ -740,16 +766,18 @@ async def phase_3():
             padding=(0, 2),
         ))
 
+        # JARVIS comments on each result
         jarvis_say(
             f"{spec['label']} completed in {ms:.0f} milliseconds "
-            f"at {tps:.0f} tokens per second.",
+            f"at approximately {tps:.0f} tokens per second. "
+            f"That's {c_tok} completion tokens on our NVIDIA L4.",
             wait=True,
         )
         console.print()
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 🧪 PHASE 4: GOVERNANCE TEST SUITE
+# 🧪 PHASE 4 — GOVERNANCE TEST SUITE
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_4():
@@ -760,10 +788,12 @@ async def phase_4():
     ))
     console.print()
 
+    # JARVIS speaks fully THEN tests start
     jarvis_say(
-        "Let's verify system integrity. "
-        "Running our full governance test suite: "
+        "Now let's verify system integrity. "
+        "I'm running our full governance test suite: "
         "over 2,000 tests covering the entire Ouroboros pipeline.",
+        wait=True,
     )
 
     console.print(
@@ -776,45 +806,69 @@ async def phase_4():
     passed = 0
     failed = 0
     elapsed = 0.0
+    stdout_data = b""
 
-    # Run tests async via subprocess
-    with console.status(
-        "[bold cyan]  🧪 Running governance tests...[/]",
-        spinner="dots",
-    ):
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                sys.executable, "-m", "pytest",
-                "tests/test_ouroboros_governance/",
-                "tests/governance/",
-                "-q", "--tb=no", "--no-header",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=str(PROJECT_ROOT),
-            )
-            stdout, _ = await asyncio.wait_for(
-                proc.communicate(), timeout=180,
-            )
-            elapsed = time.monotonic() - start
-            output = stdout.decode().strip()
+    # Run tests async with live timer
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-m", "pytest",
+            "tests/test_ouroboros_governance/",
+            "tests/governance/",
+            "-q", "--tb=no", "--no-header",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=str(PROJECT_ROOT),
+        )
 
-            for line in output.split("\n"):
-                if "passed" in line:
-                    m = re.search(r"(\d+) passed", line)
-                    if m:
-                        passed = int(m.group(1))
-                    m2 = re.search(r"(\d+) failed", line)
-                    if m2:
-                        failed = int(m2.group(1))
+        comm_task = asyncio.create_task(proc.communicate())
+
+        with Live(console=console, refresh_per_second=2) as live:
+            while not comm_task.done():
+                secs = time.monotonic() - start
+                live.update(Panel(
+                    f"  [bold cyan]🧪 Running governance tests..."
+                    f"[/]  [dim]{secs:.0f}s elapsed[/]",
+                    border_style="cyan",
+                    padding=(0, 2),
+                ))
+                if secs > 180:
+                    proc.kill()
                     break
-        except asyncio.TimeoutError:
-            elapsed = time.monotonic() - start
-            console.print("  [yellow]⚠️  Test suite timed out.[/]")
-        except Exception as e:
-            elapsed = time.monotonic() - start
-            console.print(f"  [red]❌ {e}[/]")
+                await asyncio.sleep(0.5)
 
-    wait_speech()
+            # Final update
+            secs = time.monotonic() - start
+            live.update(Panel(
+                f"  [bold green]✅ Tests complete[/]"
+                f"  [dim]{secs:.0f}s[/]",
+                border_style="green",
+                padding=(0, 2),
+            ))
+            await asyncio.sleep(0.3)
+
+        elapsed = time.monotonic() - start
+
+        if comm_task.done() and not comm_task.cancelled():
+            stdout_data, _ = comm_task.result()
+
+        output = stdout_data.decode().strip()
+
+        for line in output.split("\n"):
+            if "passed" in line:
+                m = re.search(r"(\d+) passed", line)
+                if m:
+                    passed = int(m.group(1))
+                m2 = re.search(r"(\d+) failed", line)
+                if m2:
+                    failed = int(m2.group(1))
+                break
+
+    except asyncio.TimeoutError:
+        elapsed = time.monotonic() - start
+        console.print("  [yellow]⚠️  Test suite timed out.[/]")
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        console.print(f"  [red]❌ {e}[/]")
 
     if passed > 0:
         total = passed + failed
@@ -851,7 +905,7 @@ async def phase_4():
         jarvis_say(
             f"{passed} governance tests passed in "
             f"{elapsed:.0f} seconds.{fail_note} "
-            "The entire Ouroboros pipeline is verified.",
+            "The entire Ouroboros pipeline is verified and operational.",
             wait=True,
         )
     else:
@@ -859,7 +913,7 @@ async def phase_4():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 🏛️ PHASE 5: DYNAMIC SUMMARY
+# 🏛️ PHASE 5 — DYNAMIC SUMMARY
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_5():
@@ -885,14 +939,16 @@ async def phase_5():
     components = [
         (
             "🛡️ The Body — JARVIS",
-            "Local supervisor · 200+ autonomous agents · Ouroboros backbone\n"
+            "Local supervisor · 200+ autonomous agents · "
+            "Ouroboros backbone\n"
             "Durable ledger · Risk engine · Trust graduators · "
             "Circuit breakers",
         ),
         (
             "🧠 The Mind — J-Prime",
             "GCP g2-standard-4 · NVIDIA L4 (23GB VRAM)\n"
-            "Qwen2.5-Coder-14B @ Q4_K_M · 8192 context · ~20-23 tok/s\n"
+            "Qwen2.5-Coder-14B @ Q4_K_M · 8192 context · "
+            "~20-23 tok/s\n"
             "Adaptive quantization engine · Multi-model routing",
         ),
         (
@@ -942,10 +998,10 @@ async def phase_5():
     jarvis_say(
         "That concludes our demonstration. "
         "Trinity AI is a fully autonomous, governed "
-        "software engineering system "
+        "software engineering system, "
         f"built over 7 months by a single developer. "
         f"Over {commits_str} commits, 2,146 governance tests, "
-        "3 repositories, zero external funding. "
+        "3 repositories, and zero external funding. "
         "Thank you for watching.",
         wait=True,
     )
@@ -956,21 +1012,25 @@ async def phase_5():
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def main():
+    # Kill any stale say processes from previous interrupted runs
+    _kill_stale_say()
+
     await show_banner()
+    await asyncio.sleep(_delay(1.2))
 
     data = await phase_1()
-    await asyncio.sleep(_delay(0.8))
+    await asyncio.sleep(_delay(1.2))
 
     await phase_2()
-    await asyncio.sleep(_delay(0.8))
+    await asyncio.sleep(_delay(1.2))
 
     if data:
         await phase_3()
-        await asyncio.sleep(_delay(0.8))
+        await asyncio.sleep(_delay(1.2))
 
     if not NO_TESTS:
         await phase_4()
-        await asyncio.sleep(_delay(0.8))
+        await asyncio.sleep(_delay(1.2))
 
     await phase_5()
 
@@ -985,4 +1045,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         console.print("\n  [dim]Demo interrupted.[/]")
     finally:
+        _cleanup_speech()
         _pool.shutdown(wait=False)
