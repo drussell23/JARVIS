@@ -1,0 +1,22 @@
+{
+  "workflow_name": "CodeQL Security Analysis",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/19324063898",
+  "branch": "main",
+  "commit_sha": "4f89ad2",
+  "run_number": 376,
+  "failed_count": 1,
+  "fix_branch": "fix/ci/codeql-security-analysis-run376-20251113-083135",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: CodeQL Security Analysis (Run #376)",
+  "analyses": [
+    {
+      "error_patterns": [],
+      "suggested_fixes": [
+        "Check the workflow logs for more details"
+      ],
+      "severity": "medium",
+      "category": "unknown",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-11-13T08:31:35.960721"
+}
