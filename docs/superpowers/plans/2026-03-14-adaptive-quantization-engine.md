@@ -2774,58 +2774,64 @@ git commit -m "feat: implement quality regression tester with calibration persis
 
 ## Chunk 7: Integration Patches
 
-### Task 9: Extend `/v1/capability` Endpoint
+### Task 9: Extend `/v1/capability` Endpoint (Additive, Non-Breaking)
 
 **Files:**
-- Modify: `jarvis_prime/server.py` (around line 1562-1650)
+- Modify: `jarvis_prime/server.py` -- search for `@app.get("/v1/capability")` (symbol anchor, NOT line number)
+
+**Critical:** Schema version stays `"1.0"`. New fields are **added alongside** existing fields. Do NOT bump to `"2.0"` -- supervisor boot-time contract assertion would fail. The supervisor does not validate unknown fields, so adding new keys is safe.
 
 - [ ] **Step 1: Read current capability endpoint**
 
-Run: Read `jarvis_prime/server.py` lines 1562-1650
+Run: Search `jarvis_prime/server.py` for `@app.get("/v1/capability")` and read the full function including its return statement.
 
-- [ ] **Step 2: Extend capability response with quantization + epoch data**
+- [ ] **Step 2: Add AQE fields to the existing return dict**
 
-Add to the capability endpoint's return dict (after existing fields):
+Locate the `return { ... }` block in the capability function. Add the new fields **inside** the existing dict, AFTER the current fields. Do NOT create a new dict or change `schema_version`/`contract_version`.
 
 ```python
-    # === Adaptive Quantization Engine extensions (v2.0) ===
-    quantization_info = {}
-    epoch_info = {}
-    pressure_zone = "unknown"
+    # === Adaptive Quantization Engine fields (additive) ===
+    _aqe_quantization = {}
+    _aqe_epoch = {}
+    _aqe_pressure_zone = "unknown"
 
     try:
         from jarvis_prime.core.model_transition_manager import ModelTransitionManager
-        # Access transition manager if wired
         _tmgr = getattr(_startup_state, "transition_manager", None) if _startup_state else None
         if _tmgr and isinstance(_tmgr, ModelTransitionManager):
-            status = _tmgr.status()
-            epoch_info = {
-                "model_epoch": status.get("model_epoch", 0),
-                "cache_epoch": status.get("cache_epoch", 0),
+            _aqe_status = _tmgr.status()
+            _aqe_epoch = {
+                "model_epoch": _aqe_status.get("model_epoch", 0),
+                "cache_epoch": _aqe_status.get("cache_epoch", 0),
             }
-    except ImportError:
+    except (ImportError, Exception):
         pass
 
     try:
         from jarvis_prime.core.vram_pressure_monitor import VRAMPressureMonitor
         _vmon = getattr(_startup_state, "vram_monitor", None) if _startup_state else None
         if _vmon and isinstance(_vmon, VRAMPressureMonitor):
-            pressure_zone = _vmon.current_zone.value
-    except ImportError:
+            _aqe_pressure_zone = _vmon.current_zone.value
+    except (ImportError, Exception):
         pass
+```
 
-    # Merge into response
-    response = {
-        "schema_version": "2.0",
-        "contract_version": "2.0.0",
-        # ... existing fields ...
-        "quantization": quantization_info,
-        "transition_epoch": epoch_info,
-        "vram_pressure_zone": pressure_zone,
+Then in the return dict, append (keeping schema_version as "1.0"):
+
+```python
+    return {
+        # ... ALL existing fields unchanged ...
+        "schema_version": "1.0",         # DO NOT CHANGE
+        "contract_version": "1.0.0",     # DO NOT CHANGE
+        # ... model_loaded, context_window, host_id, etc. ...
+        # === AQE extensions (additive, backwards-compatible) ===
+        "quantization": _aqe_quantization,
+        "transition_epoch": _aqe_epoch,
+        "vram_pressure_zone": _aqe_pressure_zone,
     }
 ```
 
-- [ ] **Step 3: Verify server still starts (syntax check)**
+- [ ] **Step 3: Verify server syntax**
 
 Run: `cd /Users/djrussell23/Documents/repos/jarvis-prime && python3 -c "import ast; ast.parse(open('jarvis_prime/server.py').read()); print('OK')"`
 Expected: OK
@@ -2835,93 +2841,502 @@ Expected: OK
 ```bash
 cd /Users/djrussell23/Documents/repos/jarvis-prime
 git add jarvis_prime/server.py
-git commit -m "feat: extend /v1/capability with quantization engine v2.0 fields"
+git commit -m "feat: add AQE fields to /v1/capability (additive, non-breaking)"
 ```
 
 ---
 
-### Task 10: Wire Modules into run_server.py Startup
+### Task 10: Wire AQE into run_server.py Startup
 
 **Files:**
 - Modify: `run_server.py`
 
+**Key codebase facts (from exploration):**
+
+| Variable | Type | Purpose |
+|----------|------|---------|
+| `_background_tasks` (line 306) | `set` | Fire-and-forget task registry. Pattern: `_background_tasks.add(task); task.add_done_callback(_background_tasks.discard)` |
+| `_startup_state` (line 810) | `Optional[StartupState]` | Server startup progress tracker |
+| `_executor` (line 817) | `Optional[LlamaCppExecutor]` | Model inference engine |
+| `_model_coordinator` (line 818) | `Optional[GCPModelSwapCoordinator]` | Multi-model swap orchestrator |
+| `_hardware_assessment` (line 575) | `Optional[HardwareAssessment]` | Has `total_ram_gb`, `has_gpu`, `gpu_name` etc. |
+| `@app.on_event("shutdown")` (line 3997) | Shutdown handler | Cancels tracked tasks individually |
+
+**Insertion point:** Inside `background_initialization()`, AFTER model loading completes (around line 3630) and AFTER `_model_coordinator` initialization (around line 3740). This avoids race with model loader bootstrap.
+
 - [ ] **Step 1: Read current startup flow**
 
-Run: Read `run_server.py` and search for `_load_model` and `_startup_state` to understand wiring points.
+Run: Search `run_server.py` for `background_initialization` function, `_model_coordinator` initialization, and the shutdown handler at `@app.on_event("shutdown")`.
 
-- [ ] **Step 2: Add module instantiation to startup**
+- [ ] **Step 2: Add AQE module globals**
 
-After the existing model loading code in `run_server.py`, add the adaptive quantization engine wiring. The exact insertion point depends on the current startup flow, but the pattern is:
+Add near existing globals (around line 818, after `_model_coordinator`):
 
 ```python
-# === Adaptive Quantization Engine wiring ===
-# These are lazy-imported to avoid circular dependencies
-try:
-    from jarvis_prime.core.vram_pressure_monitor import VRAMPressureMonitor, VRAMMonitorConfig
-    from jarvis_prime.core.model_transition_manager import (
-        ModelTransitionManager, VRAMBudgetAuthority, TransitionPolicy,
-    )
-    from jarvis_prime.core.adaptive_model_selector import scan_inventory, propose_optimal
-
-    # Detect total VRAM
-    _total_vram = 23_034 * 1024 * 1024  # Default L4
-    try:
-        import subprocess as _sp
-        _nv = _sp.run(
-            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if _nv.returncode == 0:
-            _total_vram = int(float(_nv.stdout.strip()) * 1024 * 1024)
-    except Exception:
-        pass
-
-    _vram_authority = VRAMBudgetAuthority(total_vram_bytes=_total_vram)
-    _vram_monitor = VRAMPressureMonitor(
-        config=VRAMMonitorConfig(),
-        node_id=os.getenv("JARVIS_HOST_ID", "gcp-jarvis-prime-stable"),
-    )
-    _transition_manager = ModelTransitionManager(
-        executor=_executor,  # The LlamaCppExecutor instance
-        vram_authority=_vram_authority,
-        model_dir=Path(os.getenv("GCP_MODELS_DIR", "models")),
-    )
-
-    # Store on startup state for capability endpoint access
-    if _startup_state:
-        _startup_state.transition_manager = _transition_manager
-        _startup_state.vram_monitor = _vram_monitor
-
-    # Start VRAM monitor background task
-    asyncio.create_task(_vram_monitor.start())
-
-    logger.info("[AQE] Adaptive Quantization Engine wired successfully")
-except ImportError as e:
-    logger.info(f"[AQE] Adaptive Quantization Engine not available: {e}")
-except Exception as e:
-    logger.warning(f"[AQE] Failed to wire Adaptive Quantization Engine: {e}")
+# Adaptive Quantization Engine (v2.0)
+_aqe_transition_manager: Optional[Any] = None
+_aqe_vram_monitor: Optional[Any] = None
+_aqe_vram_authority: Optional[Any] = None
+_aqe_monitor_task: Optional[asyncio.Task] = None
 ```
 
-**Note:** The exact variable names (`_executor`, `_startup_state`) must match the existing run_server.py code. Read the file first to identify the correct names.
+- [ ] **Step 3: Add AQE wiring after model coordinator init**
 
-- [ ] **Step 3: Verify syntax**
+Insert AFTER `_model_coordinator` initialization in `background_initialization()`, and AFTER model loading is confirmed complete:
+
+```python
+    # ================================================================
+    # STEP N: ADAPTIVE QUANTIZATION ENGINE
+    # ================================================================
+    global _aqe_transition_manager, _aqe_vram_monitor, _aqe_vram_authority, _aqe_monitor_task
+    try:
+        from jarvis_prime.core.vram_pressure_monitor import VRAMPressureMonitor, VRAMMonitorConfig
+        from jarvis_prime.core.model_transition_manager import (
+            ModelTransitionManager, VRAMBudgetAuthority, TransitionPolicy,
+        )
+        from jarvis_prime.core.adaptive_model_selector import scan_inventory, propose_optimal
+
+        # Use existing hardware assessment for VRAM -- NOT hardcoded L4
+        _aqe_total_vram = 0
+        if _hardware_assessment and _hardware_assessment.has_gpu:
+            # _assess_hardware() already detected GPU via nvidia-smi
+            # Re-query for exact VRAM bytes (assessment stores GB floats)
+            try:
+                import subprocess as _sp
+                _nv = _sp.run(
+                    ["nvidia-smi", "--query-gpu=memory.total",
+                     "--format=csv,noheader,nounits"],
+                    capture_output=True, text=True, timeout=5,
+                )
+                if _nv.returncode == 0:
+                    _aqe_total_vram = int(float(_nv.stdout.strip()) * 1024 * 1024)
+            except Exception:
+                pass
+        if _aqe_total_vram == 0:
+            # Last-resort fallback -- log explicitly
+            logger.warning("[AQE] No GPU VRAM detected, skipping AQE wiring")
+            raise RuntimeError("No GPU VRAM -- AQE requires GPU")
+
+        _aqe_vram_authority = VRAMBudgetAuthority(total_vram_bytes=_aqe_total_vram)
+        _aqe_vram_monitor = VRAMPressureMonitor(
+            config=VRAMMonitorConfig(),
+            node_id=os.getenv("JARVIS_HOST_ID", "gcp-jarvis-prime-stable"),
+        )
+        _models_dir = Path(os.getenv("GCP_MODELS_DIR", "models"))
+        if not _models_dir.is_absolute():
+            _models_dir = Path(__file__).parent / _models_dir
+
+        _aqe_transition_manager = ModelTransitionManager(
+            executor=_executor,
+            vram_authority=_aqe_vram_authority,
+            model_dir=_models_dir,
+        )
+
+        # Bind pressure events to proposal+transition pipeline
+        # Debounce: only act on sustained zone changes (config enforces 10s sustained)
+        # Cooldown gates in TransitionPolicy prevent over-reaction
+        def _on_vram_pressure(event):
+            """Handle pressure zone change -- generate proposal if warranted."""
+            from jarvis_prime.core.vram_pressure_monitor import VRAMPressureZone
+            # Cross-node safety: ignore events from other nodes
+            if event.node_id != _aqe_vram_monitor._node_id:
+                return
+            if event.zone in (VRAMPressureZone.RED, VRAMPressureZone.CRITICAL):
+                # Schedule async proposal in background (non-blocking)
+                async def _handle_pressure():
+                    try:
+                        families = await scan_inventory(_models_dir)
+                        proposal = await propose_optimal(
+                            families=families,
+                            vram_budget_bytes=_aqe_vram_authority.available_bytes,
+                            target_context=4096,  # Reduced context under pressure
+                            task_complexity="light",
+                            current_model=None,
+                            trigger="pressure",
+                        )
+                        if proposal:
+                            await _aqe_transition_manager.accept(proposal)
+                    except Exception as e:
+                        logger.warning(f"[AQE] Pressure response failed: {e}")
+                _task = asyncio.create_task(_handle_pressure())
+                _background_tasks.add(_task)
+                _task.add_done_callback(_background_tasks.discard)
+
+        _aqe_vram_monitor.on_pressure_change(_on_vram_pressure)
+
+        # Store on startup state for capability endpoint access
+        if _startup_state:
+            _startup_state.transition_manager = _aqe_transition_manager
+            _startup_state.vram_monitor = _aqe_vram_monitor
+
+        # Start VRAM monitor -- tracked task with proper lifecycle
+        _aqe_monitor_task = asyncio.create_task(
+            _aqe_vram_monitor.start(), name="aqe_vram_monitor"
+        )
+        _background_tasks.add(_aqe_monitor_task)
+        _aqe_monitor_task.add_done_callback(_background_tasks.discard)
+
+        logger.info(
+            f"[AQE] Adaptive Quantization Engine wired: "
+            f"VRAM={_aqe_total_vram / (1024**3):.1f}GB, "
+            f"node={_aqe_vram_monitor._node_id}"
+        )
+    except ImportError as e:
+        logger.info(f"[AQE] Adaptive Quantization Engine not available: {e}")
+    except Exception as e:
+        logger.warning(f"[AQE] Failed to wire Adaptive Quantization Engine: {e}")
+```
+
+- [ ] **Step 4: Add AQE shutdown to `@app.on_event("shutdown")` handler**
+
+Inside the existing shutdown handler, add BEFORE executor close:
+
+```python
+    # Adaptive Quantization Engine shutdown
+    if _aqe_monitor_task and not _aqe_monitor_task.done():
+        _aqe_monitor_task.cancel()
+        try:
+            await _aqe_monitor_task
+        except asyncio.CancelledError:
+            pass
+    if _aqe_vram_monitor:
+        await _aqe_vram_monitor.stop()
+```
+
+- [ ] **Step 5: Verify syntax**
 
 Run: `cd /Users/djrussell23/Documents/repos/jarvis-prime && python3 -c "import ast; ast.parse(open('run_server.py').read()); print('OK')"`
 Expected: OK
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /Users/djrussell23/Documents/repos/jarvis-prime
+git add run_server.py
+git commit -m "feat: wire AQE into run_server.py with proper task lifecycle and pressure binding"
+```
+
+---
+
+### Task 11: Inventory Digest + Drain Admission Gate
+
+This task adds the two high-risk enforcement mechanisms identified in review.
+
+**Files:**
+- Modify: `jarvis_prime/core/model_transition_manager.py`
+- Modify: `tests/test_model_transition_manager.py`
+
+- [ ] **Step 1: Add inventory digest revalidation at accept() time**
+
+In `ModelTransitionManager.accept()`, BEFORE the PREPARE phase, add:
+
+```python
+            # Revalidate inventory digest -- reject stale proposals
+            from jarvis_prime.core.adaptive_model_selector import _compute_inventory_digest
+            current_digest = _compute_inventory_digest(self._model_dir)
+            if (hasattr(proposal, 'inventory_digest') and
+                proposal.inventory_digest != "unknown" and
+                proposal.inventory_digest != current_digest):
+                logger.info(
+                    f"[TransitionManager] Rejected: inventory changed "
+                    f"(proposal={proposal.inventory_digest}, current={current_digest})"
+                )
+                return False
+```
+
+- [ ] **Step 2: Add drain admission flag**
+
+Add `_draining` flag to `ModelTransitionManager.__init__`:
+
+```python
+        self._draining: bool = False
+```
+
+Set `self._draining = True` at DRAIN entry, `self._draining = False` on exit.
+
+Add admission check method:
+
+```python
+    def admit_request(self) -> bool:
+        """Check if new requests should be admitted. Returns False during DRAIN."""
+        if self._draining:
+            return False
+        self.request_started()
+        return True
+```
+
+- [ ] **Step 3: Define degraded state for rollback failure**
+
+Add to the ROLLBACK exception handler:
+
+```python
+                except Exception as rollback_err:
+                    logger.critical(
+                        f"[TransitionManager] ROLLBACK FAILED: {rollback_err}. "
+                        f"Entering DEGRADED state -- no model loaded, manual intervention required."
+                    )
+                    self._degraded = True
+                    self._current_model_path = None
+                    self._current_grant = None
+                    # Emit DEGRADED alert for monitoring/supervisor
+                    self._emit_event(ModelTransitionEvent(
+                        event_type="transition_degraded",
+                        transition_id=transition_id,
+                        trigger=proposal.trigger,
+                        from_model=str(old_path),
+                        to_model="NONE",
+                        from_quant=None, to_quant="NONE",
+                        model_epoch=self._epoch.model_epoch,
+                        duration_ms=(time.monotonic() - start_time) * 1000,
+                        outcome="degraded",
+                        reason=f"Rollback failed: {rollback_err}",
+                        timestamp=time.time(),
+                    ))
+```
+
+Add `self._degraded: bool = False` to `__init__`.
+
+- [ ] **Step 4: Write tests for digest revalidation and drain gate**
+
+Append to `tests/test_model_transition_manager.py`:
+
+```python
+    @pytest.mark.asyncio
+    async def test_reject_stale_inventory_digest(self, mock_executor, tmp_models_dir, fake_gguf_files):
+        """Proposal with stale inventory digest should be rejected."""
+        from jarvis_prime.core.adaptive_model_selector import scan_inventory, propose_optimal
+        auth = VRAMBudgetAuthority(total_vram_bytes=23_034 * 1024 * 1024)
+        mgr = ModelTransitionManager(
+            executor=mock_executor, vram_authority=auth, model_dir=tmp_models_dir,
+        )
+        families = await scan_inventory(tmp_models_dir)
+        proposal = await propose_optimal(
+            families=families, vram_budget_bytes=23_034 * 1024 * 1024,
+            target_context=8192, task_complexity="medium", trigger="startup",
+            model_dir=tmp_models_dir,
+        )
+        # Mutate inventory after proposal
+        new_file = tmp_models_dir / "NewModel-7B-Q4_K_M.gguf"
+        new_file.write_bytes(b"\0" * 100)
+        result = await mgr.accept(proposal)
+        assert result is False
+
+    def test_drain_admission_gate(self, mock_executor, tmp_models_dir):
+        auth = VRAMBudgetAuthority(total_vram_bytes=23_034 * 1024 * 1024)
+        mgr = ModelTransitionManager(
+            executor=mock_executor, vram_authority=auth, model_dir=tmp_models_dir,
+        )
+        assert mgr.admit_request() is True
+        mgr._draining = True
+        assert mgr.admit_request() is False
+```
+
+- [ ] **Step 5: Run tests**
+
+Run: `cd /Users/djrussell23/Documents/repos/jarvis-prime && python3 -m pytest tests/test_model_transition_manager.py -v`
+Expected: All tests PASS
+
+- [ ] **Step 6: Commit**
+
+```bash
+cd /Users/djrussell23/Documents/repos/jarvis-prime
+git add jarvis_prime/core/model_transition_manager.py tests/test_model_transition_manager.py
+git commit -m "feat: add inventory digest gate, drain admission control, and degraded state"
+```
+
+---
+
+### Task 12: Phase 1 Download Integrity Guardrails
+
+**Files:**
+- Modify: `jarvis_prime/core/adaptive_model_selector.py`
+- Modify: `tests/test_adaptive_model_selector.py`
+
+Phase 1 minimum (full quarantine pipeline deferred to Phase 2):
+- Hash verification when `sha256` is available
+- Atomic download-to-temp then rename
+- Reject model if size/hash mismatch
+
+- [ ] **Step 1: Add verify_model_integrity function**
+
+Append to `jarvis_prime/core/adaptive_model_selector.py`:
+
+```python
+# =============================================================================
+# PHASE 1 DOWNLOAD INTEGRITY (minimum guardrails)
+# =============================================================================
+
+import hashlib as _hashlib
+
+
+def verify_model_integrity(
+    model_path: Path,
+    expected_sha256: Optional[str] = None,
+    expected_size_bytes: Optional[int] = None,
+    tolerance: float = 0.01,  # 1% size tolerance for sparse files
+) -> Tuple[bool, str]:
+    """
+    Verify a model file's integrity.
+
+    Returns (ok, reason). Does NOT delete -- caller decides.
+    Phase 1: size check + optional SHA256. Phase 2 adds GGUF header validation.
+    """
+    if not model_path.exists():
+        return False, f"File not found: {model_path}"
+
+    actual_size = model_path.stat().st_size
+
+    # Size check (if expected size known)
+    if expected_size_bytes is not None:
+        lower = int(expected_size_bytes * (1 - tolerance))
+        upper = int(expected_size_bytes * (1 + tolerance))
+        if not (lower <= actual_size <= upper):
+            return False, (
+                f"Size mismatch: expected ~{expected_size_bytes:,} bytes, "
+                f"got {actual_size:,} bytes"
+            )
+
+    # SHA256 check (if hash known)
+    if expected_sha256:
+        sha = _hashlib.sha256()
+        with open(model_path, "rb") as f:
+            for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+                sha.update(chunk)
+        actual_hash = sha.hexdigest()
+        if actual_hash != expected_sha256:
+            return False, (
+                f"SHA256 mismatch: expected {expected_sha256[:16]}..., "
+                f"got {actual_hash[:16]}..."
+            )
+
+    return True, "OK"
+
+
+async def atomic_download_model(
+    url: str,
+    target_path: Path,
+    expected_sha256: Optional[str] = None,
+    expected_size_bytes: Optional[int] = None,
+    timeout_s: float = 1800.0,  # 30 min
+) -> Tuple[bool, str]:
+    """
+    Download model to temp file, verify, then atomic rename.
+
+    Phase 1: basic download + verify + rename.
+    Phase 2: quarantine pipeline, retry policy, progress tracking.
+    """
+    import asyncio
+    import shutil
+
+    # Pre-check disk space
+    if expected_size_bytes:
+        free = shutil.disk_usage(target_path.parent).free
+        required = int(expected_size_bytes * 1.1)  # 10% safety margin
+        if free < required:
+            return False, f"Insufficient disk: {free:,} < {required:,} bytes needed"
+
+    # Download to temp file in same directory (same filesystem for atomic rename)
+    tmp_path = target_path.parent / f".downloading-{target_path.name}.tmp"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "wget", "-q", "-O", str(tmp_path), url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            proc.kill()
+            tmp_path.unlink(missing_ok=True)
+            return False, f"Download timed out after {timeout_s}s"
+
+        if proc.returncode != 0:
+            tmp_path.unlink(missing_ok=True)
+            return False, f"Download failed: {stderr.decode()[:200]}"
+
+        # Verify integrity before atomic rename
+        ok, reason = verify_model_integrity(tmp_path, expected_sha256, expected_size_bytes)
+        if not ok:
+            tmp_path.unlink(missing_ok=True)
+            return False, f"Integrity check failed: {reason}"
+
+        # Atomic rename (same filesystem)
+        tmp_path.rename(target_path)
+        return True, "OK"
+
+    except Exception as e:
+        tmp_path.unlink(missing_ok=True)
+        return False, f"Download error: {e}"
+```
+
+- [ ] **Step 2: Write tests**
+
+Append to `tests/test_adaptive_model_selector.py`:
+
+```python
+from jarvis_prime.core.adaptive_model_selector import verify_model_integrity
+
+
+class TestVerifyModelIntegrity:
+
+    def test_file_not_found(self, tmp_path):
+        ok, reason = verify_model_integrity(tmp_path / "nonexistent.gguf")
+        assert ok is False
+        assert "not found" in reason
+
+    def test_size_mismatch(self, tmp_path):
+        f = tmp_path / "test.gguf"
+        f.write_bytes(b"\0" * 1000)
+        ok, reason = verify_model_integrity(f, expected_size_bytes=5000)
+        assert ok is False
+        assert "Size mismatch" in reason
+
+    def test_size_within_tolerance(self, tmp_path):
+        f = tmp_path / "test.gguf"
+        f.write_bytes(b"\0" * 1000)
+        ok, _ = verify_model_integrity(f, expected_size_bytes=1005)  # <1% off
+        assert ok is True
+
+    def test_sha256_match(self, tmp_path):
+        import hashlib
+        data = b"hello model data"
+        f = tmp_path / "test.gguf"
+        f.write_bytes(data)
+        expected = hashlib.sha256(data).hexdigest()
+        ok, _ = verify_model_integrity(f, expected_sha256=expected)
+        assert ok is True
+
+    def test_sha256_mismatch(self, tmp_path):
+        f = tmp_path / "test.gguf"
+        f.write_bytes(b"some data")
+        ok, reason = verify_model_integrity(f, expected_sha256="0000" * 16)
+        assert ok is False
+        assert "SHA256 mismatch" in reason
+```
+
+- [ ] **Step 3: Run tests**
+
+Run: `cd /Users/djrussell23/Documents/repos/jarvis-prime && python3 -m pytest tests/test_adaptive_model_selector.py::TestVerifyModelIntegrity -v`
+Expected: All tests PASS
 
 - [ ] **Step 4: Commit**
 
 ```bash
 cd /Users/djrussell23/Documents/repos/jarvis-prime
-git add run_server.py
-git commit -m "feat: wire adaptive quantization engine into run_server.py startup"
+git add jarvis_prime/core/adaptive_model_selector.py tests/test_adaptive_model_selector.py
+git commit -m "feat: add Phase 1 download integrity guardrails (hash, size, atomic rename)"
 ```
 
 ---
 
-### Task 11: Run Full Test Suite
+### Task 13: Run Full Test Suite
 
-**Note on deferred scope:** The download trust chain (spec Section 3.2.4 — quarantine pipeline, `DownloadProposal`, `DownloadRegistry`) is intentionally deferred to Phase 2. The current plan covers all 6 modules for model selection, scoring, transitions, and monitoring. Download automation will be added after the core engine is validated in production.
+**Deferred scope (Phase 2):**
+- Full download quarantine pipeline (`DownloadProposal`, `DownloadRegistry`, state machine)
+- `ModelArchitectureParams.from_gguf_metadata()` GGUF header parsing
+- Crash counter / state restoration (`models/.transition_state.json`)
+- `StaleEpochError` request epoch enforcement in HTTP handler
+- Cross-process epoch headers (`X-Model-Epoch`, `X-Cache-Epoch`)
 
 - [ ] **Step 1: Run all new tests**
 
