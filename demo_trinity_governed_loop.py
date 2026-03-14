@@ -23,6 +23,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -63,14 +64,20 @@ def _delay(normal: float) -> float:
     return normal * 0.3 if FAST else normal
 
 
-# ── Voice Engine (robust: no overlap, no cutoff, cleanup) ───────────────────
-
+# ── Voice Engine (say → tempfile → afplay = zero cutoff) ─────────────────────
+#
+# Raw `say` can return before the audio buffer fully drains to the speaker,
+# clipping the last syllable.  The proven fix (same as backend safe_say):
+#   1. `say -o tmpfile` — synthesize to AIFF (faster than real-time)
+#   2. `afplay tmpfile`  — play back; blocks until EVERY sample reaches speaker
+#
 _speech_proc = None
+_speech_tmp = None
 
 
 def _cleanup_speech():
-    """Kill any running speech process (called on exit)."""
-    global _speech_proc
+    """Kill any running speech/playback and remove temp files."""
+    global _speech_proc, _speech_tmp
     if _speech_proc and _speech_proc.poll() is None:
         _speech_proc.terminate()
         try:
@@ -78,49 +85,88 @@ def _cleanup_speech():
         except Exception:
             _speech_proc.kill()
     _speech_proc = None
+    if _speech_tmp:
+        try:
+            os.unlink(_speech_tmp)
+        except OSError:
+            pass
+        _speech_tmp = None
 
 
 atexit.register(_cleanup_speech)
 
 
 def _kill_stale_say():
-    """Kill any leftover say processes from previous runs."""
+    """Kill any leftover say/afplay processes from previous runs."""
     if NO_VOICE:
         return
     subprocess.run(
         ["pkill", "-f", f"say -v {VOICE}"],
         capture_output=True, timeout=3,
     )
+    subprocess.run(
+        ["pkill", "-f", "afplay.*jarvis_tts_"],
+        capture_output=True, timeout=3,
+    )
     time.sleep(0.1)
 
 
 def jarvis_say(text: str, wait: bool = True):
-    """JARVIS speaks via macOS TTS. Blocks by default to prevent cutoff."""
-    global _speech_proc
+    """JARVIS speaks via say→tmpfile→afplay so every syllable lands."""
+    global _speech_proc, _speech_tmp
     if NO_VOICE:
         return
-    # ALWAYS wait for previous speech to fully complete (prevents overlap)
+    # Wait for previous speech to fully complete (prevents overlap)
     if _speech_proc is not None:
         _speech_proc.wait()
         _speech_proc = None
+    if _speech_tmp is not None:
+        try:
+            os.unlink(_speech_tmp)
+        except OSError:
+            pass
+        _speech_tmp = None
+
+    # Step 1: synthesize to temp AIFF (very fast, no audible output)
+    fd, tmp = tempfile.mkstemp(suffix=".aiff", prefix="jarvis_tts_")
+    os.close(fd)
+    _speech_tmp = tmp
+    subprocess.run(
+        ["say", "-v", VOICE, "-r", SPEECH_RATE, "-o", tmp, text],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=60,
+    )
+
+    # Step 2: play via afplay — blocks until the entire waveform is out
     _speech_proc = subprocess.Popen(
-        ["say", "-v", VOICE, "-r", SPEECH_RATE, text],
+        ["afplay", tmp],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     if wait:
         _speech_proc.wait()
         _speech_proc = None
-        # Let the last syllable land — prevents UI from rushing JARVIS
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        _speech_tmp = None
+        # Breathing pause — let the last word settle before UI continues
         time.sleep(_delay(POST_SPEECH_BREATH))
 
 
 def wait_speech():
     """Block until current speech finishes."""
-    global _speech_proc
+    global _speech_proc, _speech_tmp
     if _speech_proc is not None:
         _speech_proc.wait()
         _speech_proc = None
         time.sleep(_delay(POST_SPEECH_BREATH))
+    if _speech_tmp is not None:
+        try:
+            os.unlink(_speech_tmp)
+        except OSError:
+            pass
+        _speech_tmp = None
 
 
 # ── Async HTTP ──────────────────────────────────────────────────────────────
@@ -891,9 +937,9 @@ async def phase_3():
 
     # JARVIS announces completion — tie to defense narrative
     jarvis_say(
-        "Both tasks completed in parallel. "
-        "Notice that the infrastructure code and threat analysis "
-        "both ran through the same governed pipeline. "
+        "Both tasks completed in parallel on the same GPU. "
+        "Each request was dynamically routed through our "
+        "multi-model inference plane and governed by Ouroboros. "
         "In a defense deployment, every inference would be logged "
         "to the Ontology with full audit trail. "
         "Let me show you the results.",
@@ -917,26 +963,43 @@ async def phase_3():
         x_lat = r.get("x_latency_ms", ms)
         tps = c_tok / (x_lat / 1000) if x_lat > 0 else 0
 
-        # Response panel (syntax-highlighted if code)
-        if "def " in content or "import " in content:
+        # ── J-Prime Generated Output ────────────────────────────────
+        # Distinct visual treatment per task so FDEs can read the payload
+        if i == 0:
+            # Infrastructure code — syntax-highlighted, green
+            if "resource " in content or "provider " in content:
+                lexer = "terraform"
+            elif "apiVersion:" in content or "kind:" in content:
+                lexer = "yaml"
+            else:
+                lexer = "python"
             widget = Syntax(
-                content, "python",
+                content, lexer,
                 theme="monokai", line_numbers=True,
+                word_wrap=True,
             )
+            panel_title = (
+                "[bold green]🔒 J-Prime Output: "
+                "Secure Infrastructure Code[/]"
+            )
+            panel_border = "green"
         else:
-            widget = Text(content, style="white")
+            # Threat analysis — bold red border for urgency
+            widget = Text(content, style="bold white")
+            panel_title = (
+                "[bold bright_red]🛡️ J-Prime Output: "
+                "Defense Threat Analysis[/]"
+            )
+            panel_border = "bright_red"
 
         console.print(Panel(
             widget,
-            title=(
-                f"[bold green]{spec['emoji']} "
-                f"{spec['label']} Result[/]"
-            ),
+            title=panel_title,
             subtitle=(
                 f"[dim]⏱️ {ms:.0f}ms · ⚡ ~{tps:.1f} tok/s "
                 f"· 📝 {c_tok} tokens[/]"
             ),
-            border_style="green",
+            border_style=panel_border,
             padding=(1, 2),
         ))
 
@@ -961,6 +1024,15 @@ async def phase_3():
         ))
 
         # JARVIS comments on each result with governance context
+        route_model = routing.get("model_id", "")
+        route_tier = routing.get("tier", "primary")
+        route_note = ""
+        if route_model:
+            route_note = (
+                f" Routed through the {route_tier} tier "
+                f"on {route_model}."
+            )
+
         gov_note = ""
         if i == 0:
             gov_note = (
@@ -978,6 +1050,7 @@ async def phase_3():
             f"{spec['label']} completed in {ms:.0f} milliseconds "
             f"at approximately {tps:.0f} tokens per second. "
             f"{c_tok} completion tokens on our NVIDIA L4."
+            f"{route_note}"
             f"{gov_note}",
             wait=True,
         )
