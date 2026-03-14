@@ -1,0 +1,23 @@
+{
+  "system": {
+    "model": "Qwen2.5-Coder-14B-Instruct",
+    "artifact": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+    "compute": "gpu_l4",
+    "gpu_layers": "-1",
+    "context_window": 8192
+  },
+  "inference_0": {
+    "label": "Secure Infrastructure Code",
+    "latency_ms": 10241.7,
+    "tok_s": 24.4,
+    "completion_tokens": 250,
+    "model": "jarvis-prime"
+  },
+  "inference_1": {
+    "label": "Defense Threat Analysis",
+    "latency_ms": 5423.9,
+    "tok_s": 23.4,
+    "completion_tokens": 127,
+    "model": "jarvis-prime"
+  }
+}
