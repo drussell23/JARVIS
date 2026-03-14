@@ -826,6 +826,7 @@ async def phase_4():
         )
 
         comm_task = asyncio.create_task(proc.communicate())
+        _spoken_mid = False
 
         with Live(console=console, refresh_per_second=2) as live:
             while not comm_task.done():
@@ -836,10 +837,21 @@ async def phase_4():
                     border_style="cyan",
                     padding=(0, 2),
                 ))
+                # Mid-test progress narration (once, ~8s in)
+                if not _spoken_mid and secs >= 8:
+                    _spoken_mid = True
+                    jarvis_say(
+                        "Tests are executing. We're validating "
+                        "the full pipeline: risk classification, "
+                        "syntax validation, security gates, "
+                        "rollback integrity, and trust graduation.",
+                        wait=False,
+                    )
                 if secs > 180:
                     proc.kill()
                     break
                 await asyncio.sleep(0.5)
+            wait_speech()
 
             # Final update
             secs = time.monotonic() - start

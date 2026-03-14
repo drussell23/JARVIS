@@ -119,6 +119,7 @@ class TestDirectDelivery:
         decision = _make_comm_message("DECISION", op_id="op-lc", seq=3, payload={
             "outcome": "applied",
             "reason_code": "tests_pass",
+            "file": "a.py",
         })
         for t in transports:
             await t.send(decision)
@@ -157,6 +158,7 @@ class TestDirectDelivery:
             "root_cause": "test regression",
             "failed_phase": "validation",
             "next_safe_action": "retry with smaller scope",
+            "file": "core.py",
         })
         for t in transports:
             await t.send(postmortem)
@@ -430,6 +432,7 @@ class TestEdgeCases:
         msg = _make_comm_message("INTENT", op_id="op-idem", payload={
             "goal": "fix once",
             "target_files": ["once.py"],
+            "test_count": 3,
         })
         await narrator.send(msg)
         await narrator.send(msg)  # duplicate
@@ -448,8 +451,8 @@ class TestEdgeCases:
             tui_panel.send(msg),
         )
 
-        # Narrator still speaks (format_narration uses safe defaults)
-        mock_say.assert_called_once()
+        # Narrator stays silent — incomplete context means no narration
+        mock_say.assert_not_called()
 
         # TUI tracks with defaults
         state = tui_panel.get_state()

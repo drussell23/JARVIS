@@ -45,8 +45,9 @@ class TestNarratorScript:
 
         text = format_narration("postmortem", {
             "file": "api_handler.py",
-            "reason": "AST parse failed",
+            "root_cause": "AST parse failed",
         })
+        assert text is not None
         assert "api_handler.py" in text
         assert "AST parse failed" in text
 
@@ -63,12 +64,13 @@ class TestNarratorScript:
         from backend.core.ouroboros.governance.comms.narrator_script import format_narration
 
         text = format_narration("unknown_phase", {"op_id": "op-999"})
-        assert text  # non-empty fallback
+        assert text is not None  # unknown phases use fallback (no required keys)
         assert "op-999" in text
 
-    def test_missing_placeholder_does_not_crash(self):
+    def test_missing_required_context_returns_none(self):
         from backend.core.ouroboros.governance.comms.narrator_script import format_narration
 
-        # "signal_detected" expects {test_count} and {file} but we omit them
+        # "signal_detected" requires test_count and file — omitting them
+        # should return None (no narration) instead of "? test failures in unknown"
         text = format_narration("signal_detected", {})
-        assert isinstance(text, str)  # graceful degradation
+        assert text is None

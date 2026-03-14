@@ -68,6 +68,7 @@ def test_voice_narrator_narrates_intent():
         payload={
             "goal": "fix test",
             "target_files": ["test_foo.py"],
+            "test_count": 2,
             "risk_tier": "SAFE_AUTO",
             "blast_radius": 1,
         },

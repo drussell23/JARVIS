@@ -70,6 +70,9 @@ class VoiceNarrator:
             context.setdefault("file", target_files[0])
 
         text = format_narration(phase, context)
+        if text is None:
+            logger.debug("VoiceNarrator: suppressed narration for op %s (incomplete context)", msg.op_id)
+            return
 
         try:
             await self._say_fn(text, source=self._source)

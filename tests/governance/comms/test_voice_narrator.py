@@ -31,6 +31,7 @@ class TestVoiceNarratorSend:
         msg = _make_comm_message("INTENT", payload={
             "goal": "fix test",
             "target_files": ["tests/test_a.py"],
+            "test_count": 3,
         })
         await narrator.send(msg)
         mock_safe_say.assert_called_once()
@@ -47,6 +48,7 @@ class TestVoiceNarratorSend:
             "outcome": "applied",
             "reason_code": "tests_pass",
             "diff_summary": "added edge case",
+            "file": "tests/test_a.py",
         })
         await narrator.send(msg)
         mock_safe_say.assert_called_once()
@@ -80,10 +82,10 @@ class TestVoiceNarratorDebounce:
 
         narrator = VoiceNarrator(say_fn=mock_safe_say, debounce_s=60.0)
         msg1 = _make_comm_message("INTENT", op_id="op-001", payload={
-            "goal": "fix 1", "target_files": ["a.py"],
+            "goal": "fix 1", "target_files": ["a.py"], "test_count": 1,
         })
         msg2 = _make_comm_message("INTENT", op_id="op-002", payload={
-            "goal": "fix 2", "target_files": ["b.py"],
+            "goal": "fix 2", "target_files": ["b.py"], "test_count": 2,
         })
         await narrator.send(msg1)
         await narrator.send(msg2)
@@ -95,10 +97,10 @@ class TestVoiceNarratorDebounce:
 
         narrator = VoiceNarrator(say_fn=mock_safe_say, debounce_s=0.0)
         msg1 = _make_comm_message("INTENT", op_id="op-001", payload={
-            "goal": "fix 1", "target_files": ["a.py"],
+            "goal": "fix 1", "target_files": ["a.py"], "test_count": 1,
         })
         msg2 = _make_comm_message("INTENT", op_id="op-002", payload={
-            "goal": "fix 2", "target_files": ["b.py"],
+            "goal": "fix 2", "target_files": ["b.py"], "test_count": 2,
         })
         await narrator.send(msg1)
         await asyncio.sleep(0.01)
@@ -114,6 +116,7 @@ class TestVoiceNarratorIdempotency:
         narrator = VoiceNarrator(say_fn=mock_safe_say, debounce_s=0.0)
         msg = _make_comm_message("DECISION", op_id="op-001", payload={
             "outcome": "applied",
+            "file": "tests/test_a.py",
         })
         await narrator.send(msg)
         await narrator.send(msg)  # same op_id + same msg_type
@@ -128,7 +131,7 @@ class TestVoiceNarratorFailure:
 
         narrator = VoiceNarrator(say_fn=failing_say, debounce_s=0.0)
         msg = _make_comm_message("INTENT", payload={
-            "goal": "fix", "target_files": ["a.py"],
+            "goal": "fix", "target_files": ["a.py"], "test_count": 1,
         })
         await narrator.send(msg)  # should not raise
 
@@ -149,12 +152,15 @@ class TestSeverityAwareDebounce:
         return narrator, say
 
     def _make_msg(self, msg_type, op_id: str = "op-1"):
-        from unittest.mock import MagicMock
-        msg = MagicMock()
-        msg.msg_type = msg_type
-        msg.op_id = op_id
-        msg.payload = {"outcome": "applied"}
-        return msg
+        from backend.core.ouroboros.governance.comm_protocol import MessageType
+        # Use real payloads with required context so narration is not suppressed
+        if msg_type == MessageType.INTENT:
+            payload = {"goal": "fix", "target_files": ["a.py"], "test_count": 1}
+        elif msg_type == MessageType.POSTMORTEM:
+            payload = {"file": "a.py", "root_cause": "AST parse failed"}
+        else:  # DECISION
+            payload = {"outcome": "applied", "file": "a.py"}
+        return _make_comm_message(msg_type.name, op_id=op_id, payload=payload)
 
     async def test_postmortem_bypasses_debounce(self):
         """POSTMORTEM narrates even within debounce window."""
