@@ -254,16 +254,20 @@ def _build_comm_protocol(
         transports.append(TUITransport())
         logger.info("[Integration] TUITransport added to CommProtocol")
 
-    # VoiceNarrator — requires safe_say; skip gracefully if unavailable
-    try:
-        from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
-        from backend.core.supervisor.unified_voice_orchestrator import safe_say  # type: ignore[import]
-    except ImportError as exc:
-        logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
+    # VoiceNarrator — requires safe_say; skip if unavailable or voice disabled
+    _voice_enabled = os.environ.get("JARVIS_VOICE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
+    if not _voice_enabled:
+        logger.info("[Integration] VoiceNarrator skipped: JARVIS_VOICE_ENABLED=0")
     else:
-        _debounce = float(os.environ.get("OUROBOROS_VOICE_DEBOUNCE_S", "60.0"))
-        transports.append(VoiceNarrator(say_fn=safe_say, debounce_s=_debounce, source="ouroboros"))
-        logger.info("[Integration] VoiceNarrator added to CommProtocol")
+        try:
+            from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say  # type: ignore[import]
+        except ImportError as exc:
+            logger.debug("[Integration] VoiceNarrator skipped (audio unavailable): %s", exc)
+        else:
+            _debounce = float(os.environ.get("OUROBOROS_VOICE_DEBOUNCE_S", "60.0"))
+            transports.append(VoiceNarrator(say_fn=safe_say, debounce_s=_debounce, source="ouroboros"))
+            logger.info("[Integration] VoiceNarrator added to CommProtocol")
 
     # OpsLogger — always add; uses env var JARVIS_OPS_LOG_DIR or default
     try:

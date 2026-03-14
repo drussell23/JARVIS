@@ -809,6 +809,10 @@ async def phase_4():
     stdout_data = b""
 
     # Run tests async with live timer
+    # Disable VoiceNarrator inside test subprocesses so governance tests
+    # don't trigger unexpected speech that overlaps with the demo narration.
+    test_env = {**os.environ, "JARVIS_VOICE_ENABLED": "0"}
+
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "pytest",
@@ -818,6 +822,7 @@ async def phase_4():
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(PROJECT_ROOT),
+            env=test_env,
         )
 
         comm_task = asyncio.create_task(proc.communicate())
