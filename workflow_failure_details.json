@@ -1,0 +1,141 @@
+{
+  "workflow_name": "Code Quality Checks",
+  "workflow_url": "https://github.com/drussell23/JARVIS/actions/runs/20334188449",
+  "branch": "main",
+  "commit_sha": "1672bc2",
+  "run_number": 971,
+  "failed_count": 2,
+  "fix_branch": "fix/ci/code-quality-checks-run971-20251218-105316",
+  "pr_title": "\ud83d\udea8 Fix CI/CD: Code Quality Checks (Run #971)",
+  "analyses": [
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 37,
+              "content": "2025-12-18T10:42:22.8589746Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/': Failed to connect to github.com port 443 after 135696 ms: Couldn't connect to server",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 41,
+              "content": "2025-12-18T10:44:58.5046286Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/': Failed to connect to github.com port 443 after 135630 ms: Couldn't connect to server",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 45,
+              "content": "2025-12-18T10:47:30.0567511Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/': Failed to connect to github.com port 443 after 135539 ms: Couldn't connect to server",
+              "severity": "high",
+              "emoji": "\u274c"
+            },
+            {
+              "line_number": 46,
+              "content": "2025-12-18T10:47:30.0611964Z ##[error]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 4
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 37,
+              "content": "2025-12-18T10:42:22.8589746Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/': Failed to connect to github.com port 443 after 135696 ms: Couldn't connect to server",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 38,
+              "content": "2025-12-18T10:42:22.8597682Z The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 41,
+              "content": "2025-12-18T10:44:58.5046286Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/': Failed to connect to github.com port 443 after 135630 ms: Couldn't connect to server",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 42,
+              "content": "2025-12-18T10:44:58.5056633Z The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 45,
+              "content": "2025-12-18T10:47:30.0567511Z ##[error]fatal: unable to access 'https://github.com/drussell23/JARVIS/': Failed to connect to github.com port 443 after 135539 ms: Couldn't connect to server",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            },
+            {
+              "line_number": 46,
+              "content": "2025-12-18T10:47:30.0611964Z ##[error]The process '/usr/bin/git' failed with exit code 128",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 6
+        },
+        {
+          "pattern": "WARN|Warning|warning",
+          "matches": [
+            {
+              "line_number": 9,
+              "content": "2025-12-18T10:40:07.0578863Z hint: to use in all of your new repositories, which will suppress this warning,",
+              "severity": "medium",
+              "emoji": "\u26a0\ufe0f"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    },
+    {
+      "error_patterns": [
+        {
+          "pattern": "ERROR|Error|error",
+          "matches": [
+            {
+              "line_number": 83,
+              "content": "2025-12-18T10:47:37.9651956Z ##[error]Process completed with exit code 1.",
+              "severity": "high",
+              "emoji": "\u274c"
+            }
+          ],
+          "count": 1
+        },
+        {
+          "pattern": "FAIL|Failed|failed",
+          "matches": [
+            {
+              "line_number": 55,
+              "content": "2025-12-18T10:47:37.9500166Z \u001b[36;1mQUALITY_RESULT=\"failure\"\u001b[0m",
+              "severity": "high",
+              "emoji": "\ud83d\udca5"
+            }
+          ],
+          "count": 1
+        }
+      ],
+      "suggested_fixes": [
+        "Review the logs above for specific error messages"
+      ],
+      "severity": "high",
+      "category": "permission_error",
+      "similar_failures": []
+    }
+  ],
+  "timestamp": "2025-12-18T10:53:16.202747"
+}
