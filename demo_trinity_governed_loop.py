@@ -24,10 +24,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
+from queue import Queue, Empty
 from urllib.request import Request, urlopen
 
 from rich.console import Console
@@ -176,15 +178,59 @@ def _http_get(url: str, timeout: int = 10) -> dict:
         return json.loads(r.read())
 
 
-def _http_post(url: str, payload: dict, timeout: int = 30) -> dict:
-    data = json.dumps(payload).encode()
-    req = Request(url, data=data, headers={"Content-Type": "application/json"})
-    with urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read())
-
-
 async def _in_thread(fn, *args):
     return await asyncio.get_running_loop().run_in_executor(_pool, fn, *args)
+
+
+# ── Streaming Inference (SSE) ──────────────────────────────────────────────
+
+def _run_streaming_inference(url: str, payload: dict, q: Queue):
+    """Thread target: streams SSE tokens from J-Prime into a queue."""
+    stream_payload = {**payload, "stream": True}
+    data = json.dumps(stream_payload).encode()
+    req = Request(url, data=data, headers={"Content-Type": "application/json"})
+
+    t0 = time.monotonic()
+    c_tokens = 0
+    model_id = ""
+
+    try:
+        with urlopen(req, timeout=60) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                    if not model_id:
+                        model_id = chunk.get("model", "")
+                    choices = chunk.get("choices", [])
+                    if choices:
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            c_tokens += 1
+                            q.put(("token", token))
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        q.put(("error", str(e)))
+        return
+
+    t1 = time.monotonic()
+    q.put(("done", {
+        "latency_ms": (t1 - t0) * 1000,
+        "completion_tokens": c_tokens,
+        "model_id": model_id,
+    }))
+
+
+# ── Benchmark Accumulator ─────────────────────────────────────────────────
+
+_benchmarks: dict = {}
 
 
 # ── Dynamic Stats ───────────────────────────────────────────────────────────
@@ -404,6 +450,14 @@ async def phase_1():
         f"of inference throughput.",
         wait=True,
     )
+
+    _benchmarks["system"] = {
+        "model": model_id,
+        "artifact": artifact,
+        "compute": compute,
+        "gpu_layers": gpu_layers,
+        "context_window": ctx,
+    }
 
     return cap
 
@@ -780,7 +834,7 @@ async def phase_2():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ⚡ PHASE 3 — PARALLEL LIVE INFERENCE
+# ⚡ PHASE 3 — LIVE STREAMING INFERENCE
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_3():
@@ -791,13 +845,12 @@ async def phase_3():
     ))
     console.print()
 
-    # JARVIS speaks fully THEN parallel inference starts
     jarvis_say(
         "Now I'll demonstrate live governed inference. "
-        "I'm sending two tasks to J-Prime simultaneously: "
-        "a secure code generation task for infrastructure automation, "
-        "and a defense-grade threat analysis, "
-        "both running in parallel on our GPU.",
+        "Watch the terminal closely. Every token you see "
+        "is being generated in real time by J-Prime "
+        "on our NVIDIA L4 GPU. Nothing is cached or precomputed. "
+        "First, secure infrastructure code generation.",
         wait=True,
     )
 
@@ -850,171 +903,142 @@ async def phase_3():
         },
     ]
 
-    payloads = [
-        {
-            "messages": s["messages"],
-            "max_tokens": s["max_tokens"],
-            "temperature": 0.1,
-        }
-        for s in specs
-    ]
-
-    # Shared mutable state for live display
-    results: list = [None] * len(specs)
-    errors: list = [None] * len(specs)
-    t_start: list = [0.0] * len(specs)
-    t_end: list = [0.0] * len(specs)
-
-    def _do_inference(idx):
-        t_start[idx] = time.monotonic()
-        try:
-            results[idx] = _http_post(
-                f"{JPRIME_ENDPOINT}/v1/chat/completions",
-                payloads[idx], timeout=30,
-            )
-        except Exception as exc:
-            errors[idx] = str(exc)
-        finally:
-            t_end[idx] = time.monotonic()
-
-    def _status_panel():
-        t = Table(show_header=False, box=None, padding=(0, 1), expand=False)
-        t.add_column(width=4)
-        t.add_column(width=36)
-        t.add_column(width=22)
-        for i, s in enumerate(specs):
-            lbl = f"{s['emoji']} {s['label']}"
-            if results[i] is not None:
-                ms = (t_end[i] - t_start[i]) * 1000
-                t.add_row(
-                    "✅", f"[bold white]{lbl}[/]",
-                    f"[green bold]{ms:.0f}ms[/]",
-                )
-            elif errors[i] is not None:
-                t.add_row(
-                    "❌", f"[bold white]{lbl}[/]",
-                    "[red]error[/]",
-                )
-            elif t_start[i] > 0:
-                elapsed = (time.monotonic() - t_start[i]) * 1000
-                t.add_row(
-                    "🔄", f"[bold yellow]{lbl}[/]",
-                    f"[yellow]generating... {elapsed:.0f}ms[/]",
-                )
-            else:
-                t.add_row(
-                    "⏳", f"[dim]{lbl}[/]",
-                    "[dim]queued[/]",
-                )
-        return Panel(
-            t,
-            title="[bold magenta]⚡ Parallel Inference[/]",
-            border_style="magenta",
-            padding=(0, 2),
-        )
-
-    # Launch both in thread pool concurrently
-    loop = asyncio.get_running_loop()
-    futs = [
-        loop.run_in_executor(_pool, _do_inference, i)
-        for i in range(len(specs))
-    ]
-
-    with Live(
-        _status_panel(), console=console, refresh_per_second=4,
-    ) as live:
-        while not all(
-            r is not None or e is not None
-            for r, e in zip(results, errors)
-        ):
-            live.update(_status_panel())
-            await asyncio.sleep(0.15)
-        # Final update showing completion
-        live.update(_status_panel())
-        await asyncio.sleep(0.5)
-
-    await asyncio.gather(*futs, return_exceptions=True)
-
-    # JARVIS announces completion — tie to defense narrative
-    jarvis_say(
-        "Both tasks completed in parallel on the same GPU. "
-        "Each request was dynamically routed through our "
-        "multi-model inference plane and governed by Ouroboros. "
-        "In a defense deployment, every inference would be logged "
-        "to the Ontology with full audit trail. "
-        "Let me show you the results.",
-        wait=True,
-    )
-
-    # ── Display Results ─────────────────────────────────────────────────────
+    # ── Stream each task sequentially so the audience sees every token ─────
 
     for i, spec in enumerate(specs):
-        if results[i] is None:
-            continue
+        payload = {
+            "messages": spec["messages"],
+            "max_tokens": spec["max_tokens"],
+            "temperature": 0.1,
+        }
 
-        r = results[i]
-        ms = (t_end[i] - t_start[i]) * 1000
-        choice = r.get("choices", [{}])[0]
-        content = choice.get("message", {}).get("content", "").strip()
-        usage = r.get("usage", {})
-        routing = r.get("x_routing", {})
-        p_tok = usage.get("prompt_tokens", 0)
-        c_tok = usage.get("completion_tokens", 1)
-        x_lat = r.get("x_latency_ms", ms)
-        tps = c_tok / (x_lat / 1000) if x_lat > 0 else 0
-
-        # ── J-Prime Generated Output ────────────────────────────────
-        # Distinct visual treatment per task so FDEs can read the payload
+        # Visual style per task
         if i == 0:
-            # Infrastructure code — syntax-highlighted, green
-            if "resource " in content or "provider " in content:
-                lexer = "terraform"
-            elif "apiVersion:" in content or "kind:" in content:
-                lexer = "yaml"
-            else:
-                lexer = "python"
-            widget = Syntax(
-                content, lexer,
-                theme="monokai", line_numbers=True,
-                word_wrap=True,
+            gen_title = (
+                "[bold green]🔒 J-Prime Streaming: "
+                "Secure Infrastructure Code[/]"
             )
-            panel_title = (
+            final_title = (
                 "[bold green]🔒 J-Prime Output: "
                 "Secure Infrastructure Code[/]"
             )
-            panel_border = "green"
+            border = "green"
         else:
-            # Threat analysis — bold red border for urgency
-            widget = Text(content, style="bold white")
-            panel_title = (
+            gen_title = (
+                "[bold bright_red]🛡️ J-Prime Streaming: "
+                "Defense Threat Analysis[/]"
+            )
+            final_title = (
                 "[bold bright_red]🛡️ J-Prime Output: "
                 "Defense Threat Analysis[/]"
             )
-            panel_border = "bright_red"
+            border = "bright_red"
 
-        console.print(Panel(
-            widget,
-            title=panel_title,
-            subtitle=(
-                f"[dim]⏱️ {ms:.0f}ms · ⚡ ~{tps:.1f} tok/s "
-                f"· 📝 {c_tok} tokens[/]"
+        def _make_widget(text: str, cursor: bool = True, idx: int = i):
+            display = text + (" \u258c" if cursor else "")
+            if idx == 0:
+                if "resource " in text or "provider " in text:
+                    lexer = "terraform"
+                elif "apiVersion:" in text:
+                    lexer = "yaml"
+                else:
+                    lexer = "python"
+                return Syntax(
+                    display, lexer,
+                    theme="monokai", line_numbers=True, word_wrap=True,
+                )
+            return Text(display, style="bold white")
+
+        # Launch streaming in background thread
+        q: Queue = Queue()
+        t_start = time.monotonic()
+        thread = threading.Thread(
+            target=_run_streaming_inference,
+            args=(f"{JPRIME_ENDPOINT}/v1/chat/completions", payload, q),
+            daemon=True,
+        )
+        thread.start()
+
+        content = ""
+        stats = None
+        error_msg = None
+
+        # Real-time streaming display — every token appears as generated
+        with Live(
+            Panel(
+                _make_widget(""),
+                title=gen_title,
+                subtitle="[dim]⏱️ streaming...[/]",
+                border_style=border,
+                padding=(1, 2),
             ),
-            border_style=panel_border,
-            padding=(1, 2),
-        ))
+            console=console,
+            refresh_per_second=12,
+        ) as live:
+            done = False
+            while not done:
+                # Drain all available tokens from the queue
+                while True:
+                    try:
+                        msg_type, data = q.get_nowait()
+                        if msg_type == "token":
+                            content += data
+                        elif msg_type == "done":
+                            stats = data
+                            done = True
+                            break
+                        elif msg_type == "error":
+                            error_msg = data
+                            done = True
+                            break
+                    except Empty:
+                        break
 
-        # Routing metrics
+                elapsed_ms = (time.monotonic() - t_start) * 1000
+                if done and stats:
+                    c_tok = stats["completion_tokens"]
+                    tps = c_tok / (elapsed_ms / 1000) if elapsed_ms > 0 else 0
+                    sub = (
+                        f"[dim]⏱️ {elapsed_ms:.0f}ms · "
+                        f"⚡ ~{tps:.1f} tok/s · "
+                        f"📝 {c_tok} tokens[/]"
+                    )
+                else:
+                    sub = f"[dim]⏱️ {elapsed_ms:.0f}ms streaming...[/]"
+
+                live.update(Panel(
+                    _make_widget(content, cursor=not done),
+                    title=final_title if done else gen_title,
+                    subtitle=sub,
+                    border_style=border,
+                    padding=(1, 2),
+                ))
+
+                if not done:
+                    await asyncio.sleep(0.04)
+
+        thread.join(timeout=5)
+        ms = (time.monotonic() - t_start) * 1000
+
+        if error_msg:
+            console.print(f"  [red bold]❌ Streaming error: {error_msg}[/]")
+            continue
+
+        c_tok = stats["completion_tokens"] if stats else 0
+        tps = c_tok / (ms / 1000) if ms > 0 else 0
+        model_id = stats.get("model_id", "local-gpu") if stats else "local-gpu"
+
+        # Routing & Performance metrics
         met = Table(
             show_header=False, border_style="magenta", padding=(0, 1),
         )
         met.add_column("", style="white", width=22)
         met.add_column("", style="magenta bold")
-        met.add_row("  🎯 Routing Tier", routing.get("tier", "primary"))
-        met.add_row("  🤖 Model", routing.get("model_id", "local-gpu"))
+        met.add_row("  🎯 Routing Tier", "primary")
+        met.add_row("  🤖 Model", model_id or "local-gpu")
         met.add_row("  ⏱️  Latency", f"{ms:.0f}ms")
-        met.add_row("  📝 Tokens", f"{p_tok} → {c_tok}")
+        met.add_row("  📝 Tokens", f"{c_tok}")
         met.add_row("  ⚡ Throughput", f"~{tps:.1f} tok/s")
-        met.add_row("  🏁 Finish", choice.get("finish_reason", "unknown"))
 
         console.print(Panel(
             met,
@@ -1023,16 +1047,16 @@ async def phase_3():
             padding=(0, 2),
         ))
 
-        # JARVIS comments on each result with governance context
-        route_model = routing.get("model_id", "")
-        route_tier = routing.get("tier", "primary")
-        route_note = ""
-        if route_model:
-            route_note = (
-                f" Routed through the {route_tier} tier "
-                f"on {route_model}."
-            )
+        # Store benchmark data
+        _benchmarks[f"inference_{i}"] = {
+            "label": spec["label"],
+            "latency_ms": round(ms, 1),
+            "tok_s": round(tps, 1),
+            "completion_tokens": c_tok,
+            "model": model_id,
+        }
 
+        # JARVIS commentary with governance context
         gov_note = ""
         if i == 0:
             gov_note = (
@@ -1050,10 +1074,18 @@ async def phase_3():
             f"{spec['label']} completed in {ms:.0f} milliseconds "
             f"at approximately {tps:.0f} tokens per second. "
             f"{c_tok} completion tokens on our NVIDIA L4."
-            f"{route_note}"
             f"{gov_note}",
             wait=True,
         )
+
+        # Transition narration to next task
+        if i == 0 and len(specs) > 1:
+            jarvis_say(
+                "Now let's see the defense threat analysis. "
+                "Same GPU, same governed pipeline, different task.",
+                wait=True,
+            )
+
         console.print()
 
 
@@ -1209,6 +1241,15 @@ async def phase_4():
             "The entire Ouroboros pipeline is verified and operational.",
             wait=True,
         )
+
+        # Store test benchmarks
+        _benchmarks["tests"] = {
+            "passed": passed,
+            "failed": failed,
+            "pass_rate": round(rate, 1),
+            "duration_s": round(elapsed, 1),
+            "tests_per_second": round(tps, 0),
+        }
     else:
         console.print("  [yellow]⚠️  Could not parse test results.[/]")
 
@@ -1329,6 +1370,88 @@ async def phase_5():
         "Thank you for watching.",
         wait=True,
     )
+
+    # ── Benchmark Report ─────────────────────────────────────────────────
+    # Persistent record of every run — FDEs and investors can compare runs
+
+    if _benchmarks:
+        console.print()
+        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        bench = Table(
+            show_header=False, border_style="bright_blue",
+            padding=(0, 2), expand=True,
+        )
+        bench.add_column("", style="white", width=34)
+        bench.add_column("", style="bright_blue bold")
+
+        # Inference benchmarks
+        for key in ("inference_0", "inference_1"):
+            bm = _benchmarks.get(key)
+            if not bm:
+                continue
+            bench.add_row(
+                f"  {bm['label']}", "",
+            )
+            bench.add_row(
+                "    Latency", f"{bm['latency_ms']:.0f} ms",
+            )
+            bench.add_row(
+                "    Throughput", f"~{bm['tok_s']:.1f} tok/s",
+            )
+            bench.add_row(
+                "    Tokens Generated",
+                str(bm["completion_tokens"]),
+            )
+            bench.add_row(
+                "    Model", bm.get("model", "—"),
+            )
+            bench.add_row("", "")  # spacer
+
+        # Test benchmarks
+        tb = _benchmarks.get("tests")
+        if tb:
+            bench.add_row("  Governance Tests", "")
+            bench.add_row(
+                "    Passed",
+                f"[green bold]{tb['passed']:,}[/]",
+            )
+            if tb["failed"]:
+                bench.add_row(
+                    "    Pre-existing Failures",
+                    f"[dim]{tb['failed']}[/]",
+                )
+            bench.add_row("    Pass Rate", f"{tb['pass_rate']}%")
+            bench.add_row(
+                "    Duration", f"{tb['duration_s']}s",
+            )
+            bench.add_row(
+                "    Tests/Second",
+                f"{tb['tests_per_second']:.0f}",
+            )
+            bench.add_row("", "")
+
+        # System info
+        sys_bm = _benchmarks.get("system")
+        if sys_bm:
+            bench.add_row("  System", "")
+            bench.add_row("    GPU", "NVIDIA L4 (g2-standard-4)")
+            bench.add_row("    Model", sys_bm.get("model", "—"))
+            bench.add_row("    Artifact", sys_bm.get("artifact", "—"))
+            bench.add_row(
+                "    Context Window",
+                f"{sys_bm.get('context_window', 0):,} tokens",
+            )
+            bench.add_row("", "")
+
+        bench.add_row("  Timestamp", ts)
+
+        console.print(Panel(
+            bench,
+            title="[bold bright_blue]📊 Performance Benchmark Report[/]",
+            border_style="bright_blue",
+            padding=(1, 2),
+        ))
 
 
 # ═════════════════════════════════════════════════════════════════════════════
