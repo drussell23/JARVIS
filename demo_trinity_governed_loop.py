@@ -879,7 +879,7 @@ async def phase_3():
                                "that allows unrestricted inbound access.",
                 },
             ],
-            "max_tokens": 250,
+            "max_tokens": 700,
         },
         {
             "label": "Defense Threat Analysis",
@@ -1190,7 +1190,7 @@ async def phase_4():
 
     console.print(
         "  [dim]🧪 pytest tests/test_ouroboros_governance/ "
-        "tests/governance/ -q[/]"
+        "tests/governance/ -v --tb=no --no-header[/]"
     )
     console.print()
 
@@ -1198,38 +1198,93 @@ async def phase_4():
     passed = 0
     failed = 0
     elapsed = 0.0
-    stdout_data = b""
 
-    # Run tests async with live timer
-    # Disable VoiceNarrator inside test subprocesses so governance tests
-    # don't trigger unexpected speech that overlaps with the demo narration.
-    test_env = {**os.environ, "JARVIS_VOICE_ENABLED": "0"}
+    # PYTHONUNBUFFERED forces pytest to flush stdout line-by-line into the pipe.
+    # JARVIS_VOICE_ENABLED=0 prevents governance test fixtures from triggering TTS.
+    test_env = {**os.environ, "JARVIS_VOICE_ENABLED": "0", "PYTHONUNBUFFERED": "1"}
+
+    # Scrolling window of the most recent test results
+    recent_results: list[tuple[str, str]] = []
+    MAX_VISIBLE = 12
+
+    def _build_panel(secs: float, done: bool = False) -> Panel:
+        total_seen = passed + failed
+        pct = passed / total_seen * 100 if total_seen > 0 else 0.0
+
+        body = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+        body.add_column(width=3)
+        body.add_column()
+        body.add_column(width=12, justify="right")
+
+        # Running counters
+        body.add_row(
+            "📊",
+            f"[bold green]✅ {passed:,} passed[/]  "
+            f"[bold red]❌ {failed} failed[/]"
+            f"  [dim]{pct:.1f}%[/]",
+            f"[dim]{secs:.1f}s[/]",
+        )
+        body.add_row("", "", "")
+
+        # Scrolling recent test names
+        for status, name in recent_results[-MAX_VISIBLE:]:
+            short = name.rsplit("::", 1)[-1] if "::" in name else name
+            if status == "PASSED":
+                body.add_row("✅", f"[green]{short}[/]", "")
+            else:
+                body.add_row("❌", f"[bold red]{short}[/]", "")
+
+        border = "green" if done else "cyan"
+        title = (
+            f"[bold green]✅ {passed:,} Tests Passed — Complete[/]"
+            if done else
+            "[bold cyan]🧪 Running Governance Tests — Live[/]"
+        )
+        return Panel(body, title=title, border_style=border, padding=(0, 2))
+
+    _spoken_mid = False
 
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, "-m", "pytest",
             "tests/test_ouroboros_governance/",
             "tests/governance/",
-            "-q", "--tb=no", "--no-header",
+            "-v", "--tb=no", "--no-header",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(PROJECT_ROOT),
             env=test_env,
         )
 
-        comm_task = asyncio.create_task(proc.communicate())
-        _spoken_mid = False
-
-        with Live(console=console, refresh_per_second=2) as live:
-            while not comm_task.done():
+        with Live(console=console, refresh_per_second=8) as live:
+            async for raw in (proc.stdout or []):
+                line = raw.decode("utf-8", errors="replace").rstrip()
                 secs = time.monotonic() - start
-                live.update(Panel(
-                    f"  [bold cyan]🧪 Running governance tests..."
-                    f"[/]  [dim]{secs:.0f}s elapsed[/]",
-                    border_style="cyan",
-                    padding=(0, 2),
-                ))
-                # Mid-test progress narration (once, ~8s in)
+
+                # Parse individual test outcome lines:
+                # "tests/path/test_file.py::test_name PASSED    [ 12%]"
+                if " PASSED" in line:
+                    name = re.sub(r"\s+PASSED.*", "", line).strip()
+                    recent_results.append(("PASSED", name))
+                    passed += 1
+                elif " FAILED" in line:
+                    name = re.sub(r"\s+FAILED.*", "", line).strip()
+                    recent_results.append(("FAILED", name))
+                    failed += 1
+
+                # Parse final summary line as a fallback correction
+                m = re.search(r"(\d+) passed", line)
+                if m:
+                    p = int(m.group(1))
+                    if p > passed:
+                        passed = p
+                    m2 = re.search(r"(\d+) failed", line)
+                    if m2:
+                        f_ = int(m2.group(1))
+                        if f_ > failed:
+                            failed = f_
+
+                # Mid-test narration fires once, ~8s in
                 if not _spoken_mid and secs >= 8:
                     _spoken_mid = True
                     jarvis_say(
@@ -1242,42 +1297,19 @@ async def phase_4():
                         "the pipeline blocks the operation.",
                         wait=False,
                     )
+
                 if secs > 180:
                     proc.kill()
                     break
-                await asyncio.sleep(0.5)
+
+                live.update(_build_panel(secs))
+
+            await proc.wait()
             wait_speech()
+            elapsed = time.monotonic() - start
+            live.update(_build_panel(elapsed, done=True))
+            await asyncio.sleep(0.5)
 
-            # Final update
-            secs = time.monotonic() - start
-            live.update(Panel(
-                f"  [bold green]✅ Tests complete[/]"
-                f"  [dim]{secs:.0f}s[/]",
-                border_style="green",
-                padding=(0, 2),
-            ))
-            await asyncio.sleep(0.3)
-
-        elapsed = time.monotonic() - start
-
-        if comm_task.done() and not comm_task.cancelled():
-            stdout_data, _ = comm_task.result()
-
-        output = stdout_data.decode().strip()
-
-        for line in output.split("\n"):
-            if "passed" in line:
-                m = re.search(r"(\d+) passed", line)
-                if m:
-                    passed = int(m.group(1))
-                m2 = re.search(r"(\d+) failed", line)
-                if m2:
-                    failed = int(m2.group(1))
-                break
-
-    except asyncio.TimeoutError:
-        elapsed = time.monotonic() - start
-        console.print("  [yellow]⚠️  Test suite timed out.[/]")
     except Exception as e:
         elapsed = time.monotonic() - start
         console.print(f"  [red]❌ {e}[/]")
