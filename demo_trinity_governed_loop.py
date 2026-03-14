@@ -1256,8 +1256,9 @@ async def phase_4():
             env=test_env,
         )
 
+        assert proc.stdout is not None  # guaranteed: stdout=PIPE was set
         with Live(console=console, refresh_per_second=8) as live:
-            async for raw in (proc.stdout or []):
+            async for raw in proc.stdout:
                 line = raw.decode("utf-8", errors="replace").rstrip()
                 secs = time.monotonic() - start
 
@@ -1571,16 +1572,44 @@ async def phase_5():
         bench_dir = PROJECT_ROOT / "benchmarks"
         bench_dir.mkdir(exist_ok=True)
 
-        # Timestamped JSON — one per run, full history
         run_ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
-        run_file = bench_dir / f"run-{run_ts}.json"
-        run_file.write_text(json.dumps(_benchmarks, indent=2) + "\n")
 
-        # LATEST.md — always overwritten, easy to open in Cursor
+        # 1. Per-run JSON — one file per run, never overwritten
+        run_record = {"run_ts": run_ts, **_benchmarks}
+        run_file = bench_dir / f"run-{run_ts}.json"
+        run_file.write_text(json.dumps(run_record, indent=2) + "\n")
+
+        # 2. history.json — append-only array of every run ever recorded
+        history_file = bench_dir / "history.json"
+        history: list[dict] = []
+        if history_file.exists():
+            try:
+                history = json.loads(history_file.read_text())
+            except Exception:
+                history = []
+        history.append(run_record)
+        history_file.write_text(json.dumps(history, indent=2) + "\n")
+
+        # 3. LATEST.md — always overwritten, human-readable current + history
+        def _md_inference_rows(bm_data: dict) -> list[str]:
+            rows = []
+            for key in ("inference_0", "inference_1"):
+                bm2 = bm_data.get(key)
+                if bm2:
+                    rows.append(
+                        f"| {bm2['label']} "
+                        f"| {bm2['latency_ms']:.0f} ms "
+                        f"| ~{bm2['tok_s']:.1f} tok/s "
+                        f"| {bm2['completion_tokens']} tokens "
+                        f"| {bm2.get('model', '—')} |"
+                    )
+            return rows
+
         lines = [
             "# Trinity AI — Performance Benchmark Report",
             "",
-            f"**Run:** {ts}",
+            f"**Latest Run:** {ts}",
+            f"**Total Recorded Runs:** {len(history)}",
             "",
         ]
 
@@ -1599,27 +1628,18 @@ async def phase_5():
             ]
 
         lines += [
-            "## Inference",
+            "## Latest Inference Results",
             "",
             "| Task | Latency | Throughput | Tokens | Model |",
             "|------|---------|------------|--------|-------|",
         ]
-        for key in ("inference_0", "inference_1"):
-            bm2 = _benchmarks.get(key)
-            if bm2:
-                lines.append(
-                    f"| {bm2['label']} "
-                    f"| {bm2['latency_ms']:.0f} ms "
-                    f"| ~{bm2['tok_s']:.1f} tok/s "
-                    f"| {bm2['completion_tokens']} "
-                    f"| {bm2.get('model', '—')} |"
-                )
+        lines += _md_inference_rows(_benchmarks)
         lines.append("")
 
         tb2 = _benchmarks.get("tests")
         if tb2:
             lines += [
-                "## Governance Tests",
+                "## Latest Governance Tests",
                 "",
                 "| Metric | Value |",
                 "|--------|-------|",
@@ -1627,13 +1647,40 @@ async def phase_5():
                 f"| Failed (pre-existing) | {tb2['failed']} |",
                 f"| Pass Rate | {tb2['pass_rate']}% |",
                 f"| Duration | {tb2['duration_s']}s |",
-                f"| Tests/Second | {tb2['tests_per_second']:.0f} |",
+                f"| Tests/Second | {int(tb2['tests_per_second'])} |",
                 "",
             ]
+
+        # Historical comparison table (all runs, newest first)
+        if len(history) > 1:
+            lines += [
+                "## Run History",
+                "",
+                "| Run | Infra Latency | Infra tok/s | Threat Latency |"
+                " Threat tok/s | Tests Passed | Pass Rate |",
+                "|-----|--------------|-------------|----------------|"
+                "--------------|--------------|-----------|",
+            ]
+            for entry in reversed(history):
+                r_ts = entry.get("run_ts", "?")
+                i0 = entry.get("inference_0", {})
+                i1 = entry.get("inference_1", {})
+                te = entry.get("tests", {})
+                lines.append(
+                    f"| {r_ts} "
+                    f"| {i0.get('latency_ms', 0):.0f} ms "
+                    f"| ~{i0.get('tok_s', 0):.1f} "
+                    f"| {i1.get('latency_ms', 0):.0f} ms "
+                    f"| ~{i1.get('tok_s', 0):.1f} "
+                    f"| {te.get('passed', '—')} "
+                    f"| {te.get('pass_rate', '—')}% |"
+                )
+            lines.append("")
 
         lines += [
             "---",
             f"*Generated by `demo_trinity_governed_loop.py` at {ts}*",
+            f"*Full history: `benchmarks/history.json` ({len(history)} runs)*",
             "",
         ]
 
@@ -1641,8 +1688,8 @@ async def phase_5():
         latest_file.write_text("\n".join(lines))
 
         console.print(
-            f"  [dim]📁 Saved: {run_file.relative_to(PROJECT_ROOT)} "
-            f"+ {latest_file.relative_to(PROJECT_ROOT)}[/]"
+            f"  [dim]📁 {run_file.name}  ·  "
+            f"history.json ({len(history)} runs)  ·  LATEST.md[/]"
         )
 
 
