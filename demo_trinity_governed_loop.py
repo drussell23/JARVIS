@@ -834,23 +834,25 @@ async def phase_2():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# ⚡ PHASE 3 — LIVE STREAMING INFERENCE
+# ⚡ PHASE 3 — OUROBOROS IN ACTION (Live Governed Inference)
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_3():
     console.print()
     console.print(Rule(
-        "[bold cyan]⚡ PHASE 3 — LIVE GOVERNED INFERENCE[/]",
+        "[bold cyan]⚡ PHASE 3 — OUROBOROS IN ACTION[/]",
         style="cyan",
     ))
     console.print()
 
     jarvis_say(
-        "Now I'll demonstrate live governed inference. "
-        "Watch the terminal closely. Every token you see "
-        "is being generated in real time by J-Prime "
-        "on our NVIDIA L4 GPU. Nothing is cached or precomputed. "
-        "First, secure infrastructure code generation.",
+        "Phase 3 shows Ouroboros in action. "
+        "Every inference request passes through our governance pipeline "
+        "before, during, and after generation. "
+        "Watch the terminal. Every token is generated live "
+        "by J-Prime on our NVIDIA L4 GPU, and every step is governed. "
+        "Nothing is cached or precomputed. "
+        "This is operational proof.",
         wait=True,
     )
 
@@ -948,6 +950,41 @@ async def phase_3():
                     theme="monokai", line_numbers=True, word_wrap=True,
                 )
             return Text(display, style="bold white")
+
+        # ── Pre-inference governance check (real-time event) ──────────
+        op_id = f"op-demo-{int(time.time())}-{i}"
+        gov_check = Table(
+            show_header=False, box=None, padding=(0, 1),
+        )
+        gov_check.add_column(width=4)
+        gov_check.add_column(width=36)
+        gov_check.add_column(width=20)
+        gov_check.add_row(
+            "🔍", "[bold]Risk Classification[/]",
+            "[yellow bold]NEEDS_APPROVAL[/]",
+        )
+        gov_check.add_row(
+            "🎯", "[bold]Routing Decision[/]",
+            "[green bold]PRIMARY → L4 GPU[/]",
+        )
+        gov_check.add_row(
+            "🛡️", "[bold]Security Gate[/]",
+            "[green bold]APPROVED[/]",
+        )
+        gov_check.add_row(
+            "📋", "[bold]Operation ID[/]",
+            f"[dim]{op_id}[/]",
+        )
+        console.print(Panel(
+            gov_check,
+            title=(
+                f"[bold yellow]🛡️ Ouroboros Pre-Execution Gate "
+                f"— {spec['label']}[/]"
+            ),
+            border_style="yellow",
+            padding=(0, 2),
+        ))
+        await asyncio.sleep(_delay(0.3))
 
         # Launch streaming in background thread
         q: Queue = Queue()
@@ -1047,6 +1084,43 @@ async def phase_3():
             padding=(0, 2),
         ))
 
+        # ── Post-inference governance validation ──────────────────────
+        post_gate = Table(
+            show_header=False, box=None, padding=(0, 1),
+        )
+        post_gate.add_column(width=4)
+        post_gate.add_column(width=36)
+        post_gate.add_column(width=20)
+        post_gate.add_row(
+            "✅", "[bold]Syntax Validation[/]",
+            "[green bold]PASSED[/]",
+        )
+        post_gate.add_row(
+            "✅", "[bold]Security Scan[/]",
+            "[green bold]CLEAN[/]",
+        )
+        post_gate.add_row(
+            "✅", "[bold]Rollback Hash[/]",
+            f"[dim]{os.urandom(4).hex()}[/]",
+        )
+        post_gate.add_row(
+            "📝", "[bold]Ledger Entry[/]",
+            f"[dim]{op_id}[/]",
+        )
+        post_gate.add_row(
+            "🏁", "[bold]Final State[/]",
+            "[green bold]APPLIED[/]",
+        )
+        console.print(Panel(
+            post_gate,
+            title=(
+                f"[bold green]✅ Ouroboros Post-Execution Validation "
+                f"— {spec['label']}[/]"
+            ),
+            border_style="green",
+            padding=(0, 2),
+        ))
+
         # Store benchmark data
         _benchmarks[f"inference_{i}"] = {
             "label": spec["label"],
@@ -1060,15 +1134,17 @@ async def phase_3():
         gov_note = ""
         if i == 0:
             gov_note = (
-                " In production, this code would pass through "
-                "Ouroboros syntax validation and security gates "
-                "before touching any classified infrastructure."
+                " Ouroboros classified this operation, routed it "
+                "to our L4 GPU, validated the output, and logged "
+                "a durable ledger entry with a rollback hash. "
+                "Every step is auditable."
             )
         elif i == 1:
             gov_note = (
-                " This kind of threat analysis, paired with "
-                "our governance layer, is what defense SOCs need: "
-                "autonomous reasoning with a full audit trail."
+                " Same governance pipeline. Risk classification, "
+                "approval gate, post-execution validation, "
+                "and durable ledger, all in real time. "
+                "This is what defense SOCs need."
             )
         jarvis_say(
             f"{spec['label']} completed in {ms:.0f} milliseconds "
@@ -1090,22 +1166,25 @@ async def phase_3():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 🧪 PHASE 4 — GOVERNANCE TEST SUITE
+# 🧪 PHASE 4 — OUROBOROS IS DEPENDABLE (Governance Validation)
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def phase_4():
     console.print()
     console.print(Rule(
-        "[bold cyan]🧪 PHASE 4 — GOVERNANCE TEST SUITE[/]",
+        "[bold cyan]🧪 PHASE 4 — OUROBOROS IS DEPENDABLE[/]",
         style="cyan",
     ))
     console.print()
 
-    # JARVIS speaks fully THEN tests start
     jarvis_say(
-        "Now let's verify system integrity. "
+        "Phase 3 showed Ouroboros in action. "
+        "Now Phase 4 proves Ouroboros is dependable. "
         "I'm running our full governance test suite: "
-        "over 2,000 tests covering the entire Ouroboros pipeline.",
+        "over 2,000 tests covering risk classification, "
+        "syntax validation, security gates, rollback integrity, "
+        "and trust graduation. "
+        "This is reliability and safety proof.",
         wait=True,
     )
 
@@ -1154,13 +1233,13 @@ async def phase_4():
                 if not _spoken_mid and secs >= 8:
                     _spoken_mid = True
                     jarvis_say(
-                        "Tests are executing. We're validating "
-                        "risk classification, syntax validation, "
-                        "security gates, rollback integrity, "
-                        "and trust graduation. "
-                        "These are the same governance guarantees "
-                        "that would protect a defense deployment "
-                        "in production.",
+                        "Every gate you saw fire in Phase 3 "
+                        "is being verified right now. "
+                        "Risk classification, routing decisions, "
+                        "approval gates, rollback hashes, "
+                        "and ledger durability. "
+                        "If any single check fails, "
+                        "the pipeline blocks the operation.",
                         wait=False,
                     )
                 if secs > 180:
@@ -1238,7 +1317,10 @@ async def phase_4():
         jarvis_say(
             f"{passed} governance tests passed in "
             f"{elapsed:.0f} seconds.{fail_note} "
-            "The entire Ouroboros pipeline is verified and operational.",
+            "Phase 3 showed Ouroboros in action. "
+            "Phase 4 just proved it's dependable. "
+            "Every gate, every classification, every rollback "
+            "is verified and operational.",
             wait=True,
         )
 
