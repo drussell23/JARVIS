@@ -52,6 +52,8 @@ NO_TESTS = "--no-tests" in sys.argv
 FAST = "--fast" in sys.argv
 VOICE = os.getenv("JARVIS_VOICE", "Daniel")
 SPEECH_RATE = os.getenv("JARVIS_SPEECH_RATE", "175")
+# Breathing pause after speech — lets the last syllable land before UI continues
+POST_SPEECH_BREATH = 0.45
 
 console = Console()
 _pool = ThreadPoolExecutor(max_workers=4)
@@ -108,6 +110,8 @@ def jarvis_say(text: str, wait: bool = True):
     if wait:
         _speech_proc.wait()
         _speech_proc = None
+        # Let the last syllable land — prevents UI from rushing JARVIS
+        time.sleep(_delay(POST_SPEECH_BREATH))
 
 
 def wait_speech():
@@ -116,6 +120,7 @@ def wait_speech():
     if _speech_proc is not None:
         _speech_proc.wait()
         _speech_proc = None
+        time.sleep(_delay(POST_SPEECH_BREATH))
 
 
 # ── Async HTTP ──────────────────────────────────────────────────────────────
@@ -187,10 +192,13 @@ async def show_banner():
 
     # JARVIS intro speaks WHILE boot sequence animates
     jarvis_say(
-        "Welcome to the Trinity AI demonstration. "
-        "I'm JARVIS, your autonomous software engineering system. "
-        "I'll walk you through our governed inference pipeline "
-        "in real time.",
+        "Welcome to the Trinity AI demonstration "
+        "for the Palantir Startup Fellowship. "
+        "I'm JARVIS, an autonomous software engineering system "
+        "with a governed inference pipeline. "
+        "I'll walk you through the architecture in real time, "
+        "including how our governance telemetry maps into "
+        "Palantir's AIP Ontology.",
         wait=False,  # concurrent with boot animation
     )
 
@@ -479,13 +487,15 @@ async def phase_2():
             padding=(1, 2),
         ))
 
-    # JARVIS comments on stats (blocks until done)
+    # JARVIS comments on stats — tie to AIP
     jarvis_say(
         f"The ledger contains {total_ops} governed operations. "
         f"{outcomes['applied']} were approved and applied, "
         f"and {outcomes['failed']} were blocked by our security gates. "
         "Every operation is durably logged with rollback hashes "
-        "for full auditability.",
+        "for full auditability. "
+        "This structured telemetry is exactly what flows into "
+        "Palantir's AIP Ontology for enterprise-grade evaluation.",
         wait=True,
     )
 
@@ -556,6 +566,172 @@ async def phase_2():
     # Ensure JARVIS finishes before moving on
     wait_speech()
 
+    # ── Ledger Deep Dive: Read a real entry aloud ────────────────────────────
+
+    jarvis_say(
+        "Let me pull up a single ledger entry so you can see "
+        "the audit trail. Every field is immutable and "
+        "cryptographically verifiable.",
+        wait=True,
+    )
+
+    # Find the richest entry (most keys in data) from the best file
+    _best_entry = None
+    _best_score = 0
+    for raw in lines:
+        try:
+            e = json.loads(raw)
+            d = e.get("data", {})
+            score = len(d) + (2 if "risk_tier" in d else 0)
+            if score > _best_score:
+                _best_score = score
+                _best_entry = e
+        except Exception:
+            pass
+
+    if _best_entry:
+        # Build a clean display dict with the most relevant fields
+        display_entry = {
+            "op_id": _best_entry.get("op_id", ""),
+            "state": _best_entry.get("state", ""),
+            "timestamp": _best_entry.get("ts", ""),
+        }
+        bd = _best_entry.get("data", {})
+        for k in ("risk_tier", "target_file", "provider",
+                   "syntax_valid", "rollback_sha", "reason",
+                   "failure_class", "phase"):
+            if k in bd:
+                display_entry[k] = bd[k]
+
+        entry_json = json.dumps(display_entry, indent=2)
+        console.print(Panel(
+            Syntax(entry_json, "json", theme="monokai"),
+            title="[bold yellow]🔍 Ledger Entry (Immutable Audit Record)[/]",
+            border_style="yellow",
+            padding=(1, 2),
+        ))
+
+        # JARVIS reads key fields
+        state = display_entry.get("state", "unknown")
+        risk = bd.get("risk_tier", "")
+        target = bd.get("target_file", "")
+        risk_note = f" Risk tier: {risk.replace('_', ' ')}." if risk else ""
+        file_note = f" Target file: {target}." if target else ""
+        jarvis_say(
+            f"This operation reached state: {state}.{risk_note}{file_note} "
+            "In a Palantir AIP deployment, this record becomes "
+            "an Object in the Ontology, queryable by analysts "
+            "and auditable in real time.",
+            wait=True,
+        )
+
+    # ── AIP Ontology Mapping ─────────────────────────────────────────────────
+
+    console.print()
+    jarvis_say(
+        "Here's how our governance data maps into "
+        "Palantir's AIP Ontology. "
+        "Each Ouroboros concept becomes a structured Object Type "
+        "with Actions and Links.",
+        wait=True,
+    )
+
+    aip_tbl = Table(
+        border_style="bright_blue", padding=(0, 2), expand=True,
+    )
+    aip_tbl.add_column(
+        "Ouroboros Concept", style="cyan bold", width=26,
+    )
+    aip_tbl.add_column(
+        "AIP Object Type", style="bright_blue bold", width=24,
+    )
+    aip_tbl.add_column(
+        "Key Properties", style="dim white", width=30,
+    )
+
+    aip_tbl.add_row(
+        "  Operation Ledger",
+        "GovernedOperation",
+        "op_id, state, risk_tier, ts",
+    )
+    aip_tbl.add_row(
+        "  Routing Decision",
+        "InferenceRoute",
+        "model_id, tier, latency_ms, tok/s",
+    )
+    aip_tbl.add_row(
+        "  Risk Assessment",
+        "RiskClassification",
+        "risk_tier, blast_radius, auto/manual",
+    )
+    aip_tbl.add_row(
+        "  Trust Graduation",
+        "TrustGraduation",
+        "repo, trigger, old→new trust level",
+    )
+    aip_tbl.add_row(
+        "  Circuit Breaker",
+        "CircuitBreakerEvent",
+        "component, state, failure_count",
+    )
+    aip_tbl.add_row(
+        "  Rollback Record",
+        "RollbackAudit",
+        "sha_before, sha_after, verified",
+    )
+
+    console.print(Panel(
+        aip_tbl,
+        title="[bold bright_blue]🔗 Ouroboros → Palantir AIP Ontology[/]",
+        border_style="bright_blue",
+        padding=(1, 2),
+    ))
+
+    # Action Types
+    action_tbl = Table(
+        border_style="bright_blue", padding=(0, 2), expand=True,
+    )
+    action_tbl.add_column(
+        "AIP Action Type", style="bright_blue bold", width=28,
+    )
+    action_tbl.add_column(
+        "Trigger", style="dim white", width=40,
+    )
+
+    action_tbl.add_row(
+        "  ApproveOperation",
+        "Risk tier requires human review",
+    )
+    action_tbl.add_row(
+        "  RollbackChange",
+        "Verification failed post-apply",
+    )
+    action_tbl.add_row(
+        "  EscalateRisk",
+        "Blast radius exceeds threshold",
+    )
+    action_tbl.add_row(
+        "  TriggerDPOCapture",
+        "Applied op generates preference pair",
+    )
+
+    console.print(Panel(
+        action_tbl,
+        title="[bold bright_blue]⚡ AIP Action Types[/]",
+        border_style="bright_blue",
+        padding=(0, 2),
+    ))
+
+    jarvis_say(
+        "Each governed operation, routing decision, and risk assessment "
+        "becomes a first-class object in the Ontology. "
+        "AIP Logic evaluates these against safety rubrics, "
+        "and successful operations generate DPO preference pairs "
+        "for continuous model improvement. "
+        "This closes the loop between governance and fine-tuning.",
+        wait=True,
+    )
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # ⚡ PHASE 3 — PARALLEL LIVE INFERENCE
@@ -571,10 +747,11 @@ async def phase_3():
 
     # JARVIS speaks fully THEN parallel inference starts
     jarvis_say(
-        "Now I'll demonstrate live inference. "
+        "Now I'll demonstrate live governed inference. "
         "I'm sending two tasks to J-Prime simultaneously: "
-        "a code generation task and a reasoning task, "
-        "running in parallel on our GPU.",
+        "a secure code generation task for infrastructure automation, "
+        "and a defense-grade threat analysis, "
+        "both running in parallel on our GPU.",
         wait=True,
     )
 
@@ -582,35 +759,48 @@ async def phase_3():
 
     specs = [
         {
-            "label": "Code Generation",
-            "emoji": "💻",
-            "desc": "Python email validation with regex",
+            "label": "Secure Infrastructure Code",
+            "emoji": "🔒",
+            "desc": "Firewall rule validation for classified network",
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a senior Python engineer. "
-                               "Return only code.",
+                    "content": "You are a senior infrastructure security "
+                               "engineer working in a FedRAMP-certified "
+                               "environment. Return only code.",
                 },
                 {
                     "role": "user",
-                    "content": "Write a function that validates an email "
-                               "address using regex.",
+                    "content": "Write a Python function that validates "
+                               "firewall rules against a NIST 800-53 "
+                               "compliance policy. It should check port "
+                               "ranges, CIDR blocks, and flag any rule "
+                               "that allows unrestricted inbound access.",
+                },
+            ],
+            "max_tokens": 250,
+        },
+        {
+            "label": "Defense Threat Analysis",
+            "emoji": "🛡️",
+            "desc": "Anomaly classification for SOC workflow",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a defense cybersecurity analyst. "
+                               "Provide concise, actionable analysis.",
+                },
+                {
+                    "role": "user",
+                    "content": "A classified network SOC detected 47 failed "
+                               "SSH login attempts from 3 internal IPs "
+                               "within 90 seconds, followed by a successful "
+                               "login and immediate sudo privilege escalation. "
+                               "Classify the threat level and recommend "
+                               "immediate response actions in 3 bullet points.",
                 },
             ],
             "max_tokens": 200,
-        },
-        {
-            "label": "Architecture Reasoning",
-            "emoji": "🧠",
-            "desc": "Optimistic vs pessimistic locking",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Explain the difference between optimistic "
-                               "and pessimistic locking in 2 sentences.",
-                },
-            ],
-            "max_tokens": 100,
         },
     ]
 
@@ -699,9 +889,13 @@ async def phase_3():
 
     await asyncio.gather(*futs, return_exceptions=True)
 
-    # JARVIS announces completion
+    # JARVIS announces completion — tie to defense narrative
     jarvis_say(
         "Both tasks completed in parallel. "
+        "Notice that the infrastructure code and threat analysis "
+        "both ran through the same governed pipeline. "
+        "In a defense deployment, every inference would be logged "
+        "to the Ontology with full audit trail. "
         "Let me show you the results.",
         wait=True,
     )
@@ -766,11 +960,25 @@ async def phase_3():
             padding=(0, 2),
         ))
 
-        # JARVIS comments on each result
+        # JARVIS comments on each result with governance context
+        gov_note = ""
+        if i == 0:
+            gov_note = (
+                " In production, this code would pass through "
+                "Ouroboros syntax validation and security gates "
+                "before touching any classified infrastructure."
+            )
+        elif i == 1:
+            gov_note = (
+                " This kind of threat analysis, paired with "
+                "our governance layer, is what defense SOCs need: "
+                "autonomous reasoning with a full audit trail."
+            )
         jarvis_say(
             f"{spec['label']} completed in {ms:.0f} milliseconds "
             f"at approximately {tps:.0f} tokens per second. "
-            f"That's {c_tok} completion tokens on our NVIDIA L4.",
+            f"{c_tok} completion tokens on our NVIDIA L4."
+            f"{gov_note}",
             wait=True,
         )
         console.print()
@@ -842,9 +1050,12 @@ async def phase_4():
                     _spoken_mid = True
                     jarvis_say(
                         "Tests are executing. We're validating "
-                        "the full pipeline: risk classification, "
-                        "syntax validation, security gates, "
-                        "rollback integrity, and trust graduation.",
+                        "risk classification, syntax validation, "
+                        "security gates, rollback integrity, "
+                        "and trust graduation. "
+                        "These are the same governance guarantees "
+                        "that would protect a defense deployment "
+                        "in production.",
                         wait=False,
                     )
                 if secs > 180:
@@ -974,6 +1185,15 @@ async def phase_5():
             "Governance telemetry ingestion\n"
             "Continuous fine-tuning from production feedback",
         ),
+        (
+            "🔗 AIP Integration — Fellowship Build",
+            "Ontology: GovernedOperation · InferenceRoute · "
+            "RiskClassification\n"
+            "Actions: ApproveOperation · RollbackChange · "
+            "EscalateRisk · TriggerDPOCapture\n"
+            "Pipeline: Ouroboros telemetry → AIP Ontology → "
+            "Reactor DPO loop",
+        ),
     ]
 
     for title, desc in components:
@@ -1018,7 +1238,21 @@ async def phase_5():
         "software engineering system, "
         f"built over 7 months by a single developer. "
         f"Over {commits_str} commits, 2,146 governance tests, "
-        "3 repositories, and zero external funding. "
+        "3 repositories, and zero external funding.",
+        wait=True,
+    )
+
+    await asyncio.sleep(_delay(0.5))
+
+    jarvis_say(
+        "With Palantir's AIP and Foundry, "
+        "we can transition this governed kernel "
+        "from a local architecture into a fully deployable, "
+        "enterprise-grade operating system "
+        "for defense and critical infrastructure. "
+        "The governance telemetry is ready. "
+        "The Ontology mapping is designed. "
+        "We just need the platform to close the loop. "
         "Thank you for watching.",
         wait=True,
     )
