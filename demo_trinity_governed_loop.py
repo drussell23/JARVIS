@@ -427,7 +427,7 @@ async def phase_1():
     health: dict | None = None
 
     with console.status(
-        "[bold cyan]  📡 Querying J-Prime on GCP NVIDIA L4...[/]",
+        "[bold cyan]  📡 Querying J-Prime on GCP GPU...[/]",
         spinner="dots",
     ):
         try:
@@ -522,9 +522,10 @@ async def phase_1():
         )
     else:
         _tps_desc = "around 24 tokens per second"
+    _gpu_short = _compute_display(compute).split(" (")[0]
     jarvis_say(
         f"J-Prime is online. We're running {art_name} "
-        f"on an NVIDIA L4 GPU with {gpu_layers} layers offloaded. "
+        f"on {_gpu_short} GPU with {gpu_layers} layers offloaded. "
         f"Context window is {ctx:,} tokens, "
         f"giving us {_tps_desc} of inference throughput.",
         wait=True,
@@ -924,12 +925,15 @@ async def phase_3():
     ))
     console.print()
 
+    _p3_gpu = _compute_display(
+        _benchmarks.get("system", {}).get("compute", "gpu_l4")
+    ).split(" (")[0]
     jarvis_say(
         "Phase 3 shows Ouroboros in action. "
         "Every inference request passes through our governance pipeline "
         "before, during, and after generation. "
         "Watch the terminal. Every token is generated live "
-        "by J-Prime on our NVIDIA L4 GPU, and every step is governed. "
+        f"by J-Prime on our {_p3_gpu} GPU, and every step is governed. "
         "Nothing is cached or precomputed. "
         "This is operational proof.",
         wait=True,
@@ -1225,10 +1229,13 @@ async def phase_3():
                 "and durable ledger, all in real time. "
                 "This is what defense SOCs need."
             )
+        _inf_gpu = _compute_display(
+            _benchmarks.get("system", {}).get("compute", "gpu_l4")
+        ).split(" (")[0]
         jarvis_say(
             f"{spec['label']} completed in {ms:.0f} milliseconds "
             f"at approximately {tps:.0f} tokens per second. "
-            f"{c_tok} completion tokens on our NVIDIA L4."
+            f"{c_tok} completion tokens on our {_inf_gpu}."
             f"{gov_note}",
             wait=True,
         )
@@ -1577,7 +1584,7 @@ async def phase_5():
         "Trinity AI is a fully autonomous, governed "
         "software engineering system, "
         f"built over 7 months by a single developer. "
-        f"Over {commits_str} commits, 2,146 governance tests, "
+        f"Over {commits_str} commits, {_total_tests:,} governance tests, "
         "3 repositories, and zero external funding.",
         wait=True,
     )
@@ -1661,7 +1668,7 @@ async def phase_5():
         sys_bm = _benchmarks.get("system")
         if sys_bm:
             bench.add_row("  System", "")
-            bench.add_row("    GPU", "NVIDIA L4 (g2-standard-4)")
+            bench.add_row("    GPU", _compute_display(sys_bm.get("compute", "gpu_l4")))
             bench.add_row("    Model", sys_bm.get("model", "—"))
             bench.add_row("    Artifact", sys_bm.get("artifact", "—"))
             bench.add_row(
@@ -1731,7 +1738,7 @@ async def phase_5():
                 "",
                 "| Metric | Value |",
                 "|--------|-------|",
-                "| GPU | NVIDIA L4 (g2-standard-4) |",
+                f"| GPU | {_compute_display(sys_bm2.get('compute', 'gpu_l4'))} |",
                 f"| Model | {sys_bm2.get('model', '—')} |",
                 f"| Artifact | {sys_bm2.get('artifact', '—')} |",
                 f"| Context Window | {sys_bm2.get('context_window', 0):,} tokens |",
