@@ -52,7 +52,8 @@ LEDGER_DIR = Path(os.getenv(
 PROJECT_ROOT = Path(__file__).parent
 NO_VOICE = "--no-voice" in sys.argv or not shutil.which("say")
 NO_TESTS = "--no-tests" in sys.argv
-FAST = "--fast" in sys.argv
+FAST     = "--fast"     in sys.argv
+REPLAY   = "--replay"   in sys.argv   # show history.json data; no live GCP call
 VOICE = os.getenv("JARVIS_VOICE", "Daniel")
 SPEECH_RATE = os.getenv("JARVIS_SPEECH_RATE", "175")
 # Breathing pause after speech — lets the last syllable land before UI continues
@@ -231,6 +232,73 @@ def _run_streaming_inference(url: str, payload: dict, q: Queue):
 # ── Benchmark Accumulator ─────────────────────────────────────────────────
 
 _benchmarks: dict = {}
+
+
+# ── Compute display names (extensible, no hardcoding) ─────────────────────
+
+_COMPUTE_DISPLAY: dict[str, str] = {
+    "gpu_l4":   "NVIDIA L4 (g2-standard-4)",
+    "gpu_a100": "NVIDIA A100 (a2-highgpu-1g)",
+    "gpu_t4":   "NVIDIA T4 (n1-standard-4)",
+    "gpu_v100": "NVIDIA V100",
+    "cpu":      "CPU",
+}
+
+
+def _compute_display(compute_class: str) -> str:
+    """Map compute_class key → human-readable GPU label. Never hardcoded."""
+    return _COMPUTE_DISPLAY.get(
+        compute_class,
+        compute_class.replace("_", " ").upper() or "GPU",
+    )
+
+
+def _load_history_stats() -> dict:
+    """
+    Read benchmarks/history.json and return aggregate performance stats.
+    Used to populate dynamic display values before live inference runs.
+    Returns empty dict if history doesn't exist yet.
+    """
+    history_path = PROJECT_ROOT / "benchmarks" / "history.json"
+    if not history_path.exists():
+        return {}
+    try:
+        history: list[dict] = json.loads(history_path.read_text())
+        if not history:
+            return {}
+
+        tps_vals: list[float] = []
+        for entry in history:
+            for key in sorted(k for k in entry if k.startswith("inference_")):
+                tps = entry[key].get("tok_s")
+                if tps:
+                    tps_vals.append(float(tps))
+
+        latest       = history[-1]
+        test_data    = latest.get("tests", {})
+        sys_data     = latest.get("system", {})
+        stats: dict  = {}
+
+        if tps_vals:
+            stats["avg_tok_s"] = sum(tps_vals) / len(tps_vals)
+            stats["min_tok_s"] = min(tps_vals)
+            stats["max_tok_s"] = max(tps_vals)
+
+        if test_data:
+            stats["tests_passed"] = int(test_data.get("passed", 0))
+            stats["tests_failed"] = int(test_data.get("failed", 0))
+            stats["test_count"]   = stats["tests_passed"] + stats["tests_failed"]
+            stats["pass_rate"]    = test_data.get("pass_rate", 0)
+
+        if sys_data:
+            stats["compute"]     = sys_data.get("compute", "")
+            stats["model"]       = sys_data.get("model", "")
+            stats["artifact"]    = sys_data.get("artifact", "")
+            stats["ctx_window"]  = sys_data.get("context_window", 0)
+
+        return stats
+    except Exception:
+        return {}
 
 
 # ── Dynamic Stats ───────────────────────────────────────────────────────────
@@ -442,12 +510,23 @@ async def phase_1():
         artifact.replace(".gguf", "")
         .replace("-", " ").replace("_", " ")
     )
+    # Dynamic throughput from history — never hardcoded
+    _hist = _load_history_stats()
+    if _hist.get("avg_tok_s"):
+        _lo   = _hist["min_tok_s"]
+        _hi   = _hist["max_tok_s"]
+        _tps_desc = (
+            f"approximately {_lo:.0f} to {_hi:.0f} tokens per second"
+            if abs(_hi - _lo) > 1.0
+            else f"approximately {_hist['avg_tok_s']:.0f} tokens per second"
+        )
+    else:
+        _tps_desc = "around 24 tokens per second"
     jarvis_say(
         f"J-Prime is online. We're running {art_name} "
         f"on an NVIDIA L4 GPU with {gpu_layers} layers offloaded. "
-        f"Context window is {ctx} tokens, "
-        f"giving us roughly 20 to 23 tokens per second "
-        f"of inference throughput.",
+        f"Context window is {ctx:,} tokens, "
+        f"giving us {_tps_desc} of inference throughput.",
         wait=True,
     )
 
@@ -1393,6 +1472,28 @@ async def phase_5():
     summary = Text(justify="center")
     summary.append("\n")
 
+    # Build J-Prime description from live run data → history fallback → safe default
+    _sys_bm   = _benchmarks.get("system", {})
+    _inf0     = _benchmarks.get("inference_0", {})
+    _inf1     = _benchmarks.get("inference_1", {})
+    _tps_live = [v for v in [_inf0.get("tok_s"), _inf1.get("tok_s")] if v]
+    _hist_s   = _load_history_stats()
+
+    if _tps_live:
+        _avg_tps   = sum(_tps_live) / len(_tps_live)
+        _tps_label = f"~{_avg_tps:.1f} tok/s"
+    elif _hist_s.get("avg_tok_s"):
+        _tps_label = f"~{_hist_s['avg_tok_s']:.1f} tok/s avg"
+    else:
+        _tps_label = "~24 tok/s"
+
+    _compute_cls  = _sys_bm.get("compute") or _hist_s.get("compute") or "gpu_l4"
+    _gpu_label    = _compute_display(_compute_cls)
+    _model_name   = _sys_bm.get("model") or _hist_s.get("model") or "Qwen2.5-Coder-14B-Instruct"
+    _artifact     = _sys_bm.get("artifact") or _hist_s.get("artifact") or ""
+    _quant_tag    = _artifact.rsplit("-", 1)[-1].replace(".gguf", "") if _artifact else "Q4_K_M"
+    _ctx_win      = _sys_bm.get("context_window") or _hist_s.get("ctx_window") or 8192
+
     components = [
         (
             "🛡️ The Body — JARVIS",
@@ -1403,9 +1504,9 @@ async def phase_5():
         ),
         (
             "🧠 The Mind — J-Prime",
-            "GCP g2-standard-4 · NVIDIA L4 (23GB VRAM)\n"
-            "Qwen2.5-Coder-14B @ Q4_K_M · 8192 context · "
-            "~20-23 tok/s\n"
+            f"{_gpu_label}\n"
+            f"{_model_name} · {_quant_tag} · {_ctx_win:,} context · "
+            f"{_tps_label}\n"
             "Adaptive quantization engine · Multi-model routing",
         ),
         (
@@ -1434,9 +1535,19 @@ async def phase_5():
     summary.append("─" * 52 + "\n", style="dim")
     summary.append("\n")
 
+    # Dynamic test count: live run → history → safe fallback
+    _tb_live  = _benchmarks.get("tests", {})
+    if _tb_live:
+        _total_tests = int(_tb_live.get("passed", 0)) + int(_tb_live.get("failed", 0))
+    elif _hist_s.get("test_count"):
+        _total_tests = _hist_s["test_count"]
+    else:
+        _total_tests = 0
+    _tests_disp = f"✅ {_total_tests:,} " if _total_tests else "✅ 2,146+ "
+
     summary.append(f"📊 {commits_str} ", style="bold green")
     summary.append("commits  ·  ", style="dim")
-    summary.append("✅ 2,146 ", style="bold green")
+    summary.append(_tests_disp, style="bold green")
     summary.append("governance tests  ·  ", style="dim")
     summary.append("📦 3 ", style="bold green")
     summary.append("repos\n", style="dim")
