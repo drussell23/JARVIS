@@ -93,7 +93,7 @@ def _big_stat(ax, value_str, label_str, value_color=GREEN):
             fontsize=30, fontweight="bold", color=value_color,
             ha="center", va="center", zorder=10)
     ax.text(0.5, 0.28, label_str, transform=ax.transAxes,
-            fontsize=8, color=DIM, ha="center", va="center", zorder=10)
+            fontsize=8, color=FG, ha="center", va="center", zorder=10)
 
 def _save(fig, name):
     path = SCRIPT_DIR / name
@@ -205,9 +205,13 @@ for task, color in zip(tasks, colors):
     ax.scatter(sub["completion_tokens"], sub["latency_s"],
                label=task, color=color, s=100, zorder=4,
                edgecolors=BG, linewidths=0.8)
-    for _, row in sub.iterrows():
-        # offset annotation to avoid overlap — infra points are top-right, threat bottom-left
-        xytext = (8, 4) if row["completion_tokens"] > 200 else (8, -14)
+    pts = list(sub.sort_values("completion_tokens").iterrows())
+    for idx, (_, row) in enumerate(pts):
+        if row["completion_tokens"] > 200:
+            xytext = (8, 4)
+        else:
+            # Alternate above/below for clustered low-token points
+            xytext = (8, 8) if idx % 2 == 0 else (8, -17)
         ax.annotate(f"{row['tok_s']:.1f} tok/s",
                     (row["completion_tokens"], row["latency_s"]),
                     textcoords="offset points", xytext=xytext,
@@ -280,8 +284,8 @@ if not df_tests.empty:
     latest_tps  = df_tests["tests_per_second"].iloc[-1]
     latest_dur  = df_tests["duration_s"].iloc[-1]
     latest_tot  = int(df_tests["tests_passed"].iloc[-1] + df_tests["tests_failed"].iloc[-1])
-    _big_stat(ax, f"{latest_tps:.0f}/s", f"{latest_tot:,} tests in {latest_dur:.0f}s", PURPLE)
-    _subtitle(ax, "Full Ouroboros governance suite — circuit breakers, trust graduators, FSM transitions")
+    _big_stat(ax, f"{latest_tps:.0f}/s", f"{latest_tot:,} tests completed in {latest_dur:.0f}s", PURPLE)
+    _subtitle(ax, "Ouroboros suite: circuit breakers · trust graduators · FSM")
 
     fig.suptitle("Ouroboros Governance Test Suite — Reliability Across Runs",
                  fontsize=14, fontweight="bold", color=FG_HI, y=1.02)
@@ -309,17 +313,21 @@ ax3.set_title("Tokens Generated",    fontsize=10)
 ax1.axhline(20, color=YELLOW, lw=0.8, linestyle="--", alpha=0.7, zorder=2)
 
 if has_tests:
-    x_t  = np.arange(len(df_tests))
-    rl_t = df_tests["run_label"].tolist()
-    ax4  = fig.add_subplot(n_rows, 3, 4)
-    ax5  = fig.add_subplot(n_rows, 3, 5)
-    ax6  = fig.add_subplot(n_rows, 3, 6)
+    x_t    = np.arange(len(df_tests))
+    rl_t   = df_tests["run_label"].tolist()
+    # Narrow bars when only 1 run so it doesn't look like a solid block
+    gov_w  = 0.28 if len(df_tests) == 1 else 0.5
+    ax4    = fig.add_subplot(n_rows, 3, 4)
+    ax5    = fig.add_subplot(n_rows, 3, 5)
+    ax6    = fig.add_subplot(n_rows, 3, 6)
 
     # Pass rate
     ax4.bar(x_t, df_tests["pass_rate"], color=GREEN, alpha=0.75, zorder=3,
-            edgecolor=BG, linewidth=0.5, width=0.5)
+            edgecolor=BG, linewidth=0.5, width=gov_w)
     ax4.set_ylim(95, 101)
     ax4.set_xticks(x_t); ax4.set_xticklabels(rl_t, fontsize=7)
+    if len(df_tests) == 1:
+        ax4.set_xlim(-0.5, 0.5)
     ax4.set_ylabel("%", fontsize=8)
     ax4.set_title("Pass Rate", fontsize=10)
     ax4.axhline(99, color=YELLOW, lw=0.8, linestyle="--", alpha=0.8)
@@ -327,18 +335,22 @@ if has_tests:
 
     # Tests passed
     ax5.bar(x_t, df_tests["tests_passed"], color=CYAN, alpha=0.75, zorder=3,
-            edgecolor=BG, linewidth=0.5, width=0.5)
+            edgecolor=BG, linewidth=0.5, width=gov_w)
     ax5.bar(x_t, df_tests["tests_failed"], bottom=df_tests["tests_passed"],
-            color=RED, alpha=0.45, zorder=3, edgecolor=BG, linewidth=0.5, width=0.5)
+            color=RED, alpha=0.45, zorder=3, edgecolor=BG, linewidth=0.5, width=gov_w)
     ax5.set_xticks(x_t); ax5.set_xticklabels(rl_t, fontsize=7)
+    if len(df_tests) == 1:
+        ax5.set_xlim(-0.5, 0.5)
     ax5.set_ylabel("count", fontsize=8)
     ax5.set_title("Tests Passed", fontsize=10)
     _big_stat(ax5, f"{int(df_tests['tests_passed'].iloc[-1]):,}", "tests passing", CYAN)
 
     # Suite speed
     ax6.bar(x_t, df_tests["tests_per_second"], color=PURPLE, alpha=0.75, zorder=3,
-            edgecolor=BG, linewidth=0.5, width=0.5)
+            edgecolor=BG, linewidth=0.5, width=gov_w)
     ax6.set_xticks(x_t); ax6.set_xticklabels(rl_t, fontsize=7)
+    if len(df_tests) == 1:
+        ax6.set_xlim(-0.5, 0.5)
     ax6.set_ylabel("tests/s", fontsize=8)
     ax6.set_title("Suite Speed", fontsize=10)
     _big_stat(ax6, f"{df_tests['tests_per_second'].iloc[-1]:.0f}/s", "test execution rate", PURPLE)
