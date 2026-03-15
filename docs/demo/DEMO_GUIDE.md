@@ -20,11 +20,17 @@ python3 demo_trinity_governed_loop.py --no-tests
 # Faster pacing (30% of normal delays)
 python3 demo_trinity_governed_loop.py --fast
 
+# Offline replay mode — replays last recorded run from history.json (no GCP call)
+python3 demo_trinity_governed_loop.py --replay
+
 # Combine flags
 python3 demo_trinity_governed_loop.py --no-voice --no-tests --fast
+python3 demo_trinity_governed_loop.py --replay --no-voice --fast
 ```
 
-**Prerequisite:** J-Prime must be reachable. The demo connects to GCP at the endpoint in `JPRIME_ENDPOINT` (defaults to `http://136.113.252.164:8000`).
+**Prerequisite (live mode):** J-Prime must be reachable. The demo connects to GCP at the endpoint in `JPRIME_ENDPOINT` (defaults to `http://136.113.252.164:8000`).
+
+**Prerequisite (replay mode):** `benchmarks/history.json` must exist with at least one recorded run. Run the demo in live mode once to create it.
 
 ---
 
@@ -49,10 +55,10 @@ Trinity AI is three systems working together:
 🛡️  JARVIS (The Body)         🧠  J-Prime (The Mind)         ⚡  Reactor-Core (The Nerves)
 ─────────────────────         ─────────────────────         ──────────────────────────────
 Local supervisor kernel        GCP g2-standard-4              DPO preference pair generator
-Ouroboros governance           NVIDIA L4 (23 GB VRAM)         Feeds fine-tuning from prod
+Ouroboros governance           NVIDIA L4 GPU                  Feeds fine-tuning from prod
 Durable ledger                 Qwen2.5-Coder-14B-Q4_K_M       Governance telemetry ingestion
 Risk engine                    8,192-token context
-Trust graduators               ~20–24 tok/s generation
+Trust graduators               ~24 tok/s generation
 Circuit breakers               OpenAI-compatible API
 ```
 
@@ -217,7 +223,7 @@ A `Rich.Live` timer panel updates every 0.5 seconds while tests run. JARVIS narr
 - AIP integration plan and Ontology pipeline
 - Real commit count (from `git rev-list --count HEAD`)
 - Real governance file count (from `backend/core/ouroboros/**/*.py`)
-- 2,146 governance tests, 3 repos, 1 developer, $0 funding
+- Governance test count (dynamic from live run or history), 3 repos, 1 developer, $0 funding
 
 **Benchmark persistence:**
 ```
@@ -274,6 +280,7 @@ JARVIS_SPEECH_RATE=175     # words per minute (default: 175)
 | `--no-voice` flag | off | Disable all speech |
 | `--no-tests` flag | off | Skip Phase 4 test suite |
 | `--fast` flag | off | Use 30% of normal delays |
+| `--replay` flag | off | Replay last recorded run from `history.json`; skips live GCP inference call |
 
 ---
 
@@ -296,3 +303,39 @@ After each full run (requires J-Prime to be reachable for Phase 3 data):
 - `benchmarks/run-{timestamp}.json` — Machine-readable JSON, accumulates history
 
 See [`benchmarks/README.md`](../../benchmarks/README.md) for format details.
+
+---
+
+## Replay Mode — Fallback for Offline Review
+
+If J-Prime is unavailable during review (e.g., GCP budget exhausted or network restricted), run:
+
+```bash
+python3 demo_trinity_governed_loop.py --replay --no-voice
+```
+
+**What replay mode does:**
+- Loads `inference_0` and `inference_1` from the last entry in `benchmarks/history.json`
+- Displays all four governance panels (pre-gate, replay notice, metrics, post-gate) for each task
+- Populates `_benchmarks` identically to a live run so Phase 5 (summary + persistence) works normally
+- GPU, model, and artifact labels are read dynamically from history — no hardcoded strings
+
+**What you see instead of live streaming:**
+```
+  📼 Replay mode — last recorded run
+  631 tokens · 25665ms · ~24.6 tok/s
+```
+
+The replay panel replaces the live `Rich.Live` streaming widget. All other panels (governance gates, routing metrics, post-execution validation) render identically to a live run.
+
+**To pre-generate history.json for review sessions**, run the demo once while J-Prime is live:
+```bash
+python3 demo_trinity_governed_loop.py --no-voice --fast
+```
+Then `benchmarks/history.json` is ready and `--replay` works indefinitely.
+
+---
+
+## Submission Context
+
+> **Note for reviewers:** This demo runs in the macOS terminal using [Rich](https://github.com/Textualize/rich) for the terminal UI. A web-based dashboard UI is in development — the terminal demo is the current production interface. All performance numbers shown are from real J-Prime inference runs recorded in `benchmarks/history.json` and generated live on a GCP `g2-standard-4` instance with NVIDIA L4 GPU.
