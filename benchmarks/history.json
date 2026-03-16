@@ -53,5 +53,91 @@
       "duration_s": 100.6,
       "tests_per_second": 21.0
     }
+  },
+  {
+    "run_ts": "2026-03-16T05-55-17",
+    "system": {
+      "model": "Qwen2.5-Coder-14B-Instruct",
+      "artifact": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+      "compute": "gpu_l4",
+      "gpu_layers": "-1",
+      "context_window": 8192
+    },
+    "inference_0": {
+      "label": "Secure Infrastructure Code",
+      "latency_ms": 24149.9,
+      "tok_s": 24.6,
+      "completion_tokens": 593,
+      "model": "jarvis-prime"
+    },
+    "inference_1": {
+      "label": "Defense Threat Analysis",
+      "latency_ms": 5996.6,
+      "tok_s": 24.3,
+      "completion_tokens": 146,
+      "model": "jarvis-prime"
+    },
+    "tests": {
+      "passed": 2132,
+      "failed": 14,
+      "pass_rate": 99.3,
+      "duration_s": 100.6,
+      "tests_per_second": 21.0
+    }
+  },
+  {
+    "run_ts": "2026-03-16T06-32-13",
+    "system": {
+      "model": "Qwen2.5-Coder-14B-Instruct",
+      "artifact": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+      "compute": "gpu_l4",
+      "gpu_layers": "-1",
+      "context_window": 8192
+    },
+    "inference_0": {
+      "label": "Secure Infrastructure Code",
+      "latency_ms": 26601.6,
+      "tok_s": 24.5,
+      "completion_tokens": 652,
+      "model": "jarvis-prime"
+    },
+    "inference_1": {
+      "label": "Defense Threat Analysis",
+      "latency_ms": 5658.0,
+      "tok_s": 24.2,
+      "completion_tokens": 137,
+      "model": "jarvis-prime"
+    },
+    "tests": {
+      "passed": 2132,
+      "failed": 14,
+      "pass_rate": 99.3,
+      "duration_s": 103.5,
+      "tests_per_second": 21.0
+    }
+  },
+  {
+    "run_ts": "2026-03-16T08-05-18",
+    "system": {
+      "model": "Qwen2.5-Coder-14B-Instruct",
+      "artifact": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+      "compute": "gpu_l4",
+      "gpu_layers": "-1",
+      "context_window": 8192
+    },
+    "inference_0": {
+      "label": "Secure Infrastructure Code",
+      "latency_ms": 27629.5,
+      "tok_s": 24.6,
+      "completion_tokens": 680,
+      "model": "jarvis-prime"
+    },
+    "inference_1": {
+      "label": "Defense Threat Analysis",
+      "latency_ms": 5334.5,
+      "tok_s": 24.4,
+      "completion_tokens": 130,
+      "model": "jarvis-prime"
+    }
   }
 ]
