@@ -369,7 +369,7 @@ The replication barrier is threefold: (1) the FSM governance kernel represents 7
 
 **Why Now.** Executive Order 14110, NIST AI RMF 1.0, and the DoD AI Assurance Framework have created a compliance mandate with no currently deployable solution. Defense agencies and critical infrastructure operators are under deadline pressure to demonstrate AI governance. Trinity is the only pre-execution governance kernel that ships today.
 
-**Market Size.** The global defense AI governance and assurance market is projected to reach $10.3B by 2028 (MarketsandMarkets). The addressable segment — AI systems requiring FedRAMP/IL5-grade governance — is estimated at ~$2.1B SAM by 2027, based on projected FedRAMP Emerging Technology Baseline deployment volume across DoD cloud AI programs.
+**Market Size.** The global commercial AI governance software market is projected to reach $15.8 billion by 2030, quadrupling from 2024 levels and capturing 7% of total AI software spending (Forrester, 2024). Forrester notes that "AI governance will converge and consolidate around platform solutions" — a structural trend that positions Trinity as the governance infrastructure layer beneath Palantir's AIP platform. The defense-specific addressable segment — AI systems requiring FedRAMP/IL5-grade governance — is estimated at ~$2.1B SAM by 2027, based on projected FedRAMP Emerging Technology Baseline deployment volume across DoD cloud AI programs.
 
 **Revenue Model.** Enterprise SaaS targeting defense contractors, federal system integrators, and critical infrastructure operators:
 
