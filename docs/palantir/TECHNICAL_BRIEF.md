@@ -409,6 +409,8 @@ Trinity is a solo-founder project. The scale of the system is a direct reflectio
 | Endorsement | Letter of recommendation from Sam Altman |
 | Degree | B.S. Computer Engineering, Cal Poly San Luis Obispo |
 
+Russell's path to the degree spanned 10 years — a story of persistence covered by Cal Poly's Mustang News ([link](https://mustangnews.net/10-years-in-the-making-one-cal-poly-students-unique-path-to-an-engineering-degree/)) that contextualizes the grit behind Trinity's 5,400-commit, 7-month build velocity.
+
 Trinity is not a prototype built for this fellowship. It was built because the governance problem is real and the existing solutions are inadequate for classified environments. The fellowship is the path to formalizing the AIP integration that the system was designed to support.
 
 ---
