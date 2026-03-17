@@ -206,17 +206,24 @@ All performance data is measured from live production runs and stored in `benchm
 
 **Average throughput: 24.5 tok/s.** Throughput variance is less than 0.1 tok/s across all 5 recorded production runs — hardware-bound consistency, not software-jitter dependent.
 
+![Trinity AI — Performance Scorecard](../../benchmarks/chart_scorecard.png)
+*Figure 1: Performance scorecard across 7 key metrics — Avg Throughput (A+, 24.5 tok/s), Threat Latency (A+, 5.5s), Peak Output (A, 631 tok), GPU Consistency (A−, R²=0.9999), Gov. Pass Rate (A−, 99.3%), Tests Passing (A+, 2,132), Suite Speed (A+, 21/s).*
+
+![Trinity AI — Full Benchmark Dashboard](../../benchmarks/chart_dashboard.png)
+*Figure 2: Six-panel benchmark dashboard showing throughput consistency (~24.5 tok/s), latency distribution, tokens generated, 99.3% governance pass rate, 2,132 tests passing, and 21 tests/second suite speed across all recorded production runs.*
+
 ### 3.3 Adaptive Multi-Model Routing — Economics at Scale
 
-Trinity's ROUTE stage selects from a tiered model lineup based on task complexity. All tiers run on a single NVIDIA L4 at $409/month — the same hardware, governed by the same Ouroboros pipeline:
+Trinity's ROUTE stage selects from a tiered model lineup based on task complexity. All on-prem tiers run on a single NVIDIA L4 at $409/month — the same hardware, governed by the same Ouroboros pipeline. The architecture is designed to extend to managed inference providers for model tiers that exceed on-prem GPU constraints:
 
-| Model | Size | Quantization | Throughput | Best For |
+| Model | Size | Quantization | Throughput | Deployment |
 |---|---|---|---|---|
-| `phi3_lightweight` | 3.8B | Q4_K_M | ~47 tok/s | Fast, low-risk local tasks |
-| `qwen_coder_14b` | 14B | Q4_K_M | ~24.5 tok/s | Primary inference (J-Prime default) |
-| `qwen_coder_32b` | 32B | IQ2_M (Fisher Information) | ~10 tok/s | High-complexity, reasoning-intensive |
+| `phi3_lightweight` | 3.8B | Q4_K_M | ~47 tok/s | On-prem L4 |
+| `qwen_coder_14b` | 14B | Q4_K_M | ~24.5 tok/s | On-prem L4 (J-Prime default) |
+| `qwen_coder_32b` | 32B | IQ2_M (Fisher Information) | ~10 tok/s | On-prem L4 |
+| Ultra-scale tier | 70B–200B+ | Provider-managed | Provider SLA | Managed inference (OpenAI-compatible) |
 
-Running a 32B parameter model on a single $409/month GPU via Fisher Information-based adaptive quantization is a direct result of the information-theoretic depth built into J-Prime's quantization layer. This enables enterprise-grade model capacity at infrastructure costs that commercial AI governance tools cannot match.
+Running a 32B parameter model on a single $409/month GPU via Fisher Information-based adaptive quantization is a direct result of the information-theoretic depth built into J-Prime's quantization layer. The routing architecture is provider-agnostic at the ultra-scale tier — any OpenAI-compatible managed inference endpoint slots into the ROUTE stage without governance changes, extending Trinity's model ceiling to 70B–200B+ parameter models for the highest-complexity defense workloads.
 
 ### 3.4 HollowGuard — Hardware Admission Layer
 
@@ -350,6 +357,7 @@ The 8-week sprint is not a proof-of-concept integration. The data structures alr
 | Scale AI | Data labeling and RLHF pipelines | Trinity generates DPO pairs from live production operations, not synthetic labels |
 | LangChain / AutoGen / CrewAI | Agentic orchestration frameworks | Trinity is a kernel, not a framework — no wrappers, no silent degradation, IL5-deployable |
 | AWS Bedrock Agents | Managed cloud agentic execution | Requires AWS infrastructure; no air-gap support; post-execution logging only |
+| Anduril / Shield AI / Rebellion Defense | Autonomous defense hardware and C2 platforms | Trinity is the governance substrate underneath autonomous execution — these are integration targets, not competitors. Pre-execution classification is a requirement for deploying any autonomous system into IL5 environments. |
 
 No existing solution combines pre-execution classification, durable FSM-backed governance, automatic rollback, and a continuous DPO fine-tuning loop in a single deployable kernel. Trinity is not a better version of these tools — it is a different category.
 
