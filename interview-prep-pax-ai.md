@@ -295,7 +295,211 @@ Pick 3-4 from this list depending on conversation flow. Aim for questions that s
 
 ---
 
-## 8. INTERVIEW STRATEGY (45-Minute Breakdown)
+## 8. HOW THE SYSTEMS WORK — DETAILED EXPLANATIONS
+
+Use these when Chris asks "walk me through how this works" or "explain the architecture." Each has a **30-second elevator pitch**, a **2-minute technical walkthrough**, and **follow-up answers** for when he digs deeper.
+
+---
+
+### 8A. THE TRINITY ECOSYSTEM (High-Level)
+
+**30-second pitch:**
+> "JARVIS is a distributed AI system split into three repos that map to Body, Mind, and Nerves. The Body handles macOS integration — voice, vision, computer control, and orchestration. The Mind runs on GCP and does LLM inference across 11 specialist models with task-aware routing. The Nerves handle continuous learning — collecting experience data and fine-tuning models. All three start with a single command: `python3 unified_supervisor.py`. The supervisor discovers the other repos, starts them in the correct order, runs health checks, and coordinates everything through a 7-zone boot sequence."
+
+**2-minute technical walkthrough:**
+> "The architecture follows a clear separation of concerns. JARVIS — the body — is the control plane. It's a 101K-line Python monolith called `unified_supervisor.py` that acts as the kernel. It boots through 7 sequential zones:
+>
+> - Zones 0-2 handle protection and foundation — signal handlers, BLAS threading guards for ARM64, imports, logging, distributed locks.
+> - Zone 3 sets up resource managers — Docker, GCP VM management, port checking.
+> - Zone 4 initializes the intelligence layer — ML-based command routing, goal inference.
+> - Zone 5 is process orchestration — this is where Trinity starts. It spawns J-Prime on port 8000 and Reactor on port 8090, polls their `/health` endpoints until they report `READY`, and preserves model loading progress during the handoff.
+> - Zone 6 is the Ouroboros governance system — the self-programming loop I'm most proud of.
+> - Zone 7 is the entry point and main event loop.
+>
+> Communication between repos happens through HTTP health endpoints, a shared state directory under `~/.jarvis/`, and an EventBridge that forwards governance events bidirectionally. There's also a `CrossRepoNarrator` that converts events from Prime and Reactor back into voice narration — with a loop-break guard so JARVIS doesn't narrate its own events back to itself.
+>
+> The key architectural principle is graceful degradation. If J-Prime is unreachable, inference falls back to Claude API. If governance fails, the kernel continues normally. If any zone times out (30s per zone), it's skipped and the system keeps booting. Nothing crashes the kernel."
+
+**If Chris asks: "Why a monolith instead of microservices?"**
+> "Honestly, it started as a prototype and grew. The monolith gives me fast iteration — I can change anything in one file and test immediately. But I recognize it's the biggest piece of tech debt. If I rebuilt it, I'd extract clear services: a voice service, a governance service, a routing service, each with its own API boundary. That said, the monolith is internally organized — the 7-zone structure acts like module boundaries, and the classes inside have clear single responsibilities: `JarvisSystemKernel` (~33K lines) is the actual kernel, `HealthCheckOrchestrator` (~15K) handles health, `WorkflowOrchestrator` (~11K) handles workflows. So it's a monolith by file, but modular by design."
+
+---
+
+### 8B. JARVIS (Body) — How It Actually Works
+
+**When Chris asks: "So what does JARVIS actually do when you talk to it?"**
+> "When I say a voice command, here's what happens end to end:
+>
+> 1. **Audio capture** — A `FullDuplexDevice` (CoreAudio HAL) continuously captures audio. VAD (Voice Activity Detection) identifies when I'm speaking.
+> 2. **Intent detection** — The audio is transcribed (Whisper/Vosk), then classified. I built a zero-hardcoding ML command router — no keyword matching. It uses Apple's NaturalLanguage framework via a Swift bridge for grammar analysis, plus a Python neural network that learns from every interaction.
+> 3. **Routing** — The `PrimeRouter` decides where to send the request: J-Prime on GCP (primary), local model (secondary), or Claude API (tertiary fallback). It uses circuit breakers per endpoint — after 5 consecutive failures, the endpoint is marked OPEN and skipped for 60 seconds.
+> 4. **Inference** — The request goes to J-Prime with deadline propagation. A single monotonic deadline flows through all layers — WebSocket to Router to GCP client to inference. Each layer computes remaining time and caps its own timeout. This prevents destructive cascading timeouts.
+> 5. **Response** — The response streams back through the async pipeline (5 stages: RECEIVED, INTENT_ANALYSIS, COMPONENT_LOADING, PROCESSING, RESPONSE_GENERATION), each with a 30-second timeout and circuit breaker protection.
+> 6. **Voice output** — The response is spoken using `safe_say()` — which renders to a temp file via `say -o`, then plays via `afplay`. This avoids GIL contention and device conflicts with the input capture.
+>
+> The whole thing is async-first. Before I rebuilt the pipeline, JARVIS would get stuck on 'Processing...' for 5-35 seconds because synchronous subprocess calls blocked the event loop. After converting to fully async with `asyncio.create_subprocess_exec()`, response time dropped to 0.1-0.5 seconds."
+
+**If Chris asks: "What about the voice authentication?"**
+> "Voice unlock is a 16-step pipeline. The core is ECAPA-TDNN — a state-of-the-art speaker verification model that generates 192-dimensional embeddings from audio. I store 59 voiceprint samples per user in Cloud SQL PostgreSQL.
+>
+> When I say 'unlock my screen,' JARVIS captures audio, extracts an embedding, and computes cosine similarity against my stored voiceprints. The threshold is 85% confidence. But it's not just voice — I built multi-factor fusion:
+>
+> - Voice confidence gets 60% weight
+> - Behavioral analysis (time-of-day patterns, unlock intervals) gets 25%
+> - Contextual intelligence (location, failed attempts history) gets 15%
+>
+> I also built physics-aware anti-spoofing: a `ReverbAnalyzer` estimates room reverberation time (RT60) to detect playback attacks. A `VocalTractAnalyzer` verifies formant frequencies match an adult male vocal tract length (16-20cm). And a `DopplerAnalyzer` detects natural movement patterns that recordings can't replicate.
+>
+> For cost optimization, I added a ChromaDB semantic cache — if a voice sample is 98%+ similar to a recent successful auth, it short-circuits the full pipeline. Hit rate is 70-80%, reducing per-auth cost from $0.011 to $0.001."
+
+---
+
+### 8C. J-PRIME (Mind) — How It Actually Works
+
+**When Chris asks: "How does the inference server work?"**
+> "J-Prime runs on a GCP g2-standard-4 with an NVIDIA L4 GPU. It serves 11 specialist models, 8 actively routable.
+>
+> The key innovation is **task-aware routing**. Instead of one big model for everything, I match the task to the best specialist:
+>
+> - Math query goes to Qwen2.5-Math-7B (83.6% on MATH benchmark)
+> - Code task goes to Qwen2.5-Coder-7B (70.4% HumanEval)
+> - Chain-of-thought reasoning goes to DeepSeek-R1-Distill-Qwen-7B (55.5% AIME 2024)
+> - Fast lightweight query goes to Phi-3.5-mini (3.8B, ~3s latency)
+> - Long context goes to Llama-3.1-8B (128K context window)
+> - Translation goes to Mistral-7B
+> - General default goes to Gemma-2-9B
+>
+> All models are Q4_K_M quantized — 4-bit mixed precision that compresses 7B models from ~14GB to ~4.4GB while keeping 95%+ quality.
+>
+> The `GCPModelSwapCoordinator` handles routing. If the optimal model is already loaded, inference starts immediately. If not, there's a ~20-30s model swap. To prevent thrashing, I use sticky routing — same task type keeps the model loaded.
+>
+> With the L4 GPU, I get ~43-47 tokens/sec. The API is OpenAI-compatible (`/v1/chat/completions`), so any standard client works."
+
+**If Chris asks: "What's the golden image strategy?"**
+> "The problem: creating a fresh GCP VM means downloading 40GB of models — 30-60 minutes on cold boot. My solution: pre-bake all 11 models into a GCP disk image. When a VM spins up from this image:
+> 1. GCP creates the VM (~26s)
+> 2. Startup script launches the server (~30s)
+> 3. Default model loads from local SSD — zero network downloads
+> 4. Total: ~87 seconds from nothing to serving
+>
+> This matters because I also use GCP Spot VMs as overflow when my Mac's RAM exceeds 85%. Spot VMs can be preempted any time, so fast recovery is critical. The golden image makes recovery near-instant."
+
+---
+
+### 8D. REACTOR-CORE (Nerves) — How It Actually Works
+
+**When Chris asks: "How does the learning loop work?"**
+> "Reactor-Core creates a feedback loop where the system gets smarter from every interaction.
+>
+> The insight: every time J-Prime fails and escalates to Claude API, that's a training signal. Claude's answer becomes the 'preferred' response, J-Prime's failed answer is the 'rejected' response. That pair feeds into DPO — Direct Preference Optimization — which fine-tunes models without needing a separate reward model.
+>
+> The pipeline:
+> 1. JARVIS logs every inference request, which model handled it, and the outcome
+> 2. Escalation events create preference pairs
+> 3. Reactor runs LoRA fine-tuning — parameter-efficient, modifies only 0.1% of weights while getting 95% of full fine-tune quality
+> 4. Improved weights deploy back to J-Prime's golden image with a probation period — monitored for quality regression
+> 5. If quality drops, automatic rollback to previous weights
+>
+> Training runs on GCP Spot VMs at 60-91% cost discount. Since training isn't latency-sensitive, preemption is fine — the pipeline auto-recovers from the last checkpoint."
+
+---
+
+### 8E. OUROBOROS — The Self-Programming Loop
+
+**When Chris asks: "What is Ouroboros? How does it work?"**
+> "Ouroboros is the system that lets JARVIS autonomously improve its own code across all three repos without human intervention. The hard problem isn't generating code — it's doing it safely with rollback guarantees.
+>
+> The flow:
+>
+> **Detection** — Four sensor types run per repo:
+> - `BacklogSensor` polls `.jarvis/backlog.json` every 30 seconds
+> - `TestFailureSensor` watches for pytest failures (needs 2+ consecutive to avoid flakes)
+> - `OpportunityMinerSensor` scans for cyclomatic complexity >= 10 every 5 minutes
+> - `VoiceCommandSensor` listens for direct commands
+>
+> **Dedup** — 60-second window prevents duplicate operations.
+>
+> **Context Expansion** — `TheOracle` does semantic search, builds a `FileNeighborhood` graph across 7 edge categories (imports, tests, configs, etc.) so the generator has full context.
+>
+> **Generation** — Primary: J-Prime on GCP. Fallback: Claude API. Uses schema 2b.1 (single-repo) or 2c.1 (cross-repo coordinated patches).
+>
+> **Validation** — Lint + full test suite per repo. Fails = patch rejected.
+>
+> **Safe Apply via B+ Branch Isolation:**
+> - Create ephemeral branch: `ouroboros/saga-<op_id>/<repo>`
+> - Apply patch, commit on ephemeral branch
+> - Validate again post-apply
+> - If all repos pass: fast-forward merge to main (guarantees linear history)
+> - If any fail: `_bplus_compensate_all()` rolls back every repo to pre-saga state
+>
+> **Safety guarantees:**
+> - Two-tier locking: asyncio.Lock + fcntl.flock, acquired in sorted order (prevents deadlock)
+> - File touch cooldown: max 3 modifications per file per 10 minutes
+> - Trust graduation: high-risk files require stricter validation
+> - Frozen 15-field `SagaLedgerArtifact` audit trail per operation
+> - `SagaMessageBus`: passive observer, zero execution authority
+> - 1,361 tests validating the governance pipeline
+>
+> Every decision is narrated in real-time through voice and TUI."
+
+**If Chris asks: "What if it breaks itself?"**
+> "Three protection layers. First: no patch merges unless lint + tests pass. Second: B+ branch isolation — changes never touch main until validated. Failed branches are preserved for forensics. Third: trust graduation and file-touch cooldowns prevent runaway modification loops."
+
+---
+
+### 8F. ARCHITECTURE DIAGRAMS ON YOUR GITHUB PROFILE
+
+If Chris pulls up your GitHub profile and asks about the diagrams:
+
+**The main Architecture at a Glance diagram:**
+> "This shows the layered structure. The Unified Supervisor at the top is the single entry point with its 7-zone boot sequence. Below it: JARVIS Body on port 8010 for computer use, voice, and vision. J-Prime on port 8000 for LLM inference. Reactor on port 8090 for training. GCP Golden Image is on-demand for cloud inference. Spot VMs are the memory-pressure fallback. Frontend on port 3000 is the web UI."
+
+**The Ouroboros Loop diagram:**
+> "This shows the full governance pipeline top to bottom. Sensors at the top detect issues. Intake router deduplicates. Operation context decides single-repo vs cross-repo schema. Candidate generator tries J-Prime first, Claude fallback. Orchestrator runs validate, review, apply, commit phases. CommProtocol at the bottom sends every event through five transports: logging, TUI, voice narration, ops logger, and EventBridge for cross-repo communication."
+
+**The Triple Authority Resolution diagram (Mermaid):**
+> "This solved a real distributed systems bug — three repos had independent supervisors making conflicting lifecycle decisions, causing restart storms. The fix: `RootAuthorityWatcher` is the policy brain (decides WHAT). `ProcessOrchestrator` is the execution plane (does HOW). Handshake gate blocks 'healthy but incompatible' subsystems using schema compatibility checks. Escalation ladder is deterministic: drain, then SIGTERM, then process-group SIGKILL."
+
+**The Adaptive Timeout diagram (Mermaid):**
+> "Instead of hardcoded timeouts, there's a policy chain: env var overrides win, then learned adaptive values (p95 latency + load factor), then static defaults. Shadow mode lets me validate the adaptive system without applying it. Feedback loop at the bottom tracks operation outcomes to improve future decisions."
+
+---
+
+### 8G. OTHER GITHUB PROJECTS CHRIS MIGHT ASK ABOUT
+
+**Connect-Four-AI (TypeScript, 2 stars):**
+> "An AI-powered Connect Four game using minimax with alpha-beta pruning and a heuristic evaluation function. Built in TypeScript with React. A fun project to understand adversarial search algorithms at a fundamental level."
+
+**MLForge (C++):**
+> "A modular ML framework I'm building in C++ for implementing and benchmarking ML algorithms from scratch — gradient descent, backpropagation, optimization algorithms. The goal is understanding the math behind ML, not just calling library functions."
+
+**JARVIS-Portfolio (TypeScript/Next.js):**
+> "My portfolio and technical blog built with Next.js, showcasing projects and technical write-ups."
+
+**Ironman-Suit-Simulation (Python):**
+> "A simulation of Iron Man suit engineering integrating AI, systems programming, and robotics — modeling sensor fusion, power management, and flight dynamics."
+
+---
+
+### 8H. CONNECTING YOUR EXPERIENCE TO PAX AI
+
+After any technical deep-dive, bridge back to Pax:
+
+**After explaining the async pipeline:**
+> "This is relevant to Pax — processing duty drawback claims involves orchestrating multiple async operations: parsing documents, matching records, validating against regulations. The async pipeline patterns I built — circuit breakers, deadline propagation, graceful degradation — apply directly."
+
+**After explaining task-aware routing:**
+> "At Pax, you're using LLMs for data extraction from different document types. The same routing principle could optimize extraction accuracy — one model might be better at invoices while another handles bills of lading."
+
+**After explaining Ouroboros safety:**
+> "In duty drawback, safety matters even more than in my project. The validation-before-apply pattern, audit trails, and rollback guarantees are the kind of engineering discipline you need when incorrect calculations mean real money and compliance risk."
+
+**After explaining the golden image:**
+> "This is infrastructure-as-code thinking. At Pax's stage, having reproducible, fast-booting infrastructure means you can scale without configuration drift. Whether it's model serving or application deployment, the principle is the same."
+
+---
+
+## 9. INTERVIEW STRATEGY (45-Minute Breakdown)
 
 | Time | Phase | Goal |
 |------|-------|------|
@@ -321,7 +525,7 @@ Pick 3-4 from this list depending on conversation flow. Aim for questions that s
 
 ---
 
-## 9. LOGISTICS CHECKLIST
+## 10. LOGISTICS CHECKLIST
 
 - [ ] Test Google Meet link 15 minutes before
 - [ ] Camera on, good lighting (face lit, not backlit)
@@ -335,7 +539,7 @@ Pick 3-4 from this list depending on conversation flow. Aim for questions that s
 
 ---
 
-## 10. CLOSING STATEMENT
+## 11. CLOSING STATEMENT
 
 When the interview ends:
 
