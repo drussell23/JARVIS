@@ -447,21 +447,68 @@ Use these when Chris asks "walk me through how this works" or "explain the archi
 
 ---
 
-### 8F. ARCHITECTURE DIAGRAMS ON YOUR GITHUB PROFILE
+### 8F. ALL 12 ARCHITECTURE DIAGRAMS ON YOUR GITHUB PROFILE
 
-If Chris pulls up your GitHub profile and asks about the diagrams:
+Your GitHub profile has 12 mermaid diagrams under "The JARVIS Ecosystem." Here's how to explain each one if Chris asks.
 
-**The main Architecture at a Glance diagram:**
-> "This shows the layered structure. The Unified Supervisor at the top is the single entry point with its 7-zone boot sequence. Below it: JARVIS Body on port 8010 for computer use, voice, and vision. J-Prime on port 8000 for LLM inference. Reactor on port 8090 for training. GCP Golden Image is on-demand for cloud inference. Spot VMs are the memory-pressure fallback. Frontend on port 3000 is the web UI."
+**1. System Architecture (Hero Diagram):**
+> "This is the big picture. The Unified Supervisor Kernel at the top — single entry point, 50K+ lines, 7-zone parallel initialization. It orchestrates three subsystems: JARVIS Body (Python/Rust/Swift on port 8010) with 16+ async agents, voice auth, vision, and macOS native control. JARVIS-Prime (Python/GGUF on port 8000) with 11 specialist models and a task-type router. ReactorCore (C++/Python on port 8090) with LoRA/DPO training, deployment gates, model lineage, and GCP Spot recovery. The arrows show the closed loop: Prime sends telemetry to Reactor, Reactor sends improved models back to Prime, JARVIS exchanges inference requests/responses with Prime."
 
-**The Ouroboros Loop diagram:**
-> "This shows the full governance pipeline top to bottom. Sensors at the top detect issues. Intake router deduplicates. Operation context decides single-repo vs cross-repo schema. Candidate generator tries J-Prime first, Claude fallback. Orchestrator runs validate, review, apply, commit phases. CommProtocol at the bottom sends every event through five transports: logging, TUI, voice narration, ops logger, and EventBridge for cross-repo communication."
-
-**The Triple Authority Resolution diagram (Mermaid):**
+**2. Triple Authority Resolution:**
 > "This solved a real distributed systems bug — three repos had independent supervisors making conflicting lifecycle decisions, causing restart storms. The fix: `RootAuthorityWatcher` is the policy brain (decides WHAT). `ProcessOrchestrator` is the execution plane (does HOW). Handshake gate blocks 'healthy but incompatible' subsystems using schema compatibility checks. Escalation ladder is deterministic: drain, then SIGTERM, then process-group SIGKILL."
 
-**The Adaptive Timeout diagram (Mermaid):**
-> "Instead of hardcoded timeouts, there's a policy chain: env var overrides win, then learned adaptive values (p95 latency + load factor), then static defaults. Shadow mode lets me validate the adaptive system without applying it. Feedback loop at the bottom tracks operation outcomes to improve future decisions."
+**3. God File / Monolith Paradox:**
+> "This is my honest assessment of the biggest tech debt. The unified_supervisor.py grew to ~96K lines. The diagram shows the cure path: preserve the single entry point but extract domain controllers — Lifecycle, Health, Workflow, Resource, Self-Healing, AGI/Training — each behind typed contract boundaries. The controllers register with a Domain Controller Registry. This lets me unit test each domain in isolation without needing the full kernel context. I haven't completed this refactor yet, but the design is ready."
+
+**4. Data Flow:**
+> "This shows the runtime request path. Three input types — voice, screen capture, user command — all flow into the JARVIS Kernel. The kernel sends them to J-Prime for inference routing. Prime classifies the task type and dispatches to the right specialist model: Qwen for math, DeepCoder for code, LLaVA for vision, the fast 2.2GB model for simple queries, or Claude API for complex tasks. Every response goes back to the user AND telemetry goes to ReactorCore for LoRA/DPO training, which produces improved models that deploy back to Prime with probation monitoring."
+
+**5. Three-Tier Inference Routing:**
+> "This is the fallback ladder for reliability. Tier 1: GCP Golden Image with 11 models and ~30 second cold start. If that's unavailable, Tier 2: Local Apple Silicon with M1 Metal GPU. If that's resource-constrained, Tier 3: Claude API as emergency fallback. The key principle is the system always has a path to serve inference — it degrades in cost and latency but never goes down completely."
+
+**6. Trinity Autonomy Wiring (Phase 2):**
+> "This shows how autonomous actions create training data. The Google Workspace Agent executes tasks like sending emails or creating calendar events. It emits 7 canonical event types — intent_written, committed, failed, policy_denied, etc. Events go through a token-bucket rate limiter, then to a CrossRepoExperienceForwarder. ReactorCore's AutonomyEventIngestor validates events (7 required keys), deduplicates by composite key, classifies them (only committed/failed are trainable), and feeds them into the DPO/LoRA training pipeline. Malformed events go to a quarantine with 7-day retention — they're never silently coerced. At boot, the supervisor checks schema compatibility across all three repos and degrades to read-only if there's a mismatch."
+
+**7. Ouroboros B+ Saga (Full Detail):**
+> "This is the most detailed diagram. Zone 6.9 at the top shows four sensor types fanning out per repo. Zone 6.8 shows the Governed Loop Service with the FSM engine and 10-phase orchestrator. The B+ Saga Apply section shows the branch isolation flow: preflight, two-tier locking (asyncio + fcntl in sorted order), ephemeral branch creation, patch application, and then either ff-only promote on success or _bplus_compensate_all on failure. The SagaMessageBus passively records 8 lifecycle event types. J-Prime on GCP generates the actual patches using schema 2c.1, with a noop fast-path when the change already exists."
+
+**8. GCP Hybrid Cloud Spot Architecture:**
+> "This shows how I balance cost and reliability. A Hybrid Orchestrator receives inference or training requests and has three execution paths: GCP Spot VMs as the primary cost-optimized path, local Apple Silicon as low-latency fallback, and Claude API as emergency overflow. The key innovation is preemption handling — when a Spot VM gets preempted (which GCP can do with 30-second notice), the system resumes from the last checkpoint. Telemetry and cost signals flow back to the orchestrator so it can make smarter routing decisions over time."
+
+**9. Golden Image Architecture:**
+> "This is the immutable infrastructure pipeline. Model and runtime source code flows into an Image Builder Pipeline. The builder bakes a Golden Image — all 11 models, dependencies, and startup contracts on one disk. It goes through a Validation Gate that checks health, integrity, and startup SLA. If it passes, it enters the Image Registry. From there, autoscaled GCP inference nodes pull the image. J-Prime Router connects to those nodes. Observability and drift monitoring feeds back into the builder so the image stays current. The key insight: no VM ever downloads models at boot time. Everything is pre-baked. That's how I get 87-second cold boot."
+
+**10. Execution Planes (Control / Data / Model):**
+> "This separates concerns into three planes. The Control Plane handles policy, auth, secrets, kill switches, and guardrails. The Data Plane handles runtime events, Redis/Cloud SQL state, ChromaDB/FAISS memory, and JSONL telemetry. The Model Plane handles inference routing, tiered execution, training pipeline, and deployment gates. Control constrains both Data and Model. Data feeds context and telemetry into Model. Model sends decisions and artifacts back to Data, and health/risk signals up to Control. This separation means I can evolve the training pipeline without touching the policy engine, or add new safety controls without changing inference routing."
+
+**11. Memory Control Plane (UMA-Aware):**
+> "This is specific to Apple Silicon. M-series chips have Unified Memory Architecture — CPU, GPU, and Neural Engine all share the same RAM. The diagram shows a MemoryQuantizer sampling system and process memory to produce frozen MemorySnapshots with headroom and pressure tier. A MemoryBudgetBroker manages leases — components must request a lease before expensive allocations. A DisplayPressureController has a shedding ladder: 1080p → 900p → 720p → 576p → off, with flap guards (dwell windows, cooldowns, rate limits) to prevent oscillation. Crash-safe reconciliation uses epoch fencing to reclaim orphaned leases. This is how JARVIS runs on a 16GB Mac that's typically at 81% RAM utilization."
+
+**12. Safety & Governance Path:**
+> "This is the risk classification flow. Incoming actions go through a Risk Classifier. Low-risk actions auto-execute. Medium-risk actions run in Safe Mode with limits and constraints. High-risk actions require human approval before execution. Everything is auditable — the full decision chain is logged. This is how I balance autonomy with safety. JARVIS can handle routine tasks independently but escalates anything that could cause real damage."
+
+---
+
+### 8F-2. THE GOLDEN IMAGE — ORIGIN STORY
+
+**If Chris asks: "How did the golden image come about?"**
+
+> "It started with a painful problem. Every time I created a fresh GCP VM for inference, it had to download 11 GGUF models — about 40GB total. On GCP's network, that took 30-60 minutes per cold boot. And since I use Spot VMs for cost savings, preemption meant doing that download all over again. I was spending more time waiting for downloads than actually serving inference.
+>
+> The first optimization was obvious: cache models on persistent disk. But that still required attaching the disk, mounting it, and configuring the server — multiple failure points.
+>
+> The breakthrough was realizing I could bake everything — models, Python venv, server code, startup scripts, systemd services — into a single GCP disk image. When you create a VM from this image, the disk is already there with all models on local SSD. No network, no downloads, no configuration.
+>
+> The numbers tell the story: VM creation takes ~26 seconds, the startup script launches the server in ~30 seconds, the default model loads from local disk in ~30 seconds. Total: ~87 seconds from nothing to serving inference. That's a 20-40x improvement over the download approach.
+>
+> The image is truly immutable — I never SSH into a running VM to change things. When I need to update models or code, I build a new image, validate it passes health checks and startup SLA, and swap it into the registry. Old images stay around for rollback.
+>
+> This pattern also solved the Spot VM problem. When a Spot VM gets preempted, I just create a new one from the golden image. In under 2 minutes, I'm back to serving. The cost savings from Spot VMs (60-91% discount) far outweigh the occasional 2-minute interruption.
+>
+> It's the same principle as container images in Docker, but applied to full VMs with 40GB of ML models. Immutable infrastructure at the metal level."
+
+**If Chris asks: "How does this relate to what Pax would need?"**
+> "The principle transfers directly. At Pax's scale, you probably don't need golden images for ML models, but the pattern — pre-bake dependencies, validate before deploy, make infrastructure reproducible and immutable — is exactly how you'd want to manage your FastAPI backend, your optimization engine, and your LLM extraction services. Whether it's Docker images or VM images, the idea is the same: never depend on runtime setup."
 
 ---
 
