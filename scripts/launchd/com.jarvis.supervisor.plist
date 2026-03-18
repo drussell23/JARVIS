@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    JARVIS Supervisor — macOS launchd watchdog (Gap 1: supervisor self-healing)
+
+    This plist makes macOS responsible for keeping unified_supervisor.py running.
+    launchd will restart it automatically within ~30s of any crash — solving the
+    supervisor self-healing paradox (the supervisor can't watch itself).
+
+    INSTALL:
+        cp scripts/launchd/com.jarvis.supervisor.plist ~/Library/LaunchAgents/
+        launchctl load ~/Library/LaunchAgents/com.jarvis.supervisor.plist
+
+    START / STOP manually:
+        launchctl start com.jarvis.supervisor
+        launchctl stop  com.jarvis.supervisor
+
+    UNINSTALL:
+        launchctl unload ~/Library/LaunchAgents/com.jarvis.supervisor.plist
+        rm ~/Library/LaunchAgents/com.jarvis.supervisor.plist
+
+    LOGS:
+        tail -f ~/.jarvis/logs/supervisor_stdout.log
+        tail -f ~/.jarvis/logs/supervisor_stderr.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.jarvis.supervisor</string>
+
+    <!-- Run the supervisor via the project venv so all dependencies are available -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.venv/bin/python3</string>
+        <string>/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/unified_supervisor.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/djrussell23/Documents/repos/JARVIS-AI-Agent</string>
+
+    <!-- Pass the PATH so subprocess calls inside the supervisor resolve gcloud/gsutil -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>/Users/djrussell23</string>
+    </dict>
+
+    <!--
+        RunAtLoad=false: do NOT start the supervisor automatically on every login.
+        Use `launchctl start com.jarvis.supervisor` to start explicitly.
+        Flip to <true/> if you want it to start on every login/reboot.
+    -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!--
+        KeepAlive=true: launchd restarts the supervisor within ThrottleInterval
+        seconds if it exits for ANY reason (crash, OOM, signal). This is the
+        self-healing watchdog that solves the supervisor self-healing paradox.
+    -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!--
+        ThrottleInterval: minimum seconds between restarts.
+        30s prevents rapid restart loops while keeping recovery fast.
+    -->
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <!-- Logs — directory must exist before loading the plist -->
+    <key>StandardOutPath</key>
+    <string>/Users/djrussell23/.jarvis/logs/supervisor_stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/djrussell23/.jarvis/logs/supervisor_stderr.log</string>
+</dict>
+</plist>

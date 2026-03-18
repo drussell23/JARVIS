@@ -154,11 +154,15 @@ class GCPControllerConfig:
     )
     
     # Idle shutdown
+    # INVARIANT: idle_warning_minutes < idle_shutdown_minutes
+    # The shutdown check runs inside the warning check, so if shutdown ≤ warning,
+    # the VM is terminated the instant the warning fires with no grace period.
+    # Defaults: warn at 15min, shut down at 20min → 5-minute grace window.
     idle_warning_minutes: int = field(
-        default_factory=lambda: int(os.getenv("GCP_IDLE_WARN_MINS", "10"))
+        default_factory=lambda: int(os.getenv("GCP_IDLE_WARN_MINS", "15"))
     )
     idle_shutdown_minutes: int = field(
-        default_factory=lambda: int(os.getenv("GCP_IDLE_SHUTDOWN_MINS", "5"))
+        default_factory=lambda: int(os.getenv("GCP_IDLE_SHUTDOWN_MINS", "20"))
     )
     
     # Memory thresholds (override defaults)
@@ -779,8 +783,10 @@ class SupervisorAwareGCPController:
                 await asyncio.sleep(60)  # Check every minute
                 
                 if self._active_vm is None:
-                    break
-                
+                    # No active dynamic VM — keep the loop alive so it catches
+                    # future VMs. break would kill the monitor permanently.
+                    continue
+
                 vm = self._active_vm
                 idle_seconds = elapsed_since_s(vm.last_activity_mono)
                 idle_minutes = idle_seconds / 60

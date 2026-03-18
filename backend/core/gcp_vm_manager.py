@@ -773,6 +773,17 @@ class VMManagerConfig:
         )
     )
 
+    # Static J-Prime idle-stop (cost savings — stops jarvis-prime-stable when idle)
+    # Unlike dynamic Spot VMs, the static VM is "invincible" (never deleted), so idle-STOP
+    # is handled as a separate lifecycle path: VM is halted (disk/IP preserved), restarted
+    # on-demand via ensure_static_vm_ready() (~87s golden-image boot).
+    jprime_idle_stop_enabled: bool = field(
+        default_factory=lambda: os.getenv("JPRIME_IDLE_STOP_ENABLED", "true").lower() == "true"
+    )
+    jprime_idle_timeout_minutes: int = field(
+        default_factory=lambda: int(os.getenv("JPRIME_IDLE_TIMEOUT_MINUTES", "20"))
+    )
+
     # Retry Configuration
     max_create_attempts: int = field(
         default_factory=lambda: int(os.getenv("GCP_MAX_CREATE_ATTEMPTS", "3"))
@@ -2778,6 +2789,23 @@ class GCPVMManager:
         # Maps ip_name → monotonic allocation time for this session
         self._static_ip_tracking: Dict[str, float] = {}
 
+        # J-Prime idle-stop tracking — monotonic wall time of last successful J-Prime request.
+        # Reset by record_jprime_activity() (called from prime_router after GCP_PRIME success).
+        # _monitoring_loop Step 5c compares this against jprime_idle_timeout_minutes and issues
+        # VMAction.STOP when exceeded. Initialized to now so a freshly started system gets
+        # the full idle window before any auto-stop is considered.
+        self._jprime_last_activity: float = time.time()
+
+        # Gap 3: Idle-stopped VM tracker — distinguishes voluntary idle-stops from GCP
+        # preemptions. When Step 5c stops J-Prime for idleness, the name is added here
+        # so the recovery path can log "restarting after idle-stop" vs "GCP preemption".
+        self._idle_stopped_vms: set[str] = set()
+
+        # Gap 7: Training lock — prevents idle-stop while Reactor Core is actively using
+        # J-Prime (DPO training, batch inference, model evaluation). acquire_jprime_lock()
+        # sets the expiry; Step 5c checks _jprime_lock_until before stopping.
+        self._jprime_lock_until: float = 0.0
+
         # v224.0: Golden Image Builder for pre-baked VM images
         self._golden_image_builder: Optional[GoldenImageBuilder] = None
         self._golden_image_cache: Optional[GoldenImageInfo] = None
@@ -2922,6 +2950,40 @@ class GCPVMManager:
             self.managed_vms[vm_name].record_activity()
             return True
         return False
+
+    def record_jprime_activity(self) -> None:
+        """Record that the static J-Prime VM (jarvis-prime-stable) just handled a request.
+
+        Called by prime_router at request START and after every successful GCP_PRIME
+        response. Resets the J-Prime idle timer so _monitoring_loop Step 5c does not
+        issue a premature stop during active or long-running generations.
+        Thread-safe: float assignment is atomic in CPython.
+        """
+        self._jprime_last_activity = time.time()
+
+    def acquire_jprime_lock(self, duration_minutes: float = 60.0) -> None:
+        """Acquire a training lock to prevent J-Prime from being idle-stopped.
+
+        Call this when Reactor Core or any process begins an operation that requires
+        J-Prime to stay running (DPO training, batch inference, model evaluation).
+        The lock auto-expires after duration_minutes — no orphaned locks.
+
+        Args:
+            duration_minutes: How long to hold the lock. Default 60 minutes.
+        """
+        self._jprime_lock_until = time.time() + (duration_minutes * 60)
+        logger.info(
+            f"🔒 [JprimeLock] Training lock acquired for {duration_minutes:.0f}min "
+            f"(expires in {duration_minutes:.0f}min)"
+        )
+
+    def release_jprime_lock(self) -> None:
+        """Release the training lock early (Reactor Core finished training).
+
+        Safe to call even if no lock is held — just resets the timer to 0.
+        """
+        self._jprime_lock_until = 0.0
+        logger.info("🔓 [JprimeLock] Training lock released early.")
 
     def _update_ip_index(self, vm: VMInstance) -> None:
         """Update the IP-to-VM index when a VM's IP changes.
@@ -6631,9 +6693,14 @@ class GCPVMManager:
             return True, msg
 
         if action == VMAction.STOP:
-            # STOP is allowed for session shutdown when session lifecycle is enabled
+            # STOP is allowed for session shutdown and for cost-saving idle-stop.
+            # Both preserve disk and static IP — the VM can be resumed in ~87s via
+            # ensure_static_vm_ready(). Only VMAction.DELETE / VMAction.TERMINATE are
+            # permanently destructive and remain blocked for invincible VMs.
             session_lifecycle = os.getenv("JARVIS_GCP_SESSION_LIFECYCLE", "true").lower() == "true"
-            is_session_reason = reason in ("session_shutdown", "supervisor_cleanup", "emergency_shutdown")
+            is_session_reason = reason in (
+                "session_shutdown", "supervisor_cleanup", "emergency_shutdown", "idle_stop"
+            )
 
             if session_lifecycle and is_session_reason:
                 logger.info(
@@ -7838,6 +7905,85 @@ class GCPVMManager:
                                 await self._release_static_ip(ip_name)
                 except Exception as ip_release_err:
                     logger.debug(f"Static IP release check failed (non-critical): {ip_release_err}")
+
+                # === STEP 5c: Static J-Prime idle-stop (cost savings) ===
+                # The invincible guard prevents DELETE/TERMINATE of jarvis-prime-stable, but
+                # VMAction.STOP (halt, preserve disk/IP) is explicitly allowed for "idle_stop".
+                # When J-Prime has been idle for jprime_idle_timeout_minutes, stop it to halt
+                # billing. On next request, ensure_static_vm_ready() restarts it in ~87s.
+                #
+                # Activity is recorded by record_jprime_activity() called from prime_router
+                # after every successful GCP_PRIME response, so the timer only fires during
+                # genuine silence — not during active sessions.
+                if self.config.jprime_idle_stop_enabled:
+                    try:
+                        static_name = self.config.static_instance_name
+                        if static_name is None:
+                            pass  # No static VM configured — idle-stop not applicable
+                        else:
+                            static_vm = self.managed_vms.get(static_name)
+                            if static_vm and static_vm.state == VMState.RUNNING:
+                                now = time.time()
+
+                                # Gap 4: Startup grace period — don't idle-stop a VM that
+                                # was just brought up. ensure_static_vm_ready() sets
+                                # _startup_grace_until[name] for the boot poll window.
+                                grace_until = getattr(
+                                    self, '_startup_grace_until', {}
+                                ).get(static_name, 0.0)
+                                if now < grace_until:
+                                    logger.debug(
+                                        f"[IdleStop] J-Prime '{static_name}' in startup grace "
+                                        f"({(grace_until - now) / 60:.1f}min remaining) — skip"
+                                    )
+
+                                # Gap 7: Training lock — Reactor Core may be actively using
+                                # J-Prime for DPO training or batch inference.
+                                elif now < self._jprime_lock_until:
+                                    logger.debug(
+                                        f"[IdleStop] J-Prime '{static_name}' training lock "
+                                        f"active "
+                                        f"({(self._jprime_lock_until - now) / 60:.1f}min "
+                                        f"remaining) — skip"
+                                    )
+
+                                else:
+                                    idle_s = now - self._jprime_last_activity
+                                    timeout_s = self.config.jprime_idle_timeout_minutes * 60
+                                    if idle_s >= timeout_s:
+                                        # Pyright fix: rate read from env, not missing config field
+                                        _rate = float(
+                                            os.environ.get("JPRIME_STATIC_HOURLY_RATE", "1.35")
+                                        )
+                                        logger.warning(
+                                            f"💤 [IdleStop] J-Prime '{static_name}' idle for "
+                                            f"{idle_s / 60:.1f}min (threshold "
+                                            f"{self.config.jprime_idle_timeout_minutes}min) — "
+                                            f"stopping VM to save cost (~${_rate:.3f}/hr)"
+                                        )
+                                        stopped = await self.terminate_vm(
+                                            static_name,
+                                            reason="idle_stop",
+                                            action=VMAction.STOP,
+                                        )
+                                        if stopped:
+                                            # Gap 3: Mark as idle-stopped so recovery path
+                                            # can distinguish from GCP preemption.
+                                            self._idle_stopped_vms.add(static_name)
+                                            # Reset timer so monitoring loop doesn't
+                                            # re-trigger on the next cycle.
+                                            self._jprime_last_activity = time.time()
+                                            logger.info(
+                                                f"💤 [IdleStop] J-Prime '{static_name}' "
+                                                f"stopped (idle-stop, not preemption). "
+                                                f"Will auto-restart on next request via "
+                                                f"ensure_static_vm_ready()."
+                                            )
+                    except Exception as _idle_stop_err:
+                        logger.debug(
+                            f"[IdleStop] J-Prime idle-stop check failed (non-critical): "
+                            f"{_idle_stop_err}"
+                        )
 
                 # === STEP 6: Publish VM state for cross-repo coordination ===
                 # Called once per monitoring cycle (not per-VM) — writes to ~/.jarvis/cross_repo/gcp/
