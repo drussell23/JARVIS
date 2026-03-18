@@ -16,6 +16,8 @@ Doubleword (formerly TitanML, $12M Series A — Dawn Capital) is a managed async
 
 ## Benchmark Results (2026-03-18)
 
+> **Live benchmark run** — Batch ID `ca6b7b1f-da63-4c44-ac8e-e9e8b796eae4` · Wall time 257s · $0.000376 total
+
 ### Setup
 
 | Component | Value |
@@ -28,6 +30,8 @@ Doubleword (formerly TitanML, $12M Series A — Dawn Capital) is a managed async
 
 ### Cost Comparison
 
+![Cost Comparison](../../benchmarks/doubleword/chart_dw_cost.png)
+
 | Task | J-Prime (VM time) | Doubleword (batch) | Savings |
 |------|-------------------|--------------------|---------|
 | Secure Infrastructure Code | $0.009210 | $0.000288 | 32x cheaper |
@@ -35,6 +39,8 @@ Doubleword (formerly TitanML, $12M Series A — Dawn Capital) is a managed async
 | **Total (both tasks)** | **$0.010988** | **$0.000376** | **29x cheaper** |
 
 ### Token Volume
+
+![Token Volume](../../benchmarks/doubleword/chart_dw_tokens.png)
 
 | Task | J-Prime tokens | Doubleword tokens | Note |
 |------|---------------|-------------------|------|
@@ -67,6 +73,8 @@ Doubleword (formerly TitanML, $12M Series A — Dawn Capital) is a managed async
 
 ## Model Catalog
 
+![Model Catalog — Parameter Scale](../../benchmarks/doubleword/chart_dw_catalog.png)
+
 Full catalog available via `GET https://api.doubleword.ai/v1/models` as of 2026-03-18:
 
 | Model ID | Params | Active Params | Best for |
@@ -86,6 +94,8 @@ Full pricing: https://www.doubleword.ai/calculator
 ---
 
 ## Architecture: Where Doubleword Fits
+
+![Routing Architecture](../../benchmarks/doubleword/chart_dw_routing.png)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -115,6 +125,32 @@ Full pricing: https://www.doubleword.ai/calculator
 Reactor-Core DPO Pipeline:
   Telemetry JSONL → Doubleword Batch → 397B scoring → preference pairs → J-Prime fine-tune
 ```
+
+---
+
+## Monthly Cost Projections
+
+![Monthly Cost Projection](../../benchmarks/doubleword/chart_dw_monthly.png)
+
+| Daily ops | Doubleword batch | J-Prime (6hr/day spot) | J-Prime (always-on) |
+|-----------|-----------------|------------------------|---------------------|
+| 10 ops/day | $0.11/mo | $216/mo | $864/mo |
+| 50 ops/day | $0.56/mo | $216/mo | $864/mo |
+| 100 ops/day | $1.13/mo | $216/mo | $864/mo |
+| 500 ops/day | $5.63/mo | $216/mo | $864/mo |
+| 1,000 ops/day | $11.27/mo | $216/mo | $864/mo |
+
+*Based on $0.0003756 per 2-task batch. Doubleword cost scales linearly with usage; J-Prime VM cost is flat regardless of ops.*
+
+**Break-even:** At ~1,150 ops/day, J-Prime 6hr/day spot becomes cheaper than Doubleword batch. Below that threshold, Doubleword is the correct economic choice.
+
+---
+
+## Full Benchmark Dashboard
+
+![Trinity AI × Doubleword — Full Benchmark Dashboard](../../benchmarks/doubleword/chart_dw_dashboard.png)
+
+*Dashboard: cost comparison · token volume · model catalog · monthly projection · routing architecture · key metrics*
 
 ---
 
@@ -262,28 +298,13 @@ DOUBLEWORD_MAX_TOKENS_INFRA=3000 \
 
 Results are saved to `benchmarks/doubleword/results/<timestamp>-UTC.json` automatically.
 
-To visualise results, open the Jupyter notebook:
+To re-execute the notebook and regenerate all charts:
 
 ```bash
 cd benchmarks/doubleword
-jupyter notebook doubleword_benchmark_analysis.ipynb
+/path/to/.venv/bin/jupyter nbconvert --to notebook --execute \
+  doubleword_benchmark_analysis.ipynb --output doubleword_benchmark_analysis.ipynb
 ```
-
----
-
-## Monthly Cost Projections
-
-| Daily ops | Doubleword batch | J-Prime (6hr/day spot) | J-Prime (always-on) |
-|-----------|-----------------|------------------------|---------------------|
-| 10 ops/day | $0.11/mo | $216/mo | $864/mo |
-| 50 ops/day | $0.56/mo | $216/mo | $864/mo |
-| 100 ops/day | $1.13/mo | $216/mo | $864/mo |
-| 500 ops/day | $5.63/mo | $216/mo | $864/mo |
-| 1,000 ops/day | $11.27/mo | $216/mo | $864/mo |
-
-*Based on $0.0003756 per 2-task batch. Doubleword cost scales linearly with usage; J-Prime VM cost is flat regardless of ops.*
-
-**Break-even:** At ~1,150 ops/day, J-Prime 6hr/day spot becomes cheaper than Doubleword batch. Below that threshold, Doubleword is the correct economic choice.
 
 ---
 
