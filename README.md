@@ -6,6 +6,237 @@ JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem.
 
 ---
 
+## Session Update (2026-03-18): Unified Control Plane — UDS Multiplexing, Crash-Loop Fix, and Startup Hardening (v293.0)
+
+This session delivered four structural fixes targeting the root causes of the launchd restart loop, the split-brain `--force` problem, log blindness when running under launchd, and silent voice-shutdown sentinel races.
+
+---
+
+### 1) Root-Cause Crash-Loop Fix: `ready_for_inference: null` Contract Violation
+
+#### Problem
+
+JARVIS was caught in an infinite restart loop (`runs = 36` observed in production). Every startup ended in `exit code 1` after ~15 seconds, which triggered launchd `KeepAlive: true` to restart the process 30 seconds later.
+
+Root cause: the GCP Invincible Node VM health endpoint (`/health`) returns `ready_for_inference: null` while the model is still loading. The schema validator in `backend/core/startup_contracts.py` treated `None` as a boolean type violation, which caused the Trinity boot contract gate to raise a `RuntimeError` (`contract_gate_required_failure:jarvis_prime`). Because `JARVIS_CONTRACT_FAIL_CLOSED` defaults to `true`, JARVIS exited with code 1 on every attempt — before the voice system was ever ready to hear a shutdown command.
+
+#### What changed
+
+**`backend/core/startup_contracts.py` (line 569)**
+
+```python
+# Before
+if expected_type == "bool" and not isinstance(val, bool):
+    type_ok = False
+
+# After (v293.0)
+if expected_type == "bool" and val is not None and not isinstance(val, bool):
+    # None (null) means "not yet ready" — not a schema violation.
+    # GCP VMs return ready_for_inference: null while the model is loading.
+    type_ok = False
+```
+
+`None` for a `bool` field now passes schema validation and is treated as `False` (not ready). This matches the semantic intent — the VM is initializing, not returning a malformed response. JARVIS degrades gracefully to the Claude API fallback rather than crashing.
+
+#### Operational result
+
+The 36-restart crash loop is cured at the schema layer. JARVIS now starts once, stays running, and degrades to Claude API if J-Prime is still loading at boot time.
+
+---
+
+### 2) Early Startup Sentinel — Voice Shutdown Survives Launchd Restart
+
+#### Problem
+
+When a user issued a voice shutdown command, `_execute_graceful_shutdown()` wrote `~/.jarvis/user_requested_shutdown` as a sentinel, ran `launchctl bootout`, and set the shutdown event. However, Python's `atexit` handler (`_cleanup_stale_state_on_exit`) cleaned the sentinel file **before the process exited** — which is before launchd could attempt a restart. If `bootout` silently failed for any reason, launchd would restart JARVIS, find no sentinel, and start normally.
+
+Additionally, during the ~25-second startup window before audio and the ASR admission gate open, saying "Hey JARVIS shut down" was physically inaudible to the system. If JARVIS was crash-looping during that window, voice commands had no effect at all.
+
+#### What changed
+
+**`unified_supervisor.py` — `main()` (very top, before any subsystem)**
+
+```python
+# v293.0: Early sentinel check
+_early_sentinel = Path.home() / ".jarvis" / "user_requested_shutdown"
+if _early_sentinel.exists():
+    _sentinel_age = time.time() - _early_sentinel.stat().st_mtime
+    _early_sentinel.unlink(missing_ok=True)
+    if _sentinel_age < 300:   # Honor if written within last 5 minutes
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(_plist)], ...)
+        return 0              # Exit cleanly — launchd will not restart
+```
+
+This runs before argument parsing, before audio, before GCP, before contracts — before everything. If the sentinel exists and is fresh, JARVIS exits with code 0 without initializing a single subsystem.
+
+**`unified_supervisor.py` — `_cleanup_stale_state_on_exit()`**
+
+`user_requested_shutdown` is **removed from the `_stale_files` list**. The `atexit` handler no longer cleans this file. The early startup check owns its lifecycle: it cleans the file when it decides whether to honor or ignore it, preventing the race where atexit deletes the sentinel before the next restart can see it.
+
+#### Sentinel ownership model
+
+```
+Voice says "shut down"
+  → sentinel written + launchctl bootout + shutdown event
+  → atexit fires (sentinel is NOT cleaned — intentional)
+
+If bootout succeeded:
+  → launchd doesn't restart → sentinel eventually expires (>5 min) → ignored on next manual start
+
+If bootout failed:
+  → launchd restarts → early check sees sentinel (age < 5 min) → bootout + exit 0
+  → cycle breaks on second attempt at most
+```
+
+---
+
+### 3) UDS Client-Server Multiplexing — Unified Control Plane (v293.0)
+
+#### Problem
+
+Running `python3 unified_supervisor.py` while a daemon was already running caused a file-lock race, potential split-brain, or silent failure. There was no way to observe a running JARVIS from a new terminal without attaching to the log files manually. The `--force` flag existed solely as a workaround for the lock contention problem — not as an intentional restart mechanism.
+
+#### Architecture
+
+A new module `backend/core/supervisor_ipc.py` implements the **Control Plane / UI Plane distinction**:
+
+```
+Control Plane (daemon)
+  ~/.jarvis/supervisor.sock  ←── Unix Domain Socket
+  broadcasts newline-delimited JSON events to all connected clients:
+    {"type": "log",    "ts": …, "level": "INFO", "logger": "…", "msg": "…"}
+    {"type": "health", "ts": …, "components": {"prime": "healthy", …}}
+    {"type": "status", "ts": …, "phase": "RUNNING", "pid": 12345}
+    {"type": "shutdown","ts": …, "reason": "graceful"}
+
+UI Plane (terminal client)
+  connects to socket → renders live event stream → Ctrl+C to detach
+  daemon keeps running after client disconnects
+```
+
+#### How it works
+
+**Startup decision (sync, no asyncio needed):**
+```python
+ipc = SupervisorIPC()
+is_daemon = ipc.try_bind_sync()   # connects to existing socket to test liveness
+                                   # stale socket → unlink + become daemon
+                                   # live socket  → become client
+if not is_daemon:
+    asyncio.run(ipc.attach_as_client())
+    return 0
+```
+
+**Daemon path (`async_main`, just before kernel start):**
+```python
+_supervisor_ipc = SupervisorIPC()
+await _supervisor_ipc.start_server()     # bind UDS, accept clients
+_supervisor_ipc.install_log_handler()    # forward all Python log records to clients
+await _supervisor_ipc.broadcast_status("STARTING")
+```
+
+**Log broadcasting** — `_IPCLogHandler` is installed on the root logger. Every `logging.getLogger(name).info(…)` call anywhere in JARVIS is forwarded to all connected clients via `asyncio.run_coroutine_threadsafe`, without blocking the event loop or the emitting thread.
+
+#### New behavior
+
+```bash
+# Terminal 1 — starts the daemon (unchanged)
+python3 unified_supervisor.py
+
+# Terminal 2 — NOW attaches as live streaming client instead of clashing
+python3 unified_supervisor.py
+# → "Daemon already running — attaching to live stream. Press Ctrl+C to detach."
+# → Live colored log stream. Ctrl+C detaches. Daemon keeps running.
+
+# Force restart after a code change
+python3 unified_supervisor.py --force
+# → Kills existing daemon, starts fresh (--force now means "restart", not "bypass lock")
+```
+
+#### Control commands bypass UDS
+
+`--status`, `--shutdown`, `--monitor`, `--monitor-prime`, `--cleanup`, `--check-only`, `--dashboard`, `--install-watchdog`, `--uninstall-watchdog`, `--force`, and `--restart` all skip the UDS check and run directly. Only a bare "start daemon" invocation triggers the client-or-daemon decision.
+
+---
+
+### 4) Context-Aware Logging — TTY vs launchd (v293.0)
+
+#### Problem
+
+Log output was the same format whether running interactively or under launchd. Under launchd, ANSI escape codes polluted the log files. In a terminal, machine-readable JSON was hard to read at a glance.
+
+#### What changed
+
+`configure_context_logging()` in `supervisor_ipc.py` checks `os.isatty(sys.stdout.fileno())` at boot and installs the appropriate formatter on the root logger:
+
+| Context | Formatter | Example output |
+|---|---|---|
+| Interactive TTY | `_AnsiFormatter` | `15:23:41.042  INFO      backend.core.foo  Message here` (with colors) |
+| launchd / pipe | `_JsonFormatter` | `{"ts": 1773874469.9, "level": "INFO", "logger": "backend.core.foo", "msg": "Message here", "pid": 28063}` |
+
+The JSON formatter produces one object per line, making launchd log files directly parseable by `jq` or any structured log aggregator.
+
+---
+
+### 5) Files Changed (v293.0)
+
+| File | Change |
+|---|---|
+| `backend/core/supervisor_ipc.py` | **New.** UDS daemon/client, log broadcaster, context-aware formatters |
+| `backend/core/startup_contracts.py` | `None` allowed for `bool` fields — not a schema violation |
+| `unified_supervisor.py` | Early sentinel check in `main()`; UDS bind + log wiring in `async_main()`; sentinel removed from atexit stale-file list |
+
+---
+
+### 6) Quick Reference (v293.0 Control Surface)
+
+#### Start
+
+```bash
+# Via launchd (background, auto-restart on crash, JSON logs to file)
+launchctl load ~/Library/LaunchAgents/com.jarvis.supervisor.plist
+launchctl start com.jarvis.supervisor
+
+# Direct / foreground (colored terminal output, dies with terminal)
+python3 unified_supervisor.py
+```
+
+#### Attach to a running daemon
+
+```bash
+python3 unified_supervisor.py        # auto-detects daemon, streams live logs
+# Ctrl+C to detach — daemon keeps running
+```
+
+#### Restart (after code change)
+
+```bash
+python3 unified_supervisor.py --force
+```
+
+#### Stop
+
+```bash
+# Voice (preferred)
+"Hey JARVIS, shut down"
+
+# Manual
+launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.jarvis.supervisor.plist
+```
+
+#### Read launchd logs
+
+```bash
+# Human-readable tail
+tail -f ~/.jarvis/logs/supervisor_stderr.log
+
+# Structured queries via jq
+tail -f ~/.jarvis/logs/supervisor_stderr.log | jq 'select(.level == "ERROR")'
+tail -f ~/.jarvis/logs/supervisor_stderr.log | jq 'select(.logger | startswith("backend.core.gcp"))'
+```
+
+---
+
 ## Session Update (2026-03-18): Multi-Zone Invincible Failover + Voice Shutdown (v292.0)
 
 This session delivered two operational reliability upgrades that directly affect day-to-day survivability: (1) zone-aware recovery when GCP capacity is exhausted, and (2) authenticated voice shutdown that cooperates with launchd `KeepAlive`.
