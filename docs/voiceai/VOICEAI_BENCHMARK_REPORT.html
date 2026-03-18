@@ -1,4 +1,4 @@
-<\!DOCTYPE html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -161,7 +161,7 @@
 
 <div class="verdict-box">
   <div class="verdict-title">VERDICT: APPROVED for Trinity Integration</div>
-  <p>Voice.ai HTTP streaming delivers <strong>7-12x faster TTFB</strong> than macOS Daniel with significantly higher audio quality (MOS 3.44 vs ~2.5). <strong>92%% of HTTP persistent requests complete under 400ms.</strong> Voice cloning enables JARVIS to speak in Derek's actual voice.</p>
+  <p>Voice.ai HTTP streaming delivers <strong>7-12x faster TTFB</strong> than macOS Daniel with significantly higher audio quality (MOS 3.44 vs ~2.5). <strong>92% of HTTP persistent requests complete under 400ms.</strong> Voice cloning enables JARVIS to speak in Derek's actual voice.</p>
 </div>
 
 <table>
@@ -173,7 +173,7 @@
     <tr><td>Voice Cloning</td><td class="highlight">Yes</td><td>No</td><td class="success">Voice.ai</td></tr>
     <tr><td>Cost</td><td class="num">$30/1M chars</td><td class="num success">$0</td><td class="success">Daniel</td></tr>
     <tr><td>Offline</td><td>No</td><td class="success">Yes</td><td class="success">Daniel</td></tr>
-    <tr><td>Under 400ms</td><td class="num success">92%%</td><td class="num danger">0%%</td><td class="success">Voice.ai</td></tr>
+    <tr><td>Under 400ms</td><td class="num success">92%</td><td class="num danger">0%</td><td class="success">Voice.ai</td></tr>
   </tbody>
 </table>
 
@@ -200,8 +200,8 @@
   <div class="detail-content">
     <ul>
       <li><strong>Top-left (TTFB bars):</strong> Mean TTFB for each protocol across short/medium/long sentences. Voice.ai HTTP Persistent (leftmost) is dramatically faster than macOS Daniel (rightmost).</li>
-      <li><strong>Top-right (Scorecard):</strong> Key numbers at a glance &mdash; 350ms vs 4,209ms TTFB, 9.5x speedup, 92%% under 400ms, MOS 3.44.</li>
-      <li><strong>Middle-left (CDF):</strong> Cumulative distribution &mdash; shows what %% of requests finish under any given TTFB. Voice.ai's curve rises steeply (fast, consistent). Daniel's is flat (slow, unpredictable).</li>
+      <li><strong>Top-right (Scorecard):</strong> Key numbers at a glance &mdash; 350ms vs 4,209ms TTFB, 9.5x speedup, 92% under 400ms, MOS 3.44.</li>
+      <li><strong>Middle-left (CDF):</strong> Cumulative distribution &mdash; shows what % of requests finish under any given TTFB. Voice.ai's curve rises steeply (fast, consistent). Daniel's is flat (slow, unpredictable).</li>
       <li><strong>Middle-right (CV):</strong> Coefficient of Variation &mdash; lower = more predictable. Voice.ai HTTP is green (stable). Daniel is red (highly variable).</li>
       <li><strong>Bottom (Published vs Measured):</strong> Blue bars = Voice.ai's own published benchmarks (co-located). Red bars = our real-world measurements. Gap is explained in Section 9.</li>
     </ul>
@@ -244,7 +244,7 @@
   <summary>Reading the TTFB Box Plots</summary>
   <div class="detail-content">
     <ul>
-      <li><strong>Box</strong> = interquartile range (middle 50%% of measurements). Smaller box = more consistent.</li>
+      <li><strong>Box</strong> = interquartile range (middle 50% of measurements). Smaller box = more consistent.</li>
       <li><strong>Line inside box</strong> = median. Closer to the left = faster.</li>
       <li><strong>Whiskers</strong> = full range (excluding outliers). Shorter = more predictable.</li>
       <li><strong>Circles</strong> = outliers (unusually slow requests).</li>
@@ -381,10 +381,10 @@
 <table>
   <thead><tr><th>Protocol</th><th class="num">Under 200ms</th><th class="num">Under 400ms</th><th class="num">Under 1000ms</th></tr></thead>
   <tbody>
-    <tr><td class="highlight">Voice.ai HTTP Persistent</td><td class="num" style="color:var(--muted)">0%%</td><td class="num success">92%%</td><td class="num success">100%%</td></tr>
-    <tr><td>Voice.ai HTTP Stream</td><td class="num" style="color:var(--muted)">0%%</td><td class="num">53%%</td><td class="num">93%%</td></tr>
-    <tr><td>Voice.ai WebSocket (fresh)</td><td class="num" style="color:var(--muted)">0%%</td><td class="num" style="color:var(--muted)">0%%</td><td class="num">74%%</td></tr>
-    <tr><td class="danger">macOS Daniel</td><td class="num danger">0%%</td><td class="num danger">0%%</td><td class="num danger">0%%</td></tr>
+    <tr><td class="highlight">Voice.ai HTTP Persistent</td><td class="num" style="color:var(--muted)">0%</td><td class="num success">92%</td><td class="num success">100%</td></tr>
+    <tr><td>Voice.ai HTTP Stream</td><td class="num" style="color:var(--muted)">0%</td><td class="num">53%</td><td class="num">93%</td></tr>
+    <tr><td>Voice.ai WebSocket (fresh)</td><td class="num" style="color:var(--muted)">0%</td><td class="num" style="color:var(--muted)">0%</td><td class="num">74%</td></tr>
+    <tr><td class="danger">macOS Daniel</td><td class="num danger">0%</td><td class="num danger">0%</td><td class="num danger">0%</td></tr>
   </tbody>
 </table>
 
@@ -397,9 +397,9 @@
   <div class="detail-content">
     <ul>
       <li><strong>Top-left (Histogram):</strong> Shows the spread of all TTFB measurements. Voice.ai values cluster tightly around 300-400ms. Daniel values are scattered from 1,400 to 17,000ms.</li>
-      <li><strong>Top-right (CDF):</strong> Cumulative Distribution Function &mdash; shows what %% of requests complete under any given TTFB. A steep early rise = fast and consistent. Voice.ai's curve rises sharply before 500ms. Daniel's barely starts rising before 2,000ms.</li>
+      <li><strong>Top-right (CDF):</strong> Cumulative Distribution Function &mdash; shows what % of requests complete under any given TTFB. A steep early rise = fast and consistent. Voice.ai's curve rises sharply before 500ms. Daniel's barely starts rising before 2,000ms.</li>
       <li><strong>Bottom-left (Zoomed):</strong> Voice.ai only, zoomed to 0-1500ms. Shows the clear separation between HTTP Persistent (fastest), HTTP Stream, and WebSocket.</li>
-      <li><strong>Bottom-right (Threshold Compliance):</strong> Horizontal bars showing what %% of requests meet each latency threshold. 92%% of Voice.ai HTTP Persistent requests are under 400ms. 0%% of Daniel requests are under 1000ms.</li>
+      <li><strong>Bottom-right (Threshold Compliance):</strong> Horizontal bars showing what % of requests meet each latency threshold. 92% of Voice.ai HTTP Persistent requests are under 400ms. 0% of Daniel requests are under 1000ms.</li>
     </ul>
   </div>
 </details>
