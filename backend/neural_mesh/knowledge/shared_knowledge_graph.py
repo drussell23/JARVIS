@@ -20,6 +20,7 @@ import hashlib
 import json
 import logging
 import pickle
+import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -69,6 +70,31 @@ from ..data_models import (
 from ..config import KnowledgeGraphConfig, get_config
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# ML weight-load serializer (process-wide, works across event loops / threads)
+# ---------------------------------------------------------------------------
+
+# At most ONE SentenceTransformer model loads at a time system-wide.
+# Neural mesh runs in a dedicated thread with its own event loop, so asyncio
+# primitives cannot coordinate across callers — threading.Semaphore is used.
+_EMBEDDER_LOAD_LOCK: threading.Semaphore = threading.Semaphore(1)
+
+# Minimum free RAM (MiB) required before attempting to load the embedder.
+# all-MiniLM-L6-v2 peaks at ~350 MiB resident including PyTorch overhead.
+# 800 MiB headroom keeps us well clear of the OOM-kill zone on 16 GiB hardware.
+_MIN_FREE_MIB_FOR_EMBEDDER: float = float(
+    __import__("os").environ.get("JARVIS_EMBEDDER_MIN_FREE_MIB", "800")
+)
+
+
+def _available_ram_mib() -> float:
+    """Return currently available RAM in MiB (synchronous, no I/O)."""
+    try:
+        import psutil
+        return psutil.virtual_memory().available / (1024.0 * 1024.0)
+    except Exception:
+        return 4096.0  # Assume 4 GiB free if measurement fails.
 
 
 class LRUCache:
@@ -213,16 +239,54 @@ class SharedKnowledgeGraph:
         if self._initialized:
             return
 
-        # Initialize embedding model
+        # Initialize embedding model — guarded against OOM kills.
+        #
+        # Two defences:
+        # 1. Free-RAM check: skip the load entirely if headroom is too low.
+        # 2. Load serializer: only one SentenceTransformer loads at a time
+        #    across the whole process (neural mesh runs in a thread with its
+        #    own event loop, so asyncio primitives can't coordinate here).
         if SENTENCE_TRANSFORMERS_AVAILABLE:
             try:
-                self._embedder = SentenceTransformer(self.config.embedding_model)
-                logger.info(
-                    "Loaded embedding model: %s",
-                    self.config.embedding_model,
-                )
+                free_mib = _available_ram_mib()
+                if free_mib < _MIN_FREE_MIB_FOR_EMBEDDER:
+                    logger.warning(
+                        "SharedKnowledgeGraph: skipping embedder load — "
+                        "only %.0f MiB free (threshold %.0f MiB). "
+                        "Falling back to keyword search.",
+                        free_mib,
+                        _MIN_FREE_MIB_FOR_EMBEDDER,
+                    )
+                else:
+                    # Block until no other component is loading an ML model.
+                    # Timeout prevents deadlock if another loader crashed.
+                    acquired = _EMBEDDER_LOAD_LOCK.acquire(timeout=120.0)
+                    if not acquired:
+                        logger.warning(
+                            "SharedKnowledgeGraph: embedder load lock timed out — "
+                            "falling back to keyword search."
+                        )
+                    else:
+                        try:
+                            # Run the CPU/RAM-intensive load in a thread executor
+                            # so it does not block the async event loop.
+                            loop = asyncio.get_event_loop()
+                            model_name = self.config.embedding_model
+                            self._embedder = await loop.run_in_executor(
+                                None,
+                                lambda: SentenceTransformer(model_name),
+                            )
+                            logger.info(
+                                "Loaded embedding model: %s (%.0f MiB free before load)",
+                                self.config.embedding_model,
+                                free_mib,
+                            )
+                        except Exception as e:
+                            logger.warning("Failed to load embedding model: %s", e)
+                        finally:
+                            _EMBEDDER_LOAD_LOCK.release()
             except Exception as e:
-                logger.warning("Failed to load embedding model: %s", e)
+                logger.warning("SharedKnowledgeGraph embedder guard error: %s", e)
 
         # Initialize ChromaDB with new API (1.0+)
         if CHROMADB_AVAILABLE:
