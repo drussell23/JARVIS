@@ -1424,6 +1424,16 @@ class JarvisPrimeClient:
                 _ctx_parts.append(f"User focus: {context_metadata['user_focus']}")
             if context_metadata.get("proactive_space"):
                 _ctx_parts.append(f"Workspace: {context_metadata['proactive_space']}")
+            # v284.0: Domain hint — explicit routing signal from Body to J-Prime
+            # classifier. Used when Body has high-confidence domain knowledge (e.g.
+            # voice_unlock commands) and wants to guide the Phi classifier away from
+            # hallucinating workspace/email domains.
+            _domain_hint = context_metadata.get("domain_hint")
+            _not_workspace = context_metadata.get("not_workspace", False)
+            if _domain_hint:
+                _ctx_parts.append(f"Classification hint: domain={_domain_hint}")
+            if _not_workspace:
+                _ctx_parts.append("NOT workspace — do not suggest workspace actions")
             if _ctx_parts:
                 _enriched_query = f"[Context: {', '.join(_ctx_parts)}]\n{query}"
 
