@@ -2727,6 +2727,9 @@ class GCPVMManager:
         # Zone fallback for Spot VM capacity exhaustion
         self._zone_fallback = ZoneFallbackPolicy()
 
+        # v292.0: Track resolved zone for Invincible Node (may differ from config.zone after failover)
+        self._invincible_node_zone: Optional[str] = None
+
         # v232.0: Golden image corruption detection
         self._golden_image_stall_history: Dict[str, List[float]] = {}
         self._golden_image_suspect_set: set = set()
@@ -8350,156 +8353,324 @@ class GCPVMManager:
                 asyncio.ensure_future(self._acquire_readiness_lease_bg(static_ip, target_port))
                 return True, static_ip, "ALREADY_READY"
 
-            # Step 3: Describe instance with FULL metadata (v229.0)
-            instance_status, vm_metadata, gcp_error = await self._describe_instance_full(instance_name)
-            logger.info(f"☁️ [InvincibleNode] Instance status: {instance_status}")
+            # ═══════════════════════════════════════════════════════════════════
+            # v292.0: Multi-Zone Invincible Node with Automatic Failover
+            # ═══════════════════════════════════════════════════════════════════
+            # GCP static IPs are REGIONAL — they work across zones within the
+            # same region. When a zone lacks capacity (GPU stockout, resource
+            # exhaustion), we blacklist it and seamlessly retry in the next zone.
+            # The VM is deleted in the exhausted zone and recreated in the new one.
+            # ═══════════════════════════════════════════════════════════════════
+            resolved_zone = await self._resolve_instance_zone(instance_name)
+            current_zone = resolved_zone or self._zone_fallback.get_next_zone() or self.config.zone
+            self._invincible_node_zone = current_zone
 
-            # Step 4: Branch based on state with golden image intelligence
-            if instance_status == "NOT_FOUND":
-                # Create new VM (uses golden image automatically via _create_static_vm)
-                logger.info(f"☁️ [InvincibleNode] Instance not found - creating new VM")
-                create_success, create_error = await self._create_static_vm(
-                    instance_name, static_ip_name, target_port
-                )
-                if not create_success:
-                    return False, static_ip, f"CREATE_FAILED: {create_error}"
+            _available = self._zone_fallback.get_available_zones()
+            _max_zone_retries = max(len(_available), 1)
+            _last_error = ""
 
-            elif instance_status in ("TERMINATED", "STOPPED", "SUSPENDED"):
-                # v229.0: CHECK GOLDEN IMAGE LINEAGE before deciding start vs recreate
-                should_recreate, lineage_reason = await self._check_vm_golden_image_lineage(
-                    instance_name, vm_metadata
-                )
-                
-                if should_recreate:
-                    # VM doesn't match golden image — delete and recreate
+            for _zone_attempt in range(_max_zone_retries):
+                if _zone_attempt > 0:
                     logger.info(
-                        f"🔄 [InvincibleNode] Recreating VM from golden image "
-                        f"(reason: {lineage_reason})"
-                    )
-                    if progress_callback:
-                        # v235.0: Use low pct (0-5) so dashboard maps to 40-43%.
-                        # The callback maps pct → 40+pct*0.6. Values >5 map above
-                        # where APARS data starts (~43%), causing visible progress
-                        # regression when real APARS data arrives and overrides.
-                        progress_callback(0, "gcp", f"Recreating VM from golden image ({lineage_reason})")
-                    
-                    # Delete the old VM
-                    del_success, del_error = await self._delete_instance(instance_name)
-                    if not del_success:
-                        # If delete fails, fall back to starting the old VM
-                        logger.warning(
-                            f"⚠️ [InvincibleNode] Delete failed ({del_error}), "
-                            f"falling back to starting existing VM"
-                        )
-                        start_success, start_error = await self._start_instance(instance_name)
-                        if not start_success:
-                            return False, static_ip, f"START_FAILED: {start_error}"
-                    else:
-                        # Create new VM from golden image
-                        create_success, create_error = await self._create_static_vm(
-                            instance_name, static_ip_name, target_port
-                        )
-                        if not create_success:
-                            return False, static_ip, f"RECREATE_FAILED: {create_error}"
-                        
-                        if progress_callback:
-                            # v235.0: Low pct avoids regression when APARS data arrives
-                            progress_callback(5, "gcp", "Golden image VM created, booting")
-                else:
-                    # VM matches golden image — fast restart path
-                    logger.info(
-                        f"☁️ [InvincibleNode] Starting VM: {instance_name} "
-                        f"(lineage: {lineage_reason})"
-                    )
-                    start_success, start_error = await self._start_instance(instance_name)
-                    if not start_success:
-                        return False, static_ip, f"START_FAILED: {start_error}"
-
-            elif instance_status in ("STAGING", "PROVISIONING"):
-                # VM is starting up, proceed to poll
-                logger.info(f"☁️ [InvincibleNode] VM is starting: {instance_status}")
-
-            elif instance_status == "RUNNING":
-                # VM is running but health check failed
-                # v235.0: Check startup script version — a running VM with a stale
-                # startup script will never reach ready_for_inference. Detect and
-                # recycle early instead of polling until timeout.
-                vm_script_version = (
-                    vm_metadata.get("jarvis-startup-script-version", "")
-                    if vm_metadata else ""
-                )
-                if vm_script_version != _STARTUP_SCRIPT_VERSION:
-                    self._version_mismatch_count += 1
-                    if self._version_mismatch_terminal:
-                        logger.warning(
-                            f"🚫 [InvincibleNode] Version mismatch TERMINAL "
-                            f"(vm={vm_script_version or 'pre-v235'}, "
-                            f"expected={_STARTUP_SCRIPT_VERSION}, "
-                            f"attempts={self._version_mismatch_count}). "
-                            f"Skipping recycle — golden image needs rebuild."
-                        )
-                        return False, static_ip, (
-                            f"VERSION_MISMATCH_TERMINAL: {vm_script_version} "
-                            f"(recycled {self._version_mismatch_count}x, still mismatched)"
-                        )
-
-                    _max_recycles = int(os.getenv("JARVIS_GCP_MAX_VERSION_RECYCLES", "2"))
-                    if self._version_mismatch_count > _max_recycles:
-                        self._version_mismatch_terminal = True
-                        logger.warning(
-                            f"🚫 [InvincibleNode] Version mismatch after "
-                            f"{self._version_mismatch_count} recycle attempts "
-                            f"(vm={vm_script_version or 'pre-v235'}, "
-                            f"expected={_STARTUP_SCRIPT_VERSION}). "
-                            f"Marking TERMINAL — golden image needs rebuild."
-                        )
-                        return False, static_ip, (
-                            f"VERSION_MISMATCH_TERMINAL: {vm_script_version} "
-                            f"(recycled {self._version_mismatch_count}x, still mismatched)"
-                        )
-
-                    logger.info(
-                        f"🔄 [InvincibleNode] Running VM has stale startup script "
-                        f"(vm={vm_script_version or 'pre-v235'}, "
-                        f"current={_STARTUP_SCRIPT_VERSION}). "
-                        f"Recycling with updated script "
-                        f"(attempt {self._version_mismatch_count}/{_max_recycles})."
+                        f"🔄 [ZoneFallback] Retrying Invincible Node in zone '{current_zone}' "
+                        f"(attempt {_zone_attempt + 1}/{_max_zone_retries})"
                     )
                     if progress_callback:
                         progress_callback(
                             0, "gcp",
-                            f"Recycling VM: startup script "
-                            f"({vm_script_version or 'pre-v235'} → {_STARTUP_SCRIPT_VERSION})"
+                            f"Zone failover: trying {current_zone} "
+                            f"({_zone_attempt + 1}/{_max_zone_retries})"
                         )
 
-                    del_success, del_error = await self._delete_instance(instance_name)
-                    if del_success:
-                        create_success, create_error = await self._create_static_vm(
-                            instance_name, static_ip_name, target_port
-                        )
-                        if not create_success:
-                            return False, static_ip, f"SCRIPT_UPGRADE_FAILED: {create_error}"
-                        if progress_callback:
-                            progress_callback(
-                                5, "gcp",
-                                f"VM recreated with v{_STARTUP_SCRIPT_VERSION} script, booting"
-                            )
-                    else:
-                        logger.warning(
-                            f"⚠️ [InvincibleNode] Delete failed ({del_error}), "
-                            f"proceeding with stale VM (will likely timeout)"
-                        )
-                else:
+                # Step 3: Describe instance with FULL metadata (v229.0)
+                instance_status, vm_metadata, gcp_error = await self._describe_instance_full(
+                    instance_name, zone=current_zone
+                )
+                logger.info(
+                    f"☁️ [InvincibleNode] Instance status: {instance_status} "
+                    f"(zone: {current_zone})"
+                )
+
+                # Step 4: Branch based on state with golden image intelligence
+                _need_zone_retry = False
+
+                if instance_status == "NOT_FOUND":
+                    # Create new VM (uses golden image automatically via _create_static_vm)
                     logger.info(
-                        f"☁️ [InvincibleNode] VM running "
-                        f"(script v{vm_script_version}) but not healthy yet"
+                        f"☁️ [InvincibleNode] Instance not found in '{current_zone}' "
+                        f"- creating new VM"
+                    )
+                    create_success, create_error = await self._create_static_vm(
+                        instance_name, static_ip_name, target_port, zone=current_zone
+                    )
+                    if not create_success:
+                        if self._is_zone_capacity_error(str(create_error)):
+                            self._zone_fallback.blacklist_zone(
+                                current_zone,
+                                f"Create failed: {str(create_error)[:100]}"
+                            )
+                            _next = self._zone_fallback.get_next_zone()
+                            if _next:
+                                current_zone = _next
+                                self._invincible_node_zone = current_zone
+                                _need_zone_retry = True
+                            else:
+                                _last_error = f"CREATE_FAILED (all zones exhausted): {create_error}"
+                        else:
+                            _last_error = f"CREATE_FAILED: {create_error}"
+
+                        if _need_zone_retry:
+                            continue
+                        return False, static_ip, _last_error
+
+                elif instance_status in ("TERMINATED", "STOPPED", "SUSPENDED"):
+                    # v229.0: CHECK GOLDEN IMAGE LINEAGE before deciding start vs recreate
+                    should_recreate, lineage_reason = await self._check_vm_golden_image_lineage(
+                        instance_name, vm_metadata
                     )
 
-            elif instance_status == "ERROR":
-                return False, static_ip, f"GCP_API_ERROR: {gcp_error}"
+                    if should_recreate:
+                        # VM doesn't match golden image — delete and recreate
+                        logger.info(
+                            f"🔄 [InvincibleNode] Recreating VM from golden image "
+                            f"(reason: {lineage_reason})"
+                        )
+                        if progress_callback:
+                            progress_callback(
+                                0, "gcp",
+                                f"Recreating VM from golden image ({lineage_reason})"
+                            )
 
+                        # Delete the old VM
+                        del_success, del_error = await self._delete_instance(
+                            instance_name, zone=current_zone
+                        )
+                        if not del_success:
+                            # If delete fails, fall back to starting the old VM
+                            logger.warning(
+                                f"⚠️ [InvincibleNode] Delete failed ({del_error}), "
+                                f"falling back to starting existing VM"
+                            )
+                            start_success, start_error = await self._start_instance(
+                                instance_name, zone=current_zone
+                            )
+                            if not start_success:
+                                # v292.0: Check for zone capacity exhaustion on start
+                                if self._is_zone_capacity_error(str(start_error)):
+                                    self._zone_fallback.blacklist_zone(
+                                        current_zone,
+                                        f"Start failed: {str(start_error)[:100]}"
+                                    )
+                                    _next = self._zone_fallback.get_next_zone()
+                                    if _next:
+                                        # Force-delete then retry in new zone
+                                        logger.info(
+                                            f"🔄 [ZoneFallback] Zone '{current_zone}' exhausted "
+                                            f"on START — migrating to '{_next}'"
+                                        )
+                                        await self._delete_instance(
+                                            instance_name, zone=current_zone
+                                        )
+                                        current_zone = _next
+                                        self._invincible_node_zone = current_zone
+                                        _need_zone_retry = True
+                                    else:
+                                        _last_error = (
+                                            f"START_FAILED (all zones exhausted): {start_error}"
+                                        )
+                                else:
+                                    _last_error = f"START_FAILED: {start_error}"
+
+                                if _need_zone_retry:
+                                    continue
+                                return False, static_ip, _last_error
+                        else:
+                            # Create new VM from golden image (in current zone)
+                            create_success, create_error = await self._create_static_vm(
+                                instance_name, static_ip_name, target_port, zone=current_zone
+                            )
+                            if not create_success:
+                                if self._is_zone_capacity_error(str(create_error)):
+                                    self._zone_fallback.blacklist_zone(
+                                        current_zone,
+                                        f"Recreate failed: {str(create_error)[:100]}"
+                                    )
+                                    _next = self._zone_fallback.get_next_zone()
+                                    if _next:
+                                        current_zone = _next
+                                        self._invincible_node_zone = current_zone
+                                        _need_zone_retry = True
+                                    else:
+                                        _last_error = (
+                                            f"RECREATE_FAILED (all zones exhausted): {create_error}"
+                                        )
+                                else:
+                                    _last_error = f"RECREATE_FAILED: {create_error}"
+
+                                if _need_zone_retry:
+                                    continue
+                                return False, static_ip, _last_error
+
+                            if progress_callback:
+                                progress_callback(5, "gcp", "Golden image VM created, booting")
+                    else:
+                        # VM matches golden image — fast restart path
+                        logger.info(
+                            f"☁️ [InvincibleNode] Starting VM: {instance_name} "
+                            f"(zone: {current_zone}, lineage: {lineage_reason})"
+                        )
+                        start_success, start_error = await self._start_instance(
+                            instance_name, zone=current_zone
+                        )
+                        if not start_success:
+                            # v292.0: Zone capacity exhaustion on START — migrate to new zone
+                            if self._is_zone_capacity_error(str(start_error)):
+                                self._zone_fallback.blacklist_zone(
+                                    current_zone,
+                                    f"Start failed: {str(start_error)[:100]}"
+                                )
+                                _next = self._zone_fallback.get_next_zone()
+                                if _next:
+                                    logger.info(
+                                        f"🔄 [ZoneFallback] Zone '{current_zone}' exhausted "
+                                        f"on START — deleting VM and recreating in '{_next}'"
+                                    )
+                                    # Delete stopped VM from exhausted zone
+                                    await self._delete_instance(
+                                        instance_name, zone=current_zone
+                                    )
+                                    current_zone = _next
+                                    self._invincible_node_zone = current_zone
+                                    _need_zone_retry = True
+                                else:
+                                    _last_error = (
+                                        f"START_FAILED (all zones exhausted): {start_error}"
+                                    )
+                            else:
+                                _last_error = f"START_FAILED: {start_error}"
+
+                            if _need_zone_retry:
+                                continue
+                            return False, static_ip, _last_error
+
+                elif instance_status in ("STAGING", "PROVISIONING"):
+                    # VM is starting up, proceed to poll
+                    logger.info(f"☁️ [InvincibleNode] VM is starting: {instance_status}")
+
+                elif instance_status == "RUNNING":
+                    # VM is running but health check failed
+                    # v235.0: Check startup script version — a running VM with a stale
+                    # startup script will never reach ready_for_inference. Detect and
+                    # recycle early instead of polling until timeout.
+                    vm_script_version = (
+                        vm_metadata.get("jarvis-startup-script-version", "")
+                        if vm_metadata else ""
+                    )
+                    if vm_script_version != _STARTUP_SCRIPT_VERSION:
+                        self._version_mismatch_count += 1
+                        if self._version_mismatch_terminal:
+                            logger.warning(
+                                f"🚫 [InvincibleNode] Version mismatch TERMINAL "
+                                f"(vm={vm_script_version or 'pre-v235'}, "
+                                f"expected={_STARTUP_SCRIPT_VERSION}, "
+                                f"attempts={self._version_mismatch_count}). "
+                                f"Skipping recycle — golden image needs rebuild."
+                            )
+                            return False, static_ip, (
+                                f"VERSION_MISMATCH_TERMINAL: {vm_script_version} "
+                                f"(recycled {self._version_mismatch_count}x, still mismatched)"
+                            )
+
+                        _max_recycles = int(os.getenv("JARVIS_GCP_MAX_VERSION_RECYCLES", "2"))
+                        if self._version_mismatch_count > _max_recycles:
+                            self._version_mismatch_terminal = True
+                            logger.warning(
+                                f"🚫 [InvincibleNode] Version mismatch after "
+                                f"{self._version_mismatch_count} recycle attempts "
+                                f"(vm={vm_script_version or 'pre-v235'}, "
+                                f"expected={_STARTUP_SCRIPT_VERSION}). "
+                                f"Marking TERMINAL — golden image needs rebuild."
+                            )
+                            return False, static_ip, (
+                                f"VERSION_MISMATCH_TERMINAL: {vm_script_version} "
+                                f"(recycled {self._version_mismatch_count}x, still mismatched)"
+                            )
+
+                        logger.info(
+                            f"🔄 [InvincibleNode] Running VM has stale startup script "
+                            f"(vm={vm_script_version or 'pre-v235'}, "
+                            f"current={_STARTUP_SCRIPT_VERSION}). "
+                            f"Recycling with updated script "
+                            f"(attempt {self._version_mismatch_count}/{_max_recycles})."
+                        )
+                        if progress_callback:
+                            progress_callback(
+                                0, "gcp",
+                                f"Recycling VM: startup script "
+                                f"({vm_script_version or 'pre-v235'} → {_STARTUP_SCRIPT_VERSION})"
+                            )
+
+                        del_success, del_error = await self._delete_instance(
+                            instance_name, zone=current_zone
+                        )
+                        if del_success:
+                            create_success, create_error = await self._create_static_vm(
+                                instance_name, static_ip_name, target_port, zone=current_zone
+                            )
+                            if not create_success:
+                                # v292.0: Zone failover on recycle create failure
+                                if self._is_zone_capacity_error(str(create_error)):
+                                    self._zone_fallback.blacklist_zone(
+                                        current_zone,
+                                        f"Recycle create failed: {str(create_error)[:100]}"
+                                    )
+                                    _next = self._zone_fallback.get_next_zone()
+                                    if _next:
+                                        current_zone = _next
+                                        self._invincible_node_zone = current_zone
+                                        _need_zone_retry = True
+                                    else:
+                                        _last_error = (
+                                            f"SCRIPT_UPGRADE_FAILED (all zones exhausted): "
+                                            f"{create_error}"
+                                        )
+                                else:
+                                    _last_error = f"SCRIPT_UPGRADE_FAILED: {create_error}"
+
+                                if _need_zone_retry:
+                                    continue
+                                return False, static_ip, _last_error
+
+                            if progress_callback:
+                                progress_callback(
+                                    5, "gcp",
+                                    f"VM recreated with v{_STARTUP_SCRIPT_VERSION} script, booting"
+                                )
+                        else:
+                            logger.warning(
+                                f"⚠️ [InvincibleNode] Delete failed ({del_error}), "
+                                f"proceeding with stale VM (will likely timeout)"
+                            )
+                    else:
+                        logger.info(
+                            f"☁️ [InvincibleNode] VM running "
+                            f"(script v{vm_script_version}) but not healthy yet"
+                        )
+
+                elif instance_status == "ERROR":
+                    return False, static_ip, f"GCP_API_ERROR: {gcp_error}"
+
+                else:
+                    logger.warning(f"☁️ [InvincibleNode] Unknown status: {instance_status}")
+
+                # Success — break out of zone retry loop
+                break
             else:
-                logger.warning(f"☁️ [InvincibleNode] Unknown status: {instance_status}")
+                # Exhausted all zone retry attempts
+                return False, static_ip, (
+                    f"ZONE_EXHAUSTION: All {_max_zone_retries} zones exhausted. "
+                    f"Last error: {_last_error}"
+                )
 
         # Step 5: Poll health endpoint until ready (outside lock to avoid blocking)
         logger.info(f"☁️ [InvincibleNode] Polling health endpoint (timeout: {max_timeout}s)...")
@@ -8787,20 +8958,22 @@ class GCPVMManager:
         except Exception:
             return False
 
-    async def _describe_instance(self, instance_name: str) -> Tuple[str, Optional[str]]:
+    async def _describe_instance(self, instance_name: str, zone: Optional[str] = None) -> Tuple[str, Optional[str]]:
         """
         Get the current status of an instance from GCP.
+        v292.0: Added zone parameter for multi-zone Invincible Node failover.
 
         Returns:
             Tuple of (status: str, error: Optional[str])
             Status can be: RUNNING, STOPPED, TERMINATED, STAGING, PROVISIONING,
                           SUSPENDED, STOPPING, NOT_FOUND, ERROR
         """
+        _effective_zone = zone or self._invincible_node_zone or self.config.zone
         try:
             instance = await asyncio.to_thread(
                 self.instances_client.get,
                 project=self.config.project_id,
-                zone=self.config.zone,
+                zone=_effective_zone,
                 instance=instance_name,
             )
             return instance.status, None
@@ -8810,7 +8983,73 @@ class GCPVMManager:
                 return "NOT_FOUND", None
             return "ERROR", str(e)
 
-    async def _describe_instance_full(self, instance_name: str) -> Tuple[str, Optional[Dict[str, str]], Optional[str]]:
+    @staticmethod
+    def _is_zone_capacity_error(error_str: str) -> bool:
+        """
+        v292.0: Detect if an error indicates zone resource capacity exhaustion.
+
+        Extracted from the dynamic VM creation path for reuse by Invincible Node operations.
+        Covers quota exceeded, stockout, and general resource exhaustion patterns.
+        """
+        _err = error_str.lower()
+        return (
+            "does not have enough resources" in _err
+            or "zone_resource_pool_exhausted" in _err
+            or "stockout" in _err
+            or "insufficient" in _err
+            or "resource_exhausted" in _err
+            or ("quota" in _err and "exceeded" in _err)
+        )
+
+    async def _resolve_instance_zone(self, instance_name: str) -> Optional[str]:
+        """
+        v292.0: Search all configured fallback zones for an existing instance.
+
+        GCP instances are zone-scoped. If the Invincible Node was created in a different
+        zone than the current config (e.g., after a previous failover), we need to find it.
+
+        Returns:
+            The zone where the instance exists, or None if not found in any zone.
+        """
+        if not self.instances_client:
+            return None
+
+        zones_to_check = self._zone_fallback.get_available_zones()
+        # Also include currently blacklisted zones — the VM might exist there even
+        # if we can't create new VMs there right now.
+        all_zones = list(dict.fromkeys(
+            zones_to_check + self._zone_fallback._zones
+        ))
+
+        for zone in all_zones:
+            try:
+                instance = await asyncio.to_thread(
+                    self.instances_client.get,
+                    project=self.config.project_id,
+                    zone=zone,
+                    instance=instance_name,
+                )
+                if instance and instance.status:
+                    logger.info(
+                        f"☁️ [ZoneResolver] Found '{instance_name}' in zone '{zone}' "
+                        f"(status: {instance.status})"
+                    )
+                    return zone
+            except Exception as e:
+                _err = str(e).lower()
+                if "404" in _err or "not found" in _err or "notfound" in _err:
+                    continue  # Not in this zone, try next
+                # Non-404 errors (auth, network) — log and skip zone
+                logger.debug(f"[ZoneResolver] Error checking zone '{zone}': {e}")
+                continue
+
+        logger.info(
+            f"☁️ [ZoneResolver] Instance '{instance_name}' not found in any zone "
+            f"({', '.join(all_zones)})"
+        )
+        return None
+
+    async def _describe_instance_full(self, instance_name: str, zone: Optional[str] = None) -> Tuple[str, Optional[Dict[str, str]], Optional[str]]:
         """
         v229.0: Get the current status AND metadata of an instance from GCP.
         
@@ -8824,11 +9063,12 @@ class GCPVMManager:
             - metadata: Dict of instance metadata key-value pairs (None if NOT_FOUND)
             - error: Error message if any
         """
+        _effective_zone = zone or self._invincible_node_zone or self.config.zone
         try:
             instance = await asyncio.to_thread(
                 self.instances_client.get,
                 project=self.config.project_id,
-                zone=self.config.zone,
+                zone=_effective_zone,
                 instance=instance_name,
             )
             # Extract metadata items into a flat dict for easy lookup
@@ -8980,20 +9220,25 @@ class GCPVMManager:
         """Public API for Disease 10 readiness prober."""
         return await self._check_vm_golden_image_lineage(instance_name, vm_metadata)
 
-    async def _delete_instance(self, instance_name: str) -> Tuple[bool, Optional[str]]:
+    async def _delete_instance(self, instance_name: str, zone: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """
         v229.0: Delete an instance to allow recreation from golden image.
-        
+        v292.0: Added zone parameter for multi-zone Invincible Node failover.
+
         Returns:
             Tuple of (success: bool, error: Optional[str])
         """
+        _effective_zone = zone or self._invincible_node_zone or self.config.zone
         try:
-            logger.info(f"🗑️ [InvincibleNode] Deleting VM for golden image recreation: {instance_name}")
-            
+            logger.info(
+                f"🗑️ [InvincibleNode] Deleting VM for recreation: {instance_name} "
+                f"(zone: {_effective_zone})"
+            )
+
             operation = await asyncio.to_thread(
                 self.instances_client.delete,
                 project=self.config.project_id,
-                zone=self.config.zone,
+                zone=_effective_zone,
                 instance=instance_name,
             )
             
@@ -9833,13 +10078,15 @@ fi
 '''
         return script.replace("__STARTUP_SCRIPT_VERSION__", _STARTUP_SCRIPT_VERSION)
 
-    async def _start_instance(self, instance_name: str) -> Tuple[bool, Optional[str]]:
+    async def _start_instance(self, instance_name: str, zone: Optional[str] = None) -> Tuple[bool, Optional[str]]:
         """
         Start a stopped/terminated instance.
+        v292.0: Added zone parameter for multi-zone Invincible Node failover.
 
         Returns:
             Tuple of (success: bool, error: Optional[str])
         """
+        _effective_zone = zone or self._invincible_node_zone or self.config.zone
         budget_allowed, budget_reason, _ = await self._enforce_budget_gate(
             operation=f"start_instance:{instance_name}"
         )
@@ -9847,12 +10094,15 @@ fi
             return False, f"BUDGET_EXCEEDED: {budget_reason}"
 
         try:
-            logger.info(f"☁️ [InvincibleNode] Sending start command: {instance_name}")
+            logger.info(
+                f"☁️ [InvincibleNode] Sending start command: {instance_name} "
+                f"(zone: {_effective_zone})"
+            )
 
             operation = await asyncio.to_thread(
                 self.instances_client.start,
                 project=self.config.project_id,
-                zone=self.config.zone,
+                zone=_effective_zone,
                 instance=instance_name,
             )
 
@@ -9867,12 +10117,14 @@ fi
             return False, str(e)
 
     async def _create_static_vm(
-        self, instance_name: str, static_ip_name: str, port: int
+        self, instance_name: str, static_ip_name: str, port: int,
+        zone: Optional[str] = None,
     ) -> Tuple[bool, Optional[str]]:
         """
         v229.0: Create a new VM with static IP, intelligently selecting the
         best deployment mode (golden image > container > startup script).
-        
+        v292.0: Added zone parameter for multi-zone Invincible Node failover.
+
         This method now uses the same deployment mode hierarchy as
         _build_instance_config(), ensuring Invincible Node VMs get the
         golden image treatment when available.
@@ -9880,6 +10132,7 @@ fi
         Returns:
             Tuple of (success: bool, error: Optional[str])
         """
+        _effective_zone = zone or self._invincible_node_zone or self.config.zone
         budget_allowed, budget_reason, _ = await self._enforce_budget_gate(
             operation=f"create_static_vm:{instance_name}"
         )
@@ -9887,14 +10140,17 @@ fi
             return False, f"BUDGET_EXCEEDED: {budget_reason}"
 
         try:
-            logger.info(f"☁️ [InvincibleNode] Creating VM with static IP: {instance_name}")
+            logger.info(
+                f"☁️ [InvincibleNode] Creating VM with static IP: {instance_name} "
+                f"(zone: {_effective_zone})"
+            )
 
-            # Get static IP address for binding
+            # Get static IP address for binding (regional — works across zones)
             static_ip = await self._get_static_ip_address(static_ip_name)
             if not static_ip:
                 return False, f"Static IP '{static_ip_name}' not found"
 
-            machine_type_url = f"zones/{self.config.zone}/machineTypes/{self.config.machine_type}"
+            machine_type_url = f"zones/{_effective_zone}/machineTypes/{self.config.machine_type}"
 
             # ═══════════════════════════════════════════════════════════════════
             # v229.0: DEPLOYMENT MODE HIERARCHY (same as _build_instance_config)
@@ -9979,7 +10235,7 @@ fi
                 boot=True,
                 initialize_params=compute_v1.AttachedDiskInitializeParams(
                     disk_size_gb=effective_disk_size_gb,
-                    disk_type=f"zones/{self.config.zone}/diskTypes/{self.config.boot_disk_type}",
+                    disk_type=f"zones/{_effective_zone}/diskTypes/{self.config.boot_disk_type}",
                     source_image=source_image,
                 ),
             )
@@ -10088,7 +10344,7 @@ fi
             operation = await asyncio.to_thread(
                 self.instances_client.insert,
                 project=self.config.project_id,
-                zone=self.config.zone,
+                zone=_effective_zone,
                 instance_resource=instance,
             )
 
@@ -10098,7 +10354,8 @@ fi
 
             logger.info(
                 f"✅ [InvincibleNode] VM created: {instance_name} "
-                f"(mode: {deployment_mode}, image: {source_image.split('/')[-1]})"
+                f"(zone: {_effective_zone}, mode: {deployment_mode}, "
+                f"image: {source_image.split('/')[-1]})"
             )
             return True, None
 
@@ -10520,7 +10777,7 @@ fi
         """
         result = {
             "instance_name": self.config.static_instance_name,
-            "zone": self.config.zone,
+            "zone": self._invincible_node_zone or self.config.zone,
             "project_id": self.config.project_id,
             "static_ip": None,
             "gcp_status": "UNKNOWN",
@@ -10550,11 +10807,12 @@ fi
             result["error"] = f"Failed to get static IP: {e}"
 
         # Get instance details from GCP
+        _effective_zone = self._invincible_node_zone or self.config.zone
         try:
             instance = await asyncio.to_thread(
                 self.instances_client.get,
                 project=self.config.project_id,
-                zone=self.config.zone,
+                zone=_effective_zone,
                 instance=self.config.static_instance_name,
             )
 
@@ -10623,7 +10881,7 @@ fi
             List of command arguments for subprocess
         """
         instance_name = self.config.static_instance_name
-        zone = self.config.zone
+        zone = self._invincible_node_zone or self.config.zone
         project = self.config.project_id
 
         tail_cmd = f"tail -n {lines}"
@@ -10733,13 +10991,14 @@ fi
         if status != "RUNNING":
             return False, f"Node in unexpected state: {status}"
 
+        _effective_zone = self._invincible_node_zone or self.config.zone
         try:
-            logger.info(f"[CloudMonitor] Stopping node: {instance_name}")
+            logger.info(f"[CloudMonitor] Stopping node: {instance_name} (zone: {_effective_zone})")
 
             operation = await asyncio.to_thread(
                 self.instances_client.stop,
                 project=self.config.project_id,
-                zone=self.config.zone,
+                zone=_effective_zone,
                 instance=instance_name,
             )
 
