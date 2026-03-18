@@ -6,6 +6,56 @@ JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem.
 
 ---
 
+## Session Update (2026-03-18): Voice Unlock Routing, STT Robustness, and Latency
+
+This session focused on a root-cause fix for voice unlock commands being misrouted to J-Prime as generic workspace requests. The objective was to guarantee that biometric unlock intents are intercepted deterministically, routed to the unlock pipeline, and reflected in cross-repo telemetry for Reactor training.
+
+### 1) Voice Unlock Misrouting: Defense-in-Depth in Body (4 layers)
+
+The fix was implemented as four independent routing layers so unlock commands still route correctly even if one layer misses:
+
+1. **Layer 1 reflex interception (`~/.jarvis/trinity/reflex_manifest.json`)**
+   - Added `voice_unlock` reflex with 17 trigger patterns.
+   - Runs before normal command processing, so high-confidence unlock phrases short-circuit immediately.
+
+2. **Reflex execution branch (`backend/api/unified_command_processor.py::_execute_reflex`)**
+   - Added `voice_unlock` action handling in reflex execution.
+   - Ensures reflex hit paths execute unlock directly instead of falling through to generic intent handling.
+
+3. **Step 1.7 pre-flight guard (`_is_biometric_unlock_command`)**
+   - Added fast O(1)-style three-stage detection for paraphrase coverage:
+     - exact phrase set
+     - substring heuristics
+     - token + device-word combination check
+   - Catches unlock utterances that do not exactly match manifest patterns.
+
+4. **Classifier bias correction (`_detect_voice_unlock_patterns`)**
+   - Updated unlock scoring to **5** (from 1).
+   - Prevents unlock intents from losing routing priority to general/workspace paths.
+
+### 2) STT Hallucination and Quality Corrections
+
+`backend/voice/hybrid_stt_router.py` was updated to remove two hardcoded values that degraded routing confidence and telemetry quality:
+
+- Replaced static `confidence=0.85` with confidence heuristics derived from transcript characteristics (for better confidence realism).
+- Replaced static `audio_duration_ms=3000` with duration computed from audio byte length and `sample_rate`.
+
+These changes improve unlock gating quality and produce more trustworthy metadata for downstream evaluation.
+
+### 3) Perceived Latency Reduction in Command Path
+
+`backend/api/unified_command_processor.py` now issues early auditory acknowledgment in Step 3 as a background task before J-Prime round-trip completion.
+
+- Examples: "On it.", "Give me a moment."
+- Effect: reduces perceived idle wait during slower model responses (historically ~5-19s on heavier routes).
+
+### 4) Validation Outcome
+
+- **Nuance routing tests:** **50/50 passed** for unlock phrasing and paraphrase coverage.
+- Net result: unlock intent now routes to biometric pipeline first, with fewer false workspace classifications and clearer user feedback during long model latency.
+
+---
+
 ## What is JARVIS?
 
 | Role | Repository | Responsibility |
