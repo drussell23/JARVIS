@@ -1,0 +1,129 @@
+provider,protocol,sentence_class,ttfb_ms,total_ms,audio_bytes,text_length,success,error,round_num,playback_ms,protocol_label,run,sentence_order
+macOS_Daniel,local,short,1428.42,3623.69,88410,26,True,,0,0.0,macOS Daniel,Run 1,0
+macOS_Daniel,local,short,1861.15,4668.75,88410,26,True,,0,0.0,macOS Daniel,Run 1,0
+macOS_Daniel,local,short,3786.05,6657.88,88410,26,True,,0,0.0,macOS Daniel,Run 1,0
+macOS_Daniel,local,short,2696.81,5699.67,88410,26,True,,0,0.0,macOS Daniel,Run 1,0
+macOS_Daniel,local,short,2480.13,4789.43,88410,26,True,,0,0.0,macOS Daniel,Run 1,0
+macOS_Daniel,local,medium,3276.73,11800.43,267664,92,True,,0,0.0,macOS Daniel,Run 1,1
+macOS_Daniel,local,medium,6021.54,13179.33,267664,92,True,,0,0.0,macOS Daniel,Run 1,1
+macOS_Daniel,local,medium,2599.08,9427.19,267664,92,True,,0,0.0,macOS Daniel,Run 1,1
+macOS_Daniel,local,medium,4307.59,11675.92,267664,92,True,,0,0.0,macOS Daniel,Run 1,1
+macOS_Daniel,local,medium,17073.8,28611.13,267664,92,True,,0,0.0,macOS Daniel,Run 1,1
+macOS_Daniel,local,long,9570.51,29618.82,851052,327,True,,0,0.0,macOS Daniel,Run 1,2
+macOS_Daniel,local,long,4127.09,24300.8,851052,327,True,,0,0.0,macOS Daniel,Run 1,2
+macOS_Daniel,local,long,1813.39,21470.27,851052,327,True,,0,0.0,macOS Daniel,Run 1,2
+macOS_Daniel,local,long,1736.76,21912.16,851052,327,True,,0,0.0,macOS Daniel,Run 1,2
+macOS_Daniel,local,long,2518.23,22925.83,851052,327,True,,0,0.0,macOS Daniel,Run 1,2
+Voice.ai,http_stream,short,735.13,1089.6,25344,26,True,,0,0.0,Voice.ai HTTP Stream,Run 1,0
+Voice.ai,http_stream,short,631.05,995.42,24768,26,True,,0,0.0,Voice.ai HTTP Stream,Run 1,0
+Voice.ai,http_stream,short,603.34,1048.59,25920,26,True,,0,0.0,Voice.ai HTTP Stream,Run 1,0
+Voice.ai,http_stream,short,596.4,1027.05,25344,26,True,,0,0.0,Voice.ai HTTP Stream,Run 1,0
+Voice.ai,http_stream,short,355.11,652.54,21888,26,True,,0,0.0,Voice.ai HTTP Stream,Run 1,0
+Voice.ai,http_stream,medium,352.15,1985.15,91584,92,True,,0,0.0,Voice.ai HTTP Stream,Run 1,1
+Voice.ai,http_stream,medium,345.19,1926.21,88704,92,True,,0,0.0,Voice.ai HTTP Stream,Run 1,1
+Voice.ai,http_stream,medium,353.76,1920.7,88128,92,True,,0,0.0,Voice.ai HTTP Stream,Run 1,1
+Voice.ai,http_stream,medium,350.09,1953.73,89856,92,True,,0,0.0,Voice.ai HTTP Stream,Run 1,1
+Voice.ai,http_stream,medium,416.57,1843.43,84672,92,True,,0,0.0,Voice.ai HTTP Stream,Run 1,1
+Voice.ai,http_stream,long,387.89,6051.07,291456,327,True,,0,0.0,Voice.ai HTTP Stream,Run 1,2
+Voice.ai,http_stream,long,357.85,5537.37,266688,327,True,,0,0.0,Voice.ai HTTP Stream,Run 1,2
+Voice.ai,http_stream,long,476.23,5625.56,269568,327,True,,0,0.0,Voice.ai HTTP Stream,Run 1,2
+Voice.ai,http_stream,long,382.47,6311.4,273024,327,True,,0,0.0,Voice.ai HTTP Stream,Run 1,2
+Voice.ai,http_stream,long,1064.39,7210.77,265536,327,True,,0,0.0,Voice.ai HTTP Stream,Run 1,2
+Voice.ai,http_sync,short,689.2,689.2,20736,26,True,,0,0.0,Voice.ai HTTP Sync,Run 1,0
+Voice.ai,http_sync,short,775.08,775.08,24192,26,True,,0,0.0,Voice.ai HTTP Sync,Run 1,0
+Voice.ai,http_sync,short,994.24,994.24,25344,26,True,,0,0.0,Voice.ai HTTP Sync,Run 1,0
+Voice.ai,http_sync,short,744.97,744.97,23616,26,True,,0,0.0,Voice.ai HTTP Sync,Run 1,0
+Voice.ai,http_sync,short,800.21,800.21,24192,26,True,,0,0.0,Voice.ai HTTP Sync,Run 1,0
+Voice.ai,http_sync,medium,1979.1,1979.1,88128,92,True,,0,0.0,Voice.ai HTTP Sync,Run 1,1
+Voice.ai,http_sync,medium,2142.42,2142.42,95616,92,True,,0,0.0,Voice.ai HTTP Sync,Run 1,1
+Voice.ai,http_sync,medium,2037.79,2037.79,91008,92,True,,0,0.0,Voice.ai HTTP Sync,Run 1,1
+Voice.ai,http_sync,medium,2378.95,2378.95,88128,92,True,,0,0.0,Voice.ai HTTP Sync,Run 1,1
+Voice.ai,http_sync,medium,2037.78,2037.78,92736,92,True,,0,0.0,Voice.ai HTTP Sync,Run 1,1
+Voice.ai,http_sync,long,5825.39,5825.39,272448,327,True,,0,0.0,Voice.ai HTTP Sync,Run 1,2
+Voice.ai,http_sync,long,5838.85,5838.85,263232,327,True,,0,0.0,Voice.ai HTTP Sync,Run 1,2
+Voice.ai,http_sync,long,5953.42,5953.42,275328,327,True,,0,0.0,Voice.ai HTTP Sync,Run 1,2
+Voice.ai,http_sync,long,5965.0,5965.0,279360,327,True,,0,0.0,Voice.ai HTTP Sync,Run 1,2
+Voice.ai,http_sync,long,5867.59,5867.59,273600,327,True,,0,0.0,Voice.ai HTTP Sync,Run 1,2
+Voice.ai,websocket,short,692.97,1168.5,20160,26,True,,0,0.0,Voice.ai WebSocket,Run 1,0
+Voice.ai,websocket,short,805.62,1216.56,21312,26,True,,0,0.0,Voice.ai WebSocket,Run 1,0
+Voice.ai,websocket,short,806.93,1374.03,27072,26,True,,0,0.0,Voice.ai WebSocket,Run 1,0
+Voice.ai,websocket,short,770.56,1224.49,23040,26,True,,0,0.0,Voice.ai WebSocket,Run 1,0
+Voice.ai,websocket,short,761.61,1217.89,21888,26,True,,0,0.0,Voice.ai WebSocket,Run 1,0
+Voice.ai,websocket,medium,751.77,2403.16,85824,92,True,,0,0.0,Voice.ai WebSocket,Run 1,1
+Voice.ai,websocket,medium,906.29,2586.31,85824,92,True,,0,0.0,Voice.ai WebSocket,Run 1,1
+Voice.ai,websocket,medium,782.67,2578.14,93888,92,True,,0,0.0,Voice.ai WebSocket,Run 1,1
+Voice.ai,websocket,medium,740.68,2440.0,87552,92,True,,0,0.0,Voice.ai WebSocket,Run 1,1
+Voice.ai,websocket,medium,803.34,2613.6,94464,92,True,,0,0.0,Voice.ai WebSocket,Run 1,1
+Voice.ai,websocket,long,783.3,6454.24,283392,327,True,,0,0.0,Voice.ai WebSocket,Run 1,2
+Voice.ai,websocket,long,836.22,6492.22,280512,327,True,,0,0.0,Voice.ai WebSocket,Run 1,2
+Voice.ai,websocket,long,733.38,6072.94,271296,327,True,,0,0.0,Voice.ai WebSocket,Run 1,2
+Voice.ai,websocket,long,1021.52,7309.56,273600,327,True,,0,0.0,Voice.ai WebSocket,Run 1,2
+Voice.ai,websocket,long,1056.27,6292.63,269568,327,True,,0,0.0,Voice.ai WebSocket,Run 1,2
+macOS_Daniel,local,short,4909.62,8066.24,88410,0,True,,1,3149.87,macOS Daniel,Run 2,0
+macOS_Daniel,local,short,5752.69,5754.88,88410,0,True,,2,0.0,macOS Daniel,Run 2,0
+macOS_Daniel,local,short,4203.59,4204.48,88410,0,True,,3,0.0,macOS Daniel,Run 2,0
+macOS_Daniel,local,short,2961.4,2961.83,88410,0,True,,4,0.0,macOS Daniel,Run 2,0
+macOS_Daniel,local,short,3194.17,3195.31,88410,0,True,,5,0.0,macOS Daniel,Run 2,0
+macOS_Daniel,local,short,2653.14,2655.46,88410,0,True,,6,0.0,macOS Daniel,Run 2,0
+macOS_Daniel,local,short,2611.33,2611.78,88410,0,True,,7,0.0,macOS Daniel,Run 2,0
+macOS_Daniel,local,short,2434.16,2436.06,88410,0,True,,8,0.0,macOS Daniel,Run 2,0
+macOS_Daniel,local,medium,3633.58,10554.69,267664,0,True,,1,6920.46,macOS Daniel,Run 2,1
+macOS_Daniel,local,medium,3099.58,3100.93,267664,0,True,,2,0.0,macOS Daniel,Run 2,1
+macOS_Daniel,local,medium,2614.38,2616.85,267664,0,True,,3,0.0,macOS Daniel,Run 2,1
+macOS_Daniel,local,medium,2096.31,2096.71,267664,0,True,,4,0.0,macOS Daniel,Run 2,1
+macOS_Daniel,local,medium,2433.24,2434.35,267664,0,True,,5,0.0,macOS Daniel,Run 2,1
+macOS_Daniel,local,medium,2687.04,2687.48,267664,0,True,,6,0.0,macOS Daniel,Run 2,1
+macOS_Daniel,local,medium,2535.54,2536.93,267664,0,True,,7,0.0,macOS Daniel,Run 2,1
+macOS_Daniel,local,medium,2343.82,2345.61,267664,0,True,,8,0.0,macOS Daniel,Run 2,1
+macOS_Daniel,local,long,2524.1,22361.35,851052,0,True,,1,19835.88,macOS Daniel,Run 2,2
+macOS_Daniel,local,long,5374.76,5375.53,851052,0,True,,2,0.0,macOS Daniel,Run 2,2
+macOS_Daniel,local,long,3661.88,3662.2,851052,0,True,,3,0.0,macOS Daniel,Run 2,2
+macOS_Daniel,local,long,3917.0,3917.69,851052,0,True,,4,0.0,macOS Daniel,Run 2,2
+macOS_Daniel,local,long,2930.49,2932.32,851052,0,True,,5,0.0,macOS Daniel,Run 2,2
+macOS_Daniel,local,long,3059.89,3061.23,851052,0,True,,6,0.0,macOS Daniel,Run 2,2
+macOS_Daniel,local,long,2655.14,2656.08,851052,0,True,,7,0.0,macOS Daniel,Run 2,2
+macOS_Daniel,local,long,3266.86,3267.55,851052,0,True,,8,0.0,macOS Daniel,Run 2,2
+Voice.ai,http_persistent,short,268.73,689.27,28224,0,True,,1,2790.88,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,short,282.95,628.6,24192,0,True,,2,0.0,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,short,271.78,642.04,25920,0,True,,3,0.0,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,short,267.68,625.54,24768,0,True,,4,0.0,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,short,265.66,587.61,23040,0,True,,5,0.0,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,short,273.41,608.06,23616,0,True,,6,0.0,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,short,397.11,1029.95,28224,0,True,,7,0.0,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,short,305.76,643.06,24192,0,True,,8,0.0,Voice.ai HTTP Persistent,Run 2,0
+Voice.ai,http_persistent,medium,268.71,1860.57,91008,0,True,,1,6190.8,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,medium,284.58,1984.33,96768,0,True,,2,0.0,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,medium,301.83,1872.61,91584,0,True,,3,0.0,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,medium,269.02,1955.73,95616,0,True,,4,0.0,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,medium,270.4,1837.86,89280,0,True,,5,0.0,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,medium,271.69,1857.57,91008,0,True,,6,0.0,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,medium,267.14,1868.62,87552,0,True,,7,0.0,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,medium,863.22,3126.74,91008,0,True,,8,0.0,Voice.ai HTTP Persistent,Run 2,1
+Voice.ai,http_persistent,long,295.59,5721.95,275328,0,True,,1,18298.17,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,http_persistent,long,284.98,5516.42,272448,0,True,,2,0.0,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,http_persistent,long,345.79,5389.81,267840,0,True,,3,0.0,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,http_persistent,long,298.2,5716.42,278208,0,True,,4,0.0,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,http_persistent,long,338.83,7880.11,267840,0,True,,5,0.0,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,http_persistent,long,752.52,6986.86,266688,0,True,,6,0.0,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,http_persistent,long,287.79,7340.48,277056,0,True,,7,0.0,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,http_persistent,long,283.97,7897.02,267840,0,True,,8,0.0,Voice.ai HTTP Persistent,Run 2,2
+Voice.ai,websocket,short,747.69,1210.26,21888,0,True,,1,2543.45,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,short,965.82,2296.69,25920,0,True,,2,0.0,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,short,766.97,1255.01,23616,0,True,,3,0.0,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,short,770.49,1330.13,23616,0,True,,4,0.0,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,short,892.43,1387.43,21312,0,True,,5,0.0,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,short,664.66,1072.14,20160,0,True,,6,0.0,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,short,697.34,1169.73,23040,0,True,,7,0.0,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,short,1463.31,2827.74,26496,0,True,,8,0.0,Voice.ai WebSocket,Run 2,0
+Voice.ai,websocket,medium,721.49,2380.59,88128,0,True,,1,6030.34,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,medium,1033.44,2806.74,93312,0,True,,2,0.0,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,medium,701.16,3462.4,88128,0,True,,3,0.0,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,medium,1398.86,3621.7,86400,0,True,,4,0.0,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,medium,743.57,2599.52,95040,0,True,,5,0.0,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,medium,684.5,2422.5,92736,0,True,,6,0.0,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,medium,819.28,2463.79,85248,0,True,,7,0.0,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,medium,1061.14,3256.68,89856,0,True,,8,0.0,Voice.ai WebSocket,Run 2,1
+Voice.ai,websocket,long,686.76,5884.73,266112,0,True,,1,17637.79,Voice.ai WebSocket,Run 2,2
+Voice.ai,websocket,long,817.29,6299.67,274752,0,True,,2,0.0,Voice.ai WebSocket,Run 2,2
+Voice.ai,websocket,long,692.66,6099.0,268416,0,True,,3,0.0,Voice.ai WebSocket,Run 2,2
+Voice.ai,websocket,long,831.36,6345.83,282816,0,True,,4,0.0,Voice.ai WebSocket,Run 2,2

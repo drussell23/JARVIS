@@ -1,0 +1,10 @@
+protocol,sentence,daniel_ms,voiceai_ms,speedup_x,saved_ms
+Voice.ai HTTP Persistent,short,3151.7,291.6,10.8,2860.1
+Voice.ai HTTP Persistent,medium,4209.4,349.6,12.0,3859.8
+Voice.ai HTTP Persistent,long,3627.4,361.0,10.0,3266.4
+Voice.ai HTTP Stream,short,3151.7,584.2,5.4,2567.5
+Voice.ai HTTP Stream,medium,4209.4,363.6,11.6,3845.9
+Voice.ai HTTP Stream,long,3627.4,533.8,6.8,3093.6
+Voice.ai WebSocket,short,3151.7,831.3,3.8,2320.5
+Voice.ai WebSocket,medium,4209.4,857.6,4.9,3351.8
+Voice.ai WebSocket,long,3627.4,828.8,4.4,2798.6
