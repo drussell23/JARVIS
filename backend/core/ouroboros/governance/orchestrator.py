@@ -879,14 +879,19 @@ class GovernedOrchestrator:
             return
         try:
             async with self._oracle_update_lock:
-                await asyncio.wait_for(
+                # P1-6: shielded_wait_for — oracle index is a must-complete write.
+                # Cancellation leaves the index partially stale; shielding lets the
+                # update finish in the background while we surface TimeoutError.
+                from backend.core.async_safety import shielded_wait_for as _shielded_wf
+                await _shielded_wf(
                     oracle.incremental_update(applied_files),
                     timeout=30.0,
+                    name="oracle.incremental_update",
                 )
         except asyncio.TimeoutError:
             logger.warning(
                 "[Orchestrator] Oracle incremental_update timed out (>30s); "
-                "background oracle loop still running"
+                "update continues in background"
             )
         except asyncio.CancelledError:
             pass  # swallow — oracle update is non-blocking; don't abort COMPLETE

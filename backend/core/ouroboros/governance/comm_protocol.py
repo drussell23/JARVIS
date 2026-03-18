@@ -81,6 +81,9 @@ class CommMessage:
     payload: Dict[str, Any]
     timestamp: float = field(default_factory=time.time)
     idempotency_key: str = ""  # set by CommProtocol._emit; format: op_id:boot_id:phase:seq
+    # P1-5: Cross-op global monotonic sequence for causal ordering across all
+    # operations and repos.  Populated by CommProtocol._emit via GlobalEventSequencer.
+    global_seq: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +171,12 @@ class CommProtocol:
         msg.idempotency_key = (
             f"{msg.op_id}:{self._boot_id}:{msg.msg_type.value.lower()}:{msg.seq}"
         )
+        # P1-5: Stamp cross-op global sequence number for causal ordering.
+        try:
+            from backend.core.ouroboros.event_sequencer import next_seq as _next_global_seq
+            msg.global_seq = _next_global_seq()
+        except Exception:
+            pass  # Never block delivery on sequencer errors.
         for transport in self._transports:
             try:
                 await transport.send(msg)

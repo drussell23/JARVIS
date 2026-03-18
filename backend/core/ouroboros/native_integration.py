@@ -22128,8 +22128,8 @@ class SelfHealingServiceManager:
 
             # Check if enough time passed since last restart
             last = self._last_restart.get(service_name, 0)
-            if time.time() - last < backoff:
-                remaining = backoff - (time.time() - last)
+            if time.monotonic() - last < backoff:
+                remaining = backoff - (time.monotonic() - last)
                 logger.debug(f"Backoff for {service_name}: {remaining:.1f}s remaining")
                 return False
 
@@ -22149,7 +22149,7 @@ class SelfHealingServiceManager:
 
                 async with self._lock:
                     self._restart_attempts[service_name] += 1
-                    self._last_restart[service_name] = time.time()
+                    self._last_restart[service_name] = time.monotonic()
 
                 await self._notify_recovery(service_name, True, "Restart initiated")
                 return True
@@ -22162,7 +22162,7 @@ class SelfHealingServiceManager:
             logger.error(f"Recovery failed for {service_name}: {e}")
             async with self._lock:
                 self._restart_attempts[service_name] += 1
-                self._last_restart[service_name] = time.time()
+                self._last_restart[service_name] = time.monotonic()
             await self._notify_recovery(service_name, False, str(e))
             return False
 

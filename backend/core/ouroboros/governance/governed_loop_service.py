@@ -1291,13 +1291,21 @@ class GovernedLoopService:
                 self._config.pipeline_timeout_s + 60.0
             )  # +60s grace beyond deadline for post-COMPLETE bookkeeping
             try:
-                terminal_ctx = await asyncio.wait_for(
+                # P1-6: shielded_wait_for — orchestrator.run() is a must-complete
+                # path (ledger writes, WAL commits, COMPLETE phase bookkeeping).
+                # The inner coroutine MUST NOT be cancelled on timeout; it runs to
+                # completion in the background while we surface TimeoutError to the
+                # outer result handler.
+                from backend.core.async_safety import shielded_wait_for as _shielded_wf
+                terminal_ctx = await _shielded_wf(
                     self._orchestrator.run(ctx),
                     timeout=_pipeline_timeout,
+                    name=f"orchestrator.run/{ctx.op_id}",
                 )
             except asyncio.TimeoutError:
                 logger.error(
-                    "[GovernedLoop] orchestrator.run() exceeded %.0fs hard timeout for op=%s",
+                    "[GovernedLoop] orchestrator.run() exceeded %.0fs hard timeout for op=%s"
+                    " (pipeline continues in background to allow COMPLETE phase to finish)",
                     _pipeline_timeout, ctx.op_id,
                 )
                 duration = time.monotonic() - start_time
