@@ -1432,7 +1432,7 @@ class HybridSTTRouter:
                         # v284.0: Derive actual audio duration from byte count + sample_rate.
                         # 16-bit PCM: 2 bytes/sample → duration_ms = (bytes/2)/rate*1000
                         _actual_dur_ms = int(
-                            (len(audio_data) / 2.0 / max(sample_rate, 1)) * 1000
+                            (len(audio_data) / 2.0 / max(sample_rate or 16000, 1)) * 1000
                         ) if audio_data else 0
                         # Confidence heuristic: 0.75 base for fallback path;
                         # short text (<3 chars) or very long text (>300 chars, likely
