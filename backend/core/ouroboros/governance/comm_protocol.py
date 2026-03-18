@@ -84,6 +84,10 @@ class CommMessage:
     # P1-5: Cross-op global monotonic sequence for causal ordering across all
     # operations and repos.  Populated by CommProtocol._emit via GlobalEventSequencer.
     global_seq: int = 0
+    # P2-6: Runbook-grade observability — cross-operation correlation identifier.
+    # Defaults to op_id for single-repo ops; shared across all saga-member ops.
+    # Populated by CommProtocol._emit from the active correlation context.
+    correlation_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +136,21 @@ class CommProtocol:
         self._transports: List[Any] = transports if transports is not None else [LogTransport()]
         self._seq_counters: Dict[str, int] = {}
         self._boot_id: str = _uuid.uuid4().hex[:12]  # stable per instance, resets per restart
+        # P2-6: Active correlation_id — stamped onto every CommMessage in _emit().
+        # Set by the orchestrator when beginning a new operation via set_correlation_id().
+        self._active_correlation_id: str = ""
+
+    def set_correlation_id(self, correlation_id: str) -> None:
+        """Set the correlation_id stamped on all subsequent messages.
+
+        Called by the orchestrator at the start of each operation::
+
+            protocol.set_correlation_id(ctx.correlation_id)
+
+        For single-repo ops this equals op_id; for multi-repo sagas all
+        member ops share the saga root's correlation_id.
+        """
+        self._active_correlation_id = correlation_id
 
     # -- Sequence helpers ---------------------------------------------------
 
@@ -177,6 +196,9 @@ class CommProtocol:
             msg.global_seq = _next_global_seq()
         except Exception:
             pass  # Never block delivery on sequencer errors.
+        # P2-6: Stamp correlation_id for runbook-grade cross-op observability.
+        if not msg.correlation_id:
+            msg.correlation_id = self._active_correlation_id or msg.op_id
         for transport in self._transports:
             try:
                 await transport.send(msg)

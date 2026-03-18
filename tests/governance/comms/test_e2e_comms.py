@@ -131,6 +131,10 @@ class TestDirectDelivery:
         assert state.recent_completions[0].outcome == "applied"
         assert state.ops_today == 1
 
+        # Drain narrator queue before asserting — narrator is now non-blocking
+        # (P2-1: bounded fanout queue); drain() waits until TTS work completes.
+        await narrator.drain()
+
         # Narrator spoke for INTENT and DECISION (not HEARTBEAT)
         assert mock_say.call_count == 2
 
@@ -170,6 +174,9 @@ class TestDirectDelivery:
         assert state.recent_completions[0].outcome == "postmortem"
         assert state.ops_today == 1
 
+        # Drain narrator queue (P2-1 bounded fanout)
+        await narrator.drain()
+
         # Narrator spoke for both INTENT and POSTMORTEM
         assert mock_say.call_count == 2
 
@@ -202,6 +209,7 @@ class TestCommProtocolDriven:
         )
 
         # All transports received the INTENT
+        await narrator.drain()
         mock_say.assert_called_once()
 
         log_content = list(tmp_path.glob("*.log"))[0].read_text()
@@ -264,6 +272,7 @@ class TestCommProtocolDriven:
         )
 
         # Narrator: spoke for INTENT, DECISION, POSTMORTEM (3 narrated types)
+        await narrator.drain()
         assert mock_say.call_count == 3
 
         # Logger captured all 5 phases
@@ -296,6 +305,7 @@ class TestCommProtocolDriven:
         )
 
         # Healthy transports still received the message
+        await narrator.drain()
         mock_say.assert_called_once()
         assert len(tui_panel.get_state().active_ops) == 1
 
@@ -335,6 +345,7 @@ class TestConcurrency:
         assert tracked_ids == set(ops)
 
         # Narrator spoke for all 5 (debounce=0, all unique op_ids)
+        await narrator.drain()
         assert mock_say.call_count == 5
 
         # Logger has all 5 op_ids
@@ -436,6 +447,7 @@ class TestEdgeCases:
         })
         await narrator.send(msg)
         await narrator.send(msg)  # duplicate
+        await narrator.drain()
 
         assert mock_say.call_count == 1
 

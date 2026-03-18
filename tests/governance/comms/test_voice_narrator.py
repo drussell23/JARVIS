@@ -34,6 +34,7 @@ class TestVoiceNarratorSend:
             "test_count": 3,
         })
         await narrator.send(msg)
+        await narrator.drain()
         mock_safe_say.assert_called_once()
         call_text = mock_safe_say.call_args[0][0]
         assert isinstance(call_text, str)
@@ -51,6 +52,7 @@ class TestVoiceNarratorSend:
             "file": "tests/test_a.py",
         })
         await narrator.send(msg)
+        await narrator.drain()
         mock_safe_say.assert_called_once()
 
     @pytest.mark.asyncio
@@ -89,6 +91,7 @@ class TestVoiceNarratorDebounce:
         })
         await narrator.send(msg1)
         await narrator.send(msg2)
+        await narrator.drain()
         assert mock_safe_say.call_count == 1  # second blocked by debounce
 
     @pytest.mark.asyncio
@@ -105,6 +108,7 @@ class TestVoiceNarratorDebounce:
         await narrator.send(msg1)
         await asyncio.sleep(0.01)
         await narrator.send(msg2)
+        await narrator.drain()
         assert mock_safe_say.call_count == 2
 
 
@@ -119,7 +123,9 @@ class TestVoiceNarratorIdempotency:
             "file": "tests/test_a.py",
         })
         await narrator.send(msg)
+        await narrator.drain()
         await narrator.send(msg)  # same op_id + same msg_type
+        await narrator.drain()
         assert mock_safe_say.call_count == 1
 
 
@@ -169,10 +175,12 @@ class TestSeverityAwareDebounce:
 
         # First INTENT narrates and sets _last_narration
         await narrator.send(self._make_msg(MessageType.INTENT, "op-1"))
+        await narrator.drain()
         assert say.call_count == 1
 
         # POSTMORTEM for a different op must narrate despite debounce window
         await narrator.send(self._make_msg(MessageType.POSTMORTEM, "op-2"))
+        await narrator.drain()
         assert say.call_count == 2, (
             f"POSTMORTEM was suppressed by debounce (call_count={say.call_count})"
         )
@@ -183,9 +191,11 @@ class TestSeverityAwareDebounce:
         narrator, say = self._make_narrator(debounce_s=3600.0)
 
         await narrator.send(self._make_msg(MessageType.INTENT, "op-1"))
+        await narrator.drain()
         assert say.call_count == 1
 
         await narrator.send(self._make_msg(MessageType.DECISION, "op-2"))
+        await narrator.drain()
         assert say.call_count == 2, (
             f"DECISION was suppressed by debounce (call_count={say.call_count})"
         )
@@ -196,9 +206,11 @@ class TestSeverityAwareDebounce:
         narrator, say = self._make_narrator(debounce_s=3600.0)
 
         await narrator.send(self._make_msg(MessageType.INTENT, "op-1"))
+        await narrator.drain()
         assert say.call_count == 1
 
         await narrator.send(self._make_msg(MessageType.INTENT, "op-2"))
+        await narrator.drain()
         assert say.call_count == 1, "Second INTENT within window should be debounced"
 
     async def test_idempotency_still_blocks_duplicate_postmortem(self):
@@ -207,5 +219,7 @@ class TestSeverityAwareDebounce:
         narrator, say = self._make_narrator(debounce_s=0.0)
 
         await narrator.send(self._make_msg(MessageType.POSTMORTEM, "op-1"))
+        await narrator.drain()
         await narrator.send(self._make_msg(MessageType.POSTMORTEM, "op-1"))  # duplicate
+        await narrator.drain()
         assert say.call_count == 1, "Idempotency guard should block duplicate op_id+type"

@@ -496,6 +496,10 @@ class OperationContext:
     strategic_memory_digest: str = ""
     terminal_reason_code: str = ""
     rollback_occurred: bool = False
+    # P2-6: Runbook-grade observability — cross-operation correlation identifier.
+    # For single-repo ops: defaults to op_id (self-referential).
+    # For multi-repo sagas: all saga-member ops share the root op's correlation_id.
+    correlation_id: str = ""
 
     # ---- Telemetry (stamped at intake and COMPLETE) ----
     telemetry: Optional[TelemetryContext] = None
@@ -537,6 +541,7 @@ class OperationContext:
         saga_state: Tuple[RepoSagaStatus, ...] = (),
         schema_version: str = "3.0",
         previous_op_hash_by_scope: Tuple[Tuple[str, str], ...] = (),
+        correlation_id: str = "",
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
 
@@ -561,6 +566,8 @@ class OperationContext:
         now = _timestamp or datetime.now(tz=timezone.utc)
         resolved_op_id = op_id or generate_operation_id()
         resolved_repo_scope = repo_scope if repo_scope is not None else (primary_repo,)
+        # P2-6: default correlation_id to op_id for single-repo ops
+        resolved_correlation_id = correlation_id or resolved_op_id
 
         # Build a temporary dict of all fields (except context_hash) for hashing
         fields_for_hash: Dict[str, Any] = {
@@ -603,6 +610,7 @@ class OperationContext:
             "strategic_memory_digest": "",
             "terminal_reason_code": "",
             "rollback_occurred": False,
+            "correlation_id": resolved_correlation_id,
             "telemetry": None,
             "previous_op_hash_by_scope": previous_op_hash_by_scope,
             "frozen_autonomy_tier": "governed",
@@ -641,6 +649,7 @@ class OperationContext:
             strategic_memory_digest="",
             terminal_reason_code="",
             rollback_occurred=False,
+            correlation_id=resolved_correlation_id,
             previous_op_hash_by_scope=previous_op_hash_by_scope,
             frozen_autonomy_tier="governed",
         )

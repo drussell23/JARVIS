@@ -306,8 +306,21 @@ class CrossRepoEventBus:
         self._handlers[event_type].append(handler)
 
     async def emit(self, event: CrossRepoEvent) -> None:
-        """Emit an event to the bus."""
+        """Emit an event to the bus.
+
+        P2-1: Checks pending-dir size before writing.  If the filesystem
+        queue exceeds the maxsize, the event is shed (DROP_NEWEST policy)
+        to prevent unbounded disk accumulation under burst load.
+        """
         async with self._lock:
+            # P2-1: backpressure guard — shed if filesystem queue is saturated
+            from backend.core.bounded_fanout import check_fs_queue_maxsize
+            if not check_fs_queue_maxsize(self.event_dir / "pending"):
+                logger.warning(
+                    "CrossRepoEventBus: shedding event %s (%s) — pending queue full",
+                    event.id, event.type.value,
+                )
+                return
             event_file = self.event_dir / "pending" / f"{event.id}.json"
             await asyncio.to_thread(
                 event_file.write_text,
