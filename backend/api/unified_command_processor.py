@@ -2112,6 +2112,26 @@ class UnifiedCommandProcessor:
         if workspace_fast is not None:
             return workspace_fast
 
+        # === Step 1.7: Voice-unlock pre-flight guard (v283.0) ===
+        # Intercept biometric unlock commands BEFORE J-Prime.
+        # The reflex manifest catches exact phrases; this guard catches
+        # any paraphrasing that the exact-match reflex misses while still
+        # being unambiguously an unlock request.
+        # This is the root fix for: "Failed to create draft: Recipient 'to'
+        # is required" — J-Prime misclassified unlock as draft_email_reply.
+        if self._is_biometric_unlock_command(command_text):
+            logger.info(
+                "[v283] Voice-unlock pre-flight matched '%s' — bypassing J-Prime",
+                command_text[:80],
+            )
+            return await self._handle_voice_unlock_action(
+                command_text,
+                websocket=websocket,
+                audio_data=audio_data,
+                speaker_name=speaker_name,
+                deadline=deadline,
+            )
+
         # === Step 2: Deadline admission gate for J-Prime ===
         # Avoid launching multi-backend inference when request budget is already
         # nearly exhausted; this creates deterministic failover instead of churn.
@@ -4690,6 +4710,15 @@ class UnifiedCommandProcessor:
                     "command_type": "REFLEX",
                 }
 
+        if action == "voice_unlock":
+            # Biometric voice unlock — route directly to the handler, bypassing
+            # J-Prime entirely. Audio data + speaker are pulled from the
+            # processor's stored context (set in _execute_command_pipeline).
+            logger.info("[v242] Reflex voice_unlock → _handle_voice_unlock_action")
+            result = await self._handle_voice_unlock_action(command_text)
+            result["reflex_id"] = reflex_id
+            return result
+
         return {
             "success": False,
             "response": "Unknown reflex action",
@@ -5078,48 +5107,106 @@ class UnifiedCommandProcessor:
 
         return min(score, 0.95)
 
+    # ---------------------------------------------------------------------------
+    # Unlock command detection — used by pre-flight guard and pattern scoring
+    # ---------------------------------------------------------------------------
+
+    # Frozen sets are O(1) lookup; defined once at class level via closure.
+    _UNLOCK_EXACT: frozenset = frozenset({
+        "unlock my screen",
+        "unlock the screen",
+        "unlock screen",
+        "unlock my mac",
+        "unlock the mac",
+        "unlock mac",
+        "unlock my computer",
+        "unlock my laptop",
+        "open my screen",
+        "wake my screen",
+        "hey jarvis unlock my screen",
+        "jarvis unlock my screen",
+        "jarvis unlock",
+        "please unlock my screen",
+        "can you unlock my screen",
+        "unlock it please",
+        "unlock for me",
+        # Voice-prefixed variants
+        "voice unlock",
+        "unlock with voice",
+        "unlock with my voice",
+        "enable voice unlock",
+        "disable voice unlock",
+        "enroll my voice",
+        "enroll voice",
+        "voice enrollment",
+    })
+
+    _UNLOCK_SCREEN_WORDS: frozenset = frozenset({"screen", "mac", "computer", "laptop", "desktop"})
+
+    def _is_biometric_unlock_command(self, text: str) -> bool:
+        """Return True when *text* is unambiguously a screen-unlock request.
+
+        Three-level check (fastest first):
+        1. Exact phrase membership in _UNLOCK_EXACT.
+        2. Any exact phrase is a substring of the text (catches "hey jarvis,
+           please unlock my screen" with punctuation).
+        3. Token-level: "unlock" is present AND at least one screen/device word
+           is present in the same sentence.
+
+        Returns False for any command that contains "lock" without "unlock"
+        (those are lock-screen commands handled by a separate reflex).
+        """
+        t = text.lower().strip()
+        # Strip common wake-word prefix before matching
+        for prefix in ("hey jarvis ", "jarvis ", "ok jarvis ", "hey j "):
+            if t.startswith(prefix):
+                t = t[len(prefix):]
+                break
+
+        if t in self._UNLOCK_EXACT:
+            return True
+        if any(phrase in t for phrase in self._UNLOCK_EXACT):
+            return True
+
+        words = set(t.split())
+        if "unlock" in words and self._UNLOCK_SCREEN_WORDS & words:
+            return True
+
+        return False
+
     def _detect_voice_unlock_patterns(self, text: str) -> int:
-        """Detect voice unlock related patterns"""
+        """Return a confidence score for voice-unlock-related intent.
+
+        Higher score = stronger signal.  Used by legacy classification paths
+        that pre-date the pre-flight guard.
+
+        v283.0: Extended with screen-unlock direct phrases so "unlock my screen"
+        scores 5 (maximum) rather than 1 (was causing misclassification).
+        """
+        t = text.lower().strip()
         patterns = 0
 
-        voice_words = {"voice", "vocal", "speech", "voiceprint"}
-        unlock_words = {
-            "unlock",
-            "lock",
-            "authenticate",
-            "verify",
-            "enroll",
-            "enrollment",
-        }
+        # Strongest signal: known exact unlock phrases (was missing these)
+        if self._is_biometric_unlock_command(t):
+            return 5  # Maximum — definitively a voice-unlock command
 
-        # Check for voice + unlock combinations
-        has_voice = any(word in text for word in voice_words)
-        has_unlock = any(word in text for word in unlock_words)
+        voice_words = {"voice", "vocal", "speech", "voiceprint"}
+        unlock_words = {"unlock", "authenticate", "verify", "enroll", "enrollment"}
+
+        has_voice = any(word in t for word in voice_words)
+        has_unlock = any(word in t for word in unlock_words)
 
         if has_voice and has_unlock:
             patterns += 2
         elif has_voice or has_unlock:
             patterns += 1
 
-        # Log for debugging
         if has_voice or has_unlock:
             logger.debug(
-                f"Voice unlock pattern detection: text='{text}', has_voice={has_voice}, has_unlock={has_unlock}, patterns={patterns}"
+                "Voice unlock pattern detection: text='%s', has_voice=%s, "
+                "has_unlock=%s, patterns=%d",
+                t, has_voice, has_unlock, patterns,
             )
-
-        # Direct phrases - these are definitely voice unlock commands
-        voice_unlock_phrases = [
-            "voice unlock",
-            "unlock with voice",
-            "enable voice unlock",
-            "disable voice unlock",
-            "enroll my voice",
-            "enroll voice",
-            "voice enrollment",
-        ]
-
-        if any(phrase in text for phrase in voice_unlock_phrases):
-            patterns += 3  # Strong match
 
         return patterns
 
