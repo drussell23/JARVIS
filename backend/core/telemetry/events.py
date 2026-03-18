@@ -66,6 +66,11 @@ class EventType(Enum):
     SEMANTIC_MATCH_FOUND = "semantic.match_found"
     SEMANTIC_MATCH_NONE = "semantic.match_none"
 
+    # Authentication / voice_unlock
+    VOICE_UNLOCK_GRANTED = "auth.voice_unlock.granted"
+    VOICE_UNLOCK_DENIED = "auth.voice_unlock.denied"
+    VOICE_UNLOCK_ROUTING = "auth.voice_unlock.routing"
+
     # Performance
     LATENCY_RECORDED = "latency.recorded"
     ERROR_OCCURRED = "error.occurred"

@@ -3771,14 +3771,41 @@ class UnifiedCommandProcessor:
             )()
 
             result = await handler.handle_command(command_text, websocket, jarvis_instance)
-            return {
+            outcome = {
                 "success": result.get("success", result.get("type") == "voice_unlock"),
                 "response": result.get("message", result.get("response", "")),
                 "command_type": "voice_unlock",
                 **result,
             }
+            # v284.0: Emit telemetry for Reactor Core training pipeline
+            try:
+                from backend.core.telemetry.events import get_telemetry, EventType as _ET
+                _telemetry = get_telemetry()
+                _evt = _ET.VOICE_UNLOCK_GRANTED if outcome["success"] else _ET.VOICE_UNLOCK_DENIED
+                await _telemetry.emit(
+                    _evt,
+                    properties={
+                        "command_text": command_text[:200],
+                        "speaker": speaker_name,
+                        "confidence": result.get("confidence"),
+                        "routing_layer": result.get("routing_layer", "handler"),
+                    },
+                )
+            except Exception:
+                pass  # Telemetry never blocks unlock
+            return outcome
         except Exception as e:
             logger.error(f"[v242] Voice unlock failed: {e}", exc_info=True)
+            # v284.0: Emit denial telemetry on exception
+            try:
+                from backend.core.telemetry.events import get_telemetry, EventType as _ET
+                _telemetry = get_telemetry()
+                await _telemetry.emit(
+                    _ET.VOICE_UNLOCK_DENIED,
+                    properties={"command_text": command_text[:200], "error": str(e)},
+                )
+            except Exception:
+                pass
             return {
                 "success": False,
                 "response": f"Voice unlock failed: {str(e)}",
