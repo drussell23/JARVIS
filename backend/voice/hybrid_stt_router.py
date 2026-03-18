@@ -1429,13 +1429,29 @@ class HybridSTTRouter:
                     )
 
                     if text:
+                        # v284.0: Derive actual audio duration from byte count + sample_rate.
+                        # 16-bit PCM: 2 bytes/sample → duration_ms = (bytes/2)/rate*1000
+                        _actual_dur_ms = int(
+                            (len(audio_data) / 2.0 / max(sample_rate, 1)) * 1000
+                        ) if audio_data else 0
+                        # Confidence heuristic: 0.75 base for fallback path;
+                        # short text (<3 chars) or very long text (>300 chars, likely
+                        # verbose hallucination) get lower confidence.
+                        _text_len = len(text.strip())
+                        if _text_len < 3:
+                            _inferred_conf = 0.30
+                        elif _text_len > 300:
+                            _inferred_conf = 0.60
+                        else:
+                            _inferred_conf = 0.75
                         final_result = STTResult(
                             text=text,
-                            confidence=0.85,  # Whisper doesn't provide confidence
+                            confidence=_inferred_conf,
                             engine=STTEngine.WHISPER_LOCAL,
                             model_name="whisper-robust-fallback",
                             latency_ms=(time.time() - start_time) * 1000,
-                            audio_duration_ms=3000,  # Assume 3 seconds
+                            audio_duration_ms=_actual_dur_ms,
+                            metadata={"confidence_source": "heuristic"},
                         )
                         self._record_circuit_breaker_success("whisper_fallback")
                         logger.info(f"✅ Robust Whisper succeeded: '{final_result.text}'")
