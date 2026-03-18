@@ -29,11 +29,17 @@
     <key>Label</key>
     <string>com.jarvis.supervisor</string>
 
-    <!-- Run the supervisor via the project venv so all dependencies are available -->
+    <!--
+        Use a bash wrapper that activates the venv via `source .venv/bin/activate`
+        before exec-ing the supervisor. Direct venv python3 invocation fails from
+        launchd because macOS blocks pyvenv.cfg reads in that context (errno EPERM).
+        The wrapper avoids this by letting bash do the venv setup, then exec-ing
+        python3 so launchd still tracks the supervisor PID directly.
+    -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/.venv/bin/python3</string>
-        <string>/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/unified_supervisor.py</string>
+        <string>/bin/bash</string>
+        <string>/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/scripts/run_supervisor.sh</string>
     </array>
 
     <key>WorkingDirectory</key>

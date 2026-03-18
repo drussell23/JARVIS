@@ -75,6 +75,11 @@ POST_SPEECH_BREATH = 0.45
 console = Console()
 _pool = ThreadPoolExecutor(max_workers=4)
 
+# Set in main() when the JARVIS supervisor singleton is reachable.
+# Used to acquire a training lock (idle-stop guard) and record activity
+# after each direct J-Prime HTTP call (which bypasses prime_router).
+_demo_mgr = None
+
 
 def _delay(normal: float) -> float:
     return normal * 0.3 if FAST else normal
@@ -464,9 +469,17 @@ async def phase_1():
             )
         except Exception as e:
             console.print(f"  [red bold]❌ Cannot reach J-Prime: {e}[/]")
+            console.print(
+                "  [yellow]ℹ️  J-Prime may be idle-stopped (cost-saving after 45min idle).[/]\n"
+                "  [yellow]   Wake it:[/]  "
+                "[bold]gcloud compute instances start jarvis-prime-stable --zone=us-central1-b[/]\n"
+                "  [dim]   Then wait ~87s for the golden image to boot and re-run the demo.[/]"
+            )
             jarvis_say(
                 "Unable to reach J-Prime. "
-                "The GCP instance may be offline.",
+                "The GCP instance may be idle-stopped to save cost. "
+                "Start it with gcloud and wait about 90 seconds, "
+                "then re-run the demo.",
                 wait=True,
             )
             return None
@@ -1330,6 +1343,17 @@ async def phase_3():
             "completion_tokens": c_tok,
             "model": model_id,
         }
+
+        # Reset J-Prime idle timer. The demo hits J-Prime directly via HTTP,
+        # bypassing prime_router, so record_jprime_activity() is never called
+        # automatically. Without this, the supervisor's idle-stop could fire
+        # mid-demo if 45+ minutes of silence preceded the demo run.
+        # Belt-and-suspenders alongside the training lock held in main().
+        if _demo_mgr is not None:
+            try:
+                _demo_mgr.record_jprime_activity()
+            except Exception:
+                pass
 
         # JARVIS commentary with governance context
         gov_note = ""
@@ -2223,40 +2247,67 @@ async def phase_6() -> None:
 # ═════════════════════════════════════════════════════════════════════════════
 
 async def main():
+    global _demo_mgr
+
     # Kill any stale say processes from previous interrupted runs
     _kill_stale_say()
 
-    await show_banner()
-    await asyncio.sleep(_delay(1.2))
+    # Acquire a J-Prime training lock so idle-stop doesn't kill the VM mid-demo.
+    # The demo calls J-Prime directly via HTTP (bypassing prime_router), so the
+    # idle timer is never reset by normal traffic routing. Without a lock, the
+    # supervisor could idle-stop J-Prime mid-demo if 45+ minutes passed since
+    # last use. Best-effort: silent no-op when the supervisor isn't running.
+    try:
+        from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe  # type: ignore
+        _demo_mgr = await get_gcp_vm_manager_safe()
+        if _demo_mgr is not None:
+            _demo_mgr.acquire_jprime_lock(duration_minutes=120)
+            console.print(
+                "  [dim]🔒 J-Prime training lock acquired (120min) — "
+                "idle-stop suspended for demo duration.[/]"
+            )
+    except Exception:
+        pass  # Supervisor not running or singleton not initialized — harmless
 
-    data = await phase_1()
-    await asyncio.sleep(_delay(1.2))
-
-    await phase_2()
-    await asyncio.sleep(_delay(1.2))
-
-    if data:
-        await phase_3()
+    try:
+        await show_banner()
         await asyncio.sleep(_delay(1.2))
 
-    if not NO_TESTS:
-        await phase_4()
+        data = await phase_1()
         await asyncio.sleep(_delay(1.2))
 
-    if not NO_DOUBLEWORD and DOUBLEWORD_API_KEY:
-        await phase_6()
+        await phase_2()
         await asyncio.sleep(_delay(1.2))
-    elif not NO_DOUBLEWORD and not DOUBLEWORD_API_KEY:
-        console.print(
-            "  [dim]Skipping Phase 6 (Doubleword) — set DOUBLEWORD_API_KEY to enable.[/]"
-        )
-        await asyncio.sleep(_delay(0.3))
 
-    await phase_5()
+        if data:
+            await phase_3()
+            await asyncio.sleep(_delay(1.2))
 
-    console.print()
-    console.print("  [bold cyan]🎬 Demo complete.[/]")
-    console.print()
+        if not NO_TESTS:
+            await phase_4()
+            await asyncio.sleep(_delay(1.2))
+
+        if not NO_DOUBLEWORD and DOUBLEWORD_API_KEY:
+            await phase_6()
+            await asyncio.sleep(_delay(1.2))
+        elif not NO_DOUBLEWORD and not DOUBLEWORD_API_KEY:
+            console.print(
+                "  [dim]Skipping Phase 6 (Doubleword) — set DOUBLEWORD_API_KEY to enable.[/]"
+            )
+            await asyncio.sleep(_delay(0.3))
+
+        await phase_5()
+
+        console.print()
+        console.print("  [bold cyan]🎬 Demo complete.[/]")
+        console.print()
+    finally:
+        if _demo_mgr is not None:
+            try:
+                _demo_mgr.release_jprime_lock()
+                console.print("  [dim]🔓 J-Prime training lock released.[/]")
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

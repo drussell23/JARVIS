@@ -37898,6 +37898,114 @@ These are the non-obvious failure modes, edge cases, and advanced nuances that t
 
 ---
 
+## GCP Cost Control & Supervisor Self-Healing (2026-03-17)
+
+### The Problem
+
+GCP billing showed a **161% month-over-month cost increase**: $154.87 MTD with a $303.63 end-of-month forecast, and 2 of 3 budget thresholds exceeded. The root cause was `jarvis-prime-stable` (g2-standard-4 + NVIDIA L4, ~$1.35/hr) running **24/7** regardless of whether anyone was using it. Five compounding bugs made this impossible to fix without a surgical multi-file intervention:
+
+| # | Root Disease | Effect |
+|---|---|---|
+| 1 | **InvincibleGuard** blocked idle-stop | `VMAction.STOP` was not in the allowed-reason list for `jarvis-prime-stable`, so even if idle logic ran, the guard vetoed it |
+| 2 | **No idle timer existed** | `GcpVmManager` had no concept of "last J-Prime request time" — nothing to measure silence against |
+| 3 | **Nothing reset the timer on traffic** | `prime_router.py` never called any activity-recording function after a successful `GCP_PRIME` response |
+| 4 | **Supervisor thresholds inverted** | `idle_warning_minutes=10` nested the shutdown check inside the warning check where `idle_shutdown_minutes=5` — shutdown fired immediately when warning fired (5 < 10, so shutdown triggered as soon as warning did, not 5 minutes later) |
+| 5 | **Monitor loop killed on `None`** | `_idle_monitor_loop` used `break` when `_active_vm is None`, permanently killing the loop rather than waiting for a future VM |
+
+### What We Fixed
+
+**Engineering Mandate applied:** cure the disease, not the symptom. No workarounds, no hardcoding, no band-aids.
+
+#### Files changed
+
+**`backend/core/gcp_vm_manager.py`**
+- Added `jprime_idle_stop_enabled` and `jprime_idle_timeout_minutes` config fields (env-driven, no hardcoding)
+- Added `_jprime_last_activity: float` to `__init__` — wall-clock timestamp of last J-Prime request
+- Added `_idle_stopped_vms: set[str]` — distinguishes voluntary idle-stops from GCP preemptions in the recovery path
+- Added `_jprime_lock_until: float` — training lock that prevents idle-stop while Reactor Core is actively using J-Prime
+- Added `record_jprime_activity()` — resets idle timer; called from prime_router at request start AND completion
+- Added `acquire_jprime_lock(duration_minutes)` / `release_jprime_lock()` — Reactor Core calls these around DPO training runs
+- Added `"idle_stop"` to InvincibleGuard's allowed STOP reasons (STOP halts billing while preserving disk, IP, and golden image; TERMINATE is still permanently blocked)
+- Added `_monitoring_loop` **Step 5c** — J-Prime idle-stop check with: startup grace period guard, training lock guard, None-safe `static_name` guard, env-driven hourly rate in log message, `_idle_stopped_vms` marker on stop
+
+**`backend/core/prime_router.py`**
+- Added `record_jprime_activity()` call at **request start** (before `asyncio.wait_for`) in the `GCP_PRIME` path — prevents idle-stop from firing mid-stream during 60s+ generations (Gap 2)
+- Retained existing call at request completion so idle timer measures silence from last completed request
+
+**`backend/core/supervisor_gcp_controller.py`**
+- Fixed `idle_warning_minutes` default: `10` → `15` and `idle_shutdown_minutes` default: `5` → `20` (warn must be < shutdown)
+- Fixed `_idle_monitor_loop`: `break` on `_active_vm is None` → `continue` (prevents monitor loop death)
+
+**`.env`**
+- `JPRIME_IDLE_STOP_ENABLED=true`
+- `JPRIME_IDLE_TIMEOUT_MINUTES=45` (conservative for active dev sessions — reduce to 20 for aggressive cost saving)
+- `JPRIME_STATIC_HOURLY_RATE=1.35` (g2-standard-4 + L4 on-demand, us-central1)
+- `GCP_DAILY_BUDGET=15.00` (corrected from broken `$1.00` default that caused constant false budget alerts)
+- `GCP_WEEKLY_BUDGET=75.00`
+- `GCP_IDLE_WARN_MINS=15`
+- `GCP_IDLE_SHUTDOWN_MINS=20`
+- `JARVIS_GCP_SESSION_LIFECYCLE=true`
+
+**`scripts/launchd/com.jarvis.supervisor.plist`** + **`scripts/run_supervisor.sh`** (new)
+- macOS launchd watchdog: if `unified_supervisor.py` crashes for any reason, launchd restarts it within 30 seconds automatically
+- Solves the **supervisor self-healing paradox** (Architectural Critique item #6): the supervisor cannot watch itself — launchd is the external watchdog
+- `KeepAlive=true`, `ThrottleInterval=30s`, `RunAtLoad=false` (start explicitly with `launchctl start com.jarvis.supervisor`)
+- Install: `cp scripts/launchd/com.jarvis.supervisor.plist ~/Library/LaunchAgents/ && launchctl load ~/Library/LaunchAgents/com.jarvis.supervisor.plist`
+- Requires `/bin/bash` to have Full Disk Access granted in System Settings → Privacy & Security → Full Disk Access (one-time setup; needed because repo lives in `~/Documents`)
+
+#### Seven architectural gaps addressed
+
+After the initial five-disease fix, seven additional edge cases were identified and resolved:
+
+| Gap | Problem | Fix |
+|-----|---------|-----|
+| **1** | Supervisor self-healing paradox | launchd plist (`KeepAlive=true`) as external watchdog |
+| **2** | In-flight request safety | `record_jprime_activity()` called at request START — 60s+ generations can't falsely trigger idle-stop mid-stream |
+| **3** | Preemption vs idle-stop distinction | `_idle_stopped_vms: set[str]` — recovery path knows "we stopped this intentionally" vs GCP preemption |
+| **4** | Startup grace period collision | Step 5c checks `_startup_grace_until[static_name]` before idle-stop — can't stop a VM that just finished booting |
+| **5** | Budget ceiling | `GCP_DAILY_BUDGET` was `$1.00` (perpetually triggering false alerts); corrected to `$15.00` |
+| **6** | Timeout conservatism | `JPRIME_IDLE_TIMEOUT_MINUTES=45` for active dev sessions (prevents premature stops during normal usage) |
+| **7** | Reactor Core training lock | `acquire_jprime_lock(duration_minutes)` / `release_jprime_lock()` — Reactor Core holds this during DPO training runs so J-Prime stays up |
+
+### Did This Solve the Billing Problem?
+
+**Yes — forward-looking.** The $154.87 MTD charge for March was already incurred before the fix was applied and cannot be reversed. However, the root cause (24/7 VM) is now cured:
+
+| Scenario | Before (24/7) | After (idle-stop at 45min) |
+|----------|--------------|---------------------------|
+| VM hours/month | 720 hrs | ~30–60 hrs (estimated) |
+| Monthly cost | ~$972 | ~$40–$80 |
+| Budget alerts | 2/3 exceeded | None expected |
+| Next month forecast | $300+ | ~$50 |
+
+**How it works going forward:**
+1. You start JARVIS → `ensure_static_vm_ready()` brings J-Prime online in ~87s (golden image)
+2. Every request through `GCP_PRIME` routing resets the 45-minute idle clock
+3. When you stop using JARVIS, after 45 minutes of silence J-Prime stops itself (billing halts, disk/IP preserved)
+4. Next request automatically restarts it via `ensure_static_vm_ready()`
+5. If Reactor Core is training: `acquire_jprime_lock()` holds the VM up for the training duration, then auto-releases
+
+**To use the Reactor Core training lock:**
+```python
+from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+
+mgr = await get_gcp_vm_manager_safe()
+if mgr:
+    mgr.acquire_jprime_lock(duration_minutes=90)  # keeps J-Prime alive for 90min
+    # ... DPO training run ...
+    mgr.release_jprime_lock()  # release early if done before 90min
+```
+
+**To manage the launchd supervisor watchdog:**
+```bash
+launchctl start com.jarvis.supervisor   # start
+launchctl stop  com.jarvis.supervisor   # stop
+launchctl list  com.jarvis.supervisor   # status (PID + LastExitStatus)
+tail -f ~/.jarvis/logs/supervisor_stdout.log  # live logs
+```
+
+---
+
 ## License
 
 MIT License - see LICENSE file for details
