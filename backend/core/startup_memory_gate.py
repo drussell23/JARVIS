@@ -221,26 +221,73 @@ class MemoryGate:
             self.declare(b)
 
     # ------------------------------------------------------------------
+    # Prospective pressure helper (Nuances 3 + 9)
+    # ------------------------------------------------------------------
+
+    _PRESSURE_ORDER = [
+        MemoryPressureLevel.SAFE,
+        MemoryPressureLevel.ELEVATED,
+        MemoryPressureLevel.CRITICAL,
+        MemoryPressureLevel.OOM_IMMINENT,
+    ]
+
+    def _effective_pressure(
+        self,
+        free_mib: float,
+        required_mib: float,
+    ) -> MemoryPressureLevel:
+        """Return the WORSE of current pressure and prospective post-allocation pressure.
+
+        Even when current pressure is SAFE, if ``free_mib - required_mib``
+        would fall below the CRITICAL threshold (i.e., the allocation itself
+        would cause an OOM), the effective pressure is raised accordingly.
+
+        This catches burst-allocation spikes (model weight loading allocates
+        2–4 GiB in 200 ms) that the slope gate cannot detect fast enough.
+        """
+        current = _pressure_level(free_mib, self._total_mib)
+        if required_mib <= 0.0:
+            return current
+        prospective_free = max(0.0, free_mib - required_mib)
+        prospective = _pressure_level(prospective_free, self._total_mib)
+        order = self._PRESSURE_ORDER
+        return order[max(order.index(current), order.index(prospective))]
+
+    # ------------------------------------------------------------------
     # Pre-flight check
     # ------------------------------------------------------------------
 
     async def check(self, component: str) -> MemoryPressureLevel:
         """Check whether *component* may proceed with initialisation.
 
-        Returns the current pressure level.  Raises ``MemoryGateRefused``
-        if the component is OPTIONAL and pressure is CRITICAL or worse, or
-        if the component is REQUIRED and pressure does not drop to below
-        CRITICAL within ``_MAX_WAIT_S`` seconds.
+        Returns the effective pressure level.  Raises ``MemoryGateRefused``
+        if the component is OPTIONAL and effective pressure is CRITICAL or
+        worse, or if the component is REQUIRED and pressure does not drop
+        below CRITICAL within ``_MAX_WAIT_S`` seconds.
+
+        Effective pressure is the WORSE of:
+        * current system free RAM vs. total RAM thresholds, AND
+        * prospective RAM after allocating this component's ``required_mib``
+          (guards against burst-allocation OOM — Nuances 3 + 9).
         """
         self._checked_count += 1
         budget = self._budgets.get(component)
         free = _free_mib()
-        pressure = _pressure_level(free, self._total_mib)
+        required = budget.required_mib if budget else 0.0
+        pressure = self._effective_pressure(free, required)
+        current_pressure = _pressure_level(free, self._total_mib)
 
-        logger.debug(
-            "[MemoryGate] check '%s': free=%.0f MiB pressure=%s",
-            component, free, pressure.value,
-        )
+        if pressure != current_pressure:
+            logger.warning(
+                "[MemoryGate] '%s' prospective pressure %s after %.0f MiB alloc "
+                "(current=%s, free=%.0f MiB)",
+                component, pressure.value, required, current_pressure.value, free,
+            )
+        else:
+            logger.debug(
+                "[MemoryGate] check '%s': free=%.0f MiB pressure=%s",
+                component, free, pressure.value,
+            )
 
         # ELEVATED: log and proceed
         if pressure == MemoryPressureLevel.ELEVATED:
@@ -267,12 +314,12 @@ class MemoryGate:
             )
             raise MemoryGateRefused(component, pressure, free)
 
-        # REQUIRED component: wait up to _MAX_WAIT_S for pressure to drop
+        # REQUIRED component: wait up to _MAX_WAIT_S for effective pressure to drop
         deadline = time.monotonic() + _MAX_WAIT_S
         while time.monotonic() < deadline:
             await asyncio.sleep(_POLL_INTERVAL_S)
             free = _free_mib()
-            pressure = _pressure_level(free, self._total_mib)
+            pressure = self._effective_pressure(free, required)
             if pressure in (MemoryPressureLevel.SAFE, MemoryPressureLevel.ELEVATED):
                 logger.info(
                     "[MemoryGate] REQUIRED '%s': pressure recovered to %s, proceeding",

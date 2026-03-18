@@ -168,6 +168,12 @@ class PhaseConfig:
     policy: PhasePolicy = PhasePolicy.BEST_EFFORT
     quorum_pct: float = 75.0
     component_timeout_s: Optional[float] = None
+    stale_enforcement_s: Optional[float] = None
+    """When set, a beacon stale-monitor runs alongside each component task.
+    If the component's ``ComponentHealthBeacon`` reports no heartbeat for
+    ``stale_enforcement_s`` seconds, the component task is cancelled and
+    returned as ``TaskOutcome.TIMED_OUT``.  When ``None`` (default), stale
+    detection is advisory only (Nuance 2 fix)."""
 
 
 # ---------------------------------------------------------------------------
@@ -233,9 +239,47 @@ class StartupPhaseManager:
 
         async def _run_one(name: str, task: _TaskLike) -> ComponentResult:
             start = time.monotonic()
+
+            # Stale-enforcement monitor (Nuance 2).
+            # Runs concurrently; cancels comp_task if no beacon heartbeat.
+            stale_cancelled = False
+
+            async def _stale_monitor(comp_task: "asyncio.Task[ComponentResult]") -> None:
+                nonlocal stale_cancelled
+                # Lazy import avoids circular dependency.
+                from backend.core.component_health_beacon import get_beacon_registry  # noqa: PLC0415
+                beacon = get_beacon_registry().get_or_create(name)
+                poll = max(1.0, config.stale_enforcement_s / 10.0)  # type: ignore[operator]
+                while not comp_task.done():
+                    await asyncio.sleep(poll)
+                    if not comp_task.done() and beacon.is_stalled(
+                        config.stale_enforcement_s  # type: ignore[arg-type]
+                    ):
+                        logger.error(
+                            "[PhaseManager] [%s] '%s' STALE — cancelling "
+                            "(no beacon heartbeat for %.0fs)",
+                            config.name, name, config.stale_enforcement_s,
+                        )
+                        stale_cancelled = True
+                        comp_task.cancel()
+                        return
+
             try:
                 coro = task() if callable(task) else task
-                await asyncio.wait_for(coro, timeout=comp_timeout)
+                comp_future = asyncio.ensure_future(
+                    asyncio.wait_for(coro, timeout=comp_timeout)
+                )
+
+                monitor: Optional["asyncio.Task[None]"] = None
+                if config.stale_enforcement_s is not None:
+                    monitor = asyncio.ensure_future(_stale_monitor(comp_future))
+
+                try:
+                    await comp_future
+                finally:
+                    if monitor is not None and not monitor.done():
+                        monitor.cancel()
+
                 dur = time.monotonic() - start
                 logger.info(
                     "[PhaseManager] [%s] '%s' OK in %.3fs",
@@ -254,6 +298,12 @@ class StartupPhaseManager:
                 )
             except asyncio.CancelledError:
                 dur = time.monotonic() - start
+                # If stale monitor cancelled us, return TIMED_OUT (not CANCELLED).
+                if stale_cancelled:
+                    return ComponentResult(
+                        name, TaskOutcome.TIMED_OUT, dur,
+                        error=f"stale enforcement: no beacon for {config.stale_enforcement_s:.0f}s",
+                    )
                 return ComponentResult(
                     name, TaskOutcome.CANCELLED, dur, error="cancelled",
                 )

@@ -55,7 +55,6 @@ logger = logging.getLogger(__name__)
 try:
     from backend.core.startup_contracts import (  # type: ignore[import]
         ENV_CONTRACTS,
-        ContractSeverity,
     )
     _HAS_STARTUP_CONTRACTS = True
 except ImportError:
