@@ -1,0 +1,90 @@
+{
+  "run_at": "2026-03-18T00:56:02Z",
+  "batch_id": "ca6b7b1f-da63-4c44-ac8e-e9e8b796eae4",
+  "input_file_id": "038a977e-69b1-4208-9f12-7c19ef47a22a",
+  "output_file_id": "621e376d-0844-4858-9886-4d03e6b5187b",
+  "doubleword_model": "Qwen/Qwen3.5-35B-A3B-FP8",
+  "doubleword_model_params": "35B (MoE, ~3B active params)",
+  "jprime_model": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+  "jprime_model_params": "14B",
+  "jprime_compute": "NVIDIA L4 (g2-standard-4, 24GB VRAM)",
+  "wall_elapsed_s": 257,
+  "pricing": {
+    "input_cost_per_m": 0.10,
+    "output_cost_per_m": 0.40,
+    "currency": "USD"
+  },
+  "tasks": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "prompt": "Write a Python function that validates firewall rules against a NIST 800-53 compliance policy. It should check port ranges, CIDR blocks, and flag any rule that allows unrestricted inbound access.",
+      "system": "You are a senior infrastructure security engineer working in a FedRAMP-certified environment. Return only code.",
+      "max_tokens_requested": 700,
+      "input_tokens": 78,
+      "output_tokens": 700,
+      "total_tokens": 778,
+      "finish_reason": "length",
+      "input_cost_usd": 0.0000078,
+      "output_cost_usd": 0.00028,
+      "total_cost_usd": 0.0002878,
+      "note": "finish_reason=length: Qwen3.5-35B is a reasoning model; chain-of-thought consumed all 700 tokens before producing final code. Recommend max_tokens>=2000 for code generation tasks with reasoning models."
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "prompt": "A classified network SOC detected 47 failed SSH login attempts from 3 internal IPs within 90 seconds, followed by a successful login and immediate sudo privilege escalation. Classify the threat level and recommend immediate response actions in 3 bullet points.",
+      "system": "You are a defense cybersecurity analyst. Provide concise, actionable analysis.",
+      "max_tokens_requested": 200,
+      "input_tokens": 78,
+      "output_tokens": 200,
+      "total_tokens": 278,
+      "finish_reason": "length",
+      "input_cost_usd": 0.0000078,
+      "output_cost_usd": 0.00008,
+      "total_cost_usd": 0.0000878,
+      "note": "finish_reason=length: Same reasoning model behaviour. Recommend max_tokens>=500 for threat analysis tasks."
+    }
+  },
+  "jprime_baseline": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "latency_ms": 27630,
+      "tok_s": 24.6,
+      "tokens": 680,
+      "finish_reason": "stop"
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "latency_ms": 5334,
+      "tok_s": 24.4,
+      "tokens": 130,
+      "finish_reason": "stop"
+    }
+  },
+  "summary": {
+    "total_dw_cost_usd": 0.0003756,
+    "total_jp_cost_usd": 0.010988,
+    "cost_ratio": 29.25,
+    "cost_savings_pct": 96.6,
+    "total_dw_tokens": 900,
+    "total_jp_tokens": 810,
+    "batch_wall_time_s": 257,
+    "jprime_realtime_total_s": 32.964,
+    "tradeoff": "29x cheaper, 7.8x slower (real-time vs batch SLA) — optimal for latency-insensitive governance tasks"
+  },
+  "model_catalog": [
+    {"id": "Qwen/Qwen3-14B-FP8",                            "params": "14B",  "active_params": "14B",  "notes": "Same parameter tier as J-Prime"},
+    {"id": "openai/gpt-oss-20b",                            "params": "20B",  "active_params": "20B",  "notes": "OpenAI OSS model"},
+    {"id": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",           "params": "30B",  "active_params": "3B",   "notes": "Vision+Language MoE"},
+    {"id": "Qwen/Qwen3.5-35B-A3B-FP8",                     "params": "35B",  "active_params": "3B",   "notes": "Used in this benchmark — MoE reasoning model"},
+    {"id": "Qwen/Qwen3.5-9B",                               "params": "9B",   "active_params": "9B",   "notes": "Smallest Qwen3.5"},
+    {"id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4","params": "120B", "active_params": "12B",  "notes": "NVIDIA Nemotron MoE"},
+    {"id": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",          "params": "235B", "active_params": "22B",  "notes": "Vision+Language MoE"},
+    {"id": "Qwen/Qwen3.5-397B-A17B-FP8",                   "params": "397B", "active_params": "17B",  "notes": "Largest available — Tier 0 routing candidate"}
+  ],
+  "routing_recommendation": {
+    "tier_0_ultra": "Qwen/Qwen3.5-397B-A17B-FP8",
+    "tier_0_standard": "Qwen/Qwen3.5-35B-A3B-FP8",
+    "complexity_threshold": 0.85,
+    "use_cases": ["cross_repo_planning", "architecture_review", "dpo_pair_generation", "bulk_validation"]
+  }
+}

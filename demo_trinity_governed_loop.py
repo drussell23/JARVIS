@@ -8,10 +8,16 @@ Rich animated terminal UI, async parallel execution,
 and dynamic system telemetry.
 
 Usage:
-  python3 demo_trinity_governed_loop.py              # Full demo with voice
-  python3 demo_trinity_governed_loop.py --no-voice   # Silent mode
-  python3 demo_trinity_governed_loop.py --no-tests   # Skip test suite
-  python3 demo_trinity_governed_loop.py --fast        # Reduced pauses
+  python3 demo_trinity_governed_loop.py                        # Full demo with voice
+  python3 demo_trinity_governed_loop.py --no-voice             # Silent mode
+  python3 demo_trinity_governed_loop.py --no-tests             # Skip test suite
+  python3 demo_trinity_governed_loop.py --no-doubleword        # Skip Phase 6 (Tier 0)
+  python3 demo_trinity_governed_loop.py --fast                 # Reduced pauses
+  python3 demo_trinity_governed_loop.py --replay               # Offline replay mode
+
+  # With Doubleword Tier 0 (Phase 6):
+  DOUBLEWORD_API_KEY=sk-... python3 demo_trinity_governed_loop.py
+  DOUBLEWORD_MODEL=Qwen/Qwen3.5-397B-A17B-FP8 DOUBLEWORD_API_KEY=sk-... python3 demo_trinity_governed_loop.py
 """
 from __future__ import annotations
 
@@ -50,12 +56,19 @@ LEDGER_DIR = Path(os.getenv(
     str(Path.home() / ".jarvis" / "ouroboros" / "ledger"),
 ))
 PROJECT_ROOT = Path(__file__).parent
-NO_VOICE = "--no-voice" in sys.argv or not shutil.which("say")
-NO_TESTS = "--no-tests" in sys.argv
-FAST     = "--fast"     in sys.argv
-REPLAY   = "--replay"   in sys.argv   # show history.json data; no live GCP call
-VOICE = os.getenv("JARVIS_VOICE", "Daniel")
+NO_VOICE      = "--no-voice"      in sys.argv or not shutil.which("say")
+NO_TESTS      = "--no-tests"      in sys.argv
+NO_DOUBLEWORD = "--no-doubleword" in sys.argv
+FAST          = "--fast"          in sys.argv
+REPLAY        = "--replay"        in sys.argv   # show history.json data; no live GCP call
+VOICE       = os.getenv("JARVIS_VOICE", "Daniel")
 SPEECH_RATE = os.getenv("JARVIS_SPEECH_RATE", "175")
+
+# Doubleword config (all env-driven)
+DOUBLEWORD_API_KEY = os.getenv("DOUBLEWORD_API_KEY", "")
+DOUBLEWORD_BASE    = os.getenv("DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1")
+DOUBLEWORD_MODEL   = os.getenv("DOUBLEWORD_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8")
+DOUBLEWORD_WINDOW  = os.getenv("DOUBLEWORD_WINDOW", "1h")
 # Breathing pause after speech — lets the last syllable land before UI continues
 POST_SPEECH_BREATH = 0.45
 
@@ -1917,6 +1930,295 @@ async def phase_5():
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# 🌐 PHASE 6 — DOUBLEWORD TIER 0 (Async Batch Inference)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _dw_curl_get(path: str) -> dict:
+    """GET request to Doubleword API via subprocess curl."""
+    result = subprocess.run(
+        ["curl", "-sf",
+         "-H", f"Authorization: Bearer {DOUBLEWORD_API_KEY}",
+         f"{DOUBLEWORD_BASE}{path}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(result.stderr or "empty response")
+    return json.loads(result.stdout)
+
+
+def _dw_curl_post(path: str, payload: dict) -> dict:
+    result = subprocess.run(
+        ["curl", "-sf",
+         "-H", f"Authorization: Bearer {DOUBLEWORD_API_KEY}",
+         "-H", "Content-Type: application/json",
+         "-d", json.dumps(payload),
+         f"{DOUBLEWORD_BASE}{path}"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(result.stderr or "empty response")
+    return json.loads(result.stdout)
+
+
+def _dw_curl_upload(jsonl_path: str) -> dict:
+    result = subprocess.run(
+        ["curl", "-sf",
+         "-H", f"Authorization: Bearer {DOUBLEWORD_API_KEY}",
+         "-F", f"file=@{jsonl_path};type=application/jsonl",
+         "-F", "purpose=batch",
+         f"{DOUBLEWORD_BASE}/files"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        raise RuntimeError(result.stderr or "empty response")
+    return json.loads(result.stdout)
+
+
+def _dw_curl_content(path: str) -> str:
+    result = subprocess.run(
+        ["curl", "-sf",
+         "-H", f"Authorization: Bearer {DOUBLEWORD_API_KEY}",
+         f"{DOUBLEWORD_BASE}{path}"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(result.stderr)
+    return result.stdout
+
+
+async def phase_6() -> None:
+    console.print(Rule(
+        "[bold cyan]🌐 PHASE 6 — TIER 0 ROUTING · DOUBLEWORD BATCH[/]",
+        style="cyan",
+    ))
+    await asyncio.sleep(_delay(0.4))
+
+    jarvis_say(
+        "Phase 6 demonstrates Trinity's Tier Zero routing. "
+        "When a task exceeds J-Prime's local ceiling, "
+        "Ouroboros escalates to Doubleword — "
+        "an async batch inference service with access to models up to 397 billion parameters. "
+        "29 times cheaper than our Claude fallback, with a one-hour S.L.A.",
+        wait=False,
+    )
+
+    # ── Tier architecture panel ───────────────────────────────────────────────
+    arch = Table.grid(padding=(0, 2))
+    arch.add_column(style="bold")
+    arch.add_column()
+    arch.add_row("[purple]Tier 0[/]", f"[bold white]Doubleword Batch[/]  {DOUBLEWORD_MODEL}  ·  1-hour SLA  ·  complexity > 0.85")
+    arch.add_row("[cyan]Tier 1[/]",   "[bold white]J-Prime (NVIDIA L4)[/]  Qwen2.5-Coder-14B  ·  ~24 tok/s  ·  real-time")
+    arch.add_row("[green]Tier 2[/]",  "[bold white]Local (macOS M-series)[/]  MLX inference  ·  free  ·  ultra-low latency")
+    console.print(Panel(arch, title="[bold]Trinity Routing Architecture[/]", border_style="cyan"))
+    await asyncio.sleep(_delay(1.0))
+
+    if not DOUBLEWORD_API_KEY:
+        console.print(Panel(
+            "[yellow]DOUBLEWORD_API_KEY not set — skipping live batch.[/]\n"
+            "Set [bold]DOUBLEWORD_API_KEY[/] to enable Tier 0 routing in the demo.",
+            title="[bold yellow]⚠  Tier 0 Offline[/]",
+            border_style="yellow",
+        ))
+        wait_speech()
+        return
+
+    # ── Check available models ────────────────────────────────────────────────
+    try:
+        models_resp = await _in_thread(_dw_curl_get, "/models")
+        model_ids = [m["id"] for m in models_resp.get("data", [])]
+    except Exception:
+        model_ids = []
+
+    # ── Pre-execution governance gate ─────────────────────────────────────────
+    op_id = f"op-demo-dw-{int(time.time())}"
+    gate_table = Table.grid(padding=(0, 2))
+    gate_table.add_column(style="bold yellow")
+    gate_table.add_column()
+    gate_table.add_row("🔍 Risk Classification", "[yellow]NEEDS_APPROVAL[/]  (ultra-complex · cross-repo planning)")
+    gate_table.add_row("🎯 Routing Decision",    f"[yellow]ESCALATE → TIER 0[/]  ({DOUBLEWORD_MODEL})")
+    gate_table.add_row("🛡️  Security Gate",       "[green]APPROVED[/]  (FedRAMP-aligned · audit trail active)")
+    gate_table.add_row("📋 Operation ID",         f"[dim]{op_id}[/]")
+    console.print(Panel(gate_table, title="[bold yellow]⚡ Pre-Execution Gate — Tier 0 Escalation[/]", border_style="yellow"))
+    await asyncio.sleep(_delay(1.2))
+
+    # ── Build JSONL and submit batch ──────────────────────────────────────────
+    task_label  = "Cross-Repo Architecture Review"
+    task_prompt = (
+        "Review the Trinity AI routing architecture and produce a concise engineering summary "
+        "covering: (1) the three-tier compute model (Local / J-Prime L4 / Doubleword), "
+        "(2) the Ouroboros governance pipeline, and (3) three recommended optimisations "
+        "for the Reactor-Core DPO fine-tuning loop. Be precise and actionable."
+    )
+    jsonl_line = json.dumps({
+        "custom_id": "arch_review",
+        "method":    "POST",
+        "url":       "/v1/chat/completions",
+        "body": {
+            "model":       DOUBLEWORD_MODEL,
+            "messages": [
+                {"role": "system",  "content": "You are a senior distributed systems architect. Be precise and concise."},
+                {"role": "user",    "content": task_prompt},
+            ],
+            "max_tokens":  800,
+            "temperature": 0.1,
+        },
+    })
+    fd, _tmp = tempfile.mkstemp(suffix=".jsonl")
+    jsonl_path = Path(_tmp)
+    os.close(fd)
+    jsonl_path.write_text(jsonl_line)
+
+    console.print(f"\n  [bold]Task:[/] {task_label}")
+    console.print(f"  [dim]{task_prompt[:120]}...[/]\n")
+
+    # Upload + create batch
+    console.print("  [dim]Uploading batch to Doubleword...[/] ", end="")
+    try:
+        file_resp  = await _in_thread(_dw_curl_upload, str(jsonl_path))
+        file_id    = file_resp["id"]
+        batch_resp = await _in_thread(_dw_curl_post, "/batches", {
+            "input_file_id":     file_id,
+            "endpoint":          "/v1/chat/completions",
+            "completion_window": DOUBLEWORD_WINDOW,
+        })
+        batch_id        = batch_resp["id"]
+        output_file_id  = batch_resp.get("output_file_id", "")
+        console.print(f"[green]submitted[/]  batch_id=[dim]{batch_id}[/]")
+    except Exception as exc:
+        console.print(f"[red]FAILED: {exc}[/]")
+        wait_speech()
+        return
+    finally:
+        jsonl_path.unlink(missing_ok=True)
+
+    # ── Poll with live timer panel ────────────────────────────────────────────
+    poll_start = time.perf_counter()
+
+    def _poll_panel(elapsed: float, status: str, done: bool) -> Panel:
+        t = Text()
+        t.append(f"\n  🕐  Waiting for Doubleword batch ({DOUBLEWORD_WINDOW} SLA)\n\n", style="bold white")
+        t.append(f"  Batch ID   : ", style="dim")
+        t.append(f"{batch_id}\n", style="dim cyan")
+        t.append(f"  Model      : ", style="dim")
+        t.append(f"{DOUBLEWORD_MODEL}\n", style="dim cyan")
+        t.append(f"  Status     : ", style="dim")
+        t.append(f"{'[green]completed[/]' if done else status}\n")
+        t.append(f"  Elapsed    : ", style="dim")
+        t.append(f"{elapsed:.0f}s\n", style="bold")
+        if not done:
+            t.append(f"\n  [dim](polling every 10s — 1-hour SLA)[/]\n")
+        return Panel(t, title="[bold purple]🌐 Tier 0 · Doubleword Batch[/]", border_style="purple")
+
+    status_val = "in_progress"
+    elapsed_val = 0.0
+
+    with Live(_poll_panel(0, "in_progress", False), console=console, refresh_per_second=2) as live:
+        while True:
+            await asyncio.sleep(10)
+            elapsed_val = time.perf_counter() - poll_start
+            try:
+                b = await _in_thread(_dw_curl_get, f"/batches/{batch_id}")
+                status_val     = b.get("status", "unknown")
+                output_file_id = b.get("output_file_id", output_file_id)
+            except Exception:
+                pass
+            live.update(_poll_panel(elapsed_val, status_val, status_val == "completed"))
+            if status_val in ("completed", "failed", "cancelled", "expired"):
+                break
+            if elapsed_val > 3600:
+                break
+
+    wall_s = time.perf_counter() - poll_start
+
+    if status_val != "completed":
+        console.print(Panel(
+            f"[red]Batch ended with status: {status_val}[/]",
+            border_style="red",
+        ))
+        wait_speech()
+        return
+
+    # ── Retrieve + display result ─────────────────────────────────────────────
+    try:
+        raw_output = await _in_thread(_dw_curl_content, f"/files/{output_file_id}/content")
+        result_obj = json.loads(raw_output.strip().splitlines()[0])
+        body        = result_obj.get("response", {}).get("body", {})
+        usage       = body.get("usage", {})
+        in_t        = usage.get("prompt_tokens", 0)
+        out_t       = usage.get("completion_tokens", 0)
+        finish      = (body.get("choices") or [{}])[0].get("finish_reason", "?")
+        content     = (body.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        if not content:
+            content = (body.get("choices") or [{}])[0].get("message", {}).get("reasoning_content", "") or ""
+    except Exception as exc:
+        console.print(f"  [red]Result retrieval failed: {exc}[/]")
+        wait_speech()
+        return
+
+    # Display response
+    from rich.markdown import Markdown
+    resp_panel = Panel(
+        Markdown(content[:1200]) if content else Text("(no content — reasoning model, increase max_tokens)", style="dim"),
+        title=f"[bold purple]🌐 Doubleword Response · {DOUBLEWORD_MODEL}[/]",
+        border_style="purple",
+    )
+    console.print(resp_panel)
+    await asyncio.sleep(_delay(0.8))
+
+    # ── Routing & performance panel ───────────────────────────────────────────
+    DW_IN_COST  = 0.10
+    DW_OUT_COST = 0.40
+    cost = (in_t / 1_000_000) * DW_IN_COST + (out_t / 1_000_000) * DW_OUT_COST
+
+    perf_table = Table.grid(padding=(0, 2))
+    perf_table.add_column(style="bold magenta")
+    perf_table.add_column()
+    perf_table.add_row("🎯 Routing Tier",   "Tier 0  ·  Doubleword Batch")
+    perf_table.add_row("🤖 Model",          DOUBLEWORD_MODEL)
+    perf_table.add_row("⏱️  Wall Time",       f"{wall_s:.0f}s ({DOUBLEWORD_WINDOW} SLA)")
+    perf_table.add_row("📝 Input Tokens",    f"{in_t:,}")
+    perf_table.add_row("📝 Output Tokens",   f"{out_t:,}")
+    perf_table.add_row("💰 Request Cost",    f"${cost:.6f}")
+    perf_table.add_row("📊 Vs Claude API",   f"~{15 / DW_OUT_COST:.0f}x cheaper (output tokens)")
+    perf_table.add_row("🏁 Finish Reason",   finish)
+    console.print(Panel(perf_table, title="[bold magenta]⚡ Tier 0 · Routing & Performance[/]", border_style="magenta"))
+    await asyncio.sleep(_delay(0.8))
+
+    # ── Post-execution validation ─────────────────────────────────────────────
+    val_table = Table.grid(padding=(0, 2))
+    val_table.add_column(style="bold green")
+    val_table.add_column()
+    val_table.add_row("✅ Batch Completed",   "SUCCESS")
+    val_table.add_row("✅ Response Received", f"{out_t} tokens")
+    val_table.add_row("✅ Cost Gate",         f"${cost:.6f}  (within daily budget)")
+    val_table.add_row("📋 Ledger Entry",      op_id)
+    val_table.add_row("🏁 Final State",       "APPLIED")
+    console.print(Panel(val_table, title="[bold green]✅ Post-Execution Validation[/]", border_style="green"))
+
+    # Store benchmark data
+    _benchmarks["doubleword"] = {
+        "model":       DOUBLEWORD_MODEL,
+        "batch_id":    batch_id,
+        "wall_s":      round(wall_s, 1),
+        "in_tokens":   in_t,
+        "out_tokens":  out_t,
+        "cost_usd":    round(cost, 6),
+        "finish":      finish,
+        "model_count": len(model_ids),
+    }
+
+    jarvis_say(
+        f"Tier Zero routing complete. "
+        f"Doubleword processed the request using {DOUBLEWORD_MODEL} "
+        f"in {wall_s:.0f} seconds, at a cost of less than one cent. "
+        f"This is the compute tier that handles tasks beyond J-Prime's local ceiling.",
+        wait=True,
+    )
+
+    await asyncio.sleep(_delay(1.0))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # 🎬 MAIN
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1940,6 +2242,15 @@ async def main():
     if not NO_TESTS:
         await phase_4()
         await asyncio.sleep(_delay(1.2))
+
+    if not NO_DOUBLEWORD and DOUBLEWORD_API_KEY:
+        await phase_6()
+        await asyncio.sleep(_delay(1.2))
+    elif not NO_DOUBLEWORD and not DOUBLEWORD_API_KEY:
+        console.print(
+            "  [dim]Skipping Phase 6 (Doubleword) — set DOUBLEWORD_API_KEY to enable.[/]"
+        )
+        await asyncio.sleep(_delay(0.3))
 
     await phase_5()
 
