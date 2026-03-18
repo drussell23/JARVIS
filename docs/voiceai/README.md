@@ -6,7 +6,7 @@
 **Author:** Derek J. Russell
 **Status:** Evaluation Complete — Approved for Integration
 
-> **Interactive Report:** [Open the full interactive HTML report](./VOICEAI_BENCHMARK_REPORT.html) for styled tables, color-coded severity ratings, and the complete consultant-ready presentation.
+> **Interactive Report:** Open [`VOICEAI_BENCHMARK_REPORT.html`](./VOICEAI_BENCHMARK_REPORT.html) **in your browser** (right-click > Open With > Chrome/Safari, or run `open docs/voiceai/VOICEAI_BENCHMARK_REPORT.html` in terminal). This is a self-contained file with all charts embedded — no external dependencies. Styled with dark theme, color-coded severity ratings, and full data tables for consultants.
 
 ---
 
