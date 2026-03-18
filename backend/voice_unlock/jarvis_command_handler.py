@@ -135,6 +135,7 @@ class CommandType(Enum):
     SECURITY_TEST = auto()
     HELP = auto()
     CANCEL = auto()
+    SHUTDOWN = auto()
     UNKNOWN = auto()
 
 
@@ -629,8 +630,23 @@ class CommandPatternRegistry:
 
         # Cancel patterns
         CommandPattern(
-            r"jarvis[,.]? (?:cancel|stop|never ?mind|abort)",
+            r"jarvis[,.]? (?:cancel|never ?mind|abort)",
             CommandType.CANCEL, priority=10, description="Cancel command"
+        ),
+
+        # Shutdown patterns (v292.0: Voice-commanded graceful shutdown)
+        # Higher priority than CANCEL to prevent "stop" from matching cancel
+        CommandPattern(
+            r"(?:hey |hi )?jarvis[,.]? (?:please )?(?:shut ?down|power off|go to sleep|turn off)",
+            CommandType.SHUTDOWN, priority=12, description="Shutdown with JARVIS prefix"
+        ),
+        CommandPattern(
+            r"(?:hey |hi )?jarvis[,.]? (?:please )?(?:stop|quit|exit|terminate)(?: yourself| running| everything)?",
+            CommandType.SHUTDOWN, priority=11, description="Stop/quit JARVIS"
+        ),
+        CommandPattern(
+            r"(?:hey )?jarvis[,.]? (?:that'?s all|good ?night|i'?m done for (?:now|today|the day))",
+            CommandType.SHUTDOWN, priority=10, description="Conversational shutdown"
         ),
     ]
 
@@ -720,8 +736,17 @@ class FuzzyMatcher:
             'leaving', 'leave', 'going', 'done', 'away', 'bye',
         ]
 
+        # v292.0: Shutdown keywords for voice-commanded graceful shutdown
+        shutdown_words = [
+            'shutdown', 'shut', 'down', 'power', 'off', 'poweroff',
+            'stop', 'quit', 'exit', 'terminate', 'sleep',
+            'goodnight', 'night', 'done',
+        ]
+
         self._unlock_keywords = set(unlock_words)
         self._lock_keywords = set(lock_words)
+        self._shutdown_keywords: Set[str] = set(shutdown_words)
+        self._shutdown_phonetic_codes: Set[str] = set()
 
         # Build phonetic codes
         for word in self._unlock_keywords:
@@ -737,6 +762,13 @@ class FuzzyMatcher:
                 self._lock_phonetic_codes.add(primary)
             if secondary and secondary != primary:
                 self._lock_phonetic_codes.add(secondary)
+
+        for word in self._shutdown_keywords:
+            primary, secondary = self.encoder.encode(word)
+            if primary:
+                self._shutdown_phonetic_codes.add(primary)
+            if secondary and secondary != primary:
+                self._shutdown_phonetic_codes.add(secondary)
 
         # Default STT error mappings
         self._stt_mappings = {
@@ -824,6 +856,14 @@ class FuzzyMatcher:
             target_phrases = [
                 "lock my screen", "lock my mac", "lock the computer",
                 "jarvis lock", "activate security", "im leaving",
+            ]
+        elif target_type == CommandType.SHUTDOWN:
+            keywords = self._shutdown_keywords
+            phonetic_codes = self._shutdown_phonetic_codes
+            target_phrases = [
+                "shut down", "power off", "go to sleep", "stop jarvis",
+                "jarvis shut down", "good night jarvis", "jarvis quit",
+                "turn off", "im done for today",
             ]
         else:
             return (False, 0.0, {"error": f"Unsupported type: {target_type}"})
@@ -997,7 +1037,16 @@ class ResponseGenerator:
                 "Processing your unlock command.",
             ],
             "help": [
-                "Available commands: unlock, lock, status, enroll. Say 'Hey JARVIS' followed by your command.",
+                "Available commands: unlock, lock, status, enroll, shut down. Say 'Hey JARVIS' followed by your command.",
+            ],
+            "shutdown_confirmed": [
+                "Understood, {user}. Initiating graceful shutdown. All systems going offline. See you next time.",
+                "Shutting down now, {user}. All subsystems will be stopped safely. Good night.",
+                "Acknowledged, {user}. Powering down all systems. Until next time.",
+            ],
+            "shutdown_denied": [
+                "I can only shut down for an authenticated owner. Voice verification failed.",
+                "Shutdown requires voice authentication. I didn't recognize your voice.",
             ],
         }
 
@@ -1199,6 +1248,28 @@ class JARVISCommandHandler:
             await self._record_command(command)
             return command
 
+        # v292.0: Try shutdown intent
+        is_shutdown, shutdown_conf, shutdown_debug = await self._fuzzy_matcher.detect_intent(
+            text_lower, CommandType.SHUTDOWN
+        )
+
+        if is_shutdown:
+            command = VoiceCommand(
+                command_type=CommandType.SHUTDOWN,
+                user_name=None,
+                parameters={},
+                confidence=shutdown_conf,
+                raw_text=original_text,
+                normalized_text=shutdown_debug.get("normalized", text_lower),
+                match_type=MatchType.FUZZY,
+                match_details=shutdown_debug,
+                trace_id=trace_id,
+            )
+
+            logger.info(f"[{trace_id}] Fuzzy match: SHUTDOWN (conf={shutdown_conf:.2f})")
+            await self._record_command(command)
+            return command
+
         # =================================================================
         # PHASE 4: No match found
         # =================================================================
@@ -1259,6 +1330,11 @@ class JARVISCommandHandler:
             if result.get("success"):
                 return await self._response_generator.generate("enroll_success", context)
             return await self._response_generator.generate("enroll_failed", context)
+
+        elif command.command_type == CommandType.SHUTDOWN:
+            if result.get("authenticated"):
+                return await self._response_generator.generate("shutdown_confirmed", context)
+            return await self._response_generator.generate("shutdown_denied", context)
 
         elif command.command_type == CommandType.HELP:
             return await self._response_generator.generate("help", context)

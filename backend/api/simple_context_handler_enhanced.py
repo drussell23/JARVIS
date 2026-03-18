@@ -22,6 +22,7 @@ import asyncio
 import logging
 import os
 import re
+from pathlib import Path
 from typing import Any, Dict, Optional
 from datetime import datetime
 
@@ -237,6 +238,48 @@ class EnhancedSimpleContextHandler:
             logger.info(f"[ENHANCED CONTEXT] Command: '{command}'")
             logger.info(f"[ENHANCED CONTEXT] Speaker: {speaker_name or '(not identified)'}")
             self._add_step(f"Received command: {command}")
+
+            # ─────────────────────────────────────────────────────────
+            # v292.0: VOICE-COMMANDED GRACEFUL SHUTDOWN
+            # Intercept shutdown commands BEFORE general processing.
+            # Requires VBIA speaker verification — only the owner can
+            # shut down the system. Speaks farewell, unloads launchd
+            # plist (prevents KeepAlive restart), then signals shutdown.
+            # ─────────────────────────────────────────────────────────
+            if self._is_shutdown_command(command):
+                self._add_step("Shutdown command detected", {"command": command})
+                verified, deny_message = await self._verify_speaker_for_unlock(
+                    speaker_name
+                )
+                if not verified:
+                    self._add_step(
+                        "Shutdown DENIED: speaker not verified",
+                        {"speaker": speaker_name},
+                    )
+                    deny_response = (
+                        "I can only shut down for an authenticated owner. "
+                        "Voice verification failed."
+                    )
+                    if websocket:
+                        await self._notify_speech_and_schedule_stop(deny_response)
+                        await websocket.send_json({
+                            "type": "response",
+                            "text": deny_response,
+                        })
+                    return {
+                        "success": False,
+                        "response": deny_response,
+                        "context_handled": True,
+                        "execution_steps": self.execution_steps,
+                    }
+
+                self._add_step(
+                    f"Shutdown AUTHORIZED for speaker: {speaker_name}",
+                    {"speaker": speaker_name},
+                )
+                return await self._execute_graceful_shutdown(
+                    speaker_name, websocket
+                )
 
             # Check if command requires screen
             requires_screen = self._requires_screen(command)
@@ -456,6 +499,138 @@ class EnhancedSimpleContextHandler:
     # ─────────────────────────────────────────────────────────────────────────
     # SCREEN DETECTION & UNLOCK
     # ─────────────────────────────────────────────────────────────────────────
+
+    # ═════════════════════════════════════════════════════════════════════
+    # v292.0: Voice-Commanded Graceful Shutdown
+    # ═════════════════════════════════════════════════════════════════════
+
+    _SHUTDOWN_PATTERNS = [
+        "shut down", "shutdown", "power off", "poweroff",
+        "go to sleep", "turn off", "stop jarvis", "quit jarvis",
+        "good night jarvis", "goodnight jarvis",
+        "i'm done for today", "i'm done for the day", "im done for today",
+        "that's all jarvis", "thats all jarvis",
+        "jarvis stop", "jarvis quit", "jarvis shut down",
+        "jarvis power off", "jarvis go to sleep",
+        "jarvis terminate", "jarvis exit",
+    ]
+
+    def _is_shutdown_command(self, command: str) -> bool:
+        """Detect if the command is a shutdown request."""
+        cmd_lower = command.lower().strip()
+        return any(p in cmd_lower for p in self._SHUTDOWN_PATTERNS)
+
+    async def _execute_graceful_shutdown(
+        self,
+        speaker_name: Optional[str],
+        websocket=None,
+    ) -> Dict[str, Any]:
+        """
+        Execute a voice-commanded graceful shutdown of the entire JARVIS system.
+
+        Sequence:
+        1. Speak farewell message (blocking — JARVIS finishes speaking before dying)
+        2. Write sentinel file so supervisor knows to unload launchd plist
+        3. Send SIGTERM to self (triggers the supervisor's graceful shutdown chain)
+
+        The launchd plist has KeepAlive=true, so a normal exit would restart JARVIS.
+        The sentinel file tells the cleanup handler to run `launchctl unload` first.
+        """
+        import signal
+        import subprocess
+
+        display_name = speaker_name or "Sir"
+        farewell = (
+            f"Understood, {display_name}. Initiating graceful shutdown. "
+            f"All systems going offline. See you next time."
+        )
+
+        self._add_step("Speaking shutdown farewell", {"farewell": farewell})
+
+        # Speak the farewell BEFORE shutting down (must complete before exit)
+        if websocket:
+            await self._notify_speech_and_schedule_stop(farewell)
+            await websocket.send_json({
+                "type": "response",
+                "text": farewell,
+            })
+
+        # Also speak via safe_say for direct audio output
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+            await safe_say(
+                farewell,
+                source="shutdown",
+                wait=True,  # Block until speech completes
+                skip_dedup=True,
+                skip_gate=True,
+            )
+        except Exception as e:
+            logger.warning(f"[SHUTDOWN] Failed to speak farewell: {e}")
+
+        # Write sentinel file: tells supervisor cleanup to unload launchd plist
+        sentinel_path = Path.home() / ".jarvis" / "user_requested_shutdown"
+        try:
+            sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+            sentinel_path.write_text(
+                f"shutdown_requested_at={datetime.now().isoformat()}\n"
+                f"requested_by={speaker_name or 'voice_command'}\n"
+            )
+            self._add_step("Shutdown sentinel written", {"path": str(sentinel_path)})
+            logger.info(f"[SHUTDOWN] Sentinel written: {sentinel_path}")
+        except Exception as e:
+            logger.error(f"[SHUTDOWN] Failed to write sentinel: {e}")
+
+        # Unload launchd plist BEFORE signaling shutdown.
+        # This prevents KeepAlive from restarting the process after exit.
+        # The `launchctl bootout` (or `unload`) removes the job from launchd's
+        # watch list. The process continues running until SIGTERM arrives.
+        _plist_path = Path.home() / "Library" / "LaunchAgents" / "com.jarvis.supervisor.plist"
+        if _plist_path.exists():
+            try:
+                _uid = os.getuid()
+                # bootout is the modern replacement for `unload` on macOS 10.10+
+                subprocess.run(
+                    ["launchctl", "bootout", f"gui/{_uid}", str(_plist_path)],
+                    capture_output=True,
+                    timeout=10,
+                )
+                self._add_step("launchd plist unloaded", {"plist": str(_plist_path)})
+                logger.info(f"[SHUTDOWN] launchd plist unloaded: {_plist_path}")
+            except Exception as e:
+                # Fallback to legacy unload
+                try:
+                    subprocess.run(
+                        ["launchctl", "unload", str(_plist_path)],
+                        capture_output=True,
+                        timeout=10,
+                    )
+                    logger.info(f"[SHUTDOWN] launchd plist unloaded (legacy): {_plist_path}")
+                except Exception as e2:
+                    logger.warning(f"[SHUTDOWN] Failed to unload launchd plist: {e}, {e2}")
+        else:
+            logger.info("[SHUTDOWN] No launchd plist found — process not launchd-managed")
+
+        # Signal the supervisor to shut down gracefully
+        self._add_step("Sending SIGTERM to supervisor")
+        try:
+            # Import shutdown event directly — this is the supervisor's own event
+            from backend.core.shutdown_event import get_shutdown_event
+            shutdown_event = get_shutdown_event()
+            shutdown_event.set()
+            logger.info("[SHUTDOWN] Shutdown event set — supervisor will begin cleanup")
+        except Exception:
+            # Fallback: send SIGTERM to our own process group
+            logger.info("[SHUTDOWN] Fallback: sending SIGTERM to self")
+            os.kill(os.getpid(), signal.SIGTERM)
+
+        return {
+            "success": True,
+            "response": farewell,
+            "context_handled": True,
+            "shutdown_initiated": True,
+            "execution_steps": self.execution_steps,
+        }
 
     def _requires_screen(self, command: str) -> bool:
         """Check if command requires screen access"""
