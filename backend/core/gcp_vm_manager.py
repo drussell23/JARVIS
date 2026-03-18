@@ -2806,6 +2806,12 @@ class GCPVMManager:
         # sets the expiry; Step 5c checks _jprime_lock_until before stopping.
         self._jprime_lock_until: float = 0.0
 
+        # P0-2: Disease 10 GCPReadinessLease — formalises VM readiness as a
+        # structured contract with TTL, 3-step handshake record, and failure
+        # classification.  Set lazily by _acquire_readiness_lease_bg() after
+        # ensure_static_vm_ready() confirms the VM is healthy.
+        self._readiness_lease: Optional[Any] = None
+
         # v224.0: Golden Image Builder for pre-baked VM images
         self._golden_image_builder: Optional[GoldenImageBuilder] = None
         self._golden_image_cache: Optional[GoldenImageInfo] = None
@@ -2984,6 +2990,52 @@ class GCPVMManager:
         """
         self._jprime_lock_until = 0.0
         logger.info("🔓 [JprimeLock] Training lock released early.")
+
+    def create_readiness_prober(self) -> Any:
+        """Return a GCPVMReadinessProber backed by this manager.
+
+        P0-2: Callers (e.g. the supervisor) use this to create a
+        GCPReadinessLease via Disease 10 StartupOrchestrator.acquire_gcp_lease().
+        """
+        from backend.core.gcp_vm_readiness_prober import GCPVMReadinessProber
+        probe_cache_ttl = float(os.environ.get("JARVIS_PROBE_CACHE_TTL", "3.0"))
+        return GCPVMReadinessProber(self, probe_cache_ttl=probe_cache_ttl)
+
+    async def _acquire_readiness_lease_bg(self, host: str, port: int) -> None:
+        """Acquire a GCPReadinessLease after VM confirms ready (P0-2).
+
+        Fires a 3-step handshake (health → capabilities → warm_model) through
+        the GCPVMReadinessProber.  The first two steps are cached by the prober
+        (since they were just confirmed by ensure_static_vm_ready), so the net
+        cost is only the warm_model probe.
+
+        Failures are logged at DEBUG and silently ignored — the lease is an
+        advisory contract; readiness itself is governed by ensure_static_vm_ready.
+        """
+        try:
+            from backend.core.gcp_readiness_lease import GCPReadinessLease
+            from backend.core.gcp_vm_readiness_prober import GCPVMReadinessProber
+            ttl = float(os.environ.get("JARVIS_LEASE_TTL_S", "120.0"))
+            probe_cache_ttl = float(os.environ.get("JARVIS_PROBE_CACHE_TTL", "3.0"))
+            probe_timeout = float(os.environ.get("JARVIS_PROBE_TIMEOUT_S", "15.0"))
+            if self._readiness_lease is None:
+                prober = GCPVMReadinessProber(self, probe_cache_ttl=probe_cache_ttl)
+                self._readiness_lease = GCPReadinessLease(prober=prober, ttl_seconds=ttl)
+            success = await self._readiness_lease.acquire(
+                host, port, timeout_per_step=probe_timeout,
+            )
+            if success:
+                logger.info(
+                    "🔒 [InvincibleLease] GCP readiness lease acquired "
+                    "(host=%s port=%d ttl=%.0fs)", host, port, ttl,
+                )
+            else:
+                logger.debug(
+                    "[InvincibleLease] Lease acquisition failed: %s",
+                    self._readiness_lease.last_failure_class,
+                )
+        except Exception as exc:
+            logger.debug("[InvincibleLease] Lease acquisition error: %s", exc)
 
     def _update_ip_index(self, vm: VMInstance) -> None:
         """Update the IP-to-VM index when a VM's IP changes.
@@ -8294,6 +8346,8 @@ class GCPVMManager:
             # No need to re-check ready_for_inference here.
             if verdict == HealthVerdict.READY:
                 logger.info(f"✅ [InvincibleNode] VM already ready: {static_ip}")
+                # P0-2: Formalise readiness as a Disease 10 lease contract (non-blocking).
+                asyncio.ensure_future(self._acquire_readiness_lease_bg(static_ip, target_port))
                 return True, static_ip, "ALREADY_READY"
 
             # Step 3: Describe instance with FULL metadata (v229.0)
@@ -8471,6 +8525,8 @@ class GCPVMManager:
         if poll_success:
             logger.info(f"✅ [InvincibleNode] VM ready: {static_ip}")
             _notify_lifecycle("notify_handshake_succeeded", vm_name=instance_name, ip=static_ip)
+            # P0-2: Formalise readiness via Disease 10 GCPReadinessLease (non-blocking).
+            asyncio.ensure_future(self._acquire_readiness_lease_bg(static_ip, target_port))
             return True, static_ip, "READY"
         else:
             if "timeout" in str(final_status).lower():

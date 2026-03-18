@@ -13,6 +13,7 @@ import asyncio
 from typing import Dict, Mapping, Optional
 
 from backend.core.root_authority_types import (
+    DomainVerdict,
     PhaseVerdict,
     ResourceVerdict,
     SEVERITY_MAP,
@@ -33,6 +34,7 @@ class VerdictAuthority:
     def __init__(self) -> None:
         self._verdicts: Dict[str, ResourceVerdict] = {}
         self._phase_verdicts: Dict[str, PhaseVerdict] = {}
+        self._domain_verdicts: Dict[str, DomainVerdict] = {}
         self._current_epoch: int = 0
         self._lock = asyncio.Lock()
 
@@ -41,8 +43,17 @@ class VerdictAuthority:
     # ------------------------------------------------------------------
 
     def begin_epoch(self) -> int:
-        """Start a new boot epoch.  Stale-epoch verdicts will be rejected."""
-        self._current_epoch += 1
+        """Start a new boot epoch.  Stale-epoch verdicts will be rejected.
+
+        P0-5: Synchronises with the unified boot_epoch module so that all
+        subsystems share a consistent epoch counter.  Returns the new epoch
+        value (also mirrored in boot_epoch.get_epoch()).
+        """
+        try:
+            from backend.core.boot_epoch import advance_epoch
+            self._current_epoch = advance_epoch()
+        except Exception:
+            self._current_epoch += 1
         return self._current_epoch
 
     @property
@@ -116,6 +127,37 @@ class VerdictAuthority:
         is safe to iterate without holding a lock.
         """
         return dict(self._verdicts)
+
+    # ------------------------------------------------------------------
+    # P0-3: Cross-repo domain verdict submission and reads
+    # ------------------------------------------------------------------
+
+    async def submit_domain_verdict(self, verdict: DomainVerdict) -> bool:
+        """Submit a cross-repo state domain verdict.
+
+        Rejects stale-epoch verdicts and out-of-order monotonic timestamps.
+        Domain verdicts never enforce monotonic severity (domains may recover
+        freely — e.g. routing_target may go DEGRADED then READY again without
+        requiring ``recovery_proof``).
+
+        Returns ``True`` if the verdict was accepted.
+        """
+        async with self._lock:
+            if verdict.epoch < self._current_epoch:
+                return False
+            existing = self._domain_verdicts.get(verdict.domain)
+            if existing is not None and existing.monotonic_ns > verdict.monotonic_ns:
+                return False
+            self._domain_verdicts[verdict.domain] = verdict
+            return True
+
+    def get_domain_status(self, domain: str) -> Optional[DomainVerdict]:
+        """Read a domain verdict.  Lock-free — frozen dataclass is safe."""
+        return self._domain_verdicts.get(domain)
+
+    def get_all_domain_verdicts_snapshot(self) -> Dict[str, DomainVerdict]:
+        """Return a consistent point-in-time snapshot of all domain verdicts."""
+        return dict(self._domain_verdicts)
 
     # ------------------------------------------------------------------
     # Display helpers

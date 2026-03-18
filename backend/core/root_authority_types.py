@@ -243,6 +243,57 @@ class PhaseVerdict:
         return SEVERITY_MAP.get(self.state, 3)
 
 
+@dataclass(frozen=True)
+class DomainVerdict:
+    """Immutable verdict for a cross-repo state domain.
+
+    P0-3: Extends VerdictAuthority beyond per-component and per-phase state
+    to cover cross-repo coordination domains such as routing_target,
+    readiness_lease, and budget_state.
+
+    Unlike :class:`ResourceVerdict` (which tracks a specific managed
+    resource) this type captures the health of an abstract coordination
+    domain that spans multiple subsystems or repos.
+
+    Attributes
+    ----------
+    domain:
+        Logical domain name, e.g. ``"routing_target"``,
+        ``"readiness_lease"``, or ``"budget_state"``.
+    state:
+        Current lifecycle state of the domain.
+    serviceable:
+        Whether the domain is currently able to serve requests.
+    epoch:
+        Boot epoch at the time this verdict was issued.
+    monotonic_ns:
+        ``time.monotonic_ns()`` at issue time for ordering.
+    wall_utc:
+        ISO-8601 UTC wall-clock time for human audit logs.
+    correlation_id:
+        Trace/request ID linking this verdict to an operation chain.
+    detail:
+        Free-form human-readable summary.
+    evidence:
+        Opaque key/value bag of supporting data.
+    """
+
+    domain: str
+    state: SubsystemState
+    serviceable: bool
+    epoch: int
+    monotonic_ns: int
+    wall_utc: str
+    correlation_id: str
+    detail: str = ""
+    evidence: Mapping[str, object] = field(default_factory=dict)
+
+    @property
+    def severity(self) -> int:
+        """Return the integer severity level for the current state."""
+        return SEVERITY_MAP.get(self.state, 3)
+
+
 def aggregate_verdicts(
     phase_name: str,
     verdicts: Mapping[str, ResourceVerdict],

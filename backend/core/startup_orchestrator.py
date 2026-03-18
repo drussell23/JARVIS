@@ -24,6 +24,10 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from uuid import uuid4
 
+# P0-4: idempotency support — short hex ID that callers can pass to
+# resolve_phase() to detect duplicate submissions within one boot epoch.
+_IDEMPOTENCY_KEY_LEN = 12
+
 from backend.core.boot_invariants import BootInvariantChecker, InvariantResult
 from backend.core.gcp_readiness_lease import GCPReadinessLease
 from backend.core.routing_authority_fsm import (
@@ -116,6 +120,12 @@ class StartupOrchestrator:
         self._hybrid_router: Any = None
         self._prime_router: Any = None
 
+        # P0-4: Per-phase idempotency key registry.
+        # Maps phase name → the correlation ID of the resolve/skip/fail call
+        # that first transitioned it.  Duplicate calls with a matching key
+        # are no-ops; mismatched keys signal unexpected retries.
+        self._phase_idempotency_keys: Dict[str, str] = {}
+
     # -- Properties ------------------------------------------------------------
 
     @property
@@ -154,23 +164,51 @@ class StartupOrchestrator:
         self,
         name: str,
         detail: str = "",
+        idempotency_key: Optional[str] = None,
     ) -> GateResult:
         """Resolve a startup phase gate by name.
 
         Converts *name* to a :class:`StartupPhase` enum member, delegates
         to the gate coordinator, signals the budget policy, and emits a
         telemetry event.
+
+        Parameters
+        ----------
+        name:
+            Name of the :class:`StartupPhase` to resolve.
+        detail:
+            Optional human-readable detail string.
+        idempotency_key:
+            P0-4: Caller-supplied key (max 32 chars) that deduplicates
+            retried phase resolution calls within a single boot epoch.
+            If *name* was already resolved with the same key, the stored
+            result is returned immediately without re-driving the gate.
+            If omitted, a key is auto-generated from a short UUID fragment.
         """
+        # P0-4: Idempotency gate — prevent double-resolution of the same phase.
+        key = (idempotency_key or uuid4().hex[:_IDEMPOTENCY_KEY_LEN])
+        existing_key = self._phase_idempotency_keys.get(name)
+        if existing_key is not None and existing_key == key:
+            logger.debug(
+                "resolve_phase(%s) duplicate idempotency key=%s — returning cached",
+                name, key,
+            )
+            # Return the gate's current status without re-driving it.
+            phase = StartupPhase[name]
+            return self._gate_coordinator.resolve(phase, detail)
+
         phase = StartupPhase[name]
         result = self._gate_coordinator.resolve(phase, detail)
 
         if result.status == GateStatus.PASSED:
             self._current_phase = name
             self._budget.signal_phase_reached(name)
+            # Record idempotency key only on success so retries can re-attempt.
+            self._phase_idempotency_keys[name] = key
 
         await self._emit(
             event_type="phase_gate",
-            detail={"status": result.status.value, "phase": name},
+            detail={"status": result.status.value, "phase": name, "idem_key": key},
             phase=name,
         )
         return result

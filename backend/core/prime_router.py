@@ -57,6 +57,32 @@ from backend.core.async_safety import LazyAsyncLock
 logger = logging.getLogger(__name__)
 
 # =============================================================================
+# P0-2: Disease 10 boot routing policy wire-in
+# =============================================================================
+# The supervisor calls wire_boot_routing_policy() once after it creates the
+# StartupOrchestrator so that routing decisions during boot honour the
+# deadline-based fallback logic (StartupRoutingPolicy).
+#
+# The policy is consulted only while it is NOT yet finalised.  Once the
+# supervisor calls policy.finalize() (post CORE_READY gate), the policy
+# locks its decision and this gate is bypassed entirely.
+#
+# This is intentionally a module-level singleton (not per-PrimeRouter
+# instance) because a single supervisor manages a single routing policy.
+_g_boot_routing_policy: Optional[Any] = None
+
+
+def wire_boot_routing_policy(policy: Any) -> None:
+    """Wire the Disease 10 StartupRoutingPolicy into the prime router.
+
+    Must be called by the supervisor after it creates the StartupOrchestrator.
+    Thread-safe: Python's GIL makes the assignment atomic for CPython.
+    """
+    global _g_boot_routing_policy
+    _g_boot_routing_policy = policy
+    logger.info("[PrimeRouter] Boot routing policy wired: %s", type(policy).__name__)
+
+# =============================================================================
 # v241.0: DEADLINE PROPAGATION
 # =============================================================================
 # Monotonic deadline flows from WebSocket through all layers.
@@ -462,18 +488,38 @@ class PrimeRouter:
         return self._cloud_client
 
     def _decide_route(self) -> RoutingDecision:
-        """v290.0: GCP-first routing policy.
+        """v290.0 / P0-2: GCP-first routing policy with Disease 10 boot gate.
 
         Decision order:
-        1. GCP_PRIME (always first when promoted + circuit healthy)
-        2. CLOUD_CLAUDE (paid fallback, always reliable)
-        3. LOCAL_PRIME / HYBRID (last resort, only if no remote option)
-        4. DEGRADED (nothing available)
+        1. [P0-2] Boot routing policy gate (while startup policy not finalised)
+           — if DEGRADED, force DEGRADED immediately.
+        2. GCP_PRIME (always first when promoted + circuit healthy)
+        3. CLOUD_CLAUDE (paid fallback, always reliable)
+        4. LOCAL_PRIME / HYBRID (last resort, only if no remote option)
+        5. DEGRADED (nothing available)
 
         Memory emergency additionally blocks local inference to prevent
         thrash amplification.
         """
         self._guard_mirror("_decide_route")
+
+        # P0-2: Consult Disease 10 startup routing policy while boot is in progress.
+        # The policy tracks GCP handshake status and deadline; once finalized it is
+        # bypassed so normal runtime routing logic takes over.
+        if _g_boot_routing_policy is not None and not _g_boot_routing_policy.is_finalized:
+            try:
+                from backend.core.startup_routing_policy import BootRoutingDecision
+                boot_decision, fallback_reason = _g_boot_routing_policy.decide()
+                if boot_decision == BootRoutingDecision.DEGRADED:
+                    logger.warning(
+                        "[PrimeRouter] Boot policy forces DEGRADED "
+                        "(fallback_reason=%s)", fallback_reason.value,
+                    )
+                    return RoutingDecision.DEGRADED
+                # PENDING / GCP_PRIME / LOCAL_MINIMAL / CLOUD_CLAUDE → fall through
+                # to normal routing so we get the most current live signal.
+            except Exception:
+                pass  # Never block routing on policy errors
 
         is_emergency = self._is_memory_emergency()
 
