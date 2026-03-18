@@ -222,7 +222,7 @@ class TestDmsEscalationLedger:
 
     def test_should_escalate_true_after_interval_no_heartbeat(self, tmp_path):
         led = self._ledger(tmp_path, interval_s=0.05)
-        led.get_or_create("svc")
+        led._get_or_create("svc")
         # Force last_heartbeat into the past
         led._records["svc"].last_heartbeat_mono -= 1.0
         led._records["svc"].last_escalation_mono -= 1.0

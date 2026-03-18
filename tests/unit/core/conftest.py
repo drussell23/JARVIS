@@ -21,7 +21,9 @@ def tmp_path(request):
     """
     from pathlib import Path
 
-    short_base = tempfile.mkdtemp(prefix="jt_", dir="/tmp")
+    import os
+    tmp_root = os.environ.get("TMPDIR", "/private/tmp/claude-501")
+    short_base = tempfile.mkdtemp(prefix="jt_", dir=tmp_root)
     p = Path(short_base)
     # Register cleanup
     request.addfinalizer(lambda: _rmtree_safe(p))
