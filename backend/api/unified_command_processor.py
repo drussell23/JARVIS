@@ -2157,6 +2157,23 @@ class UnifiedCommandProcessor:
         # === Step 3: J-Prime call (the brain) ===
         logger.info(f"[v242] Sending to J-Prime: '{command_text[:80]}'")
 
+        # v284.0: Early auditory acknowledgment — fires before the J-Prime
+        # round-trip (~5-19s) so the user gets immediate feedback that JARVIS
+        # heard them. Fire-and-forget: never blocks processing or response.
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+            import random as _rnd
+            _THINKING_CUES = [
+                "On it.", "Give me a moment.", "Let me check.",
+                "Sure thing.", "Working on that.", "Just a moment.",
+            ]
+            asyncio.create_task(
+                safe_say(_rnd.choice(_THINKING_CUES), source="thinking_cue"),
+                name="jprime_thinking_cue",
+            )
+        except Exception:
+            pass  # Never let a missing TTS import delay the actual call
+
         # v242.1: Build lightweight context for J-Prime classification
         _jprime_ctx: Dict[str, Any] = {}
         if source_context and isinstance(source_context, dict):
