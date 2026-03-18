@@ -429,8 +429,18 @@ class TrinityKnowledgeGraph:
         """Initialize embedding model for semantic search."""
         try:
             from sentence_transformers import SentenceTransformer
-            self._embedder = SentenceTransformer("all-MiniLM-L6-v2")
-            logger.info("[KnowledgeGraph] Embedder initialized")
+            from backend.core.ml_load_coordinator import ml_weight_load_context
+            import asyncio as _asyncio
+
+            async with ml_weight_load_context("trinity_knowledge_graph_embedder", required_mib=350.0) as ok:
+                if ok:
+                    loop = _asyncio.get_event_loop()
+                    self._embedder = await loop.run_in_executor(
+                        None, lambda: SentenceTransformer("all-MiniLM-L6-v2")
+                    )
+                    logger.info("[KnowledgeGraph] Embedder initialized")
+                else:
+                    logger.warning("[KnowledgeGraph] Embedder skipped (low RAM or lock timeout)")
         except ImportError:
             logger.warning("[KnowledgeGraph] SentenceTransformers not available")
 

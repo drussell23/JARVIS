@@ -20,7 +20,6 @@ import hashlib
 import json
 import logging
 import pickle
-import threading
 import time
 import uuid
 from collections import OrderedDict
@@ -72,29 +71,14 @@ from ..config import KnowledgeGraphConfig, get_config
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# ML weight-load serializer (process-wide, works across event loops / threads)
+# ML weight-load coordinator (delegates to process-wide global)
 # ---------------------------------------------------------------------------
 
-# At most ONE SentenceTransformer model loads at a time system-wide.
-# Neural mesh runs in a dedicated thread with its own event loop, so asyncio
-# primitives cannot coordinate across callers — threading.Semaphore is used.
-_EMBEDDER_LOAD_LOCK: threading.Semaphore = threading.Semaphore(1)
-
-# Minimum free RAM (MiB) required before attempting to load the embedder.
-# all-MiniLM-L6-v2 peaks at ~350 MiB resident including PyTorch overhead.
-# 800 MiB headroom keeps us well clear of the OOM-kill zone on 16 GiB hardware.
-_MIN_FREE_MIB_FOR_EMBEDDER: float = float(
-    __import__("os").environ.get("JARVIS_EMBEDDER_MIN_FREE_MIB", "800")
+from backend.core.ml_load_coordinator import (  # noqa: E402
+    ml_weight_load_context,
+    MIN_FREE_MIB as _MIN_FREE_MIB_FOR_EMBEDDER,
+    available_ram_mib as _available_ram_mib,
 )
-
-
-def _available_ram_mib() -> float:
-    """Return currently available RAM in MiB (synchronous, no I/O)."""
-    try:
-        import psutil
-        return psutil.virtual_memory().available / (1024.0 * 1024.0)
-    except Exception:
-        return 4096.0  # Assume 4 GiB free if measurement fails.
 
 
 class LRUCache:
@@ -258,33 +242,35 @@ class SharedKnowledgeGraph:
                         _MIN_FREE_MIB_FOR_EMBEDDER,
                     )
                 else:
-                    # Block until no other component is loading an ML model.
-                    # Timeout prevents deadlock if another loader crashed.
-                    acquired = _EMBEDDER_LOAD_LOCK.acquire(timeout=120.0)
-                    if not acquired:
-                        logger.warning(
-                            "SharedKnowledgeGraph: embedder load lock timed out — "
-                            "falling back to keyword search."
-                        )
-                    else:
-                        try:
-                            # Run the CPU/RAM-intensive load in a thread executor
-                            # so it does not block the async event loop.
-                            loop = asyncio.get_event_loop()
-                            model_name = self.config.embedding_model
-                            self._embedder = await loop.run_in_executor(
-                                None,
-                                lambda: SentenceTransformer(model_name),
+                    # Serialise via the process-wide ML load coordinator.
+                    # ml_weight_load_context acquires threading.Semaphore so
+                    # it works across separate event loops (parallel_initializer
+                    # creates one loop per component).
+                    async with ml_weight_load_context(
+                        "knowledge_graph_embedder",
+                        required_mib=350.0,
+                        skip_on_low_ram=False,  # RAM already checked above
+                    ) as slot_acquired:
+                        if not slot_acquired:
+                            logger.warning(
+                                "SharedKnowledgeGraph: embedder load lock timed out — "
+                                "falling back to keyword search."
                             )
-                            logger.info(
-                                "Loaded embedding model: %s (%.0f MiB free before load)",
-                                self.config.embedding_model,
-                                free_mib,
-                            )
-                        except Exception as e:
-                            logger.warning("Failed to load embedding model: %s", e)
-                        finally:
-                            _EMBEDDER_LOAD_LOCK.release()
+                        else:
+                            try:
+                                loop = asyncio.get_event_loop()
+                                model_name = self.config.embedding_model
+                                self._embedder = await loop.run_in_executor(
+                                    None,
+                                    lambda: SentenceTransformer(model_name),
+                                )
+                                logger.info(
+                                    "Loaded embedding model: %s (%.0f MiB free before load)",
+                                    self.config.embedding_model,
+                                    free_mib,
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to load embedding model: %s", e)
             except Exception as e:
                 logger.warning("SharedKnowledgeGraph embedder guard error: %s", e)
 
