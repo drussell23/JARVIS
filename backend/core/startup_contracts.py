@@ -566,7 +566,13 @@ def validate_health_response(
             val = data[field_name]
             # Basic type checking
             type_ok = True
-            if expected_type == "bool" and not isinstance(val, bool):
+            if expected_type == "bool" and val is not None and not isinstance(val, bool):
+                # v293.0: None (null) means "not yet ready" — not a schema violation.
+                # GCP VMs return ready_for_inference: null while the model is still
+                # loading. Treating null as a violation causes crash loops because
+                # the contract gate fires before the VM finishes initializing.
+                # Null is normalized to False by the caller; only non-null non-bool
+                # values are true type violations.
                 type_ok = False
             elif expected_type == "str" and not isinstance(val, str):
                 type_ok = False
