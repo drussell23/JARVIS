@@ -40,6 +40,16 @@ class HeavyTaskCategory(enum.Enum):
     REACTOR_LAUNCH = (3, 1)
     ML_INIT = (4, 1)
     SUBPROCESS_SPAWN = (5, 1)
+    ML_WEIGHT_LOAD = (6, 1)
+    """Separate gate for loading raw model-weight files (gguf, safetensors, etc.).
+
+    Unlike ML_INIT (which covers Python-level model bootstrapping), this
+    category covers the actual weight-tensor reads which are memory-bandwidth-
+    bound and can spike RAM by 2–4 GiB per model.  Keeping this at weight=1
+    with a separate semaphore (max 1 concurrent) prevents two models from
+    loading their weights simultaneously — the primary cause of OOM kills on
+    16 GiB hardware.
+    """
 
     @property
     def weight(self) -> int:
