@@ -6,6 +6,101 @@ JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem.
 
 ---
 
+## Session Update (2026-03-18): Multi-Zone Invincible Failover + Voice Shutdown (v292.0)
+
+This session delivered two operational reliability upgrades that directly affect day-to-day survivability: (1) zone-aware recovery when GCP capacity is exhausted, and (2) authenticated voice shutdown that cooperates with launchd `KeepAlive`.
+
+### 1) Multi-Zone GCP Invincible Node Failover (v292.0)
+
+#### Problem
+
+When `us-central1-a` exhausted VM/GPU capacity, Invincible Node startup failed hard. Existing logic treated the zone as static and did not attempt recovery in sibling zones.
+
+#### What changed
+
+Failover is now integrated directly into the Invincible Node lifecycle:
+
+- Added `_resolve_instance_zone()` to find an existing instance across configured zones.
+- Added `_is_zone_capacity_error()` as a reusable detector for capacity-related failures.
+- Added explicit `zone` propagation to Invincible Node methods so placement is intentional and traceable.
+- Updated `ensure_static_vm_ready()` with a zone failover loop:
+  - detect capacity failure in current zone
+  - blacklist exhausted zone for this attempt window
+  - delete/recreate VM in next eligible zone
+  - continue until a healthy zone succeeds or pool is exhausted
+
+#### Why it works cleanly
+
+The static IP is regional, so it is not pinned to a single zone. VM re-creation in a new zone keeps external connectivity stable without DNS churn or client-side reconfiguration.
+
+#### Operational result
+
+A single-zone outage/capacity event is now a degraded condition, not a boot blocker.
+
+### 2) Voice-Commanded Graceful Shutdown with VBIA (v292.0)
+
+#### Problem
+
+There was no native voice shutdown path. Manual kill/unload patterns were brittle, and launchd `KeepAlive: true` restarted JARVIS after termination unless the agent was explicitly booted out/unloaded.
+
+#### What changed
+
+Implemented full authenticated shutdown orchestration:
+
+- Added command handler support for `SHUTDOWN` intent.
+- Added robust phrase capture using regex + fuzzy + phonetic matching:
+  - examples: "shut down", "power off", "good night JARVIS"
+- Added context handler flow:
+  1. VBIA speaker verification
+  2. farewell narration
+  3. `launchctl bootout` to unload the plist (prevents auto-restart)
+  4. shutdown event publication for observability/audit
+
+#### Sentinel hygiene
+
+- `~/.jarvis/user_requested_shutdown` is cleaned on next startup to prevent stale shutdown state from leaking into future runs.
+
+#### Operational result
+
+Users can now safely stop JARVIS by voice using authenticated intent, with launchd behavior handled correctly.
+
+### 3) Launchd Architecture Discovery and Runbook
+
+This session confirmed supervisor lifecycle is controlled by:
+
+- `~/Library/LaunchAgents/com.jarvis.supervisor.plist`
+- `KeepAlive: true`
+
+`stop_system.sh` is now considered stale relative to this architecture and should not be treated as source of truth for stop/start behavior.
+
+### 4) Quick Reference (Current Control Surface)
+
+#### Preferred
+
+- Voice: "Hey JARVIS, shut down"
+
+#### Manual stop
+
+```bash
+launchctl stop com.jarvis.supervisor
+launchctl unload ~/Library/LaunchAgents/com.jarvis.supervisor.plist
+```
+
+#### Manual start
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.jarvis.supervisor.plist
+launchctl start com.jarvis.supervisor
+```
+
+### 5) Validation snapshot
+
+- Zone failover path now handles capacity exhaustion by iterating configured zones.
+- Voice shutdown path now prevents immediate launchd respawn by unloading/bootout semantics.
+- Startup cleanup now removes stale user-requested shutdown sentinel state.
+
+---
+
 ## Session Update (2026-03-18): Voice Unlock Routing, STT Robustness, and Latency
 
 This session focused on a root-cause fix for voice unlock commands being misrouted to J-Prime as generic workspace requests. The objective was to guarantee that biometric unlock intents are intercepted deterministically, routed to the unlock pipeline, and reflected in cross-repo telemetry for Reactor training.
