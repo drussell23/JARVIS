@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""
+Builds the self-contained Voice.ai benchmark HTML report.
+Run: python3 benchmarks/build_report.py
+Outputs: docs/voiceai/VOICEAI_BENCHMARK_REPORT.html
+
+NOTE: innerHTML usage in the TTS script only sets hardcoded emoji characters
+(play/stop icons), never user-supplied content. No XSS risk.
+"""
+
+import base64
+import csv
+import io
+from pathlib import Path
+
+
+def encode_chart(path):
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode()
+
+
+def img_tag(b64, alt="chart"):
+    return (
+        '<img src="data:image/png;base64,' + b64 + '" '
+        'style="width:100%;max-width:920px;border-radius:8px;margin:1rem 0;" '
+        'alt="' + alt + '">'
+    )
+
+
+def csv_to_html(csv_text):
+    reader = csv.reader(io.StringIO(csv_text))
+    rows = list(reader)
+    if not rows:
+        return ""
+    out = '<table><thead><tr>'
+    for h in rows[0]:
+        out += "<th>" + h + "</th>"
+    out += "</tr></thead><tbody>"
+    for row in rows[1:]:
+        out += "<tr>"
+        for cell in row:
+            cls = ""
+            try:
+                float(cell)
+                cls = ' class="num"'
+            except ValueError:
+                pass
+            out += "<td" + cls + ">" + cell + "</td>"
+        out += "</tr>"
+    out += "</tbody></table>"
+    return out
+
+
+def main():
+    root = Path(__file__).resolve().parent.parent
+    charts_dir = root / "docs" / "voiceai" / "charts"
+    data_dir = root / "docs" / "voiceai" / "data"
+    out_path = root / "docs" / "voiceai" / "VOICEAI_BENCHMARK_REPORT.html"
+
+    chart_names = [
+        "voiceai_chart_dashboard_final",
+        "voiceai_chart_ttfb_boxplot",
+        "voiceai_chart_ttfb_bars",
+        "voiceai_chart_speedup",
+        "voiceai_chart_published_vs_measured",
+        "voiceai_chart_consistency",
+        "voiceai_chart_distribution",
+        "voiceai_chart_total_time",
+    ]
+    charts = {}
+    for name in chart_names:
+        p = charts_dir / (name + ".png")
+        if p.exists():
+            charts[name] = encode_chart(p)
+            print("Encoded " + name)
+
+    def ci(name):
+        return img_tag(charts.get(name, ""), name)
+
+    summary_csv = (data_dir / "voiceai_summary_stats.csv").read_text()
+    speedup_csv = (data_dir / "voiceai_speedup_analysis.csv").read_text()
+    summary_table = csv_to_html(summary_csv)
+    speedup_table = csv_to_html(speedup_csv)
+
+    # Load HTML template parts from file
+    tmpl = (Path(__file__).parent / "report_template.html").read_text()
+
+    # Replace placeholders
+    tmpl = tmpl.replace("{{CHART_DASHBOARD}}", ci("voiceai_chart_dashboard_final"))
+    tmpl = tmpl.replace("{{CHART_TTFB_BOXPLOT}}", ci("voiceai_chart_ttfb_boxplot"))
+    tmpl = tmpl.replace("{{CHART_TTFB_BARS}}", ci("voiceai_chart_ttfb_bars"))
+    tmpl = tmpl.replace("{{CHART_SPEEDUP}}", ci("voiceai_chart_speedup"))
+    tmpl = tmpl.replace("{{CHART_PUBLISHED}}", ci("voiceai_chart_published_vs_measured"))
+    tmpl = tmpl.replace("{{CHART_CONSISTENCY}}", ci("voiceai_chart_consistency"))
+    tmpl = tmpl.replace("{{CHART_DISTRIBUTION}}", ci("voiceai_chart_distribution"))
+    tmpl = tmpl.replace("{{CHART_TOTAL_TIME}}", ci("voiceai_chart_total_time"))
+    tmpl = tmpl.replace("{{SUMMARY_TABLE}}", summary_table)
+    tmpl = tmpl.replace("{{SPEEDUP_TABLE}}", speedup_table)
+
+    out_path.write_text(tmpl)
+    size_kb = len(tmpl) // 1024
+    print("Written: " + str(out_path) + " (" + str(size_kb) + "KB)")
+
+    if "<\\!" in tmpl:
+        print("ERROR: Found <\\! escapes")
+    else:
+        print("CLEAN")
+
+
+if __name__ == "__main__":
+    main()
