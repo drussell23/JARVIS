@@ -159,7 +159,7 @@ class JarvisConnectionService {
     this.webSocketRetryState = {
       timer: null,
       attempt: 0,
-      maxAttempts: 5,
+      maxAttempts: 20,   // v289.0: Increased from 5 — WS retries are cheap, giving up early causes REST-only mode
       inProgress: false
     };
     this.isDestroyed = false;
@@ -185,6 +185,25 @@ class JarvisConnectionService {
     
     // Initialize asynchronously (non-blocking)
     this._initializeAsync();
+
+    // v289.0: Page Visibility API — reconnect WS immediately when tab becomes
+    // visible after being hidden (locked screen, background tab).
+    // Chrome throttles setInterval in hidden tabs, which can let heartbeats
+    // expire and close the WS. On visibility, we force an immediate retry so
+    // the first voice command after unlock goes through without queuing.
+    if (typeof document !== 'undefined') {
+      this._handleVisibilityChange = () => {
+        if (document.hidden || this.isDestroyed) return;
+        // Tab is now visible
+        if (!this.isWebSocketConnected() && this.wsUrl) {
+          console.log('[JarvisConnection] Tab visible — attempting immediate WS reconnect');
+          // Reset retry counter so we get fast delays (2s, 4s, ...)
+          this.webSocketRetryState.attempt = 0;
+          this._scheduleWebSocketRetry('tab_visible');
+        }
+      };
+      document.addEventListener('visibilitychange', this._handleVisibilityChange);
+    }
   }
 
   // ==========================================================================
@@ -830,7 +849,10 @@ class JarvisConnectionService {
     }
 
     this.webSocketRetryState.attempt = attempt;
-    const delay = Math.min(2000 * Math.pow(2, attempt - 1), 32000);
+    // v289.0: Immediate reconnect when tab becomes visible (no backoff needed —
+    // the WS likely dropped due to tab throttling, not backend failure).
+    const baseDelay = reason === 'tab_visible' ? 0 : 2000;
+    const delay = Math.min(baseDelay * Math.pow(2, Math.max(0, attempt - 1)), 32000);
     console.log(`[JarvisConnection] WebSocket retry ${attempt}/${this.webSocketRetryState.maxAttempts} in ${Math.round(delay / 1000)}s (${reason})`);
 
     this.webSocketRetryState.timer = setTimeout(async () => {
@@ -1469,6 +1491,11 @@ class JarvisConnectionService {
     this._resetWebSocketRetryState();
     this.wsClient?.destroy();
     this.listeners.clear();
+    // v289.0: Clean up visibility change listener
+    if (this._handleVisibilityChange && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this._handleVisibilityChange);
+      this._handleVisibilityChange = null;
+    }
   }
 }
 

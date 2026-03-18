@@ -574,7 +574,11 @@ class DynamicWebSocketClient {
 
   _startHeartbeat(url) {
     this._stopHeartbeat(url);
-    
+
+    // v289.0: Initialize lastPong to now so the first heartbeat check
+    // doesn't fire a false timeout immediately after connecting.
+    this.lastPong.set(url, Date.now());
+
     const timerId = setInterval(() => {
       const ws = this.connections.get(url);
       if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -589,16 +593,72 @@ class DynamicWebSocketClient {
         // Connection might be closing
       }
 
-      // Check for pong timeout
+      // v289.0: Skip pong-timeout check if the tab was recently hidden.
+      // Chrome throttles setInterval in background tabs, so the heartbeat
+      // interval itself is extended — lastPong appears stale even though
+      // the connection is alive. We reset lastPong on tab-visible events
+      // (see _setupVisibilityHeartbeatReset below), so a fresh timestamp
+      // here means the tab just came back into focus.
       const lastPong = this.lastPong.get(url) || Date.now();
-      if (Date.now() - lastPong > this.config.heartbeatTimeout * 2) {
-        console.warn(`Heartbeat timeout for: ${url}`);
+      const elapsed = Date.now() - lastPong;
+      // Use heartbeatInterval (not heartbeatTimeout) as the upper bound:
+      // if the tab was hidden, the interval itself stretched, so we allow
+      // up to 2× the interval before calling it a true timeout.
+      const staleThreshold = Math.max(
+        this.config.heartbeatTimeout * 2,
+        this.config.heartbeatInterval * 2
+      );
+      if (elapsed > staleThreshold) {
+        console.warn(`[WS-Heartbeat] Pong timeout for: ${url} (${elapsed}ms > ${staleThreshold}ms)`);
         ws.close(4000, 'Heartbeat timeout');
       }
     }, this.config.heartbeatInterval);
 
     this.heartbeatTimers.set(url, timerId);
-    this.lastPong.set(url, Date.now());
+
+    // v289.0: Reset lastPong when the tab becomes visible so Chrome's
+    // timer throttling (which pauses/slows setInterval in background tabs)
+    // doesn't cause false-positive pong timeouts on tab focus.
+    this._setupVisibilityHeartbeatReset(url);
+  }
+
+  _setupVisibilityHeartbeatReset(url) {
+    // Remove any previous listener for this url
+    this._teardownVisibilityHeartbeatReset(url);
+
+    if (typeof document === 'undefined') return;
+
+    const handler = () => {
+      if (!document.hidden) {
+        // Tab became visible — reset lastPong so stale check doesn't fire
+        this.lastPong.set(url, Date.now());
+        console.log(`[WS-Heartbeat] Tab visible — reset lastPong for ${url}`);
+
+        // Also send an immediate ping to re-validate liveness
+        const ws = this.connections.get(url);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          try {
+            ws.send(JSON.stringify({ type: 'ping', timestamp: Date.now(), resuming: true }));
+          } catch {
+            // ignore — heartbeat interval will handle it
+          }
+        }
+      }
+    };
+
+    document.addEventListener('visibilitychange', handler);
+
+    if (!this._visibilityHandlers) this._visibilityHandlers = new Map();
+    this._visibilityHandlers.set(url, handler);
+  }
+
+  _teardownVisibilityHeartbeatReset(url) {
+    if (!this._visibilityHandlers || typeof document === 'undefined') return;
+    const handler = this._visibilityHandlers.get(url);
+    if (handler) {
+      document.removeEventListener('visibilitychange', handler);
+      this._visibilityHandlers.delete(url);
+    }
   }
 
   _stopHeartbeat(url) {
@@ -607,6 +667,7 @@ class DynamicWebSocketClient {
       clearInterval(timerId);
       this.heartbeatTimers.delete(url);
     }
+    this._teardownVisibilityHeartbeatReset(url);
   }
 
   // ==========================================================================

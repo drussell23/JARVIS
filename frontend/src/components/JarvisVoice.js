@@ -796,6 +796,9 @@ const JarvisVoice = () => {
   // Request ID for deduplicating WS + REST race responses
   const activeRequestIdRef = useRef(null);
 
+  // v289.0: Safety timer to reset isProcessing if queued command never replays
+  const reconnectSafetyTimerRef = useRef(null);
+
   // ROBUST COMMAND QUEUE SYSTEM - Never lose commands during WebSocket issues
   const pendingCommandsRef = useRef([]);  // Commands waiting for WebSocket
   const commandQueueProcessingRef = useRef(false);  // Prevent concurrent processing
@@ -2442,6 +2445,12 @@ const JarvisVoice = () => {
             setResponse(authMsg);
             setIsProcessing(false);
             break;
+          }
+
+          // v289.0: Cancel safety timer — real response arrived, no need to fallback
+          if (reconnectSafetyTimerRef.current) {
+            clearTimeout(reconnectSafetyTimerRef.current);
+            reconnectSafetyTimerRef.current = null;
           }
 
           // Update the UI with the response
@@ -5100,9 +5109,37 @@ const JarvisVoice = () => {
             }, 15000);
           }
         } else if (result.route === 'queued' || result.route === 'recovering') {
-          // v277.0: Contract-driven message from connection context
-          setResponse(getConnectionMessage(result));
-          setIsProcessing(false);
+          // v289.0: Command queued because WebSocket is temporarily disconnected.
+          // Don't show the reconnection string as a JARVIS response — that's a
+          // technical detail, not an answer. Keep processing state quiet while
+          // the queue replays on reconnect and the real response comes through.
+          const ctx = result?.connectionContext;
+          const isTemporary = ctx?.scenario === 'temporarily_disconnected';
+          if (!isTemporary) {
+            // Backend is truly unreachable (never_connected, starting_up) — show informational message
+            setResponse(getConnectionMessage(result));
+            setIsProcessing(false);
+          } else {
+            // For temporarily_disconnected: stay quiet — command will auto-replay.
+            // Safety net: if no response arrives within 45s (queue timeout 30s +
+            // reconnect grace 15s), reset processing state and show the message.
+            const safetyTimeout = setTimeout(() => {
+              setIsProcessing(prev => {
+                if (prev) {
+                  setResponse(getConnectionMessage(result));
+                  return false;
+                }
+                return prev;
+              });
+            }, 45000);
+            // Store cleanup ref so unmount/new-command can cancel it
+            if (reconnectSafetyTimerRef.current) {
+              clearTimeout(reconnectSafetyTimerRef.current);
+            }
+            reconnectSafetyTimerRef.current = safetyTimeout;
+          }
+          // For temporarily_disconnected: stay quiet — command will auto-replay
+          // and the WS response handler will call setResponse with the real answer.
           connectionService.reconnect();
         } else {
           // Both WebSocket and REST failed — delegate to connection service
@@ -5830,9 +5867,28 @@ const JarvisVoice = () => {
         }
 
         if (result.route === 'queued' || result.route === 'recovering') {
-          // v277.0: Contract-driven message from connection context
-          setResponse(getConnectionMessage(result));
-          setIsProcessing(false);
+          // v289.0: Same keepalive-first strategy as text-cmd path above.
+          // Temporarily disconnected → stay quiet; real answer comes on reconnect.
+          const ctx = result?.connectionContext;
+          const isTemporary = ctx?.scenario === 'temporarily_disconnected';
+          if (!isTemporary) {
+            setResponse(getConnectionMessage(result));
+            setIsProcessing(false);
+          } else {
+            const safetyTimeout = setTimeout(() => {
+              setIsProcessing(prev => {
+                if (prev) {
+                  setResponse(getConnectionMessage(result));
+                  return false;
+                }
+                return prev;
+              });
+            }, 45000);
+            if (reconnectSafetyTimerRef.current) {
+              clearTimeout(reconnectSafetyTimerRef.current);
+            }
+            reconnectSafetyTimerRef.current = safetyTimeout;
+          }
           connectionService.reconnect();
           return;
         }

@@ -975,6 +975,11 @@ class UnifiedWebSocketManager:
             ping_timestamp = message.get("timestamp", health.last_ping_time)
             health.latency_ms = (pong_time - ping_timestamp) * 1000
 
+            # v289.0: Update last_message_time on pong receipt so the health monitor
+            # clock resets — pong proves the connection is alive even during quiet periods.
+            health.last_message_time = pong_time
+            health.messages_received += 1
+
             # Update health score based on latency
             if health.latency_ms < 100:
                 health.health_score = min(100, health.health_score + 2)
@@ -2809,8 +2814,11 @@ async def unified_websocket_endpoint(websocket: WebSocket):
             pass
         return
 
-    # WebSocket idle timeout protection
+    # v289.0: WebSocket idle timeout — configurable, keepalive-first
+    # On timeout we send a server-side keepalive ping instead of immediately closing.
+    # This handles Chrome tab throttling that slows client pings below the 300s window.
     idle_timeout = float(os.getenv("TIMEOUT_WEBSOCKET_IDLE", "300.0"))  # 5 min default
+    keepalive_ping_timeout = float(os.getenv("WS_KEEPALIVE_PING_TIMEOUT", "15.0"))  # 15s to wait for response
 
     try:
         while True:
@@ -2821,7 +2829,24 @@ async def unified_websocket_endpoint(websocket: WebSocket):
                     timeout=idle_timeout
                 )
             except asyncio.TimeoutError:
-                logger.info(f"[UNIFIED-WS] WebSocket idle timeout for {client_id}, closing connection")
+                # v289.0: Don't close immediately — send a keepalive ping first.
+                # The connection may be alive but quiet (locked screen, tab throttled).
+                # Only close if the ping send itself fails (truly dead connection).
+                ping_ok = await manager._safe_send_json(
+                    client_id,
+                    {"type": "ping", "timestamp": time.time(), "keepalive": True},
+                    mark_failed_on_error=True,
+                )
+                if ping_ok:
+                    logger.debug(
+                        f"[UNIFIED-WS] Keepalive ping sent to idle {client_id} — "
+                        f"connection alive, resetting idle clock"
+                    )
+                    continue  # Reset the idle wait — connection is alive
+                logger.info(
+                    f"[UNIFIED-WS] Keepalive ping failed for {client_id} — "
+                    f"connection dead, closing"
+                )
                 break
 
             # Update health metrics
