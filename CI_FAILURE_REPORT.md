@@ -2,14 +2,14 @@
 
 ## Executive Summary
 
-- **Workflow**: pages build and deployment
-- **Run Number**: #1
-- **Branch**: `main`
-- **Commit**: `f4882d38e967a1d8e9a89a901d538f61bffbb44f`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #2435
+- **Branch**: `fix/ci/pages-build-and-deployment-run1-20260318-231333`
+- **Commit**: `05670ef5847fa7b46db8f0eb2e8fd6c251b3b796`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-03-18T23:11:37Z
-- **Triggered By**: @drussell23
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/23271606231)
+- **Timestamp**: 2026-03-18T23:14:07Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/23271688011)
 
 ## Failure Overview
 
@@ -17,23 +17,23 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | build | permission_error | high | 22s |
+| 1 | Validate PR Title | timeout | high | 4s |
 
 ## Detailed Analysis
 
-### 1. build
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Permission Error
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-03-18T23:11:42Z
-**Completed**: 2026-03-18T23:12:04Z
-**Duration**: 22 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/23271606231/job/67665414027)
+**Started**: 2026-03-18T23:14:40Z
+**Completed**: 2026-03-18T23:14:44Z
+**Duration**: 4 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/23271688011/job/67665664120)
 
 #### Failed Steps
 
-- **Step 3**: Checkout
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
@@ -42,25 +42,23 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 85: `2026-03-18T23:12:02.8057366Z ##[error]fatal: No url found for submodule path 'JARVIS-AI.wiki' in .gi`
-    - Line 86: `2026-03-18T23:12:02.8091371Z ##[error]The process '/usr/bin/git' failed with exit code 128`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 2
-  - Sample matches:
-    - Line 86: `2026-03-18T23:12:02.8091371Z ##[error]The process '/usr/bin/git' failed with exit code 128`
-    - Line 96: `2026-03-18T23:12:02.9511778Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 30: `2026-03-18T23:14:42.4419731Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-03-18T23:14:42.8787497Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: page`
 
 - Pattern: `WARN|Warning|warning`
-  - Occurrences: 3
+  - Occurrences: 1
   - Sample matches:
-    - Line 34: `2026-03-18T23:11:58.3934343Z hint: to use in all of your new repositories, which will suppress this `
-    - Line 96: `2026-03-18T23:12:02.9511778Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
-    - Line 98: `2026-03-18T23:12:02.9866098Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 58: `2026-03-18T23:14:42.9256586Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
-1. Review the logs above for specific error messages
+1. Consider increasing timeout values or optimizing slow operations
+2. Check service availability and network connectivity
 
 ---
 
@@ -80,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-03-18T23:13:33.088805*
+📊 *Report generated on 2026-03-18T23:16:15.344825*
 🤖 *JARVIS CI/CD Auto-PR Manager*
