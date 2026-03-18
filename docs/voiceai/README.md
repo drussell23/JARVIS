@@ -6,7 +6,9 @@
 **Author:** Derek J. Russell
 **Status:** Evaluation Complete — Approved for Integration
 
-> **Interactive Report:** Open [`VOICEAI_BENCHMARK_REPORT.html`](./VOICEAI_BENCHMARK_REPORT.html) **in your browser** (right-click > Open With > Chrome/Safari, or run `open docs/voiceai/VOICEAI_BENCHMARK_REPORT.html` in terminal). This is a self-contained file with all charts embedded — no external dependencies. Styled with dark theme, color-coded severity ratings, and full data tables for consultants.
+> **Interactive Report:** [**Click here to view the full benchmark report**](https://drussell23.github.io/JARVIS/voiceai/VOICEAI_BENCHMARK_REPORT.html) — self-contained page with all charts embedded, color-coded severity ratings, and full data tables. No downloads needed.
+>
+> *Local: `open docs/voiceai/VOICEAI_BENCHMARK_REPORT.html`*
 
 ---
 
