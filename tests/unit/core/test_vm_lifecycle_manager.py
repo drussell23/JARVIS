@@ -109,3 +109,77 @@ async def test_unregistered_caller_raises(tmp_path):
     with pytest.raises(UnregisteredActivitySourceError):
         mgr.record_activity_from("totally.unknown.caller")
     await mgr.stop()
+
+
+# --- T1: COLD → WARMING → READY -----------------------------------------------
+
+@pytest.mark.asyncio
+async def test_ensure_warmed_cold_to_ready(tmp_path):
+    """T1 — ensure_warmed() drives COLD→WARMING→READY via single entrypoint."""
+    from backend.core.vm_lifecycle_manager import VMLifecycleManager, VMFsmState
+    config = make_test_config(tmp_path)
+    ctrl = make_mock_controller(start_returns=(True, None, None))
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    result = await mgr.ensure_warmed("test_boot")
+    assert result is True
+    assert mgr.state == VMFsmState.READY
+    assert ctrl.start_vm.call_count == 1
+    await mgr.stop()
+
+
+# --- T2: Concurrent ensure_warmed collapses to one start ----------------------
+
+@pytest.mark.asyncio
+async def test_concurrent_ensure_warmed_collapses(tmp_path):
+    """T2 — two concurrent ensure_warmed() calls → exactly one VM start."""
+    from backend.core.vm_lifecycle_manager import VMLifecycleManager, VMFsmState
+    config = make_test_config(tmp_path)
+
+    async def _slow_start_vm():
+        await asyncio.sleep(0.05)
+        return (True, None, None)
+
+    ctrl = make_mock_controller()
+    ctrl.start_vm = _slow_start_vm
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    r1, r2 = await asyncio.gather(
+        mgr.ensure_warmed("caller_a"),
+        mgr.ensure_warmed("caller_b"),
+    )
+    assert r1 is True
+    assert r2 is True
+    assert mgr.state == VMFsmState.READY
+    await mgr.stop()
+
+
+# --- T15: Restart consistency — full COLD→READY→STOPPING→COLD→READY ----------
+
+@pytest.mark.asyncio
+async def test_restart_consistency(tmp_path):
+    """T15 — second warm cycle after STOPPING→COLD succeeds cleanly."""
+    from backend.core.vm_lifecycle_manager import VMLifecycleManager, VMFsmState
+    config = make_test_config(tmp_path, inactivity_threshold_s=0.05, idle_grace_s=0.02)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+
+    # First warm cycle
+    await mgr.ensure_warmed("first")
+    assert mgr.state == VMFsmState.READY
+
+    # Trigger shutdown
+    await mgr.request_shutdown("test_restart")
+    # Allow STOPPING→COLD
+    await asyncio.sleep(0.05)
+    assert mgr.state == VMFsmState.COLD
+
+    # Second warm cycle
+    result = await mgr.ensure_warmed("second")
+    assert result is True
+    assert mgr.state == VMFsmState.READY
+    await mgr.stop()

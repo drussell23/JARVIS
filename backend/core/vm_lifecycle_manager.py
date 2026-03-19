@@ -17,8 +17,9 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from contextlib import asynccontextmanager
 from typing import (
-    Dict, FrozenSet, Optional,
+    Callable, Dict, FrozenSet, List, Optional,
     Protocol, Tuple, runtime_checkable,
 )
 from uuid import uuid4
@@ -320,122 +321,477 @@ class LifecycleLease:
 
 
 # ---------------------------------------------------------------------------
-# VMLifecycleManager — FSM owner (stub for Task 2)
+# StartupEventBusAdapter
+# ---------------------------------------------------------------------------
+# (Defined here so vm_lifecycle_manager.py is the only file that imports
+#  startup_telemetry. VMLifecycleManager only holds a LifecycleTelemetrySink.)
+
+class StartupEventBusAdapter:
+    """Implements LifecycleTelemetrySink. Bridges LifecycleTransitionEvent → StartupEvent."""
+    def __init__(self, bus: object) -> None:
+        self._bus = bus  # StartupEventBus
+
+    async def emit(self, event: LifecycleTransitionEvent) -> None:
+        startup_event = self._bus.create_event(
+            event_type="vm_lifecycle_transition",
+            detail={
+                "from_state": event.from_state.value,
+                "to_state": event.to_state.value,
+                "trigger": event.trigger,
+                "reason_code": event.reason_code,
+                "strategy": event.strategy,
+                "latency_s": event.latency_s,
+                "retry_count": event.retry_count,
+                "active_work_count": event.active_work_count_at_transition,
+                "meaningful_count": event.meaningful_count_at_transition,
+                "detail": event.detail,
+            },
+            phase=None,
+            authority_state="",  # lifecycle events carry no routing authority_state
+        )
+        await self._bus.emit(startup_event)
+
+
+# ---------------------------------------------------------------------------
+# VMLifecycleManager
 # ---------------------------------------------------------------------------
 
 class VMLifecycleManager:
-    """Single authoritative FSM owner for the GCP VM lifecycle.
+    """Single authoritative FSM owner for GCP VM lifecycle (v298.0).
 
-    Full implementation delivered in Task 2 (v298.0).
-    This stub exposes the interface required by T18 so the test
-    can import the symbol and confirm the method contract.
+    Construction:
+        mgr = VMLifecycleManager(config, controller, telemetry_sink)
+        await mgr.start()   # acquires lease, binds event loop
+        ...
+        await mgr.stop()    # cancels tasks, releases lease
+
+    ensure_warmed(reason) — single canonical warm entrypoint.
+    work_slot(ActivityClass) — drain-safe context manager for callers.
+    record_activity_from(caller_id) — classified activity signal.
+    request_shutdown(reason) — explicit shutdown (e.g., supervisor stop).
     """
 
     def __init__(
         self,
         config: VMLifecycleConfig,
         controller: VMController,
-        telemetry_sink: Optional[LifecycleTelemetrySink] = None,
+        telemetry_sink: LifecycleTelemetrySink,
+        *,
+        _clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._config = config
         self._controller = controller
-        self._sink = telemetry_sink
+        self._telemetry_sink = telemetry_sink
+        self._clock = _clock
+
+        # FSM
         self._state = VMFsmState.COLD
-        self._session_id: Optional[str] = None
+        self._lock = asyncio.Lock()
+        self._state_entered_mono: float = 0.0
+
+        # Lease
         self._lease = LifecycleLease(config.lease_dir)
-        self._last_meaningful_activity_mono: float = 0.0
-        self._active_work_count: int = 0
-        self._meaningful_work_count: int = 0
-        self._warming_event: Optional[asyncio.Event] = None
-        self._monitor_task: Optional[asyncio.Task] = None
-        self._started: bool = False
+        self._session_id: str = ""
 
-    # ------------------------------------------------------------------
-    # Public state accessor
-    # ------------------------------------------------------------------
+        # ensure_warmed deduplication
+        self._warming_future: Optional[asyncio.Future] = None
 
-    @property
-    def state(self) -> VMFsmState:
-        return self._state
+        # Drain counters
+        self._meaningful_count: int = 0
+        self._non_meaningful_count: int = 0
+        self._drain_clear_event: Optional[asyncio.Event] = None  # initialized in start()
+
+        # Timer tasks
+        self._idle_timer_task:    Optional[asyncio.Task] = None
+        self._grace_period_task:  Optional[asyncio.Task] = None
+        self._max_uptime_task:    Optional[asyncio.Task] = None
+
+        # Timing bookmarks
+        self._last_meaningful_mono: float = 0.0
+        self._warm_started_mono:    float = 0.0
+        self._idle_grace_entered_mono: float = 0.0
+
+        # Failure tracking
+        self._last_warming_failure: Optional[Tuple[object, object]] = None
+        self._retry_count: int = 0
+        self._warm_strike_count: int = 0
+        self._warm_backoff_until: float = 0.0
+
+        # Boot mode
+        self._boot_mode: BootMode = BootMode.NORMAL
+        self._boot_mode_record: Optional[BootModeRecord] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Acquire lease and start background monitor."""
-        if self._started:
-            return
-        self._warming_event = asyncio.Event()
-        self._session_id = self._lease.acquire()
-        self._started = True
-        _log.info("VMLifecycleManager started: session=%s", self._session_id)
+        """Bind event loop, acquire LifecycleLease, initialize drain event."""
+        self._drain_clear_event = asyncio.Event()
+        self._drain_clear_event.set()
+        self._state = VMFsmState.COLD
+        self._state_entered_mono = self._clock()
+        session_id = self._lease.acquire()
+        self._session_id = session_id
+        _log.info("VMLifecycleManager started: session=%s", session_id)
 
     async def stop(self) -> None:
-        """Stop background tasks and release lease."""
-        if not self._started:
-            return
-        if self._monitor_task is not None:
-            self._monitor_task.cancel()
-            try:
-                await self._monitor_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._monitor_task = None
+        """Cancel all background tasks, release lease. Idempotent."""
+        for task in (self._idle_timer_task, self._grace_period_task, self._max_uptime_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self._idle_timer_task = None
+        self._grace_period_task = None
+        self._max_uptime_task = None
         self._lease.release()
-        self._started = False
         _log.info("VMLifecycleManager stopped: session=%s", self._session_id)
 
     # ------------------------------------------------------------------
-    # Warming
+    # ensure_warmed — single canonical warm entrypoint
     # ------------------------------------------------------------------
 
-    async def ensure_warmed(self, caller: str) -> None:
-        """Ensure VM is READY; start it if COLD.
+    async def ensure_warmed(self, reason: str) -> bool:
+        """Drive COLD → WARMING → READY.
 
-        Stub implementation: calls controller.start_vm() and transitions
-        COLD → WARMING → READY.  Full retry / strike logic in Task 2.
+        Concurrent calls collapse: all callers await the same Future.
+        If already READY/IN_USE/IDLE_GRACE, returns True immediately.
+        Returns False on handshake failure or too many strikes.
         """
-        if self._state == VMFsmState.READY or self._state == VMFsmState.IN_USE:
-            return
-        if self._state == VMFsmState.COLD:
-            self._state = VMFsmState.WARMING
-            _log.info("VMLifecycleManager: warming VM (caller=%s)", caller)
-            try:
-                success, failed_step, failure_class = await asyncio.wait_for(
-                    self._controller.start_vm(),
-                    timeout=self._config.warming_await_timeout_s,
-                )
-            except asyncio.TimeoutError:
-                self._state = VMFsmState.COLD
-                raise VMNotReadyError(VMFsmState.WARMING, None, detail="warming timeout")
-            if success:
-                self._state = VMFsmState.READY
-                if self._warming_event is not None:
-                    self._warming_event.set()
-                _log.info("VMLifecycleManager: VM is READY")
+        async with self._lock:
+            if self._state in (VMFsmState.READY, VMFsmState.IN_USE, VMFsmState.IDLE_GRACE):
+                return True
+            if self._state == VMFsmState.STOPPING:
+                return False
+            if self._state == VMFsmState.WARMING:
+                # Collapse: return the in-progress future
+                fut = self._warming_future
             else:
+                # COLD — check backoff
+                if self._clock() < self._warm_backoff_until:
+                    _log.info("ensure_warmed(%s): backoff active — returning False", reason)
+                    return False
+                fut = asyncio.get_event_loop().create_future()
+                self._warming_future = fut
+                self._state = VMFsmState.WARMING
+                self._state_entered_mono = self._clock()
+                self._retry_count = 0
+                asyncio.create_task(self._run_warming(fut, reason))
+
+        # Wait for the warming future outside the lock
+        try:
+            return await asyncio.shield(fut)
+        except Exception:
+            return False
+
+    async def _run_warming(self, fut: asyncio.Future, reason: str) -> None:
+        """Execute VM start + handshake. Resolves fut on completion."""
+        try:
+            success, failed_step, failure_class = await self._controller.start_vm()
+            async with self._lock:
+                if success:
+                    self._state = VMFsmState.READY
+                    self._state_entered_mono = self._clock()
+                    self._warm_started_mono = self._clock()
+                    self._last_meaningful_mono = self._clock()
+                    self._warming_future = None
+                    self._last_warming_failure = None
+                    self._warm_strike_count = 0
+                    # Spawn idle timer
+                    self._idle_timer_task = asyncio.create_task(self._idle_timer_coro())
+                    # Spawn max_uptime if configured
+                    if self._config.max_uptime_s is not None:
+                        self._max_uptime_task = asyncio.create_task(self._max_uptime_coro())
+                    event = self._build_transition_event(
+                        from_state=VMFsmState.WARMING, to_state=VMFsmState.READY,
+                        trigger="handshake_success", reason_code="HANDSHAKE_SUCCESS",
+                    )
+                else:
+                    self._state = VMFsmState.COLD
+                    self._state_entered_mono = self._clock()
+                    self._warming_future = None
+                    self._last_warming_failure = (failed_step, failure_class)
+                    self._warm_strike_count += 1
+                    if self._warm_strike_count >= self._config.warm_max_strikes:
+                        backoff = min(60.0 * (2 ** (self._warm_strike_count - self._config.warm_max_strikes)), 600.0)
+                        self._warm_backoff_until = self._clock() + backoff
+                        _log.warning("ensure_warmed: %d strikes — backoff %.0fs", self._warm_strike_count, backoff)
+                    event = self._build_transition_event(
+                        from_state=VMFsmState.WARMING, to_state=VMFsmState.COLD,
+                        trigger="handshake_failed", reason_code="HANDSHAKE_FAILED",
+                    )
+            asyncio.create_task(self._emit_safe(event))
+            if not fut.done():
+                fut.set_result(success)
+        except Exception as exc:
+            _log.exception("_run_warming exception: %s", exc)
+            async with self._lock:
                 self._state = VMFsmState.COLD
-                raise VMNotReadyError(VMFsmState.COLD, None, failure_class,
-                                      detail=f"start_vm failed step={failed_step}")
+                self._warming_future = None
+            if not fut.done():
+                fut.set_exception(exc)
 
     # ------------------------------------------------------------------
-    # Activity recording
+    # request_shutdown
+    # ------------------------------------------------------------------
+
+    async def request_shutdown(self, reason: str = "") -> None:
+        """Explicit shutdown: READY/IN_USE/IDLE_GRACE → STOPPING → COLD."""
+        async with self._lock:
+            if self._state not in (VMFsmState.READY, VMFsmState.IN_USE, VMFsmState.IDLE_GRACE):
+                return
+            from_state = self._state
+            self._state = VMFsmState.STOPPING
+            self._state_entered_mono = self._clock()
+            for t in (self._idle_timer_task, self._grace_period_task):
+                if t and not t.done():
+                    t.cancel()
+            self._idle_timer_task = None
+            self._grace_period_task = None
+            event = self._build_transition_event(
+                from_state=from_state, to_state=VMFsmState.STOPPING,
+                trigger="request_shutdown", reason_code="EXPLICIT_SHUTDOWN",
+                detail=reason,
+            )
+        asyncio.create_task(self._emit_safe(event))
+        asyncio.create_task(self._execute_stop())
+
+    async def _execute_stop(self) -> None:
+        """Call controller.stop_vm() then transition to COLD."""
+        try:
+            await self._controller.stop_vm()
+        except Exception as exc:
+            _log.error("_execute_stop controller error: %s", exc)
+        async with self._lock:
+            from_state = self._state
+            self._state = VMFsmState.COLD
+            self._state_entered_mono = self._clock()
+            event = self._build_transition_event(
+                from_state=from_state, to_state=VMFsmState.COLD,
+                trigger="stop_confirmed", reason_code="STOP_CONFIRMED",
+            )
+        asyncio.create_task(self._emit_safe(event))
+
+    # ------------------------------------------------------------------
+    # record_activity_from
     # ------------------------------------------------------------------
 
     def record_activity_from(self, caller_id: str) -> None:
-        """Record activity from a registered caller.
-
-        Raises UnregisteredActivitySourceError if strict_drain=True and
-        caller_id is not in _ACTIVITY_REGISTRY.
-        """
-        if caller_id not in _ACTIVITY_REGISTRY:
+        """Classify and record activity. MEANINGFUL resets idle timer."""
+        source = _ACTIVITY_REGISTRY.get(caller_id)
+        if source is None:
             if self._config.strict_drain:
                 raise UnregisteredActivitySourceError(caller_id)
-            _log.debug("VMLifecycleManager: unregistered caller %r (strict_drain=False)", caller_id)
+            _log.warning("record_activity_from: unregistered caller %r — classifying NON_MEANINGFUL", caller_id)
+            activity_class = ActivityClass.NON_MEANINGFUL
+        else:
+            activity_class = source.activity_class
+        self._record_activity(activity_class)
+
+    def _record_activity(self, activity_class: ActivityClass) -> None:
+        if activity_class == ActivityClass.MEANINGFUL:
+            self._last_meaningful_mono = self._clock()
+            # Reset idle timer
+            if self._idle_timer_task and not self._idle_timer_task.done():
+                self._idle_timer_task.cancel()
+            self._idle_timer_task = asyncio.create_task(self._idle_timer_coro())
+
+    # ------------------------------------------------------------------
+    # Internal timer coroutines
+    # ------------------------------------------------------------------
+
+    async def _idle_timer_coro(self) -> None:
+        """Single-shot: fires exactly at inactivity threshold."""
+        deadline = self._last_meaningful_mono + self._effective_threshold_s()
+        remaining = deadline - self._clock()
+        if remaining > 0:
+            try:
+                await asyncio.sleep(remaining)
+            except asyncio.CancelledError:
+                return
+        await self._on_inactivity_elapsed()
+
+    async def _on_inactivity_elapsed(self) -> None:
+        async with self._lock:
+            if self._state not in (VMFsmState.READY, VMFsmState.IN_USE):
+                return
+            from_state = self._state
+            if self._state == VMFsmState.READY or (self._state == VMFsmState.IN_USE and self._meaningful_count == 0):
+                self._state = VMFsmState.IDLE_GRACE
+                self._idle_grace_entered_mono = self._clock()
+                self._state_entered_mono = self._clock()
+                event = self._build_transition_event(
+                    from_state=from_state, to_state=VMFsmState.IDLE_GRACE,
+                    trigger="inactivity_threshold_elapsed", reason_code="IDLE_THRESHOLD_ELAPSED",
+                )
+                self._grace_period_task = asyncio.create_task(self._grace_period_coro())
+            else:
+                # IN_USE with work in flight — re-arm timer so it fires after the work drains
+                self._idle_timer_task = asyncio.create_task(self._idle_timer_coro())
+                return
+        asyncio.create_task(self._emit_safe(event))
+
+    async def _grace_period_coro(self) -> None:
+        """Single-shot grace period: fire after idle_grace_s, then await drain."""
+        deadline = self._idle_grace_entered_mono + self._config.idle_grace_s
+        remaining = deadline - self._clock()
+        if remaining > 0:
+            try:
+                await asyncio.sleep(remaining)
+            except asyncio.CancelledError:
+                return
+        # Grace elapsed — await drain (event-driven, not polling)
+        if not self._drain_clear():
+            # Hard cap timer
+            hard_cap_task = asyncio.create_task(asyncio.sleep(self._config.drain_hard_cap_s))
+            assert self._drain_clear_event is not None
+            drain_task = asyncio.create_task(self._drain_clear_event.wait())
+            done, pending = await asyncio.wait(
+                {hard_cap_task, drain_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+            if hard_cap_task in done:
+                event = self._build_transition_event(
+                    from_state=VMFsmState.IDLE_GRACE, to_state=VMFsmState.IDLE_GRACE,
+                    trigger="drain_hard_cap_exceeded",
+                    reason_code="MAX_UPTIME_DRAIN_HARD_CAP_EXCEEDED",
+                )
+                asyncio.create_task(self._emit_safe(event))
+                return  # Leave running — never force-stop an active stream
+        await self._on_grace_and_drain_complete()
+
+    async def _on_grace_and_drain_complete(self) -> None:
+        async with self._lock:
+            if self._state != VMFsmState.IDLE_GRACE:
+                return
+            self._state = VMFsmState.STOPPING
+            self._state_entered_mono = self._clock()
+            event = self._build_transition_event(
+                from_state=VMFsmState.IDLE_GRACE, to_state=VMFsmState.STOPPING,
+                trigger="grace_and_drain_complete", reason_code="DRAIN_COMPLETE",
+            )
+        asyncio.create_task(self._emit_safe(event))
+        asyncio.create_task(self._execute_stop())
+
+    async def _max_uptime_coro(self) -> None:
+        """Single-shot: fires at max_uptime_s after READY entry."""
+        try:
+            await asyncio.sleep(self._config.max_uptime_s)
+        except asyncio.CancelledError:
             return
-        source = _ACTIVITY_REGISTRY[caller_id]
-        now = time.monotonic()
-        if source.activity_class == ActivityClass.MEANINGFUL:
-            self._last_meaningful_activity_mono = now
-        _log.debug("VMLifecycleManager: activity from %s (%s)", caller_id, source.activity_class.value)
+        await self._on_max_uptime_elapsed()
+
+    async def _on_max_uptime_elapsed(self) -> None:
+        async with self._lock:
+            if self._state not in (VMFsmState.READY, VMFsmState.IN_USE):
+                return
+            from_state = self._state
+            self._state = VMFsmState.IDLE_GRACE
+            self._idle_grace_entered_mono = self._clock()
+            self._state_entered_mono = self._clock()
+            if self._idle_timer_task and not self._idle_timer_task.done():
+                self._idle_timer_task.cancel()
+            self._idle_timer_task = None
+            event = self._build_transition_event(
+                from_state=from_state, to_state=VMFsmState.IDLE_GRACE,
+                trigger="max_uptime_elapsed", reason_code="MAX_UPTIME_ELAPSED",
+            )
+            self._grace_period_task = asyncio.create_task(self._grace_period_coro())
+        asyncio.create_task(self._emit_safe(event))
+
+    def _effective_threshold_s(self) -> float:
+        """Return inactivity threshold, optionally reduced by quiet hours factor."""
+        if self._config.quiet_hours is not None:
+            h = time.localtime().tm_hour
+            start_h, end_h = self._config.quiet_hours
+            in_quiet = (start_h <= h or h < end_h) if start_h > end_h else (start_h <= h < end_h)
+            if in_quiet:
+                reduced = self._config.inactivity_threshold_s * self._config.quiet_hours_threshold_factor
+                return max(60.0, reduced)
+        return self._config.inactivity_threshold_s
+
+    def _drain_clear(self) -> bool:
+        return self._meaningful_count == 0
+
+    # ------------------------------------------------------------------
+    # Telemetry helpers
+    # ------------------------------------------------------------------
+
+    def _build_transition_event(
+        self,
+        from_state: VMFsmState,
+        to_state: VMFsmState,
+        trigger: str,
+        reason_code: str,
+        strategy: Optional[str] = None,
+        detail: Optional[str] = None,
+    ) -> LifecycleTransitionEvent:
+        return LifecycleTransitionEvent(
+            session_id=self._session_id,
+            timestamp_mono=self._clock(),
+            timestamp_wall=time.time(),
+            from_state=from_state,
+            to_state=to_state,
+            trigger=trigger,
+            reason_code=reason_code,
+            strategy=strategy,
+            latency_s=self._clock() - self._state_entered_mono,
+            retry_count=self._retry_count,
+            active_work_count_at_transition=self._meaningful_count + self._non_meaningful_count,
+            meaningful_count_at_transition=self._meaningful_count,
+            detail=detail,
+        )
+
+    async def _emit_safe(self, event: LifecycleTransitionEvent) -> None:
+        try:
+            await self._telemetry_sink.emit(event)
+        except Exception as exc:
+            _log.warning("lifecycle telemetry failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def state(self) -> VMFsmState:
+        return self._state
+
+    @property
+    def session_id(self) -> str:
+        return self._session_id
+
+    @property
+    def active_work_count(self) -> int:
+        return self._meaningful_count + self._non_meaningful_count
+
+    @property
+    def meaningful_work_count(self) -> int:
+        return self._meaningful_count
+
+    @property
+    def uptime_s(self) -> Optional[float]:
+        if self._state in (VMFsmState.COLD, VMFsmState.WARMING):
+            return None
+        return self._clock() - self._warm_started_mono
+
+    @property
+    def boot_mode(self) -> BootMode:
+        return self._boot_mode
+
+    @property
+    def boot_mode_record(self) -> Optional[BootModeRecord]:
+        return self._boot_mode_record
+
+    def set_degraded_boot_mode(self, reason: str, degraded_capabilities: FrozenSet[str]) -> None:
+        self._boot_mode = BootMode.DEGRADED
+        self._boot_mode_record = BootModeRecord(
+            mode=BootMode.DEGRADED,
+            reason=reason,
+            degraded_capabilities=degraded_capabilities,
+            entered_at_wall=time.time(),
+        )
+        _log.warning("VMLifecycleManager: DEGRADED_BOOT_MODE reason=%s caps=%s", reason, degraded_capabilities)
