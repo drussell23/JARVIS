@@ -6756,12 +6756,14 @@ class GCPVMManager:
         )
         if not result.success:
             if result.reason.value in ("op_done_failure", "permission_denied",
-                                        "invalid_request", "scope_contract_error"):
+                                        "invalid_request", "scope_contract_error",
+                                        "not_found_postcondition_fail"):
                 raise RuntimeError(
                     f"GCP operation {operation.name} failed: "
                     f"{result.reason.value} — {result.error_message}"
                 )
-            # Non-fatal outcomes (timeout, retry_exhausted, not_found_*) — log + continue
+            # Non-fatal outcomes (timeout, retry_exhausted, not_found_no_postcondition,
+            # not_found_uncorrelated) — log + continue; caller decides how to handle
             logger.warning(
                 "[GCPVMManager] Operation ended non-fatally: op=%s reason=%s msg=%s",
                 operation.name, result.reason.value, result.error_message,
