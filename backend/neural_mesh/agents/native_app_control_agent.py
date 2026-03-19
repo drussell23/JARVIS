@@ -114,11 +114,13 @@ FULL PLAN for context:
 Steps already completed:
 {previous_actions_text}
 
-Look at the screenshot carefully. Identify the exact UI element you need to interact with for the CURRENT STEP.
+Look at the screenshot carefully. Identify the UI element you need to interact with for the CURRENT STEP.
 
 RULES:
-- Provide the EXACT pixel coordinates (x, y) for click actions — look at the screenshot and estimate where the element is.
-- For "type" actions, provide the exact text to type.
+- For "click" actions: describe the UI element by name, role, and nearby visible text. Do NOT guess pixel
+  coordinates — the system will find the exact position automatically via the macOS Accessibility API.
+- For "type" actions: provide the exact text to type.
+- For "key" actions: provide the key name (e.g. "enter", "tab", "escape").
 - Set "done": true ONLY when the CURRENT STEP is fully accomplished.
 - Do NOT set "done": true just because you started the step — wait until you can see the result.
 - If you need multiple actions for one step (e.g., click then type), do ONE action at a time.
@@ -127,12 +129,16 @@ Respond ONLY with valid JSON:
 {{
   "done": false,
   "action_type": "click",
-  "detail": {{"x": 150, "y": 200}},
-  "message": "Clicking on Zach's conversation in the chat list"
+  "detail": {{"element": "search bar", "role": "text field", "near_text": "Chats"}},
+  "message": "Clicking the search bar near the Chats heading"
 }}
 
 action_type must be one of: click, type, key, scroll
-- click: detail.x (int) and detail.y (int) — pixel coordinates on screen
+- click: detail must contain:
+    "element"   (str) — short human-readable name of the element (e.g. "search bar", "Send button")
+    "role"      (str, optional) — AX role hint: "button", "text field", "menu item", "checkbox", etc.
+    "near_text" (str, optional) — visible label or text near the element to disambiguate
+  Do NOT include pixel coordinates for click actions.
 - type: detail.text (str) — text to type character by character
 - key: detail.key (str) — "enter", "tab", "escape", "return"
 - scroll: detail.direction ("up"/"down"), detail.amount (int pixels)
@@ -183,6 +189,18 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
         )
         self._app_inventory_service: Optional[Any] = None
         self._key_codes: Dict[str, int] = _load_key_codes()
+        self._accessibility_resolver: Optional[Any] = None
+
+    # ------------------------------------------------------------------
+    # Lazy AccessibilityResolver accessor
+    # ------------------------------------------------------------------
+
+    def _get_resolver(self) -> Any:
+        """Return a cached AccessibilityResolver instance (lazy init)."""
+        if self._accessibility_resolver is None:
+            from .accessibility_resolver import get_accessibility_resolver
+            self._accessibility_resolver = get_accessibility_resolver()
+        return self._accessibility_resolver
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -384,7 +402,7 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                 # Execute the action
                 try:
                     if action_type == "click":
-                        await self._click(int(detail.get("x", 0)), int(detail.get("y", 0)))
+                        await self._click_element(detail, app_name)
                     elif action_type == "type":
                         await self._type_text(str(detail.get("text", "")))
                     elif action_type == "key":
@@ -895,6 +913,117 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
     # ------------------------------------------------------------------
     # Action executors
     # ------------------------------------------------------------------
+
+    async def _click_element(self, detail: Dict[str, Any], app_name: str) -> bool:
+        """Click a UI element using AccessibilityResolver for exact coordinates.
+
+        Fallback chain:
+          1. AccessibilityResolver (AX tree) — exact position
+          2. Pixel coordinates from vision model — approximate (if provided)
+          3. AppleScript click by description — last resort
+
+        Args:
+            detail:   The detail dict from the vision model response.
+                      Expected keys: element (str), role (str, opt), near_text (str, opt).
+                      May also contain x/y as a legacy fallback.
+            app_name: The macOS application process name for AppleScript fallback.
+
+        Returns:
+            True if a click was dispatched, False if all strategies failed.
+        """
+        element_desc = detail.get("element", "")
+        role = detail.get("role")
+        near_text = detail.get("near_text")
+
+        # 1. AccessibilityResolver (exact position via AX tree)
+        try:
+            resolver = self._get_resolver()
+            coords = await resolver.resolve(
+                description=element_desc,
+                app_name=app_name,
+                role=role,
+                near_text=near_text,
+            )
+            if coords:
+                logger.info(
+                    "[NativeAppControlAgent] AX resolved '%s' → (%d, %d)",
+                    element_desc, coords["x"], coords["y"],
+                )
+                await self._cg_click(coords["x"], coords["y"])
+                return True
+        except Exception as exc:
+            logger.debug("[NativeAppControlAgent] AX resolution failed: %s", exc)
+
+        # 2. Fallback: pixel coordinates from vision model (if provided)
+        if "x" in detail and "y" in detail:
+            logger.info(
+                "[NativeAppControlAgent] AX miss — using vision coordinates (%s, %s)",
+                detail["x"], detail["y"],
+            )
+            await self._cg_click(int(detail["x"]), int(detail["y"]))
+            return True
+
+        # 3. Last resort: AppleScript click by element description
+        if element_desc:
+            logger.info(
+                "[NativeAppControlAgent] Trying AppleScript click for '%s'",
+                element_desc,
+            )
+            try:
+                safe_desc = element_desc.replace('"', '\\"')
+                safe_app = app_name.replace('"', '\\"')
+                script = (
+                    f'tell application "System Events" to tell process "{safe_app}" '
+                    f'to click (first UI element of window 1 whose description contains "{safe_desc}")'
+                )
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", script,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await asyncio.wait_for(proc.wait(), timeout=10.0)
+                return proc.returncode == 0
+            except Exception as exc:
+                logger.debug(
+                    "[NativeAppControlAgent] AppleScript click failed: %s", exc
+                )
+
+        logger.warning(
+            "[NativeAppControlAgent] Could not click element — all strategies exhausted: %s",
+            detail,
+        )
+        return False
+
+    async def _cg_click(self, x: int, y: int) -> None:
+        """Click at exact screen coordinates.
+
+        Tries cliclick first (lightweight C tool, no AppleScript overhead).
+        Falls back to the existing _click method which already has an AppleScript
+        fallback baked in, so the behaviour is unchanged for callers that used
+        the old direct-coordinate path.
+
+        Args:
+            x: Horizontal screen coordinate in points.
+            y: Vertical screen coordinate in points.
+        """
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "cliclick", f"c:{x},{y}",
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=10.0)
+            if proc.returncode == 0:
+                logger.debug("[NativeAppControlAgent] _cg_click(%d, %d) via cliclick", x, y)
+                return
+        except (FileNotFoundError, asyncio.TimeoutError, Exception) as exc:
+            logger.debug(
+                "[NativeAppControlAgent] cliclick unavailable (%s) — falling back to AppleScript.",
+                exc,
+            )
+
+        # AppleScript fallback (reuse existing _click internals)
+        await self._click(x, y)
 
     async def _click(self, x: int, y: int) -> None:
         """Click at screen coordinates (x, y).
