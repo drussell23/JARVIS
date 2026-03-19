@@ -140,6 +140,18 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# v296.0: Operation lifecycle poller — fixes zone-mismatch 404s
+try:
+    from backend.core.gcp_operation_poller import (
+        GCPOperationPoller,
+        OperationLifecycleRegistry,
+        OperationResult,
+        get_operation_registry,
+    )
+    _OPERATION_POLLER_AVAILABLE = True
+except ImportError:
+    _OPERATION_POLLER_AVAILABLE = False
+
 # Type variable for generic retry decorator
 T = TypeVar('T')
 
@@ -2660,6 +2672,13 @@ class GCPVMManager:
         self._vm_lock = asyncio.Lock()  # Protect VM state modifications
         self._init_lock = asyncio.Lock()  # Protect initialization
 
+        # v296.0: Operation lifecycle registry + poller (wired lazily with zone_operations_client)
+        _epoch = int(time.time() * 1000)
+        if _OPERATION_POLLER_AVAILABLE:
+            self._op_registry = OperationLifecycleRegistry(supervisor_epoch=_epoch)
+        else:
+            self._op_registry = None
+
         # v237.0: APARS boot session tracking — discard stale data from previous boots
         self._current_boot_session_id: Optional[str] = None
 
@@ -3228,6 +3247,32 @@ class GCPVMManager:
                 raise
 
             logger.info(f"✅ GCP API clients initialized (Project: {self.config.project_id})")
+
+            # v296.0: Load operation registry and reconcile orphans from prior sessions
+            if _OPERATION_POLLER_AVAILABLE and self._op_registry is not None:
+                try:
+                    await self._op_registry.load()
+                    orphans = self._op_registry.get_inflight()
+                    if orphans:
+                        logger.info(
+                            "[GCPVMManager] v296.0: Reconciling %d orphaned operations "
+                            "from prior session", len(orphans)
+                        )
+                        async def _describe_for_reconcile(name: str, zone: str) -> str:
+                            try:
+                                status, _, _ = await self._describe_instance_full(
+                                    name, zone=zone or None)
+                                return status
+                            except Exception:
+                                return "ERROR"
+                        await self._op_registry.reconcile_orphans(
+                            describe_fn=_describe_for_reconcile,
+                            emit_fn=self._emit_op_event,
+                        )
+                        await self._op_registry.persist()
+                except Exception as _re:
+                    logger.warning(
+                        "[GCPVMManager] Registry reconciliation failed (non-fatal): %s", _re)
 
         except Exception as e:
             log_component_failure(
@@ -4454,7 +4499,13 @@ class GCPVMManager:
                             zone=self.config.zone,
                             instance=name,
                         )
-                        await self._wait_for_operation(operation, timeout=60)
+                        await self._wait_for_operation(
+                            operation,
+                            timeout=60,
+                            action="delete",
+                            instance_name=name,
+                            postcondition=self._postcondition_gone(name, self.config.zone),
+                        )
                         results["deleted"] += 1
                         results["details"].append(
                             f"  DELETED: {name} ({status}, {age_hours:.1f}h)"
@@ -5477,7 +5528,12 @@ class GCPVMManager:
                     logger.info(f"⏳ VM creation operation started: {operation.name} (zone={_creation_zone})")
 
                     # Wait for operation to complete
-                    await self._wait_for_operation(operation)
+                    await self._wait_for_operation(
+                        operation,
+                        action="create",
+                        instance_name=vm_name,
+                        postcondition=self._postcondition_running(vm_name, _creation_zone),
+                    )
                     _notify_lifecycle("notify_vm_create_accepted", vm_name=vm_name)
 
                     # Get the created instance
@@ -6665,16 +6721,62 @@ class GCPVMManager:
         finally:
             self._golden_rebuild_in_progress = False
 
-    async def _wait_for_operation(self, operation, timeout: int = 300):
+    async def _wait_for_operation(
+        self,
+        operation,
+        timeout: int = 300,
+        *,
+        action: str = "unknown",
+        instance_name: str = "",
+        correlation_id=None,
+        postcondition=None,
+    ):
+        """
+        v296.0: Scope-aware, dedup-safe operation poller.
+
+        Zone is extracted from the operation object — never from config.zone.
+        404 is terminal (not transient). Concurrent callers share one poll loop.
+        Falls back to legacy polling if the poller module is unavailable.
+        """
+        if not _OPERATION_POLLER_AVAILABLE or self._op_registry is None:
+            logger.warning("[GCPVMManager] Operation poller unavailable — using legacy poll")
+            return await self._wait_for_operation_legacy(operation, timeout)
+
+        import uuid as _uuid
+        _corr = correlation_id or str(_uuid.uuid4())
+        poller = self._get_or_create_poller(timeout=float(timeout), postcondition=postcondition)
+        if poller is None:
+            return await self._wait_for_operation_legacy(operation, timeout)
+
+        result = await poller.wait(
+            operation,
+            action=action,
+            instance_name=instance_name,
+            correlation_id=_corr,
+        )
+        if not result.success:
+            if result.reason.value in ("op_done_failure", "permission_denied",
+                                        "invalid_request", "scope_contract_error"):
+                raise RuntimeError(
+                    f"GCP operation {operation.name} failed: "
+                    f"{result.reason.value} — {result.error_message}"
+                )
+            # Non-fatal outcomes (timeout, retry_exhausted, not_found_*) — log + continue
+            logger.warning(
+                "[GCPVMManager] Operation ended non-fatally: op=%s reason=%s msg=%s",
+                operation.name, result.reason.value, result.error_message,
+            )
+
+    async def _wait_for_operation_legacy(self, operation, timeout: int = 300):
         """
         Wait for a GCP zone operation to complete.
-        
+
         Uses the ZoneOperationsClient to poll operation status correctly.
         This fixes the 'Unknown field for Instance: target_link' error.
         """
         start_time = time.time()
         operation_name = operation.name
-        
+
         logger.debug(f"Waiting for operation: {operation_name}")
 
         while True:
@@ -6704,6 +6806,61 @@ class GCPVMManager:
                 logger.warning(f"Error polling operation status: {e}")
                 # Continue waiting - operation might still complete
                 await asyncio.sleep(2)
+
+    def _get_or_create_poller(self, *, timeout: float = 300.0, postcondition=None):
+        """Return a GCPOperationPoller wired to this manager's registry and zone ops client."""
+        if not _OPERATION_POLLER_AVAILABLE or self._op_registry is None:
+            return None
+        zone_ops = getattr(self, "zone_operations_client", None)
+        if zone_ops is None:
+            return None
+        return GCPOperationPoller(
+            operations_client=zone_ops,
+            registry=self._op_registry,
+            project=self.config.project_id,
+            postcondition=postcondition,
+            timeout=timeout,
+            metrics_emitter=self._emit_op_event,
+        )
+
+    def _emit_op_event(self, event_name: str, payload: dict) -> None:
+        """Forward operation lifecycle events to the structured log."""
+        _log_payload = {"event": event_name, **payload}
+        if event_name in ("stale_operation_detected", "operation_gc_404_terminal",
+                          "retry_budget_exhausted"):
+            logger.warning("[GCPOpLifecycle] %s: %s", event_name, _log_payload)
+        else:
+            logger.info("[GCPOpLifecycle] %s: %s", event_name, _log_payload)
+
+    def _postcondition_running(self, instance_name: str, zone=None):
+        """Postcondition factory: instance must be RUNNING."""
+        async def check() -> bool:
+            try:
+                status, _, _ = await self._describe_instance_full(instance_name, zone=zone)
+                return status == "RUNNING"
+            except Exception:
+                return False
+        return check
+
+    def _postcondition_stopped(self, instance_name: str, zone=None):
+        """Postcondition factory: instance must be TERMINATED/STOPPED."""
+        async def check() -> bool:
+            try:
+                status, _, _ = await self._describe_instance_full(instance_name, zone=zone)
+                return status in ("TERMINATED", "STOPPED", "SUSPENDED")
+            except Exception:
+                return False
+        return check
+
+    def _postcondition_gone(self, instance_name: str, zone=None):
+        """Postcondition factory: instance must no longer exist."""
+        async def check() -> bool:
+            try:
+                status, _, _ = await self._describe_instance_full(instance_name, zone=zone)
+                return status == "NOT_FOUND"
+            except Exception:
+                return False
+        return check
 
     def check_vm_protection(
         self,
@@ -6848,7 +7005,13 @@ class GCPVMManager:
 
             # Wait for operation with 120s timeout (stop can take 30-90s)
             try:
-                await self._wait_for_operation(operation, timeout=120)
+                await self._wait_for_operation(
+                    operation,
+                    timeout=120,
+                    action="stop",
+                    instance_name=vm_name,
+                    postcondition=self._postcondition_stopped(vm_name, self.config.zone),
+                )
             except (TimeoutError, asyncio.TimeoutError):
                 logger.warning(
                     f"[VMLifecycle] Timeout waiting for stop of '{vm_name}' (120s), "
@@ -7025,7 +7188,12 @@ class GCPVMManager:
                 instance=vm_name,
             )
 
-            await self._wait_for_operation(operation)
+            await self._wait_for_operation(
+                operation,
+                action="delete",
+                instance_name=vm_name,
+                postcondition=self._postcondition_gone(vm_name, self.config.zone),
+            )
 
             # Update tracking with lock protection
             async with self._vm_lock:
@@ -7184,7 +7352,12 @@ class GCPVMManager:
                 instance=vm_name,
             )
 
-            await self._wait_for_operation(operation)
+            await self._wait_for_operation(
+                operation,
+                action="delete",
+                instance_name=vm_name,
+                postcondition=self._postcondition_gone(vm_name, self.config.zone),
+            )
             logger.info(f"✅ Force-deleted VM: {vm_name}")
             return True
 
@@ -9243,11 +9416,17 @@ class GCPVMManager:
             )
             
             # Wait for deletion to complete
-            await self._wait_for_operation(operation, timeout=120)
-            
+            await self._wait_for_operation(
+                operation,
+                timeout=120,
+                action="delete",
+                instance_name=instance_name,
+                postcondition=self._postcondition_gone(instance_name, _effective_zone),
+            )
+
             logger.info(f"✅ [InvincibleNode] VM deleted: {instance_name}")
             return True, None
-            
+
         except Exception as e:
             logger.error(f"❌ [InvincibleNode] Failed to delete VM: {e}")
             return False, str(e)
@@ -10107,7 +10286,13 @@ fi
             )
 
             # Wait for operation to complete
-            await self._wait_for_operation(operation, timeout=120)
+            await self._wait_for_operation(
+                operation,
+                timeout=120,
+                action="start",
+                instance_name=instance_name,
+                postcondition=self._postcondition_running(instance_name, _effective_zone),
+            )
 
             logger.info(f"✅ [InvincibleNode] VM start command completed: {instance_name}")
             return True, None
@@ -10349,7 +10534,13 @@ fi
             )
 
             # Wait for creation
-            await self._wait_for_operation(operation, timeout=300)
+            await self._wait_for_operation(
+                operation,
+                timeout=300,
+                action="create",
+                instance_name=instance_name,
+                postcondition=self._postcondition_running(instance_name, _effective_zone),
+            )
             _notify_lifecycle("notify_vm_create_accepted", vm_name=instance_name)
 
             logger.info(
@@ -11002,7 +11193,13 @@ fi
                 instance=instance_name,
             )
 
-            await self._wait_for_operation(operation, timeout=120)
+            await self._wait_for_operation(
+                operation,
+                timeout=120,
+                action="stop",
+                instance_name=instance_name,
+                postcondition=self._postcondition_stopped(instance_name, _effective_zone),
+            )
             return True, "Node stopped successfully"
 
         except Exception as e:
