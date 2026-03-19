@@ -639,6 +639,7 @@ class VMLifecycleManager:
             # Admit the slot
             if activity_class == ActivityClass.MEANINGFUL:
                 self._meaningful_count += 1
+                assert self._drain_clear_event is not None
                 self._drain_clear_event.clear()
                 if current_state == VMFsmState.IDLE_GRACE:
                     # Cancel grace, transition to IN_USE
@@ -660,6 +661,7 @@ class VMLifecycleManager:
                 if activity_class == ActivityClass.MEANINGFUL:
                     self._meaningful_count = max(0, self._meaningful_count - 1)
                     if self._meaningful_count == 0:
+                        assert self._drain_clear_event is not None
                         self._drain_clear_event.set()
                         if self._state == VMFsmState.IN_USE:
                             # Check if idle timer already elapsed
