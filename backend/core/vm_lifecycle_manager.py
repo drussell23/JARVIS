@@ -17,9 +17,8 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from contextlib import asynccontextmanager
 from typing import (
-    Callable, Dict, FrozenSet, List, Optional,
+    Any, Callable, Dict, FrozenSet, Optional,
     Protocol, Tuple, runtime_checkable,
 )
 from uuid import uuid4
@@ -328,8 +327,8 @@ class LifecycleLease:
 
 class StartupEventBusAdapter:
     """Implements LifecycleTelemetrySink. Bridges LifecycleTransitionEvent → StartupEvent."""
-    def __init__(self, bus: object) -> None:
-        self._bus = bus  # StartupEventBus
+    def __init__(self, bus: Any) -> None:
+        self._bus: Any = bus  # StartupEventBus; typed Any to avoid importing StartupEventBus
 
     async def emit(self, event: LifecycleTransitionEvent) -> None:
         startup_event = self._bus.create_event(
@@ -468,6 +467,7 @@ class VMLifecycleManager:
                 return False
             if self._state == VMFsmState.WARMING:
                 # Collapse: return the in-progress future
+                assert self._warming_future is not None, "WARMING state must have warming_future"
                 fut = self._warming_future
             else:
                 # COLD — check backoff
@@ -678,7 +678,11 @@ class VMLifecycleManager:
         asyncio.create_task(self._execute_stop())
 
     async def _max_uptime_coro(self) -> None:
-        """Single-shot: fires at max_uptime_s after READY entry."""
+        """Single-shot: fires at max_uptime_s after READY entry.
+
+        Only spawned when max_uptime_s is not None.
+        """
+        assert self._config.max_uptime_s is not None
         try:
             await asyncio.sleep(self._config.max_uptime_s)
         except asyncio.CancelledError:
