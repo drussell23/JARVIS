@@ -67,20 +67,6 @@ _REMOTE_MIC_PATTERNS: tuple = (
     "earpods",       # Lightning/USB EarPods can still trigger Handoff mic activity
 )
 
-# Patterns that positively identify a local Mac microphone; checked first so that
-# a device like "MacBook Pro AirPlay to iPhone" doesn't accidentally pass.
-_LOCAL_MIC_PATTERNS: tuple = (
-    "macbook",
-    "built-in",
-    "built in",
-    "internal",
-    "imac",
-    "mac mini",
-    "mac pro",
-    "mac studio",
-)
-
-
 def _is_remote_mic_name(name_lower: str) -> bool:
     """Return True if the device name looks like a remote / Continuity microphone."""
     for pat in _REMOTE_MIC_PATTERNS:
@@ -725,12 +711,14 @@ class FullDuplexDevice:
             # If the system default points at a remote mic, drop that default
             if default_input is not None:
                 try:
-                    default_name = str(devices[default_input].get("name", "")).lower()
+                    _dev_list: list = list(devices)
+                    _dev_info: dict = _dev_list[default_input]
+                    default_name = str(_dev_info.get("name", "")).lower()
                     if _is_remote_mic_name(default_name):
                         logger.info(
                             "[FullDuplexDevice] System default input is a remote mic (%s); "
                             "ignoring default — will select first local mic instead.",
-                            devices[default_input].get("name", "?"),
+                            _dev_info.get("name", "?"),
                         )
                         default_input = None
                 except (IndexError, TypeError):
