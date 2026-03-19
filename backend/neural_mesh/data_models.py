@@ -121,6 +121,7 @@ class MessageType(Enum):
     # these when they detect something actionable. The orchestrator subscribes
     # and routes through plan_and_execute().
     PROACTIVE_INTENT = "proactive_intent"
+    TIER_DECISION = "tier_decision"  # ExecutionTierRouter tier selection event
 
 
 # ============================================================================

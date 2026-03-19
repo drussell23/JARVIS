@@ -36,6 +36,15 @@ try:
 except ImportError:
     _COMPUTER_USE_AVAILABLE = False
 
+try:
+    from .app_inventory_service import AppInventoryService
+    from .execution_tier_router import ExecutionTierRouter
+    from .native_app_control_agent import NativeAppControlAgent
+    from .visual_browser_agent import VisualBrowserAgent
+    _TIER_AGENTS_AVAILABLE = True
+except ImportError:
+    _TIER_AGENTS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +79,10 @@ PRODUCTION_AGENTS: List[Type[BaseNeuralMeshAgent]] = [
     # Admin/Communication agents (Chief of Staff role)
     GoogleWorkspaceAgent,
 ] + ([ComputerUseAgent] if _COMPUTER_USE_AVAILABLE else [])  # v237.1: Autonomous execution
+PRODUCTION_AGENTS += (
+    [AppInventoryService, ExecutionTierRouter, NativeAppControlAgent, VisualBrowserAgent]
+    if _TIER_AGENTS_AVAILABLE else []
+)
 
 
 class AgentInitializer:
