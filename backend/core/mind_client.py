@@ -42,8 +42,10 @@ Usage
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 import uuid
 from enum import Enum
 from typing import Any, Dict, Optional
@@ -88,6 +90,77 @@ class OperationalLevel(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+
+class _CircuitState(Enum):
+    CLOSED = "closed"        # Normal — allow all requests
+    OPEN = "open"            # Failing — block requests until cooldown
+    HALF_OPEN = "half_open"  # Testing — allow one probe request
+
+
+class _CircuitBreaker:
+    """3-state circuit breaker for the Mind-Body HTTP link.
+
+    Parameters
+    ----------
+    failure_threshold:
+        Number of consecutive failures before opening the circuit.
+    cooldown_s:
+        Seconds to wait in OPEN state before allowing a probe (HALF_OPEN).
+    """
+
+    def __init__(
+        self,
+        failure_threshold: int = 3,
+        cooldown_s: float = 30.0,
+    ) -> None:
+        self.state = _CircuitState.CLOSED
+        self._failure_count = 0
+        self._failure_threshold = failure_threshold
+        self._cooldown_s = cooldown_s
+        self._last_failure_time: float = 0.0
+
+    def can_execute(self) -> bool:
+        """Return True if a request may proceed.
+
+        Side-effect: transitions OPEN → HALF_OPEN after cooldown elapses.
+        """
+        if self.state == _CircuitState.CLOSED:
+            return True
+        if self.state == _CircuitState.OPEN:
+            if time.monotonic() - self._last_failure_time >= self._cooldown_s:
+                self.state = _CircuitState.HALF_OPEN
+                return True
+            return False
+        # HALF_OPEN: allow exactly one probe request through
+        return True
+
+    def record_success(self) -> None:
+        """Mark the last call as successful.
+
+        Closes the circuit if it was HALF_OPEN, and resets the failure counter.
+        """
+        self._failure_count = 0
+        if self.state == _CircuitState.HALF_OPEN:
+            self.state = _CircuitState.CLOSED
+
+    def record_failure(self) -> None:
+        """Mark the last call as failed.
+
+        Opens the circuit once the failure threshold is reached.
+        In HALF_OPEN the probe failed, so go straight back to OPEN.
+        """
+        self._failure_count += 1
+        self._last_failure_time = time.monotonic()
+        if self.state == _CircuitState.HALF_OPEN:
+            # Probe failed — back to fully open
+            self.state = _CircuitState.OPEN
+        elif self._failure_count >= self._failure_threshold:
+            self.state = _CircuitState.OPEN
+
+
+# ---------------------------------------------------------------------------
 # MindClient
 # ---------------------------------------------------------------------------
 
@@ -129,6 +202,22 @@ class MindClient:
 
         # Per-process session identity — useful for J-Prime log correlation
         self._session_id: str = str(uuid.uuid4())
+
+        # Circuit breaker — prevents hammering an unreachable J-Prime
+        self._circuit = _CircuitBreaker(
+            failure_threshold=int(
+                os.getenv("MIND_CLIENT_CIRCUIT_FAILURE_THRESHOLD", "3")
+            ),
+            cooldown_s=float(
+                os.getenv("MIND_CLIENT_CIRCUIT_COOLDOWN_S", "30")
+            ),
+        )
+
+        # Background health monitor
+        self._health_task: Optional[asyncio.Task] = None  # type: ignore[type-arg]
+        self._health_interval_s: float = float(
+            os.getenv("JARVIS_MIND_HEALTH_INTERVAL_S", "30")
+        )
 
         # Lazy aiohttp session (created on first actual HTTP call)
         self._session: Optional[Any] = None  # aiohttp.ClientSession
@@ -270,18 +359,25 @@ class MindClient:
     async def check_health(self) -> Dict[str, Any]:
         """GET /v1/reason/health — returns {status, protocol_version, brains_loaded}.
 
-        Records success/failure in the state machine.
+        Records success/failure in the state machine and circuit breaker.
         Raises the underlying exception on failure (callers may catch it).
         """
+        if not self._circuit.can_execute():
+            raise RuntimeError(
+                f"[MindClient] Circuit OPEN — health check blocked "
+                f"(cooldown {self._circuit._cooldown_s}s not elapsed)"
+            )
         try:
             result = await self._http_get(
                 "/v1/reason/health",
                 timeout=_env_float("MIND_CLIENT_HEALTH_TIMEOUT", 10.0),
             )
+            self._circuit.record_success()
             self._record_success()
             logger.debug("[MindClient] Health check OK: %s", result.get("status"))
             return result
         except Exception as exc:
+            self._circuit.record_failure()
             self._record_failure()
             logger.warning("[MindClient] Health check failed: %s", exc)
             raise
@@ -336,6 +432,13 @@ class MindClient:
             )
             return None
 
+        if not self._circuit.can_execute():
+            logger.debug(
+                "[MindClient] select_brain blocked — circuit %s",
+                self._circuit.state.value,
+            )
+            return None
+
         payload: Dict[str, Any] = {
             "session_id": self._session_id,
             "command": command,
@@ -352,6 +455,7 @@ class MindClient:
                 data=payload,
                 timeout=_env_float("MIND_CLIENT_SELECT_TIMEOUT", 30.0),
             )
+            self._circuit.record_success()
             self._record_success()
             logger.debug(
                 "[MindClient] select_brain OK — status=%s served_mode=%s",
@@ -360,6 +464,7 @@ class MindClient:
             )
             return result
         except Exception as exc:
+            self._circuit.record_failure()
             self._record_failure()
             logger.warning(
                 "[MindClient] select_brain failed (command=%r): %s", command, exc
@@ -367,11 +472,55 @@ class MindClient:
             return None
 
     # ------------------------------------------------------------------
+    # Background health monitor
+    # ------------------------------------------------------------------
+
+    async def start_health_monitor(self) -> None:
+        """Start the background health check task (idempotent).
+
+        The task runs every ``_health_interval_s`` seconds.  It is safe to
+        call this method more than once — the second call is a no-op.
+        """
+        if self._health_task is not None:
+            return
+        self._health_task = asyncio.create_task(
+            self._health_loop(), name="mind_health_monitor"
+        )
+        logger.info(
+            "[MindClient] Health monitor started (interval=%.1fs).",
+            self._health_interval_s,
+        )
+
+    async def _health_loop(self) -> None:
+        """Periodic health check loop — sleeps first, then probes."""
+        while True:
+            try:
+                await asyncio.sleep(self._health_interval_s)
+                await self.check_health()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # check_health already records the failure and logs a warning
+                pass
+
+    async def stop_health_monitor(self) -> None:
+        """Cancel and await the background health task."""
+        if self._health_task is not None:
+            self._health_task.cancel()
+            try:
+                await self._health_task
+            except asyncio.CancelledError:
+                pass
+            self._health_task = None
+            logger.info("[MindClient] Health monitor stopped.")
+
+    # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def close(self) -> None:
-        """Close the underlying aiohttp session."""
+        """Stop the health monitor and close the underlying aiohttp session."""
+        await self.stop_health_monitor()
         if self._session is not None and not self._session.closed:
             await self._session.close()
             self._session = None
