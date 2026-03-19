@@ -95,10 +95,12 @@ class HandshakeSession:
 
 ---
 
-### 3.2 ReadinessProber ABC Update
+### 3.2 ReadinessProber ABC Update + `_run_probe` Dispatcher
 
 **Location:** `backend/core/gcp_readiness_lease.py`
 **Cures:** D1
+
+The ABC gains a `session` parameter on all three methods:
 
 ```python
 class ReadinessProber(ABC):
@@ -120,6 +122,30 @@ class ReadinessProber(ABC):
         session: HandshakeSession,
     ) -> HandshakeResult: ...
 ```
+
+**`_run_probe` dispatcher must be updated** to forward the session. The live code calls `probe_fn(host, port, timeout)` with three positional args via a `_run_probe(probe_fn, step, ...)` helper. This dispatcher must be updated to:
+
+```python
+async def _run_probe(
+    self,
+    probe_fn: Callable,
+    step: HandshakeStep,
+    host: str,
+    port: int,
+    timeout: float,
+    session: HandshakeSession,    # NEW: forwarded to concrete implementation
+) -> HandshakeResult:
+    try:
+        result = await asyncio.wait_for(
+            probe_fn(host, port, timeout, session),   # session passed through
+            timeout=timeout,
+        )
+        ...
+    except asyncio.TimeoutError:
+        ...
+```
+
+All call sites inside `acquire()` that invoke `_run_probe` must pass `session`. The `acquire()` method creates the session before the first probe and passes the same instance to all three `_run_probe` calls.
 
 ---
 
@@ -306,6 +332,8 @@ _recreate_vm_and_upgrade_routing(session):
 
 **`signal_gcp_vm_ready(host, port)`** is the existing method on `StartupRoutingPolicy`. This spec does not add a new method — it uses the existing signal.
 
+**IPv6 scope note:** The endpoint parsing (`split(":")[-1]`) handles IPv4 and `host:port` strings only. IPv6 endpoint formats (e.g., `[::1]:8000`) are not supported by this parsing logic. GCP internal VM addresses are IPv4; this is not a concern for the current deployment. If IPv6 support is ever needed, replace with `urllib.parse.urlsplit("//"+endpoint)`.
+
 The background task is bounded: it uses `asyncio.shield()` on the recreation future so that if the startup coroutine is cancelled, recreation continues independently. Concurrent `RECREATE_VM_ASYNC` calls are guarded by the existing `DistributedLockManager` (key: `gcp_vm_recreate`) — see residual risks.
 
 ---
@@ -401,7 +429,18 @@ The gate applies **only to the initial probe scheduling**. Retries driven by `RE
 **Cures:** D7
 **Scope:** JARVIS ↔ JARVIS-Prime only (Reactor Core is separate CI/CD)
 
-**Capabilities cache interaction:** `GCPVMReadinessProber` has a TTL-based cache for CAPABILITIES probe results (verified in code). This cache must be **invalidated at the start of every new `HandshakeSession`** to prevent a cached result from bypassing the `session.instance_name` fix on retries. Implementation: in `acquire()`, before calling `probe_capabilities()`, call `prober.invalidate_capabilities_cache()` (new method, one line: `self._capabilities_cache = None`).
+**Capabilities cache interaction:** `GCPVMReadinessProber` uses a unified `self._cache: Dict[HandshakeStep, Tuple[float, HandshakeResult]]` for all step results (confirmed in code). This cache must be **cleared for both HEALTH and CAPABILITIES at the start of every new `HandshakeSession`** so that stale cached results do not bypass the session population logic on retries.
+
+Implementation: add `prober.invalidate_session_cache()` (new method):
+```python
+def invalidate_session_cache(self) -> None:
+    """Clear per-step cache for a new session. Called by acquire() before each probe run."""
+    self._cache.pop(HandshakeStep.HEALTH, None)
+    self._cache.pop(HandshakeStep.CAPABILITIES, None)
+    # WARM_MODEL is never cached per existing design — no change needed
+```
+
+Called from `GCPReadinessLease.acquire()` before the HEALTH probe, not just before CAPABILITIES. Both must be cleared because a cached HEALTH result would skip the GCP instance identity lookup that populates `session.instance_name`.
 
 ---
 
@@ -443,6 +482,7 @@ The contract check is a one-shot check within a session — no retry on hard fai
 GCPReadinessLease.acquire(host, port)
     │
     ├── session = HandshakeSession(session_id=uuid4(), lease_id=self.id)
+    ├── prober.invalidate_session_cache()   ← clears _cache[HEALTH] + _cache[CAPABILITIES]
     │
     ├── result = prober.probe_health(host, port, timeout, session)
     │   ├── HTTP GET /v1/health → verdict
@@ -452,8 +492,6 @@ GCPReadinessLease.acquire(host, port)
     │   └── → HandshakeResult
     │
     ├── [validate: session.instance_name must be non-empty before next step]
-    │
-    ├── [prober.invalidate_capabilities_cache()]  ← clears TTL cache before each session
     │
     ├── result = prober.probe_capabilities(host, port, timeout, session)
     │   ├── vm_manager.check_lineage(session.instance_name, None)
