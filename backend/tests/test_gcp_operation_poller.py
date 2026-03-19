@@ -233,3 +233,185 @@ class TestOperationLifecycleRegistry:
         assert record.terminal_state == "success"
         assert record.terminal_reason == TerminalReason.NOT_FOUND_CORRELATED
         assert any(e[0] == "orphan_recovered" for e in events)
+
+
+# ---------------------------------------------------------------------------
+# Task 3: GCPOperationPoller
+# ---------------------------------------------------------------------------
+
+def _make_done_op(name="op-1", error=None):
+    op = _make_op(name=name, status="DONE")
+    op.error = error
+    if error:
+        err_mock = MagicMock()
+        err_mock.errors = [MagicMock(message="some GCP error")]
+        op.error = err_mock
+    return op
+
+
+class TestGCPOperationPoller:
+    @pytest.fixture
+    def tmp_registry(self, tmp_path):
+        from backend.core.gcp_operation_poller import OperationLifecycleRegistry
+        return OperationLifecycleRegistry(persist_path=tmp_path / "ops.json", supervisor_epoch=1)
+
+    @pytest.fixture
+    def ops_client(self):
+        """Mock zone operations client."""
+        return MagicMock()
+
+    def _make_poller(self, ops_client, registry, postcondition=None, max_retries=3,
+                     timeout=10.0):
+        from backend.core.gcp_operation_poller import GCPOperationPoller
+        return GCPOperationPoller(
+            operations_client=ops_client,
+            registry=registry,
+            project="proj",
+            postcondition=postcondition,
+            max_retries=max_retries,
+            base_backoff=0.0,
+            max_backoff=0.0,
+            timeout=timeout,
+        )
+
+    @pytest.mark.asyncio
+    async def test_op_done_on_first_poll(self, tmp_registry, ops_client):
+        op = _make_done_op()
+        poller = self._make_poller(ops_client, tmp_registry)
+        result = await poller.wait(op, action="start", instance_name="vm-1",
+                                   correlation_id="c-1")
+        assert result.success is True
+        from backend.core.gcp_operation_poller import TerminalReason
+        assert result.reason == TerminalReason.OP_DONE_SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_op_aborting_is_failure(self, tmp_registry, ops_client):
+        op = _make_op(status="ABORTING")
+        # The client refresh also returns ABORTING
+        ops_client.get = MagicMock(return_value=_make_op(status="ABORTING"))
+        poller = self._make_poller(ops_client, tmp_registry)
+        result = await poller.wait(op, action="start", instance_name="vm-1",
+                                   correlation_id="c-1")
+        assert result.success is False
+        from backend.core.gcp_operation_poller import TerminalReason
+        assert result.reason == TerminalReason.OP_DONE_FAILURE
+
+    @pytest.mark.asyncio
+    async def test_404_correlated_success(self, tmp_registry, ops_client):
+        """404 with registry match + postcondition=True → terminal success."""
+        import google.api_core.exceptions as gex
+        from backend.core.gcp_operation_poller import TerminalReason
+        op = _make_op(status="RUNNING")
+        ops_client.get = MagicMock(side_effect=gex.NotFound("op gone"))
+        postcond = AsyncMock(return_value=True)
+        poller = self._make_poller(ops_client, tmp_registry, postcondition=postcond)
+        result = await poller.wait(op, action="start", instance_name="vm-1",
+                                   correlation_id="c-1")
+        assert result.success is True
+        assert result.reason == TerminalReason.NOT_FOUND_CORRELATED
+
+    @pytest.mark.asyncio
+    async def test_404_scope_correct_zone_used(self, tmp_registry, ops_client):
+        """Regression: NEW code uses op.zone for polling → no zone mismatch bug."""
+        import google.api_core.exceptions as gex
+        from backend.core.gcp_operation_poller import TerminalReason
+        # Op was created in us-east1-c (NOT config.zone=us-central1-b)
+        op = _make_op(
+            status="RUNNING",
+            zone_url="https://www.googleapis.com/compute/v1/projects/proj/zones/us-east1-c",
+        )
+        ops_client.get = MagicMock(side_effect=gex.NotFound("op gone"))
+        postcond = AsyncMock(return_value=True)
+        poller = self._make_poller(ops_client, tmp_registry, postcondition=postcond)
+        result = await poller.wait(op, action="start", instance_name="vm-1",
+                                   correlation_id="c-1")
+        # With correct zone-aware polling, 404 is correlated success (postcondition passes)
+        assert result.success is True
+        assert result.reason == TerminalReason.NOT_FOUND_CORRELATED
+        # Verify it polled the correct zone, not config.zone
+        call_kwargs = ops_client.get.call_args_list[0][1]
+        assert call_kwargs.get("zone") == "us-east1-c"
+
+    @pytest.mark.asyncio
+    async def test_404_no_postcondition_terminal_unknown(self, tmp_registry, ops_client):
+        """404 with registry match but no postcondition → terminal unknown."""
+        import google.api_core.exceptions as gex
+        from backend.core.gcp_operation_poller import TerminalReason
+        op = _make_op(status="RUNNING")
+        ops_client.get = MagicMock(side_effect=gex.NotFound("op gone"))
+        poller = self._make_poller(ops_client, tmp_registry, postcondition=None)
+        result = await poller.wait(op, action="start", instance_name="vm-1",
+                                   correlation_id="c-1")
+        assert result.success is False
+        assert result.reason == TerminalReason.NOT_FOUND_NO_POSTCONDITION
+
+    @pytest.mark.asyncio
+    async def test_permission_denied_immediate_failure(self, tmp_registry, ops_client):
+        import google.api_core.exceptions as gex
+        from backend.core.gcp_operation_poller import TerminalReason
+        op = _make_op(status="RUNNING")
+        ops_client.get = MagicMock(side_effect=gex.Forbidden("no permission"))
+        poller = self._make_poller(ops_client, tmp_registry)
+        result = await poller.wait(op, action="start", instance_name="vm-1",
+                                   correlation_id="c-1")
+        assert result.success is False
+        assert result.reason == TerminalReason.PERMISSION_DENIED
+        # Must NOT have retried
+        assert ops_client.get.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_retry_bounded(self, tmp_registry, ops_client):
+        """503 retries with backoff; stops at max_retries and returns RETRY_BUDGET_EXHAUSTED."""
+        import google.api_core.exceptions as gex
+        from backend.core.gcp_operation_poller import TerminalReason
+        op = _make_op(status="RUNNING")
+        ops_client.get = MagicMock(side_effect=gex.ServiceUnavailable("GCP is down"))
+        poller = self._make_poller(ops_client, tmp_registry, max_retries=3)
+        result = await poller.wait(op, action="start", instance_name="vm-1",
+                                   correlation_id="c-1")
+        assert result.success is False
+        assert result.reason == TerminalReason.RETRY_BUDGET_EXHAUSTED
+        assert ops_client.get.call_count == 4  # initial + 3 retries
+
+    @pytest.mark.asyncio
+    async def test_concurrent_dedup_single_poll_loop(self, tmp_registry, ops_client):
+        """N concurrent waiters share exactly 1 poll loop (get called once)."""
+        from backend.core.gcp_operation_poller import TerminalReason, GCPOperationPoller, reset_operation_registry
+        reset_operation_registry()
+        op = _make_done_op()
+        ops_client.get = MagicMock(return_value=op)
+        poller = self._make_poller(ops_client, tmp_registry)
+        # 5 concurrent waiters
+        results = await asyncio.gather(*[
+            poller.wait(op, action="start", instance_name="vm-1",
+                        correlation_id=f"c-{i}")
+            for i in range(5)
+        ])
+        assert all(r.success for r in results)
+        # Already DONE on first check — get() called 0 times (fast path)
+        assert ops_client.get.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_cancellation_no_task_leak(self, tmp_registry, ops_client):
+        """Cancelled waiter leaves no orphan entry in _active_pollers."""
+        import google.api_core.exceptions as gex
+        from backend.core.gcp_operation_poller import GCPOperationPoller, reset_operation_registry
+        reset_operation_registry()
+        op = _make_op(status="RUNNING")
+
+        # Make ops_client.get block by sleeping (simulates slow GCP API)
+        async def slow_get(**kw):
+            await asyncio.sleep(100)
+        ops_client.get = MagicMock(wraps=lambda **kw: None)
+
+        poller = self._make_poller(ops_client, tmp_registry, timeout=100.0)
+
+        task = asyncio.create_task(
+            poller.wait(op, action="start", instance_name="vm-1", correlation_id="c-1")
+        )
+        await asyncio.sleep(0)  # yield to let task start
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        # After cancellation, the op_id must be cleaned up from _active_pollers
+        assert op.name not in GCPOperationPoller._active_pollers

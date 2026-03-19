@@ -473,3 +473,505 @@ class OperationLifecycleRegistry:
             r.terminal_state = "timeout_pruned"
             r.terminal_reason = TerminalReason.TIMEOUT
             _log.warning("[OperationRegistry] Emergency-pruned in-flight op: %s", r.operation_id)
+
+
+# ---------------------------------------------------------------------------
+# GCPOperationPoller — internal state for dedup
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _PollerState:
+    """Tracks one active poll loop and all its concurrent waiters."""
+    task: asyncio.Task          # drives the poll loop
+    future: asyncio.Future      # resolved with OperationResult when done
+    waiter_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# GCPOperationPoller
+# ---------------------------------------------------------------------------
+
+class GCPOperationPoller:
+    """
+    Scope-aware, registry-backed, dedup-safe GCP operation poller.
+
+    Usage:
+        poller = GCPOperationPoller(
+            operations_client=zone_ops_client,
+            registry=get_operation_registry(),
+            project=config.project_id,
+            postcondition=lambda: check_vm_running(instance_name, zone),
+        )
+        result = await poller.wait(operation, action="start", instance_name="vm-1",
+                                   correlation_id=str(uuid.uuid4()))
+        if not result.success:
+            raise RuntimeError(f"Operation failed: {result.reason} — {result.error_message}")
+    """
+
+    # Class-level dedup: shared across all poller instances in this process
+    _active_pollers: Dict[str, _PollerState] = {}
+    _dedup_lock: asyncio.Lock = None  # type: ignore[assignment]
+    _dedup_enabled: bool = True
+
+    @classmethod
+    def _get_dedup_lock(cls) -> asyncio.Lock:
+        # Lazily create the class-level lock in the running event loop
+        if cls._dedup_lock is None:
+            cls._dedup_lock = asyncio.Lock()
+        return cls._dedup_lock
+
+    def __init__(
+        self,
+        operations_client: Any,
+        registry: OperationLifecycleRegistry,
+        project: str,
+        *,
+        postcondition: Optional[Callable[[], Awaitable[bool]]] = None,
+        max_retries: int = 10,
+        base_backoff: float = 1.0,
+        max_backoff: float = 30.0,
+        jitter_factor: float = 0.25,
+        timeout: float = 300.0,
+        postcondition_retry_s: float = -1.0,  # -1 = env var
+        metrics_emitter: Optional[Callable[[str, dict], None]] = None,
+    ) -> None:
+        self._client = operations_client
+        self._registry = registry
+        self._project = project
+        self._postcondition = postcondition
+        self._max_retries = max_retries
+        self._base_backoff = base_backoff
+        self._max_backoff = max_backoff
+        self._jitter_factor = jitter_factor
+        self._timeout = timeout
+        _env_retry = float(os.environ.get("JARVIS_OP_POSTCONDITION_RETRY_S", "30"))
+        self._postcondition_retry_s = postcondition_retry_s if postcondition_retry_s >= 0 else _env_retry
+        self._emit = metrics_emitter or (lambda name, payload: None)
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    async def wait(
+        self,
+        operation: Any,
+        *,
+        action: str,
+        instance_name: str,
+        correlation_id: str,
+    ) -> OperationResult:
+        """
+        Wait for an operation to reach a terminal state.
+
+        Deduplicates: if another coroutine is already polling this operation_id,
+        joins the existing poll rather than starting a new one.
+        """
+        op_id: str = operation.name
+        lock = self._get_dedup_lock()
+
+        if not self._dedup_enabled:
+            # Version-drift fallback: independent poller per caller
+            return await self._run_poll(operation, action=action,
+                                        instance_name=instance_name,
+                                        correlation_id=correlation_id)
+
+        async with lock:
+            state = self._active_pollers.get(op_id)
+            if state is not None:
+                # Join existing poll loop
+                state.waiter_count += 1
+            else:
+                # Become the primary driver
+                loop = asyncio.get_event_loop()
+                fut: asyncio.Future = loop.create_future()
+                task = asyncio.ensure_future(
+                    self._drive_poll(operation, action=action,
+                                     instance_name=instance_name,
+                                     correlation_id=correlation_id,
+                                     result_future=fut)
+                )
+                state = _PollerState(task=task, future=fut, waiter_count=1)
+                self._active_pollers[op_id] = state
+
+        try:
+            return await asyncio.shield(state.future)
+        except asyncio.CancelledError:
+            async with lock:
+                s = self._active_pollers.get(op_id)
+                if s is not None:
+                    s.waiter_count -= 1
+                    if s.waiter_count <= 0:
+                        # Last waiter gone — cancel the poll task too
+                        s.task.cancel()
+                        self._active_pollers.pop(op_id, None)
+            raise
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    async def _drive_poll(
+        self,
+        operation: Any,
+        *,
+        action: str,
+        instance_name: str,
+        correlation_id: str,
+        result_future: asyncio.Future,
+    ) -> None:
+        """Drives the poll loop and resolves result_future when done."""
+        op_id = operation.name
+        try:
+            result = await self._run_poll(operation, action=action,
+                                          instance_name=instance_name,
+                                          correlation_id=correlation_id)
+            if not result_future.done():
+                result_future.set_result(result)
+        except Exception as exc:
+            if not result_future.done():
+                result_future.set_exception(exc)
+        finally:
+            lock = self._get_dedup_lock()
+            async with lock:
+                self._active_pollers.pop(op_id, None)
+
+    async def _run_poll(
+        self,
+        operation: Any,
+        *,
+        action: str,
+        instance_name: str,
+        correlation_id: str,
+    ) -> OperationResult:
+        """Core polling state machine."""
+        t_start = time.monotonic()
+
+        # Extract scope from operation metadata
+        try:
+            scope = OperationScope.from_operation(operation, self._project)
+        except ScopeContractError as e:
+            self._emit("scope_contract_error", {"op_id": operation.name, "error": str(e)})
+            return OperationResult(
+                success=False,
+                reason=TerminalReason.SCOPE_CONTRACT_ERROR,
+                operation_id=operation.name,
+                error_message=str(e),
+            )
+
+        # Register in registry
+        record = await self._registry.register(
+            operation, instance_name=instance_name,
+            action=action, correlation_id=correlation_id,
+        )
+
+        deadline = t_start + self._timeout
+        retry_count = 0
+
+        # Fast path: already DONE
+        done_result = self._check_done(operation, record, t_start)
+        if done_result is not None:
+            await self._close_record(record, done_result)
+            return done_result
+
+        while time.monotonic() < deadline:
+            # Backoff before next poll (0 on first iteration when retry_count=0)
+            if retry_count > 0:
+                await self._backoff(retry_count)
+            else:
+                await asyncio.sleep(0)  # yield to event loop
+
+            try:
+                fresh_op = await asyncio.to_thread(
+                    self._client.get,
+                    project=scope.project,
+                    zone=scope.zone,
+                    operation=operation.name,
+                )
+                record.poll_count += 1
+                record.last_seen_at = time.time()
+
+                done_result = self._check_done(fresh_op, record, t_start)
+                if done_result is not None:
+                    await self._close_record(record, done_result)
+                    return done_result
+                # Still PENDING or RUNNING — continue
+
+            except Exception as exc:
+                error_class = self._classify_exception(exc)
+                record.poll_count += 1
+                record.last_seen_at = time.time()
+
+                if error_class == "not_found":
+                    result = await self._handle_not_found(record, t_start)
+                    await self._close_record(record, result)
+                    return result
+
+                elif error_class == "permanent":
+                    self._emit("permanent_failure", {
+                        "op_id": operation.name,
+                        "error": str(exc),
+                        "retry_count": retry_count,
+                    })
+                    result = OperationResult(
+                        success=False,
+                        reason=TerminalReason.PERMISSION_DENIED,
+                        operation_id=operation.name,
+                        scope=scope,
+                        error_message=str(exc),
+                        elapsed_ms=(time.monotonic() - t_start) * 1000,
+                        poll_count=record.poll_count,
+                    )
+                    await self._close_record(record, result)
+                    return result
+
+                elif error_class == "invalid":
+                    result = OperationResult(
+                        success=False,
+                        reason=TerminalReason.INVALID_REQUEST,
+                        operation_id=operation.name,
+                        scope=scope,
+                        error_message=str(exc),
+                        elapsed_ms=(time.monotonic() - t_start) * 1000,
+                        poll_count=record.poll_count,
+                    )
+                    await self._close_record(record, result)
+                    return result
+
+                else:
+                    # Transient — check retry budget
+                    retry_count += 1
+                    if retry_count > self._max_retries:
+                        self._emit("retry_budget_exhausted", {
+                            "op_id": operation.name,
+                            "retry_count": retry_count,
+                            "last_error": str(exc),
+                        })
+                        result = OperationResult(
+                            success=False,
+                            reason=TerminalReason.RETRY_BUDGET_EXHAUSTED,
+                            operation_id=operation.name,
+                            scope=scope,
+                            error_message=str(exc),
+                            elapsed_ms=(time.monotonic() - t_start) * 1000,
+                            poll_count=record.poll_count,
+                        )
+                        await self._close_record(record, result)
+                        return result
+                    # Continue loop with backoff
+
+        # Deadline exceeded
+        result = OperationResult(
+            success=False,
+            reason=TerminalReason.TIMEOUT,
+            operation_id=operation.name,
+            scope=scope,
+            elapsed_ms=(time.monotonic() - t_start) * 1000,
+            poll_count=record.poll_count,
+        )
+        await self._close_record(record, result)
+        return result
+
+    def _check_done(self, op: Any, record: OperationRecord, t_start: float) -> Optional[OperationResult]:
+        """Return OperationResult if op is in a terminal status, else None."""
+        try:
+            from google.cloud import compute_v1
+            status_done = compute_v1.Operation.Status.DONE
+            status_aborting_str = "ABORTING"
+        except ImportError:
+            status_done = "DONE"
+            status_aborting_str = "ABORTING"
+
+        status = op.status
+        if hasattr(status, "name"):
+            status_str = status.name
+        else:
+            status_str = str(status)
+
+        if status_str == status_aborting_str:
+            return OperationResult(
+                success=False,
+                reason=TerminalReason.OP_DONE_FAILURE,
+                operation_id=op.name,
+                scope=record.scope,
+                error_message="Operation is ABORTING",
+                elapsed_ms=(time.monotonic() - t_start) * 1000,
+                poll_count=record.poll_count,
+            )
+
+        is_done = (status == status_done) or (status_str == "DONE")
+        if not is_done:
+            return None
+
+        if op.error and getattr(op.error, "errors", None):
+            msgs = [getattr(e, "message", str(e)) for e in op.error.errors]
+            return OperationResult(
+                success=False,
+                reason=TerminalReason.OP_DONE_FAILURE,
+                operation_id=op.name,
+                scope=record.scope,
+                error_message="; ".join(msgs),
+                poll_count=record.poll_count,
+            )
+        return OperationResult(
+            success=True,
+            reason=TerminalReason.OP_DONE_SUCCESS,
+            operation_id=op.name,
+            scope=record.scope,
+            poll_count=record.poll_count,
+        )
+
+    async def _handle_not_found(self, record: OperationRecord, t_start: float) -> OperationResult:
+        """Classify 404 per correlation + postcondition rules."""
+        op_id = record.operation_id
+        scope = record.scope
+
+        # Is the op in the registry with matching scope?
+        registered = self._registry.get(op_id)
+        if registered is None:
+            # Uncorrelated — stale reference with no registry entry
+            self._emit("stale_operation_detected", {"op_id": op_id, "scope": str(scope)})
+            return OperationResult(
+                success=False,
+                reason=TerminalReason.NOT_FOUND_UNCORRELATED,
+                operation_id=op_id,
+                scope=scope,
+                error_message="404: Operation not found and not in registry",
+                poll_count=record.poll_count,
+            )
+
+        # Scope must match
+        if registered.scope != scope:
+            self._emit("stale_operation_detected", {
+                "op_id": op_id,
+                "registered_scope": str(registered.scope),
+                "poll_scope": str(scope),
+            })
+            return OperationResult(
+                success=False,
+                reason=TerminalReason.NOT_FOUND_SCOPE_MISMATCH,
+                operation_id=op_id,
+                scope=scope,
+                error_message=f"404: scope mismatch (registered={registered.scope}, poll={scope})",
+                poll_count=record.poll_count,
+            )
+
+        if self._postcondition is None:
+            self._emit("operation_gc_404_terminal", {
+                "op_id": op_id, "reason": "no_postcondition",
+            })
+            return OperationResult(
+                success=False,
+                reason=TerminalReason.NOT_FOUND_NO_POSTCONDITION,
+                operation_id=op_id,
+                scope=scope,
+                error_message="404: Operation GC'd; no postcondition to verify success",
+                poll_count=record.poll_count,
+            )
+
+        # Retry postcondition for up to postcondition_retry_s
+        postcond_deadline = time.monotonic() + self._postcondition_retry_s
+        postcond_result = False
+        while time.monotonic() < postcond_deadline:
+            try:
+                postcond_result = await self._postcondition()
+                if postcond_result:
+                    break
+            except Exception as e:
+                _log.debug("[GCPOperationPoller] postcondition threw: %s", e)
+                break
+            await asyncio.sleep(2.0)
+
+        if postcond_result:
+            self._emit("operation_gc_404_terminal", {"op_id": op_id, "reason": "correlated_success"})
+            return OperationResult(
+                success=True,
+                reason=TerminalReason.NOT_FOUND_CORRELATED,
+                operation_id=op_id,
+                scope=scope,
+                poll_count=record.poll_count,
+            )
+        else:
+            self._emit("operation_gc_404_terminal", {
+                "op_id": op_id, "reason": "postcondition_fail",
+            })
+            return OperationResult(
+                success=False,
+                reason=TerminalReason.NOT_FOUND_POSTCONDITION_FAIL,
+                operation_id=op_id,
+                scope=scope,
+                error_message="404: Operation GC'd; postcondition returned False",
+                poll_count=record.poll_count,
+            )
+
+    @staticmethod
+    def _classify_exception(exc: Exception) -> str:
+        """Return 'not_found' | 'permanent' | 'invalid' | 'transient'."""
+        try:
+            import google.api_core.exceptions as gex
+            if isinstance(exc, gex.NotFound):
+                return "not_found"
+            if isinstance(exc, (gex.Forbidden, gex.Unauthorized)):
+                return "permanent"
+            if isinstance(exc, (gex.BadRequest, gex.InvalidArgument)):
+                return "invalid"
+            if isinstance(exc, (gex.ServiceUnavailable, gex.InternalServerError,
+                                 gex.TooManyRequests, gex.ResourceExhausted,
+                                 gex.DeadlineExceeded)):
+                return "transient"
+        except ImportError:
+            pass
+        # Network errors and unknown exceptions are transient
+        exc_str = str(type(exc).__name__).lower()
+        if any(k in exc_str for k in ("connection", "timeout", "reset", "broken")):
+            return "transient"
+        return "transient"  # conservative default
+
+    async def _backoff(self, retry_count: int) -> None:
+        wait = min(
+            self._base_backoff * (2 ** retry_count),
+            self._max_backoff,
+        )
+        jitter = wait * self._jitter_factor * random.random()
+        await asyncio.sleep(wait + jitter)
+
+    async def _close_record(self, record: OperationRecord, result: OperationResult) -> None:
+        """Update registry terminal state. Non-fatal if registry update fails."""
+        try:
+            await self._registry.update_terminal(
+                record.operation_id,
+                state="success" if result.success else "failure",
+                reason=result.reason,
+                epoch=self._registry._supervisor_epoch,
+            )
+        except SplitBrainFenceError as e:
+            _log.warning("[GCPOperationPoller] Split-brain fenced: %s", e)
+        except Exception as e:
+            _log.debug("[GCPOperationPoller] Registry update failed (non-fatal): %s", e)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+_registry_instance: Optional[OperationLifecycleRegistry] = None
+
+def get_operation_registry(
+    supervisor_epoch: int = 0,
+    persist_path: Optional[Path] = None,
+) -> OperationLifecycleRegistry:
+    """Return the process-wide registry singleton."""
+    global _registry_instance
+    if _registry_instance is None:
+        _registry_instance = OperationLifecycleRegistry(
+            persist_path=persist_path,
+            supervisor_epoch=supervisor_epoch,
+        )
+    return _registry_instance
+
+
+def reset_operation_registry() -> None:
+    """Reset singleton — for tests only."""
+    global _registry_instance
+    _registry_instance = None
+    GCPOperationPoller._active_pollers.clear()
+    GCPOperationPoller._dedup_lock = None
