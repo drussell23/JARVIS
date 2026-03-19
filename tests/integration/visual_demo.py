@@ -32,51 +32,163 @@ sys.path.insert(0, str(_root / "backend"))
 # Helpers
 # ---------------------------------------------------------------------------
 
-def say(text: str):
-    """Speak text using macOS TTS (synchronous, non-blocking via subprocess)."""
-    print(f"  [JARVIS] {text}")
-    subprocess.Popen(
-        ["say", "-v", "Daniel", "-r", "190", text],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+# ---------------------------------------------------------------------------
+# TTS — Sequential speech queue (no overlapping voices)
+# ---------------------------------------------------------------------------
+
+_tts_lock = None  # Initialized lazily in async context
+
+
+def _get_tts_lock():
+    global _tts_lock
+    if _tts_lock is None:
+        _tts_lock = asyncio.Lock()
+    return _tts_lock
+
+
+async def say(text: str):
+    """Speak text and wait for completion. Sequential — no overlapping."""
+    async with _get_tts_lock():
+        print(f"  [JARVIS] {text}")
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-v", "Daniel", "-r", "190", text,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+
+
+async def say_wait(text: str):
+    """Alias for say() — always waits, always sequential."""
+    await say(text)
+
+
+# ---------------------------------------------------------------------------
+# App detection — check if installed before opening
+# ---------------------------------------------------------------------------
+
+_app_installed_cache: dict = {}
+_failed_apps: list = []  # Track for Reactor learning
+
+
+def is_app_installed(app_name: str) -> bool:
+    """Check if a macOS application is installed."""
+    if app_name in _app_installed_cache:
+        return _app_installed_cache[app_name]
+
+    from pathlib import Path
+    found = (
+        Path(f"/Applications/{app_name}.app").exists()
+        or Path(f"/System/Applications/{app_name}.app").exists()
+        or Path(os.path.expanduser(f"~/Applications/{app_name}.app")).exists()
     )
 
+    if not found:
+        # Also check via mdfind (catches non-standard install locations)
+        try:
+            result = subprocess.run(
+                ["mdfind", "-name", f"{app_name}.app", "-onlyin", "/Applications"],
+                capture_output=True, text=True, timeout=3,
+            )
+            found = bool(result.stdout.strip())
+        except Exception:
+            pass
 
-def say_wait(text: str):
-    """Speak and wait for completion."""
-    print(f"  [JARVIS] {text}")
-    subprocess.run(
-        ["say", "-v", "Daniel", "-r", "190", text],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    _app_installed_cache[app_name] = found
+    return found
+
+
+async def open_app(app_name: str) -> bool:
+    """Open a macOS application if installed. Returns False if not found."""
+    if not is_app_installed(app_name):
+        print(f"  [SKIP] {app_name} is not installed")
+        _failed_apps.append({"app": app_name, "reason": "not_installed"})
+        return False
+
+    proc = await asyncio.create_subprocess_exec(
+        "open", "-a", app_name,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
+    await proc.wait()
+    return proc.returncode == 0
 
 
-def open_app(app_name: str):
-    """Open a macOS application."""
-    subprocess.run(
-        ["open", "-a", app_name],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+# ---------------------------------------------------------------------------
+# Chrome tab detection — reuse existing tabs instead of duplicating
+# ---------------------------------------------------------------------------
+
+_ACTIVATE_TAB_SCRIPT = '''
+tell application "Google Chrome"
+    repeat with w in windows
+        set tabCount to 0
+        repeat with t in tabs of w
+            set tabCount to tabCount + 1
+            if URL of t contains "{domain}" then
+                set active tab index of w to tabCount
+                set index of w to 1
+                activate
+                return "found"
+            end if
+        end repeat
+    end repeat
+    return "not_found"
+end tell
+'''
+
+
+def activate_chrome_tab(domain: str) -> bool:
+    """Activate an existing Chrome tab matching a domain.
+
+    Returns True if an existing tab was found and activated.
+    """
+    script = _ACTIVATE_TAB_SCRIPT.replace("{domain}", domain)
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=3,
+        )
+        return result.stdout.strip() == "found"
+    except Exception:
+        return False
+
+
+async def open_url_smart(url: str) -> str:
+    """Open a URL, reusing an existing Chrome tab if one matches.
+
+    Returns "reused", "opened", or "failed".
+    """
+    # Extract domain for matching (e.g., "mail.google.com")
+    from urllib.parse import urlparse
+    domain = urlparse(url).netloc or url
+
+    # Check if tab already exists
+    if activate_chrome_tab(domain):
+        return "reused"
+
+    # No existing tab — open new one
+    proc = await asyncio.create_subprocess_exec(
+        "open", url,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
+    await proc.wait()
+    return "opened" if proc.returncode == 0 else "failed"
 
 
-def open_url(url: str):
-    """Open a URL in the default browser."""
-    subprocess.run(
-        ["open", url],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-
-
-def activate_app(app_name: str):
+async def activate_app(app_name: str):
     """Bring an app to the foreground."""
-    subprocess.run(
-        ["osascript", "-e", f'tell application "{app_name}" to activate'],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+    proc = await asyncio.create_subprocess_exec(
+        "osascript", "-e", f'tell application "{app_name}" to activate',
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
     )
+    await proc.wait()
+
+
+def get_failed_apps() -> list:
+    """Get list of apps that failed to open (for Reactor learning)."""
+    return list(_failed_apps)
 
 
 def banner(text: str):
@@ -92,7 +204,7 @@ def banner(text: str):
 async def step_1_expand_intent(command: str):
     """Step 1: Show intent expansion."""
     banner("STEP 1: Expanding intent with Psychic Brain")
-    say("Analyzing your command and expanding into tasks.")
+    await say("Analyzing your command and expanding into tasks.")
 
     from backend.neural_mesh.agents.predictive_planning_agent import (
         PredictivePlanningAgent,
@@ -123,20 +235,23 @@ async def step_1_expand_intent(command: str):
         print(f"    [{wt.priority.name:8s}] {cap:25s}{fb}")
 
     await asyncio.sleep(1)
-    say(f"Expanded into {len(prediction.expanded_tasks)} parallel tasks. Executing now.")
+    await say(f"Expanded into {len(prediction.expanded_tasks)} parallel tasks. Executing now.")
     return prediction, workflow_tasks
 
 
 async def step_2_open_apps(workflow_tasks):
     """Step 2: Open apps and Google Workspace URLs on screen.
 
-    Distinguishes between:
-    - Native macOS apps (VS Code, Slack, Terminal) → open -a
-    - Google Workspace services (Gmail, Calendar, Drive) → open URL in Chrome
+    Smart behaviors:
+    - Checks if Chrome tab already open before creating duplicate
+    - Checks if native app is installed before trying to open
+    - Reports skipped/reused items for Reactor learning
+    - Sequential TTS — no overlapping voices
     """
     banner("STEP 2: Opening apps and services on your MacBook")
 
     opened = set()  # Track what we've opened to avoid duplicates
+    skipped = []
 
     for wt in workflow_tasks:
         workspace_url = wt.input_data.get("workspace_url")
@@ -144,25 +259,46 @@ async def step_2_open_apps(workflow_tasks):
         native_app = wt.input_data.get("target_app") or wt.input_data.get("app_name")
 
         if workspace_url and workspace_url not in opened:
-            # Google Workspace — open URL in Chrome
             svc_name = (workspace_svc or "Google Workspace").replace("_", " ").title()
-            print(f"  Opening: {svc_name} in Chrome → {workspace_url}")
-            say(f"Opening {svc_name} in Chrome.")
-            open_url(workspace_url)
+
+            # Smart: check if tab already open
+            result = await open_url_smart(workspace_url)
+
+            if result == "reused":
+                print(f"  [REUSED] {svc_name} — already open in Chrome")
+                await say(f"{svc_name} is already open. Switching to it.")
+            elif result == "opened":
+                print(f"  [OPENED] {svc_name} in Chrome → {workspace_url}")
+                await say(f"Opening {svc_name} in Chrome.")
+            else:
+                print(f"  [FAILED] Could not open {svc_name}")
+                skipped.append({"service": svc_name, "url": workspace_url})
+
             opened.add(workspace_url)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
+
         elif native_app and native_app not in opened:
-            # Native macOS app
-            print(f"  Opening: {native_app}")
-            say(f"Opening {native_app}.")
-            open_app(native_app)
+            # Smart: check if installed first
+            if is_app_installed(native_app):
+                print(f"  [OPENED] {native_app}")
+                await say(f"Opening {native_app}.")
+                await open_app(native_app)
+            else:
+                print(f"  [SKIP] {native_app} — not installed on this Mac")
+                await say(f"{native_app} is not installed. Skipping.")
+                skipped.append({"app": native_app, "reason": "not_installed"})
+
             opened.add(native_app)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(1.0)
 
     if not opened:
-        print("  Opening: Google Chrome (default)")
-        say("Opening Chrome.")
-        open_app("Google Chrome")
+        print("  [OPENED] Google Chrome (default)")
+        await say("Opening Chrome.")
+        await open_app("Google Chrome")
+
+    if skipped:
+        print(f"\n  Skipped {len(skipped)} items: {skipped}")
+        print("  (These will be logged for Reactor learning)")
 
     await asyncio.sleep(0.5)
 
@@ -170,7 +306,7 @@ async def step_2_open_apps(workflow_tasks):
 async def step_3_fetch_emails():
     """Step 3: Fetch emails via Gmail API."""
     banner("STEP 3: Checking your email via Gmail API")
-    say("Checking your inbox for unread messages.")
+    await say("Checking your inbox for unread messages.")
 
     from backend.neural_mesh.agents.google_workspace_agent import (
         GoogleWorkspaceAgent,
@@ -195,15 +331,15 @@ async def step_3_fetch_emails():
             print(f"       {subject}")
             print()
 
-        say(f"You have {len(emails)} unread emails.")
+        await say(f"You have {len(emails)} unread emails.")
         await asyncio.sleep(1)
 
         # Read first email subject aloud
         first_subject = emails[0].get("subject", "no subject")[:60]
-        say(f"The most recent is: {first_subject}")
+        await say(f"The most recent is: {first_subject}")
     else:
         print("  No unread emails.")
-        say("Your inbox is clear. No unread messages.")
+        await say("Your inbox is clear. No unread messages.")
 
     await asyncio.sleep(1)
     return emails
@@ -212,7 +348,7 @@ async def step_3_fetch_emails():
 async def step_4_draft_email():
     """Step 4: Draft an email and show it in Gmail."""
     banner("STEP 4: Drafting email via Gmail API")
-    say("Drafting an email for you now.")
+    await say("Drafting an email for you now.")
 
     from backend.neural_mesh.agents.google_workspace_agent import (
         GoogleWorkspaceAgent,
@@ -245,20 +381,23 @@ async def step_4_draft_email():
         print(f"\n  Draft created successfully!")
         print(f"  Draft ID: {draft_id}")
         print(f"  Subject: [JARVIS LIVE DEMO] Drafted at {timestamp}")
-        say("Email draft created. Opening your Gmail drafts now.")
+        await say("Email draft created. Opening your Gmail drafts now.")
         await asyncio.sleep(1)
 
-        # Open Gmail drafts in browser
-        open_url("https://mail.google.com/mail/u/0/#drafts")
+        # Open Gmail drafts in browser (reuse tab if possible)
+        tab_result = await open_url_smart("https://mail.google.com/mail/u/0/#drafts")
+        if tab_result == "reused":
+            print("\n  >>> Switched to existing Gmail tab <<<")
+        else:
+            print("\n  >>> Gmail Drafts opened in your browser <<<")
         await asyncio.sleep(2)
-        activate_app("Google Chrome")
+        await activate_app("Google Chrome")
 
-        print("\n  >>> Gmail Drafts opened in your browser <<<")
-        say("Check your Gmail drafts folder. You should see the email I just created.")
+        await say("Check your Gmail drafts folder. You should see the email I just created.")
     else:
         error = result.get("error", "Unknown error")
         print(f"\n  Draft failed: {error}")
-        say(f"Draft creation failed. {error}")
+        await say(f"Draft creation failed. {error}")
 
     return result
 
@@ -266,7 +405,7 @@ async def step_4_draft_email():
 async def step_5_check_calendar():
     """Step 5: Check calendar."""
     banner("STEP 5: Checking your calendar")
-    say("Let me check your calendar for today.")
+    await say("Let me check your calendar for today.")
 
     from backend.neural_mesh.agents.google_workspace_agent import (
         GoogleWorkspaceAgent,
@@ -288,10 +427,10 @@ async def step_5_check_calendar():
             time_str = start.get("dateTime", start.get("date", ""))[:16]
             print(f"    {time_str} — {summary}")
 
-        say(f"You have {len(events)} events on your calendar today.")
+        await say(f"You have {len(events)} events on your calendar today.")
     else:
         print("\n  No events today.")
-        say("Your calendar is clear for today.")
+        await say("Your calendar is clear for today.")
 
     await asyncio.sleep(1)
 
@@ -302,11 +441,11 @@ async def run_demo():
     print("  Watch your screen — JARVIS will perform tasks visually.")
     print()
 
-    say_wait("Hello Derek. I'm going to demonstrate the Trinity pipeline.")
+    await say_wait("Hello Derek. I'm going to demonstrate the Trinity pipeline.")
     await asyncio.sleep(0.5)
 
     command = "Start my day — check email, calendar, and draft a summary"
-    say_wait(f"You said: {command}")
+    await say_wait(f"You said: {command}")
     await asyncio.sleep(0.5)
 
     # Step 1: Expand the intent
@@ -326,7 +465,7 @@ async def run_demo():
 
     # Finale
     banner("DEMO COMPLETE")
-    say_wait(
+    await say_wait(
         "All tasks completed. The Trinity pipeline is working. "
         "I expanded your command into parallel tasks, "
         "checked your email, drafted a message, "
@@ -334,12 +473,20 @@ async def run_demo():
         "JARVIS is alive."
     )
     print()
+    # Report results including what was skipped
+    failed = get_failed_apps()
+
     print("  Results:")
     print("    - Intent expanded into parallel tasks")
     print("    - Apps opened on your desktop")
     print("    - Emails fetched from Gmail API")
     print("    - Draft email created (check Gmail Drafts)")
     print("    - Calendar checked")
+    if failed:
+        print(f"\n  Apps not installed (skipped):")
+        for f_app in failed:
+            print(f"    - {f_app.get('app', f_app.get('service', '?'))}: {f_app.get('reason', 'unknown')}")
+        print("  (Logged for Reactor Core learning)")
     print()
 
 
