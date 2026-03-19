@@ -19,7 +19,7 @@ import enum
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,68 @@ class FallbackReason(str, enum.Enum):
     GCP_REVOKED = "gcp_revoked"
     GCP_HANDSHAKE_FAILED = "gcp_handshake_failed"
     NO_AVAILABLE_PATH = "no_available_path"
+
+
+class RecoveryStrategy(str, enum.Enum):
+    """Recovery action to take after a GCP handshake failure.
+
+    Used by VMLifecycleManager and PrimeRouter to decide how to react
+    when a specific handshake step fails for a specific failure class.
+    """
+
+    RETRY_SHORT       = "retry_short"        # Transient; retry quickly
+    RETRY_LONG        = "retry_long"         # Resource/preemption; longer back-off
+    RECREATE_VM_ASYNC = "recreate_vm_async"  # Lineage/schema drift; need fresh VM
+    FALLBACK_LOCAL    = "fallback_local"     # Use local model instead
+    FALLBACK_CLOUD    = "fallback_cloud"     # Use cloud Claude instead
+    ABORT             = "abort"              # Hard contract violation
+
+
+# ---------------------------------------------------------------------------
+# Recovery matrix (module-level, string keys to avoid circular import)
+# ---------------------------------------------------------------------------
+
+_RECOVERY_MATRIX: Dict[Tuple[str, str], RecoveryStrategy] = {
+    ("health", "network"):                  RecoveryStrategy.RETRY_SHORT,
+    ("health", "timeout"):                  RecoveryStrategy.RETRY_SHORT,
+    ("health", "resource"):                 RecoveryStrategy.RETRY_LONG,
+    ("health", "preemption"):               RecoveryStrategy.RETRY_LONG,
+    ("health", "quota"):                    RecoveryStrategy.FALLBACK_CLOUD,
+    ("capabilities", "transient_infra"):    RecoveryStrategy.RETRY_SHORT,
+    ("capabilities", "lineage_mismatch"):   RecoveryStrategy.RECREATE_VM_ASYNC,
+    ("capabilities", "schema_mismatch"):    RecoveryStrategy.RECREATE_VM_ASYNC,
+    ("capabilities", "contract_violation"): RecoveryStrategy.ABORT,
+    ("warm_model", "network"):              RecoveryStrategy.RETRY_SHORT,
+    ("warm_model", "timeout"):              RecoveryStrategy.RETRY_SHORT,
+    ("warm_model", "resource"):             RecoveryStrategy.RETRY_LONG,
+}
+
+_RECOVERY_MATRIX_DEFAULT: RecoveryStrategy = RecoveryStrategy.FALLBACK_LOCAL
+MAX_RETRY_ATTEMPTS_PER_HANDSHAKE: int = 3
+
+
+def select_recovery_strategy(step: Any, failure_class: Any) -> RecoveryStrategy:
+    """Return the recovery strategy for a (step, failure_class) pair.
+
+    Both arguments may be enum instances or plain strings.  String keys are
+    used internally to avoid a circular import with ``gcp_readiness_lease``.
+
+    Falls back to ``_RECOVERY_MATRIX_DEFAULT`` for unmapped combinations and
+    emits a WARNING so novel failure modes are surfaced in logs.
+    """
+    step_val = step.value if hasattr(step, "value") else str(step)
+    class_val = failure_class.value if hasattr(failure_class, "value") else str(failure_class)
+    strategy = _RECOVERY_MATRIX.get((step_val, class_val))
+    if strategy is None:
+        logger.warning(
+            "select_recovery_strategy: no matrix entry for (%s, %s) — "
+            "defaulting to %s",
+            step_val,
+            class_val,
+            _RECOVERY_MATRIX_DEFAULT.value,
+        )
+        return _RECOVERY_MATRIX_DEFAULT
+    return strategy
 
 
 # ---------------------------------------------------------------------------
@@ -173,8 +235,25 @@ class StartupRoutingPolicy:
         self._local_loaded = True
         logger.info("Local model loaded")
 
-    def signal_gcp_handshake_failed(self, reason: str) -> None:
+    def signal_gcp_handshake_failed(
+        self,
+        reason: str,
+        *,
+        step: Any = None,
+        failure_class: Any = None,
+    ) -> None:
         """Signal that the GCP handshake failed (capabilities mismatch, etc.).
+
+        Parameters
+        ----------
+        reason:
+            Human-readable failure description for the decision log.
+        step:
+            Optional ``HandshakeStep`` (or string) identifying which step failed.
+        failure_class:
+            Optional ``ReadinessFailureClass`` (or string) identifying the failure
+            category.  When both ``step`` and ``failure_class`` are provided the
+            recovery strategy is computed and attached to ``_gcp_handshake_recovery``.
 
         No-op after ``finalize()``.
         """
@@ -184,7 +263,19 @@ class StartupRoutingPolicy:
         self._gcp_handshake_failed = True
         self._gcp_ready = False
         self._gcp_handshake_fail_reason = reason
+        if step is not None and failure_class is not None:
+            self._gcp_handshake_recovery: RecoveryStrategy = select_recovery_strategy(
+                step, failure_class
+            )
         logger.warning("GCP handshake failed: %s", reason)
+
+    def select_recovery_strategy(self, step: Any, failure_class: Any) -> RecoveryStrategy:
+        """Return the recovery strategy for a (step, failure_class) pair.
+
+        Delegates to the module-level ``select_recovery_strategy`` function.
+        Provided as a method for callers that hold a policy reference.
+        """
+        return select_recovery_strategy(step, failure_class)
 
     # -- Decision engine -----------------------------------------------------
 
