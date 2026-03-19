@@ -526,3 +526,54 @@ class TestExecutionTierRouter:
             app_installed=None,
         )
         assert tier == ExecutionTier.BROWSER
+
+
+# ---------------------------------------------------------------------------
+# VisualBrowserAgent tests  (Task 4)
+# ---------------------------------------------------------------------------
+
+class TestVisualBrowserAgent:
+    """Tests for VisualBrowserAgent — Playwright + J-Prime vision for Chrome."""
+
+    # ------------------------------------------------------------------
+    # Fixtures
+    # ------------------------------------------------------------------
+
+    @pytest.fixture
+    def agent(self):
+        """Return an uninitialised VisualBrowserAgent instance."""
+        from backend.neural_mesh.agents.visual_browser_agent import VisualBrowserAgent
+        return VisualBrowserAgent()
+
+    # ------------------------------------------------------------------
+    # Structural / metadata tests
+    # ------------------------------------------------------------------
+
+    def test_agent_name_and_type(self, agent) -> None:
+        """Agent must be named 'visual_browser_agent' with type 'autonomy'."""
+        assert agent.agent_name == "visual_browser_agent"
+        assert agent.agent_type == "autonomy"
+
+    def test_agent_has_correct_capabilities(self, agent) -> None:
+        """Agent capabilities must include visual_browser and browse_and_interact."""
+        assert {"visual_browser", "browse_and_interact"} <= agent.capabilities
+
+    # ------------------------------------------------------------------
+    # Input validation
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_execute_task_requires_url_or_goal(self, agent) -> None:
+        """Calling browse_and_interact with neither url nor goal returns an error dict."""
+        await agent.initialize()  # standalone mode — no browser launched yet
+
+        result = await agent.execute_task(
+            {"action": "browse_and_interact", "url": "", "goal": ""}
+        )
+
+        assert isinstance(result, dict)
+        assert result["success"] is False
+        assert "error" in result
+        assert result["steps_taken"] == 0
+        assert isinstance(result["actions"], list)
+        assert len(result["actions"]) == 0
