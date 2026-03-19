@@ -215,6 +215,9 @@ class ExpandedTask:
     estimated_duration_seconds: int
     dependencies: List[str]  # Goals this depends on
     category: IntentCategory
+    # Google Workspace service key ("gmail", "calendar", "drive", "docs", "sheets").
+    # When set, the task targets Google Workspace in the browser (not a native macOS app).
+    workspace_service: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -224,6 +227,7 @@ class ExpandedTask:
             "estimated_duration_seconds": self.estimated_duration_seconds,
             "dependencies": self.dependencies,
             "category": self.category.value,
+            "workspace_service": self.workspace_service,
         }
 
 
@@ -337,31 +341,50 @@ INTENT_PATTERNS: Dict[IntentCategory, List[str]] = {
 # Default Task Expansions (Fallback without LLM)
 # =============================================================================
 
+# Google Workspace URLs — JARVIS data lives in Google, not Apple apps.
+# When a task targets email/calendar/drive, route to Google in Chrome,
+# not Mail.app or Calendar.app.  Configurable via env vars.
+_WORKSPACE_BROWSER = os.getenv("JARVIS_WORKSPACE_BROWSER", "Google Chrome")
+_GOOGLE_URLS: Dict[str, str] = {
+    "gmail": os.getenv("JARVIS_GMAIL_URL", "https://mail.google.com"),
+    "calendar": os.getenv("JARVIS_GCAL_URL", "https://calendar.google.com"),
+    "drive": os.getenv("JARVIS_GDRIVE_URL", "https://drive.google.com"),
+    "docs": os.getenv("JARVIS_GDOCS_URL", "https://docs.google.com"),
+    "sheets": os.getenv("JARVIS_GSHEETS_URL", "https://sheets.google.com"),
+}
+
 DEFAULT_EXPANSIONS: Dict[IntentCategory, List[Dict[str, Any]]] = {
     IntentCategory.WORK_MODE: [
         {"goal": "Open VS Code to the main project", "priority": 1, "target_app": "Visual Studio Code"},
-        {"goal": "Check email for urgent messages", "priority": 2, "target_app": "Mail"},
-        {"goal": "Check calendar for today's meetings", "priority": 2, "target_app": "Calendar"},
+        {"goal": "Check Gmail for urgent messages", "priority": 2, "target_app": None,
+         "workspace_service": "gmail"},
+        {"goal": "Check Google Calendar for today's meetings", "priority": 2, "target_app": None,
+         "workspace_service": "calendar"},
         {"goal": "Open Slack for team updates", "priority": 3, "target_app": "Slack"},
     ],
     IntentCategory.MEETING_PREP: [
-        {"goal": "Open calendar and find the meeting", "priority": 1, "target_app": "Calendar"},
-        {"goal": "Open meeting notes document", "priority": 2, "target_app": "Notes"},
+        {"goal": "Open Google Calendar and find the meeting", "priority": 1, "target_app": None,
+         "workspace_service": "calendar"},
+        {"goal": "Open meeting notes in Google Docs", "priority": 2, "target_app": None,
+         "workspace_service": "docs"},
         {"goal": "Check Slack for meeting context", "priority": 3, "target_app": "Slack"},
     ],
     IntentCategory.COMMUNICATION: [
-        {"goal": "Check email inbox for unread messages", "priority": 1, "target_app": "Mail"},
+        {"goal": "Check Gmail inbox for unread messages", "priority": 1, "target_app": None,
+         "workspace_service": "gmail"},
         {"goal": "Check Slack for team messages", "priority": 1, "target_app": "Slack"},
-        {"goal": "Review calendar for upcoming events", "priority": 2, "target_app": "Calendar"},
+        {"goal": "Review Google Calendar for upcoming events", "priority": 2, "target_app": None,
+         "workspace_service": "calendar"},
     ],
     IntentCategory.DEVELOPMENT: [
         {"goal": "Open VS Code to the project", "priority": 1, "target_app": "Visual Studio Code"},
         {"goal": "Open terminal for commands", "priority": 2, "target_app": "Terminal"},
-        {"goal": "Open browser for documentation", "priority": 3, "target_app": "Safari"},
+        {"goal": "Open browser for documentation", "priority": 3, "target_app": _WORKSPACE_BROWSER},
     ],
     IntentCategory.END_OF_DAY: [
-        {"goal": "Check email for anything urgent before leaving", "priority": 1, "target_app": "Mail"},
-        {"goal": "Update Jira with today's progress", "priority": 2, "target_app": "Safari"},
+        {"goal": "Check Gmail for anything urgent before leaving", "priority": 1, "target_app": None,
+         "workspace_service": "gmail"},
+        {"goal": "Update Jira with today's progress", "priority": 2, "target_app": _WORKSPACE_BROWSER},
         {"goal": "Send end-of-day update to team on Slack", "priority": 3, "target_app": "Slack"},
     ],
 }
@@ -695,7 +718,19 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
                 "goal": expanded.goal,
                 "query": expanded.goal,  # Agents that expect "query" key
             }
-            if expanded.target_app:
+
+            # Google Workspace service → route to Google in Chrome, not native apps.
+            # This ensures "Check email" opens Gmail in Chrome, not Mail.app.
+            if expanded.workspace_service:
+                google_url = _GOOGLE_URLS.get(expanded.workspace_service)
+                if google_url:
+                    input_data["workspace_url"] = google_url
+                    input_data["browser"] = _WORKSPACE_BROWSER
+                input_data["workspace_service"] = expanded.workspace_service
+                # Override capability to workspace handler (API + browser)
+                capability = "handle_workspace_query"
+                fallback = "computer_use"
+            elif expanded.target_app:
                 input_data["app_name"] = expanded.target_app
                 input_data["target_app"] = expanded.target_app
 
@@ -974,6 +1009,7 @@ Generate a JSON list of 3-7 executable tasks."""
                 estimated_duration_seconds=task_data.get("estimated_duration_seconds", 30),
                 dependencies=[],
                 category=intent,
+                workspace_service=task_data.get("workspace_service"),
             ))
 
         return PredictionResult(
