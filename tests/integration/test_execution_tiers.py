@@ -683,3 +683,50 @@ class TestNativeAppControlAgent:
         combined = (result.get("error", "") + result.get("final_message", "")).lower()
         assert "not installed" in combined
         assert result["steps_taken"] == 0
+
+    # ------------------------------------------------------------------
+    # Post-action verification — Task 4
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_verify_action_returns_true_when_no_vision(self, agent) -> None:
+        """_verify_action returns True when no vision model is reachable.
+
+        With no ANTHROPIC_API_KEY and J-Prime unavailable (both raise exceptions),
+        the method must fall back to True so the main loop is never blocked.
+        """
+        import os
+        from unittest.mock import AsyncMock, patch
+
+        agent._initialized = True
+
+        # Patch _take_screenshot to return a minimal fake JPEG b64 string
+        fake_b64 = "AAAA"  # not a real image, but enough to pass the None guard
+
+        with patch.object(agent, "_take_screenshot", new=AsyncMock(return_value=fake_b64)):
+            # Ensure no API key so Claude path is skipped
+            with patch.dict(os.environ, {"ANTHROPIC_API_KEY": ""}, clear=False):
+                # Make get_prime_client raise to skip J-Prime path
+                with patch(
+                    "backend.neural_mesh.agents.native_app_control_agent.asyncio.wait_for",
+                    side_effect=Exception("prime unavailable"),
+                ):
+                    result = await agent._verify_action(
+                        app_name="TestApp",
+                        action_description="Click the save button",
+                        expected_result="File saved",
+                        max_retries=0,
+                    )
+
+        assert result is True
+
+    def test_native_agent_has_verify_method(self, agent) -> None:
+        """NativeAppControlAgent must expose a _verify_action coroutine method."""
+        import inspect
+
+        assert hasattr(agent, "_verify_action"), (
+            "_verify_action method is missing from NativeAppControlAgent"
+        )
+        assert inspect.iscoroutinefunction(agent._verify_action), (
+            "_verify_action must be an async def coroutine"
+        )

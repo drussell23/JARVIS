@@ -9,11 +9,14 @@ Drives installed macOS applications using a vision-action loop:
   4. Send screenshot + goal to J-Prime vision server (free) for next-action
      inference; falls back to Claude API (paid) when J-Prime is unavailable.
   5. Execute the decided action (click / type / key / scroll).
-  6. Repeat until the goal is achieved or max steps is reached.
+  6. Verify the action succeeded via a post-action screenshot + vision check.
+  7. Repeat until the goal is achieved or max steps is reached.
 
 Configuration (all via environment variables — no hardcoding):
-  JARVIS_NATIVE_CONTROL_MAX_STEPS   — maximum loop iterations (default 10)
-  JARVIS_NATIVE_CONTROL_STEP_DELAY  — seconds to wait between steps (default 1.0)
+  JARVIS_NATIVE_CONTROL_MAX_STEPS       — maximum loop iterations (default 10)
+  JARVIS_NATIVE_CONTROL_STEP_DELAY      — seconds to wait between steps (default 1.0)
+  JARVIS_VISION_VERIFY_ACTIONS          — enable post-action verification (default "true")
+  JARVIS_VISION_VERIFY_MAX_RETRIES      — verification retry limit per action (default "2")
 """
 
 from __future__ import annotations
@@ -30,6 +33,27 @@ from typing import Any, Dict, List, Optional
 from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Env-var helpers
+# ---------------------------------------------------------------------------
+
+def _env_bool(key: str, default: bool) -> bool:
+    val = os.getenv(key, "").lower()
+    if val in ("true", "1", "yes"):
+        return True
+    if val in ("false", "0", "no"):
+        return False
+    return default
+
+
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.getenv(key, str(default)))
+    except (ValueError, TypeError):
+        return default
+
 
 # ---------------------------------------------------------------------------
 # Key code map for AppleScript key press — dynamically configurable via env
@@ -380,6 +404,27 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                         "[NativeAppControlAgent] Action error at step %d: %s",
                         step_idx + 1, exc,
                     )
+
+                # --- Post-action verification --------------------------------
+                if action_type != "done" and _env_bool(
+                    "JARVIS_VISION_VERIFY_ACTIONS", True
+                ):
+                    max_retries = _env_int("JARVIS_VISION_VERIFY_MAX_RETRIES", 2)
+                    verified = await self._verify_action(
+                        app_name=app_name,
+                        action_description=msg,
+                        expected_result=current_step,
+                        max_retries=max_retries,
+                    )
+                    if not verified:
+                        logger.warning(
+                            "[NativeAppControlAgent] Action verification failed for "
+                            "step %d: %s",
+                            step_idx + 1,
+                            msg,
+                        )
+                        # Don't break — let the vision model see the current state
+                        # and decide what to do next on the next iteration.
 
                 await asyncio.sleep(step_delay)
 
@@ -906,3 +951,150 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
             logger.warning(
                 "[NativeAppControlAgent] Scroll via AppleScript failed: %s", exc
             )
+
+    # ------------------------------------------------------------------
+    # Post-action verification
+    # ------------------------------------------------------------------
+
+    async def _verify_action(
+        self,
+        app_name: str,
+        action_description: str,
+        expected_result: str,
+        max_retries: int = 2,
+    ) -> bool:
+        """Verify that the previous action succeeded by taking a post-action screenshot.
+
+        Queries J-Prime vision (free) first, then Claude API (paid fallback).
+        If no vision model is reachable the method returns True so the main loop
+        is never blocked by an unavailable verifier.
+
+        Args:
+            app_name:           The macOS application being controlled.
+            action_description: Human-readable description of the action that was taken.
+            expected_result:    The plan step whose completion is being verified.
+            max_retries:        How many additional attempts to make if verification
+                                returns False (not counting the initial check).
+
+        Returns:
+            True when verified (or when no model is available), False when all
+            attempts conclude the action did not succeed.
+        """
+        await asyncio.sleep(0.5)  # Wait for UI to update
+
+        import re as _re
+
+        verify_prompt = (
+            f"I just performed this action in {app_name}: {action_description}\n"
+            f"The expected result is: {expected_result}\n\n"
+            f"Look at the screenshot. Did the action succeed? "
+            f'Respond with JSON: {{"verified": true/false, "reason": "..."}}'
+        )
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                logger.debug(
+                    "[NativeAppControlAgent] Verification retry %d/%d for: %s",
+                    attempt, max_retries, action_description,
+                )
+                await asyncio.sleep(0.5)
+
+            screenshot_b64 = await self._take_screenshot()
+            if not screenshot_b64:
+                logger.debug(
+                    "[NativeAppControlAgent] Verification skipped — screenshot unavailable."
+                )
+                return True  # Can't verify; don't block the loop
+
+            # --- Attempt 1: J-Prime vision server ---
+            try:
+                from backend.core.prime_client import get_prime_client
+
+                client = await asyncio.wait_for(get_prime_client(), timeout=5.0)
+                vision_ok = await asyncio.wait_for(client.get_vision_health(), timeout=5.0)
+                if vision_ok:
+                    response = await asyncio.wait_for(
+                        client.send_vision_request(
+                            image_base64=screenshot_b64,
+                            prompt=verify_prompt,
+                            max_tokens=100,
+                            temperature=0.0,
+                        ),
+                        timeout=30.0,
+                    )
+                    if response and response.content:
+                        match = _re.search(r'\{[\s\S]*\}', response.content)
+                        if match:
+                            data = json.loads(match.group())
+                            verified = bool(data.get("verified", False))
+                            logger.debug(
+                                "[NativeAppControlAgent] J-Prime verification=%s reason=%s",
+                                verified, data.get("reason", ""),
+                            )
+                            if verified:
+                                return True
+                            continue  # Retry
+            except Exception as exc:
+                logger.debug(
+                    "[NativeAppControlAgent] Verification via J-Prime failed: %s", exc
+                )
+
+            # --- Attempt 2: Claude API fallback ---
+            try:
+                import anthropic
+
+                api_key = os.getenv("ANTHROPIC_API_KEY", "")
+                if api_key:
+                    claude_client = anthropic.AsyncAnthropic(api_key=api_key)
+                    model = os.getenv(
+                        "JARVIS_NATIVE_CONTROL_CLAUDE_MODEL", "claude-sonnet-4-20250514"
+                    )
+                    claude_msg = await asyncio.wait_for(
+                        claude_client.messages.create(
+                            model=model,
+                            max_tokens=100,
+                            messages=[
+                                {
+                                    "role": "user",
+                                    "content": [
+                                        {
+                                            "type": "image",
+                                            "source": {
+                                                "type": "base64",
+                                                "media_type": "image/jpeg",
+                                                "data": screenshot_b64,
+                                            },
+                                        },
+                                        {"type": "text", "text": verify_prompt},
+                                    ],
+                                }
+                            ],
+                        ),
+                        timeout=30.0,
+                    )
+                    if claude_msg.content:
+                        match = _re.search(r'\{[\s\S]*\}', claude_msg.content[0].text)
+                        if match:
+                            data = json.loads(match.group())
+                            verified = bool(data.get("verified", False))
+                            logger.debug(
+                                "[NativeAppControlAgent] Claude verification=%s reason=%s",
+                                verified, data.get("reason", ""),
+                            )
+                            if verified:
+                                return True
+                            continue  # Retry
+            except Exception as exc:
+                logger.debug(
+                    "[NativeAppControlAgent] Verification via Claude failed: %s", exc
+                )
+
+            # Neither model is available for this attempt — assume success
+            logger.debug(
+                "[NativeAppControlAgent] No vision model available for verification; "
+                "assuming success."
+            )
+            return True
+
+        # All retries exhausted without a positive verification
+        return False

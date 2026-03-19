@@ -10,8 +10,9 @@ Architecture:
   3. Screenshot the current page via page.screenshot().
   4. Send screenshot + goal to J-Prime vision server for next action.
   5. Execute the action: click, fill, type, press, scroll, navigate.
-  6. Repeat until goal achieved or max steps exhausted.
-  7. If J-Prime is unavailable, fall back to Claude API (paid tier).
+  6. Verify the action succeeded via a post-action screenshot + vision check.
+  7. Repeat until goal achieved or max steps exhausted.
+  8. If J-Prime is unavailable, fall back to Claude API (paid tier).
 
 All configuration is env-var driven — nothing is hard-coded.
 
@@ -19,6 +20,10 @@ Agent identity:
   name:  visual_browser_agent
   type:  autonomy
   caps:  {visual_browser, browse_and_interact}
+
+Additional env vars:
+  JARVIS_VISION_VERIFY_ACTIONS      — enable post-action verification (default "true")
+  JARVIS_VISION_VERIFY_MAX_RETRIES  — verification retry limit per action (default "2")
 """
 
 from __future__ import annotations
@@ -359,7 +364,25 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
                 )
                 actions_taken[-1]["error"] = str(act_err)
 
-            # 5. Delay so the user can see what's happening
+            # 5. Post-action verification
+            if _env_bool("JARVIS_VISION_VERIFY_ACTIONS", True):
+                max_retries = _env_int("JARVIS_VISION_VERIFY_MAX_RETRIES", 2)
+                verified = await self._verify_action(
+                    page=page,
+                    action_description=message,
+                    expected_result=goal,
+                    max_retries=max_retries,
+                )
+                if not verified:
+                    logger.warning(
+                        "[VBA] Action verification failed on step %d: %s",
+                        step, message,
+                    )
+                    actions_taken[-1]["verified"] = False
+                else:
+                    actions_taken[-1]["verified"] = True
+
+            # 6. Delay so the user can see what's happening
             if self._step_delay > 0:
                 await asyncio.sleep(self._step_delay)
 
@@ -684,3 +707,106 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
                 self._playwright = None
 
         logger.info("[VBA] Playwright browser closed")
+
+    # ------------------------------------------------------------------
+    # Post-action verification
+    # ------------------------------------------------------------------
+
+    async def _verify_action(
+        self,
+        page: Any,
+        action_description: str,
+        expected_result: str,
+        max_retries: int = 2,
+    ) -> bool:
+        """Verify that the previous browser action succeeded.
+
+        Takes a post-action page screenshot and asks the vision model whether
+        the action had the intended effect.  Falls back to True when no model
+        is reachable so the main loop is never blocked.
+
+        Args:
+            page:               Playwright Page object to capture the screenshot from.
+            action_description: Human-readable description of the action taken.
+            expected_result:    The overall goal being worked toward.
+            max_retries:        Additional attempts after the initial check.
+
+        Returns:
+            True when verified (or no model available), False after all retries fail.
+        """
+        await asyncio.sleep(0.5)  # Wait for browser UI to settle
+
+        import re as _re
+
+        verify_prompt = (
+            f"I just performed this browser action: {action_description}\n"
+            f"The overall goal is: {expected_result}\n\n"
+            f"Look at the screenshot. Did the action succeed? "
+            f'Respond with JSON: {{"verified": true/false, "reason": "..."}}'
+        )
+
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                logger.debug(
+                    "[VBA] Verification retry %d/%d for: %s",
+                    attempt, max_retries, action_description,
+                )
+                await asyncio.sleep(0.5)
+
+            # Capture post-action screenshot via Playwright
+            try:
+                screenshot_bytes = await page.screenshot(
+                    type="jpeg",
+                    quality=self._screenshot_quality,
+                    full_page=False,
+                )
+            except Exception as ss_err:
+                logger.debug("[VBA] Verification screenshot failed: %s", ss_err)
+                return True  # Can't verify; don't block the loop
+
+            screenshot_b64 = base64.b64encode(screenshot_bytes).decode("ascii")
+
+            # --- Attempt: J-Prime vision server ---
+            try:
+                response_text = await self._ask_jprime(screenshot_b64, verify_prompt)
+                if response_text:
+                    match = _re.search(r'\{[\s\S]*\}', response_text)
+                    if match:
+                        data = json.loads(match.group())
+                        verified = bool(data.get("verified", False))
+                        logger.debug(
+                            "[VBA] J-Prime verification=%s reason=%s",
+                            verified, data.get("reason", ""),
+                        )
+                        if verified:
+                            return True
+                        continue  # Retry
+            except Exception as exc:
+                logger.debug("[VBA] Verification via J-Prime failed: %s", exc)
+
+            # --- Attempt: Claude API fallback ---
+            try:
+                response_text = await self._ask_claude(screenshot_b64, verify_prompt)
+                if response_text:
+                    match = _re.search(r'\{[\s\S]*\}', response_text)
+                    if match:
+                        data = json.loads(match.group())
+                        verified = bool(data.get("verified", False))
+                        logger.debug(
+                            "[VBA] Claude verification=%s reason=%s",
+                            verified, data.get("reason", ""),
+                        )
+                        if verified:
+                            return True
+                        continue  # Retry
+            except Exception as exc:
+                logger.debug("[VBA] Verification via Claude failed: %s", exc)
+
+            # No model available for this attempt — assume success
+            logger.debug(
+                "[VBA] No vision model available for verification; assuming success."
+            )
+            return True
+
+        # All retries exhausted without a positive verification
+        return False
