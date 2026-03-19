@@ -345,11 +345,17 @@ class PrimeRouter:
         self._mirror_decisions_issued: int = 0
         # Cloud Run endpoint detection patterns
         self._cloud_run_patterns = (".run.app", ".a.run.app")
+        # v298.0: VMLifecycleManager integration
+        self._lifecycle: Optional[object] = None  # VMLifecycleManager
 
     def _is_cloud_run_endpoint(self, host: Optional[str] = None) -> bool:
         """Detect if the given (or current GCP) host is a Cloud Run endpoint."""
         h = host or self._gcp_host or ""
         return any(h.endswith(pat) for pat in self._cloud_run_patterns)
+
+    def set_lifecycle_manager(self, lifecycle: object) -> None:
+        """Wire VMLifecycleManager for activity classification."""
+        self._lifecycle = lifecycle
 
     @staticmethod
     def _classify_protection_error(metadata: Dict[str, Any]) -> str:
@@ -932,13 +938,20 @@ class PrimeRouter:
                     # Gap 2: Record activity at request START so long-running generations
                     # (e.g., 60s+ codegen) don't falsely trigger idle-stop mid-stream.
                     # Idle timeout measures silence, not active generation time.
-                    try:
-                        from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
-                        _vm_mgr_pre = await get_gcp_vm_manager_safe()
-                        if _vm_mgr_pre is not None:
-                            _vm_mgr_pre.record_jprime_activity()
-                    except Exception:
-                        pass
+                    # v298.0: Use VMLifecycleManager if wired, otherwise fall back to gcp_vm_manager.
+                    if self._lifecycle is not None:
+                        try:
+                            self._lifecycle.record_activity_from("prime_client.execute_request")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                            _vm_mgr_pre = await get_gcp_vm_manager_safe()
+                            if _vm_mgr_pre is not None:
+                                _vm_mgr_pre.record_jprime_activity()
+                        except Exception:
+                            pass
                     response = await asyncio.wait_for(
                         self._generate_local(
                             prompt, system_prompt, context, max_tokens, temperature, **kwargs
@@ -948,13 +961,20 @@ class PrimeRouter:
                     self._local_circuit.record_success()
                     # Reset J-Prime idle timer so the VM is not stopped during active sessions.
                     # Best-effort: import failure or missing singleton must never block inference.
-                    try:
-                        from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
-                        _vm_mgr = await get_gcp_vm_manager_safe()
-                        if _vm_mgr is not None:
-                            _vm_mgr.record_jprime_activity()
-                    except Exception:
-                        pass
+                    # v298.0: Use VMLifecycleManager if wired, otherwise fall back to gcp_vm_manager.
+                    if self._lifecycle is not None:
+                        try:
+                            self._lifecycle.record_activity_from("prime_client.execute_request")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                            _vm_mgr = await get_gcp_vm_manager_safe()
+                            if _vm_mgr is not None:
+                                _vm_mgr.record_jprime_activity()
+                        except Exception:
+                            pass
                 except Exception as e:
                     self._local_circuit.record_failure(
                         endpoint_id=f"gcp:{self._gcp_host}:{self._gcp_port}" if self._gcp_host else None

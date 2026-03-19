@@ -125,6 +125,8 @@ class StartupOrchestrator:
         # that first transitioned it.  Duplicate calls with a matching key
         # are no-ops; mismatched keys signal unexpected retries.
         self._phase_idempotency_keys: Dict[str, str] = {}
+        # v298.0: VMLifecycleManager integration
+        self._lifecycle: Optional[object] = None  # VMLifecycleManager
 
     # -- Properties ------------------------------------------------------------
 
@@ -157,6 +159,17 @@ class StartupOrchestrator:
     def event_history(self) -> List[StartupEvent]:
         """All telemetry events emitted by this orchestrator."""
         return self._event_bus.event_history
+
+    def set_lifecycle_manager(self, lifecycle: object) -> None:
+        """Wire VMLifecycleManager. Called once before acquire_gcp_lease()."""
+        self._lifecycle = lifecycle
+
+    @property
+    def boot_mode_record(self) -> Optional[object]:
+        """BootModeRecord if DEGRADED, else None."""
+        if self._lifecycle is not None:
+            return self._lifecycle.boot_mode_record
+        return None
 
     # -- Phase gate methods ----------------------------------------------------
 
@@ -259,6 +272,11 @@ class StartupOrchestrator:
         On failure, signals the routing policy that the handshake failed
         and emits a ``lease_probe`` event with failure classification.
         """
+        if self._lifecycle is not None:
+            from backend.core.vm_lifecycle_manager import VMFsmState
+            if hasattr(self._lifecycle, 'state') and self._lifecycle.state == VMFsmState.COLD:
+                await self._lifecycle.ensure_warmed(reason="lease_request")
+
         success = await self._lease.acquire(
             host,
             port,
