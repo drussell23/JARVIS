@@ -200,6 +200,10 @@ core.*
 !docs/core/
 !docs/core/**
 !docs/core/**/*
+# Exception: Allow tests/core directory (integration/unit tests for backend/core)
+!tests/core/
+!tests/core/**
+!tests/core/**/*
 # Exception: Allow tests/unit/core directory (unit tests for backend/core)
 !tests/unit/core/
 !tests/unit/core/**
