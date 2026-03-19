@@ -33,6 +33,7 @@ class TestStartupPhaseEnum:
         assert phases == [
             StartupPhase.PREWARM_GCP,
             StartupPhase.CORE_SERVICES,
+            StartupPhase.BOOT_CONTRACT_VALIDATION,
             StartupPhase.CORE_READY,
             StartupPhase.DEFERRED_COMPONENTS,
         ]
@@ -40,7 +41,8 @@ class TestStartupPhaseEnum:
     def test_each_phase_has_dependencies(self):
         assert StartupPhase.PREWARM_GCP.dependencies == ()
         assert StartupPhase.CORE_SERVICES.dependencies == (StartupPhase.PREWARM_GCP,)
-        assert StartupPhase.CORE_READY.dependencies == (StartupPhase.CORE_SERVICES,)
+        assert StartupPhase.BOOT_CONTRACT_VALIDATION.dependencies == (StartupPhase.CORE_SERVICES,)
+        assert StartupPhase.CORE_READY.dependencies == (StartupPhase.BOOT_CONTRACT_VALIDATION,)
         assert StartupPhase.DEFERRED_COMPONENTS.dependencies == (StartupPhase.CORE_READY,)
 
 
@@ -83,11 +85,14 @@ class TestGateCoordinatorBasic:
         r2 = coordinator.resolve(StartupPhase.CORE_SERVICES)
         assert r2.status == GateStatus.PASSED
 
-        r3 = coordinator.resolve(StartupPhase.CORE_READY)
+        r3 = coordinator.resolve(StartupPhase.BOOT_CONTRACT_VALIDATION)
         assert r3.status == GateStatus.PASSED
 
-        r4 = coordinator.resolve(StartupPhase.DEFERRED_COMPONENTS)
+        r4 = coordinator.resolve(StartupPhase.CORE_READY)
         assert r4.status == GateStatus.PASSED
+
+        r5 = coordinator.resolve(StartupPhase.DEFERRED_COMPONENTS)
+        assert r5.status == GateStatus.PASSED
 
     def test_skip_gate(self, coordinator: PhaseGateCoordinator):
         result = coordinator.skip(StartupPhase.PREWARM_GCP, reason="not needed")

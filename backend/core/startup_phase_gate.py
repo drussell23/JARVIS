@@ -42,6 +42,7 @@ class StartupPhase(Enum):
 
     PREWARM_GCP = "prewarm_gcp"
     CORE_SERVICES = "core_services"
+    BOOT_CONTRACT_VALIDATION = "boot_contract_validation"
     CORE_READY = "core_ready"
     DEFERRED_COMPONENTS = "deferred_components"
 
@@ -53,10 +54,11 @@ class StartupPhase(Enum):
 
 # Dependency graph — kept outside the enum body for clarity.
 _PHASE_DEPS: Dict[StartupPhase, Tuple[StartupPhase, ...]] = {
-    StartupPhase.PREWARM_GCP: (),
-    StartupPhase.CORE_SERVICES: (StartupPhase.PREWARM_GCP,),
-    StartupPhase.CORE_READY: (StartupPhase.CORE_SERVICES,),
-    StartupPhase.DEFERRED_COMPONENTS: (StartupPhase.CORE_READY,),
+    StartupPhase.PREWARM_GCP:              (),
+    StartupPhase.CORE_SERVICES:            (StartupPhase.PREWARM_GCP,),
+    StartupPhase.BOOT_CONTRACT_VALIDATION: (StartupPhase.CORE_SERVICES,),
+    StartupPhase.CORE_READY:               (StartupPhase.BOOT_CONTRACT_VALIDATION,),
+    StartupPhase.DEFERRED_COMPONENTS:      (StartupPhase.CORE_READY,),
 }
 
 
