@@ -32,20 +32,34 @@ def csv_to_html(csv_text):
     rows = list(reader)
     if not rows:
         return ""
-    out = '<table><thead><tr>'
-    for h in rows[0]:
-        out += "<th>" + h + "</th>"
-    out += "</tr></thead><tbody>"
+
+    # Determine which columns are numeric by checking data rows
+    num_cols = set()
     for row in rows[1:]:
-        out += "<tr>"
-        for cell in row:
-            cls = ""
+        for i, cell in enumerate(row):
             try:
                 float(cell)
-                cls = ' class="num"'
+                num_cols.add(i)
             except ValueError:
                 pass
-            out += "<td" + cls + ">" + cell + "</td>"
+
+    # Build header with matching alignment
+    out = '<table><thead><tr>'
+    for i, h in enumerate(rows[0]):
+        if i in num_cols:
+            out += '<th class="num">' + h + "</th>"
+        else:
+            out += "<th>" + h + "</th>"
+    out += "</tr></thead><tbody>"
+
+    # Build data rows
+    for row in rows[1:]:
+        out += "<tr>"
+        for i, cell in enumerate(row):
+            if i in num_cols:
+                out += '<td class="num">' + cell + "</td>"
+            else:
+                out += "<td>" + cell + "</td>"
         out += "</tr>"
     out += "</tbody></table>"
     return out
