@@ -77,6 +77,7 @@ from ..data_models import (
     KnowledgeType,
     MessageType,
     MessagePriority,
+    WorkflowTask,
 )
 
 logger = logging.getLogger(__name__)
@@ -470,6 +471,19 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
             return await self.detect_intent(query)
         elif action == "get_context":
             return await self.get_prediction_context(payload.get("query", ""))
+        elif action == "plan_to_workflow":
+            query = payload.get("query", "")
+            prediction, tasks = await self.plan_to_workflow(query)
+            return {
+                "prediction": {
+                    "original_query": prediction.original_query,
+                    "detected_intent": prediction.detected_intent.value,
+                    "confidence": prediction.confidence,
+                    "reasoning": prediction.reasoning,
+                    "goals": prediction.goals,
+                },
+                "workflow_tasks": tasks,
+            }
         else:
             raise ValueError(f"Unknown action: {action}")
 
@@ -525,7 +539,7 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
         # Store in knowledge graph
         if self.knowledge_graph:
             await self.add_knowledge(
-                knowledge_type=KnowledgeType.LEARNING,
+                knowledge_type=KnowledgeType.PATTERN,
                 data={
                     "type": "intent_expansion",
                     "query": query,
@@ -557,6 +571,195 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
             await self._narrate_prediction(result)
 
         return result
+
+    # =========================================================================
+    # Wire 2: ExpandedTask → WorkflowTask Bridge
+    # =========================================================================
+
+    # Capability routing table — maps goal keywords to agent capabilities.
+    # Order matters: first match wins. Loaded once, never hardcoded per-task.
+    _CAPABILITY_ROUTES: List[Tuple[List[str], str, Optional[str]]] = [
+        # (keywords, primary_capability, fallback_capability)
+        # Workspace operations → GoogleWorkspaceAgent
+        (
+            ["email", "inbox", "mail", "unread", "gmail", "send email", "draft"],
+            "handle_workspace_query",
+            "computer_use",
+        ),
+        (
+            ["calendar", "schedule", "meeting", "event", "agenda", "appointment"],
+            "handle_workspace_query",
+            "computer_use",
+        ),
+        (
+            ["contact", "phone number", "email address"],
+            "handle_workspace_query",
+            "computer_use",
+        ),
+        (
+            ["briefing", "daily summary", "catch me up"],
+            "handle_workspace_query",
+            "computer_use",
+        ),
+        # Web operations → WebSearchAgent
+        (
+            ["search", "look up", "google", "find online", "browse", "research"],
+            "web_search",
+            "computer_use",
+        ),
+        # Screen operations → VisualMonitorAgent / ComputerUseAgent
+        (
+            ["screenshot", "capture screen", "what's on screen"],
+            "screen_capture",
+            "computer_use",
+        ),
+        # Error/debug → ErrorAnalyzerAgent
+        (
+            ["debug", "error", "fix bug", "traceback", "exception"],
+            "error_detection",
+            "knowledge_query",
+        ),
+    ]
+
+    def _map_goal_to_capability(
+        self,
+        task: "ExpandedTask",
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Map an ExpandedTask's goal to an agent capability.
+
+        Resolution order:
+        1. Keyword match against _CAPABILITY_ROUTES
+        2. If target_app is set → "switch_to_app" (SpatialAwarenessAgent)
+        3. Fallback → "computer_use" (ComputerUseAgent as universal executor)
+
+        Returns:
+            (primary_capability, fallback_capability)
+        """
+        goal_lower = task.goal.lower()
+
+        # 1. Check keyword routes
+        for keywords, capability, fallback in self._CAPABILITY_ROUTES:
+            if any(kw in goal_lower for kw in keywords):
+                return capability, fallback
+
+        # 2. If task targets a specific app, use spatial awareness to switch
+        if task.target_app:
+            return "switch_to_app", "computer_use"
+
+        # 3. Universal fallback — ComputerUseAgent can do anything visually
+        return "computer_use", None
+
+    def _map_priority_to_message_priority(self, priority: int) -> MessagePriority:
+        """Map ExpandedTask priority (1=highest) to MessagePriority enum."""
+        if priority <= 1:
+            return MessagePriority.HIGH
+        elif priority <= 3:
+            return MessagePriority.NORMAL
+        else:
+            return MessagePriority.LOW
+
+    def to_workflow_tasks(
+        self,
+        prediction: "PredictionResult",
+    ) -> List[WorkflowTask]:
+        """
+        Convert a PredictionResult into WorkflowTask objects ready for
+        the MultiAgentOrchestrator.
+
+        This is the bridge between the Psychic Brain (planning) and
+        the Parallel Muscle (execution).
+
+        Handles:
+        - Goal → capability mapping (keyword routes → app switch → computer use)
+        - Priority → MessagePriority conversion
+        - Dependency resolution (goal-string deps → task_id deps)
+        - Timeout from estimated_duration (with 2x safety margin)
+
+        Args:
+            prediction: Result from expand_intent()
+
+        Returns:
+            List of WorkflowTask objects with proper capabilities and dependencies
+        """
+        workflow_tasks: List[WorkflowTask] = []
+        # Map goal strings to task IDs for dependency resolution
+        goal_to_task_id: Dict[str, str] = {}
+
+        # First pass: create tasks and record goal→task_id mapping
+        for expanded in prediction.expanded_tasks:
+            capability, fallback = self._map_goal_to_capability(expanded)
+
+            # Build input_data with everything the agent needs
+            input_data: Dict[str, Any] = {
+                "goal": expanded.goal,
+                "query": expanded.goal,  # Agents that expect "query" key
+            }
+            if expanded.target_app:
+                input_data["app_name"] = expanded.target_app
+                input_data["target_app"] = expanded.target_app
+
+            # Add prediction context for agents that need it
+            input_data["intent"] = prediction.detected_intent.value
+            input_data["original_query"] = prediction.original_query
+
+            wf_task = WorkflowTask(
+                name=expanded.goal[:80],
+                description=expanded.goal,
+                required_capability=capability,
+                input_data=input_data,
+                timeout_seconds=max(
+                    expanded.estimated_duration_seconds * 2.0,
+                    10.0,
+                ),
+                fallback_capability=fallback,
+                priority=self._map_priority_to_message_priority(expanded.priority),
+            )
+
+            workflow_tasks.append(wf_task)
+            goal_to_task_id[expanded.goal] = wf_task.task_id
+
+        # Second pass: resolve goal-string dependencies to task_id dependencies
+        for expanded, wf_task in zip(prediction.expanded_tasks, workflow_tasks):
+            for dep_goal in expanded.dependencies:
+                dep_task_id = goal_to_task_id.get(dep_goal)
+                if dep_task_id:
+                    wf_task.dependencies.append(dep_task_id)
+                else:
+                    logger.warning(
+                        "Dependency '%s' not found in expanded tasks for '%s'",
+                        dep_goal,
+                        expanded.goal,
+                    )
+
+        logger.info(
+            "Converted %d expanded tasks → %d workflow tasks "
+            "(capabilities: %s)",
+            len(prediction.expanded_tasks),
+            len(workflow_tasks),
+            ", ".join(t.required_capability for t in workflow_tasks),
+        )
+
+        return workflow_tasks
+
+    async def plan_to_workflow(
+        self,
+        query: str,
+    ) -> Tuple["PredictionResult", List[WorkflowTask]]:
+        """
+        End-to-end: expand a user intent and convert to executable workflow.
+
+        Convenience method that chains expand_intent() → to_workflow_tasks().
+
+        Args:
+            query: User's natural language command
+
+        Returns:
+            (prediction_result, workflow_tasks) — both for logging/audit
+        """
+        prediction = await self.expand_intent(query)
+        tasks = self.to_workflow_tasks(prediction)
+        return prediction, tasks
 
     async def detect_intent(self, query: str) -> Tuple[IntentCategory, float]:
         """

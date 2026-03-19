@@ -153,6 +153,18 @@ class MultiAgentOrchestrator:
             return
 
         self._running = True
+
+        # Wire 4: Subscribe to proactive intents from background agents
+        try:
+            await self.bus.subscribe(
+                agent_name="orchestrator",
+                message_type=MessageType.PROACTIVE_INTENT,
+                callback=self._handle_proactive_intent,
+            )
+            logger.info("Subscribed to PROACTIVE_INTENT messages")
+        except Exception as e:
+            logger.debug("Could not subscribe to PROACTIVE_INTENT: %s", e)
+
         logger.info("MultiAgentOrchestrator started")
 
     async def stop(self) -> None:
@@ -269,6 +281,13 @@ class MultiAgentOrchestrator:
                 workflow_time_ms,
                 len(workflow.completed_tasks),
                 len(tasks),
+            )
+
+            # Wire 3: Emit experience to Trinity for Reactor learning.
+            # Fire-and-forget — never blocks workflow completion.
+            asyncio.create_task(
+                self._emit_trinity_experience(result, context),
+                name=f"trinity_exp_{workflow_id[:8]}",
             )
 
             return result
@@ -418,13 +437,32 @@ class MultiAgentOrchestrator:
             logger.error("Task %s rejected: empty required_capability", task.task_id[:8])
             return None
 
-        # Find capable agent
+        # Find capable agent — 3-tier resolution:
+        # 1. Primary capability
+        # 2. Fallback capability (if set)
+        # 3. ComputerUseAgent as universal last resort
         agent = await self.registry.get_best_agent(action)
 
-        if not agent:
-            # Try fallback capability
-            if task.fallback_capability:
-                agent = await self.registry.get_best_agent(task.fallback_capability)
+        if not agent and task.fallback_capability:
+            agent = await self.registry.get_best_agent(task.fallback_capability)
+            if agent:
+                logger.info(
+                    "Task %s: primary '%s' unavailable, using fallback '%s'",
+                    task.task_id[:8],
+                    action,
+                    task.fallback_capability,
+                )
+
+        if not agent and action != "computer_use":
+            # Wire 5: ComputerUseAgent as universal fallback —
+            # anything an agent can do via API, ComputerUse can do visually
+            agent = await self.registry.get_best_agent("computer_use")
+            if agent:
+                logger.info(
+                    "Task %s: no agent for '%s', falling back to ComputerUseAgent",
+                    task.task_id[:8],
+                    action,
+                )
 
         if not agent:
             task.status = "failed"
@@ -517,7 +555,52 @@ class MultiAgentOrchestrator:
                 await asyncio.sleep(retry_delay)
                 retry_delay *= self.config.retry_backoff_multiplier
 
-        # All retries exhausted
+        # All retries exhausted with primary agent.
+        # Wire 5: Try ComputerUseAgent as visual fallback before giving up.
+        if agent.agent_name != "computer_use_agent":
+            cu_agent = await self.registry.get_best_agent("computer_use")
+            if cu_agent:
+                logger.info(
+                    "Task %s: primary agent '%s' exhausted retries, "
+                    "attempting ComputerUseAgent visual fallback",
+                    task.task_id[:8],
+                    agent.agent_name,
+                )
+                try:
+                    cu_message = AgentMessage(
+                        from_agent="orchestrator",
+                        to_agent=cu_agent.agent_name,
+                        message_type=MessageType.TASK_ASSIGNED,
+                        payload=payload,
+                        priority=task.priority,
+                    )
+                    result = await self.bus.request(
+                        cu_message,
+                        timeout=task.timeout_seconds,
+                    )
+
+                    # Visual fallback succeeded
+                    task.status = "completed"
+                    task.result = result
+                    task.completed_at = datetime.now()
+                    workflow.completed_tasks.add(task.task_id)
+                    workflow.task_results[task.task_id] = result
+                    self._metrics.tasks_succeeded += 1
+
+                    logger.info(
+                        "Task %s recovered via ComputerUseAgent visual fallback",
+                        task.task_id[:8],
+                    )
+                    return result
+
+                except Exception as cu_err:
+                    logger.warning(
+                        "Task %s: ComputerUseAgent fallback also failed: %s",
+                        task.task_id[:8],
+                        cu_err,
+                    )
+
+        # Truly exhausted — all paths failed
         task.status = "failed"
         task.error = f"Failed after {retry_count} attempts"
         task.completed_at = datetime.now()
@@ -728,6 +811,374 @@ class MultiAgentOrchestrator:
                 context=context,
             )
             return result.to_dict()
+
+    # =========================================================================
+    # Wire 2: Intent → Plan → Execute (via PredictivePlanningAgent)
+    # =========================================================================
+
+    async def plan_and_execute(
+        self,
+        query: str,
+        strategy: ExecutionStrategy = ExecutionStrategy.HYBRID,
+        timeout_seconds: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> WorkflowResult:
+        """
+        End-to-end: expand a user intent into tasks and execute them.
+
+        This is the primary entry point for turning natural language
+        commands into multi-agent workflows. It bridges:
+
+        PredictivePlanningAgent (Psychic Brain) → MultiAgentOrchestrator (Parallel Muscle)
+
+        Flow:
+        1. PredictivePlanningAgent.expand_intent(query) → PredictionResult
+        2. PredictivePlanningAgent.to_workflow_tasks(result) → List[WorkflowTask]
+        3. MultiAgentOrchestrator.execute_workflow(tasks) → WorkflowResult
+
+        Falls back to create_workflow_from_query() if the planning agent
+        is unavailable (graceful degradation).
+
+        Args:
+            query: Natural language command (e.g., "Start my day")
+            strategy: Execution strategy (default HYBRID for dependency-aware)
+            timeout_seconds: Overall workflow timeout
+            context: Additional context passed to all tasks
+
+        Returns:
+            WorkflowResult with all task outcomes
+        """
+        if not self._running:
+            raise RuntimeError("Orchestrator is not running")
+
+        # Try to get the PredictivePlanningAgent via registry
+        planning_agent = await self.registry.get_best_agent("expand_intent")
+
+        if planning_agent:
+            try:
+                # Single call: plan_to_workflow expands intent AND converts
+                # to WorkflowTask objects in one round-trip
+                plan_message = AgentMessage(
+                    from_agent="orchestrator",
+                    to_agent=planning_agent.agent_name,
+                    message_type=MessageType.TASK_ASSIGNED,
+                    payload={
+                        "action": "plan_to_workflow",
+                        "query": query,
+                    },
+                    priority=MessagePriority.HIGH,
+                )
+
+                planning_timeout = getattr(
+                    self.config, "planning_timeout_seconds", 15.0
+                )
+                plan_result = await self.bus.request(
+                    plan_message,
+                    timeout=planning_timeout,
+                )
+
+                # Extract workflow tasks and prediction metadata.
+                # Defensive: if the bus serialized WorkflowTask objects to
+                # dicts (e.g. JSON transport), reconstruct them here.
+                workflow_tasks: List[WorkflowTask] = []
+                prediction_data: Optional[Dict[str, Any]] = None
+
+                if isinstance(plan_result, dict):
+                    raw_tasks = plan_result.get("workflow_tasks", [])
+                    prediction_data = plan_result.get("prediction")
+
+                    for item in raw_tasks:
+                        if isinstance(item, WorkflowTask):
+                            workflow_tasks.append(item)
+                        elif isinstance(item, dict):
+                            # Reconstruct from serialized dict
+                            try:
+                                pri = item.get("priority", MessagePriority.NORMAL)
+                                if isinstance(pri, str):
+                                    pri = MessagePriority[pri.upper()]
+                                elif isinstance(pri, int):
+                                    pri = MessagePriority(pri)
+
+                                workflow_tasks.append(WorkflowTask(
+                                    task_id=item.get("task_id", str(uuid.uuid4())),
+                                    name=item.get("name", ""),
+                                    description=item.get("description", ""),
+                                    required_capability=item.get("required_capability", "general_processing"),
+                                    input_data=item.get("input_data", {}),
+                                    dependencies=item.get("dependencies", []),
+                                    timeout_seconds=item.get("timeout_seconds", 30.0),
+                                    retry_count=item.get("retry_count", 3),
+                                    retry_delay_seconds=item.get("retry_delay_seconds", 1.0),
+                                    fallback_capability=item.get("fallback_capability"),
+                                    priority=pri,
+                                ))
+                            except Exception as deser_err:
+                                logger.warning(
+                                    "plan_and_execute: failed to deserialize task dict: %s",
+                                    deser_err,
+                                )
+
+                if workflow_tasks:
+                    # Enrich context with prediction metadata
+                    enriched_context = dict(context or {})
+                    enriched_context["prediction"] = {
+                        "original_query": query,
+                        "source": planning_agent.agent_name,
+                    }
+                    if prediction_data:
+                        enriched_context["prediction"]["intent"] = prediction_data.get(
+                            "detected_intent", "unknown"
+                        )
+                        enriched_context["prediction"]["confidence"] = prediction_data.get(
+                            "confidence", 0.0
+                        )
+
+                    logger.info(
+                        "plan_and_execute: expanded '%s' into %d tasks via %s",
+                        query[:40],
+                        len(workflow_tasks),
+                        planning_agent.agent_name,
+                    )
+
+                    return await self.execute_workflow(
+                        name=f"Plan: {query[:50]}",
+                        tasks=workflow_tasks,
+                        strategy=strategy,
+                        timeout_seconds=timeout_seconds,
+                        context=enriched_context,
+                    )
+
+                logger.warning(
+                    "plan_and_execute: planning agent returned empty tasks, "
+                    "falling back to create_workflow_from_query"
+                )
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "plan_and_execute: planning agent timed out, "
+                    "falling back to create_workflow_from_query"
+                )
+            except Exception as e:
+                logger.warning(
+                    "plan_and_execute: planning agent failed (%s), "
+                    "falling back to create_workflow_from_query",
+                    e,
+                )
+
+        else:
+            logger.info(
+                "plan_and_execute: no planning agent registered, "
+                "using create_workflow_from_query"
+            )
+
+        # Graceful degradation: fall back to keyword-based task creation
+        tasks = await self.create_workflow_from_query(query, context)
+        if not tasks:
+            return WorkflowResult(
+                workflow_id=str(uuid.uuid4()),
+                name=f"Plan: {query[:50]}",
+                status="failed",
+                tasks=[],
+                metadata={"error": "Could not create tasks from query"},
+            )
+
+        return await self.execute_workflow(
+            name=f"Plan: {query[:50]}",
+            tasks=tasks,
+            strategy=strategy,
+            timeout_seconds=timeout_seconds,
+            context=context,
+        )
+
+    # =========================================================================
+    # Wire 3: Trinity Experience Pipeline Integration
+    # =========================================================================
+
+    async def _emit_trinity_experience(
+        self,
+        result: WorkflowResult,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Emit a completed workflow as a Trinity experience for Reactor learning.
+
+        Fire-and-forget — exceptions are logged, never propagated.
+        Uses the established Trinity event bus pattern (publish_raw) so
+        Reactor-Core can:
+        - Learn which task expansions succeed/fail
+        - Improve agent selection over time
+        - Detect patterns in multi-agent workflow outcomes
+        """
+        try:
+            from core.trinity_event_bus import get_event_bus_if_exists
+
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return
+
+            # Build experience payload with full workflow trace
+            task_traces = []
+            for task in result.tasks:
+                task_traces.append({
+                    "task_id": task.task_id,
+                    "name": task.name,
+                    "capability": task.required_capability,
+                    "fallback": task.fallback_capability,
+                    "status": task.status,
+                    "assigned_agent": task.assigned_agent,
+                    "execution_time_s": task.execution_time_seconds(),
+                    "error": task.error,
+                })
+
+            experience_payload: Dict[str, Any] = {
+                "workflow_id": result.workflow_id,
+                "workflow_name": result.name,
+                "status": result.status,
+                "tasks_total": len(result.tasks),
+                "tasks_succeeded": result.successful_tasks,
+                "tasks_failed": result.failed_tasks,
+                "execution_time_s": result.total_execution_time_seconds,
+                "task_traces": task_traces,
+            }
+
+            # Include prediction context if available
+            if context and isinstance(context, dict):
+                prediction = context.get("prediction")
+                if prediction and isinstance(prediction, dict):
+                    experience_payload["intent"] = prediction.get("intent")
+                    experience_payload["confidence"] = prediction.get("confidence")
+                    experience_payload["original_query"] = prediction.get(
+                        "original_query"
+                    )
+
+            await bus.publish_raw(
+                topic="workflow.completed",
+                data=experience_payload,
+            )
+
+            logger.debug(
+                "Trinity experience emitted for workflow %s (%s)",
+                result.workflow_id[:8],
+                result.status,
+            )
+
+        except ImportError:
+            pass  # Trinity event bus not available in this environment
+        except Exception as e:
+            logger.debug(
+                "Trinity experience emission failed for workflow %s: %s",
+                result.workflow_id[:8],
+                e,
+            )
+
+    # =========================================================================
+    # Wire 4: Proactive Intent Handler
+    # =========================================================================
+
+    async def _handle_proactive_intent(self, message: AgentMessage) -> None:
+        """Handle a proactive intent from a background perception agent.
+
+        Background agents (VisualMonitor, ActivityRecognition, etc.) publish
+        PROACTIVE_INTENT messages when they detect something actionable:
+        - "Meeting in 5 minutes" → meeting prep workflow
+        - "Error dialog on screen" → debug workflow
+        - "User idle for 30 min" → end-of-day suggestions
+        - "New Slack message from boss" → communication workflow
+
+        The intent is routed through plan_and_execute() for full multi-agent
+        expansion, or directly to a specific agent if the payload specifies one.
+
+        Payload format:
+            {
+                "intent": str,           # Natural language intent description
+                "source_agent": str,     # Which agent detected this
+                "confidence": float,     # 0.0-1.0
+                "urgency": str,          # "low", "normal", "high", "critical"
+                "context": dict,         # Agent-specific context
+            }
+        """
+        if not self._running:
+            return
+
+        payload = message.payload
+        intent = payload.get("intent", "")
+        source = payload.get("source_agent", message.from_agent)
+        confidence = payload.get("confidence", 0.5)
+        urgency = payload.get("urgency", "normal")
+
+        if not intent:
+            logger.debug("Ignoring empty proactive intent from %s", source)
+            return
+
+        # Confidence gate — don't act on low-confidence background detections
+        min_confidence = float(
+            getattr(self.config, "proactive_min_confidence", 0.7)
+        )
+        if confidence < min_confidence:
+            logger.debug(
+                "Proactive intent from %s below threshold (%.2f < %.2f): %s",
+                source,
+                confidence,
+                min_confidence,
+                intent[:60],
+            )
+            return
+
+        logger.info(
+            "Proactive intent from %s (confidence=%.2f, urgency=%s): %s",
+            source,
+            confidence,
+            urgency,
+            intent[:80],
+        )
+
+        # Map urgency to execution strategy
+        strategy = ExecutionStrategy.HYBRID
+        if urgency == "critical":
+            strategy = ExecutionStrategy.PARALLEL  # Fastest possible
+
+        try:
+            result = await self.plan_and_execute(
+                query=intent,
+                strategy=strategy,
+                context={
+                    "source": "proactive_intent",
+                    "source_agent": source,
+                    "confidence": confidence,
+                    "urgency": urgency,
+                    **(payload.get("context") or {}),
+                },
+            )
+
+            logger.info(
+                "Proactive workflow completed: %s (%d/%d tasks, %.1fs)",
+                result.status,
+                result.successful_tasks,
+                len(result.tasks),
+                result.total_execution_time_seconds,
+            )
+
+            # Narrate result to user if high urgency
+            if urgency in ("high", "critical"):
+                try:
+                    from backend.core.supervisor.unified_voice_orchestrator import (
+                        safe_say,
+                    )
+
+                    task_count = result.successful_tasks
+                    await safe_say(
+                        f"I noticed something and handled it — "
+                        f"completed {task_count} tasks proactively.",
+                        source="proactive_narration",
+                    )
+                except Exception:
+                    pass  # Narration is best-effort
+
+        except Exception as e:
+            logger.warning(
+                "Proactive intent execution failed for '%s': %s",
+                intent[:60],
+                e,
+            )
 
     def get_metrics(self) -> OrchestratorMetrics:
         """Get current orchestrator metrics."""

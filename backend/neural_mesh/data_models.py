@@ -116,6 +116,12 @@ class MessageType(Enum):
     SUBSCRIPTION = "subscription"  # v18.0: Topic subscription messages
     CUSTOM = "custom"
 
+    # Wire 4: Proactive Agent Triggers
+    # Background perception agents (VisualMonitor, ActivityRecognition) publish
+    # these when they detect something actionable. The orchestrator subscribes
+    # and routes through plan_and_execute().
+    PROACTIVE_INTENT = "proactive_intent"
+
 
 # ============================================================================
 # AGENT MESSAGE

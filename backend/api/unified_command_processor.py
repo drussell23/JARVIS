@@ -3561,6 +3561,16 @@ class UnifiedCommandProcessor:
             elif domain == "workspace":
                 return await self._handle_workspace_action(command_text, response, deadline=deadline)
             else:
+                # Wire 1: Unknown domain — try multi-agent plan_and_execute
+                # before falling back to returning J-Prime's raw text.
+                # This is where "Start my day", "Set up dev environment",
+                # etc. get expanded into parallel tasks.
+                _plan_result = await self._try_plan_and_execute(
+                    command_text, response=response, deadline=deadline,
+                )
+                if _plan_result is not None:
+                    return _plan_result
+
                 return {
                     "success": True,
                     "response": response.content,
@@ -3610,7 +3620,16 @@ class UnifiedCommandProcessor:
                 logger.debug(f"[v243] AgentRuntime routing failed, falling back: {e}")
 
             if not _used_runtime:
-                # Fallback to existing compound command handler
+                # Wire 1: Try plan_and_execute before compound command handler.
+                # The orchestrator uses PredictivePlanningAgent to expand the
+                # intent into parallel tasks with dependency resolution.
+                _plan_result = await self._try_plan_and_execute(
+                    command_text, response=response, deadline=deadline,
+                )
+                if _plan_result is not None:
+                    return _plan_result
+
+                # Final fallback to existing compound command handler
                 return await self._handle_compound_command(
                     command_text, context={"suggested_actions": response.suggested_actions},
                     deadline=deadline,
@@ -3632,6 +3651,103 @@ class UnifiedCommandProcessor:
             "command_type": "QUERY",
             "source": response.source,
         }
+
+    # =========================================================================
+    # Wire 1: plan_and_execute() bridge — routes compound/unknown-domain
+    # commands through PredictivePlanningAgent → MultiAgentOrchestrator.
+    # =========================================================================
+
+    async def _try_plan_and_execute(
+        self,
+        command_text: str,
+        response: Any = None,
+        deadline: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Attempt multi-agent plan-and-execute via Neural Mesh orchestrator.
+
+        Returns a standard process_command response dict on success,
+        or None if the orchestrator is unavailable (so caller can fall through).
+        """
+        coordinator = await self._get_neural_mesh_coordinator()
+        if coordinator is None:
+            return None
+
+        try:
+            orchestrator = coordinator.orchestrator
+        except (RuntimeError, AttributeError):
+            return None
+
+        if not getattr(orchestrator, '_running', False):
+            return None
+
+        # Propagate deadline as workflow timeout
+        timeout_seconds: Optional[float] = None
+        if deadline is not None:
+            import time as _t
+            remaining = deadline - _t.monotonic()
+            if remaining < 1.0:
+                return None  # Not enough budget for a multi-agent workflow
+            timeout_seconds = remaining
+
+        try:
+            from backend.neural_mesh.data_models import ExecutionStrategy
+
+            result = await orchestrator.plan_and_execute(
+                query=command_text,
+                strategy=ExecutionStrategy.HYBRID,
+                timeout_seconds=timeout_seconds,
+                context={
+                    "source": "unified_command_processor",
+                    "jprime_intent": getattr(response, 'intent', None),
+                    "jprime_domain": getattr(response, 'domain', None),
+                    "jprime_confidence": getattr(response, 'confidence', None),
+                },
+            )
+
+            # Convert WorkflowResult to standard response dict
+            if result.is_successful():
+                # Collect task results for the response
+                task_summaries = []
+                for task_result in (result.get_task_results() or {}).values():
+                    if isinstance(task_result, dict):
+                        task_summaries.append(
+                            task_result.get("response", str(task_result))
+                        )
+                    elif task_result is not None:
+                        task_summaries.append(str(task_result))
+
+                return {
+                    "success": True,
+                    "response": (
+                        "\n".join(task_summaries)
+                        if task_summaries
+                        else f"Completed {result.successful_tasks} tasks."
+                    ),
+                    "command_type": "MULTI_AGENT_WORKFLOW",
+                    "source": "plan_and_execute",
+                    "metadata": {
+                        "workflow_id": result.workflow_id,
+                        "tasks_total": len(result.tasks),
+                        "tasks_succeeded": result.successful_tasks,
+                        "tasks_failed": result.failed_tasks,
+                        "execution_time_s": result.total_execution_time_seconds,
+                    },
+                }
+            else:
+                # Partial or failed — include what succeeded
+                logger.warning(
+                    "[Wire1] plan_and_execute partial/failed: %s "
+                    "(%d/%d tasks succeeded)",
+                    result.status,
+                    result.successful_tasks,
+                    len(result.tasks),
+                )
+                # Return None to let caller fall through to existing handlers
+                return None
+
+        except Exception as e:
+            logger.warning("[Wire1] plan_and_execute failed: %s", e)
+            return None
 
     async def _handle_surveillance_action(
         self, command_text: str, websocket=None,
