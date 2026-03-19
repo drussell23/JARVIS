@@ -83,13 +83,13 @@ class HandshakeSession:
     instance_id: str = ""                                # GCP numeric ID
     zone: str = ""
     endpoint: str = ""                                   # "host:port" that passed health
-    # Populated by CAPABILITIES step
-    should_recreate: bool = False
-    recreate_reason: str = ""
     # Timing
     started_at: float = field(default_factory=time.monotonic)
-    step_timestamps: Dict[str, float] = field(default_factory=dict)
+    # step_timestamps intentionally omitted — unused per YAGNI; add when observability
+    # requires per-step duration breakdown
 ```
+
+**Removed from session:** `should_recreate` and `recreate_reason`. The routing matrix drives the `RECREATE_VM_ASYNC` decision exclusively — these fields would be populated but never consumed. Recovery action is determined by `(step, failure_class)` from `HandshakeResult`, not by session state.
 
 **Invariant:** By the time `probe_capabilities()` is called, `session.instance_name` is non-empty. Enforced by `acquire()` which validates the session after HEALTH before calling CAPABILITIES.
 
@@ -143,12 +143,14 @@ class ReadinessFailureClass(str, Enum):
     CONTRACT_VIOLATION = "contract_violation" # Programming error: empty instance name
 ```
 
-**Reason string → FailureClass mapping** (in `GCPVMReadinessProber`, not in `gcp_vm_manager`):
+**Reason string → FailureClass mapping** (in `GCPVMReadinessProber`, not in `gcp_vm_manager`).
+The mapping also drives routing strategy when the failure class is looked up in the matrix.
+**Note on `metadata_unavailable_golden_exists`:** The existing code already sets `should_recreate=True` for this reason. Retrying with `RETRY_SHORT` would re-enter the same `None`-metadata path and loop. `RECREATE_VM_ASYNC` is correct — can't verify lineage, but a golden image exists that the VM could be built from.
 
 | Reason returned by `check_lineage` | `should_recreate` | Mapped FailureClass | Recovery |
 |------------------------------------|-------------------|---------------------|----------|
 | `metadata_fetch_failed` | False | `TRANSIENT_INFRA` | RETRY_SHORT |
-| `metadata_unavailable_golden_exists` | True | `TRANSIENT_INFRA` | RETRY_SHORT (can't confirm) |
+| `metadata_unavailable_golden_exists` | True | `TRANSIENT_INFRA` | RECREATE_VM_ASYNC (see note) |
 | `metadata_unavailable_no_golden` | False | `TRANSIENT_INFRA` | RETRY_SHORT |
 | `vm_not_from_golden_image` | True | `LINEAGE_MISMATCH` | RECREATE_VM_ASYNC |
 | `golden_image_outdated` | True | `LINEAGE_MISMATCH` | RECREATE_VM_ASYNC |
@@ -258,7 +260,12 @@ _RECOVERY_MATRIX: Dict[
     (HandshakeStep.WARM_MODEL, ReadinessFailureClass.RESOURCE):       RecoveryStrategy.RETRY_LONG,
 }
 # Default for unmatched (step, class): RecoveryStrategy.FALLBACK_LOCAL
+# Any unmatched combination logs a WARNING before returning default.
 _RECOVERY_MATRIX_DEFAULT = RecoveryStrategy.FALLBACK_LOCAL
+
+# Maximum consecutive RETRY_SHORT/RETRY_LONG outcomes before escalating to
+# FALLBACK_LOCAL. Prevents retry storms on persistent but non-fatal failures.
+MAX_RETRY_ATTEMPTS_PER_HANDSHAKE = 3
 ```
 
 **`RECREATE_VM_ASYNC` execution path:**
@@ -272,13 +279,34 @@ routing_policy.select_strategy(step, failure_class)
       )
 
 _recreate_vm_and_upgrade_routing(session):
-    result = await vm_manager.ensure_static_vm_ready(recreate=True)
-    if result.success:
-        routing_policy.notify_gcp_vm_ready(result.endpoint)
+    # ensure_static_vm_ready signature (existing, extended with recreate flag):
+    #   async def ensure_static_vm_ready(
+    #       self,
+    #       port: Optional[int] = None,
+    #       timeout: Optional[float] = None,
+    #       progress_callback: Optional[Callable] = None,
+    #       activity_callback: Optional[Callable] = None,
+    #       recreate: bool = False,          # NEW: force recreation, skip start-existing path
+    #   ) -> Tuple[bool, Optional[str], str]:
+    #       Returns: (success, endpoint_host_or_None, status_message)
+    #
+    # The `recreate=True` flag is a new parameter added by this spec.
+    # When True, the method bypasses the "restart existing instance" path and
+    # goes directly to the recreation flow (delete → recreate from golden).
+
+    success, host, status = await vm_manager.ensure_static_vm_ready(recreate=True)
+    if success and host:
+        # Use existing signal method — parse port from session or use config default
+        port = session.endpoint.split(":")[-1] if ":" in session.endpoint else vm_manager.config.port
+        routing_policy.signal_gcp_vm_ready(host, int(port))
         # Routing upgrades to GCP_PRIME seamlessly
+    else:
+        _log.warning("[RecreateVM] Recreation failed: %s — staying on fallback", status)
 ```
 
-The background task is bounded: it uses `asyncio.shield()` on the recreation future so that if the startup coroutine is cancelled, recreation continues independently.
+**`signal_gcp_vm_ready(host, port)`** is the existing method on `StartupRoutingPolicy`. This spec does not add a new method — it uses the existing signal.
+
+The background task is bounded: it uses `asyncio.shield()` on the recreation future so that if the startup coroutine is cancelled, recreation continues independently. Concurrent `RECREATE_VM_ASYNC` calls are guarded by the existing `DistributedLockManager` (key: `gcp_vm_recreate`) — see residual risks.
 
 ---
 
@@ -291,7 +319,9 @@ The background task is bounded: it uses `asyncio.shield()` on the recreation fut
 class _ProbeReadinessBudget:
     """Gates GCP probe scheduling behind CPU/memory thresholds.
 
-    Reads from IntelligentMemoryController singleton (already available).
+    Reads CPU and memory directly via psutil (same library already used by
+    IntelligentMemoryController in process_cleanup_manager.py). Does NOT
+    depend on the controller being initialized — safe to call before Zone 5.
     Does not block indefinitely — falls through with warning after MAX_WAIT.
     """
     CPU_THRESHOLD  = 85.0   # percent — don't probe while CPU > 85%
@@ -299,14 +329,31 @@ class _ProbeReadinessBudget:
     POLL_INTERVAL  = 2.0    # seconds between pressure checks
     MAX_WAIT       = 60.0   # seconds before probing regardless (safety valve)
 
+    @staticmethod
+    def _read_current_pressure() -> Tuple[float, float]:
+        """Returns (cpu_percent, mem_percent).
+
+        Uses psutil directly. `interval=None` returns cached value from last
+        psutil.cpu_percent() call, which is safe and non-blocking.
+        Falls back to (0.0, 0.0) if psutil is unavailable (test environments).
+        """
+        try:
+            import psutil
+            cpu = psutil.cpu_percent(interval=None)
+            mem = psutil.virtual_memory().percent
+            return cpu, mem
+        except Exception:
+            return 0.0, 0.0   # fail open — don't block probe if psutil unavailable
+
     async def wait_for_probe_slot(self) -> bool:
         """Await CPU/memory relief. Returns True if slot acquired, False if timed out."""
+        cpu, mem = self._read_current_pressure()
         deadline = time.monotonic() + self.MAX_WAIT
         while time.monotonic() < deadline:
-            cpu, mem = self._read_current_pressure()
             if cpu <= self.CPU_THRESHOLD and mem <= self.MEM_THRESHOLD:
                 return True
             await asyncio.sleep(self.POLL_INTERVAL)
+            cpu, mem = self._read_current_pressure()
         _log.warning(
             "[ProbeGate] Max wait exceeded (%.0fs) — probing under pressure "
             "(cpu=%.1f%%, mem=%.1f%%)", self.MAX_WAIT, cpu, mem,
@@ -354,6 +401,10 @@ The gate applies **only to the initial probe scheduling**. Retries driven by `RE
 **Cures:** D7
 **Scope:** JARVIS ↔ JARVIS-Prime only (Reactor Core is separate CI/CD)
 
+**Capabilities cache interaction:** `GCPVMReadinessProber` has a TTL-based cache for CAPABILITIES probe results (verified in code). This cache must be **invalidated at the start of every new `HandshakeSession`** to prevent a cached result from bypassing the `session.instance_name` fix on retries. Implementation: in `acquire()`, before calling `probe_capabilities()`, call `prober.invalidate_capabilities_cache()` (new method, one line: `self._capabilities_cache = None`).
+
+---
+
 JARVIS-Prime exposes `/v1/contract` (new endpoint on Prime server):
 
 ```json
@@ -372,7 +423,17 @@ _MIN_PRIME_API_VERSION = (1, 2, 0)
 _REQUIRED_CAPABILITIES = frozenset({"inference"})
 ```
 
-The HEALTH step optionally fetches `/v1/contract` after the health check passes. Incompatibility → `ABORT` with `CONTRACT_VIOLATION`. This is a one-shot check; no retry on contract mismatch (it's a deployment issue, not a transient condition).
+**Soft/hard fail boundary for `/v1/contract`:**
+
+| Condition | Treatment | Rationale |
+|-----------|-----------|-----------|
+| Endpoint returns 404 / connection refused | **Soft fail** — log INFO, skip check, continue HEALTH | Expected: Prime not yet updated to expose endpoint |
+| JSON parse error or unexpected shape | **Soft fail** — log WARNING, skip check, continue HEALTH | Defensive: don't break on schema drift in contract endpoint itself |
+| `api_version` below `_MIN_PRIME_API_VERSION` | **Hard fail** — `ABORT` + `CONTRACT_VIOLATION` | Deployment mismatch; no retry (not a transient condition) |
+| Required capability missing from `model_capabilities` | **Hard fail** — `ABORT` + `CONTRACT_VIOLATION` | Same — deployment mismatch |
+| Network timeout on `/v1/contract` fetch | **Soft fail** — log WARNING, skip check, continue HEALTH | Health endpoint passed; contract fetch timeout is non-fatal |
+
+The contract check is a one-shot check within a session — no retry on hard fail.
 
 ---
 
@@ -392,14 +453,16 @@ GCPReadinessLease.acquire(host, port)
     │
     ├── [validate: session.instance_name must be non-empty before next step]
     │
+    ├── [prober.invalidate_capabilities_cache()]  ← clears TTL cache before each session
+    │
     ├── result = prober.probe_capabilities(host, port, timeout, session)
     │   ├── vm_manager.check_lineage(session.instance_name, None)
     │   │   ├── [ContractViolationError if instance_name empty — never happens post-fix]
     │   │   ├── _describe_instance_full(instance_name) → vm_metadata
     │   │   └── → (should_recreate, reason_string)
     │   ├── _REASON_TO_FAILURE_CLASS[reason_string] → failure_class
-    │   ├── session.should_recreate = should_recreate
     │   └── → HandshakeResult(failure_class=<correct>)
+    │         [session.should_recreate removed — routing matrix drives action]
     │
     ├── result = prober.probe_warm_model(host, port, timeout, session)
     │   └── HTTP POST /v1/warm_check
@@ -438,8 +501,8 @@ All tests must be hermetic (no real GCP calls).
 | T11 | `test_probe_gate_falls_through_after_max_wait` | Gate expires after 60s, probe fires with warning |
 | T12 | `test_contract_check_abort_on_version_mismatch` | API version below minimum → `ABORT` + `CONTRACT_VIOLATION` |
 | T13 | `test_correlated_session_id_in_all_step_logs` | All three step logs contain the same `session_id` |
-| T14 | `test_recovery_matrix_covers_all_health_step_classes` | Matrix has entry for all `(HEALTH, *)` combinations |
-| T15 | `test_no_retry_storm_bounded_retries` | `RETRY_SHORT` is bounded — not an infinite loop |
+| T14 | `test_recovery_matrix_has_entries_for_expected_health_classes` | Matrix has entries for exactly `(HEALTH, NETWORK)`, `(HEALTH, TIMEOUT)`, `(HEALTH, RESOURCE)`, `(HEALTH, PREEMPTION)`, `(HEALTH, QUOTA)` — the five classes reachable at HEALTH step; new classes `TRANSIENT_INFRA`, `LINEAGE_MISMATCH` fall to default at HEALTH |
+| T15 | `test_retry_strategy_bounded_by_max_attempts` | After `MAX_RETRY_ATTEMPTS_PER_HANDSHAKE = 3` consecutive `RETRY_SHORT` results, orchestrator escalates to `FALLBACK_LOCAL` — does not loop forever |
 
 ---
 
