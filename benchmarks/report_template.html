@@ -131,13 +131,21 @@ table {
 }
 
 .table-scroll {
-  overflow-x: auto;
-  -webkit-overflow-scrolling: touch;
   margin: 1rem 0;
 }
 
 .table-scroll table {
-  min-width: 800px;
+  font-size: 0.78rem;
+}
+
+.table-scroll th {
+  font-size: 0.68rem;
+  padding: 0.5rem 0.5rem;
+  white-space: normal;
+}
+
+.table-scroll td {
+  padding: 0.4rem 0.5rem;
 }
 
 th {
@@ -159,7 +167,6 @@ td {
   border-bottom: 1px solid var(--border);
   color: var(--text);
   vertical-align: middle;
-  white-space: nowrap;
 }
 
 tr:hover {
@@ -1310,34 +1317,34 @@ details .detail-content ul li strong {
 
   <h3>Audio Payload Characteristics</h3>
   <table>
-<thead>
+    <thead>
       <tr>
         <th>Payload</th>
-        <th class="num">Text Length</th>
-        <th class="num">Est. Audio Duration</th>
+        <th>Text Length</th>
+        <th>Est. Audio Duration</th>
         <th>Voice.ai Format</th>
-        <th class="num">Daniel Format</th>
+        <th>Daniel Format</th>
       </tr>
     </thead>
     <tbody>
       <tr>
         <td>Short</td>
-        <td class="num">~20 words</td>
-        <td class="num">~3 seconds</td>
+        <td>~20 words</td>
+        <td>~3 seconds</td>
         <td>WAV 24kHz mono</td>
         <td>AIFF 22.05kHz</td>
       </tr>
       <tr>
         <td>Medium</td>
-        <td class="num">~60 words</td>
-        <td class="num">~10 seconds</td>
+        <td>~60 words</td>
+        <td>~10 seconds</td>
         <td>WAV 24kHz mono</td>
         <td>AIFF 22.05kHz</td>
       </tr>
       <tr>
         <td>Long</td>
-        <td class="num">~150 words</td>
-        <td class="num">~30 seconds</td>
+        <td>~150 words</td>
+        <td>~30 seconds</td>
         <td>WAV 24kHz mono</td>
         <td>AIFF 22.05kHz</td>
       </tr>
