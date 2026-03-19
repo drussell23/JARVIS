@@ -538,6 +538,59 @@ def validate_contracts_at_boot() -> List[ContractViolationRecord]:
     return violations
 
 
+def validate_and_enforce(logger: Optional[logging.Logger] = None) -> List[ContractViolationRecord]:
+    """Validate all cross-repo contracts and enforce blocking severities.
+
+    PRECHECK_BLOCKER violations raise LifecycleFatalError immediately.
+    BOOT_BLOCKER violations raise LifecycleFatalError immediately.
+    Lower severities are logged and returned for caller awareness.
+
+    Returns the full violation list (non-fatal violations only) so callers
+    can decide whether to advertise degraded mode.
+
+    Raises:
+        LifecycleFatalError: on any PRECHECK_BLOCKER or BOOT_BLOCKER violation.
+    """
+    from backend.core.lifecycle_exceptions import LifecycleFatalError, LifecycleErrorCode, LifecyclePhase
+
+    log = logger or logging.getLogger(__name__)
+    violations = validate_contracts_at_boot()
+
+    blocking = [
+        v for v in violations
+        if v.effective_severity in (ContractSeverity.PRECHECK_BLOCKER, ContractSeverity.BOOT_BLOCKER)
+    ]
+    non_blocking = [
+        v for v in violations
+        if v.effective_severity not in (ContractSeverity.PRECHECK_BLOCKER, ContractSeverity.BOOT_BLOCKER)
+    ]
+
+    for v in non_blocking:
+        log.warning(
+            "[Contracts] %s violation (%s): %s [origin: %s]",
+            v.effective_severity.value, v.reason_code.value, v.violation, v.value_origin,
+        )
+
+    if blocking:
+        # Log every blocker before raising so the operator sees all problems at once.
+        for v in blocking:
+            log.critical(
+                "[Contracts] BLOCKING violation (%s/%s): %s [origin: %s]",
+                v.effective_severity.value, v.reason_code.value, v.violation, v.value_origin,
+            )
+        first = blocking[0]
+        raise LifecycleFatalError(
+            f"Boot blocked by {len(blocking)} contract violation(s). "
+            f"First: {first.violation}",
+            error_code=LifecycleErrorCode.CONTRACT_INCOMPATIBLE,
+            state_at_raise="initializing",
+            phase=LifecyclePhase.PRECHECK,
+            epoch=0,
+        )
+
+    return non_blocking
+
+
 def validate_health_response(
     endpoint: str,
     data: Dict[str, Any],
