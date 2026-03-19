@@ -139,9 +139,9 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
         # --- Clients (lazy) ---
         self._prime_client: Optional[Any] = None
         self._claude_client: Optional[Any] = None
-        self._claude_model: str = os.getenv(
-            "JARVIS_BROWSER_CLAUDE_MODEL", "claude-sonnet-4-20250514"
-        )
+        from backend.core.interactive_brain_router import get_interactive_brain_router
+        _selection = get_interactive_brain_router().select_for_task("browser_navigation")
+        self._claude_model: str = os.getenv("JARVIS_BROWSER_CLAUDE_MODEL") or _selection.claude_model
 
     # ------------------------------------------------------------------
     # Lifecycle

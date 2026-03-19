@@ -680,6 +680,12 @@ class PrimeClient:
         import aiohttp
         import uuid
 
+        try:
+            from backend.core.interactive_brain_router import get_interactive_brain_router
+            _vision_model = get_interactive_brain_router().get_vision_model()
+        except Exception:
+            _vision_model = "llava-v1.5-7b"
+
         payload = {
             "messages": [{"role": "user", "content": [
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_base64}"}},
@@ -687,7 +693,7 @@ class PrimeClient:
             ]}],
             "max_tokens": max_tokens,
             "temperature": temperature,
-            "model": "llava-v1.6-mistral-7b",
+            "model": _vision_model,
         }
 
         url = f"{self._config.vision_base_url}/chat/completions"
@@ -708,7 +714,7 @@ class PrimeClient:
         content = data["choices"][0]["message"]["content"]
         return PrimeResponse(
             content=content, request_id=str(uuid.uuid4())[:8],
-            model="llava-v1.6-mistral-7b", source="gcp_vision",
+            model=_vision_model, source="gcp_vision",
             latency_ms=(time.time() - start) * 1000,
             metadata={"inference_time": data.get("x_inference_time_seconds")},
         )
@@ -1452,9 +1458,14 @@ class PrimeClient:
                 messages.extend(request.context)
             messages.append({"role": "user", "content": request.prompt})
 
-            # Call Claude API
+            # Call Claude API — use InteractiveBrainRouter for model selection
+            try:
+                from backend.core.interactive_brain_router import get_interactive_brain_router
+                _claude = get_interactive_brain_router().get_claude_model("heavy")
+            except Exception:
+                _claude = "claude-sonnet-4-20250514"
             response = await self._cloud_client.messages.create(
-                model=os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
+                model=os.getenv("CLAUDE_MODEL") or _claude,
                 max_tokens=request.max_tokens,
                 system=request.system_prompt or "You are JARVIS, an intelligent AI assistant.",
                 messages=messages,

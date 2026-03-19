@@ -35,6 +35,12 @@ from ..base.base_neural_mesh_agent import BaseNeuralMeshAgent
 logger = logging.getLogger(__name__)
 
 
+def _get_brain_router():
+    """Lazy import to avoid circular dependency at module load."""
+    from backend.core.interactive_brain_router import get_interactive_brain_router
+    return get_interactive_brain_router()
+
+
 # ---------------------------------------------------------------------------
 # Env-var helpers
 # ---------------------------------------------------------------------------
@@ -530,7 +536,8 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                 api_key = os.getenv("ANTHROPIC_API_KEY", "")
                 if api_key:
                     client = anthropic.AsyncAnthropic(api_key=api_key)
-                    model = os.getenv("JARVIS_NATIVE_CONTROL_CLAUDE_MODEL", "claude-sonnet-4-20250514")
+                    _selection = _get_brain_router().select_for_task("step_decomposition", goal)
+                    model = os.getenv("JARVIS_NATIVE_CONTROL_CLAUDE_MODEL") or _selection.claude_model
                     msg = await client.messages.create(
                         model=model,
                         max_tokens=512,
@@ -811,10 +818,10 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
             if not anthropic_api_key:
                 raise RuntimeError("ANTHROPIC_API_KEY not set")
 
+            _selection = _get_brain_router().select_for_task("vision_action", goal)
             claude_model = os.getenv(
                 "JARVIS_NATIVE_CONTROL_CLAUDE_MODEL",
-                "claude-sonnet-4-20250514",
-            )
+            ) or _selection.claude_model
 
             async_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
             message = await asyncio.wait_for(
@@ -1228,9 +1235,10 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                 api_key = os.getenv("ANTHROPIC_API_KEY", "")
                 if api_key:
                     claude_client = anthropic.AsyncAnthropic(api_key=api_key)
+                    _selection = _get_brain_router().select_for_task("vision_verification")
                     model = os.getenv(
-                        "JARVIS_NATIVE_CONTROL_CLAUDE_MODEL", "claude-sonnet-4-20250514"
-                    )
+                        "JARVIS_NATIVE_CONTROL_CLAUDE_MODEL",
+                    ) or _selection.claude_model
                     claude_msg = await asyncio.wait_for(
                         claude_client.messages.create(
                             model=model,
