@@ -2249,6 +2249,34 @@ class UnifiedCommandProcessor:
         except Exception:
             pass
 
+        # v295.0: Remote brain selection via MindClient (Step 1 migration)
+        # Feature flag: JARVIS_USE_REMOTE_BRAIN_SELECTOR=true enables remote selection
+        # Shadow mode: JARVIS_BRAIN_SELECTOR_SHADOW=true logs divergence without switching
+        _use_remote_brain = os.getenv("JARVIS_USE_REMOTE_BRAIN_SELECTOR", "false").lower() == "true"
+        _shadow_mode = os.getenv("JARVIS_BRAIN_SELECTOR_SHADOW", "false").lower() == "true"
+
+        if _use_remote_brain or _shadow_mode:
+            try:
+                from backend.core.mind_client import get_mind_client
+                _mind = get_mind_client()
+                _remote_result = await _mind.select_brain(
+                    command=command_text,
+                    task_type="classification",
+                    context=_jprime_ctx,
+                )
+                if _remote_result and _shadow_mode:
+                    try:
+                        from backend.core.interactive_brain_router import get_interactive_brain_router
+                        _local_router = get_interactive_brain_router()
+                        _classification = _remote_result.get("classification", {})
+                        await _local_router.compare_with_remote(
+                            "classification", command_text, _classification,
+                        )
+                    except Exception:
+                        pass
+            except Exception as exc:
+                logger.debug("[v295] Remote brain selection unavailable: %s", exc)
+
         response = await self._call_jprime(
             command_text, deadline=deadline, source_context=_jprime_ctx or None,
         )

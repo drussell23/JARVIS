@@ -231,6 +231,42 @@ class InteractiveBrainRouter:
         """Get the Claude model for a given complexity level."""
         return _CLAUDE_FALLBACK_MAP.get(complexity, "claude-sonnet-4-20250514")
 
+    async def compare_with_remote(
+        self,
+        task_type: str,
+        command: str,
+        remote_classification: dict,
+    ) -> Optional[dict]:
+        """Shadow mode: compare local selection with remote J-Prime selection.
+
+        Returns divergence dict if selections differ, None if they match.
+        """
+        local = self.select_for_task(task_type, command)
+        remote_brain = remote_classification.get("brain_used", "")
+        remote_complexity = remote_classification.get("complexity", "")
+
+        divergences = {}
+        if local.brain_id != remote_brain:
+            divergences["brain_id"] = {
+                "local": local.brain_id,
+                "remote": remote_brain,
+                "severity": "WARN",
+            }
+        if local.complexity != remote_complexity:
+            divergences["complexity"] = {
+                "local": local.complexity,
+                "remote": remote_complexity,
+                "severity": "WARN",
+            }
+
+        if divergences:
+            logger.warning(
+                "[Shadow] Divergence: task=%s command='%s' divergences=%s",
+                task_type, command[:60], divergences,
+            )
+            return divergences
+        return None
+
     # ── Policy loading ──────────────────────────────────────────────────────
 
     def _load_policy(self) -> None:
