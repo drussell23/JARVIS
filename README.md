@@ -2,7 +2,299 @@
 
 **The Body of the AGI OS — macOS integration, computer use, action execution, and unified orchestration**
 
-JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v262.0 (Ouroboros B+ — Full Activation)**, JARVIS autonomously self-develops across all three repos in real time with production-grade saga safety: the Ouroboros governance loop (Zones 6.0–6.9) detects improvement opportunities, generates multi-repo patches via GCP J-Prime (schema 2c.1), validates them, applies them via **B+ branch-isolated sagas** (ephemeral branches, two-tier locks, ff-only promote gates, rollback-via-branch-delete), and narrates every decision via voice and TUI — all without human intervention. v262.0 activates the full autonomous stack: `JARVIS_SAGA_BRANCH_ISOLATION=true`, `JARVIS_GOVERNANCE_MODE=governed`, SagaMessageBus passive observer, and TestFailureSensor with real TestWatcher per repo. Previous milestones include: schema 2c.1 cross-repo patches (v261.0), Memory Control Plane with lease-based memory governance (v260.0), command lifecycle event infrastructure (v243.0/v243.1), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
+JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem. It provides macOS integration, computer use (keyboard, mouse, display), voice unlock, vision, safety management, and the **unified supervisor** that starts and coordinates JARVIS-Prime (Mind) and Reactor-Core (Nerves) with a single command. As of **v294.0 (Unified Brain Selection — InteractiveBrainRouter)**, all interactive commands (voice, app control, vision, browser automation) route through a deterministic brain selection system backed by `brain_selection_policy.yaml` — the same source of truth as the Ouroboros code-generation pipeline. Zero hardcoded model references remain in the interactive pipeline. As of **v262.0 (Ouroboros B+ — Full Activation)**, JARVIS autonomously self-develops across all three repos in real time with production-grade saga safety: the Ouroboros governance loop (Zones 6.0–6.9) detects improvement opportunities, generates multi-repo patches via GCP J-Prime (schema 2c.1), validates them, applies them via **B+ branch-isolated sagas** (ephemeral branches, two-tier locks, ff-only promote gates, rollback-via-branch-delete), and narrates every decision via voice and TUI — all without human intervention. v262.0 activates the full autonomous stack: `JARVIS_SAGA_BRANCH_ISOLATION=true`, `JARVIS_GOVERNANCE_MODE=governed`, SagaMessageBus passive observer, and TestFailureSensor with real TestWatcher per repo. Previous milestones include: schema 2c.1 cross-repo patches (v261.0), Memory Control Plane with lease-based memory governance (v260.0), command lifecycle event infrastructure (v243.0/v243.1), a never-skip vision architecture with self-hosted LLaVA (v259.1), parallel initialization with cooperative cancellation (v3.0–v3.2), CPU-pressure-aware cloud shifting (v258.x), enterprise hardening, and a fully activated training pipeline with deployment gates, model lineage tracking, and post-deployment probation monitoring across all three repos.
+
+---
+
+## Session Update (2026-03-19): InteractiveBrainRouter — Unified Brain Selection for the Interactive Command Pipeline
+
+### Overview
+
+This session closed a critical architectural gap: the interactive command pipeline (voice commands, app control, vision, email, browser automation) was **entirely hardcoded** to fixed model names while the Ouroboros code-generation pipeline had already built a sophisticated `BrainSelector` system backed by `brain_selection_policy.yaml`. There were two parallel routing systems that had never been unified — this session fixes that.
+
+**What was delivered:**
+- `InteractiveBrainRouter` — a new deterministic brain selection module for all interactive tasks
+- Elimination of **every hardcoded model reference** across `NativeAppControlAgent`, `VisualBrowserAgent`, and `PrimeClient`
+- Dynamic vision model discovery (no more hardcoded `"llava-v1.6-mistral-7b"`)
+- Keyword-based complexity escalation ("analyze" → 32B, "open" → 1B)
+- Hot-reloadable YAML policy — change `brain_selection_policy.yaml` without restarting JARVIS
+- Full env-var override escape hatches preserved at every call site
+
+---
+
+### 1. The Root Problem: Two Parallel Routing Systems
+
+#### Before This Session
+
+The Ouroboros governance pipeline (`BrainSelector` in `backend/core/ouroboros/governance/brain_selector.py`) had a full brain selection stack: it reads `brain_selection_policy.yaml`, evaluates blast radius and target files, and returns a graded `BrainSelection` with fallback chains. However, it was designed **exclusively for code generation tasks** — it takes `target_files` and `blast_radius` as inputs, which make no sense for "message Zach on WhatsApp".
+
+The interactive pipeline was selecting models via hardcoded string literals scattered across multiple files:
+
+```python
+# native_app_control_agent.py (3 occurrences)
+claude_model = os.getenv("JARVIS_NATIVE_CONTROL_CLAUDE_MODEL", "claude-sonnet-4-20250514")
+
+# visual_browser_agent.py
+self._claude_model = os.getenv("JARVIS_BROWSER_CLAUDE_MODEL", "claude-sonnet-4-20250514")
+
+# prime_client.py
+model_name = os.getenv("JARVIS_VISION_MODEL_NAME", "llava-v1.6-mistral-7b")
+claude_model = "claude-sonnet-4-20250514"  # hardcoded in cloud fallback
+```
+
+This meant:
+- No task-complexity awareness — vision verification used the same model as complex multi-step planning
+- No J-Prime brain routing — the interactive pipeline never consulted J-Prime's loaded local models for anything except raw inference
+- No fallback chains — if the primary model was unavailable, the code had no knowledge of alternatives
+- Model name changes required grep-and-replace across 4+ files
+- `"llava-v1.6-mistral-7b"` was hardcoded even though J-Prime dynamically loads whichever vision model the GCP VM was provisioned with
+
+#### After This Session
+
+```
+brain_selection_policy.yaml   ← single source of truth
+        │
+        ├── BrainSelector              (Ouroboros — code generation)
+        │    reads: target_files, blast_radius → BrainSelection
+        │
+        └── InteractiveBrainRouter     (interactive commands — NEW)
+             reads: task_type, command → InteractiveBrainSelection
+```
+
+Both systems read from the same YAML. Model names, fallback chains, and cost classes are defined once.
+
+---
+
+### 2. InteractiveBrainRouter Architecture
+
+**Location:** `backend/core/interactive_brain_router.py`
+
+The router is a pure-Python, zero-LLM-call module. It maps task types to complexity tiers, looks up brain IDs in the policy, resolves model names, and returns a rich `InteractiveBrainSelection` dataclass — all in <1ms.
+
+#### Task Type → Complexity Tier → Brain ID
+
+| Task Type | Default Complexity | Brain ID | Local Model | Claude Fallback |
+|---|---|---|---|---|
+| `workspace_fastpath` | trivial | `phi3_lightweight` | Phi-3 Mini (1B) | claude-haiku-4-5 |
+| `system_command` | trivial | `phi3_lightweight` | Phi-3 Mini (1B) | claude-haiku-4-5 |
+| `reflex_match` | trivial | `phi3_lightweight` | Phi-3 Mini (1B) | claude-haiku-4-5 |
+| `classification` | light | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `step_decomposition` | light | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `email_triage` | light | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `calendar_query` | light | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `vision_action` | heavy | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `vision_verification` | heavy | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `email_compose` | heavy | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `browser_navigation` | heavy | `qwen_coder` | Qwen2.5-7B | claude-sonnet-4 |
+| `multi_step_planning` | complex | `qwen_coder_32b` | Qwen2.5-Coder-32B | claude-sonnet-4 |
+| `email_summarization` | complex | `qwen_coder_32b` | Qwen2.5-Coder-32B | claude-sonnet-4 |
+| `complex_reasoning` | complex | `qwen_coder_32b` | Qwen2.5-Coder-32B | claude-sonnet-4 |
+
+Model names come from `brain_selection_policy.yaml` at runtime — changing the YAML updates all routing without touching Python code.
+
+#### Keyword-Based Complexity Escalation
+
+The router inspects the user's command text for signal words and adjusts complexity **before** looking up the brain:
+
+```python
+# Escalation — command text triggers upgrade to "complex"
+"analyze my inbox trends"          →  email_triage(light) → complex → qwen_coder_32b
+"compare my last two pull requests" →  complex_reasoning(complex) → qwen_coder_32b
+"investigate why the build is failing" → complex → qwen_coder_32b
+
+# De-escalation — command text downgrades "light" to "trivial"
+"open Safari"                      →  classification(light) → trivial → phi3_lightweight
+"lock the screen"                  →  classification(light) → trivial → phi3_lightweight
+"what time is it"                  →  classification(light) → trivial → phi3_lightweight
+```
+
+Escalation keywords (case-insensitive): `analyze`, `summarize`, `compare`, `evaluate`, `investigate`, `explain why`, `root cause`, `trend`, `pattern`, `insight`, `strategic`
+
+De-escalation keywords: `open`, `close`, `lock`, `unlock`, `volume`, `brightness`, `screenshot`, `timer`, `what time`, `weather`
+
+De-escalation only applies when the base complexity is `light` — `heavy` and `complex` tasks are never downgraded, and de-escalation cannot override escalation.
+
+#### InteractiveBrainSelection Dataclass
+
+```python
+@dataclass(frozen=True)
+class InteractiveBrainSelection:
+    brain_id: str              # "qwen_coder", "phi3_lightweight", "qwen_coder_32b"
+    jprime_model: Optional[str]   # model name for J-Prime (None if J-Prime unavailable)
+    claude_model: Optional[str]   # Claude fallback model name
+    vision_model: Optional[str]   # vision model (only for vision_action/verification)
+    complexity: str            # "trivial", "light", "heavy", "complex"
+    task_type: str             # original task type passed in
+    routing_reason: str        # e.g. "vision_action→heavy→qwen_coder"
+    fallback_chain: List[str]  # ordered fallback brain_ids from policy
+```
+
+The `routing_reason` field is logged at every call site, giving full observability into every model selection decision.
+
+#### Routing Examples
+
+```python
+router = get_interactive_brain_router()
+
+# Simple step decomposition
+sel = router.select_for_task("step_decomposition", "message Zach on WhatsApp")
+# sel.brain_id       → "qwen_coder"
+# sel.jprime_model   → "qwen-2.5-coder-7b"  (from policy)
+# sel.claude_model   → "claude-sonnet-4-20250514"
+# sel.complexity     → "light"
+# sel.routing_reason → "step_decomposition→light→qwen_coder"
+
+# Keyword escalation: "analyze" → complex tier
+sel = router.select_for_task("email_triage", "analyze my inbox trends")
+# sel.brain_id       → "qwen_coder_32b"
+# sel.jprime_model   → "qwen-2.5-coder-32b"
+# sel.complexity     → "complex"  (escalated from "light")
+
+# Vision task (auto-populates vision_model)
+sel = router.select_for_task("vision_action", "click the send button")
+# sel.vision_model   → "llava-v1.5-7b"  (discovered dynamically from /v1/models)
+
+# Trivial system command
+sel = router.select_for_task("system_command", "turn up volume")
+# sel.brain_id       → "phi3_lightweight"
+# sel.claude_model   → "claude-haiku-4-5-20251001"  (cheapest Claude fallback)
+```
+
+---
+
+### 3. Dynamic Vision Model Discovery
+
+Previously `prime_client.py` had `"llava-v1.6-mistral-7b"` hardcoded. The GCP GPU VM (`jarvis-prime-gpu`) is provisioned with whatever vision model fits in VRAM — this name can change between VM rebuilds.
+
+`InteractiveBrainRouter._discover_vision_model()` queries J-Prime's vision server on startup:
+
+```python
+def _discover_vision_model(self) -> str:
+    host = os.getenv("JARVIS_PRIME_HOST", "136.113.252.164")
+    port = os.getenv("JARVIS_PRIME_VISION_PORT", "8001")
+    url = f"http://{host}:{port}/v1/models"
+
+    # GET /v1/models → {"data": [{"id": "/opt/models/llava-v1.5-7b.gguf"}]}
+    # Extracts stem: "llava-v1.5-7b"
+    # Falls back to "llava-v1.5-7b" if vision server is unreachable
+```
+
+The result is cached in `self._vision_model` and hot-reloaded when `brain_selection_policy.yaml` changes. This means:
+- VM rebuild with a different vision model → JARVIS picks it up automatically on next policy reload
+- Vision server offline at boot → safe default, no crash
+- Override via `JARVIS_VISION_MODEL_NAME` env var for testing
+
+---
+
+### 4. Hot-Reload Policy
+
+The router watches `brain_selection_policy.yaml`'s `mtime` on every `select_for_task()` call:
+
+```python
+def _maybe_reload(self) -> None:
+    if self._policy_path.exists():
+        mtime = self._policy_path.stat().st_mtime
+        if mtime > self._policy_mtime:
+            self._load_policy()   # re-reads brains, fallback_chains, vision model
+```
+
+This means changing a brain's model name in the YAML takes effect within one request — no JARVIS restart needed. The cost is one `stat()` syscall per routing decision, which is negligible compared to any model inference.
+
+---
+
+### 5. Files Changed
+
+#### New File
+
+| File | Purpose |
+|------|---------|
+| `backend/core/interactive_brain_router.py` | Deterministic brain selector for all interactive commands. Reads `brain_selection_policy.yaml`, maps task types to complexity tiers, resolves model names, returns `InteractiveBrainSelection`. Zero LLM calls. Hot-reloads YAML. |
+
+#### Modified Files
+
+| File | What Changed |
+|------|-------------|
+| `backend/neural_mesh/agents/native_app_control_agent.py` | Replaced 3× hardcoded `"claude-sonnet-4-20250514"` with `get_interactive_brain_router().select_for_task(task_type).claude_model`. Task types: `step_decomposition`, `vision_action`, `vision_verification`. |
+| `backend/neural_mesh/agents/visual_browser_agent.py` | Replaced `os.getenv(..., "claude-sonnet-4-20250514")` in `__init__` with router selection for `"browser_navigation"` task type. |
+| `backend/core/prime_client.py` | Replaced hardcoded `"llava-v1.6-mistral-7b"` (2 occurrences in `send_vision_request()`) with `get_interactive_brain_router().get_vision_model()`. Replaced hardcoded Claude model in `_execute_cloud_fallback()` with `get_interactive_brain_router().get_claude_model("heavy")`. |
+
+#### Unchanged (Single Source of Truth)
+
+| File | Role |
+|------|------|
+| `backend/core/ouroboros/governance/brain_selection_policy.yaml` | Defines all brain IDs, model names, fallback chains. Both `BrainSelector` (Ouroboros) and `InteractiveBrainRouter` (interactive) read this file. |
+
+---
+
+### 6. Architecture: Unified Brain Selection
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                    Brain Selection Architecture                       │
+│                                                                      │
+│  brain_selection_policy.yaml  ←── single source of truth            │
+│      │                                                               │
+│      ├─── BrainSelector (Ouroboros)                                  │
+│      │     Inputs: target_files, blast_radius, description           │
+│      │     Output: BrainSelection (code generation tasks)            │
+│      │     Used by: GovernedLoopService, orchestrator.py             │
+│      │                                                               │
+│      └─── InteractiveBrainRouter  ◄── NEW                           │
+│            Inputs: task_type, command (voice/text)                   │
+│            Output: InteractiveBrainSelection                         │
+│            Used by: NativeAppControlAgent, VisualBrowserAgent,       │
+│                     PrimeClient                                       │
+│                                                                      │
+│  Routing flow (interactive):                                         │
+│                                                                      │
+│  Voice command: "analyze my inbox trends"                            │
+│       │                                                              │
+│       ▼                                                              │
+│  task_type = "email_triage"                                          │
+│       │                                                              │
+│       ▼                                                              │
+│  base complexity = "light"   (from _INTERACTIVE_TASK_COMPLEXITY)     │
+│       │                                                              │
+│       ▼                                                              │
+│  keyword scan: "analyze" found → escalate to "complex"              │
+│       │                                                              │
+│       ▼                                                              │
+│  brain_id = "qwen_coder_32b"  (from _DEFAULT_BRAIN_MAP["complex"])  │
+│       │                                                              │
+│       ▼                                                              │
+│  jprime_model = policy["brains"]["required"][3]["model_name"]        │
+│               = "qwen-2.5-coder-32b"                                │
+│       │                                                              │
+│       ▼                                                              │
+│  claude_model = "claude-sonnet-4-20250514"  (complex fallback)       │
+│       │                                                              │
+│       ▼                                                              │
+│  InteractiveBrainSelection(                                          │
+│      brain_id="qwen_coder_32b",                                      │
+│      jprime_model="qwen-2.5-coder-32b",                              │
+│      claude_model="claude-sonnet-4-20250514",                        │
+│      complexity="complex",                                           │
+│      routing_reason="email_triage→complex→qwen_coder_32b"           │
+│  )                                                                   │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 7. Env-Var Override Escape Hatches
+
+All pre-existing env-var overrides are preserved and wired through the router:
+
+| Env Var | Controls | Default |
+|---------|----------|---------|
+| `JARVIS_INTERACTIVE_CLAUDE_MODEL` | Claude model for all interactive tasks | Per-complexity from `_CLAUDE_FALLBACK_MAP` |
+| `JARVIS_NATIVE_CONTROL_CLAUDE_MODEL` | Claude model for `NativeAppControlAgent` | Router selection |
+| `JARVIS_BROWSER_CLAUDE_MODEL` | Claude model for `VisualBrowserAgent` | Router selection |
+| `JARVIS_VISION_MODEL_NAME` | Vision model name (bypasses `/v1/models` discovery) | Discovered from J-Prime |
+| `JARVIS_PRIME_HOST` | J-Prime host for vision discovery | `136.113.252.164` |
+| `JARVIS_PRIME_VISION_PORT` | J-Prime vision server port | `8001` |
+
+The `JARVIS_INTERACTIVE_CLAUDE_MODEL` override is checked **after** the per-complexity lookup, so it can globally pin to a specific Claude model for testing without touching the policy.
 
 ---
 
