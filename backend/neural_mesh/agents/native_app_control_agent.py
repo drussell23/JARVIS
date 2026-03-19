@@ -458,10 +458,34 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
     ) -> List[str]:
         """Break a high-level goal into atomic UI steps.
 
-        Uses J-Prime or Claude for intelligent decomposition.
-        Falls back to a simple heuristic if no model available.
+        Checks the StepPlanCache first (ChromaDB semantic search).  Only calls
+        J-Prime or Claude when no sufficiently similar plan is cached.  Stores
+        successful LLM decompositions back into the cache for next time.
         """
+        # ------------------------------------------------------------------
+        # 1. Cache lookup — fast, no LLM needed
+        # ------------------------------------------------------------------
+        try:
+            from .step_plan_cache import get_step_plan_cache
+            _cache = get_step_plan_cache()
+            cached_steps = await _cache.get_cached_plan(goal, app_name)
+            if cached_steps:
+                logger.info(
+                    "[NativeAppControlAgent] Plan cache HIT for '%s' (%d steps)",
+                    goal[:60],
+                    len(cached_steps),
+                )
+                return cached_steps
+        except Exception as _exc:
+            logger.debug(
+                "[NativeAppControlAgent] Plan cache lookup failed: %s", _exc
+            )
+
+        # ------------------------------------------------------------------
+        # 2. LLM decomposition — J-Prime then Claude
+        # ------------------------------------------------------------------
         prompt = _STEP_PLANNER_PROMPT.format(app_name=app_name, goal=goal)
+        steps: List[str] = []
 
         # Try J-Prime first (free)
         try:
@@ -477,29 +501,51 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                 timeout=30.0,
             )
             if response and response.content:
-                return self._parse_plan_steps(response.content)
+                steps = self._parse_plan_steps(response.content)
         except Exception as e:
             logger.debug("[NativeAppControlAgent] J-Prime planning failed: %s", e)
 
         # Try Claude (paid fallback)
-        try:
-            import anthropic
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            if api_key:
-                client = anthropic.AsyncAnthropic(api_key=api_key)
-                model = os.getenv("JARVIS_NATIVE_CONTROL_CLAUDE_MODEL", "claude-sonnet-4-20250514")
-                msg = await client.messages.create(
-                    model=model,
-                    max_tokens=512,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                if msg.content:
-                    return self._parse_plan_steps(msg.content[0].text)
-        except Exception as e:
-            logger.debug("[NativeAppControlAgent] Claude planning failed: %s", e)
+        if not steps:
+            try:
+                import anthropic
+                api_key = os.getenv("ANTHROPIC_API_KEY", "")
+                if api_key:
+                    client = anthropic.AsyncAnthropic(api_key=api_key)
+                    model = os.getenv("JARVIS_NATIVE_CONTROL_CLAUDE_MODEL", "claude-sonnet-4-20250514")
+                    msg = await client.messages.create(
+                        model=model,
+                        max_tokens=512,
+                        messages=[{"role": "user", "content": prompt}],
+                    )
+                    if msg.content:
+                        steps = self._parse_plan_steps(msg.content[0].text)
+            except Exception as e:
+                logger.debug("[NativeAppControlAgent] Claude planning failed: %s", e)
 
         # Heuristic fallback — generic steps based on goal keywords
-        return self._heuristic_decompose(goal, app_name)
+        if not steps:
+            steps = self._heuristic_decompose(goal, app_name)
+
+        # ------------------------------------------------------------------
+        # 3. Store successful decomposition in cache for next time
+        # ------------------------------------------------------------------
+        if len(steps) > 1:
+            try:
+                from .step_plan_cache import get_step_plan_cache
+                _cache = get_step_plan_cache()
+                await _cache.store_plan(goal, app_name, steps)
+                logger.info(
+                    "[NativeAppControlAgent] Plan cached for '%s' (%d steps)",
+                    goal[:60],
+                    len(steps),
+                )
+            except Exception as _exc:
+                logger.debug(
+                    "[NativeAppControlAgent] Plan cache store failed: %s", _exc
+                )
+
+        return steps
 
     def _parse_plan_steps(self, raw_text: str) -> List[str]:
         """Parse JSON array of step strings from LLM response."""
