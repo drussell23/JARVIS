@@ -310,7 +310,7 @@ class TestFailureClassification:
     def test_all_failure_classes_exist(self):
         expected = {
             "NETWORK", "QUOTA", "RESOURCE", "PREEMPTION",
-            "SCHEMA_MISMATCH", "TIMEOUT",
+            "SCHEMA_MISMATCH", "TIMEOUT", "TRANSIENT_INFRA",
         }
         actual = {member.name for member in ReadinessFailureClass}
         assert expected == actual
