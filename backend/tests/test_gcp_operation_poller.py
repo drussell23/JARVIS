@@ -80,3 +80,30 @@ class TestOperationScope:
         # The scope must reflect the operation's actual zone, not any external config
         assert scope.zone == "us-east1-c"
         # There is no "config zone" parameter to from_operation — the old path is simply gone
+
+    def test_extracts_region_from_region_url(self):
+        """Regional operations (e.g. MIG, forwarding rules) must produce scope_type=regional."""
+        from backend.core.gcp_operation_poller import OperationScope
+        op = _make_op(
+            zone_url="",
+            region_url="https://www.googleapis.com/compute/v1/projects/proj/regions/us-central1",
+            self_link="https://www.googleapis.com/compute/v1/projects/proj/regions/us-central1/operations/op-r",
+        )
+        scope = OperationScope.from_operation(op, fallback_project="proj")
+        assert scope.scope_type == "regional"
+        assert scope.region == "us-central1"
+        assert scope.zone is None
+        assert scope.project == "proj"
+
+    def test_global_scope_from_self_link(self):
+        """Global operations (e.g. global URL map changes) must produce scope_type=global."""
+        from backend.core.gcp_operation_poller import OperationScope
+        op = _make_op(
+            zone_url="",
+            region_url="",
+            self_link="https://www.googleapis.com/compute/v1/projects/proj/global/operations/op-g",
+        )
+        scope = OperationScope.from_operation(op, fallback_project="proj")
+        assert scope.scope_type == "global"
+        assert scope.zone is None
+        assert scope.region is None
