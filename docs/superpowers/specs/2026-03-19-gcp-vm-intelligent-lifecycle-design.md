@@ -417,7 +417,7 @@ class StartupEventBusAdapter:
                 "detail": event.detail,
             },
             phase=None,
-            authority_state=None,
+            authority_state="",  # lifecycle events carry no routing authority_state; str not None
         )
         await self._bus.emit(startup_event)
 ```
