@@ -587,6 +587,8 @@ class PrimeClient:
         self._consecutive_gcp_failures: int = 0
         # v242.1: Model ID from last streaming response (extracted from X-Model-Id header)
         self._last_stream_model_id: str = "jarvis-prime"
+        # v298.0: VMLifecycleManager wiring (injected post-construction)
+        self._lifecycle: Optional[object] = None
         # v258.0: Health check backoff state
         self._health_consecutive_failures: int = 0
         self._health_backoff_interval: float = self._config.health_check_interval
@@ -1265,6 +1267,10 @@ class PrimeClient:
         async for chunk in self._execute_stream_request(request):
             yield chunk
 
+    def set_lifecycle_manager(self, lifecycle: object) -> None:
+        """Wire VMLifecycleManager for drain-safe work tracking. Call once at startup."""
+        self._lifecycle = lifecycle
+
     async def _execute_request(self, request: PrimeRequest) -> PrimeResponse:
         """Execute a request to Prime."""
         if not self._initialized:
@@ -1274,6 +1280,16 @@ class PrimeClient:
         if not await self._circuit.can_execute():
             raise RuntimeError("Circuit breaker is open - Prime appears unhealthy")
 
+        if self._lifecycle is not None:
+            from backend.core.vm_lifecycle_manager import ActivityClass
+            async with self._lifecycle.work_slot(
+                ActivityClass.MEANINGFUL, description="prime_client.execute_request"
+            ):
+                return await self._do_execute_request(request)
+        return await self._do_execute_request(request)
+
+    async def _do_execute_request(self, request: PrimeRequest) -> PrimeResponse:
+        """Inner HTTP send — called by _execute_request, wrapped by work_slot."""
         start_time = time.time()
 
         try:
@@ -1362,13 +1378,32 @@ class PrimeClient:
         self,
         request: PrimeRequest
     ) -> AsyncGenerator[str, None]:
-        """Execute a streaming request to Prime."""
+        """Execute a streaming request to Prime.
+
+        Requires Python 3.10+ for correct GeneratorExit propagation through async with.
+        """
         if not self._initialized:
             await self.initialize()
 
         if not await self._circuit.can_execute():
             raise RuntimeError("Circuit breaker is open")
 
+        if self._lifecycle is not None:
+            from backend.core.vm_lifecycle_manager import ActivityClass
+            async with self._lifecycle.work_slot(
+                ActivityClass.MEANINGFUL, description="prime_client.stream_chunks"
+            ):
+                async for chunk in self._do_execute_stream_request(request):
+                    yield chunk
+        else:
+            async for chunk in self._do_execute_stream_request(request):
+                yield chunk
+
+    async def _do_execute_stream_request(
+        self,
+        request: PrimeRequest
+    ) -> AsyncGenerator[str, None]:
+        """Inner streaming send — called by _execute_stream_request, wrapped by work_slot."""
         try:
             payload = self._build_payload(request)
             payload["stream"] = True
