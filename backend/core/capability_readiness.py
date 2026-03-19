@@ -169,9 +169,18 @@ class CapabilityRegistry:
         # Signal asyncio waiters if minimally operational
         if self.is_minimally_operational() and self._ready_event is not None:
             try:
-                loop = self._ready_event._loop  # type: ignore[attr-defined]
+                # call_soon_threadsafe is safe from any thread; asyncio.Event.set()
+                # must be called from within the event loop that created it.
+                import asyncio as _asyncio
+                try:
+                    loop = _asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = None
                 if loop is not None and loop.is_running():
                     loop.call_soon_threadsafe(self._ready_event.set)
+                else:
+                    # Best-effort if no running loop — set directly (test context)
+                    self._ready_event.set()
             except Exception:
                 pass
 
@@ -224,11 +233,11 @@ class CapabilityRegistry:
     # Async wait
     # ------------------------------------------------------------------
 
-    def bind_event_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+    def bind_event_loop(self) -> None:
         """Bind an asyncio.Event to allow await_minimal_operational().
 
-        Call once from the asyncio event loop coroutine after
-        the event loop is running.
+        Call once from within a running asyncio event loop coroutine.
+        asyncio.Event() binds to the running loop automatically (Python 3.10+).
         """
         self._ready_event = asyncio.Event()
         # If already satisfied, set immediately

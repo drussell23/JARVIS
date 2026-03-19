@@ -1939,6 +1939,16 @@ class LoadingServer:
                 return self._json_response(health)
             return self._json_response({"error": "Cross-repo health not available"}, status=503)
 
+        elif path == "/api/health/capabilities":
+            # v295.0: Per-domain capability readiness snapshot
+            try:
+                from backend.core.capability_readiness import get_capability_registry
+                return self._json_response(get_capability_registry().to_health_dict())
+            except Exception as _ce:
+                return self._json_response(
+                    {"error": f"Capability registry unavailable: {_ce}"}, status=503
+                )
+
         elif path == "/api/trinity/heartbeats":
             # Direct heartbeat file status
             return self._json_response(await self._get_trinity_heartbeats())
@@ -2003,15 +2013,19 @@ class LoadingServer:
 
     def _get_readiness_response(self) -> Dict[str, Any]:
         """
-        v185.0: Generate Kubernetes-style readiness response.
-        
+        v295.0: Generate Kubernetes-style readiness response with capability domains.
+
         Ready means the loading server is fully operational and can accept traffic.
         This differs from health (liveness) which just means the process is alive.
+
+        v295.0 adds:
+          - capability_domains: per-domain readiness from CapabilityRegistry
+          - minimally_operational: True iff backend+websocket+model_router are up
         """
         # Ready = server is up AND has received at least one progress update
         is_ready = self._progress > 0 or self._phase != "initializing"
-        
-        return {
+
+        result: Dict[str, Any] = {
             "ready": is_ready,
             "status": "ready" if is_ready else "initializing",
             "progress": self._progress,
@@ -2020,6 +2034,17 @@ class LoadingServer:
             "uptime": round(time.time() - self._startup_time, 2),
             "timestamp": datetime.now().isoformat(),
         }
+
+        # v295.0: Attach capability-domain snapshot if the registry is available.
+        try:
+            from backend.core.capability_readiness import get_capability_registry
+            cap_dict = get_capability_registry().to_health_dict()
+            result["capability_domains"] = cap_dict["domains"]
+            result["minimally_operational"] = cap_dict["minimally_operational"]
+        except Exception:
+            pass  # Registry not yet wired (e.g., standalone loading server tests)
+
+        return result
 
     def _get_progress_response(self) -> Dict[str, Any]:
         """Get current progress state."""
