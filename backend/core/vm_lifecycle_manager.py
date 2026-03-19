@@ -274,15 +274,19 @@ class LifecycleLease:
 
         session_id = uuid4().hex
         record = json.dumps({"pid": os.getpid(), "session_id": session_id, "acquired_at": time.time()})
-        os.lseek(fd, 0, os.SEEK_SET)
-        os.ftruncate(fd, 0)
-        os.write(fd, record.encode("utf-8"))
         try:
-            os.fdatasync(fd)
-        except (OSError, AttributeError):
-            pass
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, record.encode("utf-8"))
+            try:
+                os.fdatasync(fd)
+            except (OSError, AttributeError):
+                pass
+            self._fd = fd
+        except BaseException:
+            os.close(fd)
+            raise
 
-        self._fd = fd
         self._session_id = session_id
         import atexit
         atexit.register(self.release)
@@ -341,7 +345,7 @@ class VMLifecycleManager:
         self._last_meaningful_activity_mono: float = 0.0
         self._active_work_count: int = 0
         self._meaningful_work_count: int = 0
-        self._warming_event: asyncio.Event = asyncio.Event()
+        self._warming_event: Optional[asyncio.Event] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._started: bool = False
 
@@ -361,6 +365,7 @@ class VMLifecycleManager:
         """Acquire lease and start background monitor."""
         if self._started:
             return
+        self._warming_event = asyncio.Event()
         self._session_id = self._lease.acquire()
         self._started = True
         _log.info("VMLifecycleManager started: session=%s", self._session_id)
@@ -405,7 +410,8 @@ class VMLifecycleManager:
                 raise VMNotReadyError(VMFsmState.WARMING, None, detail="warming timeout")
             if success:
                 self._state = VMFsmState.READY
-                self._warming_event.set()
+                if self._warming_event is not None:
+                    self._warming_event.set()
                 _log.info("VMLifecycleManager: VM is READY")
             else:
                 self._state = VMFsmState.COLD
