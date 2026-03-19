@@ -3490,6 +3490,7 @@ class UnifiedCommandProcessor:
         """
         intent = response.intent
         domain = response.domain
+        _action_start = time.monotonic()
 
         # Intent: answer / conversation -- just return the text
         # v280.5: If domain is workspace, route to workspace handler even for
@@ -3668,12 +3669,58 @@ class UnifiedCommandProcessor:
             }
 
         # Fallback: treat as answer
-        return {
+        _fallback_result = {
             "success": True,
             "response": response.content,
             "command_type": "QUERY",
             "source": response.source,
         }
+        # Fire-and-forget: forward command outcome to Reactor Core for learning
+        asyncio.create_task(self._emit_command_experience(
+            command_text, _fallback_result,
+            intent=intent, domain=domain,
+            confidence=getattr(response, 'confidence', 0.0),
+            execution_time_s=time.monotonic() - _action_start,
+        ))
+        return _fallback_result
+
+    async def _emit_command_experience(
+        self,
+        command_text: str,
+        result: Dict[str, Any],
+        intent: str = "",
+        domain: str = "",
+        confidence: float = 0.0,
+        execution_time_s: float = 0.0,
+    ) -> None:
+        """Fire-and-forget: forward command outcome to Reactor Core for learning."""
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import get_experience_forwarder
+            forwarder = await get_experience_forwarder()
+            await forwarder.forward_experience(
+                experience_type="command_outcome",
+                input_data={
+                    "command": command_text,
+                    "intent": intent,
+                    "domain": domain,
+                },
+                output_data={
+                    "success": result.get("success", False),
+                    "command_type": result.get("command_type", ""),
+                    "source": result.get("source", ""),
+                    "response_length": len(result.get("response", "") or ""),
+                },
+                quality_score=confidence,
+                confidence=confidence,
+                success=result.get("success", False),
+                component="unified_command_processor",
+                metadata={
+                    "execution_time_s": execution_time_s,
+                    "had_tier_routing": result.get("command_type") == "MULTI_AGENT_WORKFLOW",
+                },
+            )
+        except Exception:
+            pass  # Never crash the command pipeline for forwarding
 
     # =========================================================================
     # Wire 0: Tier execution — routes interactive app commands through

@@ -528,6 +528,17 @@ class MultiAgentOrchestrator:
                     (task.execution_time_seconds() or 0) * 1000,
                 )
 
+                # Emit tier routing decision for Reactor learning
+                asyncio.create_task(
+                    self._emit_tier_decision(
+                        task=task,
+                        assigned_agent_name=agent.agent_name,
+                        execution_time_s=task.execution_time_seconds() or 0.0,
+                        success=True,
+                    ),
+                    name=f"tier_decision_{task.task_id[:8]}",
+                )
+
                 return result
 
             except asyncio.TimeoutError:
@@ -631,6 +642,17 @@ class MultiAgentOrchestrator:
             "Task %s failed after %d attempts",
             task.task_id[:8],
             retry_count,
+        )
+
+        # Emit tier routing decision for failure learning
+        asyncio.create_task(
+            self._emit_tier_decision(
+                task=task,
+                assigned_agent_name=agent.agent_name,
+                execution_time_s=task.execution_time_seconds() or 0.0,
+                success=False,
+            ),
+            name=f"tier_decision_fail_{task.task_id[:8]}",
         )
 
         return None
@@ -1022,12 +1044,93 @@ class MultiAgentOrchestrator:
         """Emit a completed workflow as a Trinity experience for Reactor learning.
 
         Fire-and-forget — exceptions are logged, never propagated.
-        Uses the established Trinity event bus pattern (publish_raw) so
-        Reactor-Core can:
-        - Learn which task expansions succeed/fail
-        - Improve agent selection over time
-        - Detect patterns in multi-agent workflow outcomes
+
+        PRIMARY: Uses CrossRepoExperienceForwarder.forward_experience() which
+        handles batching, circuit breaking, deduplication, and file fallback.
+        This ensures Reactor Core receives events with the correct
+        experience_type taxonomy (not raw event bus topics).
+
+        SECONDARY: Also publishes to the raw Trinity event bus for backward
+        compatibility with any direct subscribers.
         """
+        # Build task traces (shared by both emission paths)
+        task_traces = []
+        for task in result.tasks:
+            task_traces.append({
+                "task_id": task.task_id,
+                "name": task.name,
+                "capability": task.required_capability,
+                "fallback": task.fallback_capability,
+                "status": task.status,
+                "assigned_agent": task.assigned_agent,
+                "execution_time_s": task.execution_time_seconds(),
+                "error": task.error,
+            })
+
+        # Extract prediction context
+        original_query: Optional[str] = None
+        intent: Optional[str] = None
+        strategy: Optional[str] = None
+        confidence: float = 0.5
+
+        if context and isinstance(context, dict):
+            prediction = context.get("prediction")
+            if prediction and isinstance(prediction, dict):
+                intent = prediction.get("intent")
+                confidence = prediction.get("confidence", 0.5)
+                original_query = prediction.get("original_query")
+            strategy = context.get("strategy")
+
+        tasks_total = len(result.tasks)
+        tasks_succeeded = result.successful_tasks if isinstance(result.successful_tasks, int) else 0
+        quality_score = (tasks_succeeded / tasks_total) if tasks_total > 0 else 0.0
+
+        # ----- PRIMARY: CrossRepoExperienceForwarder -----
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import (
+                get_experience_forwarder,
+            )
+
+            forwarder = await get_experience_forwarder()
+            await forwarder.forward_experience(
+                experience_type="workflow_completion",
+                input_data={
+                    "query": original_query,
+                    "intent": intent,
+                    "strategy": strategy,
+                },
+                output_data={
+                    "workflow_id": result.workflow_id,
+                    "status": result.status,
+                    "tasks_total": tasks_total,
+                    "tasks_succeeded": tasks_succeeded,
+                    "execution_time_s": result.total_execution_time_seconds,
+                    "task_traces": task_traces,
+                },
+                quality_score=quality_score,
+                confidence=confidence,
+                success=result.is_successful() if callable(getattr(result, "is_successful", None)) else result.status == "completed",
+                component="multi_agent_orchestrator",
+            )
+
+            logger.debug(
+                "Experience forwarded for workflow %s (%s)",
+                result.workflow_id[:8],
+                result.status,
+            )
+
+        except ImportError:
+            logger.debug(
+                "CrossRepoExperienceForwarder not available, relying on event bus fallback"
+            )
+        except Exception as e:
+            logger.debug(
+                "Experience forwarding failed for workflow %s: %s",
+                result.workflow_id[:8],
+                e,
+            )
+
+        # ----- SECONDARY: Raw event bus (backward compatibility) -----
         try:
             from core.trinity_event_bus import get_event_bus_if_exists
 
@@ -1035,40 +1138,23 @@ class MultiAgentOrchestrator:
             if bus is None:
                 return
 
-            # Build experience payload with full workflow trace
-            task_traces = []
-            for task in result.tasks:
-                task_traces.append({
-                    "task_id": task.task_id,
-                    "name": task.name,
-                    "capability": task.required_capability,
-                    "fallback": task.fallback_capability,
-                    "status": task.status,
-                    "assigned_agent": task.assigned_agent,
-                    "execution_time_s": task.execution_time_seconds(),
-                    "error": task.error,
-                })
-
             experience_payload: Dict[str, Any] = {
                 "workflow_id": result.workflow_id,
                 "workflow_name": result.name,
                 "status": result.status,
-                "tasks_total": len(result.tasks),
-                "tasks_succeeded": result.successful_tasks,
-                "tasks_failed": result.failed_tasks,
+                "tasks_total": tasks_total,
+                "tasks_succeeded": tasks_succeeded,
+                "tasks_failed": result.failed_tasks if isinstance(result.failed_tasks, int) else 0,
                 "execution_time_s": result.total_execution_time_seconds,
                 "task_traces": task_traces,
             }
 
-            # Include prediction context if available
-            if context and isinstance(context, dict):
-                prediction = context.get("prediction")
-                if prediction and isinstance(prediction, dict):
-                    experience_payload["intent"] = prediction.get("intent")
-                    experience_payload["confidence"] = prediction.get("confidence")
-                    experience_payload["original_query"] = prediction.get(
-                        "original_query"
-                    )
+            if original_query:
+                experience_payload["original_query"] = original_query
+            if intent:
+                experience_payload["intent"] = intent
+            if confidence != 0.5:
+                experience_payload["confidence"] = confidence
 
             await bus.publish_raw(
                 topic="workflow.completed",
@@ -1076,16 +1162,15 @@ class MultiAgentOrchestrator:
             )
 
             logger.debug(
-                "Trinity experience emitted for workflow %s (%s)",
+                "Legacy event bus experience emitted for workflow %s",
                 result.workflow_id[:8],
-                result.status,
             )
 
         except ImportError:
             pass  # Trinity event bus not available in this environment
         except Exception as e:
             logger.debug(
-                "Trinity experience emission failed for workflow %s: %s",
+                "Legacy event bus emission failed for workflow %s: %s",
                 result.workflow_id[:8],
                 e,
             )
@@ -1103,7 +1188,53 @@ class MultiAgentOrchestrator:
         ComputerUseAgent visual fallback is invoked for a task whose primary
         agent exhausted its retries.  Exceptions are silently swallowed so
         this helper never affects task execution.
+
+        PRIMARY: CrossRepoExperienceForwarder (production path).
+        SECONDARY: Raw event bus (backward compatibility).
         """
+        # ----- PRIMARY: CrossRepoExperienceForwarder -----
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import (
+                get_experience_forwarder,
+            )
+
+            forwarder = await get_experience_forwarder()
+            await forwarder.forward_experience(
+                experience_type="tier_fallback",
+                input_data={
+                    "task_id": task.task_id,
+                    "task_name": task.name,
+                    "capability": task.required_capability,
+                },
+                output_data={
+                    "original_agent": original_agent,
+                    "fallback_agent": fallback_agent,
+                    "success": success,
+                },
+                quality_score=1.0 if success else 0.0,
+                confidence=1.0,
+                success=success,
+                component="execution_tier_router",
+            )
+
+            logger.debug(
+                "Tier fallback experience forwarded for task %s (%s -> %s, success=%s)",
+                task.task_id[:8],
+                original_agent,
+                fallback_agent,
+                success,
+            )
+
+        except ImportError:
+            pass  # Forwarder not available
+        except Exception as e:
+            logger.debug(
+                "Tier fallback experience forwarding failed for task %s: %s",
+                task.task_id[:8],
+                e,
+            )
+
+        # ----- SECONDARY: Raw event bus (backward compatibility) -----
         try:
             from core.trinity_event_bus import get_event_bus_if_exists
             bus = get_event_bus_if_exists()
@@ -1117,6 +1248,85 @@ class MultiAgentOrchestrator:
                     "capability": task.required_capability,
                     "original_agent": original_agent,
                     "fallback_agent": fallback_agent,
+                    "success": success,
+                    "timestamp": time.time(),
+                },
+            )
+        except Exception:
+            pass  # Learning is best-effort
+
+    async def _emit_tier_decision(
+        self,
+        task: WorkflowTask,
+        assigned_agent_name: str,
+        execution_time_s: float,
+        success: bool,
+    ) -> None:
+        """Emit a tier routing decision experience when a task is assigned to an agent.
+
+        Called fire-and-forget via asyncio.create_task after agent resolution
+        succeeds in _execute_task.  This lets Reactor Core learn which agents
+        are selected for which capabilities and how well they perform.
+
+        Exceptions are silently swallowed so this helper never affects task
+        execution.
+        """
+        # ----- PRIMARY: CrossRepoExperienceForwarder -----
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import (
+                get_experience_forwarder,
+            )
+
+            forwarder = await get_experience_forwarder()
+            await forwarder.forward_experience(
+                experience_type="tier_routing_decision",
+                input_data={
+                    "task_id": task.task_id,
+                    "task_name": task.name,
+                    "capability": task.required_capability,
+                    "action": task.required_capability,
+                },
+                output_data={
+                    "assigned_agent": assigned_agent_name,
+                    "execution_time_s": execution_time_s,
+                    "success": success,
+                },
+                quality_score=1.0 if success else 0.0,
+                confidence=1.0,
+                success=success,
+                component="execution_tier_router",
+            )
+
+            logger.debug(
+                "Tier decision experience forwarded for task %s -> %s (success=%s)",
+                task.task_id[:8],
+                assigned_agent_name,
+                success,
+            )
+
+        except ImportError:
+            pass  # Forwarder not available
+        except Exception as e:
+            logger.debug(
+                "Tier decision experience forwarding failed for task %s: %s",
+                task.task_id[:8],
+                e,
+            )
+
+        # ----- SECONDARY: Raw event bus (backward compatibility) -----
+        try:
+            from core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return
+            await bus.publish_raw(
+                topic="tier.routing.decision",
+                data={
+                    "task_id": task.task_id,
+                    "task_name": task.name,
+                    "capability": task.required_capability,
+                    "assigned_agent": assigned_agent_name,
+                    "execution_time_s": execution_time_s,
                     "success": success,
                     "timestamp": time.time(),
                 },
