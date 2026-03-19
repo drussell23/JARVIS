@@ -46,6 +46,14 @@ _AUDIO_IO_EXECUTOR = ThreadPoolExecutor(
     thread_name_prefix="jarvis-audio-io",
 )
 
+# v293.0: Module-level settle deadline.
+# Set to monotonic() + startup_silence_s when the stream starts.
+# safe_say() reads this before launching afplay so it never plays audio
+# during the CoreAudio HAL's post-start stabilisation window.
+# Readable from any thread without a lock (float write is atomic on CPython).
+_device_settled_after: float = 0.0
+_device_sample_rate: int = 48000  # mirrors the active DeviceConfig.sample_rate
+
 
 @atexit.register
 def _shutdown_audio_io_executor() -> None:
@@ -286,6 +294,15 @@ class FullDuplexDevice:
 
                 _pcb("stream_start", f"profile_{idx}")
                 self._stream.start()
+
+                # v293.0: Publish settle deadline and active sample rate.
+                # safe_say() reads these before launching afplay to avoid
+                # injecting audio during the CoreAudio HAL stabilisation window.
+                global _device_settled_after, _device_sample_rate
+                _device_settled_after = (
+                    time.monotonic() + self.config.startup_silence_ms / 1000.0
+                )
+                _device_sample_rate = sample_rate
 
                 if self._cancel_requested.is_set():
                     logger.warning("[FullDuplexDevice] Init cancelled after stream started — aborting")

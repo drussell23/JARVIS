@@ -1330,7 +1330,21 @@ async def safe_say(
     async def _do_say() -> bool:
         _temp_path: Optional[str] = None
         try:
-            # 2. Synthesize to tempfile (NEVER opens audio device)
+            # 2. Synthesize to tempfile (NEVER opens audio device).
+            #
+            # v293.0: Force output sample rate to match FullDuplexDevice so
+            # CoreAudio's HAL mixer never performs real-time SRC on speech.
+            # SRC during the post-start settle window is a primary source of
+            # crackling/popping artifacts at startup.
+            # --data-format=LEI16@{sr} produces signed 16-bit PCM AIFF at the
+            # device native rate — afplay plays it without any conversion.
+            _say_sr: int = 48000
+            try:
+                from backend.audio.full_duplex_device import _device_sample_rate
+                _say_sr = _device_sample_rate if _device_sample_rate > 0 else 48000
+            except Exception:
+                _say_sr = int(os.environ.get("JARVIS_AUDIO_SAMPLE_RATE", "48000"))
+
             _temp_fd, _temp_path = _tmpmod.mkstemp(
                 suffix=".aiff", prefix="jarvis_safe_say_"
             )
@@ -1341,6 +1355,7 @@ async def safe_say(
                 "-v", voice,
                 "-r", str(rate),
                 "-o", _temp_path,
+                "--data-format", f"LEI16@{_say_sr}",
                 text,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
@@ -1370,6 +1385,22 @@ async def safe_say(
             # audio. CoreAudio's HAL mixer handles coexistence with
             # FullDuplexDevice's PortAudio stream (the output callback safely
             # outputs silence when PlaybackRingBuffer is empty).
+            #
+            # v293.0: Wait for FullDuplexDevice's post-start settle window
+            # before launching afplay.  Connecting a new CoreAudio client
+            # (afplay) while PortAudio's HAL stream is still stabilising its
+            # PLL and buffer routing produces clicks/pops regardless of the
+            # audio content.  The settle deadline is a monotonic timestamp
+            # written by full_duplex_device.py when the stream starts.
+            try:
+                import time as _time_settle
+                from backend.audio.full_duplex_device import _device_settled_after
+                _settle_remaining = _device_settled_after - _time_settle.monotonic()
+                if 0 < _settle_remaining <= 1.0:  # cap: never wait more than 1 s
+                    await asyncio.sleep(_settle_remaining)
+            except Exception:
+                pass  # Module not loaded (very early startup) — proceed immediately
+
             if True:  # v283.0: Always afplay — no AudioBus routing
                 _afplay = await asyncio.create_subprocess_exec(
                     "afplay", _temp_path,
