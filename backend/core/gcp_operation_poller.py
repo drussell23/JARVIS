@@ -301,7 +301,7 @@ class OperationLifecycleRegistry:
             record.terminal_reason = reason
             record.last_seen_at = time.time()
         # Persist asynchronously (best-effort)
-        asyncio.ensure_future(self._persist_safe())
+        asyncio.create_task(self._persist_safe())
 
     def get_inflight(self) -> List[OperationRecord]:
         return [r for r in self._records.values() if r.terminal_state is None]
@@ -316,15 +316,19 @@ class OperationLifecycleRegistry:
 
     async def _persist_safe(self) -> None:
         try:
-            self._persist_path.parent.mkdir(parents=True, exist_ok=True)
             data = {op_id: r.to_dict() for op_id, r in self._records.items()}
-            tmp = self._persist_path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2))
-            tmp.replace(self._persist_path)
+            serialized = json.dumps(data, indent=2)
+
+            def _write_atomic(path: Path, content: str) -> None:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".tmp")
+                tmp.write_text(content)
+                tmp.replace(path)
+
+            await asyncio.to_thread(_write_atomic, self._persist_path, serialized)
             # Also write cross-repo shared state (best-effort)
             cross_repo_path = Path.home() / ".jarvis" / "cross_repo" / "gcp" / "operations.json"
-            cross_repo_path.parent.mkdir(parents=True, exist_ok=True)
-            cross_repo_path.write_text(json.dumps(data, indent=2))
+            await asyncio.to_thread(_write_atomic, cross_repo_path, serialized)
         except Exception as e:
             _log.warning("[OperationRegistry] Persist failed (non-fatal): %s", e)
 
