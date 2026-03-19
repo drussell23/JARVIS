@@ -944,14 +944,6 @@ class PrimeRouter:
                             self._lifecycle.record_activity_from("prime_client.execute_request")
                         except Exception:
                             pass
-                    else:
-                        try:
-                            from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
-                            _vm_mgr_pre = await get_gcp_vm_manager_safe()
-                            if _vm_mgr_pre is not None:
-                                _vm_mgr_pre.record_jprime_activity()
-                        except Exception:
-                            pass
                     response = await asyncio.wait_for(
                         self._generate_local(
                             prompt, system_prompt, context, max_tokens, temperature, **kwargs
@@ -965,14 +957,6 @@ class PrimeRouter:
                     if self._lifecycle is not None:
                         try:
                             self._lifecycle.record_activity_from("prime_client.execute_request")
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
-                            _vm_mgr = await get_gcp_vm_manager_safe()
-                            if _vm_mgr is not None:
-                                _vm_mgr.record_jprime_activity()
                         except Exception:
                             pass
                 except Exception as e:
