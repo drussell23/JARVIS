@@ -55,6 +55,57 @@ _device_settled_after: float = 0.0
 _device_sample_rate: int = 48000  # mirrors the active DeviceConfig.sample_rate
 
 
+# v295.1: Remote-mic exclusion helpers.
+# These device-name substrings identify microphones that are NOT physically attached
+# to the Mac.  Matching is case-insensitive.
+_REMOTE_MIC_PATTERNS: tuple = (
+    "iphone",
+    "ipad",
+    "continuity",
+    "airpods",       # AirPods mic is a BT remote device
+    "beats",         # Beats BT headsets
+    "earpods",       # Lightning/USB EarPods can still trigger Handoff mic activity
+)
+
+# Patterns that positively identify a local Mac microphone; checked first so that
+# a device like "MacBook Pro AirPlay to iPhone" doesn't accidentally pass.
+_LOCAL_MIC_PATTERNS: tuple = (
+    "macbook",
+    "built-in",
+    "built in",
+    "internal",
+    "imac",
+    "mac mini",
+    "mac pro",
+    "mac studio",
+)
+
+
+def _is_remote_mic_name(name_lower: str) -> bool:
+    """Return True if the device name looks like a remote / Continuity microphone."""
+    for pat in _REMOTE_MIC_PATTERNS:
+        if pat in name_lower:
+            return True
+    return False
+
+
+def _filter_local_input_devices(devices: list) -> list:
+    """Return a copy of devices with remote-mic entries zeroed out (max_input_channels=0).
+
+    We zero channels rather than remove entries so that device indices in the
+    returned list still match the original PortAudio indices — the caller
+    relies on index correspondence when passing device numbers to PortAudio.
+    """
+    filtered = []
+    for dev in devices:
+        name_lower = str(dev.get("name", "")).lower()
+        if dev.get("max_input_channels", 0) > 0 and _is_remote_mic_name(name_lower):
+            # Mask the input capability so _resolve_device() skips this entry
+            dev = dict(dev, max_input_channels=0)
+        filtered.append(dev)
+    return filtered
+
+
 @atexit.register
 def _shutdown_audio_io_executor() -> None:
     """Release the dedicated audio executor during interpreter shutdown."""
@@ -79,6 +130,10 @@ class DeviceConfig:
     require_input: bool = False           # Fail startup if no input device
     allow_output_only: bool = True        # Degrade to output-only when no input
     startup_silence_ms: int = 250         # Silence window to avoid startup pop/click/static
+    # v295.1: Prefer built-in Mac microphone — skip iPhone/Continuity/AirPods/BT devices
+    # during input resolution so macOS never activates a Continuity Microphone handshake.
+    # Override with JARVIS_AUDIO_PREFER_LOCAL_MIC=0 if you intentionally want a remote mic.
+    prefer_local_mic: bool = True
 
     def __post_init__(self):
         # Allow env var overrides
@@ -115,6 +170,10 @@ class DeviceConfig:
         dev_out = os.getenv("JARVIS_AUDIO_OUTPUT_DEVICE")
         if dev_out is not None:
             self.output_device = int(dev_out)
+
+        prefer_local_env = os.getenv("JARVIS_AUDIO_PREFER_LOCAL_MIC")
+        if prefer_local_env is not None:
+            self.prefer_local_mic = prefer_local_env.lower() not in ("0", "false", "no", "off")
 
     @property
     def frame_size(self) -> int:
@@ -646,6 +705,37 @@ class FullDuplexDevice:
             default_input = None
             default_output = None
 
+        # v295.1: Build a filtered device list for input resolution that excludes
+        # iPhone, Continuity, AirPods, and other remote-mic devices.  This prevents
+        # macOS from activating a Continuity Microphone handshake with a nearby iPhone
+        # just because PortAudio enumerated the device.  JARVIS only needs the built-in
+        # Mac microphone; remote devices are never intentionally chosen here.
+        input_devices = devices
+        if self.config.prefer_local_mic and self.config.input_device is None:
+            input_devices = _filter_local_input_devices(devices)
+            if not any(
+                int(d.get("max_input_channels", 0)) >= self.config.channels
+                for d in input_devices
+            ):
+                # Nothing local — fall back to full list so startup still works
+                logger.debug(
+                    "[FullDuplexDevice] No local-only mic found; falling back to all devices"
+                )
+                input_devices = devices
+            # If the system default points at a remote mic, drop that default
+            if default_input is not None:
+                try:
+                    default_name = str(devices[default_input].get("name", "")).lower()
+                    if _is_remote_mic_name(default_name):
+                        logger.info(
+                            "[FullDuplexDevice] System default input is a remote mic (%s); "
+                            "ignoring default — will select first local mic instead.",
+                            devices[default_input].get("name", "?"),
+                        )
+                        default_input = None
+                except (IndexError, TypeError):
+                    pass
+
         output_device = self._resolve_device(
             devices=devices,
             configured=self.config.output_device,
@@ -656,7 +746,7 @@ class FullDuplexDevice:
             raise RuntimeError("No valid output device available")
 
         input_device = self._resolve_device(
-            devices=devices,
+            devices=input_devices,
             configured=self.config.input_device,
             default=default_input,
             direction="input",
