@@ -2364,7 +2364,10 @@ class UnifiedCommandProcessor:
                 return f"Email check failed: {error_str}"
             count = result.get("count", 0)
             total = result.get("total_unread", count)
+            _filtered_category = result.get("category", "")
             if count == 0:
+                if _filtered_category:
+                    return f"No unread emails in your {_filtered_category} category."
                 return "No unread emails found."
             emails = result.get("emails", [])
             display_limit = int(os.getenv("JARVIS_EMAIL_DISPLAY_LIMIT", "8"))
@@ -2395,17 +2398,31 @@ class UnifiedCommandProcessor:
             important_count = tier_counts.get(2, 0)
 
             # ── Header line with intelligence ──
-            header = f"You have {total} unread email{'s' if total != 1 else ''}."
+            if _filtered_category:
+                header = f"You have {total} unread {_filtered_category} email{'s' if total != 1 else ''}."
+            else:
+                header = f"You have {total} unread email{'s' if total != 1 else ''}."
             if urgent_count:
                 header += f" {urgent_count} urgent."
             if important_count:
                 header += f" {important_count} important."
 
-            # Category breakdown if mixed
-            non_primary = {k: v for k, v in tab_counts.items() if k != "primary"}
-            if non_primary:
-                parts = [f"{v} {k}" for k, v in sorted(non_primary.items(), key=lambda x: -x[1])]
-                header += f"\n  Categories: {tab_counts.get('primary', 0)} primary, {', '.join(parts)}."
+            # Category breakdown — prefer global category_counts from Gmail API if available,
+            # otherwise fall back to per-email label classification of fetched emails.
+            _cat_counts = result.get("category_counts")
+            if isinstance(_cat_counts, dict) and _cat_counts:
+                _cat_parts = []
+                for _cname in ("primary", "promotions", "social", "updates", "forums"):
+                    _cval = _cat_counts.get(_cname, 0)
+                    if _cval > 0:
+                        _cat_parts.append(f"{_cval} {_cname}")
+                if _cat_parts:
+                    header += f"\n  Categories: {', '.join(_cat_parts)}."
+            else:
+                non_primary = {k: v for k, v in tab_counts.items() if k != "primary"}
+                if non_primary:
+                    parts = [f"{v} {k}" for k, v in sorted(non_primary.items(), key=lambda x: -x[1])]
+                    header += f"\n  Categories: {tab_counts.get('primary', 0)} primary, {', '.join(parts)}."
 
             lines = [header, ""]
 
@@ -3205,6 +3222,7 @@ class UnifiedCommandProcessor:
             content="",
             request_id=uuid.uuid4().hex,
             correlation_id=uuid.uuid4().hex,
+            entities=getattr(detection, "entities", {}),
         )
 
         try:
@@ -3403,6 +3421,7 @@ class UnifiedCommandProcessor:
             content="",
             request_id=command_id,
             correlation_id=uuid.uuid4().hex,
+            entities=getattr(detection, "entities", {}),
         )
 
         # Guardrail 9: Execute with stage-level deadline partitioning
@@ -4510,6 +4529,11 @@ class UnifiedCommandProcessor:
                     "idempotency_key": idempotency_key,
                     "upstream_outputs": dict(artifacts),
                 }
+
+                # Propagate routing-intelligence entities (e.g. category)
+                _routing_entities = getattr(response, "entities", None)
+                if isinstance(_routing_entities, dict) and _routing_entities:
+                    payload.update(_routing_entities)
 
                 _node_exec_start = _time.monotonic()
                 try:

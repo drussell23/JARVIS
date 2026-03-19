@@ -4812,6 +4812,37 @@ Return ONLY a JSON object with these keys (use null if not found):
             result.setdefault("idempotency_key", idempotency_key)
         return result
 
+    async def _get_category_counts(self) -> Dict[str, int]:
+        """Get unread email counts per Gmail category tab.
+
+        Queries the Gmail API for unread message counts in each of the
+        five standard category labels (Primary, Promotions, Social,
+        Updates, Forums).  Returns an empty dict on any error so callers
+        can treat category enrichment as best-effort.
+        """
+        categories = {
+            "primary": "CATEGORY_PERSONAL",
+            "promotions": "CATEGORY_PROMOTIONS",
+            "social": "CATEGORY_SOCIAL",
+            "updates": "CATEGORY_UPDATES",
+            "forums": "CATEGORY_FORUMS",
+        }
+        counts: Dict[str, int] = {}
+        try:
+            if not self._client or not self._client._gmail_service:
+                return counts
+            for name, label_id in categories.items():
+                label_info = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda lid=label_id: self._client._gmail_service.users().labels().get(
+                        userId="me", id=lid,
+                    ).execute(),
+                )
+                counts[name] = label_info.get("messagesUnread", 0)
+        except Exception as e:
+            logger.debug(f"Category count fetch failed: {e}")
+        return counts
+
     async def _fetch_unread_emails(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Fetch unread emails using unified executor with waterfall fallback.
@@ -4821,6 +4852,76 @@ Return ONLY a JSON object with these keys (use null if not found):
         2. Computer Use (visual - open Gmail in browser)
         """
         limit = payload.get("limit", self.config.default_email_limit)
+        raw_category = payload.get("category", "").lower().strip()
+
+        # Normalize singular/variant forms to canonical category names
+        _category_aliases = {
+            "primary": "primary",
+            "promotion": "promotions", "promotions": "promotions",
+            "social": "social",
+            "update": "updates", "updates": "updates",
+            "forum": "forums", "forums": "forums",
+        }
+        category = _category_aliases.get(raw_category, raw_category)
+
+        # ── Category-specific fetch (direct API, skips executor waterfall) ──
+        _gmail_categories = {
+            "primary": "CATEGORY_PERSONAL",
+            "promotions": "CATEGORY_PROMOTIONS",
+            "social": "CATEGORY_SOCIAL",
+            "updates": "CATEGORY_UPDATES",
+            "forums": "CATEGORY_FORUMS",
+        }
+        if category and self._client and self._client._gmail_service:
+            label_id = _gmail_categories.get(category)
+            if label_id:
+                asyncio.create_task(self._narrate(f"Checking your {category} emails."))
+                try:
+                    results = await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: self._client._gmail_service.users().messages().list(
+                            userId="me",
+                            labelIds=[label_id, "UNREAD"],
+                            maxResults=limit,
+                        ).execute(),
+                    )
+                    messages = results.get("messages", [])
+                    emails = []
+                    for msg in messages[:limit]:
+                        msg_data = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda mid=msg["id"]: self._client._gmail_service.users().messages().get(
+                                userId="me", id=mid, format="metadata",
+                                metadataHeaders=["From", "Subject", "Date"],
+                            ).execute(),
+                        )
+                        headers = {
+                            h["name"]: h["value"]
+                            for h in msg_data.get("payload", {}).get("headers", [])
+                        }
+                        emails.append({
+                            "id": msg["id"],
+                            "from": headers.get("From", ""),
+                            "subject": headers.get("Subject", ""),
+                            "date": headers.get("Date", ""),
+                            "snippet": msg_data.get("snippet", ""),
+                            "category": category,
+                        })
+
+                    asyncio.create_task(self._narrate(
+                        f"You have {len(emails)} unread {category} email{'s' if len(emails) != 1 else ''}."
+                    ))
+
+                    return {
+                        "success": True,
+                        "emails": emails,
+                        "count": len(emails),
+                        "category": category,
+                        "workspace_action": "fetch_unread_emails",
+                    }
+                except Exception as e:
+                    logger.warning(f"Category fetch for '{category}' failed: {e}, falling through to default")
+
         asyncio.create_task(self._narrate("Checking your inbox now."))
         allow_visual_fallback = bool(
             payload.get(
@@ -4922,6 +5023,39 @@ Return ONLY a JSON object with these keys (use null if not found):
                     ))
                 except Exception as e:
                     logger.debug(f"Email triage scoring failed: {e}")
+
+                # ── Enrich with per-category unread counts ──
+                try:
+                    category_counts = await self._get_category_counts()
+                    if category_counts:
+                        result["category_counts"] = category_counts
+                        result["total_across_categories"] = sum(category_counts.values())
+
+                        # Build smart narration with category awareness
+                        parts = []
+                        primary = category_counts.get("primary", 0)
+                        promos = category_counts.get("promotions", 0)
+                        social = category_counts.get("social", 0)
+                        updates = category_counts.get("updates", 0)
+                        forums = category_counts.get("forums", 0)
+                        if primary > 0:
+                            parts.append(f"{primary} in Primary")
+                        if promos > 0:
+                            parts.append(f"{promos} promotion{'s' if promos != 1 else ''}")
+                        if social > 0:
+                            parts.append(f"{social} social")
+                        if updates > 0:
+                            parts.append(f"{updates} update{'s' if updates != 1 else ''}")
+                        if forums > 0:
+                            parts.append(f"{forums} in forums")
+
+                        if parts:
+                            cat_summary = ", ".join(parts)
+                            asyncio.create_task(self._narrate(
+                                f"Your inbox breakdown: {cat_summary}."
+                            ))
+                except Exception:
+                    pass  # Category enrichment is best-effort
 
                 result["workspace_action"] = "fetch_unread_emails"
                 return result
