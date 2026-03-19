@@ -591,6 +591,16 @@ class MultiAgentOrchestrator:
                         "Task %s recovered via ComputerUseAgent visual fallback",
                         task.task_id[:8],
                     )
+                    # Emit learning: visual fallback was needed and succeeded
+                    asyncio.create_task(
+                        self._emit_tier_fallback_experience(
+                            task=task,
+                            original_agent=agent.agent_name,
+                            fallback_agent=cu_agent.agent_name,
+                            success=True,
+                        ),
+                        name=f"reactor_fallback_{task.task_id[:8]}",
+                    )
                     return result
 
                 except Exception as cu_err:
@@ -598,6 +608,16 @@ class MultiAgentOrchestrator:
                         "Task %s: ComputerUseAgent fallback also failed: %s",
                         task.task_id[:8],
                         cu_err,
+                    )
+                    # Emit learning: visual fallback was needed but also failed
+                    asyncio.create_task(
+                        self._emit_tier_fallback_experience(
+                            task=task,
+                            original_agent=agent.agent_name,
+                            fallback_agent=cu_agent.agent_name,
+                            success=False,
+                        ),
+                        name=f"reactor_fallback_{task.task_id[:8]}",
                     )
 
         # Truly exhausted — all paths failed
@@ -1069,6 +1089,40 @@ class MultiAgentOrchestrator:
                 result.workflow_id[:8],
                 e,
             )
+
+    async def _emit_tier_fallback_experience(
+        self,
+        task: WorkflowTask,
+        original_agent: str,
+        fallback_agent: str,
+        success: bool,
+    ) -> None:
+        """Emit tier fallback experience to Trinity for Reactor learning.
+
+        Called fire-and-forget via asyncio.create_task whenever the
+        ComputerUseAgent visual fallback is invoked for a task whose primary
+        agent exhausted its retries.  Exceptions are silently swallowed so
+        this helper never affects task execution.
+        """
+        try:
+            from core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return
+            await bus.publish_raw(
+                topic="tier.fallback.execution",
+                data={
+                    "task_id": task.task_id,
+                    "task_name": task.name,
+                    "capability": task.required_capability,
+                    "original_agent": original_agent,
+                    "fallback_agent": fallback_agent,
+                    "success": success,
+                    "timestamp": time.time(),
+                },
+            )
+        except Exception:
+            pass  # Learning is best-effort
 
     # =========================================================================
     # Wire 4: Proactive Intent Handler

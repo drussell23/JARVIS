@@ -603,6 +603,18 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
     # Order matters: first match wins. Loaded once, never hardcoded per-task.
     _CAPABILITY_ROUTES: List[Tuple[List[str], str, Optional[str]]] = [
         # (keywords, primary_capability, fallback_capability)
+        # Native app interaction → NativeAppControlAgent
+        (
+            ["whatsapp", "spotify", "discord", "telegram", "imessage", "facetime", "messages app"],
+            "native_app_control",
+            "visual_browser",  # Fallback to web version if app not installed
+        ),
+        # Browser-only services → VisualBrowserAgent
+        (
+            ["linkedin", "twitter", "facebook", "instagram", "reddit", "youtube"],
+            "visual_browser",
+            "computer_use",
+        ),
         # Workspace operations → GoogleWorkspaceAgent
         (
             ["email", "inbox", "mail", "unread", "gmail", "send email", "draft"],

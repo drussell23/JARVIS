@@ -26,6 +26,8 @@ _EXPORTS: Dict[str, Tuple[str, str]] = {
     "get_agent_initializer": (".agent_initializer", "get_agent_initializer"),
     "initialize_production_agents": (".agent_initializer", "initialize_production_agents"),
     "shutdown_production_agents": (".agent_initializer", "shutdown_production_agents"),
+    "AccessibilityResolver": (".accessibility_resolver", "AccessibilityResolver"),
+    "get_accessibility_resolver": (".accessibility_resolver", "get_accessibility_resolver"),
 }
 
 __all__ = list(_EXPORTS)
