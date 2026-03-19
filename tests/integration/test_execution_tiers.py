@@ -577,3 +577,109 @@ class TestVisualBrowserAgent:
         assert result["steps_taken"] == 0
         assert isinstance(result["actions"], list)
         assert len(result["actions"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# NativeAppControlAgent tests  (Task 3)
+# ---------------------------------------------------------------------------
+
+
+class TestNativeAppControlAgent:
+    """Tests for NativeAppControlAgent vision-action loop agent."""
+
+    # ------------------------------------------------------------------
+    # Fixtures
+    # ------------------------------------------------------------------
+
+    @pytest.fixture
+    def agent(self):
+        """Return an uninitialised NativeAppControlAgent instance."""
+        from backend.neural_mesh.agents.native_app_control_agent import (
+            NativeAppControlAgent,
+        )
+        return NativeAppControlAgent()
+
+    # ------------------------------------------------------------------
+    # Structural / metadata tests
+    # ------------------------------------------------------------------
+
+    def test_agent_has_correct_capabilities(self, agent) -> None:
+        """Agent must advertise native_app_control and interact_with_app."""
+        assert {"native_app_control", "interact_with_app"} <= agent.capabilities
+
+    def test_agent_name(self, agent) -> None:
+        assert agent.agent_name == "native_app_control_agent"
+
+    def test_agent_type(self, agent) -> None:
+        assert agent.agent_type == "autonomy"
+
+    # ------------------------------------------------------------------
+    # Validation: empty app_name
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_execute_task_validates_app_name(self, agent) -> None:
+        """Empty app_name must return an error dict (not raise)."""
+        agent._initialized = True  # Skip full init for unit test
+        result = await agent.execute_task(
+            {"action": "interact_with_app", "app_name": "", "goal": "do something"}
+        )
+        assert isinstance(result, dict)
+        assert result["success"] is False
+        assert "error" in result
+        assert result["steps_taken"] == 0
+
+    # ------------------------------------------------------------------
+    # Validation: empty goal
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_execute_task_validates_goal(self, agent) -> None:
+        """Empty goal must return an error dict (not raise)."""
+        agent._initialized = True
+        result = await agent.execute_task(
+            {"action": "interact_with_app", "app_name": "Finder", "goal": ""}
+        )
+        assert isinstance(result, dict)
+        assert result["success"] is False
+        assert "error" in result
+        assert result["steps_taken"] == 0
+
+    # ------------------------------------------------------------------
+    # App installed check
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_execute_task_checks_app_installed(self, agent) -> None:
+        """A definitely non-existent app must produce an error mentioning 'not installed'."""
+        agent._initialized = True
+
+        # Provide a real mock AppInventoryService that reports not-found
+        mock_svc = MagicMock()
+        mock_svc.execute_task = AsyncMock(
+            return_value={
+                "found": False,
+                "app_name": "XJARVIS_GHOST_APP_XYZ",
+                "bundle_id": None,
+                "path": None,
+                "is_running": False,
+                "window_count": 0,
+                "confidence": 0.0,
+            }
+        )
+        agent._app_inventory_service = mock_svc
+
+        result = await agent.execute_task(
+            {
+                "action": "interact_with_app",
+                "app_name": "XJARVIS_GHOST_APP_XYZ",
+                "goal": "open settings",
+            }
+        )
+
+        assert isinstance(result, dict)
+        assert result["success"] is False
+        # Error or final_message must mention "not installed"
+        combined = (result.get("error", "") + result.get("final_message", "")).lower()
+        assert "not installed" in combined
+        assert result["steps_taken"] == 0
