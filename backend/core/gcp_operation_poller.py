@@ -799,7 +799,6 @@ class GCPOperationPoller:
     def _check_done(self, op: Any, record: OperationRecord, t_start: float) -> Optional[OperationResult]:
         """Return OperationResult if op is in a terminal status, else None."""
         status_done = _OP_STATUS_DONE
-        status_aborting_str = "ABORTING"
 
         status = op.status
         if hasattr(status, "name"):
@@ -807,7 +806,8 @@ class GCPOperationPoller:
         else:
             status_str = str(status)
 
-        if status_str == status_aborting_str:
+        aborting_str = getattr(_OP_STATUS_ABORTING, "name", str(_OP_STATUS_ABORTING))
+        if status_str == aborting_str:
             return OperationResult(
                 success=False,
                 reason=TerminalReason.OP_DONE_FAILURE,
