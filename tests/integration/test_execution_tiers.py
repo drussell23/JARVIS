@@ -239,3 +239,290 @@ class TestAppInventoryService:
         assert result["confidence"] == pytest.approx(0.97)
 
         mock_library.resolve_app_name_async.assert_awaited_once_with("Chrome")
+
+
+# ---------------------------------------------------------------------------
+# ExecutionTierRouter tests  (Task 2)
+# ---------------------------------------------------------------------------
+
+class TestExecutionTierRouter:
+    """Tests for ExecutionTierRouter routing logic."""
+
+    # ------------------------------------------------------------------
+    # Fixtures
+    # ------------------------------------------------------------------
+
+    @pytest.fixture
+    def router(self):
+        """Return an uninitialised ExecutionTierRouter (no Neural Mesh needed)."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTierRouter
+        return ExecutionTierRouter()
+
+    # ------------------------------------------------------------------
+    # Core routing — the five required test cases
+    # ------------------------------------------------------------------
+
+    def test_gmail_routes_to_api_tier(self, router) -> None:
+        """workspace_service='gmail' must resolve to the API tier."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier(
+            "send an email to Derek",
+            workspace_service="gmail",
+        )
+        assert tier == ExecutionTier.API
+
+    def test_whatsapp_installed_routes_to_native(self, router) -> None:
+        """target_app='WhatsApp' + app_installed=True -> NATIVE_APP."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier(
+            "send a WhatsApp message",
+            target_app="WhatsApp",
+            app_installed=True,
+        )
+        assert tier == ExecutionTier.NATIVE_APP
+
+    def test_whatsapp_not_installed_routes_to_browser(self, router) -> None:
+        """target_app='WhatsApp' + app_installed=False -> BROWSER."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier(
+            "send a WhatsApp message",
+            target_app="WhatsApp",
+            app_installed=False,
+        )
+        assert tier == ExecutionTier.BROWSER
+
+    def test_visual_request_forces_browser(self, router) -> None:
+        """force_visual=True overrides everything and returns BROWSER."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        # Even with a valid API service, force_visual wins.
+        tier = router.decide_tier(
+            "check my calendar visually",
+            workspace_service="calendar",
+            force_visual=True,
+        )
+        assert tier == ExecutionTier.BROWSER
+
+    def test_linkedin_no_api_routes_to_browser(self, router) -> None:
+        """No known API service, no target app -> falls through to BROWSER."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier("browse LinkedIn profiles")
+        assert tier == ExecutionTier.BROWSER
+
+    # ------------------------------------------------------------------
+    # Additional coverage
+    # ------------------------------------------------------------------
+
+    def test_all_api_services_route_to_api(self, router) -> None:
+        """Every service in _API_SERVICES must route to API."""
+        from backend.neural_mesh.agents.execution_tier_router import (
+            ExecutionTier,
+            _API_SERVICES,
+        )
+
+        for svc in _API_SERVICES:
+            tier = router.decide_tier(
+                f"do something with {svc}", workspace_service=svc
+            )
+            assert tier == ExecutionTier.API, f"Expected API for service={svc!r}"
+
+    def test_slack_installed_routes_to_native(self, router) -> None:
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier(
+            "message the team on Slack",
+            target_app="Slack",
+            app_installed=True,
+        )
+        assert tier == ExecutionTier.NATIVE_APP
+
+    def test_slack_not_installed_routes_to_browser(self, router) -> None:
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier(
+            "message the team on Slack",
+            target_app="Slack",
+            app_installed=False,
+        )
+        assert tier == ExecutionTier.BROWSER
+
+    def test_get_web_alternative_known_app(self, router) -> None:
+        url = router.get_web_alternative("WhatsApp")
+        assert url == "https://web.whatsapp.com"
+
+    def test_get_web_alternative_unknown_app(self, router) -> None:
+        url = router.get_web_alternative("NonExistentApp123")
+        assert url is None
+
+    def test_get_web_alternative_case_insensitive(self, router) -> None:
+        """Lookup works regardless of input capitalisation."""
+        url = router.get_web_alternative("spotify")
+        assert url is not None
+
+    def test_email_keyword_routes_to_api(self, router) -> None:
+        """Goals containing email keyword should route to API without workspace_service."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier("send an email to my boss")
+        assert tier == ExecutionTier.API
+
+    def test_calendar_keyword_routes_to_api(self, router) -> None:
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier("schedule a calendar event tomorrow")
+        assert tier == ExecutionTier.API
+
+    def test_force_visual_overrides_native_app(self, router) -> None:
+        """force_visual=True must win even when app is installed."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        tier = router.decide_tier(
+            "show me Slack visually",
+            target_app="Slack",
+            app_installed=True,
+            force_visual=True,
+        )
+        assert tier == ExecutionTier.BROWSER
+
+    # ------------------------------------------------------------------
+    # execute_task dispatch
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_execute_task_decide_tier_gmail(self, router) -> None:
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        result = await router.execute_task(
+            {
+                "action": "decide_tier",
+                "goal": "draft a reply email",
+                "workspace_service": "gmail",
+            }
+        )
+        assert result["tier"] == ExecutionTier.API.value
+        assert result["goal"] == "draft a reply email"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_decide_tier_browser(self, router) -> None:
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        result = await router.execute_task(
+            {
+                "action": "decide_tier",
+                "goal": "open LinkedIn",
+            }
+        )
+        assert result["tier"] == ExecutionTier.BROWSER.value
+
+    @pytest.mark.asyncio
+    async def test_execute_task_not_installed_includes_web_url(
+        self, router
+    ) -> None:
+        """BROWSER tier for a known app should include web_url in result."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        result = await router.execute_task(
+            {
+                "action": "decide_tier",
+                "goal": "open WhatsApp",
+                "target_app": "WhatsApp",
+                "app_installed": False,
+            }
+        )
+        assert result["tier"] == ExecutionTier.BROWSER.value
+        assert result["web_url"] == "https://web.whatsapp.com"
+
+    @pytest.mark.asyncio
+    async def test_execute_task_unknown_action_raises(self, router) -> None:
+        with pytest.raises(ValueError, match="Unknown action"):
+            await router.execute_task({"action": "fly_to_moon"})
+
+    # ------------------------------------------------------------------
+    # on_initialize — graceful degradation when AppInventoryService absent
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_on_initialize_without_app_inventory(self, router) -> None:
+        """on_initialize must not raise even when AppInventoryService is missing."""
+        with patch(
+            "backend.neural_mesh.agents.execution_tier_router.importlib.import_module",
+            side_effect=ImportError("no module"),
+        ):
+            await router.on_initialize()
+        assert router._app_inventory_service is None
+
+    @pytest.mark.asyncio
+    async def test_on_initialize_with_mock_app_inventory(self, router) -> None:
+        """When AppInventoryService is importable, it should be stored."""
+        mock_svc_cls = MagicMock()
+        mock_svc_instance = MagicMock()
+        mock_svc_cls.return_value = mock_svc_instance
+
+        mock_module = MagicMock()
+        mock_module.AppInventoryService = mock_svc_cls
+
+        with patch(
+            "backend.neural_mesh.agents.execution_tier_router.importlib.import_module",
+            return_value=mock_module,
+        ):
+            await router.on_initialize()
+
+        assert router._app_inventory_service is not None
+
+    # ------------------------------------------------------------------
+    # Dynamic app check (app_installed=None + AppInventoryService present)
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_dynamic_app_check_installed(self, router) -> None:
+        """With app_installed=None and mock service saying installed -> NATIVE_APP."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        mock_svc = AsyncMock()
+        mock_svc.is_installed = AsyncMock(return_value=True)
+        router._app_inventory_service = mock_svc
+
+        tier = await router.decide_tier_async(
+            "open Discord",
+            target_app="Discord",
+            app_installed=None,
+        )
+        assert tier == ExecutionTier.NATIVE_APP
+
+    @pytest.mark.asyncio
+    async def test_dynamic_app_check_not_installed(self, router) -> None:
+        """With app_installed=None and mock service saying not installed -> BROWSER."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        mock_svc = AsyncMock()
+        mock_svc.is_installed = AsyncMock(return_value=False)
+        router._app_inventory_service = mock_svc
+
+        tier = await router.decide_tier_async(
+            "open Discord",
+            target_app="Discord",
+            app_installed=None,
+        )
+        assert tier == ExecutionTier.BROWSER
+
+    @pytest.mark.asyncio
+    async def test_dynamic_app_check_service_error_falls_back_to_browser(
+        self, router
+    ) -> None:
+        """If AppInventoryService.is_installed raises, fall back to BROWSER."""
+        from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
+
+        mock_svc = AsyncMock()
+        mock_svc.is_installed = AsyncMock(side_effect=RuntimeError("service down"))
+        router._app_inventory_service = mock_svc
+
+        tier = await router.decide_tier_async(
+            "open Telegram",
+            target_app="Telegram",
+            app_installed=None,
+        )
+        assert tier == ExecutionTier.BROWSER
