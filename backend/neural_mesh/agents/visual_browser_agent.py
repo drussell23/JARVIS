@@ -135,7 +135,7 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
         self._prime_client: Optional[Any] = None
         self._claude_client: Optional[Any] = None
         self._claude_model: str = os.getenv(
-            "JARVIS_BROWSER_CLAUDE_MODEL", "claude-3-5-sonnet-20241022"
+            "JARVIS_BROWSER_CLAUDE_MODEL", "claude-sonnet-4-20250514"
         )
 
     # ------------------------------------------------------------------
@@ -284,6 +284,21 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
                 logger.warning("[VBA] Screenshot failed on step %d: %s", step, ss_err)
                 final_message = f"Screenshot failed: {ss_err}"
                 break
+
+            # Compress if over 4MB (Claude limit is 5MB, J-Prime works best under 2MB)
+            if len(screenshot_bytes) > 4 * 1024 * 1024:
+                try:
+                    from PIL import Image
+                    import io
+                    img = Image.open(io.BytesIO(screenshot_bytes))
+                    max_dim = int(os.getenv("JARVIS_SCREENSHOT_MAX_DIM", "1536"))
+                    if max(img.size) > max_dim:
+                        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                    buf = io.BytesIO()
+                    img.save(buf, format="JPEG", quality=70)
+                    screenshot_bytes = buf.getvalue()
+                except Exception:
+                    pass  # Use original if compression fails
 
             screenshot_b64 = base64.b64encode(screenshot_bytes).decode("ascii")
             current_url = page.url

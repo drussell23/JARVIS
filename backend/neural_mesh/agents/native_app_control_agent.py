@@ -418,7 +418,28 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                 return None
 
             raw_bytes = Path(tmp_path).read_bytes()
-            return base64.b64encode(raw_bytes).decode("ascii")
+
+            # Compress: resize to max 1536px wide + JPEG quality 80
+            # Keeps images under 5MB for both J-Prime LLaVA and Claude fallback
+            try:
+                from PIL import Image
+                import io
+                img = Image.open(io.BytesIO(raw_bytes))
+                max_dim = int(os.getenv("JARVIS_SCREENSHOT_MAX_DIM", "1536"))
+                if max(img.size) > max_dim:
+                    img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+                buf = io.BytesIO()
+                img.convert("RGB").save(buf, format="JPEG", quality=80)
+                compressed = buf.getvalue()
+                logger.debug(
+                    "[NativeAppControlAgent] Screenshot compressed: %dKB → %dKB",
+                    len(raw_bytes) // 1024,
+                    len(compressed) // 1024,
+                )
+                return base64.b64encode(compressed).decode("ascii")
+            except ImportError:
+                # Pillow not available — send raw PNG
+                return base64.b64encode(raw_bytes).decode("ascii")
 
         except asyncio.TimeoutError:
             logger.warning("[NativeAppControlAgent] Screenshot timed out.")
@@ -510,7 +531,7 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
 
             claude_model = os.getenv(
                 "JARVIS_NATIVE_CONTROL_CLAUDE_MODEL",
-                "claude-opus-4-5",
+                "claude-sonnet-4-20250514",
             )
 
             async_client = anthropic.AsyncAnthropic(api_key=anthropic_api_key)
@@ -526,7 +547,7 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                                     "type": "image",
                                     "source": {
                                         "type": "base64",
-                                        "media_type": "image/png",
+                                        "media_type": "image/jpeg",
                                         "data": screenshot_b64,
                                     },
                                 },
