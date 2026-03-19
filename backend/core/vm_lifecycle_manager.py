@@ -14,12 +14,11 @@ import json
 import logging
 import os
 import time
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import (
-    AsyncIterator, Callable, Dict, FrozenSet, List, Optional,
+    Dict, FrozenSet, Optional,
     Protocol, Tuple, runtime_checkable,
 )
 from uuid import uuid4
@@ -278,10 +277,12 @@ class LifecycleLease:
             os.lseek(fd, 0, os.SEEK_SET)
             os.ftruncate(fd, 0)
             os.write(fd, record.encode("utf-8"))
-            try:
-                os.fdatasync(fd)
-            except (OSError, AttributeError):
-                pass
+            _fdatasync = getattr(os, "fdatasync", None)
+            if _fdatasync is not None:
+                try:
+                    _fdatasync(fd)
+                except OSError:
+                    pass
             self._fd = fd
         except BaseException:
             os.close(fd)
