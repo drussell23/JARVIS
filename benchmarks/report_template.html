@@ -128,7 +128,16 @@ table {
   border-collapse: collapse;
   margin: 1rem 0;
   font-size: 0.9rem;
-  table-layout: fixed;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin: 1rem 0;
+}
+
+.table-scroll table {
+  min-width: 800px;
 }
 
 th {
@@ -139,8 +148,6 @@ th {
   font-weight: 600;
   border-bottom: 2px solid var(--accent);
   white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
 th.num {
@@ -152,11 +159,6 @@ td {
   border-bottom: 1px solid var(--border);
   color: var(--text);
   vertical-align: middle;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-td:first-child {
   white-space: nowrap;
 }
 
@@ -630,14 +632,7 @@ details .detail-content ul li strong {
   </div>
 
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 15%;">
-      <col style="width: 15%;">
-      <col style="width: 15%;">
-      <col style="width: 25%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Protocol</th>
         <th class="num">Short TTFB</th>
@@ -736,20 +731,13 @@ details .detail-content ul li strong {
   <p>Time to First Byte (TTFB) measures the elapsed time from sending the TTS request to receiving the first audio byte. This is the most critical metric for perceived responsiveness in a voice assistant.</p>
 
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Protocol</th>
         <th>Payload</th>
-        <th class="num" class="num">TTFB (ms)</th>
-        <th class="num" class="num">vs Daniel</th>
-        <th class="num" class="num">Rating</th>
+        <th class="num">TTFB (ms)</th>
+        <th class="num">vs Daniel</th>
+        <th class="num">Rating</th>
       </tr>
     </thead>
     <tbody>
@@ -894,20 +882,13 @@ details .detail-content ul li strong {
   <p>Speedup factor calculated as macOS Daniel TTFB divided by Voice.ai TTFB for each payload size. Higher is better.</p>
 
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Protocol</th>
-        <th class="num" class="num">Short (x)</th>
-        <th class="num" class="num">Medium (x)</th>
-        <th class="num" class="num">Long (x)</th>
-        <th class="num" class="num">Average</th>
+        <th class="num">Short (x)</th>
+        <th class="num">Medium (x)</th>
+        <th class="num">Long (x)</th>
+        <th class="num">Average</th>
       </tr>
     </thead>
     <tbody>
@@ -942,7 +923,7 @@ details .detail-content ul li strong {
     </tbody>
   </table>
 
-  {{SPEEDUP_TABLE}}
+  <div class="table-scroll">{{SPEEDUP_TABLE}}</div>
 
   <div class="chart-container">
     {{CHART_SPEEDUP}}
@@ -973,18 +954,11 @@ details .detail-content ul li strong {
   <p>Comparison of Voice.ai's published latency claims against our independently measured results. Discrepancies indicate either different measurement methodology or marketing optimism.</p>
 
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Protocol</th>
-        <th class="num" class="num">Published Latency</th>
-        <th class="num" class="num">Measured Latency</th>
+        <th class="num">Published Latency</th>
+        <th class="num">Measured Latency</th>
         <th>Delta</th>
         <th>Ratio</th>
       </tr>
@@ -1036,26 +1010,16 @@ details .detail-content ul li strong {
   <p>Consistency measures how predictable latency is across repeated requests. Low standard deviation and tight percentile spreads indicate reliable performance that users can depend on.</p>
 
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 10%;">
-      <col style="width: 10%;">
-      <col style="width: 10%;">
-      <col style="width: 10%;">
-      <col style="width: 10%;">
-      <col style="width: 10%;">
-      <col style="width: 10%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Protocol</th>
-        <th class="num" class="num">Mean TTFB</th>
-        <th class="num" class="num">Std Dev</th>
+        <th class="num">Mean TTFB</th>
+        <th class="num">Std Dev</th>
         <th>CV (%)</th>
         <th>P50</th>
-        <th class="num" class="num">P95</th>
-        <th class="num" class="num">P99</th>
-        <th class="num" class="num">Rating</th>
+        <th class="num">P95</th>
+        <th class="num">P99</th>
+        <th class="num">Rating</th>
       </tr>
     </thead>
     <tbody>
@@ -1141,21 +1105,13 @@ details .detail-content ul li strong {
   <p>Percentage of requests meeting key latency thresholds. The 400ms threshold represents the upper bound of perceived instant response in voice interaction.</p>
 
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Protocol</th>
-        <th class="num" class="num">Under 200ms</th>
-        <th class="num" class="num">Under 400ms</th>
-        <th class="num" class="num">Under 600ms</th>
-        <th class="num" class="num">Under 1,000ms</th>
+        <th class="num">Under 200ms</th>
+        <th class="num">Under 400ms</th>
+        <th class="num">Under 600ms</th>
+        <th class="num">Under 1,000ms</th>
         <th>Over 1,000ms</th>
       </tr>
     </thead>
@@ -1261,18 +1217,12 @@ details .detail-content ul li strong {
   <div class="gap-box">
     <h3>Measured vs Published Latency Gaps</h3>
     <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 23%;">
-      <col style="width: 23%;">
-      <col style="width: 23%;">
-    </colgroup>
-      <thead>
+<thead>
         <tr>
-          <th class="num" class="num">Component</th>
-          <th class="num" class="num">HTTP Persistent</th>
+          <th class="num">Component</th>
+          <th class="num">HTTP Persistent</th>
           <th>WebSocket (fresh)</th>
-          <th class="num" class="num">Notes</th>
+          <th class="num">Notes</th>
         </tr>
       </thead>
       <tbody>
@@ -1353,27 +1303,20 @@ details .detail-content ul li strong {
   <p>Raw data tables for archival and further analysis. These tables contain the complete benchmark dataset.</p>
 
   <h3>Summary Statistics</h3>
-  {{SUMMARY_TABLE}}
+  <div class="table-scroll">{{SUMMARY_TABLE}}</div>
 
   <h3>Speedup Factors</h3>
-  {{SPEEDUP_TABLE}}
+  <div class="table-scroll">{{SPEEDUP_TABLE}}</div>
 
   <h3>Audio Payload Characteristics</h3>
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Payload</th>
-        <th class="num" class="num">Text Length</th>
-        <th class="num" class="num">Est. Audio Duration</th>
+        <th class="num">Text Length</th>
+        <th class="num">Est. Audio Duration</th>
         <th>Voice.ai Format</th>
-        <th class="num" class="num">Daniel Format</th>
+        <th class="num">Daniel Format</th>
       </tr>
     </thead>
     <tbody>
@@ -1425,20 +1368,13 @@ details .detail-content ul li strong {
 
   <h3>Performance Gaps</h3>
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-      <col style="width: 17%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Issue</th>
         <th>Severity</th>
         <th>Protocol</th>
         <th>Impact</th>
-        <th class="num" class="num">Mitigation</th>
+        <th class="num">Mitigation</th>
       </tr>
     </thead>
     <tbody>
@@ -1482,18 +1418,12 @@ details .detail-content ul li strong {
 
   <h3>Edge Cases &amp; Untested Scenarios</h3>
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 23%;">
-      <col style="width: 23%;">
-      <col style="width: 23%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
-        <th class="num" class="num">Scenario</th>
+        <th class="num">Scenario</th>
         <th>Risk Level</th>
         <th>Why It Matters</th>
-        <th class="num" class="num">Recommended Test</th>
+        <th class="num">Recommended Test</th>
       </tr>
     </thead>
     <tbody>
@@ -1679,21 +1609,13 @@ details .detail-content ul li strong {
   <p>A phased integration plan based on benchmark findings. Each phase builds on the previous one, with clear success criteria.</p>
 
   <table>
-    <colgroup>
-      <col style="width: 30%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-      <col style="width: 14%;">
-    </colgroup>
-    <thead>
+<thead>
       <tr>
         <th>Phase</th>
-        <th class="num" class="num">Milestone</th>
+        <th class="num">Milestone</th>
         <th>Protocol</th>
         <th>Success Criteria</th>
-        <th class="num" class="num">Duration</th>
+        <th class="num">Duration</th>
         <th>Risk Level</th>
       </tr>
     </thead>
