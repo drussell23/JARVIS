@@ -24,6 +24,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Awaitable
 
 _log = logging.getLogger(__name__)
 
+# GCP Operation status constants — resolved once at module load.
+# Falls back to plain strings if the library is not installed.
+try:
+    from google.cloud.compute_v1 import Operation as _GcpOperation
+    _OP_STATUS_DONE = _GcpOperation.Status.DONE
+    _OP_STATUS_ABORTING = _GcpOperation.Status.ABORTING
+except (ImportError, AttributeError):
+    _OP_STATUS_DONE = "DONE"      # type: ignore[assignment]
+    _OP_STATUS_ABORTING = "ABORTING"  # type: ignore[assignment]
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -335,9 +345,15 @@ class OperationLifecycleRegistry:
     async def load(self) -> None:
         """Load registry from disk. Prunes stale records. Best-effort."""
         try:
-            if not self._persist_path.exists():
+            def _read_file(path: Path) -> Optional[str]:
+                if not path.exists():
+                    return None
+                return path.read_text()
+
+            raw = await asyncio.to_thread(_read_file, self._persist_path)
+            if raw is None:
                 return
-            data = json.loads(self._persist_path.read_text())
+            data = json.loads(raw)
             now = time.time()
             async with self._lock:
                 for op_id, d in data.items():
@@ -515,8 +531,17 @@ class GCPOperationPoller:
 
     @classmethod
     def _get_dedup_lock(cls) -> asyncio.Lock:
-        # Lazily create the class-level lock in the running event loop
-        if cls._dedup_lock is None:
+        # Lazily create the class-level lock in the running event loop.
+        # Re-create if the cached lock belongs to a different (closed) loop,
+        # which can happen in tests that spin up a fresh event loop per test case.
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if cls._dedup_lock is None or (
+            current_loop is not None
+            and getattr(cls._dedup_lock, "_loop", None) is not current_loop
+        ):
             cls._dedup_lock = asyncio.Lock()
         return cls._dedup_lock
 
@@ -773,13 +798,8 @@ class GCPOperationPoller:
 
     def _check_done(self, op: Any, record: OperationRecord, t_start: float) -> Optional[OperationResult]:
         """Return OperationResult if op is in a terminal status, else None."""
-        try:
-            from google.cloud import compute_v1
-            status_done = compute_v1.Operation.Status.DONE
-            status_aborting_str = "ABORTING"
-        except ImportError:
-            status_done = "DONE"
-            status_aborting_str = "ABORTING"
+        status_done = _OP_STATUS_DONE
+        status_aborting_str = "ABORTING"
 
         status = op.status
         if hasattr(status, "name"):
@@ -810,6 +830,7 @@ class GCPOperationPoller:
                 operation_id=op.name,
                 scope=record.scope,
                 error_message="; ".join(msgs),
+                elapsed_ms=(time.monotonic() - t_start) * 1000,
                 poll_count=record.poll_count,
             )
         return OperationResult(
@@ -817,6 +838,7 @@ class GCPOperationPoller:
             reason=TerminalReason.OP_DONE_SUCCESS,
             operation_id=op.name,
             scope=record.scope,
+            elapsed_ms=(time.monotonic() - t_start) * 1000,
             poll_count=record.poll_count,
         )
 

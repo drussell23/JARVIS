@@ -250,6 +250,16 @@ def _make_done_op(name="op-1", error=None):
 
 
 class TestGCPOperationPoller:
+    @pytest.fixture(autouse=True)
+    def reset_class_state(self):
+        from backend.core.gcp_operation_poller import GCPOperationPoller, reset_operation_registry
+        reset_operation_registry()
+        GCPOperationPoller._active_pollers.clear()
+        GCPOperationPoller._dedup_lock = None
+        yield
+        GCPOperationPoller._active_pollers.clear()
+        GCPOperationPoller._dedup_lock = None
+
     @pytest.fixture
     def tmp_registry(self, tmp_path):
         from backend.core.gcp_operation_poller import OperationLifecycleRegistry
@@ -286,15 +296,16 @@ class TestGCPOperationPoller:
 
     @pytest.mark.asyncio
     async def test_op_aborting_is_failure(self, tmp_registry, ops_client):
+        # ABORTING is caught by the fast-path _check_done on the initial operation
+        # object — no client.get call is made (the status is terminal immediately).
         op = _make_op(status="ABORTING")
-        # The client refresh also returns ABORTING
-        ops_client.get = MagicMock(return_value=_make_op(status="ABORTING"))
         poller = self._make_poller(ops_client, tmp_registry)
         result = await poller.wait(op, action="start", instance_name="vm-1",
                                    correlation_id="c-1")
         assert result.success is False
         from backend.core.gcp_operation_poller import TerminalReason
         assert result.reason == TerminalReason.OP_DONE_FAILURE
+        assert ops_client.get.call_count == 0  # fast-path: no poll needed
 
     @pytest.mark.asyncio
     async def test_404_correlated_success(self, tmp_registry, ops_client):
@@ -413,3 +424,14 @@ class TestGCPOperationPoller:
             await task
         # After cancellation, the op_id must be cleaned up from _active_pollers
         assert op.name not in GCPOperationPoller._active_pollers
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_timeout_reason(self, tmp_registry, ops_client):
+        """Op stays RUNNING past timeout → TIMEOUT result."""
+        from backend.core.gcp_operation_poller import TerminalReason
+        op = _make_op(status="RUNNING")
+        ops_client.get = MagicMock(return_value=_make_op(status="RUNNING"))
+        poller = self._make_poller(ops_client, tmp_registry, timeout=0.001)
+        result = await poller.wait(op, action="start", instance_name="vm-1", correlation_id="c-1")
+        assert result.success is False
+        assert result.reason == TerminalReason.TIMEOUT
