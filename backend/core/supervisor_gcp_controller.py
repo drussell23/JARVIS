@@ -271,14 +271,15 @@ class SupervisorAwareGCPController:
         # Supervisor state
         self._supervisor_state = SupervisorState.RUNNING
         
-        # Idle monitoring task
-        self._idle_monitor_task: Optional[asyncio.Task] = None
         self._shutdown_event = asyncio.Event()
         
         # Callbacks
         self._on_decision: List[Callable[[VMCreationRequest], None]] = []
         self._on_vm_created: List[Callable[[ActiveVM], None]] = []
         self._on_vm_terminated: List[Callable[[ActiveVM], None]] = []
+
+        # v298.0: VMLifecycleManager wiring (injected post-construction)
+        self._lifecycle: Optional[object] = None
 
         # v3.1: Stall recovery tracking
         self._stall_count: int = 0
@@ -672,11 +673,7 @@ class SupervisorAwareGCPController:
                 self._last_vm_created_mono = now_mono
             
             logger.info(f"🚀 VM created: {active_vm.instance_id}")
-            
-            # Start idle monitoring
-            if self._idle_monitor_task is None or self._idle_monitor_task.done():
-                self._idle_monitor_task = asyncio.create_task(self._idle_monitor_loop())
-            
+
             # Notify callbacks
             for callback in self._on_vm_created:
                 try:
@@ -760,67 +757,6 @@ class SupervisorAwareGCPController:
             async with self._state_lock:
                 self._state = VMLifecycleState.FAILED
             return False
-    
-    # =========================================================================
-    # IDLE MONITORING
-    # =========================================================================
-    
-    def record_vm_activity(self) -> None:
-        """Record that VM was just used."""
-        if self._active_vm:
-            self._active_vm.last_activity = datetime.now()
-            self._active_vm.last_activity_mono = monotonic_s()
-            self._active_vm.requests_handled += 1
-            self._active_vm.idle_since = None
-            self._active_vm.idle_warnings = 0
-    
-    async def _idle_monitor_loop(self) -> None:
-        """Background loop to monitor VM idle state."""
-        logger.info("🔍 Idle monitor started")
-        
-        while not self._shutdown_event.is_set():
-            try:
-                await asyncio.sleep(60)  # Check every minute
-                
-                if self._active_vm is None:
-                    # No active dynamic VM — keep the loop alive so it catches
-                    # future VMs. break would kill the monitor permanently.
-                    continue
-
-                vm = self._active_vm
-                idle_seconds = elapsed_since_s(vm.last_activity_mono)
-                idle_minutes = idle_seconds / 60
-                
-                # Check for idle warning threshold
-                if idle_minutes >= self.config.idle_warning_minutes:
-                    if vm.idle_since is None:
-                        vm.idle_since = datetime.now()
-                    
-                    vm.idle_warnings += 1
-                    
-                    # Check for shutdown threshold
-                    if idle_minutes >= self.config.idle_shutdown_minutes:
-                        logger.warning(
-                            f"⚠️ VM {vm.instance_id} idle for {idle_minutes:.0f} min - terminating"
-                        )
-                        await self.terminate_vm(
-                            reason=f"idle_{idle_minutes:.0f}min",
-                            was_effective=vm.requests_handled > 0,
-                        )
-                        break
-                    else:
-                        remaining = self.config.idle_shutdown_minutes - idle_minutes
-                        logger.info(
-                            f"⏰ VM {vm.instance_id} idle for {idle_minutes:.0f} min "
-                            f"({remaining:.0f} min until shutdown)"
-                        )
-                
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Idle monitor error: {e}")
-        
-        logger.info("🔍 Idle monitor stopped")
     
     # =========================================================================
     # STATS AND MONITORING
@@ -915,27 +851,99 @@ class SupervisorAwareGCPController:
     # =========================================================================
     # LIFECYCLE
     # =========================================================================
-    
+
+    def set_lifecycle_manager(self, lifecycle: "VMLifecycleManager") -> None:
+        """Wire the VMLifecycleManager. Called once at startup before start()."""
+        from backend.core.vm_lifecycle_manager import VMLifecycleManager
+        self._lifecycle = lifecycle
+
+    @property
+    def vm_lifecycle_state(self) -> VMLifecycleState:
+        """Read-only projection of VMFsmState → VMLifecycleState."""
+        from backend.core.vm_lifecycle_manager import VMFsmState
+        if self._lifecycle is None:
+            return self._state  # fallback to legacy state
+        _FSM_TO_LEGACY = {
+            VMFsmState.COLD:       VMLifecycleState.NONE,
+            VMFsmState.WARMING:    VMLifecycleState.CREATING,
+            VMFsmState.READY:      VMLifecycleState.RUNNING,
+            VMFsmState.IN_USE:     VMLifecycleState.RUNNING,
+            VMFsmState.IDLE_GRACE: VMLifecycleState.IDLE,
+            VMFsmState.STOPPING:   VMLifecycleState.TERMINATING,
+        }
+        return _FSM_TO_LEGACY.get(self._lifecycle.state, VMLifecycleState.NONE)
+
     async def start(self) -> None:
-        """Start the controller."""
+        """Start the controller. Proactively warm GCP VM if lifecycle manager is wired.
+
+        PRECONDITION (spec Phase 0): VMLifecycleManager.start() — which acquires
+        LifecycleLease and binds the asyncio event loop — MUST be called before
+        this method. Wiring order is enforced in startup_orchestrator.py.
+        Calling ensure_warmed() before VMLifecycleManager.start() raises RuntimeError.
+        """
         logger.info("🎮 Supervisor-Aware GCP Controller started")
+        if self._lifecycle is not None:
+            asyncio.create_task(self._lifecycle.ensure_warmed("supervisor_boot"))
     
     async def stop(self) -> None:
         """Stop the controller and cleanup."""
         self._shutdown_event.set()
-        
-        if self._idle_monitor_task and not self._idle_monitor_task.done():
-            self._idle_monitor_task.cancel()
-            try:
-                await self._idle_monitor_task
-            except asyncio.CancelledError:
-                pass
-        
+
         # Terminate any active VM
         if self._active_vm:
             await self.terminate_vm(reason="controller_shutdown")
         
         logger.info("🎮 Supervisor-Aware GCP Controller stopped")
+
+    class _GCPControllerAdapter:
+        """Implements VMController Protocol, delegating to SupervisorAwareGCPController.
+
+        Injected into VMLifecycleManager as its VMController. Dependency flows
+        one way: VMLifecycleManager → VMController protocol → _GCPControllerAdapter
+        → SupervisorAwareGCPController. No circular import.
+
+        NOTE: Once v297.0 HandshakeSession result type is confirmed, update start_vm()
+        to extract (failed_step, failure_class) from ensure_static_vm_ready() return value.
+        """
+        def __init__(self, outer: "SupervisorAwareGCPController") -> None:
+            self._outer = outer
+
+        async def start_vm(self):
+            """Delegate to gcp_vm_manager.ensure_static_vm_ready() and return (success, failed_step, failure_class)."""
+            try:
+                try:
+                    from backend.core.gcp_vm_manager import get_gcp_vm_manager_safe
+                except ImportError:
+                    from core.gcp_vm_manager import get_gcp_vm_manager_safe
+                vm_manager = await get_gcp_vm_manager_safe()
+                if vm_manager is None:
+                    logger.error("_GCPControllerAdapter.start_vm: gcp_vm_manager not available")
+                    return (False, None, None)
+                result = await vm_manager.ensure_static_vm_ready()
+                # ensure_static_vm_ready returns Tuple[bool, Optional[str], str]
+                # Map to VMController contract. TODO(v297.0 followup): extract failure taxonomy.
+                success = result[0] if isinstance(result, tuple) else bool(result)
+                return (success, None, None)
+            except Exception as exc:
+                logger.error("_GCPControllerAdapter.start_vm failed: %s", exc)
+                return (False, None, None)
+
+        async def stop_vm(self) -> None:
+            try:
+                if self._outer._active_vm:
+                    await self._outer.terminate_vm(reason="lifecycle_manager_request")
+            except Exception as exc:
+                logger.error("_GCPControllerAdapter.stop_vm failed: %s", exc)
+
+        def get_vm_host_port(self):
+            if self._outer._active_vm:
+                host = os.environ.get("JARVIS_PRIME_HOST", "127.0.0.1")
+                port = int(os.environ.get("JARVIS_PRIME_PORT", "8000"))
+                return (host, port)
+            return None
+
+        def notify_vm_unreachable(self) -> None:
+            logger.warning("_GCPControllerAdapter: VM marked unreachable")
 
 
 # ============================================================================
