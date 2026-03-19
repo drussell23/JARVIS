@@ -1,13 +1,18 @@
 """
-On-demand GPU VM lifecycle for vision tasks.
+On-demand GPU VM lifecycle for vision and text inference.
 
-Starts the GPU VM when vision is needed, tracks idle time,
-and stops it after configurable idle timeout to save costs.
+Starts the GPU VM when J-Prime is needed (vision or text), tracks idle
+time, and stops it after configurable idle timeout to save costs.
 
 Usage in vision agents:
     from .vision_gpu_lifecycle import ensure_vision_available
     if await ensure_vision_available():
         response = await client.send_vision_request(...)
+
+Usage for text inference:
+    from .vision_gpu_lifecycle import ensure_text_available
+    if await ensure_text_available():
+        response = await client.send_request(...)
 """
 
 import asyncio
@@ -22,6 +27,7 @@ _IDLE_TIMEOUT_S = float(os.getenv("JARVIS_GPU_IDLE_TIMEOUT_S", "1800"))  # 30 mi
 _STARTUP_TIMEOUT_S = float(os.getenv("JARVIS_GPU_STARTUP_TIMEOUT_S", "300"))  # 5 min
 _INSTANCE_NAME = os.getenv("JARVIS_GPU_INSTANCE_NAME", "jarvis-prime-gpu")
 _INSTANCE_ZONE = os.getenv("JARVIS_GPU_INSTANCE_ZONE", "us-central1-a")
+_GCP_PROJECT = os.getenv("GCP_PROJECT_ID", "jarvis-473803")
 _VISION_PORT = int(os.getenv("JARVIS_PRIME_VISION_PORT", "8001"))
 _TEXT_PORT = int(os.getenv("JARVIS_PRIME_PORT", "8000"))
 # Poll interval (seconds) when waiting for model to load after VM start
@@ -85,74 +91,133 @@ async def ensure_vision_available() -> bool:
             pass
 
         logger.info("[VisionGPU] J-Prime vision offline — starting GPU VM...")
+        return await _start_gpu_vm_and_wait(wait_for_vision=True)
+
+
+async def ensure_text_available() -> bool:
+    """Ensure J-Prime text server is available, starting GPU VM if needed.
+
+    Same as ensure_vision_available() but only waits for the text model
+    (port 8000), not the vision model (port 8001). Faster cold start
+    since text model loads first.
+    """
+    global _last_vision_use
+
+    # Quick health check — text model on port 8000
+    try:
+        from backend.core.prime_client import get_prime_client, PrimeStatus
+
+        client = await asyncio.wait_for(get_prime_client(), timeout=5.0)
+        status = await asyncio.wait_for(client._check_health(), timeout=5.0)
+        if status == PrimeStatus.AVAILABLE:
+            _last_vision_use = time.monotonic()
+            _schedule_idle_stop()
+            return True
+    except Exception:
+        pass
+
+    # Text not healthy — start the GPU VM
+    async with _get_starting_lock():
+        # Double-check after lock
+        try:
+            from backend.core.prime_client import get_prime_client, PrimeStatus
+
+            client = await asyncio.wait_for(get_prime_client(), timeout=5.0)
+            status = await asyncio.wait_for(client._check_health(), timeout=5.0)
+            if status == PrimeStatus.AVAILABLE:
+                _last_vision_use = time.monotonic()
+                _schedule_idle_stop()
+                return True
+        except Exception:
+            pass
+
+        logger.info("[VisionGPU] J-Prime text offline — starting GPU VM...")
+        return await _start_gpu_vm_and_wait(wait_for_vision=False)
+
+
+async def _start_gpu_vm_and_wait(wait_for_vision: bool = True) -> bool:
+    """Start the GPU VM and wait for models to load.
+
+    Args:
+        wait_for_vision: If True, wait for the vision model (port 8001).
+                         If False, only wait for the text model (port 8000).
+    """
+    global _last_vision_use
+
+    try:
+        from backend.core.gcp_vm_manager import get_gcp_vm_manager
+
+        vm_manager = await get_gcp_vm_manager()
+
+        # Override instance config for GPU VM.
+        original_name = vm_manager.config.static_instance_name
+        original_zone = vm_manager.config.zone
+
+        vm_manager.config.static_instance_name = _INSTANCE_NAME
+        vm_manager.config.zone = _INSTANCE_ZONE
 
         try:
-            from backend.core.gcp_vm_manager import get_gcp_vm_manager
+            success, ip_address, message = await asyncio.wait_for(
+                vm_manager.ensure_static_vm_ready(),
+                timeout=_STARTUP_TIMEOUT_S,
+            )
+        finally:
+            vm_manager.config.static_instance_name = original_name
+            vm_manager.config.zone = original_zone
 
-            vm_manager = get_gcp_vm_manager()
+        if success and ip_address:
+            logger.info("[VisionGPU] GPU VM started at %s", ip_address)
 
-            # Override instance config for GPU VM.
-            # The default GCPVMManager may point at the CPU/text instance;
-            # we temporarily swap to the GPU instance, then restore.
-            original_name = vm_manager.config.static_instance_name
-            original_zone = vm_manager.config.zone
+            from backend.core.prime_client import get_prime_client, PrimeStatus
 
-            vm_manager.config.static_instance_name = _INSTANCE_NAME
-            vm_manager.config.zone = _INSTANCE_ZONE
+            client = await get_prime_client()
+            await client.update_endpoint(ip_address, _TEXT_PORT)
 
-            try:
-                success, ip_address, message = await asyncio.wait_for(
-                    vm_manager.ensure_static_vm_ready(),
-                    timeout=_STARTUP_TIMEOUT_S,
-                )
-            finally:
-                # Always restore original config, even if startup failed/timed out
-                vm_manager.config.static_instance_name = original_name
-                vm_manager.config.zone = original_zone
+            label = "vision" if wait_for_vision else "text"
+            logger.info("[VisionGPU] Waiting for %s model loading...", label)
 
-            if success and ip_address:
-                logger.info("[VisionGPU] GPU VM started at %s", ip_address)
-
-                # Point PrimeClient at the new IP for both text and vision ports
-                client = await get_prime_client()
-                client.update_endpoint(ip_address, _TEXT_PORT)
-
-                # Wait for model loading (LLaVA takes ~3 min on cold start)
-                logger.info("[VisionGPU] Waiting for model loading...")
-                for attempt in range(_MODEL_MAX_POLLS):
-                    await asyncio.sleep(_MODEL_POLL_INTERVAL_S)
-                    try:
+            for attempt in range(_MODEL_MAX_POLLS):
+                await asyncio.sleep(_MODEL_POLL_INTERVAL_S)
+                try:
+                    if wait_for_vision:
                         healthy = await asyncio.wait_for(
                             client.get_vision_health(), timeout=5.0
                         )
-                        if healthy:
-                            elapsed = (attempt + 1) * _MODEL_POLL_INTERVAL_S
-                            logger.info(
-                                "[VisionGPU] Vision server ready after %.0fs", elapsed
-                            )
-                            _last_vision_use = time.monotonic()
-                            _schedule_idle_stop()
-                            return True
-                    except Exception:
-                        pass
+                    else:
+                        status = await asyncio.wait_for(
+                            client._check_health(), timeout=5.0
+                        )
+                        healthy = (status == PrimeStatus.AVAILABLE)
+                    if healthy:
+                        elapsed = (attempt + 1) * _MODEL_POLL_INTERVAL_S
+                        logger.info(
+                            "[VisionGPU] %s server ready after %.0fs",
+                            label.capitalize(), elapsed,
+                        )
+                        _last_vision_use = time.monotonic()
+                        _schedule_idle_stop()
+                        return True
+                except Exception:
+                    pass
 
-                logger.warning(
-                    "[VisionGPU] Vision server did not become ready after startup "
-                    "(waited %.0fs across %d polls)",
-                    _MODEL_MAX_POLLS * _MODEL_POLL_INTERVAL_S,
-                    _MODEL_MAX_POLLS,
-                )
-                return False
-            else:
-                logger.warning("[VisionGPU] Failed to start GPU VM: %s", message)
-                return False
+            logger.warning(
+                "[VisionGPU] %s server did not become ready "
+                "(waited %.0fs across %d polls)",
+                label.capitalize(),
+                _MODEL_MAX_POLLS * _MODEL_POLL_INTERVAL_S,
+                _MODEL_MAX_POLLS,
+            )
+            return False
+        else:
+            logger.warning("[VisionGPU] Failed to start GPU VM: %s", message)
+            return False
 
-        except ImportError:
-            logger.debug("[VisionGPU] GCPVMManager not available — skipping VM start")
-            return False
-        except Exception as exc:
-            logger.warning("[VisionGPU] GPU VM startup failed: %s", exc)
-            return False
+    except ImportError:
+        logger.debug("[VisionGPU] GCPVMManager not available — skipping VM start")
+        return False
+    except Exception as exc:
+        logger.warning("[VisionGPU] GPU VM startup failed: %s", exc)
+        return False
 
 
 def record_vision_use() -> None:
@@ -207,6 +272,7 @@ async def _stop_gpu_vm() -> None:
             "stop",
             _INSTANCE_NAME,
             f"--zone={_INSTANCE_ZONE}",
+            f"--project={_GCP_PROJECT}",
             "--quiet",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,

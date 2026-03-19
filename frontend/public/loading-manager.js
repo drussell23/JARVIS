@@ -2018,11 +2018,15 @@ class JARVISLoadingManager {
         this.state.redirecting = true;
 
         // Update UI to show verifying state
+        // v294.0: Never regress progress display — keep current width if already above 98%
         if (this.elements.statusMessage) {
             this.elements.statusMessage.textContent = 'Verifying connection...';
         }
         if (this.elements.progressBar) {
-            this.elements.progressBar.style.width = '98%';
+            const currentWidth = parseFloat(this.elements.progressBar.style.width) || 0;
+            if (currentWidth < 98) {
+                this.elements.progressBar.style.width = '98%';
+            }
         }
         if (this.elements.subtitle) {
             this.elements.subtitle.textContent = 'VERIFYING';
@@ -4518,8 +4522,11 @@ class JARVISLoadingManager {
         }
 
         console.log('[Complete] ✓ Backend operationally ready');
-        this.state.progress = 96;
-        this.state.targetProgress = 96;
+        // v294.0: Never regress progress during verification — completion steps
+        // only advance forward. If current progress is already above 96 (e.g. 98%
+        // from the loading server), keep it there.
+        this.state.progress = Math.max(this.state.progress, 96);
+        this.state.targetProgress = Math.max(this.state.targetProgress, 96);
         this.updateProgressBar();
 
         // ═══════════════════════════════════════════════════════════════════════════
@@ -4538,8 +4545,8 @@ class JARVISLoadingManager {
             }
         }
 
-        this.state.progress = 97;
-        this.state.targetProgress = 97;
+        this.state.progress = Math.max(this.state.progress, 97);
+        this.state.targetProgress = Math.max(this.state.targetProgress, 97);
         this.updateProgressBar();
 
         // ═══════════════════════════════════════════════════════════════════════════
@@ -4557,8 +4564,8 @@ class JARVISLoadingManager {
         }
 
         console.log('[Complete] ✓ Frontend ready');
-        this.state.progress = 99;
-        this.state.targetProgress = 99;
+        this.state.progress = Math.max(this.state.progress, 99);
+        this.state.targetProgress = Math.max(this.state.targetProgress, 99);
         this.updateProgressBar();
 
         // ═══════════════════════════════════════════════════════════════════════════
@@ -4667,17 +4674,22 @@ class JARVISLoadingManager {
                             lastStatus = status;
                         }
 
-                        // Check if operationally ready
-                        // v6.0: Accept more status values as "ready" to match backend progressive readiness
-                        // The backend returns ready=true for: ready, degraded, warming_up, websocket_ready
+                        // Check if operationally ready.
+                        // v294.0: Only accept truly interactive-ready statuses.
+                        // 'warming_up' excluded — backend is NOT yet able to service
+                        // user requests during ML model warm-up. Premature redirect at
+                        // warming_up causes StartupGate in the React app to see an
+                        // unresponsive backend and redirect back to loading page.
+                        // 'degraded' excluded from first-pass — only accept if we've
+                        // been waiting a long time (handled below as a grace fallback).
+                        const elapsed = Math.round((Date.now() - startTime) / 1000);
                         const isOperational =
                             readyData.ready === true ||
                             readyData.operational === true ||
                             status === 'ready' ||
                             status === 'operational' ||
-                            status === 'warming_up' ||    // ML can warm in background
-                            status === 'websocket_ready' || // WebSocket = interactive
-                            status === 'degraded';        // Some services unavailable but core works
+                            status === 'websocket_ready' ||  // WebSocket = interactive
+                            (status === 'degraded' && elapsed > 45);  // degraded only after 45s grace
 
                         if (isOperational) {
                             // v5.0: Also verify WebSocket connectivity before declaring ready
