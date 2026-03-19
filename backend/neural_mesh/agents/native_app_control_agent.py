@@ -77,32 +77,64 @@ def _load_key_codes() -> Dict[str, int]:
 # Vision-action prompt template
 # ---------------------------------------------------------------------------
 
-_VISION_PROMPT_TEMPLATE = """You are a macOS automation assistant controlling the application: {app_name}.
+_VISION_PROMPT_TEMPLATE = """You are JARVIS, an AI assistant physically controlling the macOS application: {app_name}.
 
-Current goal: {goal}
+You are executing step-by-step instructions like a human would.
 
-Steps taken so far:
+CURRENT STEP: {current_step}
+(This is step {step_number} of {total_steps} in the full plan)
+
+FULL PLAN for context:
+{plan_text}
+
+Steps already completed:
 {previous_actions_text}
 
-Look at the screenshot and decide the SINGLE next action to achieve the goal.
+Look at the screenshot carefully. Identify the exact UI element you need to interact with for the CURRENT STEP.
 
-Respond ONLY with valid JSON in this exact format:
+RULES:
+- Provide the EXACT pixel coordinates (x, y) for click actions — look at the screenshot and estimate where the element is.
+- For "type" actions, provide the exact text to type.
+- Set "done": true ONLY when the CURRENT STEP is fully accomplished.
+- Do NOT set "done": true just because you started the step — wait until you can see the result.
+- If you need multiple actions for one step (e.g., click then type), do ONE action at a time.
+
+Respond ONLY with valid JSON:
 {{
   "done": false,
   "action_type": "click",
   "detail": {{"x": 150, "y": 200}},
-  "message": "Clicking the submit button"
+  "message": "Clicking on Zach's conversation in the chat list"
 }}
 
-action_type must be one of: click, type, key, scroll, done
-- click: requires detail.x (int) and detail.y (int)
-- type: requires detail.text (str)
-- key: requires detail.key (str, e.g. "enter", "tab", "escape")
-- scroll: requires detail.direction (str: "up" or "down") and detail.amount (int, pixels)
-- done: set "done": true and omit action_type / detail
+action_type must be one of: click, type, key, scroll
+- click: detail.x (int) and detail.y (int) — pixel coordinates on screen
+- type: detail.text (str) — text to type character by character
+- key: detail.key (str) — "enter", "tab", "escape", "return"
+- scroll: detail.direction ("up"/"down"), detail.amount (int pixels)
 
-If the goal is already accomplished set "done": true.
-If you cannot determine a useful next action set "done": true with an explanatory message."""
+When the CURRENT STEP is complete (you can verify from the screenshot), respond:
+{{
+  "done": true,
+  "action_type": "done",
+  "detail": {{}},
+  "message": "Step complete: [what was accomplished]"
+}}"""
+
+
+_STEP_PLANNER_PROMPT = """You are JARVIS, planning how to accomplish a task in the macOS application: {app_name}.
+
+Task: {goal}
+
+Break this into a numbered list of concrete, atomic steps that a screen automation tool can execute one at a time. Each step should be a single UI interaction (click something, type something, press a key).
+
+Be very specific. For example, instead of "send a message", say:
+1. Click on the message text input field at the bottom of the conversation
+2. Type the message text: "Hello Zach"
+3. Press Enter to send the message
+
+Respond with ONLY a JSON array of step strings:
+["Click on the search bar at the top", "Type 'Zach' in the search bar", "Click on Zach's conversation in the results list", ...]"""
 
 
 class NativeAppControlAgent(BaseNeuralMeshAgent):
@@ -255,101 +287,233 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
                 )
 
         # --- Config -----------------------------------------------------------
-        max_steps: int = int(os.getenv("JARVIS_NATIVE_CONTROL_MAX_STEPS", "10"))
+        max_actions_per_step: int = int(os.getenv("JARVIS_NATIVE_CONTROL_MAX_ACTIONS_PER_STEP", "5"))
         step_delay: float = float(os.getenv("JARVIS_NATIVE_CONTROL_STEP_DELAY", "1.0"))
 
         # --- Activate the app -------------------------------------------------
         await self._activate_app(app_name)
         await asyncio.sleep(step_delay)
 
-        # --- Vision-action loop -----------------------------------------------
+        # --- Decompose goal into micro-steps ----------------------------------
+        plan_steps = await self._decompose_goal(goal, app_name)
+        logger.info(
+            "[NativeAppControlAgent] Decomposed '%s' into %d steps: %s",
+            goal, len(plan_steps), plan_steps,
+        )
+
+        # --- Step-by-step vision-action loop ----------------------------------
         actions_taken: List[Dict[str, Any]] = []
-        final_message = f"Reached maximum steps ({max_steps}) without completing goal."
+        final_message = f"Completed all {len(plan_steps)} steps."
         success = False
+        plan_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(plan_steps))
 
-        for step in range(max_steps):
-            logger.debug(
-                "[NativeAppControlAgent] Step %d/%d -- app=%s goal=%s",
-                step + 1,
-                max_steps,
-                app_name,
-                goal,
+        for step_idx, current_step in enumerate(plan_steps):
+            logger.info(
+                "[NativeAppControlAgent] Step %d/%d: %s",
+                step_idx + 1, len(plan_steps), current_step,
             )
 
-            # Capture screenshot
-            screenshot_b64 = await self._take_screenshot()
-            if screenshot_b64 is None:
-                logger.warning(
-                    "[NativeAppControlAgent] Screenshot failed at step %d.", step + 1
+            # Each step gets up to max_actions_per_step vision-action iterations
+            step_done = False
+            for action_num in range(max_actions_per_step):
+                # Capture screenshot
+                screenshot_b64 = await self._take_screenshot()
+                if screenshot_b64 is None:
+                    logger.warning(
+                        "[NativeAppControlAgent] Screenshot failed at step %d action %d.",
+                        step_idx + 1, action_num + 1,
+                    )
+                    final_message = "Screenshot capture failed."
+                    break
+
+                # Ask vision model — now with current step context
+                decision = await self._ask_jprime_for_action(
+                    screenshot_b64, goal, app_name, actions_taken,
+                    current_step=current_step,
+                    step_number=step_idx + 1,
+                    total_steps=len(plan_steps),
+                    plan_text=plan_text,
                 )
-                final_message = "Screenshot capture failed."
-                break
 
-            # Ask vision model for next action
-            decision = await self._ask_jprime_for_action(
-                screenshot_b64, goal, app_name, actions_taken
-            )
+                msg = decision.get("message", "")
+                action_type = decision.get("action_type", "")
+                detail = decision.get("detail", {})
+                done = bool(decision.get("done", False))
 
-            msg = decision.get("message", "")
-            action_type = decision.get("action_type", "")
-            detail = decision.get("detail", {})
-            done = bool(decision.get("done", False))
-
-            actions_taken.append(
-                {
-                    "step": step + 1,
+                actions_taken.append({
+                    "plan_step": step_idx + 1,
+                    "action_num": action_num + 1,
+                    "step_description": current_step,
                     "action_type": action_type if not done else "done",
                     "detail": detail,
                     "message": msg,
-                }
-            )
+                })
 
-            if done:
-                success = True
-                final_message = msg or "Goal achieved."
-                logger.info(
-                    "[NativeAppControlAgent] Goal achieved after %d step(s): %s",
-                    step + 1,
-                    final_message,
-                )
-                break
-
-            # Execute the decided action
-            try:
-                if action_type == "click":
-                    await self._click(int(detail.get("x", 0)), int(detail.get("y", 0)))
-                elif action_type == "type":
-                    await self._type_text(str(detail.get("text", "")))
-                elif action_type == "key":
-                    await self._press_key(str(detail.get("key", "")))
-                elif action_type == "scroll":
-                    await self._scroll(
-                        str(detail.get("direction", "down")),
-                        int(detail.get("amount", 3)),
+                if done:
+                    step_done = True
+                    logger.info(
+                        "[NativeAppControlAgent] Step %d complete: %s",
+                        step_idx + 1, msg,
                     )
-                else:
+                    break
+
+                # Execute the action
+                try:
+                    if action_type == "click":
+                        await self._click(int(detail.get("x", 0)), int(detail.get("y", 0)))
+                    elif action_type == "type":
+                        await self._type_text(str(detail.get("text", "")))
+                    elif action_type == "key":
+                        await self._press_key(str(detail.get("key", "")))
+                    elif action_type == "scroll":
+                        await self._scroll(
+                            str(detail.get("direction", "down")),
+                            int(detail.get("amount", 3)),
+                        )
+                    else:
+                        logger.warning(
+                            "[NativeAppControlAgent] Unknown action '%s'",
+                            action_type,
+                        )
+                except Exception as exc:
                     logger.warning(
-                        "[NativeAppControlAgent] Unknown action_type '%s' at step %d.",
-                        action_type,
-                        step + 1,
+                        "[NativeAppControlAgent] Action error at step %d: %s",
+                        step_idx + 1, exc,
                     )
-            except Exception as exc:
-                logger.warning(
-                    "[NativeAppControlAgent] Action execution error at step %d: %s",
-                    step + 1,
-                    exc,
-                )
 
-            await asyncio.sleep(step_delay)
+                await asyncio.sleep(step_delay)
+
+            if not step_done:
+                final_message = f"Step {step_idx + 1} did not complete: {current_step}"
+                logger.warning("[NativeAppControlAgent] %s", final_message)
+                break  # Stop plan execution if a step can't be completed
+
+        else:
+            # All steps completed successfully (for/else: no break)
+            success = True
+            final_message = f"All {len(plan_steps)} steps completed successfully."
 
         return {
             "success": success,
             "goal": goal,
             "app": app_name,
-            "steps_taken": len(actions_taken),
+            "plan_steps": plan_steps,
+            "steps_completed": step_idx + 1 if 'step_idx' in dir() else 0,
+            "actions_taken": len(actions_taken),
             "actions": actions_taken,
             "final_message": final_message,
         }
+
+    # ------------------------------------------------------------------
+    # Goal Decomposition (Step Planner)
+    # ------------------------------------------------------------------
+
+    async def _decompose_goal(
+        self, goal: str, app_name: str
+    ) -> List[str]:
+        """Break a high-level goal into atomic UI steps.
+
+        Uses J-Prime or Claude for intelligent decomposition.
+        Falls back to a simple heuristic if no model available.
+        """
+        prompt = _STEP_PLANNER_PROMPT.format(app_name=app_name, goal=goal)
+
+        # Try J-Prime first (free)
+        try:
+            from backend.core.prime_client import get_prime_client
+            client = await asyncio.wait_for(get_prime_client(), timeout=5.0)
+            response = await asyncio.wait_for(
+                client.send_vision_request(
+                    image_base64="",  # No image needed for planning
+                    prompt=prompt,
+                    max_tokens=512,
+                    temperature=0.2,
+                ),
+                timeout=30.0,
+            )
+            if response and response.content:
+                return self._parse_plan_steps(response.content)
+        except Exception as e:
+            logger.debug("[NativeAppControlAgent] J-Prime planning failed: %s", e)
+
+        # Try Claude (paid fallback)
+        try:
+            import anthropic
+            api_key = os.getenv("ANTHROPIC_API_KEY", "")
+            if api_key:
+                client = anthropic.AsyncAnthropic(api_key=api_key)
+                model = os.getenv("JARVIS_NATIVE_CONTROL_CLAUDE_MODEL", "claude-sonnet-4-20250514")
+                msg = await client.messages.create(
+                    model=model,
+                    max_tokens=512,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                if msg.content:
+                    return self._parse_plan_steps(msg.content[0].text)
+        except Exception as e:
+            logger.debug("[NativeAppControlAgent] Claude planning failed: %s", e)
+
+        # Heuristic fallback — generic steps based on goal keywords
+        return self._heuristic_decompose(goal, app_name)
+
+    def _parse_plan_steps(self, raw_text: str) -> List[str]:
+        """Parse JSON array of step strings from LLM response."""
+        import json as _json
+        import re
+        cleaned = raw_text.strip()
+        # Try direct JSON parse
+        try:
+            result = _json.loads(cleaned)
+            if isinstance(result, list) and all(isinstance(s, str) for s in result):
+                return result
+        except _json.JSONDecodeError:
+            pass
+        # Try extracting JSON array from text
+        match = re.search(r'\[[\s\S]*\]', cleaned)
+        if match:
+            try:
+                result = _json.loads(match.group())
+                if isinstance(result, list):
+                    return [str(s) for s in result]
+            except _json.JSONDecodeError:
+                pass
+        # Fall back to line-by-line numbered list
+        lines = [
+            re.sub(r'^\d+[\.\)]\s*', '', line.strip())
+            for line in cleaned.split('\n')
+            if line.strip() and re.match(r'^\d+[\.\)]', line.strip())
+        ]
+        return lines if lines else [cleaned]
+
+    def _heuristic_decompose(self, goal: str, app_name: str) -> List[str]:
+        """Simple keyword-based step decomposition when no LLM available."""
+        goal_lower = goal.lower()
+        steps = []
+
+        if "message" in goal_lower or "send" in goal_lower:
+            # Extract recipient name if present
+            import re
+            name_match = re.search(r'(?:to|message)\s+(\w+)', goal_lower)
+            name = name_match.group(1).title() if name_match else "the contact"
+
+            # Extract message content
+            msg_match = re.search(r'(?:say|send|type|message)[:\s]+"?([^"]+)"?', goal_lower)
+            message_text = msg_match.group(1) if msg_match else "Testing with JARVIS"
+
+            steps = [
+                f"Click on the search bar at the top of {app_name}",
+                f"Type '{name}' in the search bar",
+                f"Click on {name}'s conversation in the search results",
+                f"Click on the message text input field at the bottom",
+                f"Type the message: '{message_text}'",
+                "Press Enter to send the message",
+            ]
+        elif "open" in goal_lower:
+            steps = [f"The app {app_name} is already open and active"]
+        else:
+            steps = [goal]  # Single step — let vision figure it out
+
+        return steps
 
     # ------------------------------------------------------------------
     # App activation
@@ -464,6 +628,10 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
         goal: str,
         app_name: str,
         previous_actions: List[Dict[str, Any]],
+        current_step: str = "",
+        step_number: int = 1,
+        total_steps: int = 1,
+        plan_text: str = "",
     ) -> Dict[str, Any]:
         """Determine the next UI action using J-Prime vision or Claude API.
 
@@ -472,19 +640,13 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
           2. Claude API vision (paid) -- fallback when J-Prime unavailable.
           3. No-op return -- when both are unavailable.
 
-        Args:
-            screenshot_b64: Base64-encoded PNG of the current screen.
-            goal: The automation goal.
-            app_name: Name of the target application.
-            previous_actions: List of dicts describing actions already taken.
-
         Returns:
             Dict with keys: done, action_type, detail, message.
         """
         previous_actions_text = (
             "\n".join(
-                f"  Step {a['step']}: [{a['action_type']}] {a['message']}"
-                for a in previous_actions
+                f"  [{a.get('action_type', '?')}] {a.get('message', '?')}"
+                for a in previous_actions[-5:]  # Last 5 actions for context
             )
             if previous_actions
             else "  (none yet)"
@@ -493,6 +655,10 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
         prompt = _VISION_PROMPT_TEMPLATE.format(
             app_name=app_name,
             goal=goal,
+            current_step=current_step or goal,
+            step_number=step_number,
+            total_steps=total_steps,
+            plan_text=plan_text or goal,
             previous_actions_text=previous_actions_text,
         )
 
