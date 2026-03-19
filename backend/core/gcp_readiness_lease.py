@@ -53,6 +53,7 @@ class ReadinessFailureClass(str, Enum):
     PREEMPTION = "preemption"
     SCHEMA_MISMATCH = "schema_mismatch"
     TIMEOUT = "timeout"
+    TRANSIENT_INFRA = "transient_infra"
 
 
 class LeaseStatus(str, Enum):

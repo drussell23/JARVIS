@@ -188,3 +188,279 @@ async def test_restart_consistency(tmp_path):
     assert result is True
     assert mgr.state == VMFsmState.READY
     await mgr.stop()
+
+
+# --- T3: MEANINGFUL resets idle timer -----------------------------------------
+
+@pytest.mark.asyncio
+async def test_meaningful_activity_resets_idle_timer(tmp_path):
+    """T3 — record_activity_from(MEANINGFUL) resets _last_meaningful_mono."""
+    from backend.core.vm_lifecycle_manager import VMLifecycleManager, VMFsmState
+    config = make_test_config(tmp_path, inactivity_threshold_s=10.0)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t3")
+    before = mgr._last_meaningful_mono
+    await asyncio.sleep(0.02)
+    mgr.record_activity_from("prime_client.execute_request")
+    after = mgr._last_meaningful_mono
+    assert after > before, "MEANINGFUL call must advance _last_meaningful_mono"
+    assert mgr.state == VMFsmState.READY
+    await mgr.stop()
+
+
+# --- T4: NON_MEANINGFUL does NOT reset idle timer -----------------------------
+
+@pytest.mark.asyncio
+async def test_non_meaningful_does_not_reset_idle_timer(tmp_path):
+    """T4 — health probe call does NOT change _last_meaningful_mono."""
+    from backend.core.vm_lifecycle_manager import VMLifecycleManager, VMFsmState
+    config = make_test_config(tmp_path, inactivity_threshold_s=10.0)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t4")
+    before = mgr._last_meaningful_mono
+    await asyncio.sleep(0.01)
+    mgr.record_activity_from("health_probe.probe_health")
+    after = mgr._last_meaningful_mono
+    assert after == before, "NON_MEANINGFUL must not change _last_meaningful_mono"
+    await mgr.stop()
+
+
+# --- T5: 1000 health probe calls → no idle reset ------------------------------
+
+@pytest.mark.asyncio
+async def test_health_probe_1000_calls_no_idle_reset(tmp_path):
+    """T5 — 1000 probe_health calls → _last_meaningful_mono unchanged."""
+    from backend.core.vm_lifecycle_manager import VMLifecycleManager
+    config = make_test_config(tmp_path, inactivity_threshold_s=10.0)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t5")
+    baseline = mgr._last_meaningful_mono
+    for _ in range(1000):
+        mgr.record_activity_from("health_probe.probe_health")
+    assert mgr._last_meaningful_mono == baseline
+    await mgr.stop()
+
+
+# --- T6: Health probe in IDLE_GRACE → STOPPING proceeds -----------------------
+
+@pytest.mark.asyncio
+async def test_health_probe_does_not_block_stopping(tmp_path):
+    """T6 — NON_MEANINGFUL work_slot in IDLE_GRACE → STOPPING proceeds unblocked."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, ActivityClass,
+    )
+    config = make_test_config(tmp_path, inactivity_threshold_s=0.05, idle_grace_s=0.3)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t6")
+    # Allow idle timer to fire → IDLE_GRACE
+    await asyncio.sleep(0.12)
+    assert mgr.state == VMFsmState.IDLE_GRACE
+    # Start a NON_MEANINGFUL slot (health probe)
+    entered = False
+    exited = False
+    async def _probe():
+        nonlocal entered, exited
+        async with mgr.work_slot(ActivityClass.NON_MEANINGFUL, description="health_probe.probe_health"):
+            entered = True
+            await asyncio.sleep(0.5)  # holds slot for 500ms — much longer than grace
+            exited = True
+    probe_task = asyncio.create_task(_probe())
+    await asyncio.sleep(0.01)
+    assert entered is True
+    # NON_MEANINGFUL slot must not block STOPPING — drain check ignores it
+    # Manually call grace_and_drain_complete path
+    assert mgr._drain_clear() is True  # _meaningful_count == 0 despite probe running
+    probe_task.cancel()
+    try:
+        await probe_task
+    except asyncio.CancelledError:
+        pass
+    await mgr.stop()
+
+
+# --- T7: MEANINGFUL slot blocks STOPPING --------------------------------------
+
+@pytest.mark.asyncio
+async def test_meaningful_drain_blocks_stopping(tmp_path):
+    """T7 — MEANINGFUL work_slot held → drain not clear → STOPPING waits."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, ActivityClass,
+    )
+    config = make_test_config(tmp_path, inactivity_threshold_s=0.05, idle_grace_s=0.05)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t7")
+
+    slot_released = asyncio.Event()
+    slot_entered = asyncio.Event()
+
+    async def _hold_slot():
+        async with mgr.work_slot(ActivityClass.MEANINGFUL, description="prime_client.execute_request"):
+            slot_entered.set()
+            await slot_released.wait()
+
+    task = asyncio.create_task(_hold_slot())
+    await slot_entered.wait()
+    assert not mgr._drain_clear(), "MEANINGFUL slot in flight → drain not clear"
+    slot_released.set()
+    await task
+    assert mgr._drain_clear()
+    await mgr.stop()
+
+
+# --- T8: drain_clear_event release triggers STOPPING -------------------------
+
+@pytest.mark.asyncio
+async def test_drain_event_driven_releases_stopping(tmp_path):
+    """T8 — releasing MEANINGFUL slot sets _drain_clear_event → STOPPING fires."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, ActivityClass,
+    )
+    config = make_test_config(tmp_path, inactivity_threshold_s=0.05, idle_grace_s=0.05)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t8")
+
+    slot_released = asyncio.Event()
+
+    async def _hold():
+        async with mgr.work_slot(ActivityClass.MEANINGFUL, description="prime_client.execute_request"):
+            await slot_released.wait()
+
+    task = asyncio.create_task(_hold())
+    await asyncio.sleep(0.12)  # allow idle timer to fire
+    assert mgr.state in (VMFsmState.IDLE_GRACE, VMFsmState.IN_USE)
+    slot_released.set()
+    await task
+    # After slot released, give time for grace → drain → STOPPING → COLD
+    await asyncio.sleep(0.3)
+    assert mgr.state == VMFsmState.COLD
+    await mgr.stop()
+
+
+# --- T9: IDLE_GRACE + new work_slot(MEANINGFUL) → IN_USE, grace cancelled ----
+
+@pytest.mark.asyncio
+async def test_idle_grace_cancelled_by_new_work(tmp_path):
+    """T9 — MEANINGFUL work_slot during IDLE_GRACE → IN_USE + grace cancelled."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, ActivityClass,
+    )
+    config = make_test_config(tmp_path, inactivity_threshold_s=0.05, idle_grace_s=2.0)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t9")
+    # Let idle timer fire
+    await asyncio.sleep(0.12)
+    assert mgr.state == VMFsmState.IDLE_GRACE
+    async with mgr.work_slot(ActivityClass.MEANINGFUL, description="prime_client.execute_request"):
+        assert mgr.state == VMFsmState.IN_USE
+        assert mgr._grace_period_task is None or mgr._grace_period_task.done() or mgr._grace_period_task.cancelled()
+    await mgr.stop()
+
+
+# --- T10: work_slot WARMING bounded-await success -----------------------------
+
+@pytest.mark.asyncio
+async def test_work_slot_warming_bounded_await_success(tmp_path):
+    """T10 — work_slot called during WARMING → bounded-await → READY → proceeds."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, ActivityClass,
+    )
+    config = make_test_config(tmp_path, warming_await_timeout_s=2.0)
+
+    async def _slow_start():
+        await asyncio.sleep(0.1)
+        return (True, None, None)
+
+    ctrl = make_mock_controller()
+    ctrl.start_vm = _slow_start
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+
+    warm_task = asyncio.create_task(mgr.ensure_warmed("t10"))
+    await asyncio.sleep(0.01)  # ensure we're in WARMING
+    assert mgr.state == VMFsmState.WARMING
+
+    # work_slot should bounded-await and succeed once READY
+    async with mgr.work_slot(ActivityClass.MEANINGFUL, description="prime_client.execute_request"):
+        assert mgr.state == VMFsmState.IN_USE
+
+    await warm_task
+    await mgr.stop()
+
+
+# --- T11: work_slot WARMING timeout → VMNotReadyError with recovery -----------
+
+@pytest.mark.asyncio
+async def test_work_slot_warming_timeout_taxonomy_recovery(tmp_path):
+    """T11 — warming_await_timeout elapses → VMNotReadyError.recovery from _RECOVERY_MATRIX."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, ActivityClass, VMNotReadyError,
+    )
+    config = make_test_config(tmp_path, warming_await_timeout_s=0.05)
+
+    async def _very_slow_start():
+        await asyncio.sleep(5.0)
+        return (True, None, None)
+
+    ctrl = make_mock_controller()
+    ctrl.start_vm = _very_slow_start
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    asyncio.create_task(mgr.ensure_warmed("t11"))
+    await asyncio.sleep(0.01)
+    assert mgr.state == VMFsmState.WARMING
+
+    with pytest.raises(VMNotReadyError) as exc_info:
+        async with mgr.work_slot(ActivityClass.MEANINGFUL, description="prime_client.execute_request"):
+            pass
+    assert exc_info.value.recovery is not None, "VMNotReadyError must carry a recovery strategy"
+    await mgr.stop()
+
+
+# --- T12: work_slot COLD + prior failure → VMNotReadyError with recovery ------
+
+@pytest.mark.asyncio
+async def test_work_slot_cold_taxonomy_recovery(tmp_path):
+    """T12 — COLD state after prior failure → VMNotReadyError.recovery from matrix."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, ActivityClass, VMNotReadyError,
+    )
+    from backend.core.gcp_readiness_lease import HandshakeStep, ReadinessFailureClass
+    config = make_test_config(tmp_path)
+
+    ctrl = make_mock_controller(start_returns=(False, HandshakeStep.HEALTH, ReadinessFailureClass.TRANSIENT_INFRA))
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    # Trigger a failure to populate _last_warming_failure
+    await mgr.ensure_warmed("t12_fail")
+    assert mgr.state == VMFsmState.COLD
+    assert mgr._last_warming_failure is not None
+
+    with pytest.raises(VMNotReadyError) as exc_info:
+        async with mgr.work_slot(ActivityClass.MEANINGFUL, description="prime_client.execute_request"):
+            pass
+    assert exc_info.value.recovery is not None
+    await mgr.stop()

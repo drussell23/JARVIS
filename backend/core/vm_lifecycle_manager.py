@@ -14,11 +14,12 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import (
-    Any, Callable, Dict, FrozenSet, Optional,
+    Any, AsyncIterator, Callable, Dict, FrozenSet, Optional,
     Protocol, Tuple, runtime_checkable,
 )
 from uuid import uuid4
@@ -584,6 +585,100 @@ class VMLifecycleManager:
                 trigger="stop_confirmed", reason_code="STOP_CONFIRMED",
             )
         asyncio.create_task(self._emit_safe(event))
+
+    # ------------------------------------------------------------------
+    # work_slot — drain-safe context manager
+    # ------------------------------------------------------------------
+
+    @asynccontextmanager
+    async def work_slot(
+        self, activity_class: ActivityClass, *, description: str = ""
+    ) -> AsyncIterator[None]:
+        """Drain-safe context manager. Tracks in-flight work.
+
+        WARMING: bounded-await up to warming_await_timeout_s.
+        STOPPING/COLD: raises VMNotReadyError immediately.
+        IDLE_GRACE + MEANINGFUL: cancels grace → IN_USE.
+        """
+        # Phase 1: Snapshot warming_future without holding lock during await
+        async with self._lock:
+            current_state = self._state
+            warming_future = self._warming_future if current_state == VMFsmState.WARMING else None
+
+        if warming_future is not None:
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(warming_future),
+                    timeout=self._config.warming_await_timeout_s,
+                )
+            except asyncio.TimeoutError:
+                step, fc = self._last_warming_failure or (None, None)
+                from backend.core.startup_routing_policy import select_recovery_strategy
+                from backend.core.gcp_readiness_lease import HandshakeStep, ReadinessFailureClass
+                _step = step or HandshakeStep.HEALTH
+                _fc   = fc   or ReadinessFailureClass.TRANSIENT_INFRA
+                strategy = select_recovery_strategy(_step, _fc)
+                raise VMNotReadyError(
+                    state=VMFsmState.WARMING, recovery=strategy, failure_class=_fc,
+                    detail="warming_await_timeout",
+                )
+
+        # Phase 2: Re-check state after possible await
+        async with self._lock:
+            current_state = self._state
+            if current_state in (VMFsmState.COLD, VMFsmState.STOPPING):
+                step, fc = self._last_warming_failure or (None, None)
+                from backend.core.startup_routing_policy import select_recovery_strategy
+                from backend.core.gcp_readiness_lease import HandshakeStep, ReadinessFailureClass
+                _step = step or HandshakeStep.HEALTH
+                _fc   = fc   or ReadinessFailureClass.TRANSIENT_INFRA
+                strategy = select_recovery_strategy(_step, _fc)
+                raise VMNotReadyError(
+                    state=current_state, recovery=strategy, failure_class=_fc,
+                )
+            # Admit the slot
+            if activity_class == ActivityClass.MEANINGFUL:
+                self._meaningful_count += 1
+                self._drain_clear_event.clear()
+                if current_state == VMFsmState.IDLE_GRACE:
+                    # Cancel grace, transition to IN_USE
+                    if self._grace_period_task and not self._grace_period_task.done():
+                        self._grace_period_task.cancel()
+                    self._grace_period_task = None
+                    self._state = VMFsmState.IN_USE
+                    self._state_entered_mono = self._clock()
+                elif current_state == VMFsmState.READY:
+                    self._state = VMFsmState.IN_USE
+                    self._state_entered_mono = self._clock()
+            else:
+                self._non_meaningful_count += 1
+
+        try:
+            yield
+        finally:
+            async with self._lock:
+                if activity_class == ActivityClass.MEANINGFUL:
+                    self._meaningful_count = max(0, self._meaningful_count - 1)
+                    if self._meaningful_count == 0:
+                        self._drain_clear_event.set()
+                        if self._state == VMFsmState.IN_USE:
+                            # Check if idle timer already elapsed
+                            if (self._last_meaningful_mono + self._effective_threshold_s()) <= self._clock():
+                                self._state = VMFsmState.IDLE_GRACE
+                                self._idle_grace_entered_mono = self._clock()
+                                self._state_entered_mono = self._clock()
+                                event = self._build_transition_event(
+                                    from_state=VMFsmState.IN_USE, to_state=VMFsmState.IDLE_GRACE,
+                                    trigger="last_meaningful_slot_released_timer_elapsed",
+                                    reason_code="IDLE_THRESHOLD_ELAPSED",
+                                )
+                                asyncio.create_task(self._emit_safe(event))
+                                self._grace_period_task = asyncio.create_task(self._grace_period_coro())
+                            else:
+                                self._state = VMFsmState.READY
+                                self._state_entered_mono = self._clock()
+                else:
+                    self._non_meaningful_count = max(0, self._non_meaningful_count - 1)
 
     # ------------------------------------------------------------------
     # record_activity_from
