@@ -6,6 +6,240 @@ JARVIS is the **control plane and execution layer** of the JARVIS AGI ecosystem.
 
 ---
 
+## Session Update (2026-03-19): 3-Tier Execution System, Reactor Learning Pipeline, and Claude-Level Google Workspace
+
+### Overview
+
+This session delivered the **execution layer** — the system that turns JARVIS from a conversational assistant into an agent that physically operates your Mac. Three major subsystems landed:
+
+1. **3-Tier Execution System**: A complete agent pipeline that routes tasks to API calls, native macOS app control (accessibility + CGEvents), or browser automation (Playwright), with J-Prime vision in the loop for verification.
+2. **Reactor Core Learning Pipeline Fix**: The cross-repository learning data flow (JARVIS → Trinity Event Bus → Reactor Core) was broken due to an event type mismatch. Now every command outcome, tier routing decision, and fallback event flows through to Reactor's `UnifiedTrainingPipeline`.
+3. **Google Workspace Claude Computer Use-Level Experience**: Gmail, Calendar, and Drive operations now feature draft-then-confirm gates, real-time voice narration, visual-by-default rendering, inbox triage scoring, and category-aware summaries (Primary, Promotions, Social, Updates, Forums).
+
+Additionally: the GCP GPU VM (`jarvis-prime-gpu`) was assigned a **static IP** (`136.113.252.164`) so `.env` configuration survives VM restarts, and the on-demand lifecycle manager was hardened.
+
+---
+
+### 1. 3-Tier Execution System
+
+#### Problem
+
+JARVIS could understand commands like "message Zach on WhatsApp" or "play Lo-Fi on Spotify" but had no way to actually *do* them. The intent classifier would fire, but execution dead-ended at the command processor. Interactive app control — clicking buttons, typing into fields, navigating UI — required a fundamentally new architecture.
+
+#### Solution: ExecutionTierRouter + Agent Pipeline
+
+Every actionable command now flows through a 3-tier routing decision:
+
+| Tier | Agent | When Used | Example |
+|------|-------|-----------|---------|
+| `API` | Direct API call | Structured APIs available | "Check my email" |
+| `NATIVE_APP` | `NativeAppControlAgent` | macOS app interaction needed | "Message Zach on WhatsApp" |
+| `BROWSER` | `VisualBrowserAgent` | Web-only targets | "Go to linkedin.com and check messages" |
+
+**ExecutionTierRouter** (`execution_tier_router.py`) makes the routing decision based on app availability (via `AppInventoryService` Spotlight scanning), task semantics, and capability matching.
+
+#### NativeAppControlAgent: Vision-Action Loop with AX Precision
+
+The core innovation is the hybrid **vision + accessibility** approach. LLaVA vision identifies WHAT to interact with; the macOS Accessibility API finds WHERE it is (exact pixel coordinates):
+
+```
+NativeAppControlAgent
+  1. _decompose_goal() → J-Prime text model breaks goal into steps
+     └─ StepPlanCache: ChromaDB semantic cache (identical goals reuse cached plans)
+
+  2. For each step:
+     ├─ AccessibilityResolver.resolve()
+     │   ├─ AXUIElement tree walk (exact position + size)
+     │   ├─ Scored matching: exact title (100) → fuzzy (80) →
+     │   │   role+desc (60) → placeholder (40)
+     │   └─ Fallback: AX → AppleScript → None
+     ├─ CGEventPost (click / type / scroll at exact coordinates)
+     └─ Post-action verification (screenshot + vision model)
+```
+
+**Why AX instead of pixel coordinates?** LLaVA returns pixel coordinates with ~50-100px error — enough to click the wrong button. The `AccessibilityResolver` uses `AXUIElementCopyAttributeValue(element, kAXPositionAttribute)` for exact bounds:
+
+```python
+# Instead of: click at LLaVA's estimated (290, 120) — might miss
+# We do:      find AXTextField "Search" → exact bounds (285, 114, 200×22)
+#             click center: (385, 125) — pixel-perfect, guaranteed hit
+```
+
+#### Command Pipeline Wiring
+
+Three integration points in `unified_command_processor.py` catch interactive app commands:
+
+```python
+# _is_interactive_app_command() distinguishes:
+#   "message Zach on WhatsApp" → True  (tier system)
+#   "open WhatsApp"            → False (simple app launch)
+#   "play Lo-Fi on Spotify"    → True  (tier system)
+#   "turn up volume"           → False (system command)
+#   "go to linkedin.com"       → True  (tier system)
+#   "check my email"           → False (workspace handler)
+```
+
+Full chain: `command processor → _try_tier_execution() → plan_and_execute() → PredictivePlanningAgent (capability routing) → NativeAppControlAgent → AccessibilityResolver → CGEventPost`
+
+#### On-Demand GPU VM
+
+J-Prime runs on `jarvis-prime-gpu` (g2-standard-4 + NVIDIA L4, static IP `136.113.252.164`):
+- **Text model**: Qwen2.5-7B-Instruct (port 8000) — step decomposition, classification
+- **Vision model**: LLaVA v1.5-7B (port 8001) — screenshot analysis, verification
+- `ensure_vision_available()` / `ensure_text_available()` start the VM on-demand
+- Auto-stop after 30 min idle — **~$2-5/day** vs $640/month always-on
+- Systemd services auto-start models on boot
+
+---
+
+### 2. Reactor Core Learning Pipeline Fix
+
+#### Problem
+
+The orchestrator was emitting events as `workflow.completed` topic, but Reactor Core's `TrinityExperienceReceiver` only processes `learning_signal` events. Result: **zero learning data reached Reactor Core** from the multi-agent pipeline. Additionally, the forwarder's dict-based format mismatched the receiver's string-based normalization.
+
+#### Fix: 4 New Experience Types + Schema Fix
+
+All orchestrator emissions now go through the production `CrossRepoExperienceForwarder.forward_experience()`:
+
+| Experience Type | Source | What It Captures |
+|---|---|---|
+| `command_outcome` | Command processor | Every command's success/fail, intent, domain, execution time |
+| `workflow_completion` | Multi-agent orchestrator | Full workflow results with per-task traces |
+| `tier_routing_decision` | Orchestrator | Which agent was assigned, whether it succeeded |
+| `tier_fallback` | Orchestrator | When primary tier fails and fallback is used |
+
+Reactor Core's `TrinityExperienceReceiver` updated to accept all 4 new types and normalize the dict-based format. Data flows across all 3 repos:
+
+```
+JARVIS Body → CrossRepoExperienceForwarder → Trinity Event Bus → Reactor Core
+                                                                   ↓
+                                                        UnifiedTrainingPipeline
+```
+
+---
+
+### 3. Google Workspace: Claude Computer Use-Level Experience
+
+#### 6 Enhancements
+
+| Enhancement | What Changed |
+|------------|--------------|
+| **Send confirmation gate** | `send_email` now drafts first → JARVIS says "Want me to send it?" → waits for voice yes/no before sending |
+| **Visual-by-default** | Voice commands auto-upgrade to `visual_preferred` — user sees JARVIS open Gmail, fill compose fields on screen |
+| **Real-time narration** | `_narrate()` fires `safe_say()` on every action: "Checking inbox...", "2 urgent emails from your boss" |
+| **Email triage scoring** | Integrates `email_triage.scoring` — emails sorted by priority tier, urgent count narrated |
+| **Gmail category awareness** | Per-category counts: Primary, Promotions, Social, Updates, Forums. Narrates: "6 in Primary, 49 promotions, 10 social, 4 updates, 50 forums" |
+| **New commands** | `find_free_time` (FreeBusy API, business-hours gaps), `cancel_event` (search-by-term + voice confirm) |
+
+#### Send Email Flow
+
+```
+User: "Send an email to John about the meeting"
+  │
+  ▼
+Workspace fast-path (<1ms local detection)
+  │
+  ▼
+GoogleWorkspaceAgent
+  ├─ JARVIS: "Drafting an email to John."
+  ├─ API: Creates Gmail draft
+  ├─ Visual: Opens Gmail Compose on screen
+  ├─ JARVIS: "I've drafted the email. Want me to send it?"
+  │
+  ▼
+User: "Yes, send it"
+  ├─ JARVIS: "Sending the email to John now."
+  └─ API: messages.send() (confirmed=True)
+```
+
+#### Gmail Category Awareness
+
+JARVIS now understands Gmail's tab system and can report/filter by category:
+
+```
+User: "Check my email"
+JARVIS: "Your inbox: 6 in Primary, 49 promotions, 10 social,
+         4 updates, and 50 in forums."
+
+User: "Check my promotions"
+JARVIS: "You have 49 unread promotions emails." [shows top 10]
+
+User: "What's important?"
+JARVIS: "2 urgent emails — one from Sebastian about a Sequoia-backed
+         startup, one from Ria about the Genentech interview."
+```
+
+---
+
+### 4. Architecture: Complete Execution Pipeline
+
+```
+┌──────────────────────────────────────────────────────────────────┐
+│                     JARVIS Command Flow                          │
+│                                                                  │
+│  Voice Input                                                     │
+│    │                                                             │
+│    ▼                                                             │
+│  Whisper STT → Intent Classification                             │
+│    │                                                             │
+│    ├─ Workspace keyword? ──→ GoogleWorkspaceAgent                │
+│    │   (email, calendar,      ├─ Voice narration                 │
+│    │    drive, <1ms detect)   ├─ Visual rendering on screen      │
+│    │                          ├─ Draft → confirm → send          │
+│    │                          └─ Triage / categories / free time │
+│    │                                                             │
+│    ├─ Interactive app? ────→ ExecutionTierRouter                  │
+│    │   (WhatsApp, Spotify,    ├─ NATIVE_APP → NativeAppControl   │
+│    │    LinkedIn, etc.)       │   ├─ J-Prime step decomposition  │
+│    │                          │   ├─ AccessibilityResolver (AX)  │
+│    │                          │   └─ CGEventPost (click/type)    │
+│    │                          ├─ BROWSER → VisualBrowserAgent    │
+│    │                          │   └─ Playwright + J-Prime vision │
+│    │                          └─ API → Direct API call           │
+│    │                                                             │
+│    └─ Other ───────────────→ Standard command processor          │
+│        (system, query)        └─ J-Prime / Claude inference      │
+│                                                                  │
+│  Every execution emits learning data:                            │
+│    command_outcome → CrossRepoExperienceForwarder                │
+│    tier_routing_decision     → Trinity Event Bus                 │
+│    workflow_completion       → Reactor Core                      │
+│    tier_fallback             → UnifiedTrainingPipeline           │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 5. Files Changed
+
+#### New Files
+
+| File | Purpose |
+|------|---------|
+| `backend/neural_mesh/agents/execution_tier_router.py` | Routes tasks to API / NATIVE_APP / BROWSER |
+| `backend/neural_mesh/agents/native_app_control_agent.py` | Vision-action loop + AX + CGEvents for macOS apps |
+| `backend/neural_mesh/agents/accessibility_resolver.py` | Exact element positions via macOS AXUIElement API |
+| `backend/neural_mesh/agents/visual_browser_agent.py` | Playwright + J-Prime vision for Chrome |
+| `backend/neural_mesh/agents/app_inventory_service.py` | Spotlight-based installed app scanner |
+| `backend/neural_mesh/agents/step_plan_cache.py` | ChromaDB semantic cache for goal decomposition |
+| `backend/neural_mesh/agents/vision_gpu_lifecycle.py` | On-demand GPU VM lifecycle (~$2-5/day) |
+| `tests/integration/test_execution_tiers.py` | 92 unit tests for tier system |
+| `tests/integration/smoke_whatsapp.py` | Narrated WhatsApp smoke test |
+
+#### Modified Files
+
+| File | Changes |
+|------|---------|
+| `unified_command_processor.py` | Tier routing at 3 points, command experience forwarding, Gmail categories |
+| `multi_agent_orchestrator.py` | Production forwarder, tier decision + fallback emissions |
+| `google_workspace_agent.py` | Confirmation gate, visual-by-default, narration, triage, categories, find_free_time, cancel_event |
+| `workspace_routing_intelligence.py` | find_free_time, cancel_event patterns, category entity extraction |
+| `predictive_planning_agent.py` | Capability routes (whatsapp→native_app, linkedin→browser) |
+| `reactor-core/.../trinity_experience_receiver.py` | New event types, dict-based schema normalization fix |
+
+---
+
 ## Session Update (2026-03-18): Unified Control Plane — UDS Multiplexing, Crash-Loop Fix, and Startup Hardening (v293.0)
 
 This session delivered four structural fixes targeting the root causes of the launchd restart loop, the split-brain `--force` problem, log blindness when running under launchd, and silent voice-shutdown sentinel races.
