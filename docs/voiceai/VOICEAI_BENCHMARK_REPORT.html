@@ -132,26 +132,22 @@ table {
 
 .table-scroll {
   margin: 1rem 0;
+  overflow-x: auto;
 }
 
 .table-scroll table {
-  font-size: 0.78rem;
+  font-size: 0.8rem;
 }
 
-.table-scroll th {
-  font-size: 0.68rem;
-  padding: 0.5rem 0.5rem;
-  white-space: normal;
-}
-
+.table-scroll th,
 .table-scroll td {
-  padding: 0.4rem 0.5rem;
+  padding: 0.4rem 0.6rem;
 }
 
 th {
   background: var(--bg);
   color: var(--accent);
-  padding: 0.75rem 1rem;
+  padding: 0.6rem 1.2rem;
   text-align: left;
   font-weight: 600;
   border-bottom: 2px solid var(--accent);
@@ -159,11 +155,11 @@ th {
 }
 
 th.num {
-  text-align: right;
+  text-align: center;
 }
 
 td {
-  padding: 0.6rem 1rem;
+  padding: 0.6rem 1.2rem;
   border-bottom: 1px solid var(--border);
   color: var(--text);
   vertical-align: middle;
@@ -174,7 +170,7 @@ tr:hover {
 }
 
 .num {
-  text-align: right;
+  text-align: center;
   font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
   font-size: 0.85rem;
   white-space: nowrap;
