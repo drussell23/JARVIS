@@ -3549,6 +3549,15 @@ class UnifiedCommandProcessor:
                     )
                     _ws_rescue.setdefault("source", "system_to_workspace_rescue")
                     return _ws_rescue
+                # Wire 0: Intercept interactive app commands (messaging, in-app
+                # actions) BEFORE the basic system handler.  J-Prime often
+                # classifies "message Zach on WhatsApp" as domain="system",
+                # but it needs the 3-tier execution system, not AppleScript.
+                _tier_result = await self._try_tier_execution(
+                    command_text, response=response, deadline=deadline,
+                )
+                if _tier_result is not None:
+                    return _tier_result
                 return await self._handle_system_action_via_jprime(
                     command_text, response.suggested_actions, deadline=deadline,
                 )
@@ -3561,6 +3570,13 @@ class UnifiedCommandProcessor:
             elif domain == "workspace":
                 return await self._handle_workspace_action(command_text, response, deadline=deadline)
             else:
+                # Wire 0: Interactive app commands get tier routing first.
+                _tier_result = await self._try_tier_execution(
+                    command_text, response=response, deadline=deadline,
+                )
+                if _tier_result is not None:
+                    return _tier_result
+
                 # Wire 1: Unknown domain — try multi-agent plan_and_execute
                 # before falling back to returning J-Prime's raw text.
                 # This is where "Start my day", "Set up dev environment",
@@ -3620,6 +3636,13 @@ class UnifiedCommandProcessor:
                 logger.debug(f"[v243] AgentRuntime routing failed, falling back: {e}")
 
             if not _used_runtime:
+                # Wire 0: Interactive app commands get tier routing first.
+                _tier_result = await self._try_tier_execution(
+                    command_text, response=response, deadline=deadline,
+                )
+                if _tier_result is not None:
+                    return _tier_result
+
                 # Wire 1: Try plan_and_execute before compound command handler.
                 # The orchestrator uses PredictivePlanningAgent to expand the
                 # intent into parallel tasks with dependency resolution.
@@ -3651,6 +3674,91 @@ class UnifiedCommandProcessor:
             "command_type": "QUERY",
             "source": response.source,
         }
+
+    # =========================================================================
+    # Wire 0: Tier execution — routes interactive app commands through
+    # ExecutionTierRouter → NativeAppControlAgent / VisualBrowserAgent.
+    # This is the PRIMARY path for "message Zach on WhatsApp", etc.
+    # =========================================================================
+
+    # Apps that support in-app interaction (not just open/close)
+    _INTERACTIVE_APPS = {
+        "whatsapp", "discord", "slack", "telegram", "imessage", "messages",
+        "spotify", "finder", "notes", "reminders", "signal", "teams",
+    }
+    # Verbs that indicate in-app interaction (not just "open X")
+    _INTERACTION_VERBS = {
+        "message", "text", "dm", "send", "reply", "write", "tell",
+        "post", "comment", "like", "share", "follow", "search",
+        "navigate", "browse", "type", "click", "play", "pause",
+        "skip", "queue", "add", "remove", "delete", "create",
+    }
+    # Web domains that should route to VisualBrowserAgent
+    _WEB_PATTERNS = (
+        ".com", ".org", ".net", ".io", ".dev", ".ai", ".co",
+    )
+
+    def _is_interactive_app_command(self, command_text: str) -> bool:
+        """Detect commands that need in-app interaction (not just open/close).
+
+        Returns True for: "message Zach on WhatsApp", "play Chill Vibes on Spotify",
+                          "go to linkedin.com and check messages"
+        Returns False for: "open WhatsApp", "close Spotify", "turn up volume"
+        """
+        lower = command_text.lower()
+
+        # Web URL navigation
+        if any(p in lower for p in self._WEB_PATTERNS):
+            if any(v in lower for v in ("go to", "navigate", "open", "visit", "browse")):
+                return True
+
+        # Check for interaction verb + interactive app
+        has_verb = any(v in lower for v in self._INTERACTION_VERBS)
+        has_app = any(a in lower for a in self._INTERACTIVE_APPS)
+        if has_verb and has_app:
+            return True
+
+        # "on WhatsApp" / "in Slack" / "via Discord" patterns
+        for prep in ("on ", "in ", "via ", "through ", "using "):
+            idx = lower.find(prep)
+            if idx >= 0:
+                after = lower[idx + len(prep):].strip().split()[0] if lower[idx + len(prep):].strip() else ""
+                if after in self._INTERACTIVE_APPS and has_verb:
+                    return True
+
+        return False
+
+    async def _try_tier_execution(
+        self,
+        command_text: str,
+        response: Any = None,
+        deadline: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Route interactive app commands through the 3-tier execution system.
+
+        Tier 1: API (GoogleWorkspaceAgent) — handled by workspace fast-path already
+        Tier 2: NATIVE_APP (NativeAppControlAgent + AX resolver)
+        Tier 3: BROWSER (VisualBrowserAgent + Playwright)
+
+        Returns standard response dict on success, or None to fall through.
+        """
+        if not self._is_interactive_app_command(command_text):
+            return None
+
+        logger.info(
+            "[TierExec] Interactive app command detected: '%s' — "
+            "routing through ExecutionTierRouter",
+            command_text[:80],
+        )
+
+        # Route through the orchestrator's plan_and_execute — it uses
+        # PredictivePlanningAgent which maps app keywords to capabilities:
+        #   "whatsapp" → native_app_control
+        #   "linkedin" → visual_browser
+        # Then the orchestrator dispatches to the correct tier agent.
+        return await self._try_plan_and_execute(
+            command_text, response=response, deadline=deadline,
+        )
 
     # =========================================================================
     # Wire 1: plan_and_execute() bridge — routes compound/unknown-domain
