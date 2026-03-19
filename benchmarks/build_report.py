@@ -82,27 +82,34 @@ def main():
     summary_table = csv_to_html(summary_csv)
     speedup_table = csv_to_html(speedup_csv)
 
-    # Load HTML template parts from file
-    tmpl = (Path(__file__).parent / "report_template.html").read_text()
+    # Load the template and replace placeholders
+    tmpl_path = Path(__file__).parent / "report_template.html"
+    html = tmpl_path.read_text()
+    print("Loaded template: " + str(tmpl_path) + " (" + str(len(html) // 1024) + "KB)")
 
-    # Replace placeholders
-    tmpl = tmpl.replace("{{CHART_DASHBOARD}}", ci("voiceai_chart_dashboard_final"))
-    tmpl = tmpl.replace("{{CHART_TTFB_BOXPLOT}}", ci("voiceai_chart_ttfb_boxplot"))
-    tmpl = tmpl.replace("{{CHART_TTFB_BARS}}", ci("voiceai_chart_ttfb_bars"))
-    tmpl = tmpl.replace("{{CHART_SPEEDUP}}", ci("voiceai_chart_speedup"))
-    tmpl = tmpl.replace("{{CHART_PUBLISHED}}", ci("voiceai_chart_published_vs_measured"))
-    tmpl = tmpl.replace("{{CHART_CONSISTENCY}}", ci("voiceai_chart_consistency"))
-    tmpl = tmpl.replace("{{CHART_DISTRIBUTION}}", ci("voiceai_chart_distribution"))
-    tmpl = tmpl.replace("{{CHART_TOTAL_TIME}}", ci("voiceai_chart_total_time"))
-    tmpl = tmpl.replace("{{SUMMARY_TABLE}}", summary_table)
-    tmpl = tmpl.replace("{{SPEEDUP_TABLE}}", speedup_table)
+    html = html.replace("{{CHART_DASHBOARD}}", ci("voiceai_chart_dashboard_final"))
+    html = html.replace("{{CHART_TTFB_BOXPLOT}}", ci("voiceai_chart_ttfb_boxplot"))
+    html = html.replace("{{CHART_TTFB_BARS}}", ci("voiceai_chart_ttfb_bars"))
+    html = html.replace("{{CHART_SPEEDUP}}", ci("voiceai_chart_speedup"))
+    html = html.replace("{{CHART_PUBLISHED}}", ci("voiceai_chart_published_vs_measured"))
+    html = html.replace("{{CHART_CONSISTENCY}}", ci("voiceai_chart_consistency"))
+    html = html.replace("{{CHART_DISTRIBUTION}}", ci("voiceai_chart_distribution"))
+    html = html.replace("{{CHART_TOTAL_TIME}}", ci("voiceai_chart_total_time"))
+    html = html.replace("{{SUMMARY_TABLE}}", summary_table)
+    html = html.replace("{{SPEEDUP_TABLE}}", speedup_table)
 
-    out_path.write_text(tmpl)
-    size_kb = len(tmpl) // 1024
+    out_path.write_text(html)
+    size_kb = len(html) // 1024
     print("Written: " + str(out_path) + " (" + str(size_kb) + "KB)")
 
-    if "<\\!" in tmpl:
-        print("ERROR: Found <\\! escapes")
+    # Verify
+    issues = []
+    if "{{" in html:
+        issues.append("Unreplaced placeholders")
+    if html[:20].count("\\") > 0:
+        issues.append("Backslash in DOCTYPE")
+    if issues:
+        print("ISSUES: " + str(issues))
     else:
         print("CLEAN")
 

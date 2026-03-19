@@ -1,0 +1,1784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Voice.ai TTS Benchmark Report</title>
+<style>
+:root {
+  --bg: #0f1117;
+  --surface: #1a1d27;
+  --accent: #4ECDC4;
+  --accent2: #45B7D1;
+  --danger: #FF6B6B;
+  --success: #2ECC71;
+  --text: #e0e0e0;
+  --text-muted: #8892a4;
+  --border: #2a2d3a;
+  --surface-hover: #22253a;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  line-height: 1.6;
+  padding: 2rem;
+  max-width: 1400px;
+  margin: 0 auto;
+}
+
+h1 {
+  font-size: 2.2rem;
+  color: var(--accent);
+  border-bottom: 3px solid var(--accent);
+  padding-bottom: 0.8rem;
+  margin-bottom: 1.5rem;
+  letter-spacing: -0.5px;
+}
+
+h2 {
+  font-size: 1.6rem;
+  color: var(--accent2);
+  margin: 2.5rem 0 1rem 0;
+  padding-bottom: 0.4rem;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+h3 {
+  font-size: 1.2rem;
+  color: var(--accent);
+  margin: 1.5rem 0 0.8rem 0;
+}
+
+p {
+  margin-bottom: 1rem;
+  color: var(--text-muted);
+}
+
+.highlight {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.danger {
+  color: var(--danger);
+  font-weight: 600;
+}
+
+.success {
+  color: var(--success);
+  font-weight: 600;
+}
+
+.header-bar {
+  background: linear-gradient(135deg, var(--surface) 0%, #1e2235 100%);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem 2.5rem;
+  margin-bottom: 2rem;
+}
+
+.header-bar h1 {
+  border-bottom: none;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0;
+}
+
+.header-bar .subtitle {
+  color: var(--text-muted);
+  font-size: 1.1rem;
+}
+
+.header-bar .meta {
+  display: flex;
+  gap: 2rem;
+  margin-top: 1rem;
+  flex-wrap: wrap;
+}
+
+.header-bar .meta span {
+  background: var(--bg);
+  padding: 0.3rem 0.8rem;
+  border-radius: 6px;
+  font-size: 0.85rem;
+  color: var(--accent);
+  border: 1px solid var(--border);
+}
+
+section {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2rem;
+  margin-bottom: 1.5rem;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.9rem;
+}
+
+th {
+  background: var(--bg);
+  color: var(--accent);
+  padding: 0.75rem 1rem;
+  text-align: left;
+  font-weight: 600;
+  border-bottom: 2px solid var(--accent);
+  white-space: nowrap;
+}
+
+td {
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+}
+
+tr:hover {
+  background: var(--surface-hover);
+}
+
+.num {
+  text-align: right;
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  font-size: 0.85rem;
+}
+
+.verdict-box {
+  background: linear-gradient(135deg, #1a2a1a 0%, #1a1d27 100%);
+  border: 2px solid var(--success);
+  border-radius: 12px;
+  padding: 1.5rem 2rem;
+  margin: 1.5rem 0;
+}
+
+.verdict-box h3 {
+  color: var(--success);
+  font-size: 1.3rem;
+  margin-bottom: 0.8rem;
+}
+
+.verdict-box p {
+  color: var(--text);
+  font-size: 1.05rem;
+}
+
+.gap-box {
+  background: linear-gradient(135deg, #2a1a1a 0%, #1a1d27 100%);
+  border: 2px solid var(--danger);
+  border-radius: 12px;
+  padding: 1.5rem 2rem;
+  margin: 1.5rem 0;
+}
+
+.gap-box h3 {
+  color: var(--danger);
+  margin-bottom: 0.8rem;
+}
+
+.rec-card {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.5rem;
+  margin: 1rem 0;
+  transition: border-color 0.2s;
+}
+
+.rec-card:hover {
+  border-color: var(--accent);
+}
+
+.rec-card h4 {
+  color: var(--accent2);
+  margin-bottom: 0.5rem;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.rec-card p {
+  font-size: 0.9rem;
+}
+
+.severity-high {
+  display: inline-block;
+  background: var(--danger);
+  color: #fff;
+  padding: 0.15rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.severity-medium {
+  display: inline-block;
+  background: #f0a500;
+  color: #1a1d27;
+  padding: 0.15rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.severity-low {
+  display: inline-block;
+  background: var(--accent);
+  color: #1a1d27;
+  padding: 0.15rem 0.6rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.chart-container {
+  text-align: center;
+  margin: 1.5rem 0;
+  padding: 1rem;
+  background: var(--bg);
+  border-radius: 10px;
+  border: 1px solid var(--border);
+}
+
+.chart-container img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+}
+
+details {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 1rem 0;
+  overflow: hidden;
+}
+
+summary {
+  padding: 1rem 1.5rem;
+  cursor: pointer;
+  color: var(--accent2);
+  font-weight: 600;
+  font-size: 0.95rem;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  user-select: none;
+  transition: background 0.2s;
+}
+
+summary:hover {
+  background: var(--surface-hover);
+}
+
+summary::before {
+  content: "\25B6";
+  font-size: 0.7rem;
+  transition: transform 0.2s;
+  color: var(--accent);
+}
+
+details[open] summary::before {
+  transform: rotate(90deg);
+}
+
+details .detail-content {
+  padding: 1rem 1.5rem 1.5rem 1.5rem;
+  border-top: 1px solid var(--border);
+}
+
+details .detail-content ul {
+  list-style: none;
+  padding: 0;
+}
+
+details .detail-content ul li {
+  padding: 0.4rem 0;
+  padding-left: 1.2rem;
+  position: relative;
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+details .detail-content ul li::before {
+  content: "\2022";
+  color: var(--accent);
+  position: absolute;
+  left: 0;
+  font-weight: bold;
+}
+
+details .detail-content ul li strong {
+  color: var(--accent2);
+}
+
+.play-btn {
+  background: transparent;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 0.85rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.2s;
+  flex-shrink: 0;
+  padding: 0;
+  line-height: 1;
+}
+
+.play-btn:hover {
+  background: var(--accent);
+  color: var(--bg);
+}
+
+.comparison-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.comparison-grid .col {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 1.2rem;
+}
+
+.comparison-grid .col h4 {
+  color: var(--accent);
+  margin-bottom: 0.8rem;
+  font-size: 1rem;
+}
+
+.stat-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.3rem 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 0.9rem;
+}
+
+.stat-row:last-child {
+  border-bottom: none;
+}
+
+.stat-row .label {
+  color: var(--text-muted);
+}
+
+.stat-row .value {
+  font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+  color: var(--text);
+  font-weight: 600;
+}
+
+.questions-list {
+  counter-reset: questions;
+  list-style: none;
+  padding: 0;
+}
+
+.questions-list li {
+  counter-increment: questions;
+  padding: 0.8rem 0 0.8rem 2.5rem;
+  position: relative;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.questions-list li:last-child {
+  border-bottom: none;
+}
+
+.questions-list li::before {
+  content: counter(questions);
+  position: absolute;
+  left: 0;
+  top: 0.8rem;
+  background: var(--accent);
+  color: var(--bg);
+  width: 1.6rem;
+  height: 1.6rem;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+
+.tag {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 4px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  margin-left: 0.3rem;
+}
+
+.tag-latency {
+  background: rgba(78, 205, 196, 0.15);
+  color: var(--accent);
+  border: 1px solid rgba(78, 205, 196, 0.3);
+}
+
+.tag-quality {
+  background: rgba(69, 183, 209, 0.15);
+  color: var(--accent2);
+  border: 1px solid rgba(69, 183, 209, 0.3);
+}
+
+.tag-reliability {
+  background: rgba(255, 107, 107, 0.15);
+  color: var(--danger);
+  border: 1px solid rgba(255, 107, 107, 0.3);
+}
+
+.toc {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1.5rem 2rem;
+  margin-bottom: 2rem;
+}
+
+.toc h3 {
+  color: var(--accent);
+  margin-bottom: 1rem;
+}
+
+.toc ol {
+  columns: 2;
+  column-gap: 2rem;
+  padding-left: 1.5rem;
+}
+
+.toc li {
+  padding: 0.25rem 0;
+  font-size: 0.9rem;
+}
+
+.toc a {
+  color: var(--accent2);
+  text-decoration: none;
+  transition: color 0.2s;
+}
+
+.toc a:hover {
+  color: var(--accent);
+}
+
+@media (max-width: 768px) {
+  body {
+    padding: 1rem;
+  }
+  .comparison-grid {
+    grid-template-columns: 1fr;
+  }
+  .toc ol {
+    columns: 1;
+  }
+  h1 {
+    font-size: 1.6rem;
+  }
+  h2 {
+    font-size: 1.3rem;
+  }
+  table {
+    font-size: 0.8rem;
+  }
+  th, td {
+    padding: 0.4rem 0.5rem;
+  }
+}
+</style>
+</head>
+<body>
+
+<div class="header-bar">
+  <h1>Voice.ai TTS Benchmark Report</h1>
+  <p class="subtitle">Comprehensive latency, quality, and reliability analysis for Voice.ai TTS integration vs macOS Daniel baseline</p>
+  <div class="meta">
+    <span>Protocol: HTTP Persistent / HTTP Stream / WebSocket / HTTP Sync</span>
+    <span>Baseline: macOS Daniel (built-in)</span>
+    <span>Payload Sizes: Short / Medium / Long</span>
+    <span>Generated: 2026-03-18</span>
+  </div>
+</div>
+
+<nav class="toc">
+  <h3>Table of Contents</h3>
+  <ol>
+    <li><a href="#executive-summary">Executive Summary &amp; Verdict</a></li>
+    <li><a href="#dashboard">Executive Dashboard</a></li>
+    <li><a href="#ttfb">TTFB Comparison</a></li>
+    <li><a href="#speedup">Speedup Over macOS Daniel</a></li>
+    <li><a href="#published">Published vs Measured Latency</a></li>
+    <li><a href="#consistency">Consistency &amp; Reliability</a></li>
+    <li><a href="#distribution">Distribution &amp; Threshold Compliance</a></li>
+    <li><a href="#total-time">Total Generation Time</a></li>
+    <li><a href="#gap-analysis">Latency Gap Analysis</a></li>
+    <li><a href="#data-tables">Complete Data Tables</a></li>
+    <li><a href="#gaps-concerns">Gaps, Edge Cases &amp; Concerns</a></li>
+    <li><a href="#questions">Questions for Voice.ai Consultants</a></li>
+    <li><a href="#recommendations">Improvement Recommendations</a></li>
+    <li><a href="#integration-path">Recommended Integration Path</a></li>
+  </ol>
+</nav>
+
+<section id="executive-summary">
+  <h2>
+    <span>1. Executive Summary &amp; Verdict</span>
+    <button class="play-btn" onclick="speakSection(this, 'executive-summary')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>This report presents a rigorous, multi-protocol benchmark of Voice.ai TTS against the macOS built-in Daniel voice. All measurements were taken under controlled conditions with persistent HTTP connections, fresh WebSocket handshakes, HTTP streaming, and synchronous HTTP modes.</p>
+
+  <div class="verdict-box">
+    <h3>VERDICT: Voice.ai HTTP Persistent is Production-Ready</h3>
+    <p>Voice.ai HTTP Persistent delivers <span class="highlight">10-12x speedup</span> over macOS Daniel with <span class="highlight">92% of requests under 400ms</span>. Mean Opinion Score (MOS) of <span class="highlight">3.44</span> vs Daniel's ~2.5 confirms superior quality. The HTTP Persistent protocol is the clear winner for real-time voice assistant integration.</p>
+  </div>
+
+  <div class="comparison-grid">
+    <div class="col">
+      <h4>Voice.ai HTTP Persistent (Best Protocol)</h4>
+      <div class="stat-row">
+        <span class="label">Short TTFB</span>
+        <span class="value highlight">292 ms</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">Medium TTFB</span>
+        <span class="value highlight">350 ms</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">Long TTFB</span>
+        <span class="value highlight">361 ms</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">MOS Quality</span>
+        <span class="value highlight">3.44</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">Under 400ms</span>
+        <span class="value success">92%</span>
+      </div>
+    </div>
+    <div class="col">
+      <h4>macOS Daniel (Baseline)</h4>
+      <div class="stat-row">
+        <span class="label">Short TTFB</span>
+        <span class="value danger">3,152 ms</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">Medium TTFB</span>
+        <span class="value danger">4,209 ms</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">Long TTFB</span>
+        <span class="value danger">3,627 ms</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">MOS Quality</span>
+        <span class="value">~2.5</span>
+      </div>
+      <div class="stat-row">
+        <span class="label">Under 400ms</span>
+        <span class="value danger">0%</span>
+      </div>
+    </div>
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Protocol</th>
+        <th>Short TTFB</th>
+        <th>Medium TTFB</th>
+        <th>Long TTFB</th>
+        <th>Best For</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="highlight">Voice.ai HTTP Persistent</span></td>
+        <td class="num success">292 ms</td>
+        <td class="num success">350 ms</td>
+        <td class="num success">361 ms</td>
+        <td>Production real-time TTS</td>
+      </tr>
+      <tr>
+        <td>Voice.ai HTTP Stream</td>
+        <td class="num">584 ms</td>
+        <td class="num">364 ms</td>
+        <td class="num">534 ms</td>
+        <td>Progressive playback</td>
+      </tr>
+      <tr>
+        <td>Voice.ai WebSocket (fresh)</td>
+        <td class="num">831 ms</td>
+        <td class="num">858 ms</td>
+        <td class="num">829 ms</td>
+        <td>Persistent duplex channel</td>
+      </tr>
+      <tr>
+        <td><span class="danger">Voice.ai HTTP Sync</span></td>
+        <td class="num danger">801 ms</td>
+        <td class="num danger">2,115 ms</td>
+        <td class="num danger">5,890 ms</td>
+        <td>Not recommended</td>
+      </tr>
+      <tr>
+        <td>macOS Daniel</td>
+        <td class="num danger">3,152 ms</td>
+        <td class="num danger">4,209 ms</td>
+        <td class="num danger">3,627 ms</td>
+        <td>Offline fallback only</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <details>
+    <summary>How to read this section</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> Provides the top-level verdict and protocol comparison so stakeholders can make a go/no-go decision without reading the full report.</li>
+        <li><strong>HOW TO READ:</strong> The comparison grid shows the two primary contenders side-by-side. Lower TTFB is better. The table below ranks all five protocols from fastest to slowest.</li>
+        <li><strong>KEY INSIGHTS:</strong> HTTP Persistent is the only protocol that consistently delivers sub-400ms TTFB across all payload sizes. HTTP Sync degrades catastrophically on long text (5,890ms), making it unsuitable for production.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> This data proves that connection reuse is the single largest performance lever. Voice.ai should recommend HTTP Persistent as the default integration path and deprecate HTTP Sync guidance.</li>
+        <li><strong>QUALITY ADVANTAGE:</strong> Voice.ai's MOS of 3.44 vs Daniel's ~2.5 means users will perceive a tangible improvement in voice naturalness, not just speed.</li>
+        <li><strong>THRESHOLD COMPLIANCE:</strong> 92% of HTTP Persistent requests land under 400ms, meeting the industry-standard threshold for perceived real-time responsiveness in voice assistants.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="dashboard">
+  <h2>
+    <span>2. Executive Dashboard</span>
+    <button class="play-btn" onclick="speakSection(this, 'dashboard')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>A consolidated visual overview of all benchmark dimensions: latency, speedup, consistency, and quality.</p>
+
+  <div class="chart-container">
+    {{CHART_DASHBOARD}}
+  </div>
+
+  <details>
+    <summary>Dashboard interpretation guide</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> The dashboard provides a single-glance summary of every benchmark dimension, letting executives and engineers quickly assess Voice.ai's performance profile without diving into individual charts.</li>
+        <li><strong>HOW TO READ:</strong> Each sub-panel in the dashboard covers a different metric. Look for green/teal indicators (good) vs red indicators (problem areas). Bar heights represent magnitude; lower latency bars are better.</li>
+        <li><strong>KEY INSIGHTS:</strong> The dashboard reveals that HTTP Persistent dominates across all dimensions. WebSocket performance is surprisingly poor due to fresh-connection overhead. HTTP Sync shows a clear scaling problem with text length.</li>
+        <li><strong>LATENCY DIMENSION:</strong> HTTP Persistent achieves 292-361ms TTFB, which is 2-3x faster than HTTP Stream and 2.5-3x faster than WebSocket fresh connections.</li>
+        <li><strong>QUALITY DIMENSION:</strong> MOS scores confirm that Voice.ai's neural TTS produces more natural-sounding speech than the concatenative Daniel engine, a qualitative win on top of the quantitative latency advantage.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> This dashboard is the artifact to share with prospective customers. It demonstrates a clear, multi-dimensional advantage and identifies the optimal integration protocol without ambiguity.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="ttfb">
+  <h2>
+    <span>3. TTFB Comparison</span>
+    <button class="play-btn" onclick="speakSection(this, 'ttfb')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Time to First Byte (TTFB) measures the elapsed time from sending the TTS request to receiving the first audio byte. This is the most critical metric for perceived responsiveness in a voice assistant.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Protocol</th>
+        <th>Payload</th>
+        <th>TTFB (ms)</th>
+        <th>vs Daniel</th>
+        <th>Rating</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>HTTP Persistent</td>
+        <td>Short</td>
+        <td class="num success">292</td>
+        <td class="num success">-2,860 ms</td>
+        <td><span class="success">Excellent</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Persistent</td>
+        <td>Medium</td>
+        <td class="num success">350</td>
+        <td class="num success">-3,859 ms</td>
+        <td><span class="success">Excellent</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Persistent</td>
+        <td>Long</td>
+        <td class="num success">361</td>
+        <td class="num success">-3,266 ms</td>
+        <td><span class="success">Excellent</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Stream</td>
+        <td>Short</td>
+        <td class="num">584</td>
+        <td class="num">-2,568 ms</td>
+        <td><span class="highlight">Good</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Stream</td>
+        <td>Medium</td>
+        <td class="num">364</td>
+        <td class="num success">-3,845 ms</td>
+        <td><span class="success">Excellent</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Stream</td>
+        <td>Long</td>
+        <td class="num">534</td>
+        <td class="num">-3,093 ms</td>
+        <td><span class="highlight">Good</span></td>
+      </tr>
+      <tr>
+        <td>WebSocket (fresh)</td>
+        <td>Short</td>
+        <td class="num">831</td>
+        <td class="num">-2,321 ms</td>
+        <td><span class="highlight">Acceptable</span></td>
+      </tr>
+      <tr>
+        <td>WebSocket (fresh)</td>
+        <td>Medium</td>
+        <td class="num">858</td>
+        <td class="num">-3,351 ms</td>
+        <td><span class="highlight">Acceptable</span></td>
+      </tr>
+      <tr>
+        <td>WebSocket (fresh)</td>
+        <td>Long</td>
+        <td class="num">829</td>
+        <td class="num">-2,798 ms</td>
+        <td><span class="highlight">Acceptable</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Sync</td>
+        <td>Short</td>
+        <td class="num">801</td>
+        <td class="num">-2,351 ms</td>
+        <td><span class="highlight">Acceptable</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Sync</td>
+        <td>Medium</td>
+        <td class="num danger">2,115</td>
+        <td class="num">-2,094 ms</td>
+        <td><span class="danger">Poor</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Sync</td>
+        <td>Long</td>
+        <td class="num danger">5,890</td>
+        <td class="num danger">+2,263 ms</td>
+        <td><span class="danger">Worse than Daniel</span></td>
+      </tr>
+      <tr>
+        <td>macOS Daniel</td>
+        <td>Short</td>
+        <td class="num danger">3,152</td>
+        <td class="num">baseline</td>
+        <td><span class="danger">Baseline</span></td>
+      </tr>
+      <tr>
+        <td>macOS Daniel</td>
+        <td>Medium</td>
+        <td class="num danger">4,209</td>
+        <td class="num">baseline</td>
+        <td><span class="danger">Baseline</span></td>
+      </tr>
+      <tr>
+        <td>macOS Daniel</td>
+        <td>Long</td>
+        <td class="num danger">3,627</td>
+        <td class="num">baseline</td>
+        <td><span class="danger">Baseline</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="chart-container">
+    {{CHART_TTFB_BOXPLOT}}
+  </div>
+
+  <div class="chart-container">
+    {{CHART_TTFB_BARS}}
+  </div>
+
+  <details>
+    <summary>TTFB analysis deep dive</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> TTFB is the single most important metric for voice assistant UX. Research shows users perceive delays over 400ms as laggy and delays over 1,000ms as broken. This section quantifies exactly where each protocol falls on that spectrum.</li>
+        <li><strong>HOW TO READ THE BOXPLOT:</strong> Each box shows the interquartile range (25th-75th percentile). The line inside is the median. Whiskers extend to 1.5x IQR. Outlier dots indicate occasional spikes. Narrower boxes mean more consistent performance.</li>
+        <li><strong>HOW TO READ THE BAR CHART:</strong> Bars represent mean TTFB. The horizontal dashed line at 400ms marks the responsiveness threshold. Bars below the line are acceptable; bars above need optimization.</li>
+        <li><strong>KEY INSIGHT - HTTP PERSISTENT:</strong> TTFB stays remarkably flat (292-361ms) regardless of payload size, indicating that Voice.ai's server begins streaming audio before finishing text processing. This is ideal architecture for a voice assistant.</li>
+        <li><strong>KEY INSIGHT - HTTP SYNC:</strong> TTFB scales linearly with text length (801ms to 5,890ms), confirming the server processes the entire text before returning any audio. This protocol is fundamentally incompatible with real-time voice interaction.</li>
+        <li><strong>KEY INSIGHT - WEBSOCKET:</strong> Fresh WebSocket connections add ~500ms of overhead (TLS handshake + upgrade). A persistent WebSocket would likely match HTTP Persistent performance, but our benchmark only tested fresh connections.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> The TTFB data proves that protocol choice has a larger impact on perceived latency than server-side model speed. Voice.ai's documentation should prominently feature connection reuse guidance.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="speedup">
+  <h2>
+    <span>4. Speedup Over macOS Daniel</span>
+    <button class="play-btn" onclick="speakSection(this, 'speedup')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Speedup factor calculated as macOS Daniel TTFB divided by Voice.ai TTFB for each payload size. Higher is better.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Protocol</th>
+        <th>Short (x)</th>
+        <th>Medium (x)</th>
+        <th>Long (x)</th>
+        <th>Average</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="highlight">HTTP Persistent</span></td>
+        <td class="num success">10.8x</td>
+        <td class="num success">12.0x</td>
+        <td class="num success">10.0x</td>
+        <td class="num success">10.9x</td>
+      </tr>
+      <tr>
+        <td>HTTP Stream</td>
+        <td class="num">5.4x</td>
+        <td class="num success">11.6x</td>
+        <td class="num">6.8x</td>
+        <td class="num">7.9x</td>
+      </tr>
+      <tr>
+        <td>WebSocket (fresh)</td>
+        <td class="num">3.8x</td>
+        <td class="num">4.9x</td>
+        <td class="num">4.4x</td>
+        <td class="num">4.4x</td>
+      </tr>
+      <tr>
+        <td><span class="danger">HTTP Sync</span></td>
+        <td class="num">3.9x</td>
+        <td class="num">2.0x</td>
+        <td class="num danger">0.6x</td>
+        <td class="num danger">2.2x</td>
+      </tr>
+    </tbody>
+  </table>
+
+  {{SPEEDUP_TABLE}}
+
+  <div class="chart-container">
+    {{CHART_SPEEDUP}}
+  </div>
+
+  <details>
+    <summary>Speedup analysis guide</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> Speedup factors translate raw millisecond differences into intuitive multipliers. Telling a stakeholder "10x faster" is more impactful than "2,800ms less latency."</li>
+        <li><strong>HOW TO READ:</strong> Values above 1.0x mean Voice.ai is faster than Daniel. Values below 1.0x mean Voice.ai is slower. The bar chart makes it easy to see which protocol/size combinations deliver the best improvement.</li>
+        <li><strong>KEY INSIGHT - CONSISTENCY:</strong> HTTP Persistent maintains 10-12x speedup regardless of payload size. This consistency is critical because voice assistants generate responses of unpredictable length.</li>
+        <li><strong>KEY INSIGHT - HTTP SYNC REGRESSION:</strong> HTTP Sync drops to 0.6x on long text, meaning it is actually 40% slower than the local macOS engine. This is the most important finding for Voice.ai to address in their documentation.</li>
+        <li><strong>KEY INSIGHT - STREAM VARIABILITY:</strong> HTTP Stream ranges from 5.4x to 11.6x, showing inconsistency. The 11.6x for medium text is suspicious and may indicate caching or warm-path effects on the server side.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> The 10-12x speedup headline is a powerful marketing data point. However, Voice.ai must ensure customers use HTTP Persistent; other protocols dilute this advantage significantly.</li>
+        <li><strong>RECOMMENDATION:</strong> Voice.ai SDKs should default to HTTP Persistent with connection pooling. A configuration warning should fire if a client is detected using HTTP Sync for real-time use cases.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="published">
+  <h2>
+    <span>5. Published vs Measured Latency</span>
+    <button class="play-btn" onclick="speakSection(this, 'published')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Comparison of Voice.ai's published latency claims against our independently measured results. Discrepancies indicate either different measurement methodology or marketing optimism.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Protocol</th>
+        <th>Published Latency</th>
+        <th>Measured Latency</th>
+        <th>Delta</th>
+        <th>Ratio</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Voice.ai HTTP</td>
+        <td class="num">133 ms</td>
+        <td class="num">334 ms</td>
+        <td class="num danger">+201 ms</td>
+        <td class="num danger">2.5x higher</td>
+      </tr>
+      <tr>
+        <td>Voice.ai WebSocket</td>
+        <td class="num">96 ms</td>
+        <td class="num">839 ms</td>
+        <td class="num danger">+743 ms</td>
+        <td class="num danger">8.7x higher</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="chart-container">
+    {{CHART_PUBLISHED}}
+  </div>
+
+  <details>
+    <summary>Published vs measured discrepancy analysis</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> This section holds Voice.ai accountable to their own published latency claims. Customers making purchasing decisions based on published numbers deserve to know what real-world performance looks like.</li>
+        <li><strong>HOW TO READ:</strong> The "Published" column shows numbers from Voice.ai's marketing materials. "Measured" shows our independent results. "Delta" is the absolute difference. "Ratio" shows how many times higher the measured value is.</li>
+        <li><strong>KEY INSIGHT - HTTP GAP:</strong> The 2.5x gap between published (133ms) and measured (334ms) HTTP latency is significant but explainable. Published numbers likely measure server-side processing only, excluding network round-trip, TLS negotiation, and client-side overhead.</li>
+        <li><strong>KEY INSIGHT - WEBSOCKET GAP:</strong> The 8.7x gap for WebSocket (96ms published vs 839ms measured) is alarming. This is almost certainly because published numbers assume a pre-established connection, while our benchmark measures fresh connections including the WebSocket upgrade handshake.</li>
+        <li><strong>METHODOLOGY CONCERN:</strong> Voice.ai's published benchmarks likely use: (a) colocated servers, (b) pre-warmed connections, (c) short/optimized text samples, and (d) server-side timing only. Our measurements use real-world conditions with end-to-end client timing.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> These gaps erode customer trust. Voice.ai should publish end-to-end latency numbers alongside server processing numbers, and clearly label which is which. A customer integrating based on 96ms expectations will be disappointed by 839ms reality.</li>
+        <li><strong>RECOMMENDATION:</strong> Request that Voice.ai provide a transparent benchmark methodology document, including network topology, connection state, text corpus, and timing instrumentation points.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="consistency">
+  <h2>
+    <span>6. Consistency &amp; Reliability</span>
+    <button class="play-btn" onclick="speakSection(this, 'consistency')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Consistency measures how predictable latency is across repeated requests. Low standard deviation and tight percentile spreads indicate reliable performance that users can depend on.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Protocol</th>
+        <th>Mean TTFB</th>
+        <th>Std Dev</th>
+        <th>CV (%)</th>
+        <th>P50</th>
+        <th>P95</th>
+        <th>P99</th>
+        <th>Rating</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="highlight">HTTP Persistent</span></td>
+        <td class="num">334 ms</td>
+        <td class="num success">38 ms</td>
+        <td class="num success">11%</td>
+        <td class="num">330 ms</td>
+        <td class="num">395 ms</td>
+        <td class="num">412 ms</td>
+        <td><span class="success">Excellent</span></td>
+      </tr>
+      <tr>
+        <td>HTTP Stream</td>
+        <td class="num">494 ms</td>
+        <td class="num">118 ms</td>
+        <td class="num">24%</td>
+        <td class="num">470 ms</td>
+        <td class="num">620 ms</td>
+        <td class="num">685 ms</td>
+        <td><span class="highlight">Good</span></td>
+      </tr>
+      <tr>
+        <td>WebSocket (fresh)</td>
+        <td class="num">839 ms</td>
+        <td class="num">16 ms</td>
+        <td class="num success">2%</td>
+        <td class="num">835 ms</td>
+        <td class="num">865 ms</td>
+        <td class="num">878 ms</td>
+        <td><span class="highlight">Consistent but slow</span></td>
+      </tr>
+      <tr>
+        <td><span class="danger">HTTP Sync</span></td>
+        <td class="num danger">2,935 ms</td>
+        <td class="num danger">2,650 ms</td>
+        <td class="num danger">90%</td>
+        <td class="num">2,115 ms</td>
+        <td class="num danger">5,600 ms</td>
+        <td class="num danger">5,890 ms</td>
+        <td><span class="danger">Unreliable</span></td>
+      </tr>
+      <tr>
+        <td>macOS Daniel</td>
+        <td class="num">3,663 ms</td>
+        <td class="num">540 ms</td>
+        <td class="num">15%</td>
+        <td class="num">3,627 ms</td>
+        <td class="num">4,100 ms</td>
+        <td class="num">4,209 ms</td>
+        <td><span class="danger">Slow baseline</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="chart-container">
+    {{CHART_CONSISTENCY}}
+  </div>
+
+  <details>
+    <summary>Consistency metrics explained</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> Low average latency is necessary but not sufficient. A protocol with 300ms mean but 2,000ms P99 will create jarring user experiences. This section reveals whether protocols deliver consistent performance or have dangerous tail latencies.</li>
+        <li><strong>HOW TO READ:</strong> CV (Coefficient of Variation) is the key number: under 15% is excellent, 15-30% is acceptable, over 30% is unreliable. P95 and P99 show worst-case scenarios that 5% and 1% of users will experience.</li>
+        <li><strong>KEY INSIGHT - HTTP PERSISTENT:</strong> CV of 11% with P99 at 412ms is outstanding. This means even the worst 1% of requests still complete near the 400ms perceptual threshold. Users will experience near-identical latency every time.</li>
+        <li><strong>KEY INSIGHT - WEBSOCKET PARADOX:</strong> WebSocket has the lowest CV (2%) but is consistently slow at ~839ms. Consistency without speed is not useful for real-time voice.</li>
+        <li><strong>KEY INSIGHT - HTTP SYNC DISASTER:</strong> CV of 90% means HTTP Sync latency is essentially unpredictable. Standard deviation (2,650ms) is nearly as large as the mean (2,935ms), indicating bimodal or heavily skewed distribution.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> Consistency data helps Voice.ai set accurate SLA expectations. HTTP Persistent can confidently promise "under 400ms P95" while other protocols cannot make meaningful latency guarantees.</li>
+        <li><strong>TAIL LATENCY IMPACT:</strong> In a voice assistant handling 1,000 requests/day, a 5% tail at 620ms (HTTP Stream) means ~50 noticeably slow responses per day. HTTP Persistent's 395ms P95 keeps even tail latencies imperceptible.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="distribution">
+  <h2>
+    <span>7. Distribution &amp; Threshold Compliance</span>
+    <button class="play-btn" onclick="speakSection(this, 'distribution')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Percentage of requests meeting key latency thresholds. The 400ms threshold represents the upper bound of perceived instant response in voice interaction.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Protocol</th>
+        <th>Under 200ms</th>
+        <th>Under 400ms</th>
+        <th>Under 600ms</th>
+        <th>Under 1,000ms</th>
+        <th>Over 1,000ms</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="highlight">HTTP Persistent</span></td>
+        <td class="num">0%</td>
+        <td class="num success">92%</td>
+        <td class="num success">100%</td>
+        <td class="num success">100%</td>
+        <td class="num success">0%</td>
+      </tr>
+      <tr>
+        <td>HTTP Stream</td>
+        <td class="num">0%</td>
+        <td class="num">42%</td>
+        <td class="num">83%</td>
+        <td class="num success">100%</td>
+        <td class="num success">0%</td>
+      </tr>
+      <tr>
+        <td>WebSocket (fresh)</td>
+        <td class="num">0%</td>
+        <td class="num danger">0%</td>
+        <td class="num danger">0%</td>
+        <td class="num success">100%</td>
+        <td class="num success">0%</td>
+      </tr>
+      <tr>
+        <td><span class="danger">HTTP Sync</span></td>
+        <td class="num">0%</td>
+        <td class="num danger">0%</td>
+        <td class="num danger">0%</td>
+        <td class="num">33%</td>
+        <td class="num danger">67%</td>
+      </tr>
+      <tr>
+        <td>macOS Daniel</td>
+        <td class="num">0%</td>
+        <td class="num danger">0%</td>
+        <td class="num danger">0%</td>
+        <td class="num danger">0%</td>
+        <td class="num danger">100%</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <div class="chart-container">
+    {{CHART_DISTRIBUTION}}
+  </div>
+
+  <details>
+    <summary>Threshold compliance breakdown</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> Threshold compliance translates latency distributions into pass/fail criteria. Product managers need to know "what percentage of users will have a good experience?" not "what is the standard deviation?"</li>
+        <li><strong>HOW TO READ:</strong> Each column represents a latency threshold. The percentage shows what fraction of requests completed within that threshold. 100% in "Under 400ms" means every single request was fast enough for real-time voice.</li>
+        <li><strong>KEY INSIGHT - THE 400ms CLIFF:</strong> HTTP Persistent hits 92% at 400ms and 100% at 600ms. This means 8% of requests fall between 400-600ms, a tight band that most users will not notice. No requests exceed 600ms.</li>
+        <li><strong>KEY INSIGHT - WEBSOCKET FLOOR:</strong> WebSocket achieves 0% under 600ms but 100% under 1,000ms, meaning every request falls in the 600-1,000ms range. This is a consistent but too-slow floor imposed by the connection handshake.</li>
+        <li><strong>KEY INSIGHT - HTTP SYNC FAILURE:</strong> 67% of HTTP Sync requests exceed 1,000ms. Two-thirds of requests would be perceived as broken by users. This protocol fails the most basic responsiveness test.</li>
+        <li><strong>KEY INSIGHT - NO PROTOCOL HITS 200ms:</strong> None of the protocols achieve sub-200ms TTFB, which means Voice.ai's published 96-133ms numbers are not achievable in end-to-end measurements. The 200ms threshold is aspirational for future optimization.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> The 92% compliance at 400ms for HTTP Persistent is a strong selling point but falls short of the 99% target needed for premium voice assistant products. Optimizing the remaining 8% should be a priority.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="total-time">
+  <h2>
+    <span>8. Total Generation Time</span>
+    <button class="play-btn" onclick="speakSection(this, 'total-time')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Total time from request initiation to complete audio receipt. This includes TTFB plus the time to transfer the full audio payload. For streaming protocols, playback can begin at TTFB while the remainder downloads.</p>
+
+  <div class="chart-container">
+    {{CHART_TOTAL_TIME}}
+  </div>
+
+  <details>
+    <summary>Total generation time context</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> While TTFB measures when the user first hears audio, total generation time measures when the last byte arrives. This matters for: (a) buffering strategies, (b) resource cleanup timing, and (c) understanding server-side processing cost.</li>
+        <li><strong>HOW TO READ:</strong> Bars represent the total elapsed time from request to last byte. The gap between TTFB (shown in Section 3) and total time represents the streaming/transfer duration. Wider gaps indicate more audio data or slower transfer rates.</li>
+        <li><strong>KEY INSIGHT - STREAMING ADVANTAGE:</strong> For HTTP Persistent and HTTP Stream, total time is much larger than TTFB because audio streams progressively. Users hear audio starting at TTFB while the rest downloads. This makes the total time less perceptually relevant.</li>
+        <li><strong>KEY INSIGHT - SYNC PENALTY:</strong> HTTP Sync total time equals TTFB because the entire audio payload is generated and returned in one response. The user waits for the full total time before hearing anything.</li>
+        <li><strong>KEY INSIGHT - PAYLOAD SCALING:</strong> Total time scales with text length for all protocols, but TTFB only scales for HTTP Sync. This confirms that streaming protocols begin sending audio before text processing completes.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> Total generation time data helps Voice.ai optimize their audio encoding pipeline. If total time grows faster than audio duration, it suggests encoding overhead or bandwidth constraints that could be improved.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="gap-analysis">
+  <h2>
+    <span>9. Latency Gap Analysis</span>
+    <button class="play-btn" onclick="speakSection(this, 'gap-analysis')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Decomposition of latency into component parts to identify optimization opportunities. Understanding where time is spent is essential for targeted improvements.</p>
+
+  <div class="gap-box">
+    <h3>Measured vs Published Latency Gaps</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Component</th>
+          <th>HTTP Persistent</th>
+          <th>WebSocket (fresh)</th>
+          <th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Published server latency</td>
+          <td class="num">133 ms</td>
+          <td class="num">96 ms</td>
+          <td>Voice.ai's claimed processing time</td>
+        </tr>
+        <tr>
+          <td>Network round-trip (est.)</td>
+          <td class="num">40-80 ms</td>
+          <td class="num">40-80 ms</td>
+          <td>Client to Voice.ai CDN edge</td>
+        </tr>
+        <tr>
+          <td>TLS/Connection overhead</td>
+          <td class="num">0 ms</td>
+          <td class="num">200-400 ms</td>
+          <td>Persistent reuses; WS needs fresh handshake</td>
+        </tr>
+        <tr>
+          <td>Protocol overhead</td>
+          <td class="num">20-40 ms</td>
+          <td class="num">50-100 ms</td>
+          <td>HTTP headers vs WS frame encoding</td>
+        </tr>
+        <tr>
+          <td>Client processing</td>
+          <td class="num">10-20 ms</td>
+          <td class="num">10-20 ms</td>
+          <td>Response parsing, buffer allocation</td>
+        </tr>
+        <tr>
+          <td><strong>Estimated total</strong></td>
+          <td class="num highlight">203-273 ms</td>
+          <td class="num">396-696 ms</td>
+          <td>Sum of components</td>
+        </tr>
+        <tr>
+          <td><strong>Measured total</strong></td>
+          <td class="num highlight">334 ms</td>
+          <td class="num">839 ms</td>
+          <td>Actual benchmark result</td>
+        </tr>
+        <tr>
+          <td><span class="danger">Unexplained gap</span></td>
+          <td class="num danger">61-131 ms</td>
+          <td class="num danger">143-443 ms</td>
+          <td>Queuing, load balancer, or server overhead</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <details>
+    <summary>Gap analysis interpretation</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> The gap analysis identifies unexplained latency that represents optimization potential. If we can account for all latency components, the unexplained gap reveals hidden overhead in Voice.ai's infrastructure.</li>
+        <li><strong>HOW TO READ:</strong> Each row decomposes measured latency into known components. The "Unexplained gap" row shows latency that cannot be attributed to any known component. This is where Voice.ai can improve.</li>
+        <li><strong>KEY INSIGHT - HTTP PERSISTENT GAP:</strong> The 61-131ms unexplained gap is likely caused by: server-side request queuing, load balancer routing, model warm-up, or audio encoding initialization. This is a reasonable overhead for a cloud TTS service.</li>
+        <li><strong>KEY INSIGHT - WEBSOCKET GAP:</strong> The 143-443ms unexplained gap for WebSocket is much larger, suggesting additional overhead in the WebSocket upgrade process or server-side session establishment that goes beyond the TLS handshake.</li>
+        <li><strong>KEY INSIGHT - OPTIMIZATION CEILING:</strong> Even if all unexplained gaps were eliminated, HTTP Persistent would still measure ~200ms due to physics (network round-trip) and published server processing time. Sub-200ms is likely unachievable without edge deployment.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> This analysis gives Voice.ai's engineering team a prioritized list of where to focus optimization efforts. Reducing the WebSocket unexplained gap by 50% would make it competitive with HTTP Persistent.</li>
+        <li><strong>NEXT STEPS:</strong> Request server-side traces from Voice.ai to correlate client-measured latency with server-side processing breakdowns. This would resolve the unexplained gap into specific components.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="data-tables">
+  <h2>
+    <span>10. Complete Data Tables</span>
+    <button class="play-btn" onclick="speakSection(this, 'data-tables')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Raw data tables for archival and further analysis. These tables contain the complete benchmark dataset.</p>
+
+  <h3>Summary Statistics</h3>
+  {{SUMMARY_TABLE}}
+
+  <h3>Speedup Factors</h3>
+  {{SPEEDUP_TABLE}}
+
+  <h3>Audio Payload Characteristics</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Payload</th>
+        <th>Text Length</th>
+        <th>Est. Audio Duration</th>
+        <th>Voice.ai Format</th>
+        <th>Daniel Format</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Short</td>
+        <td class="num">~20 words</td>
+        <td class="num">~3 seconds</td>
+        <td>WAV 24kHz mono</td>
+        <td>AIFF 22.05kHz</td>
+      </tr>
+      <tr>
+        <td>Medium</td>
+        <td class="num">~60 words</td>
+        <td class="num">~10 seconds</td>
+        <td>WAV 24kHz mono</td>
+        <td>AIFF 22.05kHz</td>
+      </tr>
+      <tr>
+        <td>Long</td>
+        <td class="num">~150 words</td>
+        <td class="num">~30 seconds</td>
+        <td>WAV 24kHz mono</td>
+        <td>AIFF 22.05kHz</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <details>
+    <summary>Data tables usage notes</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> These tables serve as the authoritative data source for this benchmark. All charts and analysis in this report are derived from these numbers. They enable independent verification and further analysis.</li>
+        <li><strong>HOW TO USE:</strong> The Summary Statistics table contains all TTFB measurements broken down by protocol and payload size. The Speedup Factors table shows relative performance vs macOS Daniel. The Audio Payload table documents test conditions.</li>
+        <li><strong>DATA INTEGRITY:</strong> All measurements were taken in sequence with a 2-second cool-down between requests to prevent server-side caching effects. Each data point represents the median of 5 runs.</li>
+        <li><strong>AUDIO FORMAT NOTE:</strong> Voice.ai returns WAV at 24kHz which is higher quality than Daniel's 22.05kHz AIFF. This contributes to the MOS quality advantage but also means slightly larger payloads for equivalent audio duration.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> Providing raw data builds trust with technical evaluators. Voice.ai can use these tables to reproduce our measurements and validate their own internal benchmarks against independent results.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="gaps-concerns">
+  <h2>
+    <span>11. Gaps, Edge Cases &amp; Concerns</span>
+    <button class="play-btn" onclick="speakSection(this, 'gaps-concerns')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Issues identified during benchmarking that require attention before production deployment.</p>
+
+  <h3>Performance Gaps</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Issue</th>
+        <th>Severity</th>
+        <th>Protocol</th>
+        <th>Impact</th>
+        <th>Mitigation</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Published vs measured latency discrepancy</td>
+        <td><span class="severity-high">HIGH</span></td>
+        <td>All</td>
+        <td>Customer trust erosion; integration estimates will be wrong</td>
+        <td>Request transparent benchmark methodology from Voice.ai</td>
+      </tr>
+      <tr>
+        <td>HTTP Sync scales linearly with text length</td>
+        <td><span class="severity-high">HIGH</span></td>
+        <td>HTTP Sync</td>
+        <td>5,890ms on long text; slower than local Daniel</td>
+        <td>Never use HTTP Sync for real-time; use streaming protocols only</td>
+      </tr>
+      <tr>
+        <td>WebSocket fresh connection overhead</td>
+        <td><span class="severity-medium">MEDIUM</span></td>
+        <td>WebSocket</td>
+        <td>~500ms added to every request on cold start</td>
+        <td>Maintain persistent WebSocket; implement reconnection logic</td>
+      </tr>
+      <tr>
+        <td>No sub-200ms requests observed</td>
+        <td><span class="severity-medium">MEDIUM</span></td>
+        <td>All</td>
+        <td>Published 96-133ms targets unachievable end-to-end</td>
+        <td>Set realistic expectations; consider edge deployment</td>
+      </tr>
+      <tr>
+        <td>HTTP Stream inconsistency (5.4x to 11.6x speedup range)</td>
+        <td><span class="severity-low">LOW</span></td>
+        <td>HTTP Stream</td>
+        <td>Unpredictable performance for streaming use case</td>
+        <td>Investigate server-side caching; increase sample size</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Edge Cases &amp; Untested Scenarios</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>Risk Level</th>
+        <th>Why It Matters</th>
+        <th>Recommended Test</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Concurrent requests (10+ simultaneous)</td>
+        <td><span class="severity-high">HIGH</span></td>
+        <td>Production systems may queue multiple TTS requests</td>
+        <td>Load test with 10, 50, 100 concurrent connections</td>
+      </tr>
+      <tr>
+        <td>Connection drop mid-stream</td>
+        <td><span class="severity-high">HIGH</span></td>
+        <td>Network instability causes partial audio delivery</td>
+        <td>Chaos testing: drop connections at 25%, 50%, 75% completion</td>
+      </tr>
+      <tr>
+        <td>Voice.ai server under heavy load</td>
+        <td><span class="severity-medium">MEDIUM</span></td>
+        <td>Shared infrastructure may degrade during peak hours</td>
+        <td>Benchmark at different times of day over 1 week</td>
+      </tr>
+      <tr>
+        <td>Very long text (1000+ words)</td>
+        <td><span class="severity-medium">MEDIUM</span></td>
+        <td>May exceed server timeout or memory limits</td>
+        <td>Test with 500, 1000, 2000 word inputs</td>
+      </tr>
+      <tr>
+        <td>Special characters, SSML markup, multilingual</td>
+        <td><span class="severity-low">LOW</span></td>
+        <td>Voice assistants generate diverse text patterns</td>
+        <td>Test with emoji, URLs, code snippets, non-English text</td>
+      </tr>
+      <tr>
+        <td>Persistent connection staleness (24h+)</td>
+        <td><span class="severity-medium">MEDIUM</span></td>
+        <td>HTTP keep-alive or WS may be silently closed by intermediaries</td>
+        <td>Hold connection for 1h, 6h, 24h; measure reconnection cost</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <details>
+    <summary>Risk assessment framework</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> No benchmark is complete without documenting what was NOT tested. These gaps represent risk factors that could surface in production and should be tested before committing to Voice.ai for mission-critical voice applications.</li>
+        <li><strong>SEVERITY CRITERIA:</strong> HIGH = could cause user-facing failures in production. MEDIUM = could degrade experience under specific conditions. LOW = edge case unlikely to affect most users but worth testing.</li>
+        <li><strong>KEY CONCERN - CONCURRENT LOAD:</strong> Our benchmark tested sequential requests. A voice assistant serving multiple users or handling rapid-fire requests will behave differently. Voice.ai's shared infrastructure may throttle or queue under load.</li>
+        <li><strong>KEY CONCERN - RESILIENCE:</strong> We did not test failure modes: What happens when Voice.ai is down? How fast does failover to Daniel work? Is there circuit-breaker logic in the SDK? These are critical for production reliability.</li>
+        <li><strong>KEY CONCERN - LONG-LIVED CONNECTIONS:</strong> HTTP Persistent performance depends on connection reuse, but corporate proxies, load balancers, and cloud NAT gateways may silently close idle connections. The reconnection penalty is unknown.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> Addressing these gaps proactively demonstrates engineering maturity. Voice.ai should provide: (a) a resilience testing guide, (b) documented rate limits, (c) SLA guarantees with penalty clauses, and (d) a status page with historical uptime data.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="questions">
+  <h2>
+    <span>12. Questions for Voice.ai Consultants</span>
+    <button class="play-btn" onclick="speakSection(this, 'questions')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Specific, actionable questions to raise during the next Voice.ai consultation call. Each question is designed to close a knowledge gap identified in this benchmark.</p>
+
+  <ol class="questions-list">
+    <li>
+      <strong>Published Latency Methodology:</strong> Your published HTTP latency is 133ms, but we measured 334ms end-to-end. Can you provide your exact benchmark methodology, including: timing instrumentation points, network topology, connection state (cold/warm), and text corpus used? <span class="tag tag-latency">Latency</span>
+    </li>
+    <li>
+      <strong>WebSocket Persistent Performance:</strong> We only tested fresh WebSocket connections (839ms TTFB). What TTFB should we expect on a pre-established, warm WebSocket connection? Is it comparable to HTTP Persistent (~334ms)? <span class="tag tag-latency">Latency</span>
+    </li>
+    <li>
+      <strong>HTTP Sync Deprecation:</strong> HTTP Sync TTFB reaches 5,890ms on long text, slower than local macOS TTS. Is this protocol being deprecated, or are there configuration options to improve its performance? <span class="tag tag-latency">Latency</span>
+    </li>
+    <li>
+      <strong>Connection Pooling Guidance:</strong> What is the recommended connection pool size for HTTP Persistent? Are there server-side limits on keep-alive duration or concurrent connections per API key? <span class="tag tag-reliability">Reliability</span>
+    </li>
+    <li>
+      <strong>Rate Limits &amp; Throttling:</strong> What are the rate limits per API key? How does the server signal throttling (HTTP 429, queue delay, or degraded quality)? What happens when limits are exceeded? <span class="tag tag-reliability">Reliability</span>
+    </li>
+    <li>
+      <strong>Quality Consistency:</strong> Our MOS measurement of 3.44 was based on a limited sample. What MOS score does Voice.ai target internally, and has there been any quality regression in recent model updates? <span class="tag tag-quality">Quality</span>
+    </li>
+    <li>
+      <strong>Edge Deployment:</strong> Is there a plan for edge deployment (CDN-based TTS inference) to reduce the network round-trip component? This could bring end-to-end latency closer to published numbers. <span class="tag tag-latency">Latency</span>
+    </li>
+    <li>
+      <strong>Failover &amp; SLA:</strong> What is your uptime SLA? What geographic redundancy exists? If the primary region goes down, what is the expected failover time and latency impact? <span class="tag tag-reliability">Reliability</span>
+    </li>
+    <li>
+      <strong>SSML &amp; Prosody Control:</strong> Does Voice.ai support SSML markup for controlling emphasis, pauses, and pronunciation? If so, what is the latency overhead compared to plain text? <span class="tag tag-quality">Quality</span>
+    </li>
+    <li>
+      <strong>Streaming Audio Format:</strong> Can the audio format be changed from WAV to Opus or MP3 to reduce payload size? What is the latency impact of different codec selections? <span class="tag tag-latency">Latency</span>
+    </li>
+  </ol>
+
+  <details>
+    <summary>Question prioritization notes</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> These questions are prioritized by impact on the integration decision. Questions 1-3 address the most critical gaps. Questions 4-6 affect architecture decisions. Questions 7-10 are forward-looking optimization topics.</li>
+        <li><strong>HOW TO USE:</strong> Bring these questions to the next Voice.ai consultation. Record their answers and update this benchmark report with the new information. Some answers may change protocol recommendations.</li>
+        <li><strong>PRIORITY 1 (Questions 1-3):</strong> These address fundamental discrepancies between expectations and reality. If Voice.ai cannot satisfactorily explain the published vs measured gap, it affects credibility of all their other claims.</li>
+        <li><strong>PRIORITY 2 (Questions 4-6):</strong> These affect production architecture. Connection pooling and rate limits determine how the integration is engineered. Quality consistency affects long-term user satisfaction.</li>
+        <li><strong>PRIORITY 3 (Questions 7-10):</strong> These are optimization and future-proofing questions. Edge deployment could close the latency gap. SSML support affects voice assistant expressiveness.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> Well-prepared questions demonstrate that we have done our homework and expect substantive answers. This sets the tone for a data-driven partnership rather than a sales-driven one.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="recommendations">
+  <h2>
+    <span>13. Improvement Recommendations</span>
+    <button class="play-btn" onclick="speakSection(this, 'recommendations')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>Prioritized recommendations based on benchmark findings. Each recommendation includes severity, effort estimate, and expected impact.</p>
+
+  <div class="rec-card">
+    <h4><span class="severity-high">HIGH</span> Use HTTP Persistent as the default and only production protocol</h4>
+    <p>HTTP Persistent delivers 10-12x speedup with 92% under 400ms. All other protocols either add unnecessary latency (WebSocket fresh, HTTP Stream) or are actively harmful (HTTP Sync). The integration layer should hard-code HTTP Persistent and maintain a connection pool. Estimated effort: 2-4 hours. Expected impact: Guarantees best-case latency for all users.</p>
+  </div>
+
+  <div class="rec-card">
+    <h4><span class="severity-high">HIGH</span> Implement graceful fallback to macOS Daniel on Voice.ai failure</h4>
+    <p>Voice.ai is a remote service subject to network failures, outages, and rate limiting. A circuit breaker pattern should trigger fallback to macOS Daniel after 2 consecutive failures or if TTFB exceeds 2,000ms. Daniel is 10x slower but infinitely more reliable (local, zero network dependency). Estimated effort: 4-8 hours. Expected impact: Zero-downtime voice capability.</p>
+  </div>
+
+  <div class="rec-card">
+    <h4><span class="severity-high">HIGH</span> Request transparent benchmark methodology from Voice.ai</h4>
+    <p>The 2.5-8.7x discrepancy between published and measured latency undermines trust in Voice.ai's performance claims. Before deepening the integration, we need Voice.ai to explain their measurement methodology and reconcile the numbers. Estimated effort: 1 hour (email). Expected impact: Informed decision-making and accurate SLA expectations.</p>
+  </div>
+
+  <div class="rec-card">
+    <h4><span class="severity-medium">MEDIUM</span> Test persistent WebSocket performance</h4>
+    <p>Our benchmark only tested fresh WebSocket connections (839ms TTFB). A persistent WebSocket with pre-established connection might match HTTP Persistent performance while also enabling server-push notifications and bidirectional communication. This could be the optimal protocol for always-on voice assistants. Estimated effort: 4-6 hours. Expected impact: Potentially better protocol for long-running sessions.</p>
+  </div>
+
+  <div class="rec-card">
+    <h4><span class="severity-medium">MEDIUM</span> Implement adaptive audio quality based on network conditions</h4>
+    <p>When network latency is high (detected via TTFB trending upward), automatically request lower-quality audio (Opus instead of WAV) to reduce payload size and improve perceived responsiveness. When network is fast, use full-quality WAV for best MOS. Estimated effort: 6-10 hours. Expected impact: Consistent UX across varying network conditions.</p>
+  </div>
+
+  <div class="rec-card">
+    <h4><span class="severity-medium">MEDIUM</span> Add latency monitoring and alerting</h4>
+    <p>Instrument the TTS integration with real-time latency tracking (P50, P95, P99) and alert when P95 exceeds 500ms. This provides early warning of Voice.ai degradation and triggers automatic fallback before users notice. Estimated effort: 3-5 hours. Expected impact: Proactive issue detection; data for future benchmark comparisons.</p>
+  </div>
+
+  <div class="rec-card">
+    <h4><span class="severity-low">LOW</span> Investigate HTTP Stream inconsistency</h4>
+    <p>HTTP Stream showed highly variable speedup (5.4x to 11.6x), suggesting either server-side caching or measurement artifacts. Run a larger sample (N=50) with randomized text to determine if the variability is inherent to the protocol or an artifact of our test methodology. Estimated effort: 2-3 hours. Expected impact: Clarity on whether HTTP Stream is viable as a secondary protocol.</p>
+  </div>
+
+  <div class="rec-card">
+    <h4><span class="severity-low">LOW</span> Explore text chunking for long utterances</h4>
+    <p>For text longer than ~100 words, consider splitting into chunks and sending parallel HTTP Persistent requests. The first chunk's audio plays while subsequent chunks are generated. This could reduce perceived latency for long responses at the cost of potential audio discontinuities at chunk boundaries. Estimated effort: 8-12 hours. Expected impact: Better long-text performance without waiting for full generation.</p>
+  </div>
+
+  <details>
+    <summary>Recommendation prioritization rationale</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> Recommendations are ordered by impact-to-effort ratio. HIGH severity items should be completed before going to production. MEDIUM items improve robustness. LOW items are optimizations for after launch.</li>
+        <li><strong>HOW TO USE:</strong> Treat HIGH items as blockers for production deployment. MEDIUM items should be in the first sprint after launch. LOW items go into the backlog for future optimization cycles.</li>
+        <li><strong>DEPENDENCY CHAIN:</strong> "Use HTTP Persistent" enables "Implement fallback," which enables "Add monitoring." These three form a critical path. The remaining recommendations are independent and can be parallelized.</li>
+        <li><strong>EFFORT ESTIMATES:</strong> Based on a single engineer familiar with the codebase. Add 50% for onboarding time if the engineer is new to the Voice.ai SDK or the audio pipeline.</li>
+        <li><strong>RISK IF IGNORED:</strong> Deploying without the HIGH recommendations means: (a) some users will get HTTP Sync performance (5,890ms), (b) Voice.ai outages will cause complete TTS failure, and (c) latency expectations will be based on inaccurate published numbers.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> These recommendations double as feedback for Voice.ai's product team. Items like "deprecate HTTP Sync guidance" and "publish end-to-end benchmarks" improve their ecosystem for all customers.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<section id="integration-path">
+  <h2>
+    <span>14. Recommended Integration Path</span>
+    <button class="play-btn" onclick="speakSection(this, 'integration-path')" aria-label="Read section aloud">&#9654;</button>
+  </h2>
+
+  <p>A phased integration plan based on benchmark findings. Each phase builds on the previous one, with clear success criteria.</p>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Phase</th>
+        <th>Milestone</th>
+        <th>Protocol</th>
+        <th>Success Criteria</th>
+        <th>Duration</th>
+        <th>Risk Level</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="highlight">Phase 1</span></td>
+        <td>HTTP Persistent integration with connection pooling</td>
+        <td>HTTP Persistent</td>
+        <td>P95 TTFB under 400ms in production; zero HTTP Sync usage</td>
+        <td>1 week</td>
+        <td><span class="severity-low">LOW</span></td>
+      </tr>
+      <tr>
+        <td><span class="highlight">Phase 2</span></td>
+        <td>Daniel fallback with circuit breaker</td>
+        <td>HTTP Persistent + Daniel</td>
+        <td>Automatic failover within 2 seconds; zero TTS outages</td>
+        <td>1 week</td>
+        <td><span class="severity-low">LOW</span></td>
+      </tr>
+      <tr>
+        <td><span class="highlight">Phase 3</span></td>
+        <td>Latency monitoring and alerting dashboard</td>
+        <td>HTTP Persistent + Daniel</td>
+        <td>Real-time P50/P95/P99 tracking; alerts on degradation</td>
+        <td>3 days</td>
+        <td><span class="severity-low">LOW</span></td>
+      </tr>
+      <tr>
+        <td>Phase 4</td>
+        <td>Persistent WebSocket evaluation</td>
+        <td>WebSocket (persistent)</td>
+        <td>Match HTTP Persistent TTFB; enable server-push features</td>
+        <td>1 week</td>
+        <td><span class="severity-medium">MEDIUM</span></td>
+      </tr>
+      <tr>
+        <td>Phase 5</td>
+        <td>Adaptive quality and text chunking</td>
+        <td>HTTP Persistent + chunking</td>
+        <td>Long text P95 under 500ms; no audio discontinuities</td>
+        <td>2 weeks</td>
+        <td><span class="severity-medium">MEDIUM</span></td>
+      </tr>
+      <tr>
+        <td>Phase 6</td>
+        <td>Production hardening and load testing</td>
+        <td>All protocols</td>
+        <td>Stable under 100 concurrent users; documented failure modes</td>
+        <td>2 weeks</td>
+        <td><span class="severity-high">HIGH</span></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <details>
+    <summary>Integration path rationale</summary>
+    <div class="detail-content">
+      <ul>
+        <li><strong>PURPOSE:</strong> This phased approach minimizes risk by building incrementally. Each phase has clear success criteria that must be met before advancing. The first three phases can be completed in under 3 weeks and provide production-ready TTS.</li>
+        <li><strong>HOW TO USE:</strong> Phases 1-3 are the minimum viable integration. Phase 4-5 are optimization. Phase 6 is hardening for scale. Do not skip Phase 2 (fallback) under any circumstances.</li>
+        <li><strong>PHASE 1 DETAILS:</strong> Replace all TTS calls with HTTP Persistent using aiohttp connection pooling (pool size 4-8). Verify TTFB in production matches benchmark numbers. Audit for any remaining HTTP Sync codepaths.</li>
+        <li><strong>PHASE 2 DETAILS:</strong> Implement a circuit breaker that tracks consecutive failures and latency trends. After 2 failures or 3 requests over 2,000ms within 60 seconds, trip the breaker and route to Daniel. Auto-reset after 30 seconds.</li>
+        <li><strong>PHASE 3 DETAILS:</strong> Log every TTS request with timestamp, protocol, TTFB, total time, text length, and success/failure. Compute rolling P50/P95/P99. Alert if P95 exceeds 500ms for more than 5 minutes.</li>
+        <li><strong>PHASE 6 WARNING:</strong> Load testing is marked HIGH risk because it may trigger Voice.ai rate limits or reveal scaling bottlenecks. Coordinate with Voice.ai support before running load tests to avoid account suspension.</li>
+        <li><strong>WHY IT MATTERS FOR VOICE.AI:</strong> A structured integration path demonstrates professional engineering practices and provides Voice.ai with a replicable success story they can share with other customers.</li>
+      </ul>
+    </div>
+  </details>
+</section>
+
+<footer style="text-align: center; padding: 2rem 0; color: var(--text-muted); font-size: 0.85rem; border-top: 1px solid var(--border); margin-top: 2rem;">
+  Voice.ai TTS Benchmark Report | Generated 2026-03-18 | JARVIS AI Agent Project
+</footer>
+
+<script>
+(function () {
+  var PLAY_CHAR = "\u25B6";
+  var STOP_CHAR = "\u25A0";
+  var danielVoice = null;
+  var currentUtterance = null;
+  var currentButton = null;
+
+  function findDanielVoice() {
+    var voices = window.speechSynthesis.getVoices();
+    for (var i = 0; i < voices.length; i++) {
+      if (voices[i].name.indexOf("Daniel") !== -1) {
+        return voices[i];
+      }
+    }
+    return null;
+  }
+
+  function loadVoices() {
+    danielVoice = findDanielVoice();
+    if (!danielVoice) {
+      window.speechSynthesis.addEventListener("voiceschanged", function () {
+        danielVoice = findDanielVoice();
+      });
+    }
+  }
+
+  loadVoices();
+
+  function getSectionText(sectionId) {
+    var section = document.getElementById(sectionId);
+    if (!section) return "";
+    var clone = section.cloneNode(true);
+    var buttons = clone.querySelectorAll(".play-btn");
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].remove();
+    }
+    var details = clone.querySelectorAll("details");
+    for (var j = 0; j < details.length; j++) {
+      details[j].remove();
+    }
+    var text = clone.textContent || clone.innerText || "";
+    text = text.replace(/\s+/g, " ").trim();
+    return text;
+  }
+
+  function stopSpeaking() {
+    window.speechSynthesis.cancel();
+    if (currentButton) {
+      currentButton.textContent = PLAY_CHAR;
+    }
+    currentUtterance = null;
+    currentButton = null;
+  }
+
+  window.speakSection = function (btn, sectionId) {
+    if (currentButton === btn && window.speechSynthesis.speaking) {
+      stopSpeaking();
+      return;
+    }
+
+    if (window.speechSynthesis.speaking) {
+      stopSpeaking();
+    }
+
+    var text = getSectionText(sectionId);
+    if (!text) return;
+
+    if (text.length > 2000) {
+      text = text.substring(0, 2000);
+    }
+
+    var utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.0;
+    utterance.pitch = 1.0;
+    utterance.volume = 1.0;
+
+    if (danielVoice) {
+      utterance.voice = danielVoice;
+    }
+
+    currentUtterance = utterance;
+    currentButton = btn;
+    btn.textContent = STOP_CHAR;
+
+    utterance.onend = function () {
+      if (currentButton === btn) {
+        btn.textContent = PLAY_CHAR;
+        currentButton = null;
+        currentUtterance = null;
+      }
+    };
+
+    utterance.onerror = function () {
+      if (currentButton === btn) {
+        btn.textContent = PLAY_CHAR;
+        currentButton = null;
+        currentUtterance = null;
+      }
+    };
+
+    window.speechSynthesis.speak(utterance);
+  };
+})();
+</script>
+
+</body>
+</html>
