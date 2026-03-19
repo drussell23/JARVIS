@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -252,7 +253,7 @@ class AppInventoryService(BaseNeuralMeshAgent):
         if self._app_library is not None:
             try:
                 result = await self._app_library.resolve_app_name_async(app_name)
-                return _resolution_to_dict(result)
+                resolved = _resolution_to_dict(result)
             except Exception as exc:
                 logger.warning(
                     "[AppInventoryService] AppLibrary resolution failed for '%s': %s. "
@@ -260,9 +261,30 @@ class AppInventoryService(BaseNeuralMeshAgent):
                     app_name,
                     exc,
                 )
+                resolved = await _filesystem_check(app_name)
+        else:
+            # Filesystem fallback
+            resolved = await _filesystem_check(app_name)
 
-        # Filesystem fallback
-        return await _filesystem_check(app_name)
+        # Emit a learning experience when the app is not found so Reactor Core
+        # can track missing-app patterns and inform tier routing decisions.
+        if not resolved.get("found", True):
+            try:
+                from core.trinity_event_bus import get_event_bus_if_exists
+                bus = get_event_bus_if_exists()
+                if bus:
+                    await bus.publish_raw(
+                        topic="app.not_found",
+                        data={
+                            "app_name": app_name,
+                            "checked_paths": [str(d) for d in _APP_DIRS],
+                            "timestamp": time.time(),
+                        },
+                    )
+            except Exception:
+                pass  # Learning is best-effort
+
+        return resolved
 
     async def _scan_installed(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Check a set of apps concurrently and return only the found ones.

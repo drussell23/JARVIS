@@ -24,6 +24,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import time
 from enum import Enum
 from typing import Any, Dict, Optional, Set
 
@@ -271,7 +272,48 @@ class ExecutionTierRouter(BaseNeuralMeshAgent):
                     target_app,
                     exc,
                 )
+                # Emit learning experience for the error-driven fallback
+                try:
+                    from core.trinity_event_bus import get_event_bus_if_exists
+                    bus = get_event_bus_if_exists()
+                    if bus:
+                        await bus.publish_raw(
+                            topic="tier.fallback",
+                            data={
+                                "goal": goal,
+                                "target_app": target_app,
+                                "original_tier": "native_app",
+                                "fallback_tier": "browser",
+                                "reason": "app_check_error",
+                                "web_alternative": self.get_web_alternative(target_app),
+                                "timestamp": time.time(),
+                            },
+                        )
+                except Exception:
+                    pass  # Learning is best-effort
                 return ExecutionTier.BROWSER
+
+        # Emit a learning experience when the app is confirmed NOT installed
+        # and the tier will fall back to BROWSER.
+        if target_app is not None and resolved_installed is False:
+            try:
+                from core.trinity_event_bus import get_event_bus_if_exists
+                bus = get_event_bus_if_exists()
+                if bus:
+                    await bus.publish_raw(
+                        topic="tier.fallback",
+                        data={
+                            "goal": goal,
+                            "target_app": target_app,
+                            "original_tier": "native_app",
+                            "fallback_tier": "browser",
+                            "reason": "app_not_installed",
+                            "web_alternative": self.get_web_alternative(target_app),
+                            "timestamp": time.time(),
+                        },
+                    )
+            except Exception:
+                pass  # Learning is best-effort
 
         return self.decide_tier(
             goal,
