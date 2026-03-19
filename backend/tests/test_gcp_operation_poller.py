@@ -399,10 +399,8 @@ class TestGCPOperationPoller:
         reset_operation_registry()
         op = _make_op(status="RUNNING")
 
-        # Make ops_client.get block by sleeping (simulates slow GCP API)
-        async def slow_get(**kw):
-            await asyncio.sleep(100)
-        ops_client.get = MagicMock(wraps=lambda **kw: None)
+        # ops_client.get is never reached — cancel fires at asyncio.shield before first poll
+        ops_client.get = MagicMock(return_value=_make_op(status="RUNNING"))
 
         poller = self._make_poller(ops_client, tmp_registry, timeout=100.0)
 

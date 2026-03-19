@@ -582,7 +582,7 @@ class GCPOperationPoller:
                 state.waiter_count += 1
             else:
                 # Become the primary driver
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 fut: asyncio.Future = loop.create_future()
                 task = asyncio.ensure_future(
                     self._drive_poll(operation, action=action,
@@ -836,22 +836,6 @@ class GCPOperationPoller:
                 operation_id=op_id,
                 scope=scope,
                 error_message="404: Operation not found and not in registry",
-                poll_count=record.poll_count,
-            )
-
-        # Scope must match
-        if registered.scope != scope:
-            self._emit("stale_operation_detected", {
-                "op_id": op_id,
-                "registered_scope": str(registered.scope),
-                "poll_scope": str(scope),
-            })
-            return OperationResult(
-                success=False,
-                reason=TerminalReason.NOT_FOUND_SCOPE_MISMATCH,
-                operation_id=op_id,
-                scope=scope,
-                error_message=f"404: scope mismatch (registered={registered.scope}, poll={scope})",
                 poll_count=record.poll_count,
             )
 
