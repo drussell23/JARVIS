@@ -84,11 +84,14 @@ _INTERACTIVE_TASK_COMPLEXITY: Dict[str, str] = {
     # Heavy — 7B+ preferred, vision models for screenshots
     "vision_action": "heavy",              # screenshot → next action inference
     "vision_verification": "heavy",        # did the click work?
+    "screen_observation": "heavy",         # "what do you see?" — single-shot describe
+    "proactive_narration": "heavy",        # ambient screen monitor narration
     "email_compose": "heavy",              # draft email with context
     "browser_navigation": "heavy",         # navigate complex web pages
 
     # Complex — 14B+ or deep reasoning
     "multi_step_planning": "complex",      # complex multi-app workflows
+    "goal_chain_step": "light",            # one step inside a GoalChain (7B sufficient)
     "email_summarization": "complex",      # summarize inbox trends
     "complex_reasoning": "complex",        # "why is X happening?"
 }
@@ -109,8 +112,13 @@ _CLAUDE_FALLBACK_MAP: Dict[str, str] = {
     "complex": "claude-sonnet-4-20250514",
 }
 
-# Vision task types → vision model
-_VISION_TASK_TYPES = {"vision_action", "vision_verification"}
+# Vision task types → vision model (all types that require a multimodal/vision model)
+_VISION_TASK_TYPES = {
+    "vision_action",
+    "vision_verification",
+    "screen_observation",    # "what do you see?" queries
+    "proactive_narration",   # ambient screen monitor
+}
 
 
 # ---------------------------------------------------------------------------

@@ -539,3 +539,35 @@ Respond in this JSON format:
             'recent_changes': len(self.monitoring_state['recent_changes']),
             'current_context': self.monitoring_state['current_context']
         }
+
+    # -------------------------------------------------------------------------
+    # Lifecycle API — thin wrappers used by UnifiedCommandProcessor
+    # -------------------------------------------------------------------------
+
+    def is_running(self) -> bool:
+        """Return True while the ambient monitor is active."""
+        return bool(self.monitoring_state.get('active', False))
+
+    async def start(
+        self,
+        on_narration: Optional[Any] = None,
+        interval_s: Optional[float] = None,
+    ) -> None:
+        """Start proactive ambient monitoring.
+
+        Args:
+            on_narration: Optional async callback ``(notification_dict) -> None``
+                that receives each proactive narration.  When provided, it
+                overrides the callback set at construction time.
+            interval_s: Override the default analysis interval (seconds).
+                Honoured only when the monitor is not already running.
+        """
+        if on_narration is not None:
+            self.notification_callback = on_narration
+        if interval_s is not None:
+            self.config['analysis_interval'] = float(interval_s)
+        await self.start_monitoring()
+
+    async def stop(self) -> None:
+        """Stop the ambient monitor and send a summary."""
+        await self.stop_monitoring()

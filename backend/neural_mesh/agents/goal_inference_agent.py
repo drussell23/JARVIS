@@ -341,6 +341,36 @@ class GoalInferenceAgent(BaseNeuralMeshAgent):
             "inference_time_ms": inference_time,
         }
 
+    async def infer_for_command(
+        self, command: str, context: Optional[Dict[str, Any]] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Direct call adapter for the voice-command pipeline.
+
+        Wraps _infer_goal() with a tight deadline so callers (UnifiedCommandProcessor,
+        TaskChainExecutor) get goal inference without blocking their critical path.
+
+        Args:
+            command: The raw voice/text command.
+            context: Optional context dict (speaker, source, active_app, etc.)
+
+        Returns:
+            Goal dict with goal_id/category/description/confidence/sub_goals,
+            or None on timeout / inference error.
+        """
+        timeout_s = float(os.getenv("JARVIS_GOAL_INFERENCE_TIMEOUT_S", "1.5"))
+        try:
+            result = await asyncio.wait_for(
+                self._infer_goal({"command": command, "context": context or {}}),
+                timeout=timeout_s,
+            )
+            return result
+        except asyncio.TimeoutError:
+            logger.debug("[GoalInference] infer_for_command timed out after %.1fs", timeout_s)
+            return None
+        except Exception as exc:
+            logger.debug("[GoalInference] infer_for_command error: %s", exc)
+            return None
+
     def _classify_category(self, command: str) -> Tuple[GoalCategory, float]:
         """Classify command into goal category."""
         command_lower = command.lower()

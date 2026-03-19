@@ -117,6 +117,15 @@ try:
 except ImportError:
     _HAS_MANAGED_EXECUTOR = False
 
+# Brain router — lazy import to avoid circular deps at module load time
+def _get_brain_router_for_computer_use():
+    """Return the InteractiveBrainRouter singleton, or None on import failure."""
+    try:
+        from backend.core.interactive_brain_router import get_interactive_brain_router
+        return get_interactive_brain_router()
+    except Exception:
+        return None
+
 # ============================================================================
 # Async Utilities - Thread Pool for Blocking Operations
 # ============================================================================
@@ -1917,8 +1926,8 @@ class ClaudeComputerUseConnector:
     Integrates with voice narration for transparency.
     """
 
-    # Claude Computer Use model (v6.3: env-var configurable)
-    COMPUTER_USE_MODEL = os.getenv("COMPUTER_USE_MODEL", "claude-sonnet-4-20250514")
+    # System prompt for computer use - Enhanced with Open Interpreter patterns
+    # (model is resolved dynamically via _resolve_model() — no class-level constant)
 
     # System prompt for computer use - Enhanced with Open Interpreter patterns
     SYSTEM_PROMPT = """You are JARVIS, an AI assistant helping to control a macOS computer.
@@ -2243,6 +2252,27 @@ Always provide your reasoning before taking action, including grid position esti
 
         logger.warning("[API KEY] Could not resolve ANTHROPIC_API_KEY from any backend")
         return None
+
+    def _resolve_model(self) -> str:
+        """Resolve the Claude model for Computer Use dynamically.
+
+        Resolution order (highest → lowest priority):
+        1. COMPUTER_USE_MODEL env var — operator override
+        2. InteractiveBrainRouter.get_claude_model("heavy") — policy-driven
+        3. Hard-coded safe fallback — always present
+
+        Zero hardcoding: the default model lives in brain_selection_policy.yaml.
+        """
+        env_override = os.getenv("COMPUTER_USE_MODEL")
+        if env_override:
+            return env_override
+        router = _get_brain_router_for_computer_use()
+        if router is not None:
+            try:
+                return router.get_claude_model("heavy")
+            except Exception as exc:
+                logger.warning("[ComputerUse] Brain router model resolution failed: %s", exc)
+        return "claude-sonnet-4-20250514"  # safe fallback — only reached if router unavailable
 
     async def _ensure_refinements_initialized(self) -> bool:
         """Lazily initialize Open Interpreter refinement components."""
@@ -2843,7 +2873,7 @@ Respond with your analysis followed by the action JSON."""
             # Call Claude with computer use capability - with timeout
             response = await asyncio.wait_for(
                 self.client.messages.create(
-                    model=self.COMPUTER_USE_MODEL,
+                    model=self._resolve_model(),
                     max_tokens=1024,
                     system=system_prompt,
                     messages=[

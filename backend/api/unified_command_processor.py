@@ -2136,6 +2136,24 @@ class UnifiedCommandProcessor:
                 deadline=deadline,
             )
 
+        # === Step 1.8: Screen observation commands ===
+        # "What do you see?" / "Describe my screen" etc. — capture + vision query.
+        # Intercepted before J-Prime to avoid misclassification as generic queries.
+        if self._is_screen_observation_command(command_text):
+            logger.info(
+                "[vision] Screen observation matched '%s' — bypassing J-Prime",
+                command_text[:80],
+            )
+            return await self._handle_screen_observation(command_text, deadline=deadline)
+
+        # === Step 1.9: Proactive ambient monitor toggle ===
+        # "Watch my screen" / "Stop monitoring" etc.
+        if self._is_proactive_mode_command(command_text):
+            logger.info(
+                "[vision] Proactive mode command matched '%s'", command_text[:80]
+            )
+            return await self._handle_proactive_mode(command_text)
+
         # === Step 2: Deadline admission gate for J-Prime ===
         # Avoid launching multi-backend inference when request budget is already
         # nearly exhausted; this creates deterministic failover instead of churn.
@@ -2216,9 +2234,44 @@ class UnifiedCommandProcessor:
                 _jprime_ctx.update(_sensory)
         except Exception:
             pass  # Sensory failure never blocks command processing
+
+        # v295.0: Fire GoalInference concurrently with the J-Prime round-trip.
+        # Result enriches routing context and enables multi-step task chaining.
+        # Timeout-bounded — never blocks or delays J-Prime.
+        _goal_inference_task: Optional[asyncio.Task] = None
+        try:
+            _agent = await self._get_neural_mesh_agent("goal_inference_agent")
+            if _agent is not None and hasattr(_agent, "infer_for_command"):
+                _goal_inference_task = asyncio.create_task(
+                    _agent.infer_for_command(command_text, context=_jprime_ctx),
+                    name="goal_inference",
+                )
+        except Exception:
+            pass
+
         response = await self._call_jprime(
             command_text, deadline=deadline, source_context=_jprime_ctx or None,
         )
+
+        # v295.0: Collect GoalInference result (already computed concurrently).
+        # Non-blocking: done() check returns immediately; cancel on miss.
+        _goal_inference_result: Optional[Dict[str, Any]] = None
+        if _goal_inference_task is not None:
+            if _goal_inference_task.done():
+                try:
+                    _goal_inference_result = _goal_inference_task.result()
+                except Exception:
+                    pass
+            else:
+                _goal_inference_task.cancel()  # J-Prime was faster; don't wait
+
+        # Forward goal inference to Reactor Core for learning (best-effort, fire-and-forget)
+        if _goal_inference_result:
+            asyncio.create_task(
+                self._emit_goal_inference_experience(_goal_inference_result, command_text),
+                name="goal_inference_experience",
+            )
+
         if response:
             logger.info(
                 f"[v242] J-Prime classified: intent={response.intent}, "
