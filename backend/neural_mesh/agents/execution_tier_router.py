@@ -254,9 +254,11 @@ class ExecutionTierRouter(BaseNeuralMeshAgent):
             and self._app_inventory_service is not None
         ):
             try:
-                resolved_installed = await self._app_inventory_service.is_installed(
-                    target_app
-                )
+                check_result = await self._app_inventory_service.execute_task({
+                    "action": "check_app",
+                    "app_name": target_app,
+                })
+                resolved_installed = check_result.get("found", False)
                 logger.debug(
                     "ExecutionTierRouter: dynamic check app=%r → installed=%s",
                     target_app,
@@ -264,7 +266,7 @@ class ExecutionTierRouter(BaseNeuralMeshAgent):
                 )
             except Exception as exc:
                 logger.warning(
-                    "ExecutionTierRouter: AppInventoryService.is_installed(%r) failed: %s — "
+                    "ExecutionTierRouter: app check for %r failed: %s — "
                     "falling back to BROWSER",
                     target_app,
                     exc,

@@ -483,7 +483,7 @@ class TestExecutionTierRouter:
         from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
 
         mock_svc = AsyncMock()
-        mock_svc.is_installed = AsyncMock(return_value=True)
+        mock_svc.execute_task = AsyncMock(return_value={"found": True, "app_name": "Discord"})
         router._app_inventory_service = mock_svc
 
         tier = await router.decide_tier_async(
@@ -499,7 +499,7 @@ class TestExecutionTierRouter:
         from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
 
         mock_svc = AsyncMock()
-        mock_svc.is_installed = AsyncMock(return_value=False)
+        mock_svc.execute_task = AsyncMock(return_value={"found": False})
         router._app_inventory_service = mock_svc
 
         tier = await router.decide_tier_async(
@@ -513,11 +513,11 @@ class TestExecutionTierRouter:
     async def test_dynamic_app_check_service_error_falls_back_to_browser(
         self, router
     ) -> None:
-        """If AppInventoryService.is_installed raises, fall back to BROWSER."""
+        """If AppInventoryService.execute_task raises, fall back to BROWSER."""
         from backend.neural_mesh.agents.execution_tier_router import ExecutionTier
 
         mock_svc = AsyncMock()
-        mock_svc.is_installed = AsyncMock(side_effect=RuntimeError("service down"))
+        mock_svc.execute_task = AsyncMock(side_effect=RuntimeError("service down"))
         router._app_inventory_service = mock_svc
 
         tier = await router.decide_tier_async(
