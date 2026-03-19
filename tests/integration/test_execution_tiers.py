@@ -1214,3 +1214,47 @@ class TestVisionGPULifecycle:
 
         assert isinstance(result, bool)
         assert result is False
+
+
+# ---------------------------------------------------------------------------
+# AccessibilityResolver tests
+# ---------------------------------------------------------------------------
+
+class TestAccessibilityResolver:
+    """Tests for AccessibilityResolver -- macOS AX tree element lookup."""
+
+    @pytest.mark.asyncio
+    async def test_resolver_import(self):
+        from backend.neural_mesh.agents.accessibility_resolver import AccessibilityResolver
+        resolver = AccessibilityResolver()
+        assert resolver is not None
+
+    @pytest.mark.asyncio
+    async def test_get_pid_for_finder(self):
+        from backend.neural_mesh.agents.accessibility_resolver import AccessibilityResolver
+        resolver = AccessibilityResolver()
+        pid = resolver._get_pid_for_app("Finder")
+        assert pid is not None
+        assert isinstance(pid, int)
+        assert pid > 0
+
+    @pytest.mark.asyncio
+    async def test_get_pid_nonexistent_app(self):
+        from backend.neural_mesh.agents.accessibility_resolver import AccessibilityResolver
+        resolver = AccessibilityResolver()
+        pid = resolver._get_pid_for_app("FakeApp999")
+        assert pid is None
+
+    @pytest.mark.asyncio
+    async def test_resolve_returns_dict_or_none(self):
+        from backend.neural_mesh.agents.accessibility_resolver import AccessibilityResolver
+        resolver = AccessibilityResolver()
+        result = await resolver.resolve("search", app_name="Finder")
+        assert result is None or ("x" in result and "y" in result)
+
+    @pytest.mark.asyncio
+    async def test_list_elements_returns_list(self):
+        from backend.neural_mesh.agents.accessibility_resolver import AccessibilityResolver
+        resolver = AccessibilityResolver()
+        elements = await resolver.list_elements("Finder", max_depth=3)
+        assert isinstance(elements, list)
