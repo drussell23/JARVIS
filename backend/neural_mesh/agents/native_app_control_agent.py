@@ -753,6 +753,13 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
             previous_actions_text=previous_actions_text,
         )
 
+        # --- Ensure GPU VM is running (starts on-demand if needed) -----------
+        try:
+            from .vision_gpu_lifecycle import ensure_vision_available
+            await ensure_vision_available()
+        except Exception:
+            pass  # Best-effort — will fall through to Claude if J-Prime unavailable
+
         # --- Attempt 1: J-Prime vision server ---------------------------------
         try:
             from backend.core.prime_client import get_prime_client

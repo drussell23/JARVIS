@@ -1112,3 +1112,105 @@ class TestStepPlanCache:
 
         assert result == llm_steps
         mock_cache.store_plan.assert_awaited_once()
+
+
+# ---------------------------------------------------------------------------
+# VisionGPULifecycle tests  (Task 2)
+# ---------------------------------------------------------------------------
+
+
+class TestVisionGPULifecycle:
+    """Tests for vision_gpu_lifecycle — on-demand GPU VM management."""
+
+    def test_vision_gpu_lifecycle_module_exists(self) -> None:
+        """vision_gpu_lifecycle must be importable and expose ensure_vision_available."""
+        import inspect
+
+        from backend.neural_mesh.agents.vision_gpu_lifecycle import (
+            ensure_vision_available,
+            record_vision_use,
+        )
+
+        assert inspect.iscoroutinefunction(ensure_vision_available), (
+            "ensure_vision_available must be an async def coroutine"
+        )
+        assert callable(record_vision_use), (
+            "record_vision_use must be callable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_ensure_vision_available_returns_bool_on_healthy(self) -> None:
+        """ensure_vision_available returns True when vision health check passes."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        mock_client = MagicMock()
+        mock_client.get_vision_health = AsyncMock(return_value=True)
+
+        async def _mock_get_client():
+            return mock_client
+
+        with patch(
+            "backend.neural_mesh.agents.vision_gpu_lifecycle.asyncio.wait_for",
+            side_effect=[mock_client, True],  # first call → client, second → healthy
+        ):
+            # Patch get_prime_client at the source where it's imported inside the function
+            with patch(
+                "backend.core.prime_client.get_prime_client",
+                new=AsyncMock(return_value=mock_client),
+            ):
+                import asyncio as _asyncio
+                import backend.neural_mesh.agents.vision_gpu_lifecycle as _mod
+
+                # Reset module state so we actually exercise the health-check path
+                _mod._last_vision_use = 0.0
+
+                # Directly mock wait_for to return healthy=True on the health call
+                original_wait_for = _asyncio.wait_for
+
+                call_count = 0
+
+                async def _patched_wait_for(coro, timeout):
+                    nonlocal call_count
+                    call_count += 1
+                    if call_count == 1:
+                        # First call: get_prime_client() coroutine
+                        return mock_client
+                    elif call_count == 2:
+                        # Second call: get_vision_health()
+                        return True
+                    return await original_wait_for(coro, timeout=timeout)
+
+                with patch(
+                    "backend.neural_mesh.agents.vision_gpu_lifecycle.asyncio.wait_for",
+                    side_effect=_patched_wait_for,
+                ):
+                    result = await _mod.ensure_vision_available()
+
+        assert isinstance(result, bool)
+        assert result is True
+
+    @pytest.mark.asyncio
+    async def test_ensure_vision_available_returns_false_when_gcp_unavailable(
+        self,
+    ) -> None:
+        """ensure_vision_available returns False when GCPVMManager is not importable."""
+        import backend.neural_mesh.agents.vision_gpu_lifecycle as _mod
+
+        # Reset module state
+        _mod._last_vision_use = 0.0
+        _mod._starting_lock = None
+
+        # Make every wait_for call raise (simulates both health checks failing)
+        with patch(
+            "backend.neural_mesh.agents.vision_gpu_lifecycle.asyncio.wait_for",
+            side_effect=Exception("prime offline"),
+        ):
+            # Also make GCPVMManager import fail so we don't hang on startup
+            with patch.dict(
+                "sys.modules",
+                {"backend.core.gcp_vm_manager": None},
+            ):
+                result = await _mod.ensure_vision_available()
+
+        assert isinstance(result, bool)
+        assert result is False

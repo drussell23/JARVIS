@@ -481,6 +481,13 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
 
     async def _ask_jprime(self, screenshot_b64: str, user_message: str) -> Optional[str]:
         """Send vision request to J-Prime server."""
+        # Ensure GPU VM is running (starts on-demand if needed)
+        try:
+            from .vision_gpu_lifecycle import ensure_vision_available
+            await ensure_vision_available()
+        except Exception:
+            pass  # Best-effort — will fall through to Claude if J-Prime unavailable
+
         if self._prime_client is None:
             try:
                 from backend.core.prime_client import get_prime_client
