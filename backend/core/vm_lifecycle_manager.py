@@ -474,7 +474,7 @@ class VMLifecycleManager:
                 if self._clock() < self._warm_backoff_until:
                     _log.info("ensure_warmed(%s): backoff active — returning False", reason)
                     return False
-                fut = asyncio.get_event_loop().create_future()
+                fut = asyncio.get_running_loop().create_future()
                 self._warming_future = fut
                 self._state = VMFsmState.WARMING
                 self._state_entered_mono = self._clock()
@@ -560,12 +560,22 @@ class VMLifecycleManager:
         asyncio.create_task(self._execute_stop())
 
     async def _execute_stop(self) -> None:
-        """Call controller.stop_vm() then transition to COLD."""
+        """Call controller.stop_vm() then transition to COLD.
+
+        Guard: if state is no longer STOPPING when we re-acquire the lock,
+        a new lifecycle cycle has already started — skip the COLD transition.
+        """
         try:
             await self._controller.stop_vm()
         except Exception as exc:
             _log.error("_execute_stop controller error: %s", exc)
         async with self._lock:
+            if self._state != VMFsmState.STOPPING:
+                _log.debug(
+                    "_execute_stop: state is %s (not STOPPING) — skipping COLD transition",
+                    self._state.value,
+                )
+                return
             from_state = self._state
             self._state = VMFsmState.COLD
             self._state_entered_mono = self._clock()

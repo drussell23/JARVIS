@@ -137,7 +137,11 @@ async def test_concurrent_ensure_warmed_collapses(tmp_path):
     from backend.core.vm_lifecycle_manager import VMLifecycleManager, VMFsmState
     config = make_test_config(tmp_path)
 
+    start_count = 0
+
     async def _slow_start_vm():
+        nonlocal start_count
+        start_count += 1
         await asyncio.sleep(0.05)
         return (True, None, None)
 
@@ -153,6 +157,7 @@ async def test_concurrent_ensure_warmed_collapses(tmp_path):
     assert r1 is True
     assert r2 is True
     assert mgr.state == VMFsmState.READY
+    assert start_count == 1, f"Expected exactly 1 VM start, got {start_count}"
     await mgr.stop()
 
 
