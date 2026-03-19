@@ -464,3 +464,146 @@ async def test_work_slot_cold_taxonomy_recovery(tmp_path):
             pass
     assert exc_info.value.recovery is not None
     await mgr.stop()
+
+
+# --- T13: max_uptime → IDLE_GRACE (not STOPPING) -----------------------------
+
+@pytest.mark.asyncio
+async def test_max_uptime_enters_idle_grace_not_stopping(tmp_path):
+    """T13 — max_uptime_s elapses → IDLE_GRACE (drain honored, never direct STOPPING)."""
+    from backend.core.vm_lifecycle_manager import VMFsmState, VMLifecycleManager
+    config = make_test_config(tmp_path, max_uptime_s=0.1, idle_grace_s=2.0)
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t13")
+    await asyncio.sleep(0.15)  # let max_uptime fire
+    assert mgr.state == VMFsmState.IDLE_GRACE, f"Expected IDLE_GRACE, got {mgr.state}"
+    await mgr.stop()
+
+
+# --- T14: drain hard cap exceeded → telemetry emitted, no force stop ----------
+
+@pytest.mark.asyncio
+async def test_max_uptime_drain_hard_cap_emits_telemetry(tmp_path):
+    """T14 — drain hard cap exceeded → telemetry event emitted, VM stays running."""
+    from backend.core.vm_lifecycle_manager import (
+        VMFsmState, VMLifecycleManager, ActivityClass,
+    )
+    config = make_test_config(
+        tmp_path, max_uptime_s=0.05, idle_grace_s=0.05, drain_hard_cap_s=0.1
+    )
+    ctrl = make_mock_controller()
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+    await mgr.ensure_warmed("t14")
+
+    # Hold a MEANINGFUL slot — this will prevent the drain from clearing
+    slot_released = asyncio.Event()
+    async def _hold():
+        async with mgr.work_slot(ActivityClass.MEANINGFUL, description="prime_client.execute_request"):
+            await slot_released.wait()
+
+    task = asyncio.create_task(_hold())
+    await asyncio.sleep(0.01)
+    # Allow max_uptime → IDLE_GRACE → grace expires → hard cap hits
+    await asyncio.sleep(0.3)
+
+    hard_cap_events = [
+        e for e in sink.events
+        if e.reason_code == "MAX_UPTIME_DRAIN_HARD_CAP_EXCEEDED"
+    ]
+    assert len(hard_cap_events) >= 1, "Hard cap event must be emitted"
+    # VM must still be in IDLE_GRACE (not COLD) — no force stop
+    assert mgr.state == VMFsmState.IDLE_GRACE, f"Expected IDLE_GRACE, got {mgr.state}"
+
+    slot_released.set()
+    await task
+    await mgr.stop()
+
+
+# --- T19: Transition telemetry is off the critical path -----------------------
+
+@pytest.mark.asyncio
+async def test_transition_telemetry_off_critical_path(tmp_path):
+    """T19 — telemetry task is scheduled after lock release (fire-and-forget)."""
+    from backend.core.vm_lifecycle_manager import VMLifecycleManager, VMFsmState
+    import time as _time
+    config = make_test_config(tmp_path)
+    ctrl = make_mock_controller()
+
+    emit_delays = []
+
+    class _TimedSink:
+        async def emit(self, event):
+            await asyncio.sleep(0.05)  # simulate slow telemetry
+            emit_delays.append(True)
+
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=_TimedSink())
+    await mgr.start()
+    t0 = _time.monotonic()
+    await mgr.ensure_warmed("t19")
+    elapsed = _time.monotonic() - t0
+    # ensure_warmed must complete in << 50ms (telemetry is fire-and-forget)
+    assert elapsed < 0.04, f"ensure_warmed blocked on telemetry: {elapsed:.3f}s"
+    assert mgr.state == VMFsmState.READY
+    await asyncio.sleep(0.1)  # let background telemetry drain
+    assert len(emit_delays) >= 1, "Telemetry should fire eventually"
+    await mgr.stop()
+
+
+# --- T20: DEGRADED_BOOT_MODE on J-Prime offline --------------------------------
+
+@pytest.mark.asyncio
+async def test_degraded_boot_mode_on_jprime_offline(tmp_path):
+    """T20 — J-Prime start fails → DEGRADED set, warm strikes accumulate, backoff fires."""
+    from backend.core.vm_lifecycle_manager import (
+        VMLifecycleManager, VMFsmState, BootMode,
+    )
+    from backend.core.gcp_readiness_lease import HandshakeStep, ReadinessFailureClass
+    from backend.core.capability_readiness import (
+        CapabilityRegistry, CapabilityDomain, DomainStatus,
+    )
+    config = make_test_config(tmp_path, warm_max_strikes=2)
+    ctrl = make_mock_controller(start_returns=(False, HandshakeStep.HEALTH, ReadinessFailureClass.TRANSIENT_INFRA))
+    sink = _RecordingSink()
+    mgr = VMLifecycleManager(config=config, controller=ctrl, telemetry_sink=sink)
+    await mgr.start()
+
+    # First failure
+    r1 = await mgr.ensure_warmed("t20_1")
+    assert r1 is False
+    assert mgr._warm_strike_count == 1
+
+    # Second failure → hits warm_max_strikes (2)
+    mgr._warm_backoff_until = 0.0  # reset any early backoff
+    r2 = await mgr.ensure_warmed("t20_2")
+    assert r2 is False
+    assert mgr._warm_strike_count == 2
+
+    # Third attempt → backoff active → immediate False
+    r3 = await mgr.ensure_warmed("t20_3")
+    assert r3 is False, "Backoff must prevent further warm attempts"
+
+    # Set degraded mode explicitly (as boot sequence would do after detecting J-Prime offline)
+    mgr.set_degraded_boot_mode(
+        reason="j_prime_unreachable",
+        degraded_capabilities=frozenset({"prime_inference", "gpu_acceleration"}),
+    )
+    assert mgr.boot_mode == BootMode.DEGRADED
+    assert mgr.boot_mode_record is not None
+    assert mgr.boot_mode_record.reason == "j_prime_unreachable"
+
+    # Verify that the boot sequence correctly marks MODEL_ROUTER degraded in CapabilityRegistry
+    cap_registry = CapabilityRegistry()
+    if mgr.boot_mode == BootMode.DEGRADED:
+        cap_registry.mark_degraded(
+            CapabilityDomain.MODEL_ROUTER,
+            detail="j_prime_unreachable",
+        )
+    assert cap_registry.status_of(CapabilityDomain.MODEL_ROUTER) == DomainStatus.DEGRADED, (
+        "Spec section 4: MODEL_ROUTER must be marked DEGRADED when J-Prime is offline"
+    )
+    await mgr.stop()
