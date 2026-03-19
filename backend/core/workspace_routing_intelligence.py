@@ -60,6 +60,7 @@ class WorkspaceIntent(str, Enum):
     CREATE_EVENT = "create_event"
     SCHEDULE_MEETING = "schedule_meeting"
     CANCEL_EVENT = "cancel_event"
+    FIND_FREE_TIME = "find_free_time"
 
     CREATE_DOCUMENT = "create_document"
     EDIT_DOCUMENT = "edit_document"
@@ -234,6 +235,39 @@ class WorkspaceIntentDetector:
                 "time": r"at\s+(\d+(?::\d+)?\s*(?:am|pm)?)",
             },
             visual_keywords=["create", "schedule", "add"],
+            weight=0.95,
+        ))
+
+        self._patterns.append(IntentPattern(
+            intent=WorkspaceIntent.FIND_FREE_TIME,
+            triggers=[
+                "when am i free", "find free time", "when am i available",
+                "free slot", "availability", "open time", "schedule opening",
+                "free time", "available time", "open slot", "gap in schedule",
+                "when is there time", "find availability",
+            ],
+            entity_patterns={
+                "date": r"(?:for|on|this|next)\s+(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|week|\d+)",
+                "duration": r"(\d+)\s*(?:hour|hr|minute|min)",
+            },
+            visual_keywords=[],
+            weight=0.9,
+        ))
+
+        self._patterns.append(IntentPattern(
+            intent=WorkspaceIntent.CANCEL_EVENT,
+            triggers=[
+                "cancel meeting", "cancel event", "cancel my",
+                "remove event", "delete meeting", "cancel the",
+                "remove meeting", "delete event", "cancel appointment",
+                "remove appointment", "unschedule",
+            ],
+            entity_patterns={
+                "title": r"(?:called|titled|named)\s+(.+?)(?:\s+on|\s+at|$)",
+                "date": r"(?:for|on)\s+(today|tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|\d+)",
+                "time": r"at\s+(\d+(?::\d+)?\s*(?:am|pm)?)",
+            },
+            visual_keywords=["cancel", "remove", "delete"],
             weight=0.95,
         ))
 

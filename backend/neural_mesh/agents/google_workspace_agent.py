@@ -3721,6 +3721,14 @@ class GoogleWorkspaceAgent(BaseNeuralMeshAgent):
         self._documents_created = 0
         self._fallback_uses = 0
 
+    async def _narrate(self, text: str) -> None:
+        """Fire-and-forget voice narration for real-time feedback."""
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+            await safe_say(text)
+        except Exception:
+            pass  # Voice narration is best-effort
+
     async def on_initialize(self) -> None:
         """Initialize agent resources."""
         logger.info("Initializing GoogleWorkspaceAgent v2.0 (Unified Execution)")
@@ -4474,6 +4482,10 @@ Return ONLY a JSON object with these keys (use null if not found):
         """
         action = payload.get("action", "")
         execution_mode = payload.get("execution_mode", "auto")
+        # Default voice commands to visual mode so user can watch JARVIS work
+        source = payload.get("source", "")
+        if execution_mode == "auto" and source in ("voice_command", "unified_command_processor"):
+            execution_mode = "visual_preferred"
         visual_context = payload.get("visual_context")
         query = payload.get("query", "")
         deadline = payload.get("deadline_monotonic")
@@ -4740,11 +4752,20 @@ Return ONLY a JSON object with these keys (use null if not found):
             else:
                 result = await self._draft_email(payload)
         elif action == "send_email":
-            result = await self._send_email(payload)
+            # If payload has confirmed=True, this is the confirmed send after draft review
+            if payload.get("confirmed"):
+                result = await self._send_email(payload)
+            else:
+                # Step 1: Draft first, ask for confirmation
+                result = await self._send_email_with_confirmation(payload, execution_mode)
         elif action == "check_calendar_events":
             result = await self._check_calendar(payload)
         elif action == "create_calendar_event":
             result = await self._create_event(payload)
+        elif action == "find_free_time":
+            result = await self._find_free_time(payload)
+        elif action == "cancel_event":
+            result = await self._cancel_event(payload)
         elif action == "create_document":
             result = await self._create_document(payload)
         elif action == "get_contacts":
@@ -4800,6 +4821,7 @@ Return ONLY a JSON object with these keys (use null if not found):
         2. Computer Use (visual - open Gmail in browser)
         """
         limit = payload.get("limit", self.config.default_email_limit)
+        asyncio.create_task(self._narrate("Checking your inbox now."))
         allow_visual_fallback = bool(
             payload.get(
                 "allow_visual_fallback",
@@ -4856,6 +4878,50 @@ Return ONLY a JSON object with these keys (use null if not found):
                     success=True,
                     confidence=0.9,
                 )
+
+                # Enrich with email triage scoring for priority awareness
+                try:
+                    from backend.autonomy.email_triage.scoring import score_email
+                    emails = result.get("emails", [])
+                    for email in emails:
+                        score = score_email({
+                            "from": email.get("from", ""),
+                            "subject": email.get("subject", ""),
+                            "snippet": email.get("snippet", email.get("body", "")),
+                        })
+                        email["priority_score"] = score.get("score", 0.5)
+                        email["priority_tier"] = score.get("tier", "unknown")
+
+                    # Sort by priority (highest first)
+                    emails.sort(key=lambda e: e.get("priority_score", 0), reverse=True)
+                    result["emails"] = emails
+
+                    # Count by tier
+                    tier_counts = {}
+                    for email in emails:
+                        tier = email.get("priority_tier", "unknown")
+                        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+                    result["priority_summary"] = tier_counts
+
+                    # Narrate priority summary
+                    urgent = tier_counts.get("tier1_critical", 0) + tier_counts.get("tier2_important", 0)
+                    total = len(emails)
+                    if urgent > 0:
+                        asyncio.create_task(self._narrate(
+                            f"You have {total} unread emails. {urgent} are marked as important."
+                        ))
+                    else:
+                        asyncio.create_task(self._narrate(
+                            f"You have {total} unread emails. Nothing urgent."
+                        ))
+                except ImportError:
+                    # Triage scoring not available — still narrate count
+                    email_count = result.get("count", len(result.get("emails", [])))
+                    asyncio.create_task(self._narrate(
+                        f"You have {email_count} unread emails."
+                    ))
+                except Exception as e:
+                    logger.debug(f"Email triage scoring failed: {e}")
 
                 result["workspace_action"] = "fetch_unread_emails"
                 return result
@@ -4924,6 +4990,7 @@ Return ONLY a JSON object with these keys (use null if not found):
         to = payload.get("to", "")
         subject = payload.get("subject", "")
         body = payload.get("body", "")
+        asyncio.create_task(self._narrate(f"Drafting an email to {to or 'your recipient'}."))
         reply_to = payload.get("reply_to_id")
         query = payload.get("query", "")
         visual_context = payload.get("visual_context")
@@ -5178,6 +5245,7 @@ EMAIL BODY:"""
             f"[GoogleWorkspaceAgent] 🎬 Drafting email VISUALLY "
             f"(to: {to}, subject: {subject[:30]}...)"
         )
+        asyncio.create_task(self._narrate(f"Opening Gmail to draft your email to {to}."))
 
         # Ensure unified executor is available
         if not self._unified_executor:
@@ -5266,6 +5334,7 @@ EMAIL BODY:"""
         subject = payload.get("subject", "")
         body = payload.get("body", "")
         html_body = payload.get("html_body")
+        asyncio.create_task(self._narrate(f"Sending the email to {to or 'the recipient'} now."))
 
         if not to:
             return {"error": "Recipient 'to' is required", "workspace_action": "send_email"}
@@ -5309,6 +5378,72 @@ EMAIL BODY:"""
         result["workspace_action"] = "send_email"
         return result
 
+    async def _send_email_with_confirmation(
+        self, payload: Dict[str, Any], execution_mode: str = "auto",
+    ) -> Dict[str, Any]:
+        """Draft an email and ask the user for confirmation before sending.
+
+        Creates the draft (visually if voice command, via API otherwise),
+        then returns a pending_confirmation response. The user can say
+        "yes send it" or "no cancel" which routes back with confirmed=True.
+        """
+        to = payload.get("to", "")
+        subject = payload.get("subject", "")
+        body = payload.get("body", "")
+
+        if not to or not subject or not body:
+            return {
+                "status": "need_details",
+                "message": "I need the recipient, subject, and body to draft the email.",
+                "instructions": "Please provide: to, subject, and body",
+                "workspace_action": "send_email",
+            }
+
+        # Draft the email first (via API — creates a real Gmail draft)
+        draft_result = await self._draft_email(payload)
+
+        if draft_result.get("error"):
+            return draft_result
+
+        draft_id = draft_result.get("draft_id", "")
+
+        # If visual mode, also show it on screen
+        if execution_mode in ("visual_preferred", "visual_only"):
+            try:
+                await self._draft_email_visual(payload)
+            except Exception:
+                pass  # Visual is best-effort; API draft already created
+
+        # Voice narration: tell the user what we drafted
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+            await safe_say(
+                f"I've drafted an email to {to} with the subject: {subject}. "
+                f"Would you like me to send it, or would you like to make changes?"
+            )
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "status": "pending_confirmation",
+            "message": (
+                f"Email drafted to {to} with subject '{subject}'. "
+                f"Say 'yes, send it' to send, or 'no' to cancel. "
+                f"You can also edit it in Gmail Drafts."
+            ),
+            "workspace_action": "send_email",
+            "draft_id": draft_id,
+            "pending_action": "send_email",
+            "pending_payload": {
+                "to": to,
+                "subject": subject,
+                "body": body,
+                "confirmed": True,
+                "draft_id": draft_id,
+            },
+        }
+
     async def _check_calendar(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Check calendar events using unified executor with waterfall fallback.
@@ -5321,6 +5456,7 @@ EMAIL BODY:"""
         This is a "Never-Fail" operation - even if Google is down,
         JARVIS can still check your local calendar.
         """
+        asyncio.create_task(self._narrate("Let me check your calendar."))
         date_str = payload.get("date", "today")
         days = payload.get("days", 1)
         hours_ahead = days * 24
@@ -5445,6 +5581,168 @@ EMAIL BODY:"""
 
         result["workspace_action"] = "create_calendar_event"
         return result
+
+    async def _find_free_time(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Find free time slots using Calendar FreeBusy API."""
+        asyncio.create_task(self._narrate("Let me check your availability."))
+
+        days = payload.get("days", 3)
+        min_duration_minutes = payload.get("min_duration_minutes", 30)
+
+        try:
+            from datetime import datetime, timedelta
+            import pytz
+
+            # Get timezone from system or default to UTC
+            tz_name = payload.get("timezone", "America/Chicago")
+            tz = pytz.timezone(tz_name)
+
+            now = datetime.now(tz)
+            time_min = now.isoformat()
+            time_max = (now + timedelta(days=days)).isoformat()
+
+            if not self._client or not self._client._calendar_service:
+                return {
+                    "error": "Calendar API not available",
+                    "workspace_action": "find_free_time",
+                }
+
+            # Query FreeBusy
+            body = {
+                "timeMin": time_min,
+                "timeMax": time_max,
+                "items": [{"id": "primary"}],
+            }
+
+            freebusy = self._client._calendar_service.freebusy().query(body=body).execute()
+            busy_periods = freebusy.get("calendars", {}).get("primary", {}).get("busy", [])
+
+            # Find free slots (business hours: 9am-6pm)
+            free_slots = []
+            current = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            if current < now:
+                current += timedelta(days=1)
+
+            for day_offset in range(days):
+                day_start = current + timedelta(days=day_offset)
+                day_end = day_start.replace(hour=18)
+
+                # Get busy periods for this day
+                day_busy = []
+                for bp in busy_periods:
+                    bp_start = datetime.fromisoformat(bp["start"].replace("Z", "+00:00")).astimezone(tz)
+                    bp_end = datetime.fromisoformat(bp["end"].replace("Z", "+00:00")).astimezone(tz)
+                    if bp_start.date() == day_start.date():
+                        day_busy.append((bp_start, bp_end))
+
+                day_busy.sort(key=lambda x: x[0])
+
+                # Find gaps
+                slot_start = day_start
+                for busy_start, busy_end in day_busy:
+                    if (busy_start - slot_start).total_seconds() >= min_duration_minutes * 60:
+                        free_slots.append({
+                            "date": day_start.strftime("%A, %B %d"),
+                            "start": slot_start.strftime("%I:%M %p"),
+                            "end": busy_start.strftime("%I:%M %p"),
+                            "duration_minutes": int((busy_start - slot_start).total_seconds() / 60),
+                        })
+                    slot_start = max(slot_start, busy_end)
+
+                # Check remaining time after last meeting
+                if (day_end - slot_start).total_seconds() >= min_duration_minutes * 60:
+                    free_slots.append({
+                        "date": day_start.strftime("%A, %B %d"),
+                        "start": slot_start.strftime("%I:%M %p"),
+                        "end": day_end.strftime("%I:%M %p"),
+                        "duration_minutes": int((day_end - slot_start).total_seconds() / 60),
+                    })
+
+            # Narrate summary
+            if free_slots:
+                first = free_slots[0]
+                asyncio.create_task(self._narrate(
+                    f"You have {len(free_slots)} free slots in the next {days} days. "
+                    f"The next one is {first['date']} from {first['start']} to {first['end']}."
+                ))
+
+            return {
+                "success": True,
+                "free_slots": free_slots[:10],  # Cap at 10
+                "total_free_slots": len(free_slots),
+                "days_checked": days,
+                "min_duration_minutes": min_duration_minutes,
+                "workspace_action": "find_free_time",
+                "message": (
+                    f"Found {len(free_slots)} free slots in the next {days} days."
+                    if free_slots
+                    else f"No free slots of {min_duration_minutes}+ minutes found in the next {days} days."
+                ),
+            }
+
+        except Exception as e:
+            logger.error(f"[GoogleWorkspaceAgent] find_free_time failed: {e}")
+            return {
+                "error": str(e),
+                "workspace_action": "find_free_time",
+            }
+
+    async def _cancel_event(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Cancel a calendar event by ID or search term."""
+        asyncio.create_task(self._narrate("Looking for the event to cancel."))
+
+        event_id = payload.get("event_id", "")
+        search_term = payload.get("search", payload.get("title", ""))
+
+        try:
+            if not self._client or not self._client._calendar_service:
+                return {"error": "Calendar API not available", "workspace_action": "cancel_event"}
+
+            # If no event_id, search for the event
+            if not event_id and search_term:
+                from datetime import datetime, timedelta
+                now = datetime.utcnow().isoformat() + "Z"
+                future = (datetime.utcnow() + timedelta(days=7)).isoformat() + "Z"
+
+                events_result = self._client._calendar_service.events().list(
+                    calendarId="primary",
+                    timeMin=now,
+                    timeMax=future,
+                    q=search_term,
+                    maxResults=5,
+                    singleEvents=True,
+                    orderBy="startTime",
+                ).execute()
+
+                events = events_result.get("items", [])
+                if not events:
+                    return {
+                        "error": f"No upcoming events found matching '{search_term}'",
+                        "workspace_action": "cancel_event",
+                    }
+
+                # Use the first match
+                event_id = events[0]["id"]
+                event_name = events[0].get("summary", "Untitled")
+
+                asyncio.create_task(self._narrate(f"Found {event_name}. Cancelling it now."))
+
+            self._client._calendar_service.events().delete(
+                calendarId="primary",
+                eventId=event_id,
+            ).execute()
+
+            return {
+                "success": True,
+                "status": "cancelled",
+                "event_id": event_id,
+                "message": f"Event cancelled successfully.",
+                "workspace_action": "cancel_event",
+            }
+
+        except Exception as e:
+            logger.error(f"[GoogleWorkspaceAgent] cancel_event failed: {e}")
+            return {"error": str(e), "workspace_action": "cancel_event"}
 
     async def _get_contacts(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Get contacts."""
@@ -5700,6 +5998,7 @@ EMAIL BODY:"""
                 "get_contacts": WorkspaceIntent.GET_CONTACTS,
                 "create_document": WorkspaceIntent.CREATE_DOCUMENT,
                 "workspace_summary": WorkspaceIntent.DAILY_BRIEFING,
+                "find_free_time": WorkspaceIntent.FIND_FREE_TIME,
             }
             if getattr(shared_result, "is_workspace_command", False):
                 intent = intent_map.get(shared_intent_value, WorkspaceIntent.UNKNOWN)
@@ -5795,6 +6094,12 @@ EMAIL BODY:"""
                 "instructions": "Please provide: title, start, and optionally end, description, location, attendees",
                 "workspace_action": "create_calendar_event",
             }
+
+        elif intent == WorkspaceIntent.FIND_FREE_TIME:
+            return await self._find_free_time({
+                "days": payload.get("days", 3),
+                "deadline_monotonic": payload.get("deadline_monotonic"),
+            })
 
         else:
             return {

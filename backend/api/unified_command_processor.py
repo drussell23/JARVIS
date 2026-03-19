@@ -173,6 +173,8 @@ _WORKSPACE_INTENT_ACTION_MAP: Dict[str, str] = {
     "create_document": "create_document",
     "workspace_summary": "workspace_summary",
     "daily_briefing": "workspace_summary",
+    "find_free_time": "find_free_time",
+    "cancel_event": "cancel_event",
 }
 
 _WORKSPACE_FASTPATH_INTENTS: frozenset = frozenset({
@@ -188,6 +190,8 @@ _WORKSPACE_FASTPATH_INTENTS: frozenset = frozenset({
     "create_document",
     "workspace_summary",
     "daily_briefing",
+    "find_free_time",
+    "cancel_event",
 })
 
 
