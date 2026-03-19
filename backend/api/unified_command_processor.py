@@ -9289,6 +9289,283 @@ class UnifiedCommandProcessor:
         return self._detect_default_browser()
 
 
+    # =========================================================================
+    # v295.0: Screen Observation + Proactive Vision + Goal Inference helpers
+    # =========================================================================
+
+    # Compiled once at class body — zero per-call overhead
+    _SCREEN_OBS_RE = re.compile(
+        r"\b(what (do you |can you |can i |)see|describe (my |the |)screen|"
+        r"what('?s| is) on (my |the |)screen|look at (my |the |)screen|"
+        r"screen (description|read|check)|what('?s| is) (showing|displayed|open|visible))\b",
+        re.IGNORECASE,
+    )
+    _PROACTIVE_ON_RE = re.compile(
+        r"\b(watch|monitor|observe|start watching|start monitoring|proactive (mode|vision|screen)( on)?|"
+        r"keep (an )?eye on (my |the |)screen|ambient (monitor|mode) (on|start))\b",
+        re.IGNORECASE,
+    )
+    _PROACTIVE_OFF_RE = re.compile(
+        r"\b(stop (watching|monitoring|observing)|proactive (mode|vision|screen) off|"
+        r"stop (ambient|screen) monitor(ing)?|disable (proactive|ambient)|ambient (monitor|mode) (off|stop))\b",
+        re.IGNORECASE,
+    )
+
+    def _is_screen_observation_command(self, command_text: str) -> bool:
+        """Return True when the command is a one-shot 'what do you see?' query."""
+        return bool(self._SCREEN_OBS_RE.search(command_text))
+
+    def _is_proactive_mode_command(self, command_text: str) -> bool:
+        """Return True when the command toggles ambient screen monitoring."""
+        return bool(
+            self._PROACTIVE_ON_RE.search(command_text)
+            or self._PROACTIVE_OFF_RE.search(command_text)
+        )
+
+    async def _handle_screen_observation(
+        self, command_text: str, deadline: Optional[float] = None
+    ) -> Dict[str, Any]:
+        """Capture screen and describe it via J-Prime vision.
+
+        Pipeline:
+          screencapture (subprocess.run in thread) → base64 encode
+          → prime_client.send_vision_request() → TTS narration → return result
+        """
+        import base64
+        import subprocess
+        import tempfile as _tf
+
+        try:
+            from backend.core.interactive_brain_router import get_interactive_brain_router
+            _router = get_interactive_brain_router()
+            selection = _router.select_for_task("screen_observation", command_text)
+            vision_model = selection.vision_model or _router.get_vision_model()
+        except Exception:
+            vision_model = "llava-v1.5-7b"
+
+        # Capture screen to a temp PNG.
+        # subprocess.run(["screencapture", ...]) — argument list, never a shell string,
+        # input is entirely hard-coded constants (no user data in the argv).
+        tmp_path: Optional[str] = None
+        try:
+            with _tf.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                tmp_path = f.name
+
+            _timeout_cap = 8.0
+            if deadline is not None:
+                _timeout_cap = max(2.0, deadline - time.monotonic() - 5.0)
+
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    subprocess.run,
+                    ["screencapture", "-x", "-t", "png", tmp_path],
+                    capture_output=True,
+                    timeout=int(_timeout_cap),
+                ),
+                timeout=_timeout_cap + 1,
+            )
+
+            with open(tmp_path, "rb") as f:
+                img_bytes = f.read()
+            img_b64 = base64.b64encode(img_bytes).decode()
+
+        except Exception as exc:
+            logger.warning("[vision] Screen capture failed: %s", exc)
+            return {
+                "success": False,
+                "response": "I couldn't capture the screen right now. Please try again.",
+                "command_type": "screen_observation",
+                "error": str(exc),
+            }
+        finally:
+            if tmp_path:
+                try:
+                    import os as _os
+                    _os.unlink(tmp_path)
+                except Exception:
+                    pass
+
+        # Send to J-Prime vision
+        description = ""
+        source = "gcp_vision"
+        try:
+            from backend.core.prime_client import get_prime_client
+            _prime = get_prime_client()
+            vision_timeout = float(os.getenv("JARVIS_VISION_TIMEOUT_S", "30"))
+            if deadline is not None:
+                vision_timeout = max(5.0, deadline - time.monotonic() - 1.0)
+            prompt = (
+                "You are JARVIS, an AI assistant. Describe exactly what you see on this screen "
+                "in 2-4 natural sentences. Focus on what the user is doing and any important "
+                "information visible. Be concise and helpful."
+            )
+            prime_resp = await _prime.send_vision_request(
+                image_base64=img_b64,
+                prompt=prompt,
+                max_tokens=256,
+                timeout=vision_timeout,
+            )
+            description = prime_resp.content
+            source = prime_resp.source
+        except Exception as exc:
+            logger.warning("[vision] J-Prime vision unavailable: %s — falling back to Claude", exc)
+            try:
+                import anthropic
+                from backend.display.computer_use_connector import _get_brain_router_for_computer_use
+                _model = "claude-sonnet-4-20250514"
+                _br = _get_brain_router_for_computer_use()
+                if _br:
+                    _model = _br.get_claude_model("heavy")
+                _client = anthropic.Anthropic()
+                _msg = _client.messages.create(
+                    model=_model,
+                    max_tokens=256,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": img_b64,
+                                },
+                            },
+                            {"type": "text", "text": "Describe what you see on this screen in 2-4 sentences."},
+                        ],
+                    }],
+                )
+                description = _msg.content[0].text if _msg.content else ""
+                source = "claude_fallback"
+            except Exception as claude_exc:
+                logger.warning("[vision] Claude fallback also failed: %s", claude_exc)
+                description = "I can see your screen but couldn't analyse it right now."
+                source = "error"
+
+        # Narrate result
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+            asyncio.create_task(
+                safe_say(description, source="screen_observation"),
+                name="screen_obs_narration",
+            )
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "response": description,
+            "command_type": "screen_observation",
+            "vision_model": vision_model,
+            "source": source,
+        }
+
+    async def _handle_proactive_mode(self, command_text: str) -> Dict[str, Any]:
+        """Start or stop the ProactiveVisionIntelligence ambient monitor."""
+        activating = bool(self._PROACTIVE_ON_RE.search(command_text))
+
+        if not hasattr(self, "_proactive_vision"):
+            self._proactive_vision = None  # type: ignore[attr-defined]
+
+        if activating:
+            if self._proactive_vision is not None and self._proactive_vision.is_running():
+                msg = "I'm already watching your screen. I'll keep you updated on anything important."
+            else:
+                try:
+                    from backend.vision.proactive_vision_intelligence import ProactiveVisionIntelligence
+
+                    async def _narrate(notification: Dict[str, Any]) -> None:
+                        try:
+                            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                            await safe_say(
+                                notification.get("message", ""),
+                                source="proactive_vision",
+                            )
+                        except Exception:
+                            pass
+
+                    if self._proactive_vision is None:
+                        self._proactive_vision = ProactiveVisionIntelligence(
+                            vision_analyzer=None,
+                            notification_callback=_narrate,
+                        )
+                    interval = float(os.getenv("JARVIS_PROACTIVE_INTERVAL_S", "5.0"))
+                    await self._proactive_vision.start(on_narration=_narrate, interval_s=interval)
+                    msg = "I'm now watching your screen. I'll let you know if I notice anything important."
+                except Exception as exc:
+                    logger.warning("[vision] Proactive monitor start failed: %s", exc)
+                    msg = "I had trouble starting screen monitoring. Please try again."
+        else:
+            if self._proactive_vision is not None and self._proactive_vision.is_running():
+                try:
+                    await self._proactive_vision.stop()
+                    msg = "I've stopped monitoring your screen."
+                except Exception as exc:
+                    logger.warning("[vision] Proactive monitor stop failed: %s", exc)
+                    msg = "Screen monitoring stopped."
+            else:
+                msg = "I wasn't monitoring your screen."
+
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+            asyncio.create_task(safe_say(msg, source="proactive_mode"), name="proactive_mode_ack")
+        except Exception:
+            pass
+
+        return {
+            "success": True,
+            "response": msg,
+            "command_type": "proactive_vision",
+            "action": "start" if activating else "stop",
+        }
+
+    async def _get_neural_mesh_agent(self, agent_name: str) -> Optional[Any]:
+        """Resolve a specific agent by name from the Neural Mesh registry.
+
+        Returns None if the mesh is unavailable or the agent is not registered.
+        Callers treat None as a no-op.
+        """
+        coordinator = await self._get_neural_mesh_coordinator()
+        if coordinator is None:
+            return None
+        try:
+            if hasattr(coordinator, "get_agent"):
+                return await asyncio.wait_for(
+                    coordinator.get_agent(agent_name), timeout=0.5
+                )
+            registry = getattr(coordinator, "_agent_registry", None) or getattr(
+                coordinator, "agents", {}
+            )
+            return registry.get(agent_name)
+        except Exception as exc:
+            logger.debug("[v295] get_neural_mesh_agent(%s) failed: %s", agent_name, exc)
+            return None
+
+    async def _emit_goal_inference_experience(
+        self, goal_result: Dict[str, Any], command_text: str
+    ) -> None:
+        """Forward a goal inference result to Reactor Core for learning (best-effort)."""
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import get_experience_forwarder
+            fwd = await get_experience_forwarder()
+            await fwd.forward_experience(
+                experience_type="goal_inference_result",
+                input_data={"command": command_text[:500]},
+                output_data={
+                    "goal_id": goal_result.get("goal_id"),
+                    "category": goal_result.get("category"),
+                    "description": goal_result.get("description"),
+                    "intent_level": goal_result.get("intent_level"),
+                },
+                quality_score=float(goal_result.get("confidence", 0.5)),
+                confidence=float(goal_result.get("confidence", 0.5)),
+                success=True,
+                component="goal_inference_agent",
+            )
+        except Exception as exc:
+            logger.debug("[v295] goal_inference experience forward failed: %s", exc)
+
+
 # Singleton instance
 _unified_processor = None
 
