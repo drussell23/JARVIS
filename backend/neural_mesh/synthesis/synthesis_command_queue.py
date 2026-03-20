@@ -9,8 +9,9 @@ from __future__ import annotations
 import os
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 from backend.neural_mesh.synthesis.gap_signal_bus import CapabilityGapEvent
 
@@ -27,7 +28,7 @@ class SynthesisCommandQueue:
             os.environ.get("DAS_MODE_B_TTL_S", "1800")
         )
         self._lock = threading.Lock()
-        self._order: List[str] = []
+        self._order: deque = deque()
         self._store: Dict[str, SynthesisCommand] = {}
 
     def enqueue(self, event: CapabilityGapEvent) -> None:
@@ -47,13 +48,14 @@ class SynthesisCommandQueue:
                 key = self._order[0]
                 cmd = self._store.get(key)
                 if cmd is None:
-                    self._order.pop(0)
+                    # Guard for future remove() or external eviction paths.
+                    self._order.popleft()
                     continue
                 if now - cmd.enqueued_at > self._ttl:
-                    self._order.pop(0)
+                    self._order.popleft()
                     del self._store[key]
                     continue
-                self._order.pop(0)
+                self._order.popleft()
                 del self._store[key]
                 return cmd
         return None

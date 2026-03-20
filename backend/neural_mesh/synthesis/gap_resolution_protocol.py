@@ -18,6 +18,7 @@ Resolution modes:
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import os
 import time
@@ -73,6 +74,7 @@ class GapResolutionPolicy:
     slo_p99_ms: int = 5000
 
 
+@functools.lru_cache(maxsize=None)
 def _load_policy(domain_id: str) -> GapResolutionPolicy:
     try:
         data = yaml.safe_load(_POLICY_PATH.read_text())

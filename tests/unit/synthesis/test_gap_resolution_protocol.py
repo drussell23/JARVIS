@@ -18,9 +18,9 @@ def _evt(source="primary_fallback", task_type="vision_action", target_app="xcode
 
 
 def test_resolution_modes_exist():
-    assert ResolutionMode.A
-    assert ResolutionMode.B
-    assert ResolutionMode.C
+    assert ResolutionMode.A.value == "A"
+    assert ResolutionMode.B.value == "B"
+    assert ResolutionMode.C.value == "C"
 
 
 def test_19_states_defined():
@@ -58,13 +58,28 @@ def test_screen_observation_is_mode_c():
     assert mode == ResolutionMode.C
 
 
+def test_oscillation_freeze_blocks_after_threshold():
+    protocol = GapResolutionProtocol()
+    # Drive flip count to threshold — should freeze on the threshold-th flip
+    for _ in range(protocol._oscillation_flip_threshold):
+        protocol.record_route_flip("test_domain")
+    assert protocol._is_oscillating("test_domain")
+
+
+def test_oscillation_not_triggered_below_threshold():
+    protocol = GapResolutionProtocol()
+    for _ in range(protocol._oscillation_flip_threshold - 1):
+        protocol.record_route_flip("test_domain")
+    assert not protocol._is_oscillating("test_domain")
+
+
 @pytest.mark.asyncio
 async def test_single_flight_dedup_collapses_burst():
     protocol = GapResolutionProtocol()
     synthesis_calls = []
 
-    async def fake_synthesize(_event, dedupe_key):
-        synthesis_calls.append(dedupe_key)
+    async def fake_synthesize(_event, _dedupe_key, _retry_count=0):
+        synthesis_calls.append(_dedupe_key)
         await asyncio.sleep(0.02)
 
     protocol._synthesize = fake_synthesize
