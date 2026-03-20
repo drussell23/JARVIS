@@ -548,13 +548,90 @@ Auto-approve miner tasks only in AUTONOMOUS tier with risk gates.
 
 ## 10. Safety Invariants
 
-1. **Iteration never blocks user requests.** Separate concurrency slot + ResourceGovernor preemption.
+1. **Iteration never blocks user requests.** Separate scheduler instance + ResourceGovernor preemption.
 2. **No auto-merge to main.** REVIEW_GATE enforces human merge in OBSERVE/SUGGEST/GOVERNED tiers.
-3. **Budget is monotonic.** Ledger-backed window resets only on day boundary.
+3. **Budget is monotonic.** Ledger-backed window, iteration-specific tracking (not shared with BrainSelector).
 4. **Policy hash validates freshness.** Stale plans abort before execution.
-5. **Poisoned tasks don't loop.** 3 rejections → cooldown before retry.
-6. **Trust regression is automatic.** Error streak → tier demotion → miner tasks require ACK again.
-7. **Kill switch is immediate.** STOPPED cancels in-flight + writes terminal ledger entry.
-8. **All paths are canonical.** One function, shared across all components.
-9. **Causal trace is unbroken.** iteration_id propagates through every artifact.
-10. **Partial apply is detected.** Ledger checksum reconciliation prevents corrupted state.
+5. **Poisoned tasks don't loop.** 3 rejections with cooldown before retry.
+6. **Trust regression is automatic.** Error streak triggers tier demotion, miner tasks require ACK again.
+7. **Kill switch is immediate.** STOPPED cancels in-flight + writes terminal ledger event.
+8. **All paths are canonical.** Single `canonicalize_path()` function shared across all components.
+9. **Causal trace is unbroken.** iteration_id propagates through every artifact to Langfuse + PR.
+10. **Partial apply is detected.** Pre-apply checksums in ledger, reconciled on recovery.
+11. **Task source is pull-based.** Reads backlog JSON + miner scan directly (not via sensor/router pipeline).
+12. **Iteration uses dedicated scheduler.** Separate SubagentScheduler instance with own graph store.
+
+## 11. Review Fixes
+
+Fixes for all critical and important findings from spec review.
+
+### C1: Task Query API (pull-based work selection)
+
+The iteration service does NOT read from sensors or the intake router. It reads sources directly:
+
+- **Backlog**: Reads `~/.jarvis/backlog.json` directly, constructs `IterationTask` objects.
+- **Miner**: Calls `OpportunityMinerSensor.scan_once()` directly for `StaticCandidate` list.
+
+New class `IterationTaskSource` handles both with `get_backlog_tasks()` and `get_miner_tasks()`.
+Poisoned tasks (3+ rejections) are filtered out. Clean separation: sensors push to intake pipeline
+for reactive behavior; iteration service pulls for proactive behavior. Same data, different access.
+
+### C2: Iteration-Specific Cost Attribution
+
+`IterationBudgetGuard` tracks spend independently from `BrainSelector.daily_spend` via ledger
+entries tagged with `state=BUDGET_CHECKPOINT`. Cost per graph execution is extracted from
+`OperationResult` metadata. On startup, budget window is reconstructed from today's ledger entries.
+Iteration and user budgets are fully independent.
+
+### C3: Recovery Checksum Storage and Semantics
+
+Checksums stored in the **OperationLedger** (not ExecutionGraphStore) as `PRE_APPLY_CHECKSUM` entries.
+Before execution, `IterationRecoveryManager.capture_pre_apply_checksums()` snapshots SHA256 of all
+target files. On recovery, `reconcile()` compares current file state: pending units whose files changed
+externally trigger `PAUSE_IRRECOVERABLE`. Applied units whose files match ledger checksums allow safe resume.
+
+### I1: Startup Recovery Path
+
+On `start()`, check `graph_store.list_nonterminal()`. If in-flight graphs exist, enter RECOVERING
+before IDLE. Reconcile each graph via `IterationRecoveryManager`. Only transition to IDLE after all
+graphs are resolved.
+
+### I2: Miner Fairness
+
+Every Nth cycle, miner is checked **first** (priority slot). If miner has nothing, fall back to
+backlog. No wasted cycles. Default N=5.
+
+### I3: IterationTask Construction
+
+`IterationTaskSource` constructs `IterationTask` from both `BacklogTask` JSON and `StaticCandidate`.
+No backlog JSON schema changes needed. Mapping is explicit with field-by-field correspondence.
+
+### I4: Oracle Purity
+
+Oracle reads are read-only in-memory index lookups: `semantic_search()`, `get_file_neighborhood()`,
+`has_exported_symbols()`. No I/O, no network, no state mutation.
+
+### I5: PlanningContext.trust_tier Type
+
+Changed from `str` to `AutonomyTier` enum for type safety and hash consistency.
+
+### I6: REVIEW_GATE Contract
+
+Branch naming: `autonomy/{plan_id[:12]}`. PR target: `main`. PR label: `ouroboros-autonomy`.
+Git operations via `asyncio.create_subprocess_exec("git", ...)`. PR creation via `gh pr create`.
+`max_open_prs` enforced by counting existing labeled PRs before creating new ones.
+
+### I7: Separate SubagentScheduler Instance
+
+Iteration creates its own SubagentScheduler with `max_concurrent_graphs=1` and a dedicated
+store directory (`~/.jarvis/ouroboros/iteration-graphs/`). No state collision with interactive scheduler.
+
+### Additional Go/No-Go Tests
+
+| ID | Test | Verifies |
+|----|------|----------|
+| T31 | `test_feature_flag_off_mid_executing` | Flag toggled off transitions to STOPPED safely |
+| T32 | `test_no_overlapping_iteration_sessions` | Second start() is idempotent when already running |
+| T33 | `test_malformed_backlog_json_handled` | Bad JSON produces empty task list, no crash |
+| T34 | `test_iteration_state_persisted_on_crash` | consecutive_failures survives restart via ledger |
+| T35 | `test_voice_narrator_debounced_for_iteration` | Rapid state changes produce max 1 narration per 60s |
