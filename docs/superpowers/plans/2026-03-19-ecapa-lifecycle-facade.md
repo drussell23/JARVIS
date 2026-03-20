@@ -493,6 +493,101 @@ async def test_restart_consistency():
     assert ready is True
     assert facade.state == EcapaState.READY
     await facade.stop()
+
+
+@pytest.mark.asyncio
+async def test_get_status_returns_dict():
+    from backend.core.ecapa_facade import EcapaFacade
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = True
+    facade = EcapaFacade(registry=registry, config=_make_config())
+    status = facade.get_status()
+    assert isinstance(status, dict)
+    assert "state" in status
+    assert "tier" in status
+    assert "active_backend" in status
+    assert status["state"] == EcapaState.UNINITIALIZED.value
+    await facade.start()
+    await facade.ensure_ready(timeout=5.0)
+    status = facade.get_status()
+    assert status["state"] == EcapaState.READY.value
+    assert status["tier"] == EcapaTier.READY.value
+    await facade.stop()
+
+
+@pytest.mark.asyncio
+async def test_start_is_nonblocking():
+    """SLO: start() must return immediately without blocking supervisor."""
+    from backend.core.ecapa_facade import EcapaFacade
+    import time
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = False
+    wrapper.load = AsyncMock(side_effect=asyncio.sleep(60))
+    facade = EcapaFacade(registry=registry, config=_make_config())
+    t0 = time.monotonic()
+    await facade.start()
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.5, f"start() blocked for {elapsed:.1f}s (must be non-blocking)"
+    await facade.stop()
+
+
+@pytest.mark.asyncio
+async def test_flapping_hysteresis():
+    """Alternating success/fail must not cause rapid state flapping."""
+    from backend.core.ecapa_facade import EcapaFacade
+    import numpy as np
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = True
+    facade = EcapaFacade(registry=registry, config=_make_config(failure_threshold=3))
+    await facade.start()
+    await facade.ensure_ready(timeout=5.0)
+    # Alternate: 2 failures, 1 success, 2 failures, 1 success — never hits 3 consecutive
+    for _ in range(3):
+        wrapper.extract = AsyncMock(side_effect=RuntimeError("fail"))
+        try:
+            await facade.extract_embedding(b"a")
+        except Exception:
+            pass
+        try:
+            await facade.extract_embedding(b"a")
+        except Exception:
+            pass
+        wrapper.extract = AsyncMock(return_value=np.zeros(192))
+        await facade.extract_embedding(b"a")
+    # Should still be READY (success resets counter before hitting 3)
+    assert facade.state == EcapaState.READY
+    await facade.stop()
+
+
+@pytest.mark.asyncio
+async def test_cloud_unavailable_local_fallback():
+    """Cloud probe fails -> local model loads -> READY via local."""
+    from backend.core.ecapa_facade import EcapaFacade
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = True
+    cloud = _mock_cloud_client(healthy=False)
+    facade = EcapaFacade(registry=registry, cloud_client=cloud, config=_make_config())
+    await facade.start()
+    ready = await facade.ensure_ready(timeout=5.0)
+    assert ready is True
+    assert facade.active_backend == "local"
+    await facade.stop()
+
+
+@pytest.mark.asyncio
+async def test_local_unavailable_cloud_fallback():
+    """Local model import fails -> cloud serves -> READY via cloud."""
+    from backend.core.ecapa_facade import EcapaFacade
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = False
+    wrapper.load = AsyncMock(side_effect=ImportError("no speechbrain"))
+    cloud = _mock_cloud_client(healthy=True)
+    facade = EcapaFacade(registry=registry, cloud_client=cloud, config=_make_config())
+    await facade.start()
+    ready = await facade.ensure_ready(timeout=5.0)
+    assert ready is True
+    assert facade.active_backend in ("cloud_run", "docker")
+    await facade.stop()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -518,14 +613,20 @@ Create `backend/core/ecapa_facade.py`. Key implementation details:
 
 **`check_capability()`:** Pure function — lookup tier, return `CapabilityCheck` from a static mapping table. No I/O.
 
+**`get_status()`:** Return dict with `state`, `tier`, `active_backend`, `uptime_s`,
+`consecutive_failures`, `consecutive_successes`, `reprobe_budget_remaining`, `metrics`.
+Pure read of internal state — no I/O.
+
 **`subscribe()`:** Append callback to `_subscribers` list. Return a lambda that removes it.
 
 **Singleton factory `get_ecapa_facade()`:** Module-level `_facade_instance` + asyncio.Lock. PID file at `~/.jarvis/ecapa_facade.pid`.
 
+**`_reset_facade()`:** Test-only function that sets `_facade_instance = None`. Used by test teardown to reset singleton state between tests.
+
 - [ ] **Step 4: Run tests to verify they pass**
 
 Run: `cd /Users/djrussell23/Documents/repos/JARVIS-AI-Agent && python3 -m pytest tests/unit/core/test_ecapa_facade.py -v`
-Expected: All 17 tests PASS
+Expected: All 22 tests PASS
 
 - [ ] **Step 5: Commit**
 
@@ -646,10 +747,10 @@ Find the ECAPA background verification task launch (~line 74053-74058). BEFORE t
                         if _registry is not None:
                             _cloud = None
                             try:
-                                if hasattr(self, '_app') and hasattr(self._app.state, 'cloud_ecapa_client'):
-                                    _cloud = self._app.state.cloud_ecapa_client
+                                from backend.voice_unlock.cloud_ecapa_client import get_cloud_ecapa_client
+                                _cloud = await get_cloud_ecapa_client()
                             except Exception:
-                                pass
+                                pass  # Cloud client optional — facade works without it
                             self._ecapa_facade = EcapaFacade(
                                 registry=_registry,
                                 cloud_client=_cloud,
@@ -675,12 +776,16 @@ Find the supervisor's `_shutdown` or `_cleanup` method. Add:
             self._ecapa_facade = None
 ```
 
-- [ ] **Step 5: Verify the existing tests still pass**
+- [ ] **Step 5: Verify rollback works (ECAPA_USE_FACADE=false)**
+
+Set `ECAPA_USE_FACADE=false` in a test and verify the facade is not created. The supervisor should skip facade creation and use the old ECAPA plumbing.
+
+- [ ] **Step 6: Verify the existing tests still pass**
 
 Run: `cd /Users/djrussell23/Documents/repos/JARVIS-AI-Agent && python3 -m pytest tests/unit/core/test_ecapa_facade.py tests/unit/core/test_ecapa_types.py -v`
 Expected: All tests PASS
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add unified_supervisor.py
