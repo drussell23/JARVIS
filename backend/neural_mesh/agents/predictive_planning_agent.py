@@ -98,6 +98,7 @@ class IntentCategory(str, Enum):
     END_OF_DAY = "end_of_day"  # Wrap up, prepare to leave
     CREATIVE = "creative"  # Design, write, create content
     ADMIN = "admin"  # Administrative tasks
+    CROSS_APP = "cross_app"  # Multi-app chaining (e.g., LinkedIn → WhatsApp)
     CUSTOM = "custom"  # Custom/unknown intent
 
 
@@ -334,6 +335,17 @@ INTENT_PATTERNS: Dict[IntentCategory, List[str]] = {
         "admin", "expense", "timesheet", "report", "review", "approve",
         "schedule", "organize", "clean up",
     ],
+    IntentCategory.CROSS_APP: [
+        # LinkedIn → WhatsApp / other messenger
+        "on linkedin", "linkedin and", "from linkedin",
+        "find on linkedin", "look up on linkedin", "search linkedin",
+        # Cross-app send patterns
+        "then message", "then send", "then text", "then dm",
+        "and message on", "and send on", "and text on",
+        # Other cross-app chaining signals
+        "find and message", "find and send", "look up and message",
+        "search for and message", "find their",
+    ],
 }
 
 
@@ -537,7 +549,17 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
         context = await self.get_prediction_context(query)
 
         # 3. Expand tasks
-        if self._claude_client and confidence < 0.9:
+        # Pre-check: cross-app chaining has its own deterministic expansion and
+        # must run BEFORE the LLM path so the sequential dependency is preserved.
+        cross_app_parse = self._detect_cross_app_command(query)
+        if cross_app_parse is not None:
+            logger.info(
+                "[PPA] Cross-app intent detected: %s → %s",
+                cross_app_parse[1], cross_app_parse[2],
+            )
+            result = self._expand_cross_app_intent(query, cross_app_parse, context)
+            intent = IntentCategory.CROSS_APP
+        elif self._claude_client and confidence < 0.9:
             # Use LLM for intelligent expansion
             try:
                 result = await self._expand_with_llm(query, intent, context)
@@ -895,25 +917,42 @@ class PredictivePlanningAgent(BaseNeuralMeshAgent):
         """Expand intent using Claude LLM."""
         system_prompt = """You are JARVIS's Predictive Planning Engine.
 
-Your job is to expand vague user commands into concrete, executable tasks.
+Your job is to expand user commands into concrete, executable tasks for a multi-agent system.
+
+Available agent capabilities:
+- native_app_control: Drives installed macOS apps (WhatsApp, Slack, Discord, Spotify, Messages, Telegram) via vision-action loop
+- visual_browser: Drives Chrome via Playwright (LinkedIn, Twitter, web pages, any URL)
+- handle_workspace_query: Gmail, Google Calendar, Google Drive, Google Docs
+- web_search: DuckDuckGo / Google search (facts, news, research)
+- screen_capture: Screenshot / read what is on screen
+- error_detection: Debug errors, read logs, fix exceptions
+- computer_use: Generic fallback — can control any visible UI element
 
 Rules:
-1. Output 3-7 specific, actionable tasks
-2. Each task should be executable by a Computer Use agent
-3. Consider the time of day and context
-4. Prioritize tasks (1=most important)
-5. Identify target apps when possible
-6. Tasks should be independent (can run in parallel)
+1. Output 2-6 specific, actionable tasks
+2. Each task maps to one agent capability (use target_app to signal the right agent)
+3. Tasks CAN have dependencies — if task B requires task A's output, list task A's goal in B's depends_on
+4. For multi-app flows (e.g., find on LinkedIn THEN message on WhatsApp), create two sequential tasks with depends_on
+5. Prioritize tasks (1 = most important / runs first)
+6. Keep goals concrete: include person names, URLs, message content when present in the query
 
 Output Format (JSON):
 {
-    "reasoning": "Brief explanation of expansion logic",
+    "reasoning": "Brief explanation",
     "tasks": [
         {
-            "goal": "Specific action to take",
+            "goal": "Specific action, e.g. Search LinkedIn for Zach and extract their profile URL",
             "priority": 1,
-            "target_app": "App name or null",
-            "estimated_duration_seconds": 30
+            "target_app": "LinkedIn",
+            "estimated_duration_seconds": 45,
+            "depends_on": []
+        },
+        {
+            "goal": "Message Zach on WhatsApp: I will be 10 minutes late",
+            "priority": 2,
+            "target_app": "WhatsApp",
+            "estimated_duration_seconds": 20,
+            "depends_on": ["Search LinkedIn for Zach and extract their profile URL"]
         }
     ]
 }"""
@@ -924,7 +963,7 @@ User Command: "{query}"
 Detected Intent: {intent.value}
 Context: {context.to_full_prompt_context()}
 
-Generate a JSON list of 3-7 executable tasks."""
+Generate a JSON object with reasoning and tasks list."""
 
         try:
             response = await self._claude_client.messages.create(
@@ -951,7 +990,7 @@ Generate a JSON list of 3-7 executable tasks."""
                         priority=task_data.get("priority", i + 1),
                         target_app=task_data.get("target_app"),
                         estimated_duration_seconds=task_data.get("estimated_duration_seconds", 30),
-                        dependencies=[],
+                        dependencies=task_data.get("depends_on", []),
                         category=intent,
                     ))
 
@@ -996,6 +1035,192 @@ Generate a JSON list of 3-7 executable tasks."""
     # =========================================================================
     # Fallback Expansion
     # =========================================================================
+
+    # =========================================================================
+    # Cross-App Intent Detection & Expansion
+    # =========================================================================
+
+    # Maps app keywords → (canonical_name, primary_capability, fallback_capability)
+    _APP_CAPABILITY_MAP: Dict[str, Tuple[str, str, Optional[str]]] = {
+        "linkedin": ("LinkedIn", "visual_browser", "computer_use"),
+        "twitter": ("Twitter", "visual_browser", "computer_use"),
+        "instagram": ("Instagram", "visual_browser", "computer_use"),
+        "facebook": ("Facebook", "visual_browser", "computer_use"),
+        "whatsapp": ("WhatsApp", "native_app_control", "visual_browser"),
+        "telegram": ("Telegram", "native_app_control", "visual_browser"),
+        "discord": ("Discord", "native_app_control", "visual_browser"),
+        "slack": ("Slack", "native_app_control", "visual_browser"),
+        "imessage": ("Messages", "native_app_control", "computer_use"),
+        "messages": ("Messages", "native_app_control", "computer_use"),
+        "signal": ("Signal", "native_app_control", "computer_use"),
+        "teams": ("Microsoft Teams", "native_app_control", "computer_use"),
+    }
+
+    # Source-app verbs (lookup / find / research)
+    _SOURCE_VERBS = frozenset([
+        "find", "look up", "search", "search for", "lookup",
+        "check", "get", "locate", "research",
+    ])
+
+    # Destination-app verbs (communicate)
+    _DEST_VERBS = frozenset([
+        "message", "text", "dm", "send", "tell", "write", "notify",
+        "contact", "reach", "ping", "msg",
+    ])
+
+    @staticmethod
+    def _extract_person_name(query: str) -> str:
+        """Best-effort person name extraction from a natural language query.
+
+        Looks for capitalized word sequences after common subject indicators.
+        Returns empty string if no confident match found.
+        """
+        import re
+
+        # Patterns like "find Zach", "message John Smith", "look up Sarah Connor"
+        # Match 1-3 consecutive capitalized words after a verb
+        person_pattern = re.compile(
+            r"(?:find|message|text|dm|send|search for|look up|contact|tell|"
+            r"notify|reach|ping|msg)\s+([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})",
+        )
+        m = person_pattern.search(query)
+        if m:
+            return m.group(1).strip()
+
+        # Fallback: first capitalized word sequence that isn't a known app/verb
+        cap_words = re.findall(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b", query)
+        for phrase in cap_words:
+            lower = phrase.lower()
+            if lower not in PredictivePlanningAgent._APP_CAPABILITY_MAP:
+                return phrase
+
+        return ""
+
+    @staticmethod
+    def _extract_message_content(query: str, person: str) -> str:
+        """Extract the message body from a cross-app query.
+
+        Looks for content after tell|say|message|that|:
+        Returns a placeholder if nothing is found.
+        """
+        import re
+
+        # "tell him/her/them X", "say X", "message saying X"
+        patterns = [
+            r"(?:tell|say|message|that|saying|to say)[:\s]+(.+)$",
+            r'["\'](.+)["\']',
+        ]
+        for pat in patterns:
+            m = re.search(pat, query, re.IGNORECASE)
+            if m:
+                content = m.group(1).strip().rstrip(".")
+                if content and content.lower() not in ("him", "her", "them", "they"):
+                    return content
+
+        return f"[message content — please specify what to say to {person or 'them'}]"
+
+    def _detect_cross_app_command(
+        self, query: str
+    ) -> Optional[Tuple[str, str, str, str, str]]:
+        """Detect a cross-app chaining command.
+
+        Returns (person, source_app_key, dest_app_key, source_goal, dest_goal)
+        or None if this is not a cross-app command.
+
+        Examples that match:
+          "find Zach on LinkedIn then message him on WhatsApp"
+          "search for Sarah Connor on LinkedIn and send her a message on WhatsApp"
+          "look up Zach's LinkedIn and text him on WhatsApp: I'll be 10 min late"
+        """
+        lower = query.lower()
+
+        # Need at least one source app AND one dest app
+        source_key: Optional[str] = None
+        dest_key: Optional[str] = None
+
+        for app_key in self._APP_CAPABILITY_MAP:
+            if app_key not in lower:
+                continue
+            _, cap, _ = self._APP_CAPABILITY_MAP[app_key]
+            if cap == "visual_browser" and source_key is None:
+                source_key = app_key
+            elif cap == "native_app_control" and dest_key is None:
+                dest_key = app_key
+
+        if source_key is None or dest_key is None:
+            return None  # Not a cross-app command
+
+        # Also require at least one source-verb OR dest-verb in the query
+        has_source_verb = any(v in lower for v in self._SOURCE_VERBS)
+        has_dest_verb = any(v in lower for v in self._DEST_VERBS)
+        if not (has_source_verb or has_dest_verb):
+            return None
+
+        person = self._extract_person_name(query)
+        message_content = self._extract_message_content(query, person)
+        source_name = self._APP_CAPABILITY_MAP[source_key][0]
+        dest_name = self._APP_CAPABILITY_MAP[dest_key][0]
+
+        person_ref = person if person else "the person"
+        source_goal = (
+            f"Search {source_name} for {person_ref} and extract their full name "
+            f"and any available contact info"
+        )
+        dest_goal = (
+            f"Message {person_ref} on {dest_name}: {message_content}"
+        )
+
+        return person, source_key, dest_key, source_goal, dest_goal
+
+    def _expand_cross_app_intent(
+        self,
+        query: str,
+        parse: Tuple[str, str, str, str, str],
+        context: PredictionContext,
+    ) -> PredictionResult:
+        """Build a two-task sequential workflow for a cross-app command.
+
+        Task 1: Lookup on source app (visual_browser)
+        Task 2: Action on dest app (native_app_control) — depends on Task 1
+        """
+        person, source_key, dest_key, source_goal, dest_goal = parse
+        source_name, source_cap, _ = self._APP_CAPABILITY_MAP[source_key]
+        dest_name, dest_cap, _ = self._APP_CAPABILITY_MAP[dest_key]
+
+        task1 = ExpandedTask(
+            goal=source_goal,
+            priority=1,
+            target_app=source_name,
+            estimated_duration_seconds=45,
+            dependencies=[],
+            category=IntentCategory.CROSS_APP,
+        )
+        # Task 2 depends on Task 1 completing — dependency by goal string,
+        # resolved to task_id in to_workflow_tasks().
+        task2 = ExpandedTask(
+            goal=dest_goal,
+            priority=2,
+            target_app=dest_name,
+            estimated_duration_seconds=30,
+            dependencies=[source_goal],
+            category=IntentCategory.CROSS_APP,
+        )
+
+        person_label = person or "the person"
+        reasoning = (
+            f"Cross-app workflow: look up {person_label} on {source_name} "
+            f"({source_cap}), then message on {dest_name} ({dest_cap}) "
+            f"after lookup completes."
+        )
+
+        return PredictionResult(
+            original_query=query,
+            detected_intent=IntentCategory.CROSS_APP,
+            confidence=0.92,
+            expanded_tasks=[task1, task2],
+            reasoning=reasoning,
+            context_used=context.to_full_prompt_context(),
+        )
 
     def _expand_with_fallback(
         self,
