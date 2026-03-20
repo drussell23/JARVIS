@@ -342,6 +342,43 @@ class TestChainTelemetryEnvelope:
         assert received[0].partition_key == "reasoning"
 
 
+class TestLifecycleTelemetryEnvelope:
+    @pytest.mark.asyncio
+    async def test_lifecycle_transition_emits_envelope(self):
+        bus = TelemetryBus(max_queue=100)
+        received = []
+        async def handler(env):
+            received.append(env)
+        bus.subscribe("lifecycle.*", handler)
+
+        with patch("backend.core.jprime_lifecycle_controller.get_telemetry_bus", return_value=bus):
+            await bus.start()
+            from backend.core.jprime_lifecycle_controller import (
+                JprimeLifecycleController, RestartPolicy,
+                HealthResult, HealthVerdict,
+            )
+            ctrl = JprimeLifecycleController(
+                host="127.0.0.1", port=8000,
+                restart_policy=RestartPolicy(max_restarts=3, window_s=60.0, base_backoff_s=0.01),
+            )
+            ctrl._probe = AsyncMock()
+            ctrl._probe.check.return_value = HealthResult(
+                verdict=HealthVerdict.READY, ready_for_inference=True,
+            )
+            ctrl._prime_router_notify = AsyncMock()
+            ctrl._mind_client_update = AsyncMock()
+
+            await ctrl._do_probe()
+            await asyncio.sleep(0.1)
+            await bus.stop()
+
+        assert len(received) == 1
+        assert received[0].event_schema == "lifecycle.transition@1.0.0"
+        assert received[0].partition_key == "lifecycle"
+        assert received[0].payload["to_state"] == "READY"
+        assert received[0].source == "jprime_lifecycle_controller"
+
+
 class TestTelemetryBusSingleton:
     def test_singleton(self):
         import backend.core.telemetry_contract as mod

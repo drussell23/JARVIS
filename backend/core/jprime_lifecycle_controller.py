@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Deque, Dict, List, Optional
 
+from backend.core.telemetry_contract import TelemetryEnvelope, get_telemetry_bus
+
 logger = logging.getLogger(__name__)
 
 
@@ -417,15 +419,25 @@ class JprimeLifecycleController:
         await self._notify_downstream(to)
 
     def _emit_telemetry(self, transition: LifecycleTransition) -> None:
-        """Fire-and-forget telemetry emission via structured logging.
-
-        Future: forward to Reactor Core / Langfuse.
-        """
+        """Fire-and-forget telemetry via structured logging + TelemetryBus."""
         try:
             logger.debug(
                 "[JprimeLifecycle] telemetry: %s",
                 transition.to_telemetry_dict(),
             )
+            # v300.1: Emit to unified TelemetryBus
+            envelope = TelemetryEnvelope.create(
+                event_schema="lifecycle.transition@1.0.0",
+                source="jprime_lifecycle_controller",
+                trace_id=transition.root_cause_id or "",
+                span_id=str(uuid.uuid4())[:8],
+                partition_key="lifecycle",
+                severity="warning" if transition.to_state in (
+                    LifecycleState.UNHEALTHY, LifecycleState.TERMINAL,
+                ) else "info",
+                payload=transition.to_telemetry_dict(),
+            )
+            get_telemetry_bus().emit(envelope)
         except Exception:
             logger.debug("[JprimeLifecycle] telemetry emission failed", exc_info=True)
 
