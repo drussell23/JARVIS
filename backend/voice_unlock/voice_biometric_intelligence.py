@@ -57,6 +57,9 @@ import random
 
 logger = logging.getLogger(__name__)
 
+# v300.1: EcapaFacade feature flag (Phase 2 migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
 # =============================================================================
 # PHYSICS-AWARE & BAYESIAN FUSION INTEGRATION (v3.0)
 # =============================================================================
@@ -2806,23 +2809,38 @@ class VoiceBiometricIntelligence:
     async def _extract_embedding_fast(self, audio_data: bytes) -> Optional[Any]:
         """
         Extract embedding using fastest available method with cloud fallback (v5.0.0).
-        
+
         Priority order:
-        1. Local quantized encoder (fastest if available)
-        2. Local standard encoder (via registry)
-        3. Cloud ECAPA service (GCP Cloud Run fallback)
-        
+        1. EcapaFacade (v300.1 — if enabled)
+        2. Local quantized encoder (fastest if available)
+        3. Local standard encoder (via registry)
+        4. Cloud ECAPA service (GCP Cloud Run fallback)
+
         Features:
         - Timeout protection (prevents event loop blocking)
         - Automatic cloud fallback on local failure
         - Memory pressure detection for smart routing
         """
         import os
-        
+
+        # v300.1: EcapaFacade path — single authoritative extraction
+        if _USE_FACADE:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                result = await facade.extract_embedding(audio_data)
+                if result.success:
+                    self._stats['facade_extractions'] = self._stats.get('facade_extractions', 0) + 1
+                    return result.embedding
+            except Exception as e:
+                logger.debug(f"EcapaFacade extraction failed: {e}")
+            return None
+
+        # --- Legacy path below (unchanged) ---
         # Get configuration
         local_timeout = float(os.getenv('VBI_LOCAL_EXTRACTION_TIMEOUT', '5.0'))
         use_cloud_fallback = os.getenv('VBI_CLOUD_FALLBACK', 'true').lower() == 'true'
-        
+
         # Check memory pressure - skip local if RAM is low
         skip_local = False
         try:
@@ -3210,10 +3228,17 @@ class VoiceBiometricIntelligence:
             try:
                 import numpy as np
 
-                # Extract embedding from current audio using ML registry
+                # Extract embedding from current audio
+                # v300.1: EcapaFacade path for hot cache embedding extraction
                 try:
-                    from voice_unlock.ml_engine_registry import extract_speaker_embedding
-                    current_embedding = await extract_speaker_embedding(audio_data)
+                    if _USE_FACADE:
+                        from backend.core.ecapa_facade import get_ecapa_facade
+                        facade = await get_ecapa_facade()
+                        result = await facade.extract_embedding(audio_data)
+                        current_embedding = result.embedding if result.success else None
+                    else:
+                        from voice_unlock.ml_engine_registry import extract_speaker_embedding
+                        current_embedding = await extract_speaker_embedding(audio_data)
 
                     if current_embedding is not None and len(current_embedding) > 0:
                         # Ensure embeddings are same shape

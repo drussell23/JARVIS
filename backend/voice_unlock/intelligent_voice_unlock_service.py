@@ -64,6 +64,9 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+# v300.1: EcapaFacade feature flag (Phase 2 migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
 # =============================================================================
 # DYNAMIC TIMEOUT CONFIGURATION - Environment-configurable with smart defaults
 # =============================================================================
@@ -1401,24 +1404,38 @@ class IntelligentVoiceUnlockService:
         # =======================================================================
         # STEP 2: Try ML Engine Registry (handles both cloud and local)
         # =======================================================================
-        try:
-            from voice_unlock.ml_engine_registry import ensure_ecapa_available
+        # v300.1: EcapaFacade path — delegate readiness to facade singleton
+        if _USE_FACADE:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                success = await facade.ensure_ready(timeout=30.0)
+                if success:
+                    self._ecapa_available = True
+                    self._degraded_mode = False
+                    logger.info("✅ On-demand ECAPA SUCCESS via EcapaFacade")
+                    return True
+            except Exception as e:
+                logger.warning(f"   EcapaFacade ensure_ready failed: {e}")
+        else:
+            try:
+                from voice_unlock.ml_engine_registry import ensure_ecapa_available
 
-            # ensure_ecapa_available has built-in hybrid cloud support
-            result = await ensure_ecapa_available(timeout=30.0, allow_cloud=True)
-            if isinstance(result, tuple):
-                success, message, _ = result
-            else:
-                success = result
+                # ensure_ecapa_available has built-in hybrid cloud support
+                result = await ensure_ecapa_available(timeout=30.0, allow_cloud=True)
+                if isinstance(result, tuple):
+                    success, message, _ = result
+                else:
+                    success = result
 
-            if success:
-                self._ecapa_available = True
-                self._degraded_mode = False
-                logger.info(f"✅ On-demand ECAPA SUCCESS via ensure_ecapa_available()")
-                return True
+                if success:
+                    self._ecapa_available = True
+                    self._degraded_mode = False
+                    logger.info(f"✅ On-demand ECAPA SUCCESS via ensure_ecapa_available()")
+                    return True
 
-        except Exception as e:
-            logger.warning(f"   ensure_ecapa_available failed: {e}")
+            except Exception as e:
+                logger.warning(f"   ensure_ecapa_available failed: {e}")
 
         # =======================================================================
         # STEP 3: Try Unified Voice Cache (may have cloud connection)
@@ -4119,6 +4136,20 @@ async def get_cached_ecapa_classifier():
 
 async def prewarm_ecapa_classifier():
     """Pre-warm the ECAPA classifier at startup. Call this in server initialization."""
+    # v300.1: EcapaFacade path — prewarm via facade readiness check
+    if _USE_FACADE:
+        try:
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            ready = await facade.ensure_ready(timeout=30.0)
+            if ready:
+                logger.info("[ROBUST-ECAPA] ECAPA pre-warmed via EcapaFacade")
+                return True
+        except Exception as e:
+            logger.error(f"[ROBUST-ECAPA] EcapaFacade prewarm failed: {e}")
+        return False
+
+    # --- Legacy path below (unchanged) ---
     try:
         logger.info("[ROBUST-ECAPA] Pre-warming ECAPA classifier...")
         classifier = await get_cached_ecapa_classifier()

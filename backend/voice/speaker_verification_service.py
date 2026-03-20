@@ -62,6 +62,9 @@ from uuid import uuid4
 
 import numpy as np
 
+# v300.1: EcapaFacade feature flag (Phase 2 migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
 # Import managed executor for clean shutdown
 try:
     from core.thread_manager import ManagedThreadPoolExecutor
@@ -3445,7 +3448,22 @@ class SpeakerVerificationService:
         # This was missing and caused voice verification to return 0% confidence
         # because the ECAPA encoder never got loaded.
         # ========================================================================
-        if ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
+        # v300.1: EcapaFacade path — delegate readiness check to facade
+        if _USE_FACADE:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                ecapa_phase6_timeout = float(os.environ.get("ECAPA_PHASE6_TIMEOUT", "25.0"))
+                facade = await get_ecapa_facade()
+                ecapa_ok = await facade.ensure_ready(timeout=ecapa_phase6_timeout)
+                if ecapa_ok:
+                    self._use_registry_encoder = True
+                    self._ecapa_load_source = "facade"
+                    logger.info("✅ [FAST-INIT] ECAPA ready via EcapaFacade")
+                else:
+                    logger.warning("⚠️ [FAST-INIT] EcapaFacade not ready - will use SpeechBrain fallback")
+            except Exception as e:
+                logger.warning(f"⚠️ [FAST-INIT] EcapaFacade error: {e} - will use SpeechBrain fallback")
+        elif ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
             logger.info("🔄 [FAST-INIT] Triggering ECAPA loading from ML Engine Registry...")
             try:
                 # Start ECAPA loading as background task to keep init fast
@@ -3460,7 +3478,7 @@ class SpeakerVerificationService:
                 effective_timeout = min(ecapa_load_timeout, ecapa_phase6_timeout)
                 logger.info(f"   [FAST-INIT] ECAPA timeout: {effective_timeout:.1f}s (phase6 cap: {ecapa_phase6_timeout}s)")
 
-                # 🆕 EDGE-NATIVE: In edge-native mode, NEVER allow cloud ECAPA
+                # EDGE-NATIVE: In edge-native mode, NEVER allow cloud ECAPA
                 if self._edge_config.enabled and self._edge_config.local_ecapa_only:
                     ecapa_allow_cloud = False
                     logger.info("🌐 [EDGE-NATIVE] Cloud ECAPA disabled - local only")
@@ -4002,7 +4020,21 @@ class SpeakerVerificationService:
         ecapa_retry_attempts = int(os.environ.get("ECAPA_RETRY_ATTEMPTS", "3"))
         ecapa_retry_delay = float(os.environ.get("ECAPA_RETRY_DELAY", "2.0"))
 
-        if ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
+        # v300.1: EcapaFacade path — delegate readiness to facade singleton
+        if _USE_FACADE:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                ecapa_ok = await facade.ensure_ready(timeout=ecapa_load_timeout)
+                if ecapa_ok:
+                    self._use_registry_encoder = True
+                    self._ecapa_load_source = "facade"
+                    logger.info("✅ [INIT] ECAPA ready via EcapaFacade")
+                else:
+                    logger.warning("⚠️ [INIT] EcapaFacade not ready - falling back to local engine")
+            except Exception as e:
+                logger.warning(f"⚠️ [INIT] EcapaFacade error: {e} - falling back to local engine")
+        elif ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
             logger.info("🔄 [INIT] ML Engine Registry available - proactively loading ECAPA...")
 
             ecapa_loaded = False
@@ -4142,6 +4174,19 @@ class SpeakerVerificationService:
         Returns:
             Embedding tensor or None on failure
         """
+        # v300.1: EcapaFacade path — single authoritative ECAPA lifecycle owner
+        if _USE_FACADE:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                result = await facade.extract_embedding(audio_data)
+                if result.success:
+                    return result.embedding
+                return None
+            except Exception:
+                return None  # Facade unavailable, return None like old path
+
+        # --- Legacy path below (unchanged) ---
         try:
             # Early validation: reject empty or invalid audio
             if audio_data is None or len(audio_data) == 0:
