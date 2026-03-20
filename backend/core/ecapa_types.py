@@ -183,11 +183,12 @@ class EcapaStateEvent:
         error_class: Optional[str] = None,
         latency_ms: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        root_cause_id: Optional[str] = None,
     ) -> "EcapaStateEvent":
         import time
         return cls(
             event_id=str(uuid.uuid4()),
-            root_cause_id=str(uuid.uuid4()),
+            root_cause_id=root_cause_id or str(uuid.uuid4()),
             timestamp=time.time(),
             warning_code=warning_code,
             previous_state=previous_state,

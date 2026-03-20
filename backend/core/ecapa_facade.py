@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.core.ecapa_types import (
@@ -73,6 +74,7 @@ _DEGRADED_ALLOWED: Set[VoiceCapability] = {
     VoiceCapability.PASSWORD_FALLBACK,
     VoiceCapability.VOICE_UNLOCK,
     VoiceCapability.AUTH_COMMAND,
+    VoiceCapability.EXTRACT_EMBEDDING,
 }
 
 _DEGRADED_CONSTRAINED: Dict[VoiceCapability, Dict[str, Any]] = {
@@ -127,13 +129,16 @@ class EcapaFacade:
         self._consecutive_failures = 0
         self._consecutive_successes = 0
 
-        # Back-pressure
-        self._semaphore = asyncio.Semaphore(self._config.max_concurrent_extractions)
-        self._active_extractions = 0
-        self._extraction_lock = asyncio.Lock()
+        # Back-pressure — counter-based (no TOCTOU race)
+        self._max_concurrent = self._config.max_concurrent_extractions
+        self._inflight_count = 0
+        self._inflight_lock = asyncio.Lock()
 
         # Timing
         self._started_at: Optional[float] = None
+
+        # Root cause ID propagation (Issue 5)
+        self._current_root_cause_id: Optional[str] = None
         self._last_root_cause_id: Optional[str] = None
 
     # -- public read-only properties -----------------------------------------
@@ -186,7 +191,10 @@ class EcapaFacade:
         self._ready_event.clear()
         self._consecutive_failures = 0
         self._consecutive_successes = 0
+        self._inflight_count = 0
         self._started_at = None
+
+        self._current_root_cause_id = None
 
         if old_state != EcapaState.UNINITIALIZED:
             await self._emit_event(
@@ -195,7 +203,7 @@ class EcapaFacade:
                     new_state=EcapaState.UNINITIALIZED,
                     active_backend=None,
                     reason="stop() called",
-                    warning_code="ECAPA_W001",
+                    warning_code="ECAPA_STOP",
                 )
             )
 
@@ -230,18 +238,18 @@ class EcapaFacade:
                 f"ECAPA backend unavailable (state={self._state.value})"
             )
 
-        # Non-blocking semaphore check for back-pressure
-        acquired = self._semaphore._value > 0  # noqa: SLF001 — fast path
-        if not acquired:
-            raise EcapaOverloadError(
-                retry_after_s=1.0,
-                message=(
-                    f"ECAPA at capacity: {self._config.max_concurrent_extractions} "
-                    "concurrent extractions already running"
-                ),
-            )
+        # Atomic counter-based back-pressure (no TOCTOU race)
+        async with self._inflight_lock:
+            if self._inflight_count >= self._max_concurrent:
+                raise EcapaOverloadError(
+                    retry_after_s=1.0,
+                    message=(
+                        f"ECAPA at capacity: {self._max_concurrent} "
+                        "concurrent extractions already running"
+                    ),
+                )
+            self._inflight_count += 1
 
-        await self._semaphore.acquire()
         t0 = time.monotonic()
         try:
             embedding = await self._route_extraction(audio)
@@ -261,6 +269,20 @@ class EcapaFacade:
             self._consecutive_failures += 1
             self._consecutive_successes = 0
 
+            # Emit extraction failure event with derived root cause
+            await self._emit_event(
+                EcapaStateEvent.make(
+                    previous_state=self._state,
+                    new_state=self._state,
+                    active_backend=self._active_backend,
+                    reason=f"Extraction failed: {type(exc).__name__}: {exc}",
+                    warning_code="ECAPA_W005",
+                    error_class=type(exc).__name__,
+                    latency_ms=latency_ms,
+                    root_cause_id=self._current_root_cause_id,
+                )
+            )
+
             # Check failure threshold -> DEGRADED
             if (
                 self._state == EcapaState.READY
@@ -269,13 +291,14 @@ class EcapaFacade:
                 await self._try_transition(
                     EcapaState.DEGRADED,
                     reason=f"{self._consecutive_failures} consecutive extraction failures",
-                    warning_code="ECAPA_W001",
+                    warning_code="ECAPA_W006",
                     error_class=type(exc).__name__,
                 )
 
             raise
         finally:
-            self._semaphore.release()
+            async with self._inflight_lock:
+                self._inflight_count -= 1
 
     def check_capability(self, capability: VoiceCapability) -> CapabilityCheck:
         """Synchronous capability admission check based on current tier."""
@@ -362,10 +385,18 @@ class EcapaFacade:
         error_class: Optional[str] = None,
         latency_ms: Optional[float] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        root_cause_id: Optional[str] = None,
     ) -> bool:
         """Attempt a state transition under the state lock.
 
         Returns True if the transition was legal and executed, False otherwise.
+
+        Parameters
+        ----------
+        root_cause_id:
+            If provided, reuse this ID for the event (derived event).
+            If ``None``, a new root cause ID is generated (root event)
+            and stored as ``_current_root_cause_id``.
         """
         async with self._state_lock:
             key = (self._state, new_state)
@@ -388,6 +419,13 @@ class EcapaFacade:
             else:
                 self._ready_event.clear()
 
+            # Root cause ID: new transitions generate a new root cause,
+            # derived events reuse the provided one.
+            effective_root_cause_id = root_cause_id
+            if effective_root_cause_id is None:
+                effective_root_cause_id = str(uuid.uuid4())
+                self._current_root_cause_id = effective_root_cause_id
+
             event = EcapaStateEvent.make(
                 previous_state=old_state,
                 new_state=new_state,
@@ -397,6 +435,7 @@ class EcapaFacade:
                 error_class=error_class,
                 latency_ms=latency_ms,
                 metadata=metadata,
+                root_cause_id=effective_root_cause_id,
             )
             self._last_root_cause_id = event.root_cause_id
 
@@ -441,7 +480,7 @@ class EcapaFacade:
                 await self._try_transition(
                     EcapaState.READY,
                     reason="Cloud backend healthy",
-                    warning_code="ECAPA_W001",
+                    warning_code="ECAPA_W003",
                 )
                 return
 
@@ -450,7 +489,7 @@ class EcapaFacade:
                 await self._try_transition(
                     EcapaState.READY,
                     reason="Local backend loaded",
-                    warning_code="ECAPA_W001",
+                    warning_code="ECAPA_W003",
                 )
                 return
 
@@ -458,7 +497,7 @@ class EcapaFacade:
             await self._try_transition(
                 EcapaState.LOADING,
                 reason="Probes failed, attempting local load",
-                warning_code="ECAPA_W001",
+                warning_code="ECAPA_STATE_CHANGE",
             )
 
             try:
@@ -471,7 +510,7 @@ class EcapaFacade:
                     await self._try_transition(
                         EcapaState.READY,
                         reason="Local backend loaded after explicit load()",
-                        warning_code="ECAPA_W001",
+                        warning_code="ECAPA_W004",
                     )
                     return
             except (asyncio.TimeoutError, Exception) as exc:
@@ -481,9 +520,11 @@ class EcapaFacade:
             await self._try_transition(
                 EcapaState.UNAVAILABLE,
                 reason="All backends exhausted",
-                warning_code="ECAPA_W001",
+                warning_code="ECAPA_W002",
                 error_class="NoBackendAvailable",
             )
+            # Launch reprobe loop when entering UNAVAILABLE
+            self._launch_reprobe_loop()
 
         except asyncio.CancelledError:
             logger.debug("Probe-and-load task cancelled")
@@ -495,8 +536,9 @@ class EcapaFacade:
                 await self._try_transition(
                     EcapaState.UNAVAILABLE,
                     reason="Unexpected probe error",
-                    warning_code="ECAPA_W001",
+                    warning_code="ECAPA_W002",
                 )
+                self._launch_reprobe_loop()
             except Exception:
                 pass
 
@@ -537,15 +579,157 @@ class EcapaFacade:
             raise EcapaUnavailableError("No active backend for extraction")
 
     async def _emit_event(self, event: EcapaStateEvent) -> None:
-        """Emit an event to all subscribers, catching their exceptions."""
+        """Emit an event to all subscribers via fire-and-forget tasks.
+
+        Each subscriber call is wrapped in ``asyncio.create_task`` so that:
+        - Slow subscribers do not block the state machine.
+        - Exceptions are logged but do not propagate.
+        """
         for sub in list(self._subscribers):
-            try:
-                result = sub(event)
-                # Support both sync and async subscribers
-                if asyncio.iscoroutine(result):
-                    await result
-            except Exception:
-                logger.exception("Subscriber %r raised during event emission", sub)
+            asyncio.create_task(self._run_subscriber(sub, event))
+
+    @staticmethod
+    async def _run_subscriber(sub: Callable, event: EcapaStateEvent) -> None:
+        """Invoke a single subscriber, handling sync and async callbacks."""
+        try:
+            result = sub(event)
+            # Support both sync and async subscribers
+            if asyncio.iscoroutine(result):
+                await result
+        except Exception:
+            logger.exception("Subscriber %r raised during event emission", sub)
+
+    # -- reprobe loop (Issue 2) -----------------------------------------------
+
+    def _launch_reprobe_loop(self) -> None:
+        """Start the reprobe background task if not already running."""
+        # Only launch when UNAVAILABLE
+        if self._state != EcapaState.UNAVAILABLE:
+            return
+        task = asyncio.ensure_future(self._reprobe_loop())
+        self._bg_tasks.append(task)
+
+    async def _reprobe_loop(self) -> None:
+        """Background loop: exponential-backoff reprobing while UNAVAILABLE.
+
+        On success: UNAVAILABLE -> RECOVERING, then test N successes -> READY.
+        On budget exhaustion: emit ECAPA_W015 and stop.
+        """
+        budget_remaining = self._config.reprobe_budget
+        backoff = self._config.reprobe_interval_s
+
+        try:
+            while self._state == EcapaState.UNAVAILABLE and budget_remaining > 0:
+                await asyncio.sleep(backoff)
+
+                # If state changed (e.g., stop() was called), bail out
+                if self._state != EcapaState.UNAVAILABLE:
+                    return
+
+                # Lightweight probe
+                cloud_ok = False
+                local_ok = False
+                try:
+                    cloud_ok = await asyncio.wait_for(
+                        self._probe_cloud(),
+                        timeout=self._config.probe_timeout_s,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass
+
+                if not cloud_ok:
+                    try:
+                        local_ok = await asyncio.wait_for(
+                            self._probe_local(),
+                            timeout=self._config.probe_timeout_s,
+                        )
+                    except (asyncio.TimeoutError, Exception):
+                        pass
+
+                if cloud_ok or local_ok:
+                    # Found a candidate
+                    candidate_backend = "cloud" if cloud_ok else "local"
+                    await self._emit_event(
+                        EcapaStateEvent.make(
+                            previous_state=self._state,
+                            new_state=self._state,
+                            active_backend=candidate_backend,
+                            reason=f"Reprobe found candidate: {candidate_backend}",
+                            warning_code="ECAPA_W009",
+                            root_cause_id=self._current_root_cause_id,
+                        )
+                    )
+
+                    self._active_backend = candidate_backend
+                    ok = await self._try_transition(
+                        EcapaState.RECOVERING,
+                        reason=f"Reprobe found {candidate_backend}",
+                        warning_code="ECAPA_W009",
+                    )
+                    if ok:
+                        # Test N consecutive successes before promoting to READY
+                        success_count = 0
+                        while success_count < self._config.recovery_threshold:
+                            try:
+                                if candidate_backend == "cloud":
+                                    healthy = await self._probe_cloud()
+                                else:
+                                    healthy = await self._probe_local()
+                                if healthy:
+                                    success_count += 1
+                                else:
+                                    # Recovery failed
+                                    break
+                            except Exception:
+                                break
+
+                            if success_count < self._config.recovery_threshold:
+                                await asyncio.sleep(self._config.reprobe_interval_s)
+
+                        if success_count >= self._config.recovery_threshold:
+                            await self._try_transition(
+                                EcapaState.READY,
+                                reason=f"Recovery verified: {success_count} consecutive successes",
+                                warning_code="ECAPA_W007",
+                            )
+                            return  # Fully recovered
+                        else:
+                            # Fall back to UNAVAILABLE
+                            await self._try_transition(
+                                EcapaState.UNAVAILABLE,
+                                reason="Recovery verification failed",
+                                warning_code="ECAPA_W008",
+                            )
+                            # Continue reprobe loop
+                    # Reset backoff on any probe success
+                    backoff = self._config.reprobe_interval_s
+                else:
+                    # Probe failed
+                    budget_remaining -= 1
+                    backoff = min(backoff * 2, self._config.reprobe_max_backoff_s)
+
+            # Budget exhausted
+            if budget_remaining <= 0 and self._state == EcapaState.UNAVAILABLE:
+                logger.warning(
+                    "ECAPA reprobe budget exhausted (%d attempts)",
+                    self._config.reprobe_budget,
+                )
+                await self._emit_event(
+                    EcapaStateEvent.make(
+                        previous_state=self._state,
+                        new_state=self._state,
+                        active_backend=None,
+                        reason=f"Reprobe budget exhausted after {self._config.reprobe_budget} attempts",
+                        warning_code="ECAPA_W015",
+                        root_cause_id=self._current_root_cause_id,
+                    )
+                )
+
+        except asyncio.CancelledError:
+            logger.debug("Reprobe loop cancelled")
+            raise
+        except Exception:
+            logger.exception("Unexpected error in _reprobe_loop")
 
 
 # ---------------------------------------------------------------------------
