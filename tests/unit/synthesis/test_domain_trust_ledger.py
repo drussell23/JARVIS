@@ -53,7 +53,6 @@ def test_incident_resets_to_tier1(ledger):
     domain = "test:incident_reset"
     for _ in range(25):
         ledger.record_success(domain)
-    pre = ledger.record(domain).tier
     ledger.record_incident(domain)
     assert ledger.record(domain).tier == 1
 
@@ -64,7 +63,6 @@ def test_tier3_requires_zero_incidents(ledger):
         ledger.record_success(domain)
     for _ in range(5):
         ledger.record_audit(domain)
-    r = ledger.record(domain)
     # If incident_count > 0 it cannot be tier 3
     ledger.record_incident(domain)
     assert ledger.record(domain).tier < 3
