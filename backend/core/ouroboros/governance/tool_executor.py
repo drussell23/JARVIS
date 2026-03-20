@@ -236,6 +236,31 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"read", "subprocess"}),
     ),
+    # ---- Phase C/D tools (optional, env-gated) ----
+    "bash": ToolManifest(
+        name="bash", version="1.0",
+        description="Execute a sandboxed shell command (allowlisted, timeout-enforced)",
+        arg_schema={
+            "command": {"type": "string"},
+            "timeout": {"type": "number"},
+        },
+        capabilities=frozenset({"subprocess", "write"}),
+    ),
+    "web_fetch": ToolManifest(
+        name="web_fetch", version="1.0",
+        description="Fetch a URL and return text content (HTML stripped)",
+        arg_schema={"url": {"type": "string"}},
+        capabilities=frozenset({"network"}),
+    ),
+    "web_search": ToolManifest(
+        name="web_search", version="1.0",
+        description="Search the web via DuckDuckGo, return titles/URLs/snippets",
+        arg_schema={
+            "query":       {"type": "string"},
+            "max_results": {"type": "integer", "default": 5},
+        },
+        capabilities=frozenset({"network"}),
+    ),
 }
 
 

@@ -482,7 +482,10 @@ def _build_tool_section() -> str:
         "- `read_file(path, lines_from=1, lines_to=200)` — read file content (repo-relative path)\n"
         "- `list_symbols(module_path)` — list functions and classes in a Python file\n"
         "- `run_tests(paths)` — run pytest for the given test paths (list of strings), returns summary\n"
-        "- `get_callers(function_name, file_path=None)` — find call sites of a function\n\n"
+        "- `get_callers(function_name, file_path=None)` — find call sites of a function\n"
+        "- `bash(command, timeout=30)` — execute a shell command (sandboxed, allowlisted)\n"
+        "- `web_fetch(url)` — fetch a URL and return its text content (HTML stripped)\n"
+        '- `web_search(query, max_results=5)` — search the web, returns titles/URLs/snippets\n\n'
         f"Max {MAX_TOOL_ITERATIONS} tool calls total. After gathering info, respond with the patch JSON."
     )
 
