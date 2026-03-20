@@ -61,10 +61,11 @@ def test_capability_gap_in_valid_sources():
 
 def test_capability_gap_sensor_registered_in_agent_initializer():
     """agent_initializer must import CapabilityGapSensor."""
-    import importlib
+    import importlib.util
     src = importlib.util.find_spec(
         "backend.neural_mesh.agents.agent_initializer"
     )
     assert src is not None
+    assert src.origin is not None
     text = open(src.origin).read()
     assert "CapabilityGapSensor" in text
