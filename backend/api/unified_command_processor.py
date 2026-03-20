@@ -2235,6 +2235,22 @@ class UnifiedCommandProcessor:
         except Exception:
             pass  # Sensory failure never blocks command processing
 
+        # Inject live agent capability index so J-Prime ExecutionPlanner can do
+        # dynamic tool assignment instead of falling back to its static _TOOL_MAP.
+        try:
+            from backend.neural_mesh.registry.agent_registry import (
+                get_agent_registry,
+                get_capability_index,
+            )
+            _cap_index = get_capability_index()
+            await asyncio.wait_for(
+                _cap_index.ensure_fresh(get_agent_registry()),
+                timeout=0.5,
+            )
+            _jprime_ctx["capability_index"] = _cap_index.to_planning_context()
+        except Exception:
+            pass  # Capability index failure never blocks command processing
+
         # v295.0: Fire GoalInference concurrently with the J-Prime round-trip.
         # Result enriches routing context and enables multi-step task chaining.
         # Timeout-bounded — never blocks or delays J-Prime.

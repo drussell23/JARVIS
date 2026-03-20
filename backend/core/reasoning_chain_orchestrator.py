@@ -609,12 +609,30 @@ class ReasoningChainOrchestrator:
             logger.warning("[ReasoningChain] MindClient unavailable — falling through")
             return None
 
+        # Fetch live capability index once before the loop so J-Prime
+        # ExecutionPlanner receives dynamic agent manifests for tool assignment.
+        _capability_ctx: Dict[str, Any] = {}
+        try:
+            from backend.neural_mesh.registry.agent_registry import (
+                get_agent_registry,
+                get_capability_index,
+            )
+            _cap_index = get_capability_index()
+            await asyncio.wait_for(
+                _cap_index.ensure_fresh(get_agent_registry()),
+                timeout=0.5,
+            )
+            _capability_ctx["capability_index"] = _cap_index.to_planning_context()
+        except Exception:
+            pass  # Never block reasoning chain for capability index
+
         for intent in expanded_intents:
             try:
                 mind_result = await mind.send_command(
                     command=intent,
                     context={
                         **context,
+                        **_capability_ctx,
                         "trace_id": trace_id,
                         "parent_command": command,
                         "expanded_from_chain": True,
