@@ -289,3 +289,13 @@ class TestDashboardImport:
             mock_stdout.isatty.return_value = False
             result = start_dashboard()
         assert result is None
+
+
+class TestStartDashboard:
+    def test_no_tty_returns_none(self):
+        from backend.core.tui.app import start_dashboard
+        from unittest.mock import patch
+        with patch("sys.stdout") as mock_stdout:
+            mock_stdout.isatty.return_value = False
+            result = start_dashboard()
+        assert result is None
