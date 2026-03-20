@@ -10,7 +10,7 @@ import os
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, FrozenSet, Optional
+from typing import Any, Dict, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -93,14 +93,14 @@ class EcapaFacadeConfig:
     recovering_fail_threshold: int = 2
 
     # Timing
-    transition_cooldown_s: float = 2.0
-    reprobe_interval_s: float = 30.0
-    reprobe_max_backoff_s: float = 300.0
+    transition_cooldown_s: float = 10.0
+    reprobe_interval_s: float = 15.0
+    reprobe_max_backoff_s: float = 120.0
     probe_timeout_s: float = 8.0
-    local_load_timeout_s: float = 60.0
+    local_load_timeout_s: float = 45.0
 
     # Budget
-    reprobe_budget: int = 10
+    reprobe_budget: int = 20
     max_concurrent_extractions: int = 4
 
     @classmethod
@@ -110,12 +110,12 @@ class EcapaFacadeConfig:
             failure_threshold=_env_int("ECAPA_FAILURE_THRESHOLD", 3),
             recovery_threshold=_env_int("ECAPA_RECOVERY_THRESHOLD", 3),
             recovering_fail_threshold=_env_int("ECAPA_RECOVERING_FAIL_THRESHOLD", 2),
-            transition_cooldown_s=_env_float("ECAPA_TRANSITION_COOLDOWN_S", 2.0),
-            reprobe_interval_s=_env_float("ECAPA_REPROBE_INTERVAL_S", 30.0),
-            reprobe_max_backoff_s=_env_float("ECAPA_REPROBE_MAX_BACKOFF_S", 300.0),
+            transition_cooldown_s=_env_float("ECAPA_TRANSITION_COOLDOWN_S", 10.0),
+            reprobe_interval_s=_env_float("ECAPA_REPROBE_INTERVAL_S", 15.0),
+            reprobe_max_backoff_s=_env_float("ECAPA_REPROBE_MAX_BACKOFF_S", 120.0),
             probe_timeout_s=_env_float("ECAPA_PROBE_TIMEOUT_S", 8.0),
-            local_load_timeout_s=_env_float("ECAPA_LOCAL_LOAD_TIMEOUT_S", 60.0),
-            reprobe_budget=_env_int("ECAPA_REPROBE_BUDGET", 10),
+            local_load_timeout_s=_env_float("ECAPA_LOCAL_LOAD_TIMEOUT_S", 45.0),
+            reprobe_budget=_env_int("ECAPA_REPROBE_BUDGET", 20),
             max_concurrent_extractions=_env_int("ECAPA_MAX_CONCURRENT_EXTRACTIONS", 4),
         )
 
@@ -150,7 +150,7 @@ class CapabilityCheck:
     allowed: bool
     tier: EcapaTier
     reason_code: str
-    constraints: FrozenSet[str] = field(default_factory=frozenset)
+    constraints: Dict[str, Any] = field(default_factory=dict)
     fallback: Optional[str] = None
     root_cause_id: Optional[str] = None
 
@@ -165,7 +165,7 @@ class EcapaStateEvent:
     previous_state: EcapaState
     new_state: EcapaState
     tier: EcapaTier
-    active_backend: str
+    active_backend: Optional[str]
     reason: str
     error_class: Optional[str] = None
     latency_ms: Optional[float] = None
@@ -177,7 +177,7 @@ class EcapaStateEvent:
         *,
         previous_state: EcapaState,
         new_state: EcapaState,
-        active_backend: str,
+        active_backend: Optional[str],
         reason: str,
         warning_code: str = "ECAPA_STATE_CHANGE",
         error_class: Optional[str] = None,
