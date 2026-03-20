@@ -43,6 +43,7 @@ from ..data_models import (
     HealthStatus,
 )
 from ..config import AgentRegistryConfig, get_config
+from ..synthesis.gap_signal_bus import CapabilityGapEvent, get_gap_signal_bus
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +232,12 @@ class AgentRegistry:
 
         # v116.0: Mark as initialized
         self._initialized = True
+
+        # DAS Task 7: routing snapshot for rollback support
+        self._stable_routes: Dict[str, str] = {}
+        self._active_routes: Dict[str, str] = {}
+        self._rollback_log: List[Dict[str, Any]] = []
+        self._version: int = 0
 
         logger.info("AgentRegistry v116.0 initialized (singleton + dependency-aware health checks)")
 
@@ -1437,6 +1444,79 @@ class AgentRegistry:
 
         except Exception as e:
             logger.exception("Failed to load registry: %s", e)
+
+    # ------------------------------------------------------------------
+    # DAS Task 7: capability resolution (delegates to AgentCapabilityIndex)
+    # ------------------------------------------------------------------
+
+    def _resolve_internal(
+        self,
+        goal: str,
+        target_app: Optional[str],
+        task_type: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Verbatim delegation to AgentCapabilityIndex.resolve_capability.
+
+        Extracted so the public wrapper can detect the universal-fallback
+        case without duplicating resolution logic.
+        """
+        # AgentCapabilityIndex is defined later in this same module; no import needed.
+        return AgentCapabilityIndex().resolve_capability(goal, target_app, task_type)
+
+    def resolve_capability(
+        self,
+        goal: str,
+        target_app: Optional[str],
+        task_type: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Resolve (primary_capability, fallback_capability) for a goal.
+
+        Wraps _resolve_internal and emits a CapabilityGapEvent on the
+        GapSignalBus whenever the universal fallback ``computer_use`` is
+        returned with no specific fallback — indicating no registered agent
+        covers the requested capability.
+        """
+        primary, fallback = self._resolve_internal(goal, target_app, task_type)
+        if primary == "computer_use" and fallback is None:
+            get_gap_signal_bus().emit(CapabilityGapEvent(
+                goal=goal,
+                task_type=task_type or "",
+                target_app=target_app or "",
+                source="primary_fallback",
+            ))
+        return primary, fallback
+
+    async def rollback_agent(self, domain_id: str, reason: str) -> None:
+        """
+        Roll back the active route for *domain_id* to its last stable snapshot.
+
+        Records the rollback in the append-only log and bumps the registry
+        version counter.  In-flight executions complete normally — this
+        method does NOT evict modules or cancel tasks.
+
+        Args:
+            domain_id: The capability domain being rolled back
+                       (same format as CapabilityGapEvent.domain_id).
+            reason:    Human-readable explanation for the rollback.
+        """
+        async with self._lock:
+            self._version += 1
+            self._rollback_log.append({
+                "domain_id": domain_id,
+                "version": self._version,
+                "reason": reason,
+                "timestamp_ms": int(time.time() * 1000),
+            })
+            if domain_id in self._stable_routes:
+                self._active_routes[domain_id] = self._stable_routes[domain_id]
+            logger.info(
+                "rollback_agent: domain=%s version=%d reason=%s",
+                domain_id,
+                self._version,
+                reason,
+            )
 
     def __repr__(self) -> str:
         """String representation."""
