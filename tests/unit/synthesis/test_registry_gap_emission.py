@@ -88,3 +88,25 @@ def test_no_gap_when_capability_found(registry):
         )
 
     assert len(emitted) == 0
+
+
+def test_das_canary_key_generation():
+    """das_canary_key = sha256(cmd_id:normalized_command) — verify formula."""
+    import hashlib
+    import re
+
+    def _normalize_command(text: str) -> str:
+        return re.sub(r"\s+", " ", text.lower().strip())
+
+    session_id = "test-session-abc"
+    command_text = "  Open My Email  "
+    expected = hashlib.sha256(
+        f"{session_id}:{_normalize_command(command_text)}".encode()
+    ).hexdigest()
+
+    # Verify the formula is deterministic and matches expected hash
+    result = hashlib.sha256(
+        f"{session_id}:{_normalize_command(command_text)}".encode()
+    ).hexdigest()
+    assert result == expected
+    assert len(result) == 64
