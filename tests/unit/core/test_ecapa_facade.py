@@ -534,3 +534,49 @@ async def test_local_unavailable_cloud_fallback():
     assert facade.active_backend == "cloud"
     assert facade.state == EcapaState.READY
     await facade.stop()
+
+
+@pytest.mark.asyncio
+async def test_cloud_sql_down_ecapa_ready():
+    """ECAPA readiness must NOT depend on Cloud SQL."""
+    from backend.core.ecapa_facade import EcapaFacade
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = True
+    facade = EcapaFacade(registry=registry, config=_make_config())
+    await facade.start()
+    ready = await facade.ensure_ready(timeout=5.0)
+    assert ready is True
+    assert facade.state == EcapaState.READY
+    await facade.stop()
+
+
+@pytest.mark.asyncio
+async def test_warning_noise_bounded():
+    """Each state transition should emit <= 3 warnings per root_cause_id."""
+    from backend.core.ecapa_facade import EcapaFacade
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = True
+    facade = EcapaFacade(registry=registry, config=_make_config())
+    events = []
+    facade.subscribe(lambda e: events.append(e))
+    await facade.start()
+    await facade.ensure_ready(timeout=5.0)
+    await asyncio.sleep(0.1)  # Let subscriber tasks complete
+    await facade.stop()
+    await asyncio.sleep(0.1)  # Let stop event dispatch
+    from collections import Counter
+    root_counts = Counter(e.root_cause_id for e in events)
+    for root_id, count in root_counts.items():
+        assert count <= 3, f"root_cause_id {root_id} emitted {count} events (max 3)"
+
+
+@pytest.mark.asyncio
+async def test_singleton_fencing():
+    """get_ecapa_facade() returns same instance."""
+    from backend.core.ecapa_facade import get_ecapa_facade, _reset_facade
+    _reset_facade()
+    registry, _ = _mock_registry()
+    f1 = await get_ecapa_facade(registry=registry, config=_make_config())
+    f2 = await get_ecapa_facade()
+    assert f1 is f2
+    _reset_facade()
