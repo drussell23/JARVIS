@@ -2277,6 +2277,15 @@ class UnifiedCommandProcessor:
             except Exception as exc:
                 logger.debug("[v295] Remote brain selection unavailable: %s", exc)
 
+        # v300.0: Reasoning chain pre-routing — ProactiveDetector -> PredictivePlanner -> Coordinator
+        # If command is multi-task (proactive), expand into sub-intents and execute each through Mind.
+        # Feature flags: JARVIS_REASONING_CHAIN_SHADOW or JARVIS_REASONING_CHAIN_ENABLED
+        _chain_result = await self._try_reasoning_chain(
+            command_text, _jprime_ctx or {}, deadline=deadline, websocket=websocket,
+        )
+        if _chain_result is not None:
+            return _chain_result
+
         # v295.0 Step 2: Full remote reasoning via MindClient
         # Feature flag: JARVIS_USE_REMOTE_REASONING=true routes commands through
         # J-Prime POST /v1/reason for full reasoning pipeline.
@@ -9615,6 +9624,92 @@ class UnifiedCommandProcessor:
             )
         except Exception as exc:
             logger.debug("[v295] goal_inference experience forward failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # v300.0: Reasoning chain pre-routing
+    # ------------------------------------------------------------------
+
+    async def _try_reasoning_chain(
+        self, command_text: str, context: Dict[str, Any],
+        deadline: Optional[float] = None, websocket=None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        v300.0: Try reasoning chain (ProactiveDetector -> PredictivePlanner -> Coordinator).
+
+        Returns a response dict if the chain handled the command (expanded into
+        sub-intents and executed them). Returns None if the chain is disabled,
+        the command is not proactive, or any component fails — caller falls
+        through to the existing single-intent Mind path.
+        """
+        try:
+            from backend.core.reasoning_chain_orchestrator import (
+                ChainConfig,
+                get_reasoning_chain_orchestrator,
+            )
+
+            config = ChainConfig.from_env()
+            if not config.is_active():
+                return None
+
+            orch = get_reasoning_chain_orchestrator()
+            trace_id = str(uuid.uuid4())[:12]
+
+            chain_result = await orch.process(
+                command=command_text,
+                context=context,
+                trace_id=trace_id,
+                deadline=deadline,
+            )
+
+            if chain_result is None:
+                return None
+
+            # Needs confirmation — return as confirmation dialog
+            if chain_result.needs_confirmation:
+                return {
+                    "success": True,
+                    "response": chain_result.confirmation_prompt,
+                    "command_type": "reasoning_chain_confirm",
+                    "needs_confirmation": True,
+                    "expanded_intents": chain_result.expanded_intents,
+                    "trace_id": trace_id,
+                    "chain_phase": chain_result.phase.value,
+                }
+
+            # Chain handled and executed — aggregate mind results
+            if chain_result.handled and chain_result.mind_results:
+                all_step_results = []
+                for mr in chain_result.mind_results:
+                    if mr.get("status") == "plan_ready":
+                        step_result = await self._execute_mind_plan(
+                            mr, command_text, websocket=websocket, deadline=deadline,
+                        )
+                        all_step_results.append(step_result)
+
+                success = all(r.get("success", False) for r in all_step_results)
+                response_parts = [r.get("response", "") for r in all_step_results if r.get("response")]
+                response_text = " | ".join(response_parts) if response_parts else "All tasks completed."
+
+                return {
+                    "success": success,
+                    "response": response_text,
+                    "command_type": "reasoning_chain",
+                    "chain_phase": chain_result.phase.value,
+                    "trace_id": trace_id,
+                    "expanded_intents": chain_result.expanded_intents,
+                    "intents_executed": len(chain_result.mind_results),
+                    "intents_succeeded": sum(
+                        1 for r in chain_result.mind_results
+                        if r.get("status") == "plan_ready"
+                    ),
+                    "total_ms": chain_result.total_ms,
+                    "audit_trail": chain_result.audit_trail,
+                }
+
+        except Exception as exc:
+            logger.debug("[v300] Reasoning chain failed (non-fatal): %s", exc)
+
+        return None
 
     # ------------------------------------------------------------------
     # v295.0 Step 2: Mind plan execution
