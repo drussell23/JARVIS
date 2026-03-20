@@ -1,5 +1,7 @@
 """Tests for ReasoningChainOrchestrator."""
+import asyncio
 import pytest
+from typing import List
 from unittest.mock import AsyncMock, MagicMock, patch
 from backend.core.reasoning_chain_orchestrator import (
     ChainPhase,
@@ -7,6 +9,8 @@ from backend.core.reasoning_chain_orchestrator import (
     ChainResult,
     ChainTelemetry,
     ShadowMetrics,
+    ReasoningChainOrchestrator,
+    get_reasoning_chain_orchestrator,
 )
 
 
@@ -247,3 +251,236 @@ class TestChainTelemetry:
         )
         assert "timestamp" in event
         assert isinstance(event["timestamp"], float)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator test helpers
+# ---------------------------------------------------------------------------
+
+
+def _mock_detection_result(is_proactive: bool, confidence: float = 0.9):
+    """Create a mock ProactiveDetectionResult."""
+    return MagicMock(
+        is_proactive=is_proactive,
+        confidence=confidence,
+        signals_detected=["workflow_trigger"] if is_proactive else [],
+        suggested_intent="work_mode" if is_proactive else None,
+        reasoning="test",
+        should_use_expand_and_execute=is_proactive,
+    )
+
+
+def _mock_prediction_result(intents: List[str] = None):
+    """Create a mock PredictionResult."""
+    intents = intents or ["check email", "check calendar", "open Slack"]
+    tasks = []
+    for i, intent in enumerate(intents):
+        task = MagicMock()
+        task.goal = intent
+        task.priority = i + 1
+        task.target_app = None
+        task.category = MagicMock(name="WORK_MODE")
+        tasks.append(task)
+    result = MagicMock()
+    result.original_query = "start my day"
+    result.confidence = 0.88
+    result.expanded_tasks = tasks
+    result.reasoning = "Morning workflow detected"
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator tests
+# ---------------------------------------------------------------------------
+
+
+class TestOrchestratorShadowPhase:
+    @pytest.mark.asyncio
+    async def test_shadow_returns_none(self):
+        """Shadow mode: detect + expand in background, return None."""
+        config = ChainConfig(phase=ChainPhase.SHADOW, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.92)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result()
+        orch._planner = mock_planner
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is None
+        mock_detector.detect.assert_called_once_with("start my day")
+
+    @pytest.mark.asyncio
+    async def test_shadow_logs_divergence(self):
+        """Shadow mode records divergence metrics."""
+        config = ChainConfig(phase=ChainPhase.SHADOW, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.92)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result()
+        orch._planner = mock_planner
+        await orch.process("start my day", context={}, trace_id="t1")
+        assert orch._shadow_metrics.total_detections == 1
+        assert orch._shadow_metrics.would_expand_count == 1
+
+
+class TestOrchestratorNotProactive:
+    @pytest.mark.asyncio
+    async def test_non_proactive_returns_none(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(False, 0.2)
+        orch._detector = mock_detector
+        result = await orch.process("what time is it", context={}, trace_id="t1")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_below_threshold_returns_none(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.8, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.7)
+        orch._detector = mock_detector
+        result = await orch.process("maybe start work", context={}, trace_id="t1")
+        assert result is None
+
+
+class TestOrchestratorSoftEnable:
+    @pytest.mark.asyncio
+    async def test_soft_enable_returns_confirmation(self):
+        config = ChainConfig(phase=ChainPhase.SOFT_ENABLE, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.92)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result()
+        orch._planner = mock_planner
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is not None
+        assert result.handled is True
+        assert result.needs_confirmation is True
+        assert len(result.expanded_intents) == 3
+        assert "check email" in result.expanded_intents
+
+
+class TestOrchestratorFullEnable:
+    @pytest.mark.asyncio
+    async def test_full_enable_expands_and_executes(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, auto_expand_threshold=0.85, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.92)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result()
+        orch._planner = mock_planner
+        mock_mind = AsyncMock()
+        mock_mind.send_command.return_value = {
+            "status": "plan_ready",
+            "plan": {"sub_goals": [{"goal": "done"}], "plan_id": "p1"},
+            "classification": {},
+        }
+        orch._mind_client = mock_mind
+        mock_coordinator = AsyncMock()
+        mock_coordinator.execute_task.return_value = {"status": "delegated", "task_id": "t1", "delegated_to": "agent1"}
+        orch._coordinator = mock_coordinator
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is not None
+        assert result.handled is True
+        assert result.needs_confirmation is False
+        assert mock_mind.send_command.call_count == 3
+        assert len(result.mind_results) == 3
+
+    @pytest.mark.asyncio
+    async def test_full_enable_below_auto_threshold_asks_confirmation(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, auto_expand_threshold=0.95, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.88)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result()
+        orch._planner = mock_planner
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result.needs_confirmation is True
+
+
+class TestOrchestratorErrorHandling:
+    @pytest.mark.asyncio
+    async def test_detector_failure_returns_none(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.side_effect = Exception("detector exploded")
+        orch._detector = mock_detector
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_planner_failure_returns_none(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.92)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.side_effect = Exception("planner exploded")
+        orch._planner = mock_planner
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_mind_failure_for_one_intent_continues_others(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.92)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result(["a", "b"])
+        orch._planner = mock_planner
+        call_count = 0
+
+        async def mind_side_effect(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return None
+            return {"status": "plan_ready", "plan": {"sub_goals": [], "plan_id": "p1"}, "classification": {}}
+
+        mock_mind = AsyncMock()
+        mock_mind.send_command.side_effect = mind_side_effect
+        orch._mind_client = mock_mind
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is not None
+        assert result.handled is True
+
+    @pytest.mark.asyncio
+    async def test_timeout_returns_none(self):
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, expansion_timeout=0.01, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+
+        async def slow_detect(cmd):
+            await asyncio.sleep(0.1)
+            return _mock_detection_result(True, 0.92)
+
+        mock_detector.detect.side_effect = slow_detect
+        orch._detector = mock_detector
+        result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is None
+
+
+class TestOrchestratorSingleton:
+    def test_singleton(self):
+        # Reset singleton for test isolation
+        import backend.core.reasoning_chain_orchestrator as mod
+        mod._orchestrator_instance = None
+        orch1 = get_reasoning_chain_orchestrator()
+        orch2 = get_reasoning_chain_orchestrator()
+        assert orch1 is orch2
+        mod._orchestrator_instance = None  # Clean up

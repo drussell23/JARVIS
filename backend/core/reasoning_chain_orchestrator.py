@@ -387,3 +387,299 @@ class ChainTelemetry:
             "success_rate": success_rate,
             "timestamp": time.time(),
         })
+
+
+class ReasoningChainOrchestrator:
+    """
+    Pre-routing layer that wires ProactiveCommandDetector ->
+    PredictivePlanningAgent -> CoordinatorAgent before MindClient.
+
+    process() returns:
+      None        — chain didn't handle it; caller uses single-intent path
+      ChainResult — chain handled it (expanded, confirmed, or needs confirmation)
+    """
+
+    def __init__(self, config: Optional[ChainConfig] = None):
+        self._config = config or ChainConfig.from_env()
+        self._telemetry = ChainTelemetry()
+        self._shadow_metrics = ShadowMetrics()
+        self._detector = None
+        self._planner = None
+        self._mind_client = None
+        self._coordinator = None
+
+    def _get_detector(self):
+        if self._detector is None:
+            try:
+                from backend.core.proactive_command_detector import get_proactive_detector
+                self._detector = get_proactive_detector(
+                    min_confidence=self._config.proactive_threshold,
+                )
+            except Exception as exc:
+                logger.warning("[ReasoningChain] ProactiveCommandDetector unavailable: %s", exc)
+        return self._detector
+
+    async def _get_planner(self):
+        if self._planner is None:
+            try:
+                from backend.neural_mesh.agents.predictive_planning_agent import get_predictive_agent
+                self._planner = await get_predictive_agent()
+            except Exception as exc:
+                logger.warning("[ReasoningChain] PredictivePlanningAgent unavailable: %s", exc)
+        return self._planner
+
+    def _get_mind_client(self):
+        if self._mind_client is None:
+            try:
+                from backend.core.mind_client import get_mind_client
+                self._mind_client = get_mind_client()
+            except Exception as exc:
+                logger.warning("[ReasoningChain] MindClient unavailable: %s", exc)
+        return self._mind_client
+
+    async def _get_coordinator(self):
+        if self._coordinator is None:
+            try:
+                from backend.neural_mesh.agents.agent_initializer import get_agent_initializer
+                initializer = await get_agent_initializer()  # async factory
+                if initializer and hasattr(initializer, "get_agent"):
+                    self._coordinator = initializer.get_agent("coordinator_agent")  # sync lookup
+            except Exception as exc:
+                logger.debug("[ReasoningChain] CoordinatorAgent unavailable: %s", exc)
+        return self._coordinator
+
+    async def process(
+        self,
+        command: str,
+        context: Dict[str, Any],
+        trace_id: str,
+        deadline: Optional[float] = None,
+    ) -> Optional[ChainResult]:
+        """
+        Run the reasoning chain on a command.
+
+        Returns None if the chain doesn't handle this command. The caller
+        should fall through to the existing single-intent path.
+        """
+        start_ms = time.monotonic() * 1000
+
+        # Step 1: Proactive detection
+        try:
+            detector = self._get_detector()
+            if detector is None:
+                return None
+            detect_start = time.monotonic() * 1000
+            # Deliberate use of wait_for (cancels on timeout — acceptable here)
+            detection = await asyncio.wait_for(
+                detector.detect(command),
+                timeout=self._config.expansion_timeout,
+            )
+            detect_ms = time.monotonic() * 1000 - detect_start
+            await self._telemetry.emit_proactive_detection(
+                trace_id=trace_id,
+                command=command,
+                is_proactive=detection.is_proactive,
+                confidence=detection.confidence,
+                signals=[s.value if hasattr(s, "value") else str(s) for s in detection.signals_detected],
+                latency_ms=detect_ms,
+            )
+        except asyncio.TimeoutError:
+            logger.info("[ReasoningChain] Detection timed out — falling through")
+            return None
+        except Exception as exc:
+            logger.warning("[ReasoningChain] Detection failed: %s — falling through", exc)
+            return None
+
+        if not detection.is_proactive or detection.confidence < self._config.proactive_threshold:
+            return None
+
+        # Step 2: Intent expansion
+        try:
+            planner = await self._get_planner()
+            if planner is None:
+                return None
+            expand_start = time.monotonic() * 1000
+            remaining_timeout = self._config.expansion_timeout - (detect_ms / 1000)
+            if remaining_timeout <= 0:
+                return None
+            prediction = await asyncio.wait_for(
+                planner.expand_intent(command),
+                timeout=remaining_timeout,
+            )
+            expand_ms = time.monotonic() * 1000 - expand_start
+            expanded_intents = [t.goal for t in prediction.expanded_tasks]
+            await self._telemetry.emit_intent_expansion(
+                trace_id=trace_id,
+                original_query=command,
+                expanded_count=len(expanded_intents),
+                intents=expanded_intents,
+                confidence=prediction.confidence,
+                latency_ms=expand_ms,
+            )
+        except asyncio.TimeoutError:
+            logger.info("[ReasoningChain] Expansion timed out — falling through")
+            return None
+        except Exception as exc:
+            logger.warning("[ReasoningChain] Expansion failed: %s — falling through", exc)
+            return None
+
+        total_detect_expand_ms = time.monotonic() * 1000 - start_ms
+        self._shadow_metrics.record_latency(total_detect_expand_ms)
+
+        # Phase-dependent behavior
+        if self._config.phase == ChainPhase.SHADOW:
+            self._shadow_metrics.record_detection(would_expand=True, actually_expanded=False)
+            await self._telemetry.emit_shadow_divergence(
+                trace_id=trace_id, would_expand=True, actually_expanded=False, match=False,
+            )
+            return None
+
+        # Soft enable or Full enable with low confidence -> ask confirmation
+        needs_confirmation = (
+            self._config.phase == ChainPhase.SOFT_ENABLE
+            or detection.confidence < self._config.auto_expand_threshold
+        )
+
+        if needs_confirmation:
+            intent_list = ", ".join(expanded_intents)
+            return ChainResult(
+                handled=True,
+                phase=self._config.phase,
+                trace_id=trace_id,
+                original_command=command,
+                expanded_intents=expanded_intents,
+                needs_confirmation=True,
+                confirmation_prompt=f"Sounds like multiple tasks. Want me to handle these separately? {intent_list}",
+                total_ms=total_detect_expand_ms,
+                audit_trail={
+                    "detection": {
+                        "is_proactive": detection.is_proactive,
+                        "confidence": detection.confidence,
+                        "signals": [s.value if hasattr(s, "value") else str(s) for s in detection.signals_detected],
+                    },
+                    "expansion": {
+                        "confidence": prediction.confidence,
+                        "reasoning": prediction.reasoning,
+                    },
+                },
+            )
+
+        # Full enable + auto-expand: send each sub-intent to Mind
+        mind_results = []
+        mind = self._get_mind_client()
+        if mind is None:
+            logger.warning("[ReasoningChain] MindClient unavailable — falling through")
+            return None
+
+        for intent in expanded_intents:
+            try:
+                mind_result = await mind.send_command(
+                    command=intent,
+                    context={
+                        **context,
+                        "trace_id": trace_id,
+                        "parent_command": command,
+                        "expanded_from_chain": True,
+                    },
+                    deadline_ms=(
+                        int((deadline - time.monotonic()) * 1000) if deadline else None
+                    ),
+                )
+                mind_results.append(mind_result or {"success": False, "error": "Mind returned None"})
+            except Exception as exc:
+                logger.warning("[ReasoningChain] Mind failed for '%s': %s", intent, exc)
+                mind_results.append({"success": False, "error": str(exc)})
+
+        # Route plan steps through CoordinatorAgent
+        coordinator_delegations = []
+        coordinator = await self._get_coordinator()
+
+        for i, (intent, mr) in enumerate(zip(expanded_intents, mind_results)):
+            if mr.get("status") != "plan_ready":
+                continue
+            plan = mr.get("plan", {})
+            plan_id = plan.get("plan_id", f"p-{i}")
+            sub_goals = plan.get("sub_goals", [])
+
+            for j, sg in enumerate(sub_goals):
+                step_id = f"{plan_id}-s{j}"
+                capability = sg.get("tool_required", "computer_use")
+                delegation = {"plan_id": plan_id, "step_id": step_id, "capability": capability}
+
+                if coordinator is not None:
+                    try:
+                        delegate_start = time.monotonic() * 1000
+                        delegate_result = await coordinator.execute_task({
+                            "action": "delegate_task",
+                            "capability": capability,
+                            "task_payload": {
+                                "trace_id": trace_id,
+                                "plan_id": plan_id,
+                                "step": sg,
+                            },
+                            "priority": "high" if sg.get("priority", 99) <= 2 else "normal",
+                        })
+                        delegate_ms = time.monotonic() * 1000 - delegate_start
+                        delegation["result"] = delegate_result
+                        delegation["agent_name"] = delegate_result.get("delegated_to", "unknown")
+                        await self._telemetry.emit_coordinator_delegation(
+                            trace_id=trace_id,
+                            plan_id=plan_id,
+                            step_id=step_id,
+                            agent_name=delegation["agent_name"],
+                            capability=capability,
+                            latency_ms=delegate_ms,
+                        )
+                    except Exception as exc:
+                        logger.debug("[ReasoningChain] Coordinator delegation failed: %s", exc)
+                        delegation["error"] = str(exc)
+
+                coordinator_delegations.append(delegation)
+
+        total_ms = time.monotonic() * 1000 - start_ms
+
+        await self._telemetry.emit_chain_complete(
+            trace_id=trace_id,
+            total_intents=len(expanded_intents),
+            total_steps=len(coordinator_delegations),
+            total_ms=total_ms,
+            success_rate=sum(1 for r in mind_results if r.get("status") == "plan_ready") / max(len(mind_results), 1),
+        )
+
+        self._shadow_metrics.record_detection(would_expand=True, actually_expanded=True)
+
+        return ChainResult(
+            handled=True,
+            phase=self._config.phase,
+            trace_id=trace_id,
+            original_command=command,
+            expanded_intents=expanded_intents,
+            mind_results=mind_results,
+            coordinator_delegations=coordinator_delegations,
+            total_ms=total_ms,
+            audit_trail={
+                "detection": {
+                    "is_proactive": detection.is_proactive,
+                    "confidence": detection.confidence,
+                    "signals": [s.value if hasattr(s, "value") else str(s) for s in detection.signals_detected],
+                },
+                "expansion": {
+                    "confidence": prediction.confidence,
+                    "intent_count": len(expanded_intents),
+                    "reasoning": prediction.reasoning,
+                },
+                "mind_requests": len(mind_results),
+                "delegations": len(coordinator_delegations),
+            },
+        )
+
+
+_orchestrator_instance: Optional[ReasoningChainOrchestrator] = None
+
+
+def get_reasoning_chain_orchestrator() -> ReasoningChainOrchestrator:
+    """Get or create the process-wide ReasoningChainOrchestrator singleton."""
+    global _orchestrator_instance
+    if _orchestrator_instance is None:
+        _orchestrator_instance = ReasoningChainOrchestrator()
+    return _orchestrator_instance
