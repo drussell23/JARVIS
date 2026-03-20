@@ -258,45 +258,26 @@ class VisionRouter:
     # ------------------------------------------------------------------
 
     async def _call_jprime_vision(self, query: VisionQuery) -> Dict:
-        """Call J-Prime GPU LLaVA endpoint.
+        """Call J-Prime GPU vision endpoint via MindClient.
 
-        This is a stub placeholder.  Task 8 (VisionActionLoop) will replace
-        the body with a real ``MindClient.send_vision_frame()`` call.
-
-        Parameters
-        ----------
-        query:
-            The vision query, including ``vision_task_type`` for brain
-            selection and ``frame_artifact_ref`` if a frame was pre-captured.
-
-        Returns
-        -------
-        dict
-            Expected shape::
-
-                {
-                    "status": "found" | "not_found",
-                    "elements": [
-                        {
-                            "coords": [x, y],
-                            "confidence": 0.0–1.0,
-                            "element_type": "button",   # optional
-                            "text_content": "OK",       # optional
-                        },
-                        ...
-                    ],
-                }
+        Sends the frame reference and target description to POST /v1/vision/analyze.
+        Returns dict with status + elements (coords, confidence).
         """
-        # Real implementation will call:
-        #   await mind_client.send_vision_frame(
-        #       frame_ref=query.frame_artifact_ref,
-        #       task_type=query.vision_task_type,
-        #       description=query.target_description,
-        #   )
-        raise NotImplementedError(
-            "_call_jprime_vision is a stub — mock it in tests or wire "
-            "MindClient in Task 8."
-        )
+        try:
+            from backend.core.mind_client import get_mind_client
+            client = get_mind_client()
+            result = await client.send_vision_frame(
+                frame_ref=query.frame_artifact_ref or "live_capture",
+                target_description=query.target_description,
+                action_intent="click",
+                vision_task_type=query.vision_task_type,
+            )
+            if result is None:
+                raise RuntimeError("MindClient.send_vision_frame returned None")
+            return result
+        except Exception as exc:
+            logger.warning("[VisionRouter] L2 J-Prime vision call failed: %s", exc)
+            raise
 
     async def _call_claude_vision(self, query: VisionQuery) -> Dict:
         """Call Claude Vision API (paid fallback).

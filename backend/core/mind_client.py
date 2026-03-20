@@ -549,6 +549,70 @@ class MindClient:
             return None
 
     # ------------------------------------------------------------------
+    # Vision frame analysis (L2 path)
+    # ------------------------------------------------------------------
+
+    async def send_vision_frame(
+        self,
+        frame_ref: str,
+        target_description: str,
+        action_intent: str = "click",
+        vision_task_type: str = "ui_element_detection",
+        frame_width: int = 1440,
+        frame_height: int = 900,
+        scale_factor: float = 2.0,
+    ) -> Optional[Dict[str, Any]]:
+        """POST /v1/vision/analyze — send a frame to J-Prime for element detection.
+
+        Returns dict with status, elements (coords + confidence), or None on failure.
+        Same circuit breaker and level gating as send_command().
+        """
+        if self._level == OperationalLevel.LEVEL_2:
+            return None
+
+        if not self._circuit.can_execute():
+            return None
+
+        import time as _time
+        request_id = str(uuid.uuid4())[:12]
+
+        payload: Dict[str, Any] = {
+            "request_id": request_id,
+            "session_id": self._session_id,
+            "trace_id": str(uuid.uuid4())[:12],
+            "frame": {
+                "artifact_ref": frame_ref,
+                "width": frame_width,
+                "height": frame_height,
+                "scale_factor": scale_factor,
+                "captured_at_ms": int(_time.time() * 1000),
+                "display_id": 0,
+            },
+            "task": {
+                "type": "find_element",
+                "target_description": target_description,
+                "action_intent": action_intent,
+            },
+        }
+
+        timeout = float(os.getenv("MIND_CLIENT_VISION_TIMEOUT", "10"))
+
+        try:
+            result = await self._http_post(
+                "/v1/vision/analyze",
+                data=payload,
+                timeout=timeout,
+            )
+            self._circuit.record_success()
+            self._record_success()
+            return result
+        except Exception as exc:
+            self._circuit.record_failure()
+            self._record_failure()
+            logger.warning("[MindClient] send_vision_frame failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
     # Background health monitor
     # ------------------------------------------------------------------
 
