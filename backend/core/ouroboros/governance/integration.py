@@ -278,6 +278,21 @@ def _build_comm_protocol(
         transports.append(OpsLogger())
         logger.info("[Integration] OpsLogger added to CommProtocol")
 
+    # LangfuseTransport — optional, enabled via LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
+    if os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"):
+        try:
+            from backend.core.ouroboros.governance.comms.langfuse_transport import LangfuseTransport
+            _lf = LangfuseTransport()
+            if _lf.is_active:
+                transports.append(_lf)
+                logger.info("[Integration] LangfuseTransport added to CommProtocol")
+            else:
+                logger.debug("[Integration] LangfuseTransport: client not active")
+        except ImportError:
+            logger.debug("[Integration] LangfuseTransport skipped: langfuse not installed")
+        except Exception as exc:
+            logger.debug("[Integration] LangfuseTransport skipped: %s", exc)
+
     # Extra transports (for testing / future extension)
     if extra_transports:
         transports.extend(extra_transports)

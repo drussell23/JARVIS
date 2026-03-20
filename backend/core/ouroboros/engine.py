@@ -2466,14 +2466,59 @@ async def improve_file(
     return await engine.improve(request)
 
 
-async def improve_with_goal(goal: str) -> ImprovementResult:
-    """
-    Improve code with just a goal description.
+async def improve_with_goal(goal: str, repo: str = "jarvis") -> Any:
+    """Decompose a high-level goal into sub-operations via GoalDecomposer.
 
-    The engine will attempt to identify the target file(s) from the goal.
+    Uses the reasoning chain (if active) to expand the goal into sub-intents,
+    then queries TheOracle semantic search for target files, and submits
+    IntentEnvelopes to the intake router.
+
+    Returns a GoalDecompositionResult with submitted sub-tasks.
     """
-    # This is a simplified version - in production, we'd use LLM to identify files
-    raise NotImplementedError("Goal-based improvement not yet implemented")
+    from backend.core.ouroboros.governance.goal_decomposer import (
+        GoalDecomposer,
+        GoalDecompositionResult,
+    )
+
+    # Lazy-load dependencies — they may not be available in all contexts
+    oracle = None
+    try:
+        from backend.core.ouroboros.oracle import TheOracle
+        oracle = TheOracle.get_instance() if hasattr(TheOracle, "get_instance") else None
+    except Exception:
+        pass
+
+    intake_router = None
+    try:
+        from backend.core.ouroboros.governance.intake.unified_intake_router import (
+            get_unified_intake_router,
+        )
+        intake_router = get_unified_intake_router()
+    except Exception:
+        pass
+
+    reasoning_chain = None
+    try:
+        from backend.core.reasoning_chain_orchestrator import (
+            get_reasoning_chain_orchestrator,
+        )
+        reasoning_chain = get_reasoning_chain_orchestrator()
+    except Exception:
+        pass
+
+    if intake_router is None:
+        raise RuntimeError(
+            "Goal-based improvement requires an active intake router. "
+            "Ensure GovernedLoopService (Zone 6.8) and IntakeLayerService "
+            "(Zone 6.9) are running."
+        )
+
+    decomposer = GoalDecomposer(
+        oracle=oracle,
+        intake_router=intake_router,
+        reasoning_chain=reasoning_chain,
+    )
+    return await decomposer.decompose(goal, repo=repo)
 
 
 # =============================================================================

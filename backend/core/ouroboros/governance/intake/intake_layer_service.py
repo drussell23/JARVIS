@@ -245,6 +245,13 @@ class IntakeLayerService:
             except Exception as exc:
                 logger.warning("[IntakeLayer] Sensor stop error: %s", exc)
 
+        # Stop reactor consumer
+        if hasattr(self, "_reactor_consumer") and self._reactor_consumer is not None:
+            try:
+                await self._reactor_consumer.stop()
+            except Exception as exc:
+                logger.warning("[IntakeLayer] ReactorEventConsumer stop error: %s", exc)
+
         # Stop router (drains in-flight queue)
         if self._router is not None:
             try:
@@ -416,11 +423,45 @@ class IntakeLayerService:
         # Sensors with start/stop lifecycle
         self._sensors = backlog_sensors + test_failure_sensors + miner_sensors
 
+        # ---- ScheduledTriggerSensor (P6) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.scheduled_sensor import (
+                ScheduledTriggerSensor,
+            )
+            _sched = ScheduledTriggerSensor(router=self._router)
+            self._sensors.append(_sched)
+            logger.info("[IntakeLayer] ScheduledTriggerSensor added")
+        except ImportError:
+            logger.debug("[IntakeLayer] ScheduledTriggerSensor: croniter not installed")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] ScheduledTriggerSensor skipped: %s", exc)
+
+        # ---- ReactorEventConsumer (P3) ----
+        self._reactor_consumer = None
+        try:
+            from backend.core.ouroboros.governance.reactor_event_consumer import (
+                ReactorEventConsumer,
+            )
+            from backend.core.ouroboros.cross_repo import CrossRepoEventBus
+            _event_bus = CrossRepoEventBus()
+            self._reactor_consumer = ReactorEventConsumer(event_bus=_event_bus)
+            logger.info("[IntakeLayer] ReactorEventConsumer added")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] ReactorEventConsumer skipped: %s", exc)
+
         router = self._router
         assert router is not None
         await router.start()
         for sensor in self._sensors:
             await sensor.start()
+
+        # Start reactor consumer after sensors (non-critical, fire-and-forget)
+        if self._reactor_consumer is not None:
+            try:
+                await self._reactor_consumer.start()
+            except Exception as exc:
+                logger.warning("[IntakeLayer] ReactorEventConsumer start failed: %s", exc)
+                self._reactor_consumer = None
 
     async def _teardown(self) -> None:
         """Best-effort cleanup after failed start."""

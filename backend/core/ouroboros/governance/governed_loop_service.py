@@ -1437,6 +1437,23 @@ class GovernedLoopService:
                 rollback_reason=_reason_code,
             )
 
+            # ---- MCP external tool hooks (P5, fire-and-forget) ----
+            if self._mcp_client is not None:
+                try:
+                    if terminal_ctx.phase is OperationPhase.POSTMORTEM:
+                        await asyncio.wait_for(
+                            self._mcp_client.on_postmortem(terminal_ctx),
+                            timeout=12.0,
+                        )
+                    elif terminal_ctx.phase is OperationPhase.COMPLETE:
+                        _applied = list(terminal_ctx.target_files) if not _is_noop else []
+                        await asyncio.wait_for(
+                            self._mcp_client.on_complete(terminal_ctx, _applied),
+                            timeout=12.0,
+                        )
+                except Exception as _mcp_exc:
+                    logger.debug("[GovernedLoop] MCP hook error: %s", _mcp_exc)
+
             return result
 
         finally:
@@ -2088,6 +2105,32 @@ class GovernedLoopService:
             config=orch_config,
             validation_runner=validation_runner,
         )
+
+        # ---- Wire ReasoningChainBridge (P1) ----
+        try:
+            from backend.core.ouroboros.governance.reasoning_chain_bridge import ReasoningChainBridge
+            _reasoning_bridge = ReasoningChainBridge(comm=self._stack.comm)
+            if _reasoning_bridge.is_active:
+                self._orchestrator.set_reasoning_bridge(_reasoning_bridge)
+                logger.info("[GLS] ReasoningChainBridge wired (phase=%s)",
+                            getattr(getattr(_reasoning_bridge, '_orchestrator', None), '_config', None))
+            else:
+                logger.debug("[GLS] ReasoningChainBridge: chain not active (env flags not set)")
+        except Exception as exc:
+            logger.debug("[GLS] ReasoningChainBridge skipped: %s", exc)
+
+        # ---- Wire GovernanceMCPClient (P5) ----
+        self._mcp_client = None
+        try:
+            from backend.core.ouroboros.governance.mcp_tool_client import GovernanceMCPClient
+            _mcp = GovernanceMCPClient()
+            if _mcp.is_enabled:
+                self._mcp_client = _mcp
+                logger.info("[GLS] GovernanceMCPClient wired")
+            else:
+                logger.debug("[GLS] GovernanceMCPClient: no servers configured")
+        except Exception as exc:
+            logger.debug("[GLS] GovernanceMCPClient skipped: %s", exc)
 
         # NOTE: IntakeLayerService is started by the supervisor (Zone 6.9) which
         # injects say_fn and repo_registry.  GLS exposes _repo_registry so Zone 6.9
