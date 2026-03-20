@@ -280,25 +280,83 @@ class VisionRouter:
             raise
 
     async def _call_claude_vision(self, query: VisionQuery) -> Dict:
-        """Call Claude Vision API (paid fallback).
+        """Call Claude Vision API (paid fallback, L3).
 
-        This is a stub placeholder.  A future task will implement the real
-        Anthropic API call with base64-encoded screenshot payload.
-
-        Parameters
-        ----------
-        query:
-            The vision query.
-
-        Returns
-        -------
-        dict
-            Same shape as :meth:`_call_jprime_vision`.
+        Uses the Anthropic SDK to send a screenshot to Claude for UI element
+        detection. Only used when J-Prime is unavailable.
+        Respects brain router's Claude fallback model selection.
         """
-        raise NotImplementedError(
-            "_call_claude_vision is a stub — mock it in tests or implement "
-            "the Anthropic Vision API call."
-        )
+        try:
+            import anthropic
+            import base64
+            import subprocess
+            import tempfile
+
+            # Capture a fresh screenshot for Claude
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+                tmp_path = f.name
+
+            await asyncio.to_thread(
+                subprocess.run,
+                ["screencapture", "-x", "-t", "png", tmp_path],
+                capture_output=True,
+                timeout=5,
+            )
+
+            with open(tmp_path, "rb") as f:
+                img_b64 = base64.b64encode(f.read()).decode()
+
+            try:
+                import os as _os
+                _os.unlink(tmp_path)
+            except Exception:
+                pass
+
+            # Get Claude model from brain router
+            _model = "claude-sonnet-4-20250514"
+            try:
+                from backend.core.interactive_brain_router import get_interactive_brain_router
+                _br = get_interactive_brain_router()
+                _model = _br.get_claude_model("heavy")
+            except Exception:
+                pass
+
+            client = anthropic.Anthropic()
+            prompt = (
+                f"You are a UI element detector. Find the element matching: "
+                f"'{query.target_description}'. Return ONLY JSON: "
+                f'{{"elements": [{{"description": "...", "coords": [x, y], '
+                f'"confidence": 0.0-1.0, "element_type": "...", '
+                f'"text_content": "..."}}], "scene_summary": "..."}}'
+            )
+
+            _timeout = float(os.getenv("VISION_CLAUDE_TIMEOUT_S", "15"))
+            msg = await asyncio.wait_for(
+                asyncio.to_thread(
+                    client.messages.create,
+                    model=_model,
+                    max_tokens=512,
+                    messages=[{
+                        "role": "user",
+                        "content": [
+                            {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": img_b64}},
+                            {"type": "text", "text": prompt},
+                        ],
+                    }],
+                ),
+                timeout=_timeout,
+            )
+
+            content = msg.content[0].text if msg.content else "{}"
+            import json
+            parsed = json.loads(content)
+            elements = parsed.get("elements", [])
+            status = "found" if elements else "not_found"
+            return {"status": status, "elements": elements, "scene_summary": parsed.get("scene_summary", "")}
+
+        except Exception as exc:
+            logger.warning("[VisionRouter] L3 Claude Vision call failed: %s", exc)
+            raise
 
     # ------------------------------------------------------------------
     # L1 scene-graph helpers
