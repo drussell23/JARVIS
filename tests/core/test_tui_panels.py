@@ -168,3 +168,95 @@ class TestFaultsData:
                 "fault_id": env.event_id, "resolution": "ok", "duration_ms": 100,
             }, trace_id=f"f-{i}"))
         assert len(data.resolved_faults) <= 20
+
+
+# ---------------------------------------------------------------------------
+# BusConsumer + StatusBarData tests
+# ---------------------------------------------------------------------------
+from backend.core.tui.bus_consumer import TelemetryBusConsumer, StatusBarData
+
+
+class TestBusConsumer:
+    def test_routes_reasoning_to_pipeline(self):
+        pipeline, agents, system, faults, status = PipelineData(), AgentsData(), SystemData(), FaultsData(), StatusBarData()
+        consumer = TelemetryBusConsumer(pipeline, agents, system, faults, status)
+        consumer.handle_sync(_make_envelope("reasoning.decision@1.0.0", {
+            "command": "test", "is_proactive": False, "confidence": 0.1,
+            "signals": [], "phase": "shadow", "expanded_intents": [],
+            "mind_requests": 0, "delegations": 0, "total_ms": 50, "success_rate": 0,
+        }))
+        assert len(pipeline.commands) == 1
+
+    def test_routes_lifecycle_to_system(self):
+        pipeline, agents, system, faults, status = PipelineData(), AgentsData(), SystemData(), FaultsData(), StatusBarData()
+        consumer = TelemetryBusConsumer(pipeline, agents, system, faults, status)
+        consumer.handle_sync(_make_envelope("lifecycle.transition@1.0.0", {
+            "from_state": "UNKNOWN", "to_state": "READY", "trigger": "t",
+            "reason_code": "r", "attempt": 0, "restarts_in_window": 0,
+            "elapsed_in_prev_state_ms": 0,
+        }))
+        assert system.lifecycle_state == "READY"
+
+    def test_routes_scheduler_to_agents(self):
+        pipeline, agents, system, faults, status = PipelineData(), AgentsData(), SystemData(), FaultsData(), StatusBarData()
+        consumer = TelemetryBusConsumer(pipeline, agents, system, faults, status)
+        consumer.handle_sync(_make_envelope("scheduler.graph_state@1.0.0", {
+            "total_agents": 5, "initialized": 5, "failed": 0, "agent_names": ["a","b","c","d","e"],
+        }))
+        assert agents.total_agents == 5
+
+    def test_routes_fault_to_faults(self):
+        pipeline, agents, system, faults, status = PipelineData(), AgentsData(), SystemData(), FaultsData(), StatusBarData()
+        consumer = TelemetryBusConsumer(pipeline, agents, system, faults, status)
+        consumer.handle_sync(_make_envelope("fault.raised@1.0.0", {
+            "fault_class": "test", "component": "test", "message": "test",
+            "recovery_policy": "none", "terminal": False,
+        }))
+        assert len(faults.active_faults) == 1
+
+    def test_gate_activation_routed_to_system(self):
+        pipeline, agents, system, faults, status = PipelineData(), AgentsData(), SystemData(), FaultsData(), StatusBarData()
+        consumer = TelemetryBusConsumer(pipeline, agents, system, faults, status)
+        consumer.handle_sync(_make_envelope("reasoning.activation@1.0.0", {
+            "from_state": "READY", "to_state": "ACTIVE", "trigger": "dwell",
+            "cause_code": "ARMED", "critical_deps": {}, "gate_sequence": 1,
+            "dwell_ms": 5000, "in_flight_preempted": 0, "degraded_overrides": {},
+        }))
+        assert system.gate_state == "ACTIVE"
+
+
+class TestStatusBarData:
+    def test_lifecycle_updates(self):
+        s = StatusBarData()
+        s.update(_make_envelope("lifecycle.transition@1.0.0", {"to_state": "READY"}))
+        assert s.lifecycle_state == "READY"
+
+    def test_gate_updates(self):
+        s = StatusBarData()
+        s.update(_make_envelope("reasoning.activation@1.0.0", {"to_state": "ACTIVE"}))
+        assert s.gate_state == "ACTIVE"
+
+    def test_command_count(self):
+        s = StatusBarData()
+        s.update(_make_envelope("reasoning.decision@1.0.0", {"command": "test"}))
+        assert s.command_count == 1
+
+    def test_fault_count(self):
+        s = StatusBarData()
+        s.update(_make_envelope("fault.raised@1.0.0", {}))
+        assert s.fault_count == 1
+        s.update(_make_envelope("fault.resolved@1.0.0", {}))
+        assert s.fault_count == 0
+
+    def test_to_string(self):
+        s = StatusBarData()
+        text = s.to_string()
+        assert "J-Prime:" in text
+        assert "Gate:" in text
+        assert "Agents:" in text
+
+    def test_bus_emitted_counter(self):
+        s = StatusBarData()
+        s.update(_make_envelope("lifecycle.transition@1.0.0", {}))
+        s.update(_make_envelope("reasoning.decision@1.0.0", {}))
+        assert s.bus_emitted == 2
