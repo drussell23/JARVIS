@@ -696,7 +696,7 @@ async def test_singleton_fencing():
 - [ ] **Step 2: Run all facade tests**
 
 Run: `cd /Users/djrussell23/Documents/repos/JARVIS-AI-Agent && python3 -m pytest tests/unit/core/test_ecapa_facade.py -v`
-Expected: All 20 tests PASS
+Expected: All 25 tests PASS (22 from Task 2 + 3 new)
 
 - [ ] **Step 3: Commit**
 
@@ -764,7 +764,7 @@ Find the ECAPA background verification task launch (~line 74053-74058). BEFORE t
 
 - [ ] **Step 4: Add facade stop in supervisor shutdown**
 
-Find the supervisor's `_shutdown` or `_cleanup` method. Add:
+Search for `_ecapa_reprobe_task` cancellation in `unified_supervisor.py` (around line 94154-94166 inside `_apply_ecapa_policy`). Also search for any `async def _shutdown` or `async def _cleanup` or `async def _stop` method in the supervisor kernel class. Add the facade stop near where existing ECAPA background tasks are cancelled. If no centralized shutdown exists, add it at the location where `_ecapa_reprobe_task.cancel()` is called:
 
 ```python
         # v300.0: Stop EcapaFacade
@@ -826,9 +826,9 @@ For each file:
 - [ ] Run full test suite
 - [ ] Commit: `feat(ecapa): migrate secondary consumers to EcapaFacade (Phase 3)`
 
-### Task 7: Phase 4 — Delete old load paths (9 files)
+### Task 7: Phase 4 — Delete old load paths (10 files)
 
-**Files:** All 9 files listed in the spec's Phase 4 section.
+**Files:** All files listed in the spec's Phase 4 section, plus `process_isolated_ml_loader.py`.
 
 For each file:
 - [ ] Delete direct `safe_from_hparams` ECAPA calls
