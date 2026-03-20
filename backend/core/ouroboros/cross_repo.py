@@ -776,11 +776,37 @@ class CrossRepoOrchestrator:
             )
 
     async def _on_training_complete(self, event: CrossRepoEvent) -> None:
-        """Handle training complete event."""
-        self.logger.info(f"Training completed: {event.id}")
+        """Handle training complete -- notify Prime to reload updated model if applicable."""
+        self.logger.info("Training completed: %s", event.id)
+        self._metrics["training_completed"] = self._metrics.get("training_completed", 0) + 1
 
-        # Could trigger model update in Prime
-        # For now, just log it
+        model_path = event.payload.get("model_path")
+        if not model_path:
+            self.logger.debug("No model_path in training_complete payload, skipping reload")
+            return
+
+        # Notify J-Prime to hot-reload the updated model
+        prime_connector = self._connectors.get(RepoType.PRIME)
+        if prime_connector and prime_connector.get_state().healthy:
+            try:
+                # Emit a MODEL_UPDATE_REQUESTED event for Prime
+                update_event = CrossRepoEvent(
+                    id=f"model_update_{uuid.uuid4().hex[:12]}",
+                    type=EventType.IMPROVEMENT_REQUEST,
+                    source_repo=RepoType.REACTOR,
+                    target_repo=RepoType.PRIME,
+                    payload={
+                        "action": "model_reload",
+                        "model_path": model_path,
+                        "training_event_id": event.id,
+                    },
+                )
+                await self._event_bus.emit(update_event)
+                self.logger.info("Requested Prime model reload: %s", model_path)
+            except Exception as e:
+                self.logger.warning("Prime model reload request failed: %s", e)
+        else:
+            self.logger.warning("Prime connector not healthy, skipping model reload")
 
     def get_status(self) -> Dict[str, Any]:
         """Get orchestrator status."""

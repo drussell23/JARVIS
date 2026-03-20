@@ -211,6 +211,11 @@ class GovernedOrchestrator:
         self._config = config
         self._validation_runner = validation_runner
         self._oracle_update_lock: asyncio.Lock = asyncio.Lock()
+        self._reasoning_bridge: Optional[Any] = None  # set via set_reasoning_bridge()
+
+    def set_reasoning_bridge(self, bridge: Any) -> None:
+        """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning."""
+        self._reasoning_bridge = bridge
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
@@ -302,8 +307,23 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("emit_intent failed for op=%s", ctx.op_id, exc_info=True)
 
-        # Advance to ROUTE with risk_tier set
-        ctx = ctx.advance(OperationPhase.ROUTE, risk_tier=risk_tier)
+        # ---- Reasoning chain classification (optional, pre-routing) ----
+        reasoning_result = None
+        if self._reasoning_bridge and self._reasoning_bridge.is_active:
+            try:
+                reasoning_result = await self._reasoning_bridge.classify_with_reasoning(
+                    command=ctx.description,
+                    op_id=ctx.op_id,
+                )
+            except Exception:
+                logger.debug("Reasoning chain bridge error", exc_info=True)
+
+        # Advance to ROUTE with risk_tier set (and optional reasoning result)
+        ctx = ctx.advance(
+            OperationPhase.ROUTE,
+            risk_tier=risk_tier,
+            reasoning_chain_result=reasoning_result,
+        )
 
         # ---- Phase 2: ROUTE ----
         if self._config.context_expansion_enabled:

@@ -510,6 +510,9 @@ class OperationContext:
     # ---- Autonomy tier frozen at submit() — gate reads this, never re-queries TrustGraduator ----
     frozen_autonomy_tier: str = "governed"  # "governed" | "observe"; default = backward compat
 
+    # ---- Reasoning chain result (stamped at CLASSIFY if chain is active) ----
+    reasoning_chain_result: Optional[Dict[str, Any]] = None
+
     # ------------------------------------------------------------------
     # Post-init
     # ------------------------------------------------------------------
@@ -614,6 +617,7 @@ class OperationContext:
             "telemetry": None,
             "previous_op_hash_by_scope": previous_op_hash_by_scope,
             "frozen_autonomy_tier": "governed",
+            "reasoning_chain_result": None,
         }
         context_hash = _compute_hash(fields_for_hash)
 
