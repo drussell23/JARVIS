@@ -229,3 +229,7 @@ class EcapaOverloadError(EcapaError):
 
 class EcapaTimeoutError(EcapaError):
     """Raised when an ECAPA operation exceeds its deadline."""
+
+
+class DualAuthorityError(EcapaError):
+    """Raised when another process already owns the ECAPA facade lock."""

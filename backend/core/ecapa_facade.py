@@ -15,13 +15,18 @@ Key design points:
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import json
 import logging
+import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backend.core.ecapa_types import (
     CapabilityCheck,
+    DualAuthorityError,
     EcapaFacadeConfig,
     EcapaOverloadError,
     EcapaState,
@@ -34,6 +39,88 @@ from backend.core.ecapa_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Process-level file fence
+# ---------------------------------------------------------------------------
+
+
+class _FileFence:
+    """Process-level fencing via flock to prevent dual ECAPA owners.
+
+    Uses ``fcntl.LOCK_EX | fcntl.LOCK_NB`` so that the lock is held only by
+    one OS process at a time.  A stale lock file left by a crashed process is
+    not held by any process, so ``flock`` succeeds and the file is reused.
+    """
+
+    def __init__(self, lock_path: Optional[str] = None) -> None:
+        self._lock_path = Path(
+            lock_path or os.path.expanduser("~/.jarvis/locks/ecapa_facade.lock")
+        )
+        self._lock_fd: Optional[int] = None
+
+    def acquire(self) -> None:
+        """Acquire exclusive lock.  Raises DualAuthorityError if another process holds it."""
+        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self._lock_fd = os.open(str(self._lock_path), os.O_CREAT | os.O_RDWR)
+            fcntl.flock(self._lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            # Another process holds the lock — read its info then raise.
+            if self._lock_fd is not None:
+                try:
+                    os.close(self._lock_fd)
+                except OSError:
+                    pass
+                self._lock_fd = None
+
+            existing_info = self._read_lock_info()
+            raise DualAuthorityError(
+                f"Another process (PID {existing_info.get('pid', '?')}) "
+                f"already owns the ECAPA facade lock at {self._lock_path}"
+            ) from exc
+
+        # Write our ownership metadata into the lock file.
+        self._write_lock_info()
+
+    def release(self) -> None:
+        """Release the lock and clean up."""
+        if self._lock_fd is not None:
+            try:
+                fcntl.flock(self._lock_fd, fcntl.LOCK_UN)
+                os.close(self._lock_fd)
+            except OSError:
+                pass
+            self._lock_fd = None
+
+        # Remove the lock file (best-effort; another process may race here).
+        try:
+            self._lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _write_lock_info(self) -> None:
+        """Write ownership metadata to the lock file."""
+        if self._lock_fd is None:
+            return
+        info = {
+            "pid": os.getpid(),
+            "started_at": time.time(),
+        }
+        data = json.dumps(info).encode()
+        os.lseek(self._lock_fd, 0, os.SEEK_SET)
+        os.ftruncate(self._lock_fd, 0)
+        os.write(self._lock_fd, data)
+
+    def _read_lock_info(self) -> dict:
+        """Read existing lock file info (best-effort)."""
+        try:
+            return json.loads(self._lock_path.read_text())
+        except Exception:
+            return {}
+
 
 # ---------------------------------------------------------------------------
 # Legal transitions table
@@ -141,6 +228,9 @@ class EcapaFacade:
         self._current_root_cause_id: Optional[str] = None
         self._last_root_cause_id: Optional[str] = None
 
+        # Process-level file fence — prevents dual ECAPA owners across OS processes.
+        self._fence = _FileFence()
+
     # -- public read-only properties -----------------------------------------
 
     @property
@@ -161,6 +251,9 @@ class EcapaFacade:
         """Start the lifecycle probe.  Non-blocking and idempotent."""
         if self._state != EcapaState.UNINITIALIZED:
             return
+
+        # Raises DualAuthorityError if another OS process already owns the lock.
+        self._fence.acquire()
 
         self._started_at = time.monotonic()
         await self._try_transition(
@@ -195,6 +288,9 @@ class EcapaFacade:
         self._started_at = None
 
         self._current_root_cause_id = None
+
+        # Release process-level file fence so another process can take over.
+        self._fence.release()
 
         if old_state != EcapaState.UNINITIALIZED:
             await self._emit_event(

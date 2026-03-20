@@ -72,13 +72,29 @@ def _mock_cloud_client(healthy: bool = True):
 
 
 @pytest.fixture(autouse=True)
-def _reset_singleton():
-    """Reset the module-level singleton before each test."""
+def _reset_singleton(tmp_path):
+    """Reset the module-level singleton before each test.
+
+    Each test gets its own isolated lock path via ``tmp_path`` so that the
+    file fence never conflicts between tests that call ``start()``.
+    """
     from backend.core import ecapa_facade as mod
+    from backend.core.ecapa_facade import _FileFence
+
+    # Patch the default fence constructor to use a per-test tmp path.
+    _default_lock = str(tmp_path / "ecapa_default.lock")
+    _original_FileFence_init = _FileFence.__init__
+
+    def _patched_init(self, lock_path=None):
+        _original_FileFence_init(self, lock_path=lock_path or _default_lock)
+
+    _FileFence.__init__ = _patched_init
 
     mod._reset_facade()
     yield
     mod._reset_facade()
+
+    _FileFence.__init__ = _original_FileFence_init
 
 
 # ---------------------------------------------------------------------------
@@ -580,3 +596,66 @@ async def test_singleton_fencing():
     f2 = await get_ecapa_facade()
     assert f1 is f2
     _reset_facade()
+
+
+@pytest.mark.asyncio
+async def test_file_fence_prevents_dual_owners(tmp_path):
+    """Two facades with the same lock path — second raises DualAuthorityError."""
+    from backend.core.ecapa_facade import EcapaFacade, _FileFence
+    from backend.core.ecapa_types import DualAuthorityError
+
+    lock_path = str(tmp_path / "ecapa.lock")
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = True
+
+    # First facade acquires lock
+    f1 = EcapaFacade(registry=registry, config=_make_config())
+    f1._fence = _FileFence(lock_path=lock_path)
+    await f1.start()
+    await f1.ensure_ready(timeout=5.0)
+
+    # Second facade should fail
+    f2 = EcapaFacade(registry=registry, config=_make_config())
+    f2._fence = _FileFence(lock_path=lock_path)
+    with pytest.raises(DualAuthorityError):
+        await f2.start()
+
+    await f1.stop()
+
+
+@pytest.mark.asyncio
+async def test_file_fence_released_on_stop(tmp_path):
+    """After stop(), another facade can acquire the lock."""
+    from backend.core.ecapa_facade import EcapaFacade, _FileFence
+
+    lock_path = str(tmp_path / "ecapa.lock")
+    registry, wrapper = _mock_registry()
+    wrapper.is_loaded = True
+
+    f1 = EcapaFacade(registry=registry, config=_make_config())
+    f1._fence = _FileFence(lock_path=lock_path)
+    await f1.start()
+    await f1.ensure_ready(timeout=5.0)
+    await f1.stop()
+
+    # Second facade should succeed after first releases
+    f2 = EcapaFacade(registry=registry, config=_make_config())
+    f2._fence = _FileFence(lock_path=lock_path)
+    await f2.start()
+    await f2.ensure_ready(timeout=5.0)
+    await f2.stop()
+
+
+@pytest.mark.asyncio
+async def test_stale_lock_recovery(tmp_path):
+    """A lock file from a dead process should not block acquisition."""
+    from backend.core.ecapa_facade import _FileFence
+
+    lock_path = tmp_path / "ecapa.lock"
+    # Write a stale lock file (PID that doesn't exist)
+    lock_path.write_text('{"pid": 99999999, "started_at": 0}')
+
+    # Should succeed because no process actually holds the flock
+    fence = _FileFence(lock_path=str(lock_path))
+    fence.acquire()  # Should not raise — file exists but flock is not held
+    fence.release()
