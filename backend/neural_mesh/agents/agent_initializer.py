@@ -36,6 +36,15 @@ try:
 except ImportError:
     _COMPUTER_USE_AVAILABLE = False
 
+# DAS Task 8: CapabilityGapSensor — wired at intake layer startup
+try:
+    from backend.core.ouroboros.governance.intake.sensors.capability_gap_sensor import (
+        CapabilityGapSensor,
+    )
+    _CAPABILITY_GAP_SENSOR_AVAILABLE = True
+except ImportError:
+    _CAPABILITY_GAP_SENSOR_AVAILABLE = False
+
 try:
     from .app_inventory_service import AppInventoryService
     from .execution_tier_router import ExecutionTierRouter
@@ -367,3 +376,24 @@ async def shutdown_production_agents() -> None:
     if _initializer:
         await _initializer.shutdown_all_agents()
         _initializer = None
+
+
+async def start_capability_gap_sensor(intake_router: Any, repo: str) -> None:
+    """Start the CapabilityGapSensor if available.
+
+    Called by the intake layer (IntakeLayerService._build_components) after
+    the router is live so the sensor has a valid intake_router reference.
+
+    Args:
+        intake_router: The running UnifiedIntakeRouter instance.
+        repo:          Repository name forwarded to make_envelope.
+    """
+    if not _CAPABILITY_GAP_SENSOR_AVAILABLE:
+        logger.debug("CapabilityGapSensor not available — skipping registration")
+        return
+    gap_sensor = CapabilityGapSensor(
+        intake_router=intake_router,
+        repo=repo,
+    )
+    await gap_sensor.start()
+    logger.info("CapabilityGapSensor registered and started for repo=%s", repo)

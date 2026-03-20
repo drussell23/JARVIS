@@ -52,3 +52,19 @@ def test_sensor_location():
         "backend.core.ouroboros.governance.intake.sensors.capability_gap_sensor"
     )
     assert hasattr(mod, "CapabilityGapSensor")
+
+
+def test_capability_gap_in_valid_sources():
+    from backend.core.ouroboros.governance.intake.intent_envelope import _VALID_SOURCES
+    assert "capability_gap" in _VALID_SOURCES
+
+
+def test_capability_gap_sensor_registered_in_agent_initializer():
+    """agent_initializer must import CapabilityGapSensor."""
+    import importlib
+    src = importlib.util.find_spec(
+        "backend.neural_mesh.agents.agent_initializer"
+    )
+    assert src is not None
+    text = open(src.origin).read()
+    assert "CapabilityGapSensor" in text

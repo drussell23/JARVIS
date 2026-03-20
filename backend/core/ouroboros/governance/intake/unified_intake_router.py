@@ -35,6 +35,7 @@ _PRIORITY_MAP: Dict[str, int] = {
     "test_failure": 1,
     "backlog": 2,
     "ai_miner": 3,
+    "capability_gap": 4,
 }
 
 # Sources that bypass backpressure
