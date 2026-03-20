@@ -551,3 +551,41 @@ class TestMindClientEndpointSync:
         session_id = mc._session_id
         mc.update_endpoint("host2", 8001)
         assert mc._session_id == session_id  # Session preserved
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Boot gate integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestBootGateIntegration:
+    @pytest.mark.asyncio
+    async def test_boot_gate_returns_level_0_on_ready(self):
+        policy = RestartPolicy(max_restarts=3, window_s=60.0, base_backoff_s=0.01)
+        ctrl = JprimeLifecycleController(
+            host="127.0.0.1", port=8000, restart_policy=policy,
+        )
+        ctrl._probe = AsyncMock()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.READY, ready_for_inference=True,
+        )
+        ctrl._prime_router_notify = AsyncMock()
+        ctrl._mind_client_update = AsyncMock()
+        level = await ctrl.ensure_ready(timeout=10)
+        assert level == "LEVEL_0"
+        assert ctrl.state == LifecycleState.READY
+
+    @pytest.mark.asyncio
+    async def test_boot_gate_returns_level_2_on_timeout(self):
+        policy = RestartPolicy(max_restarts=1, window_s=60.0, base_backoff_s=0.01)
+        ctrl = JprimeLifecycleController(
+            host="127.0.0.1", port=8000, restart_policy=policy,
+        )
+        ctrl._probe = AsyncMock()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.UNREACHABLE, error="timeout",
+        )
+        ctrl._prime_router_notify = AsyncMock()
+        ctrl._mind_client_update = AsyncMock()
+        level = await ctrl.ensure_ready(timeout=1.0)
+        assert level == "LEVEL_2"
