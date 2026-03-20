@@ -1,0 +1,166 @@
+<h2>JARVIS Live Agent Dashboard — Layout</h2>
+<p class="subtitle">How should the TUI dashboard organize information? Pick the layout that matches how you'd monitor JARVIS.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Three-Panel Vertical Split</h3>
+      <div class="mockup" style="margin-top:12px">
+        <div class="mockup-body" style="padding:0">
+          <div style="display:flex;height:280px;font-size:12px;font-family:monospace">
+            <div style="flex:1;border-right:1px solid #333;padding:8px;overflow:hidden">
+              <div style="color:#10b981;font-weight:bold;margin-bottom:6px">SYSTEM STATUS</div>
+              <div style="color:#666;font-size:11px">
+                <div>J-Prime: <span style="color:#10b981">READY</span></div>
+                <div>Lifecycle: <span style="color:#10b981">LEVEL_0</span></div>
+                <div>Gate: <span style="color:#10b981">ACTIVE</span></div>
+                <div>Agents: <span style="color:#10b981">15/15</span></div>
+                <div style="margin-top:8px;color:#666">Uptime: 2h 34m</div>
+                <div>Commands: 147</div>
+                <div>Expansions: 23</div>
+                <div style="margin-top:8px;color:#f59e0b">Telemetry Bus</div>
+                <div>Emitted: 1,247</div>
+                <div>Dropped: 0</div>
+                <div>Dead-letter: 0</div>
+              </div>
+            </div>
+            <div style="flex:2;border-right:1px solid #333;padding:8px;overflow:hidden">
+              <div style="color:#3b82f6;font-weight:bold;margin-bottom:6px">PIPELINE TRACE (Live)</div>
+              <div style="color:#666;font-size:11px">
+                <div style="color:#10b981">14:23:05 "start my day"</div>
+                <div style="padding-left:12px">Detect: proactive=true conf=0.92 (15ms)</div>
+                <div style="padding-left:12px">Expand: 3 intents [email, calendar, slack]</div>
+                <div style="padding-left:12px;color:#3b82f6">Mind[1/3]: check email -> plan_ready</div>
+                <div style="padding-left:12px;color:#3b82f6">Mind[2/3]: check calendar -> plan_ready</div>
+                <div style="padding-left:12px;color:#3b82f6">Mind[3/3]: open slack -> plan_ready</div>
+                <div style="padding-left:12px;color:#10b981">Coord: email->GoogleWorkspace</div>
+                <div style="padding-left:12px;color:#10b981">Coord: calendar->GoogleWorkspace</div>
+                <div style="padding-left:12px;color:#10b981">Coord: slack->NativeAppControl</div>
+                <div style="padding-left:12px;color:#10b981">COMPLETE 2.3s success=100%</div>
+                <div style="margin-top:6px;color:#a78bfa">14:22:41 "what's the weather"</div>
+                <div style="padding-left:12px;color:#666">Detect: proactive=false -> passthrough</div>
+              </div>
+            </div>
+            <div style="flex:1;padding:8px;overflow:hidden">
+              <div style="color:#a78bfa;font-weight:bold;margin-bottom:6px">AGENT INVENTORY</div>
+              <div style="color:#666;font-size:11px">
+                <div><span style="color:#10b981">*</span> CoordinatorAgent <span style="color:#10b981">idle</span></div>
+                <div><span style="color:#10b981">*</span> PredictivePlanner <span style="color:#f59e0b">busy</span></div>
+                <div><span style="color:#10b981">*</span> MemoryAgent <span style="color:#10b981">idle</span></div>
+                <div><span style="color:#10b981">*</span> GoogleWorkspace <span style="color:#f59e0b">busy</span></div>
+                <div><span style="color:#10b981">*</span> SpatialAwareness <span style="color:#10b981">idle</span></div>
+                <div><span style="color:#10b981">*</span> VisualMonitor <span style="color:#10b981">idle</span></div>
+                <div><span style="color:#10b981">*</span> ErrorAnalyzer <span style="color:#10b981">idle</span></div>
+                <div><span style="color:#10b981">*</span> WebSearch <span style="color:#10b981">idle</span></div>
+                <div><span style="color:#666">.</span> HealthMonitor <span style="color:#666">n/a</span></div>
+                <div style="margin-top:8px;color:#ef4444;font-weight:bold">FAULTS</div>
+                <div style="color:#666">None active</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p style="margin-top:8px;color:#888">Left: system health. Center: live command flow. Right: agent status. Classic monitoring layout.</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Stacked Horizontal — Pipeline on Top, Details Below</h3>
+      <div class="mockup" style="margin-top:12px">
+        <div class="mockup-body" style="padding:0">
+          <div style="height:280px;font-size:12px;font-family:monospace">
+            <div style="border-bottom:1px solid #333;padding:8px;height:40%">
+              <div style="display:flex;justify-content:space-between">
+                <span style="color:#3b82f6;font-weight:bold">PIPELINE TRACE</span>
+                <span style="color:#666">J-Prime:<span style="color:#10b981">READY</span> | Gate:<span style="color:#10b981">ACTIVE</span> | Agents:<span style="color:#10b981">15/15</span></span>
+              </div>
+              <div style="color:#666;font-size:11px;margin-top:4px">
+                <div style="color:#10b981">14:23:05 "start my day" -> Detect(0.92) -> Expand(3) -> Mind(3/3) -> Coord(3/3) -> DONE 2.3s</div>
+                <div style="color:#a78bfa">14:22:41 "what's the weather" -> Detect(0.10) -> passthrough -> J-Prime -> DONE 1.1s</div>
+                <div style="color:#10b981">14:22:02 "check my email" -> Detect(0.78) -> single-intent -> Mind -> DONE 3.2s</div>
+                <div style="color:#666">14:21:15 "unlock my screen" -> reflex -> DONE 0.8s</div>
+              </div>
+            </div>
+            <div style="display:flex;height:60%">
+              <div style="flex:1;border-right:1px solid #333;padding:8px">
+                <div style="color:#a78bfa;font-weight:bold;margin-bottom:4px">AGENTS (15)</div>
+                <div style="color:#666;font-size:11px;display:grid;grid-template-columns:1fr 1fr;gap:2px">
+                  <div><span style="color:#10b981">*</span> Coordinator</div>
+                  <div><span style="color:#f59e0b">*</span> Predictive</div>
+                  <div><span style="color:#10b981">*</span> Memory</div>
+                  <div><span style="color:#10b981">*</span> Workspace</div>
+                  <div><span style="color:#10b981">*</span> Spatial</div>
+                  <div><span style="color:#10b981">*</span> Visual</div>
+                  <div><span style="color:#10b981">*</span> Error</div>
+                  <div><span style="color:#10b981">*</span> Context</div>
+                </div>
+              </div>
+              <div style="flex:1;border-right:1px solid #333;padding:8px">
+                <div style="color:#f59e0b;font-weight:bold;margin-bottom:4px">LIFECYCLE</div>
+                <div style="color:#666;font-size:11px">
+                  <div>State: <span style="color:#10b981">READY</span></div>
+                  <div>Restarts: 0/5</div>
+                  <div>Uptime: 2h 34m</div>
+                  <div>Health: 100%</div>
+                </div>
+              </div>
+              <div style="flex:1;padding:8px">
+                <div style="color:#ef4444;font-weight:bold;margin-bottom:4px">FAULTS & EVENTS</div>
+                <div style="color:#666;font-size:11px">
+                  <div>Active faults: 0</div>
+                  <div>Resolved today: 2</div>
+                  <div>Telemetry: 1,247</div>
+                  <div>Dropped: 0</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p style="margin-top:8px;color:#888">Pipeline trace takes top half (most important). Agents, lifecycle, and faults share bottom. Compact one-line-per-command view.</p>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Tabbed — Pipeline default, switch to Agents/System</h3>
+      <div class="mockup" style="margin-top:12px">
+        <div class="mockup-body" style="padding:0">
+          <div style="height:280px;font-size:12px;font-family:monospace">
+            <div style="display:flex;border-bottom:1px solid #333;padding:4px 8px;gap:16px">
+              <span style="color:#3b82f6;font-weight:bold;border-bottom:2px solid #3b82f6;padding-bottom:2px">Pipeline</span>
+              <span style="color:#666">Agents</span>
+              <span style="color:#666">System</span>
+              <span style="color:#666">Faults</span>
+              <span style="flex:1"></span>
+              <span style="color:#10b981;font-size:10px">J-Prime:READY | Gate:ACTIVE</span>
+            </div>
+            <div style="padding:8px;color:#666;font-size:11px">
+              <div style="color:#10b981;margin-bottom:4px">14:23:05 "start my day" trace_id=abc-123</div>
+              <div style="padding-left:12px">
+                <div>DETECT   proactive=true  conf=0.92   signals=[workflow,multi_task]   15ms</div>
+                <div>EXPAND   3 intents       conf=0.88   [check email, calendar, slack]  120ms</div>
+                <div style="color:#3b82f6">MIND[1]  check email     plan_ready  brain=qwen-2.5-7b   850ms</div>
+                <div style="color:#3b82f6">MIND[2]  check calendar  plan_ready  brain=qwen-2.5-7b   720ms</div>
+                <div style="color:#3b82f6">MIND[3]  open slack      plan_ready  brain=qwen-2.5-7b   640ms</div>
+                <div style="color:#10b981">COORD    email -> GoogleWorkspaceAgent                    50ms</div>
+                <div style="color:#10b981">COORD    calendar -> GoogleWorkspaceAgent                 45ms</div>
+                <div style="color:#10b981">COORD    slack -> NativeAppControlAgent                   38ms</div>
+                <div style="color:#10b981;font-weight:bold">DONE     3/3 intents  success=100%  total=2.3s</div>
+              </div>
+              <div style="margin-top:8px;color:#a78bfa">14:22:41 "what's the weather" trace_id=def-456</div>
+              <div style="padding-left:12px;color:#666">
+                <div>DETECT   proactive=false conf=0.10  -> passthrough (single-intent)</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <p style="margin-top:8px;color:#888">Full screen for the active tab. Pipeline gets maximum detail. Tab status bar shows health at a glance. Most screen real estate for whatever you're focused on.</p>
+    </div>
+  </div>
+</div>
