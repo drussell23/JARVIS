@@ -98,6 +98,40 @@ class VoiceCapability(enum.Enum):
     EXTRACT_EMBEDDING = "CAP_EXTRACT_EMBEDDING"
     PASSWORD_FALLBACK = "CAP_PASSWORD_FALLBACK"
 
+@dataclass
+class EcapaFacadeConfig:
+    """All facade parameters. Reads from env vars with sane defaults."""
+    failure_threshold: int = 3
+    recovery_threshold: int = 3
+    transition_cooldown_s: float = 10.0
+    reprobe_interval_s: float = 15.0
+    reprobe_max_backoff_s: float = 120.0
+    reprobe_budget: int = 20
+    probe_timeout_s: float = 8.0
+    local_load_timeout_s: float = 45.0
+    max_concurrent_extractions: int = 4
+    recovering_fail_threshold: int = 2  # Failures in RECOVERING -> UNAVAILABLE
+
+    @classmethod
+    def from_env(cls) -> "EcapaFacadeConfig":
+        import os
+        def _int(key: str, default: int) -> int:
+            return int(os.getenv(key, str(default)))
+        def _float(key: str, default: float) -> float:
+            return float(os.getenv(key, str(default)))
+        return cls(
+            failure_threshold=_int("ECAPA_FAILURE_THRESHOLD", 3),
+            recovery_threshold=_int("ECAPA_RECOVERY_THRESHOLD", 3),
+            transition_cooldown_s=_float("ECAPA_TRANSITION_COOLDOWN_S", 10.0),
+            reprobe_interval_s=_float("ECAPA_REPROBE_INTERVAL_S", 15.0),
+            reprobe_max_backoff_s=_float("ECAPA_REPROBE_MAX_BACKOFF_S", 120.0),
+            reprobe_budget=_int("ECAPA_REPROBE_BUDGET", 20),
+            probe_timeout_s=_float("ECAPA_PROBE_TIMEOUT_S", 8.0),
+            local_load_timeout_s=_float("ECAPA_LOCAL_LOAD_TIMEOUT_S", 45.0),
+            max_concurrent_extractions=_int("ECAPA_MAX_CONCURRENT_EXTRACTIONS", 4),
+            recovering_fail_threshold=_int("ECAPA_RECOVERING_FAIL_THRESHOLD", 2),
+        )
+
 @dataclass(frozen=True)
 class EmbeddingResult:
     """Result of an embedding extraction request."""
@@ -220,6 +254,13 @@ promotion occurs (intra-state `READY -> READY` with backend switch, emitting
 - `READY` directly to `UNAVAILABLE` (must pass through `DEGRADED`)
 - `RECOVERING` to `DEGRADED` (succeeds to READY or fails to UNAVAILABLE)
 - Any backward transition without `stop()`
+
+**RECOVERING exit criteria:** In RECOVERING state, the facade tests the candidate
+backend. If `recovering_fail_threshold` (default: 2) consecutive failures occur,
+the facade transitions back to UNAVAILABLE and decrements the reprobe budget.
+There is no maximum time in RECOVERING — the exit is always via success count
+(N successes -> READY) or failure count (recovering_fail_threshold failures ->
+UNAVAILABLE).
 
 ### Transition Parameters
 
