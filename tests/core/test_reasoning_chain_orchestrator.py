@@ -484,3 +484,117 @@ class TestOrchestratorSingleton:
         orch2 = get_reasoning_chain_orchestrator()
         assert orch1 is orch2
         mod._orchestrator_instance = None  # Clean up
+
+
+# ---------------------------------------------------------------------------
+# End-to-end chain tests
+# ---------------------------------------------------------------------------
+
+
+class TestEndToEndChain:
+    """Full pipeline: detect -> expand -> mind -> coordinate -> result."""
+
+    @pytest.mark.asyncio
+    async def test_full_pipeline_start_my_day(self):
+        """Simulate 'start my day' through the full chain."""
+        config = ChainConfig(
+            phase=ChainPhase.FULL_ENABLE,
+            proactive_threshold=0.5,
+            auto_expand_threshold=0.8,
+            active=True,
+        )
+        orch = ReasoningChainOrchestrator(config=config)
+
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.95)
+        orch._detector = mock_detector
+
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result(
+            ["check email", "check calendar", "open Slack"]
+        )
+        orch._planner = mock_planner
+
+        mock_mind = AsyncMock()
+        mock_mind.send_command.return_value = {
+            "status": "plan_ready",
+            "success": True,
+            "plan": {
+                "sub_goals": [{"goal": "done", "tool_required": "handle_workspace_query"}],
+                "plan_id": "p-test",
+            },
+            "classification": {"brain_used": "qwen-2.5-7b"},
+        }
+        orch._mind_client = mock_mind
+
+        mock_coord = AsyncMock()
+        mock_coord.execute_task.return_value = {
+            "status": "delegated",
+            "task_id": "t-test",
+            "delegated_to": "GoogleWorkspaceAgent",
+        }
+        orch._coordinator = mock_coord
+
+        result = await orch.process("start my day", context={}, trace_id="e2e-test")
+
+        assert result is not None
+        assert result.handled is True
+        assert result.needs_confirmation is False
+        assert len(result.expanded_intents) == 3
+        assert len(result.mind_results) == 3
+        assert result.success_rate > 0
+        assert result.total_ms > 0
+        assert mock_detector.detect.call_count == 1
+        assert mock_planner.expand_intent.call_count == 1
+        assert mock_mind.send_command.call_count == 3
+        assert mock_coord.execute_task.call_count == 3
+
+        # Verify trace_id propagated to Mind
+        for call in mock_mind.send_command.call_args_list:
+            ctx = call.kwargs.get("context", {})
+            assert ctx.get("trace_id") == "e2e-test"
+            assert ctx.get("expanded_from_chain") is True
+
+        # Verify audit trail
+        assert "detection" in result.audit_trail
+        assert result.audit_trail["detection"]["confidence"] == 0.95
+        assert result.audit_trail["expansion"]["intent_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_non_proactive_command_passthrough(self):
+        """Simple command should not be intercepted."""
+        config = ChainConfig(
+            phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, active=True,
+        )
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(False, 0.1)
+        orch._detector = mock_detector
+        result = await orch.process("what time is it", context={}, trace_id="simple")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_go_no_go_metrics_accumulate(self):
+        """Shadow metrics accumulate for go/no-go evaluation."""
+        config = ChainConfig(phase=ChainPhase.SHADOW, proactive_threshold=0.5, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        mock_detector = AsyncMock()
+        mock_detector.detect.return_value = _mock_detection_result(True, 0.9)
+        orch._detector = mock_detector
+        mock_planner = AsyncMock()
+        mock_planner.expand_intent.return_value = _mock_prediction_result()
+        orch._planner = mock_planner
+
+        for i in range(5):
+            await orch.process(f"command {i}", context={}, trace_id=f"shadow-{i}")
+
+        assert orch._shadow_metrics.total_detections == 5
+        assert orch._shadow_metrics.would_expand_count == 5
+        assert orch._shadow_metrics.actually_expanded_count == 0
+        assert len(orch._shadow_metrics.latency_samples_ms) == 5
+
+        status = orch._shadow_metrics.go_no_go_status()
+        assert "expansion_accuracy" in status
+        assert "false_positive_rate" in status
+        assert "latency_p95_ms" in status
+        assert "mind_plan_quality" in status
