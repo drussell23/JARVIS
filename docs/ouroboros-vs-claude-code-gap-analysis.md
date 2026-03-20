@@ -1077,13 +1077,17 @@ Both SPA (Khemani) and the hybrid framework (James et al.) independently converg
 ---
 
 Sources:
-- [Hooks reference](https://docs.anthropic.com/en/docs/claude-code/hooks)
-- [Settings and permissions](https://docs.anthropic.com/en/docs/claude-code/settings)
-- [How Claude remembers your project](https://docs.anthropic.com/en/docs/claude-code/memory)
-- [Create custom subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents)
-- [Subagents in the SDK](https://docs.anthropic.com/en/docs/claude-code/sdk/subagents)
-- [Agent SDK overview](https://docs.anthropic.com/en/docs/claude-code/sdk)
-- [Connect to external tools with MCP](https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-mcp)
-- [Configure permissions](https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-permissions)
-- Khemani, K. (2025). Self-Programming AI: Code-Learning Agents for Autonomous Refactoring and Architectural Evolution. Research Square. https://doi.org/10.21203/rs.3.rs-6688473/v1
-- James, N. H., Ene, D. S., & Lenu, G. F. (2025). Self-Programming Artificial Intelligence: Autonomous Learning and Evolutionary Algorithms. International Journal of Computer Science and Mathematical Theory (IJCSMT), Vol. 11, No. 5. DOI: 10.56201/ijcsmt.vol.11.no5.2025.pg77.92
+
+**Claude Code Technical Documentation**
+- [Hooks reference](https://docs.anthropic.com/en/docs/claude-code/hooks) — https://docs.anthropic.com/en/docs/claude-code/hooks
+- [Settings and permissions](https://docs.anthropic.com/en/docs/claude-code/settings) — https://docs.anthropic.com/en/docs/claude-code/settings
+- [How Claude remembers your project](https://docs.anthropic.com/en/docs/claude-code/memory) — https://docs.anthropic.com/en/docs/claude-code/memory
+- [Create custom subagents](https://docs.anthropic.com/en/docs/claude-code/sub-agents) — https://docs.anthropic.com/en/docs/claude-code/sub-agents
+- [Subagents in the SDK](https://docs.anthropic.com/en/docs/claude-code/sdk/subagents) — https://docs.anthropic.com/en/docs/claude-code/sdk/subagents
+- [Agent SDK overview](https://docs.anthropic.com/en/docs/claude-code/sdk) — https://docs.anthropic.com/en/docs/claude-code/sdk
+- [Connect to external tools with MCP](https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-mcp) — https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-mcp
+- [Configure permissions](https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-permissions) — https://docs.anthropic.com/en/docs/claude-code/sdk/sdk-permissions
+
+**Research Papers**
+- Khemani, K. (2025). Self-Programming AI: Code-Learning Agents for Autonomous Refactoring and Architectural Evolution. Research Square (preprint). [https://doi.org/10.21203/rs.3.rs-6688473/v1](https://doi.org/10.21203/rs.3.rs-6688473/v1)
+- James, N. H., Ene, D. S., & Lenu, G. F. (2025). Self-Programming Artificial Intelligence: Autonomous Learning and Evolutionary Algorithms. International Journal of Computer Science and Mathematical Theory (IJCSMT), Vol. 11, No. 5, pp. 77–92. [https://doi.org/10.56201/ijcsmt.vol.11.no5.2025.pg77.92](https://doi.org/10.56201/ijcsmt.vol.11.no5.2025.pg77.92)
