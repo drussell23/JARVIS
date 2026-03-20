@@ -718,6 +718,7 @@ class GovernedLoopService:
         self._safety_net: Optional[ProductionSafetyNet] = None
         self._subagent_scheduler: Optional[Any] = None
         self._advanced_autonomy: Optional[Any] = None
+        self._mcp_client: Optional[Any] = None  # Phase A: GovernanceMCPClient, wired in start()
 
         # Compute-class admission gate (set externally after fetching /v1/capability;
         # None = gate disabled — backward-compatible default)
