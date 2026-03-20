@@ -15,7 +15,8 @@ def test_new_domain_at_tier1(ledger):
 
 
 def test_trust_score_ratio_formula(ledger):
-    """trust_score = 0.40*(s/n) - 0.30*(r/n) - 0.20*(i/n) + 0.10*(a/n)"""
+    """trust_score = 0.40*(s/n) - 0.30*(r/n) - 0.20*(i/n) + 0.10*(a/n)
+    where n = total_attempts (audits don't count as attempts)"""
     domain = "test:ratio"
     for _ in range(10):
         ledger.record_success(domain)
@@ -26,7 +27,7 @@ def test_trust_score_ratio_formula(ledger):
     for _ in range(3):
         ledger.record_audit(domain)
     r = ledger.record(domain)
-    n = max(r.total_attempts, 1)
+    n = max(r.total_attempts, 1)  # = 13 (audits excluded)
     expected = (
         0.40 * (r.successful_runs / n)
         - 0.30 * (r.rollback_count / n)
@@ -38,18 +39,20 @@ def test_trust_score_ratio_formula(ledger):
 
 def test_tier2_requires_score_and_attempts(ledger):
     domain = "test:tier2"
-    # Gate 1: fewer than 5 attempts → still tier 1 even with perfect ratio
+    # Gate 1: fewer than 5 attempts → tier 1
     for _ in range(4):
         ledger.record_success(domain)
     assert ledger.record(domain).tier == 1
 
-    # Gate 2: trust_score formula max is 0.40+0.10=0.50, below tier-2 threshold (0.70)
-    # So even with 5+ attempts and best possible score, tier remains 1
-    ledger.record_success(domain)  # now 5 attempts
+    # Now meet both gates: 5 attempts + score >= 0.70 via audits
+    # 5 successes (n=5), 15 audits → score = 0.40*(5/5) + 0.10*(15/5) = 0.70
+    ledger.record_success(domain)          # 5th attempt
+    for _ in range(15):
+        ledger.record_audit(domain)        # boosts score without increasing n
     r = ledger.record(domain)
     assert r.total_attempts == 5
-    assert r.trust_score <= 0.50   # confirms formula upper bound
-    assert r.tier == 1              # tier 2 threshold (0.70) unreachable with current weights
+    assert abs(r.trust_score - 0.70) < 1e-9
+    assert r.tier == 2
 
 
 def test_incident_resets_to_tier1(ledger):
@@ -86,6 +89,7 @@ def test_total_attempts_counts_all_events(ledger):
     ledger.record_success(domain)
     ledger.record_rollback(domain)
     ledger.record_incident(domain)
-    ledger.record_audit(domain)
+    ledger.record_audit(domain)  # audit does NOT count as attempt
     r = ledger.record(domain)
-    assert r.total_attempts == 4
+    assert r.total_attempts == 3   # only success + rollback + incident
+    assert r.audit_pass_count == 1  # audit still tracked

@@ -10,7 +10,7 @@ Trust formula (ratio-based, Goodhart-resistant):
   )
 
 Tier graduation gates:
-  tier_0: risk_class=critical OR compensation_strategy.strategy_type="manual" — never graduates
+  tier_0: risk_class=critical OR compensation_strategy.strategy_type="manual" — enforced by caller (AgentSynthesisLoader), not this ledger
   tier_1: default for new domains — human approves each synthesis
   tier_2: trust_score >= 0.70 AND total_attempts >= 5
   tier_3: trust_score >= 0.90 AND total_attempts >= 20 AND incident_count == 0
@@ -49,10 +49,13 @@ def _compute_tier(r: DomainTrustRecord) -> int:
     if r.incident_count > 0:
         return 1
     if r.trust_score >= 0.90 and r.total_attempts >= 20 and r.incident_count == 0:
-        return 3
-    if r.trust_score >= 0.70 and r.total_attempts >= 5:
-        return 2
-    return 1
+        target = 3
+    elif r.trust_score >= 0.70 and r.total_attempts >= 5:
+        target = 2
+    else:
+        target = 1
+    # Enforce tier-by-tier graduation: never advance more than one tier at a time
+    return min(target, r.tier + 1)
 
 
 def _compute_score(r: DomainTrustRecord) -> float:
@@ -91,15 +94,18 @@ class DomainTrustLedger:
         with self._lock:
             r = self._get_or_create(domain)
             r.journal.append(TrustJournalEntry(kind=kind, timestamp_ms=now_ms))
-            r.total_attempts += 1
             if kind == "success":
                 r.successful_runs += 1
+                r.total_attempts += 1
             elif kind == "rollback":
                 r.rollback_count += 1
+                r.total_attempts += 1
             elif kind == "incident":
                 r.incident_count += 1
+                r.total_attempts += 1
             elif kind == "audit":
                 r.audit_pass_count += 1
+                # audits are secondary annotations — do NOT increment total_attempts
             r.trust_score = _compute_score(r)
             r.tier = _compute_tier(r)
             r.last_updated_ms = now_ms
