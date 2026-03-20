@@ -12,6 +12,26 @@ from backend.core.reasoning_chain_orchestrator import (
     ReasoningChainOrchestrator,
     get_reasoning_chain_orchestrator,
 )
+from backend.core.reasoning_activation_gate import GateState
+
+
+# ---------------------------------------------------------------------------
+# Auto-mock the activation gate as ACTIVE for all tests in this module so
+# that existing orchestrator tests are not blocked by the gate (Task 3).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(autouse=True)
+def _mock_gate_active():
+    """Ensure the reasoning activation gate reports ACTIVE for every test."""
+    mock_gate = MagicMock()
+    mock_gate.is_active.return_value = True
+    mock_gate.state = GateState.ACTIVE
+    mock_gate.get_degraded_config.return_value = {}
+    with patch(
+        "backend.core.reasoning_activation_gate.get_reasoning_activation_gate",
+        return_value=mock_gate,
+    ):
+        yield mock_gate
 
 
 class TestChainPhase:

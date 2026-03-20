@@ -479,6 +479,28 @@ class ReasoningChainOrchestrator:
         """
         start_ms = time.monotonic() * 1000
 
+        # v300.2: Reasoning activation gate check
+        try:
+            from backend.core.reasoning_activation_gate import (
+                get_reasoning_activation_gate,
+                GateState,
+            )
+            _gate = get_reasoning_activation_gate()
+            if not _gate.is_active():
+                return None
+
+            # Apply degraded overrides
+            if _gate.state == GateState.DEGRADED:
+                _overrides = _gate.get_degraded_config()
+                if _overrides.get("proactive_threshold_boost"):
+                    self._config.proactive_threshold += _overrides["proactive_threshold_boost"]
+                if "auto_expand_threshold" in _overrides:
+                    self._config.auto_expand_threshold = _overrides["auto_expand_threshold"]
+                if "expansion_timeout_factor" in _overrides:
+                    self._config.expansion_timeout *= _overrides["expansion_timeout_factor"]
+        except Exception:
+            pass  # Gate unavailable — proceed without gating
+
         # Step 1: Proactive detection
         try:
             detector = self._get_detector()
