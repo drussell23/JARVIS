@@ -1986,78 +1986,20 @@ class UnifiedVoiceCacheManager:
         return status
 
     async def _load_ecapa_directly(self):
-        """
-        Direct ECAPA-TDNN loading as fallback when parallel loader fails.
-
-        Returns:
-            Loaded encoder or None
-        """
+        """ECAPA loading delegated to EcapaFacade."""
         try:
-            logger.info("🔄 Loading ECAPA-TDNN directly from SpeechBrain...")
-
-            # v271.3: Route through centralized safe loader (meta tensor protection)
-            def _load():
-                import torch
-                try:
-                    from voice.engines.speechbrain_engine import safe_from_hparams
-                except ImportError:
-                    from backend.voice.engines.speechbrain_engine import safe_from_hparams
-
-                # Force CPU to avoid MPS issues
-                torch.set_num_threads(1)
-
-                return safe_from_hparams(
-                    "speechbrain.inference.speaker.EncoderClassifier",
-                    model_name="ecapa_cache_direct",
-                    source="speechbrain/spkrec-ecapa-voxceleb",
-                    run_opts={"device": "cpu"},
-                )
-
-            # Use asyncio.to_thread (Python 3.9+) for thread-safe execution
-            encoder = await asyncio.wait_for(
-                asyncio.to_thread(_load),
-                timeout=60.0
-            )
-
-            logger.info("✅ ECAPA-TDNN loaded directly")
-            return encoder
-
-        except ImportError as e:
-            logger.warning(f"⚠️ SpeechBrain not installed - cannot load ECAPA-TDNN: {e}")
-            return None
-        except asyncio.TimeoutError:
-            logger.warning("⏱️ Direct ECAPA load timed out after 60s")
-            return None
-        except Exception as e:
-            logger.error(f"❌ Direct ECAPA load failed: {e}")
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            await facade.ensure_ready(timeout=30.0)
+            return None  # Callers handle None gracefully
+        except Exception:
             return None
 
     def _create_ecapa_loader(self):
-        """
-        Create a function to load ECAPA-TDNN encoder.
-
-        Returns a callable that loads the model, for use with ParallelModelLoader.
-        """
-        def _load_ecapa():
-            # v271.3: Route through centralized safe loader (meta tensor protection)
-            import torch
-            try:
-                from voice.engines.speechbrain_engine import safe_from_hparams
-            except ImportError:
-                from backend.voice.engines.speechbrain_engine import safe_from_hparams
-
-            # Force CPU to avoid MPS issues with FFT operations
-            torch.set_num_threads(1)
-
-            encoder = safe_from_hparams(
-                "speechbrain.inference.speaker.EncoderClassifier",
-                model_name="ecapa_cache_factory",
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"},
-            )
-            return encoder
-
-        return _load_ecapa
+        """ECAPA loading delegated to EcapaFacade."""
+        def _noop():
+            return None
+        return _noop
 
     def get_ecapa_encoder(self):
         """

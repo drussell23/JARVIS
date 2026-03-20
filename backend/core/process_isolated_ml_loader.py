@@ -884,6 +884,22 @@ def _worker_load_speechbrain_model(
 
     Writes result to a file to avoid pickling the model.
     """
+    # ECAPA loading is now handled by EcapaFacade — short-circuit
+    if "spkrec-ecapa" in model_name:
+        _ecapa_result = {
+            'success': True,
+            'error': None,
+            'model_info': {'name': model_name, 'delegated': 'EcapaFacade'},
+            'load_time_ms': 0,
+        }
+        try:
+            with open(result_file, 'wb') as f:
+                pickle.dump(_ecapa_result, f)  # noqa: S301 — pre-existing pickle IPC pattern
+        except Exception:
+            pass
+        logger.info("[Worker] ECAPA load delegated to EcapaFacade")
+        return
+
     # Set process title for identification
     try:
         import setproctitle
@@ -1059,6 +1075,7 @@ class ProcessIsolatedMLLoader:
             model_name: HuggingFace model name (e.g., "speechbrain/spkrec-ecapa-voxceleb")
             save_dir: Directory to save model files
             device: Device to load model on ("cpu", "cuda", "mps")
+
             timeout: Timeout in seconds (default from config)
 
         Returns:
@@ -1067,7 +1084,21 @@ class ProcessIsolatedMLLoader:
         Raises:
             MLLoadTimeout: If loading times out
             MLLoadError: If loading fails
+
+        Note:
+            ECAPA models are now loaded via EcapaFacade. Requests for
+            spkrec-ecapa-voxceleb short-circuit to a no-op.
         """
+        # ECAPA loading delegated to EcapaFacade
+        if "spkrec-ecapa" in model_name:
+            logger.info("ECAPA load delegated to EcapaFacade (process-isolated path bypassed)")
+            return {
+                'success': True,
+                'error': None,
+                'model_info': {'name': model_name, 'delegated': 'EcapaFacade'},
+                'load_time_ms': 0,
+            }
+
         await self.initialize()
 
         timeout = timeout or self.config.default_timeout

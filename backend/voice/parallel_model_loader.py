@@ -522,31 +522,8 @@ async def load_whisper_model() -> Any:
 
 
 async def load_ecapa_encoder() -> Any:
-    """Load ECAPA-TDNN speaker encoder with caching."""
-    def _load():
-        # v271.3: Route through centralized safe loader (meta tensor protection)
-        try:
-            from voice.engines.speechbrain_engine import safe_from_hparams
-        except ImportError:
-            from backend.voice.engines.speechbrain_engine import safe_from_hparams
-        import torch
-
-        # Force CPU for ECAPA-TDNN (MPS doesn't support required FFT ops)
-        torch.set_num_threads(1)
-
-        # Suppress benign HuggingFace warnings about Wav2Vec2 weight initialization
-        with suppress_hf_model_warnings():
-            encoder = safe_from_hparams(
-                "speechbrain.inference.speaker.EncoderClassifier",
-                model_name="ecapa_parallel_loader",
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"},
-            )
-        return encoder
-
-    loader = get_model_loader()
-    result = await loader.load_model("ecapa_encoder", _load, timeout=120.0)
-    return result.model if result.success else None
+    """ECAPA loading delegated to EcapaFacade."""
+    return None
 
 
 async def load_all_voice_models() -> ParallelLoadResult:
@@ -570,27 +547,14 @@ async def load_all_voice_models() -> ParallelLoadResult:
 
     # Legacy path (no broker)
     from voice.whisper_audio_fix import _whisper_handler
-    # v271.3: Route through centralized safe loader (meta tensor protection)
-    try:
-        from voice.engines.speechbrain_engine import safe_from_hparams
-    except ImportError:
-        from backend.voice.engines.speechbrain_engine import safe_from_hparams
-    import torch
 
     def load_whisper():
         _whisper_handler.load_model()
         return _whisper_handler
 
     def load_ecapa():
-        torch.set_num_threads(1)
-        # Suppress benign HuggingFace warnings about Wav2Vec2 weight initialization
-        with suppress_hf_model_warnings():
-            return safe_from_hparams(
-                "speechbrain.inference.speaker.EncoderClassifier",
-                model_name="ecapa_parallel_all",
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": "cpu"},
-            )
+        """ECAPA loading delegated to EcapaFacade."""
+        return None
 
     loader = get_model_loader()
     return await loader.load_models_parallel([

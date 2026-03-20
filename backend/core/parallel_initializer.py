@@ -2269,30 +2269,9 @@ class ParallelInitializer:
             # 1. ECAPA-TDNN Speaker Embedding Model (Heavy - 4+ seconds normally)
             # =========================================================
             def load_ecapa_heavy():
-                """Heavy loader for ECAPA-TDNN model - runs in background thread."""
-                try:
-                    from cloud_services.ecapa_cloud_service import ECAPAModelManager
-                    manager = ECAPAModelManager()
-                    logger.info("   [BACKGROUND] ECAPA model loaded")
-                    return manager
-                except ImportError:
-                    # v271.3: Route through centralized safe loader (meta tensor protection)
-                    try:
-                        try:
-                            from voice.engines.speechbrain_engine import safe_from_hparams
-                        except ImportError:
-                            from backend.voice.engines.speechbrain_engine import safe_from_hparams
-                        model = safe_from_hparams(
-                            "speechbrain.inference.speaker.EncoderClassifier",
-                            model_name="ecapa_parallel_init",
-                            source="speechbrain/spkrec-ecapa-voxceleb",
-                            savedir="/tmp/ecapa_model",
-                        )
-                        logger.info("   [BACKGROUND] ECAPA (SpeechBrain) loaded")
-                        return model
-                    except Exception as e:
-                        logger.warning(f"   [BACKGROUND] ECAPA load failed: {e}")
-                        return None
+                """ECAPA loading now handled by EcapaFacade — this is a no-op stub."""
+                logger.info("   [BACKGROUND] ECAPA load delegated to EcapaFacade")
+                return None
 
             # Register with AI Manager - returns INSTANTLY!
             ecapa_proxy = ai_manager.register_model(

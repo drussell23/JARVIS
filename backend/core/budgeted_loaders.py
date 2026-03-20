@@ -584,58 +584,19 @@ class EcapaBudgetedLoader:
     # --- Loading ---
 
     async def load_with_grant(self, grant: "BudgetGrant") -> LoadResult:
-        """Load ECAPA-TDNN model using the grant's resources."""
-        import time as _time
-
-        start = _time.monotonic()
-
-        try:
-            await grant.heartbeat()
-            model = self._load_ecapa_model()
-            self._model_handle = model
-
-            elapsed_ms = (_time.monotonic() - start) * 1000
-            proof = ConfigProof(
-                component_id=self.component_id,
-                requested_constraints={},
-                applied_config={"device": "cpu"},
-                compliant=True,
-                evidence=f"ECAPA-TDNN loaded in {elapsed_ms:.0f}ms",
-            )
-            return LoadResult(
-                success=True,
-                actual_bytes=grant.granted_bytes,
-                config_proof=proof,
-                model_handle=model,
-                load_duration_ms=elapsed_ms,
-                error=None,
-            )
-        except Exception as e:
-            elapsed_ms = (_time.monotonic() - start) * 1000
-            logger.error("ECAPA load failed: %s", e)
-            return LoadResult(
-                success=False,
-                actual_bytes=0,
-                config_proof=None,
-                model_handle=None,
-                load_duration_ms=elapsed_ms,
-                error=str(e),
-            )
+        """ECAPA loading delegated to EcapaFacade."""
+        return LoadResult(
+            success=True,
+            actual_bytes=0,
+            config_proof=None,
+            model_handle=None,
+            load_duration_ms=0,
+            error=None,
+        )
 
     def _load_ecapa_model(self) -> Any:
-        """Load the ECAPA-TDNN model.  Override in tests."""
-        try:
-            from voice.engines.speechbrain_engine import safe_from_hparams
-        except ImportError:
-            from backend.voice.engines.speechbrain_engine import safe_from_hparams
-        import torch
-        torch.set_num_threads(1)
-        return safe_from_hparams(
-            "speechbrain.inference.speaker.EncoderClassifier",
-            model_name="ecapa_parallel_all",
-            source="speechbrain/spkrec-ecapa-voxceleb",
-            run_opts={"device": "cpu"},
-        )
+        """ECAPA loading delegated to EcapaFacade."""
+        return None
 
     # --- Helpers ---
 
