@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from backend.core.telemetry_contract import TelemetryEnvelope, get_telemetry_bus
+
 logger = logging.getLogger(__name__)
 
 
@@ -307,6 +309,20 @@ class ChainTelemetry:
             event["trace_id"],
             {k: v for k, v in event.items() if k not in ("event", "trace_id")},
         )
+        # v300.1: Emit to unified TelemetryBus
+        try:
+            envelope = TelemetryEnvelope.create(
+                event_schema="reasoning.decision@1.0.0",
+                source="reasoning_chain",
+                trace_id=event.get("trace_id", ""),
+                span_id=event.get("trace_id", ""),
+                partition_key="reasoning",
+                severity="info",
+                payload=event,
+            )
+            get_telemetry_bus().emit(envelope)
+        except Exception:
+            pass  # Telemetry must never block runtime
         try:
             asyncio.create_task(
                 self._forward_to_reactor(event),

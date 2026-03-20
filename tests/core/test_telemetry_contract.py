@@ -312,6 +312,36 @@ class TestTelemetryBus:
         assert "queue_size" in m
 
 
+class TestChainTelemetryEnvelope:
+    @pytest.mark.asyncio
+    async def test_proactive_detection_emits_envelope(self):
+        bus = TelemetryBus(max_queue=100)
+        received = []
+        async def handler(env):
+            received.append(env)
+        bus.subscribe("reasoning.*", handler)
+
+        with patch("backend.core.reasoning_chain_orchestrator.get_telemetry_bus", return_value=bus):
+            await bus.start()
+            from backend.core.reasoning_chain_orchestrator import ChainTelemetry
+            ct = ChainTelemetry()
+            event = await ct.emit_proactive_detection(
+                trace_id="t1", command="start my day", is_proactive=True,
+                confidence=0.92, signals=["workflow_trigger"], latency_ms=15.0,
+            )
+            await asyncio.sleep(0.1)
+            await bus.stop()
+
+        # Original dict still returned
+        assert event["event"] == "proactive_detection"
+        # Envelope emitted to bus
+        assert len(received) == 1
+        assert received[0].event_schema == "reasoning.decision@1.0.0"
+        assert received[0].trace_id == "t1"
+        assert received[0].source == "reasoning_chain"
+        assert received[0].partition_key == "reasoning"
+
+
 class TestTelemetryBusSingleton:
     def test_singleton(self):
         import backend.core.telemetry_contract as mod
