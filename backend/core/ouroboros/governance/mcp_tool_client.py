@@ -13,11 +13,23 @@ Configuration via YAML file at JARVIS_MCP_CONFIG path, or disabled if not set.
 
 All MCP calls are fire-and-forget with timeout. Failures are logged but never
 block the governance pipeline.
+
+MCP stdio protocol implementation
+----------------------------------
+MCPServerConnection manages a live subprocess running an MCP server (e.g.
+``npx -y @modelcontextprotocol/server-github``).  Communication uses JSON-RPC
+2.0 over newline-delimited stdin/stdout:
+
+  1. ``connect()``  — spawn process, send ``initialize``, receive capabilities,
+     send ``notifications/initialized``.
+  2. ``call_tool()`` — send ``tools/call`` request, wait for JSON-RPC response.
+  3. ``disconnect()`` — terminate the child process.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -28,6 +40,8 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("Ouroboros.MCPToolClient")
 
 _DEFAULT_TIMEOUT = 10.0  # seconds per MCP tool call
+_MCP_REQUEST_TIMEOUT = 30.0  # seconds per individual MCP JSON-RPC request
+_MCP_CONNECT_TIMEOUT = 15.0  # seconds for the initialize handshake
 
 
 @dataclass
@@ -96,6 +110,324 @@ class MCPClientConfig:
         return cls.from_file(config_path)
 
 
+# ---------------------------------------------------------------------------
+# MCP stdio transport — live connection to a single MCP server process
+# ---------------------------------------------------------------------------
+
+
+class MCPServerConnection:
+    """A live connection to an MCP server via stdio transport.
+
+    Manages the full lifecycle of a child MCP server process:
+    * Spawn the process with the configured command and environment.
+    * Perform the JSON-RPC ``initialize`` / ``notifications/initialized``
+      handshake required by the MCP specification.
+    * Expose ``call_tool`` for invoking tools on the server.
+    * Gracefully terminate on ``disconnect``.
+
+    All I/O is async and uses ``asyncio.subprocess``.
+    """
+
+    def __init__(self, config: MCPServerConfig) -> None:
+        self._config = config
+        self._process: Optional[asyncio.subprocess.Process] = None
+        self._request_id: int = 0
+        self._connected: bool = False
+        self._server_capabilities: Optional[Dict[str, Any]] = None
+        self._server_info: Optional[Dict[str, Any]] = None
+        self._lock = asyncio.Lock()
+
+    @property
+    def connected(self) -> bool:
+        """Whether the connection is live and initialized."""
+        return self._connected
+
+    @property
+    def server_capabilities(self) -> Optional[Dict[str, Any]]:
+        """Capabilities reported by the server during ``initialize``."""
+        return self._server_capabilities
+
+    @property
+    def server_info(self) -> Optional[Dict[str, Any]]:
+        """Server info reported during ``initialize``."""
+        return self._server_info
+
+    async def connect(self) -> bool:
+        """Spawn the MCP server process and perform the initialize handshake.
+
+        Returns ``True`` if the server started and completed initialization,
+        ``False`` otherwise (logged as warning, never raises).
+        """
+        if self._config.transport != "stdio" or not self._config.command:
+            logger.warning(
+                "MCPServerConnection requires stdio transport with a command; "
+                "server=%s transport=%s",
+                self._config.name,
+                self._config.transport,
+            )
+            return False
+
+        try:
+            env = dict(os.environ)
+            env.update(self._config.env)
+
+            self._process = await asyncio.create_subprocess_exec(
+                *self._config.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+
+            # --- MCP initialize handshake ---
+            result = await self._send_request(
+                "initialize",
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "ouroboros-governance",
+                        "version": "1.0.0",
+                    },
+                },
+                timeout=_MCP_CONNECT_TIMEOUT,
+            )
+
+            if result is not None:
+                self._server_capabilities = result.get("capabilities")
+                self._server_info = result.get("serverInfo")
+
+                # Acknowledge initialization
+                await self._send_notification("notifications/initialized", {})
+                self._connected = True
+                logger.info(
+                    "MCP server %s connected (serverInfo=%s)",
+                    self._config.name,
+                    self._server_info,
+                )
+                return True
+
+            logger.warning(
+                "MCP initialize returned None for server=%s", self._config.name
+            )
+            await self.disconnect()
+            return False
+
+        except Exception as exc:
+            logger.warning(
+                "MCP connect failed for %s: %s", self._config.name, exc
+            )
+            await self.disconnect()
+            return False
+
+    async def call_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Call a tool on the MCP server.
+
+        Parameters
+        ----------
+        tool_name : str
+            The MCP tool name (e.g. ``"create_issue"``).
+        arguments : dict
+            Tool-specific arguments.
+        timeout : float, optional
+            Per-request timeout; defaults to ``_MCP_REQUEST_TIMEOUT``.
+
+        Returns
+        -------
+        dict or None
+            The ``result`` field from the JSON-RPC response, or ``None``
+            on any failure.
+        """
+        if not self._connected or self._process is None:
+            return None
+        return await self._send_request(
+            "tools/call",
+            {"name": tool_name, "arguments": arguments},
+            timeout=timeout or _MCP_REQUEST_TIMEOUT,
+        )
+
+    async def list_tools(
+        self, *, timeout: Optional[float] = None
+    ) -> Optional[Dict[str, Any]]:
+        """List available tools on the MCP server.
+
+        Returns the ``result`` from ``tools/list``, which typically contains
+        a ``tools`` array.
+        """
+        if not self._connected or self._process is None:
+            return None
+        return await self._send_request(
+            "tools/list",
+            {},
+            timeout=timeout or _MCP_REQUEST_TIMEOUT,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal JSON-RPC transport
+    # ------------------------------------------------------------------
+
+    async def _send_request(
+        self,
+        method: str,
+        params: Dict[str, Any],
+        *,
+        timeout: float = _MCP_REQUEST_TIMEOUT,
+    ) -> Optional[Dict[str, Any]]:
+        """Send a JSON-RPC 2.0 request and wait for the matching response.
+
+        Uses a lock to serialize concurrent requests on the same stdio pipe.
+        Notifications from the server (messages without ``id``) are silently
+        skipped while waiting for the response.
+        """
+        if (
+            self._process is None
+            or self._process.stdin is None
+            or self._process.stdout is None
+        ):
+            return None
+
+        async with self._lock:
+            self._request_id += 1
+            req_id = self._request_id
+
+            request = {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": method,
+                "params": params,
+            }
+            line = json.dumps(request) + "\n"
+            self._process.stdin.write(line.encode())
+            await self._process.stdin.drain()
+
+            # Read lines until we find the matching response
+            try:
+                deadline = asyncio.get_event_loop().time() + timeout
+                while True:
+                    remaining = deadline - asyncio.get_event_loop().time()
+                    if remaining <= 0:
+                        logger.warning(
+                            "MCP request timed out: method=%s id=%d", method, req_id
+                        )
+                        return None
+
+                    response_line = await asyncio.wait_for(
+                        self._process.stdout.readline(),
+                        timeout=remaining,
+                    )
+
+                    if not response_line:
+                        # EOF — process exited
+                        logger.warning(
+                            "MCP server %s: EOF on stdout (process exited?)",
+                            self._config.name,
+                        )
+                        self._connected = False
+                        return None
+
+                    try:
+                        response = json.loads(response_line.decode())
+                    except (json.JSONDecodeError, UnicodeDecodeError) as parse_err:
+                        logger.debug(
+                            "MCP: skipping non-JSON line from %s: %s",
+                            self._config.name,
+                            parse_err,
+                        )
+                        continue
+
+                    # Skip server-initiated notifications (no "id" field)
+                    if "id" not in response:
+                        logger.debug(
+                            "MCP notification from %s: method=%s",
+                            self._config.name,
+                            response.get("method", "?"),
+                        )
+                        continue
+
+                    # Check if this is our response
+                    if response.get("id") != req_id:
+                        logger.debug(
+                            "MCP: skipping response with mismatched id=%s (expected %d)",
+                            response.get("id"),
+                            req_id,
+                        )
+                        continue
+
+                    if "result" in response:
+                        return response["result"]
+                    elif "error" in response:
+                        logger.warning(
+                            "MCP error from %s: %s",
+                            self._config.name,
+                            response["error"],
+                        )
+                        return None
+                    else:
+                        logger.warning(
+                            "MCP malformed response from %s: %s",
+                            self._config.name,
+                            response,
+                        )
+                        return None
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "MCP request timed out: method=%s server=%s",
+                    method,
+                    self._config.name,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "MCP response error from %s: %s", self._config.name, exc
+                )
+            return None
+
+    async def _send_notification(
+        self, method: str, params: Dict[str, Any]
+    ) -> None:
+        """Send a JSON-RPC 2.0 notification (no ``id``, no response expected)."""
+        if self._process is None or self._process.stdin is None:
+            return
+        notification = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+        }
+        line = json.dumps(notification) + "\n"
+        self._process.stdin.write(line.encode())
+        await self._process.stdin.drain()
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def disconnect(self) -> None:
+        """Terminate the MCP server process and clean up."""
+        self._connected = False
+        if self._process is not None:
+            try:
+                self._process.terminate()
+                await asyncio.wait_for(self._process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                if self._process.returncode is None:
+                    self._process.kill()
+                    try:
+                        await asyncio.wait_for(self._process.wait(), timeout=2.0)
+                    except asyncio.TimeoutError:
+                        pass
+            except Exception:
+                if self._process.returncode is None:
+                    self._process.kill()
+            finally:
+                self._process = None
+
+
 class GovernanceMCPClient:
     """MCP client for governance pipeline external actions.
 
@@ -105,29 +437,60 @@ class GovernanceMCPClient:
     - Sending alerts/notifications
 
     All operations are fire-and-forget with configurable timeout.
+
+    In ``start()``, each configured stdio server is spawned as a child
+    process and the MCP initialize handshake is performed.  If a server
+    fails to connect, it is marked unavailable and its tools are skipped.
     """
 
     def __init__(self, config: Optional[MCPClientConfig] = None) -> None:
         self._config = config or MCPClientConfig.from_env()
         self._available_servers: Dict[str, bool] = {}
+        self._connections: Dict[str, MCPServerConnection] = {}
 
     @property
     def is_enabled(self) -> bool:
         return self._config.enabled and bool(self._config.servers)
 
     async def start(self) -> None:
-        """Verify which MCP servers are available."""
+        """Connect to all configured MCP servers.
+
+        For stdio servers, spawns the child process and performs the MCP
+        initialize handshake.  For SSE servers, marks them available if
+        a URL is configured (actual SSE transport is not yet implemented).
+        """
         if not self.is_enabled:
             logger.debug("MCP client disabled -- no servers configured")
             return
         for name, server in self._config.servers.items():
-            available = await self._check_server(server)
-            self._available_servers[name] = available
-            status = "available" if available else "unavailable"
-            logger.info("MCP server %s: %s", name, status)
+            if server.transport == "stdio" and server.command:
+                conn = MCPServerConnection(server)
+                connected = await conn.connect()
+                self._available_servers[name] = connected
+                if connected:
+                    self._connections[name] = conn
+                status = "connected" if connected else "unavailable"
+                logger.info("MCP server %s: %s", name, status)
+            else:
+                # SSE or other transports — availability check only
+                available = await self._check_server(server)
+                self._available_servers[name] = available
+                status = "available" if available else "unavailable"
+                logger.info("MCP server %s: %s", name, status)
+
+    async def stop(self) -> None:
+        """Disconnect all live MCP server connections."""
+        for name, conn in list(self._connections.items()):
+            try:
+                await conn.disconnect()
+                logger.info("MCP server %s: disconnected", name)
+            except Exception as exc:
+                logger.warning("MCP server %s: disconnect error: %s", name, exc)
+        self._connections.clear()
+        self._available_servers.clear()
 
     async def _check_server(self, server: MCPServerConfig) -> bool:
-        """Check if an MCP server is reachable."""
+        """Check if an MCP server is reachable (legacy path for non-stdio)."""
         if server.transport == "stdio" and server.command:
             try:
                 cmd = server.command[0]
@@ -203,19 +566,98 @@ class GovernanceMCPClient:
         logger.info("MCP alert [%s]: %s", severity, message[:200])
 
     async def _create_github_issue(self, ctx: Any) -> None:
-        """Create a GitHub issue for a pipeline failure."""
+        """Create a GitHub issue for a pipeline failure via MCP tool call."""
         title = f"[Ouroboros] Pipeline failure: {ctx.description[:80]}"
         body = self._format_failure_body(ctx)
-        logger.info("Would create GitHub issue: %s", title)
-        # MCP tool call would go here when server is connected.
-        # Actual MCP stdio protocol implementation requires the full
-        # MCP client SDK which is a larger integration.
-        logger.info("GitHub issue body:\n%s", body[:500])
+
+        conn = self._connections.get("github")
+        if conn is not None and conn.connected:
+            repo = os.getenv("JARVIS_GITHUB_REPO", "")
+            owner = os.getenv("JARVIS_GITHUB_OWNER", "")
+            result = await conn.call_tool(
+                "create_issue",
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "title": title,
+                    "body": body,
+                },
+            )
+            if result is not None:
+                logger.info(
+                    "GitHub issue created via MCP: %s",
+                    result.get("content", [{}])[0].get("text", "")
+                    if isinstance(result.get("content"), list)
+                    else result,
+                )
+            else:
+                logger.warning(
+                    "GitHub issue creation returned no result for op=%s",
+                    ctx.op_id,
+                )
+        else:
+            # Fallback: log only (no live connection)
+            logger.info("Would create GitHub issue (no MCP connection): %s", title)
+            logger.debug("GitHub issue body:\n%s", body[:500])
 
     async def _create_github_pr(self, ctx: Any, applied_files: List[str]) -> None:
-        """Create a GitHub PR for applied changes."""
+        """Create a GitHub PR for applied changes via MCP tool call."""
         title = f"[Ouroboros] {ctx.description[:80]}"
-        logger.info("Would create GitHub PR: %s (files: %s)", title, applied_files)
+        body_parts = [
+            "## Ouroboros Auto-PR",
+            "",
+            f"**Operation ID**: `{ctx.op_id}`",
+            f"**Description**: {ctx.description}",
+            "",
+            "### Modified files",
+            "",
+        ]
+        body_parts.extend(f"- `{f}`" for f in applied_files)
+        body_parts.extend([
+            "",
+            "---",
+            "*Auto-generated by Ouroboros governance pipeline*",
+        ])
+        pr_body = "\n".join(body_parts)
+
+        conn = self._connections.get("github")
+        if conn is not None and conn.connected:
+            repo = os.getenv("JARVIS_GITHUB_REPO", "")
+            owner = os.getenv("JARVIS_GITHUB_OWNER", "")
+            head_branch = os.getenv(
+                "JARVIS_GITHUB_HEAD_BRANCH", f"ouroboros/{ctx.op_id}"
+            )
+            base_branch = os.getenv("JARVIS_GITHUB_BASE_BRANCH", "main")
+            result = await conn.call_tool(
+                "create_pull_request",
+                {
+                    "owner": owner,
+                    "repo": repo,
+                    "title": title,
+                    "body": pr_body,
+                    "head": head_branch,
+                    "base": base_branch,
+                },
+            )
+            if result is not None:
+                logger.info(
+                    "GitHub PR created via MCP: %s",
+                    result.get("content", [{}])[0].get("text", "")
+                    if isinstance(result.get("content"), list)
+                    else result,
+                )
+            else:
+                logger.warning(
+                    "GitHub PR creation returned no result for op=%s",
+                    ctx.op_id,
+                )
+        else:
+            # Fallback: log only (no live connection)
+            logger.info(
+                "Would create GitHub PR (no MCP connection): %s (files: %s)",
+                title,
+                applied_files,
+            )
 
     @staticmethod
     def _format_failure_body(ctx: Any) -> str:
@@ -243,7 +685,11 @@ class GovernanceMCPClient:
         return {
             "enabled": self.is_enabled,
             "servers": {
-                name: {"available": avail}
+                name: {
+                    "available": avail,
+                    "connected": name in self._connections
+                    and self._connections[name].connected,
+                }
                 for name, avail in self._available_servers.items()
             },
             "auto_issue": self._config.auto_issue,
