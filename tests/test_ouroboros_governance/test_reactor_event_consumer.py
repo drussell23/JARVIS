@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+from typing import Optional
 from unittest.mock import AsyncMock, patch
 
 from backend.core.ouroboros.governance.reactor_event_consumer import (
@@ -50,7 +51,7 @@ def _make_event_dict(
     event_type: str = "training_complete",
     source: str = "reactor",
     target: str = "jarvis",
-    payload: dict | None = None,
+    payload: Optional[dict] = None,
 ) -> dict:
     """Build a valid event dict for writing to a JSON file."""
     return {

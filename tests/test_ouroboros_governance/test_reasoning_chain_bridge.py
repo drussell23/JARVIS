@@ -22,7 +22,7 @@ from backend.core.ouroboros.governance.reasoning_chain_bridge import (
 def _make_chain_result(
     *,
     handled: bool = True,
-    expanded_intents: list | None = None,
+    expanded_intents=None,
     needs_confirmation: bool = False,
     phase_value: str = "soft_enable",
     success_rate: float = 0.9,
