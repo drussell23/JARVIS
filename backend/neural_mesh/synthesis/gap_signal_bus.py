@@ -10,10 +10,6 @@ get_gap_signal_bus() – process-wide singleton accessor (thread-safe lazy init)
 Implementation notes
 --------------------
 - ``frozen=True`` enforces immutability on CapabilityGapEvent.
-- ``slots=True`` is part of the spec but requires Python ≥ 3.10; on 3.9 we
-  achieve equivalent memory layout by declaring ``__slots__`` on a thin
-  wrapper that delegates to the frozen dataclass fields.  The public interface
-  and all property semantics are identical across Python versions.
 - ``emit()`` uses ``put_nowait()`` (never ``await put()``) to keep the call
   synchronous and safe from any call-site (sync or async).
 - The singleton is double-checked with a ``threading.Lock`` so it is safe to
@@ -25,7 +21,6 @@ import asyncio
 import hashlib
 import logging
 import re
-import sys
 import threading
 from typing import Optional
 
@@ -52,127 +47,64 @@ def _sha16(value: str) -> str:
 # CapabilityGapEvent
 # ---------------------------------------------------------------------------
 
-# Python 3.10+ supports slots=True on dataclass; 3.9 does not.
-# We branch at definition time so the class is always frozen and slot-efficient
-# regardless of the interpreter version.
+# Python 3.9.6 target — frozen=True without slots=True.
+# Equivalent semantics; slightly larger per-instance memory footprint.
+from dataclasses import dataclass as _dataclass
 
-if sys.version_info >= (3, 10):
-    from dataclasses import dataclass as _dataclass
 
-    @_dataclass(frozen=True, slots=True)
-    class CapabilityGapEvent:
+@_dataclass(frozen=True)
+class CapabilityGapEvent:
+    """
+    Immutable description of a detected capability gap.
+
+    Attributes
+    ----------
+    goal            Human-readable description of what JARVIS was trying to do.
+    task_type       Semantic category of the task (e.g. "Browser Navigation").
+    target_app      Application involved, if any (empty string = unknown).
+    source          Component that detected the gap (e.g. "agent_registry").
+    resolution_mode Optional hint about how the gap should be resolved.
+    """
+
+    goal: str
+    task_type: str
+    target_app: str
+    source: str
+    resolution_mode: Optional[str] = None
+
+    @property
+    def domain_id(self) -> str:
         """
-        Immutable description of a detected capability gap.
+        Stable domain identifier combining task_type and target_app.
 
-        Attributes
-        ----------
-        goal            Human-readable description of what JARVIS was trying to do.
-        task_type       Semantic category of the task (e.g. "Browser Navigation").
-        target_app      Application involved, if any (empty string = unknown).
-        source          Component that detected the gap (e.g. "agent_registry").
-        resolution_mode Optional hint about how the gap should be resolved.
+        Format: ``<normalised_task_type>:<normalised_target_app_or_any>``
+
+        Examples
+        --------
+        "Browser Navigation" + "Notion"  ->  "browser_navigation:notion"
+        "Vision Action"      + ""         ->  "vision_action:any"
         """
+        app_part = _normalize(self.target_app) or "any"
+        return f"{_normalize(self.task_type)}:{app_part}"
 
-        goal: str
-        task_type: str
-        target_app: str
-        source: str
-        resolution_mode: Optional[str] = None
-
-        @property
-        def domain_id(self) -> str:
-            """
-            Stable domain identifier combining task_type and target_app.
-
-            Format: ``<normalised_task_type>:<normalised_target_app_or_any>``
-
-            Examples
-            --------
-            "Browser Navigation" + "Notion"  ->  "browser_navigation:notion"
-            "Vision Action"      + ""         ->  "vision_action:any"
-            """
-            app_part = _normalize(self.target_app) if self.target_app else "any"
-            return f"{_normalize(self.task_type)}:{app_part}"
-
-        @property
-        def dedupe_key(self) -> str:
-            """
-            16-character hex key stable for the same (task_type, target_app) pair.
-
-            Used to suppress duplicate gap signals for the same domain.
-            """
-            return _sha16(
-                f"{_normalize(self.task_type)}:{_normalize(self.target_app or 'any')}"
-            )
-
-        @property
-        def attempt_key(self) -> str:
-            """
-            16-character hex key scoped to (task_type, target_app, source).
-
-            Used to track per-source resolution attempts without conflating sources.
-            """
-            return _sha16(f"{self.dedupe_key}{self.source}")
-
-else:
-    # Python 3.9 — frozen=True without slots=True.
-    # Equivalent semantics; slightly larger per-instance memory footprint.
-    from dataclasses import dataclass as _dataclass
-
-    @_dataclass(frozen=True)
-    class CapabilityGapEvent:  # type: ignore[no-redef]
+    @property
+    def dedupe_key(self) -> str:
         """
-        Immutable description of a detected capability gap.
+        16-character hex key stable for the same (task_type, target_app) pair.
 
-        Attributes
-        ----------
-        goal            Human-readable description of what JARVIS was trying to do.
-        task_type       Semantic category of the task (e.g. "Browser Navigation").
-        target_app      Application involved, if any (empty string = unknown).
-        source          Component that detected the gap (e.g. "agent_registry").
-        resolution_mode Optional hint about how the gap should be resolved.
+        Used to suppress duplicate gap signals for the same domain.
         """
+        app_part = _normalize(self.target_app) or "any"
+        return _sha16(f"{_normalize(self.task_type)}:{app_part}")
 
-        goal: str
-        task_type: str
-        target_app: str
-        source: str
-        resolution_mode: Optional[str] = None
+    @property
+    def attempt_key(self) -> str:
+        """
+        16-character hex key scoped to (task_type, target_app, source).
 
-        @property
-        def domain_id(self) -> str:
-            """
-            Stable domain identifier combining task_type and target_app.
-
-            Format: ``<normalised_task_type>:<normalised_target_app_or_any>``
-
-            Examples
-            --------
-            "Browser Navigation" + "Notion"  ->  "browser_navigation:notion"
-            "Vision Action"      + ""         ->  "vision_action:any"
-            """
-            app_part = _normalize(self.target_app) if self.target_app else "any"
-            return f"{_normalize(self.task_type)}:{app_part}"
-
-        @property
-        def dedupe_key(self) -> str:
-            """
-            16-character hex key stable for the same (task_type, target_app) pair.
-
-            Used to suppress duplicate gap signals for the same domain.
-            """
-            return _sha16(
-                f"{_normalize(self.task_type)}:{_normalize(self.target_app or 'any')}"
-            )
-
-        @property
-        def attempt_key(self) -> str:
-            """
-            16-character hex key scoped to (task_type, target_app, source).
-
-            Used to track per-source resolution attempts without conflating sources.
-            """
-            return _sha16(f"{self.dedupe_key}{self.source}")
+        Used to track per-source resolution attempts without conflating sources.
+        """
+        return _sha16(f"{self.dedupe_key}{self.source}")
 
 
 # ---------------------------------------------------------------------------

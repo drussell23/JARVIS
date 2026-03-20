@@ -46,6 +46,32 @@ def test_domain_id_empty_app():
     assert event.domain_id == "vision_action:any"
 
 
+def test_domain_id_whitespace_app_normalizes_to_any():
+    """target_app that normalizes to empty string should fall back to 'any'."""
+    event = CapabilityGapEvent(
+        goal="do something",
+        task_type="Task Type",
+        target_app="___",  # normalizes to empty string
+        source="test",
+    )
+    assert event.domain_id == "task_type:any"
+
+
+# ===========================================================================
+# CapabilityGapEvent — resolution_mode
+# ===========================================================================
+
+def test_resolution_mode_default_and_set():
+    """resolution_mode should default to None and be settable."""
+    ev1 = CapabilityGapEvent(goal="g", task_type="t", target_app="", source="s")
+    assert ev1.resolution_mode is None
+
+    ev2 = CapabilityGapEvent(
+        goal="g", task_type="t", target_app="", source="s", resolution_mode="synthesize"
+    )
+    assert ev2.resolution_mode == "synthesize"
+
+
 # ===========================================================================
 # CapabilityGapEvent — dedupe_key
 # ===========================================================================
