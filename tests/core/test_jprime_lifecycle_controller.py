@@ -4,6 +4,9 @@ import pytest
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 from backend.core.jprime_lifecycle_controller import (
+    HealthProbe,
+    HealthResult,
+    HealthVerdict,
     LifecycleState,
     RestartPolicy,
     LifecycleTransition,
@@ -243,3 +246,77 @@ class TestLifecycleTransition:
         )
         after = time.time()
         assert before <= t.timestamp <= after
+
+
+class TestHealthVerdict:
+    def test_verdict_values(self):
+        assert HealthVerdict.READY.value == "READY"
+        assert HealthVerdict.ALIVE_NOT_READY.value == "ALIVE_NOT_READY"
+        assert HealthVerdict.UNREACHABLE.value == "UNREACHABLE"
+        assert HealthVerdict.UNHEALTHY.value == "UNHEALTHY"
+
+
+class TestHealthProbe:
+    @pytest.mark.asyncio
+    async def test_ready_verdict(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        mock_response = {
+            "status": "healthy",
+            "ready_for_inference": True,
+            "apars": {"total_progress": 100},
+        }
+        with patch.object(probe, "_http_get", return_value=mock_response):
+            result = await probe.check()
+        assert result.verdict == HealthVerdict.READY
+        assert result.ready_for_inference is True
+
+    @pytest.mark.asyncio
+    async def test_alive_not_ready_verdict(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        mock_response = {
+            "status": "starting",
+            "ready_for_inference": False,
+            "apars": {"total_progress": 45},
+        }
+        with patch.object(probe, "_http_get", return_value=mock_response):
+            result = await probe.check()
+        assert result.verdict == HealthVerdict.ALIVE_NOT_READY
+        assert result.apars_progress == 45
+
+    @pytest.mark.asyncio
+    async def test_unreachable_on_connection_refused(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        with patch.object(probe, "_http_get", side_effect=ConnectionRefusedError()):
+            result = await probe.check()
+        assert result.verdict == HealthVerdict.UNREACHABLE
+
+    @pytest.mark.asyncio
+    async def test_unreachable_on_timeout(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        with patch.object(probe, "_http_get", side_effect=asyncio.TimeoutError()):
+            result = await probe.check()
+        assert result.verdict == HealthVerdict.UNREACHABLE
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_on_unexpected_error(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        with patch.object(probe, "_http_get", side_effect=ValueError("bad json")):
+            result = await probe.check()
+        assert result.verdict == HealthVerdict.UNHEALTHY
+        assert "bad json" in result.error
+
+    @pytest.mark.asyncio
+    async def test_response_time_tracked(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        mock_response = {"status": "healthy", "ready_for_inference": True}
+        with patch.object(probe, "_http_get", return_value=mock_response):
+            result = await probe.check()
+        assert result.response_time_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_no_apars_key(self):
+        probe = HealthProbe(host="127.0.0.1", port=8000)
+        mock_response = {"status": "healthy", "ready_for_inference": True}
+        with patch.object(probe, "_http_get", return_value=mock_response):
+            result = await probe.check()
+        assert result.apars_progress is None

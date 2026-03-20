@@ -174,3 +174,80 @@ class LifecycleTransition:
             "vm_zone": self.vm_zone,
             "elapsed_in_prev_state_ms": self.elapsed_in_prev_state_ms,
         }
+
+
+# ---------------------------------------------------------------------------
+# Health probing
+# ---------------------------------------------------------------------------
+
+class HealthVerdict(str, Enum):
+    READY = "READY"
+    ALIVE_NOT_READY = "ALIVE_NOT_READY"
+    UNREACHABLE = "UNREACHABLE"
+    UNHEALTHY = "UNHEALTHY"
+
+
+@dataclass
+class HealthResult:
+    verdict: HealthVerdict
+    ready_for_inference: bool = False
+    response_time_ms: float = 0.0
+    apars_progress: Optional[float] = None
+    raw_response: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+
+
+class HealthProbe:
+    """HTTP health probe for J-Prime /v1/reason/health endpoint."""
+
+    def __init__(self, host: str, port: int, timeout_s: float = 5.0):
+        self._host = host
+        self._port = port
+        self._timeout_s = timeout_s
+        self._url = f"http://{host}:{port}/v1/reason/health"
+
+    async def _http_get(self, url: str, timeout: float) -> Dict[str, Any]:
+        """HTTP GET returning parsed JSON. Raises on failure."""
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout)) as resp:
+                return await resp.json()
+
+    async def check(self) -> HealthResult:
+        """Probe J-Prime health. Never raises -- always returns a HealthResult."""
+        start = time.monotonic()
+        try:
+            data = await self._http_get(self._url, self._timeout_s)
+            elapsed_ms = (time.monotonic() - start) * 1000
+
+            ready = bool(data.get("ready_for_inference", False))
+            apars = data.get("apars", {})
+            progress = apars.get("total_progress") if apars else None
+
+            verdict = HealthVerdict.READY if ready else HealthVerdict.ALIVE_NOT_READY
+
+            return HealthResult(
+                verdict=verdict,
+                ready_for_inference=ready,
+                response_time_ms=elapsed_ms,
+                apars_progress=progress,
+                raw_response=data,
+            )
+        except (ConnectionRefusedError, ConnectionResetError, OSError):
+            return HealthResult(
+                verdict=HealthVerdict.UNREACHABLE,
+                response_time_ms=(time.monotonic() - start) * 1000,
+                error="connection_refused",
+            )
+        except asyncio.TimeoutError:
+            return HealthResult(
+                verdict=HealthVerdict.UNREACHABLE,
+                response_time_ms=(time.monotonic() - start) * 1000,
+                error="timeout",
+            )
+        except Exception as exc:
+            return HealthResult(
+                verdict=HealthVerdict.UNHEALTHY,
+                response_time_ms=(time.monotonic() - start) * 1000,
+                error=str(exc),
+            )
