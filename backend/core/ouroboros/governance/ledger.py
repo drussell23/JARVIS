@@ -61,6 +61,11 @@ class OperationState(Enum):
     FAILED = "failed"
     BLOCKED = "blocked"
 
+    # Iteration Mode lifecycle checkpoints
+    BUDGET_CHECKPOINT = "budget_checkpoint"
+    PRE_APPLY_CHECKSUM = "pre_apply_checksum"
+    ITERATION_OUTCOME = "iteration_outcome"
+
 
 # ---------------------------------------------------------------------------
 # Data classes
