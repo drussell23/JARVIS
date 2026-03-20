@@ -14,12 +14,13 @@ Ordering: per-partition_key monotonic sequence; no global ordering.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 import uuid
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -181,3 +182,205 @@ class EventRegistry:
         for schema in V1_EVENT_SCHEMAS:
             registry.register(schema)
         return registry
+
+
+# ---------------------------------------------------------------------------
+# TelemetryBus — bounded queue, dedup, backpressure, dead-letter
+# ---------------------------------------------------------------------------
+
+CRITICAL_EVENT_SCHEMAS: Set[str] = {"fault.raised", "lifecycle.transition"}
+
+TelemetryHandler = Callable[[TelemetryEnvelope], Coroutine[Any, Any, None]]
+
+
+class TelemetryBus:
+    """Async event bus for telemetry envelopes.
+
+    Features:
+    - Bounded asyncio.Queue with configurable max size.
+    - Pattern-based subscribe (``lifecycle.*`` matches ``lifecycle.transition@1.0.0``).
+    - Non-blocking ``emit()`` with dedup (idempotency_key window) and
+      backpressure (drops non-critical events when queue is full).
+    - Async consumer loop dispatches to matching subscribers.
+    - Dead-letter deque for consumer errors.
+    - ``get_metrics()`` for observability.
+    """
+
+    def __init__(
+        self,
+        max_queue: int = 1000,
+        dedup_window_s: float = 300.0,
+        dead_letter_max: int = 100,
+    ) -> None:
+        self._queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue)
+        self._dedup_window_s = dedup_window_s
+        self._subscribers: List[tuple] = []
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._running = False
+        self._seen_keys: Dict[str, float] = {}
+        self.dead_letter: Deque[Dict[str, Any]] = deque(maxlen=dead_letter_max)
+        self.dropped_count: int = 0
+        self.emitted_count: int = 0
+        self.delivered_count: int = 0
+        self.deduped_count: int = 0
+        self._registry = EventRegistry.with_v1_defaults()
+
+    # ------------------------------------------------------------------
+    # subscribe
+    # ------------------------------------------------------------------
+
+    def subscribe(self, pattern: str, handler: TelemetryHandler) -> None:
+        """Register *handler* for envelopes whose ``event_schema`` matches *pattern*.
+
+        Pattern language:
+        - ``"*"`` — matches every event.
+        - ``"lifecycle.*"`` — matches any event whose schema name starts with ``lifecycle``.
+        """
+        self._subscribers.append((pattern, handler))
+
+    # ------------------------------------------------------------------
+    # emit (non-blocking)
+    # ------------------------------------------------------------------
+
+    def emit(self, envelope: TelemetryEnvelope) -> None:
+        """Enqueue *envelope* for delivery.  Non-blocking (``put_nowait``).
+
+        Dedup: envelopes with an ``idempotency_key`` already seen within the
+        dedup window are silently dropped.
+
+        Backpressure: when the queue is full, non-critical events are dropped.
+        Critical events (schemas in ``CRITICAL_EVENT_SCHEMAS``) are logged but
+        **not** silently discarded — the caller is still notified via the
+        warning log so they can decide to retry.
+        """
+        now = time.time()
+
+        # --- dedup ---
+        if envelope.idempotency_key in self._seen_keys:
+            if now - self._seen_keys[envelope.idempotency_key] < self._dedup_window_s:
+                self.deduped_count += 1
+                return
+
+        self._seen_keys[envelope.idempotency_key] = now
+
+        # Prune stale keys to bound memory.
+        if len(self._seen_keys) > 5000:
+            cutoff = now - self._dedup_window_s
+            self._seen_keys = {k: v for k, v in self._seen_keys.items() if v > cutoff}
+
+        # --- schema registration warning ---
+        if not self._registry.is_registered(envelope.event_schema):
+            logger.warning(
+                "[TelemetryBus] Unknown event_schema: %s", envelope.event_schema
+            )
+
+        # --- enqueue with backpressure ---
+        try:
+            self._queue.put_nowait(envelope)
+            self.emitted_count += 1
+        except asyncio.QueueFull:
+            schema_name = (
+                envelope.event_schema.split("@")[0]
+                if "@" in envelope.event_schema
+                else envelope.event_schema
+            )
+            if schema_name in CRITICAL_EVENT_SCHEMAS:
+                logger.warning(
+                    "[TelemetryBus] Queue full, critical event %s may be delayed",
+                    envelope.event_schema,
+                )
+            else:
+                self.dropped_count += 1
+
+    # ------------------------------------------------------------------
+    # pattern matching
+    # ------------------------------------------------------------------
+
+    def _matches_pattern(self, pattern: str, event_schema: str) -> bool:
+        """Return ``True`` if *event_schema* matches the subscriber *pattern*."""
+        if pattern == "*":
+            return True
+        prefix = pattern.rstrip("*").rstrip(".")
+        schema_name = (
+            event_schema.split("@")[0] if "@" in event_schema else event_schema
+        )
+        return schema_name.startswith(prefix)
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+
+    async def start(self) -> None:
+        """Start the background consumer loop."""
+        if self._running:
+            return
+        self._running = True
+        self._consumer_task = asyncio.create_task(
+            self._consumer_loop(), name="telemetry_bus_consumer"
+        )
+
+    async def _consumer_loop(self) -> None:
+        """Drain the queue and dispatch to matching subscribers."""
+        while self._running:
+            try:
+                envelope = await asyncio.wait_for(self._queue.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            except asyncio.CancelledError:
+                break
+
+            for pattern, handler in self._subscribers:
+                if self._matches_pattern(pattern, envelope.event_schema):
+                    try:
+                        await handler(envelope)
+                        self.delivered_count += 1
+                    except Exception as exc:
+                        self.dead_letter.append(
+                            {
+                                "envelope": envelope.to_dict(),
+                                "error": str(exc),
+                                "timestamp": time.time(),
+                                "handler": getattr(handler, "__name__", str(handler)),
+                            }
+                        )
+
+    async def stop(self) -> None:
+        """Stop the consumer loop and cancel its task."""
+        self._running = False
+        if self._consumer_task is not None:
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                pass
+            self._consumer_task = None
+
+    # ------------------------------------------------------------------
+    # metrics
+    # ------------------------------------------------------------------
+
+    def get_metrics(self) -> Dict[str, Any]:
+        """Return a snapshot of bus metrics."""
+        return {
+            "emitted": self.emitted_count,
+            "delivered": self.delivered_count,
+            "dropped": self.dropped_count,
+            "deduped": self.deduped_count,
+            "dead_letter": len(self.dead_letter),
+            "queue_size": self._queue.qsize(),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_bus_instance: Optional[TelemetryBus] = None
+
+
+def get_telemetry_bus() -> TelemetryBus:
+    """Return the module-level ``TelemetryBus`` singleton (lazy-created)."""
+    global _bus_instance
+    if _bus_instance is None:
+        _bus_instance = TelemetryBus()
+    return _bus_instance

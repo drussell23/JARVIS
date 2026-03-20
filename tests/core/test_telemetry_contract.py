@@ -8,6 +8,8 @@ from backend.core.telemetry_contract import (
     EventRegistry,
     SequenceCounter,
     ENVELOPE_VERSION,
+    TelemetryBus,
+    get_telemetry_bus,
 )
 
 
@@ -168,3 +170,153 @@ class TestEventRegistry:
     def test_v1_has_exactly_9_events(self):
         registry = EventRegistry.with_v1_defaults()
         assert len(registry._schemas) == 9
+
+
+class TestTelemetryBus:
+    @pytest.mark.asyncio
+    async def test_emit_and_subscribe(self):
+        bus = TelemetryBus(max_queue=100)
+        received = []
+        async def handler(env):
+            received.append(env)
+        bus.subscribe("lifecycle.*", handler)
+        await bus.start()
+        env = TelemetryEnvelope.create(
+            event_schema="lifecycle.transition@1.0.0",
+            source="test", trace_id="t1", span_id="s1",
+            partition_key="lifecycle", payload={"test": True},
+        )
+        bus.emit(env)
+        await asyncio.sleep(0.1)
+        await bus.stop()
+        assert len(received) == 1
+        assert received[0].event_id == env.event_id
+
+    @pytest.mark.asyncio
+    async def test_pattern_matching(self):
+        bus = TelemetryBus(max_queue=100)
+        lifecycle_events = []
+        reasoning_events = []
+        async def lh(env): lifecycle_events.append(env)
+        async def rh(env): reasoning_events.append(env)
+        bus.subscribe("lifecycle.*", lh)
+        bus.subscribe("reasoning.*", rh)
+        await bus.start()
+        bus.emit(TelemetryEnvelope.create(
+            event_schema="lifecycle.transition@1.0.0",
+            source="test", trace_id="t1", span_id="s1",
+            partition_key="lifecycle", payload={},
+        ))
+        bus.emit(TelemetryEnvelope.create(
+            event_schema="reasoning.decision@1.0.0",
+            source="test", trace_id="t2", span_id="s2",
+            partition_key="reasoning", payload={},
+        ))
+        await asyncio.sleep(0.1)
+        await bus.stop()
+        assert len(lifecycle_events) == 1
+        assert len(reasoning_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_dedup_by_idempotency_key(self):
+        bus = TelemetryBus(max_queue=100, dedup_window_s=5.0)
+        received = []
+        async def handler(env): received.append(env)
+        bus.subscribe("*", handler)
+        await bus.start()
+        env = TelemetryEnvelope.create(
+            event_schema="lifecycle.health@1.0.0",
+            source="test", trace_id="t1", span_id="s1",
+            partition_key="lifecycle", payload={},
+        )
+        bus.emit(env)
+        bus.emit(env)  # Duplicate
+        await asyncio.sleep(0.1)
+        await bus.stop()
+        assert len(received) == 1
+
+    @pytest.mark.asyncio
+    async def test_backpressure_drops_non_critical(self):
+        bus = TelemetryBus(max_queue=2)
+        bus.subscribe("*", AsyncMock())
+        # Don't start consumer — let queue fill
+        env1 = TelemetryEnvelope.create(
+            event_schema="lifecycle.health@1.0.0",
+            source="test", trace_id="t1", span_id="s1",
+            partition_key="lifecycle", payload={},
+        )
+        env2 = TelemetryEnvelope.create(
+            event_schema="lifecycle.health@1.0.0",
+            source="test", trace_id="t2", span_id="s2",
+            partition_key="lifecycle", payload={},
+        )
+        bus.emit(env1)
+        bus.emit(env2)
+        # Queue full — next non-critical should drop
+        env3 = TelemetryEnvelope.create(
+            event_schema="lifecycle.health@1.0.0",
+            source="test", trace_id="t3", span_id="s3",
+            partition_key="lifecycle", payload={},
+        )
+        bus.emit(env3)
+        assert bus.dropped_count > 0
+
+    @pytest.mark.asyncio
+    async def test_dead_letter_on_consumer_error(self):
+        bus = TelemetryBus(max_queue=100)
+        async def failing_handler(env):
+            raise ValueError("consumer exploded")
+        bus.subscribe("lifecycle.*", failing_handler)
+        await bus.start()
+        env = TelemetryEnvelope.create(
+            event_schema="lifecycle.transition@1.0.0",
+            source="test", trace_id="t1", span_id="s1",
+            partition_key="lifecycle", payload={},
+        )
+        bus.emit(env)
+        await asyncio.sleep(0.1)
+        await bus.stop()
+        assert len(bus.dead_letter) == 1
+        assert bus.dead_letter[0]["error"] == "consumer exploded"
+
+    @pytest.mark.asyncio
+    async def test_wildcard_subscribe(self):
+        bus = TelemetryBus(max_queue=100)
+        all_events = []
+        async def catch_all(env): all_events.append(env)
+        bus.subscribe("*", catch_all)
+        await bus.start()
+        bus.emit(TelemetryEnvelope.create(
+            event_schema="lifecycle.transition@1.0.0",
+            source="test", trace_id="t1", span_id="s1",
+            partition_key="lifecycle", payload={},
+        ))
+        bus.emit(TelemetryEnvelope.create(
+            event_schema="fault.raised@1.0.0",
+            source="test", trace_id="t2", span_id="s2",
+            partition_key="recovery", payload={},
+        ))
+        await asyncio.sleep(0.1)
+        await bus.stop()
+        assert len(all_events) == 2
+
+    @pytest.mark.asyncio
+    async def test_get_metrics(self):
+        bus = TelemetryBus(max_queue=100)
+        m = bus.get_metrics()
+        assert "emitted" in m
+        assert "delivered" in m
+        assert "dropped" in m
+        assert "deduped" in m
+        assert "dead_letter" in m
+        assert "queue_size" in m
+
+
+class TestTelemetryBusSingleton:
+    def test_singleton(self):
+        import backend.core.telemetry_contract as mod
+        mod._bus_instance = None
+        b1 = get_telemetry_bus()
+        b2 = get_telemetry_bus()
+        assert b1 is b2
+        mod._bus_instance = None
