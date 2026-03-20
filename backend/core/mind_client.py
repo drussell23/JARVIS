@@ -237,6 +237,20 @@ class MindClient:
         """Current operational level."""
         return self._level
 
+    def update_endpoint(self, host: str, port: int) -> None:
+        """Update the J-Prime endpoint (called by JprimeLifecycleController).
+
+        Rebuilds ``_base_url`` so subsequent requests target the new endpoint.
+        The aiohttp session and session_id are preserved.
+        """
+        self._host = host
+        self._port = port
+        self._base_url = f"http://{host}:{port}"
+        logger.info(
+            "[MindClient] Endpoint updated to %s (by lifecycle controller)",
+            self._base_url,
+        )
+
     # ------------------------------------------------------------------
     # State machine helpers (synchronous — no I/O)
     # ------------------------------------------------------------------
