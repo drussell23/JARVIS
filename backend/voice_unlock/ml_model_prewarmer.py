@@ -45,8 +45,7 @@ from backend.core.async_safety import LazyAsyncLock
 
 logger = logging.getLogger(__name__)
 
-# v300.1: EcapaFacade feature flag (Phase 3a migration)
-_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+# Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 # =============================================================================
 # PREWARMING CONFIGURATION
@@ -165,71 +164,23 @@ async def _prewarm_ecapa() -> bool:
     """
     global _prewarm_status
 
-    # v300.1: EcapaFacade path — delegate prewarming to facade singleton
-    if _USE_FACADE:
-        try:
-            from backend.core.ecapa_facade import get_ecapa_facade
-            facade = await get_ecapa_facade()
-            ready = await facade.ensure_ready(timeout=60.0)
-            if ready:
-                _prewarm_status.ecapa_loaded = True
-                _prewarm_status.speaker_encoder_loaded = True
-                logger.info("✅ [PREWARM] ECAPA-TDNN prewarmed via EcapaFacade")
-                return True
-            else:
-                logger.warning("[PREWARM] EcapaFacade ensure_ready returned False, falling through to legacy")
-        except Exception as e:
-            logger.warning(f"[PREWARM] EcapaFacade prewarm failed ({e}), falling through to legacy")
-
+    # EcapaFacade path — delegate prewarming to facade singleton (sole ECAPA owner)
     try:
-        logger.info("🔥 [PREWARM] Loading ECAPA-TDNN speaker encoder...")
-        start = time.time()
-
-        # Try new speaker verification service first
-        try:
-            from voice.speaker_verification_service import SpeakerVerificationService
-
-            # Get or create singleton instance
-            service = SpeakerVerificationService()
-
-            # The service has an async initialize() method that:
-            # 1. Initializes SpeechBrain engine
-            # 2. Calls preload_speaker_encoder_async() internally
-            # 3. Loads speaker profiles
-            await asyncio.wait_for(
-                service.initialize(preload_encoder=True),
-                timeout=ECAPA_PREWARM_TIMEOUT
-            )
-
-            load_time = (time.time() - start) * 1000
+        from backend.core.ecapa_facade import get_ecapa_facade
+        facade = await get_ecapa_facade()
+        ready = await facade.ensure_ready(timeout=60.0)
+        if ready:
             _prewarm_status.ecapa_loaded = True
             _prewarm_status.speaker_encoder_loaded = True
-            logger.info(f"✅ [PREWARM] ECAPA-TDNN encoder loaded in {load_time:.0f}ms")
+            logger.info("✅ [PREWARM] ECAPA-TDNN prewarmed via EcapaFacade")
             return True
-
-        except ImportError:
-            # Fall back to legacy speaker recognition
-            from voice.speaker_recognition import get_speaker_recognition_engine
-
-            engine = get_speaker_recognition_engine()
-            await asyncio.wait_for(
-                engine.initialize(),
-                timeout=ECAPA_PREWARM_TIMEOUT
-            )
-
-            load_time = (time.time() - start) * 1000
-            _prewarm_status.ecapa_loaded = True
-            _prewarm_status.speaker_encoder_loaded = True
-            logger.info(f"✅ [PREWARM] Legacy speaker engine loaded in {load_time:.0f}ms")
-            return True
-
-    except asyncio.TimeoutError:
-        _prewarm_status.errors["ecapa"] = f"Timeout after {ECAPA_PREWARM_TIMEOUT}s"
-        logger.warning(f"⏱️ [PREWARM] ECAPA-TDNN prewarm timed out after {ECAPA_PREWARM_TIMEOUT}s")
-        return False
+        else:
+            _prewarm_status.errors["ecapa"] = "EcapaFacade ensure_ready returned False"
+            logger.warning("[PREWARM] EcapaFacade ensure_ready returned False")
+            return False
     except Exception as e:
         _prewarm_status.errors["ecapa"] = str(e)
-        logger.error(f"❌ [PREWARM] ECAPA-TDNN prewarm failed: {e}")
+        logger.error(f"❌ [PREWARM] EcapaFacade prewarm failed: {e}")
         return False
 
 

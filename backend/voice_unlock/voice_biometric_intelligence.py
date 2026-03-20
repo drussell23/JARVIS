@@ -57,8 +57,7 @@ import random
 
 logger = logging.getLogger(__name__)
 
-# v300.1: EcapaFacade feature flag (Phase 2 migration)
-_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+# Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 # =============================================================================
 # PHYSICS-AWARE & BAYESIAN FUSION INTEGRATION (v3.0)
@@ -2823,73 +2822,16 @@ class VoiceBiometricIntelligence:
         """
         import os
 
-        # v300.1: EcapaFacade path — single authoritative extraction
-        if _USE_FACADE:
-            try:
-                from backend.core.ecapa_facade import get_ecapa_facade
-                facade = await get_ecapa_facade()
-                result = await facade.extract_embedding(audio_data)
-                if result.success:
-                    self._stats['facade_extractions'] = self._stats.get('facade_extractions', 0) + 1
-                    return result.embedding
-            except Exception as e:
-                logger.debug(f"EcapaFacade extraction failed: {e}")
-            return None
-
-        # --- Legacy path below (unchanged) ---
-        # Get configuration
-        local_timeout = float(os.getenv('VBI_LOCAL_EXTRACTION_TIMEOUT', '5.0'))
-        use_cloud_fallback = os.getenv('VBI_CLOUD_FALLBACK', 'true').lower() == 'true'
-
-        # Check memory pressure - skip local if RAM is low
-        skip_local = False
+        # EcapaFacade path — single authoritative extraction (sole ECAPA owner)
         try:
-            import psutil
-            available_gb = psutil.virtual_memory().available / (1024**3)
-            memory_threshold = float(os.getenv('VBI_MEMORY_THRESHOLD_GB', '3.0'))
-            
-            if available_gb < memory_threshold:
-                logger.info(f"⚠️ Low RAM ({available_gb:.1f}GB) - skipping local extraction")
-                skip_local = True
-                self._stats['cloud_routing_memory_pressure'] = self._stats.get('cloud_routing_memory_pressure', 0) + 1
-        except Exception:
-            pass
-        
-        # Try local extraction first (unless skipped due to memory)
-        if not skip_local:
-            try:
-                embedding = await asyncio.wait_for(
-                    self._extract_embedding_local(audio_data),
-                    timeout=local_timeout
-                )
-                
-                if embedding is not None:
-                    self._stats['local_extractions'] = self._stats.get('local_extractions', 0) + 1
-                    return embedding
-                    
-            except asyncio.TimeoutError:
-                logger.warning(f"⏱️ Local extraction timed out after {local_timeout}s")
-                self._stats['local_timeouts'] = self._stats.get('local_timeouts', 0) + 1
-                
-            except Exception as e:
-                logger.debug(f"Local extraction failed: {e}")
-                self._stats['local_failures'] = self._stats.get('local_failures', 0) + 1
-        
-        # Cloud fallback
-        if use_cloud_fallback:
-            try:
-                logger.info("🌐 Attempting cloud ECAPA extraction...")
-                embedding = await self._extract_embedding_cloud(audio_data)
-                
-                if embedding is not None:
-                    self._stats['cloud_extractions'] = self._stats.get('cloud_extractions', 0) + 1
-                    logger.info("✅ Cloud extraction successful")
-                    return embedding
-                    
-            except Exception as e:
-                logger.warning(f"Cloud extraction failed: {e}")
-                self._stats['cloud_failures'] = self._stats.get('cloud_failures', 0) + 1
-        
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            result = await facade.extract_embedding(audio_data)
+            if result.success:
+                self._stats['facade_extractions'] = self._stats.get('facade_extractions', 0) + 1
+                return result.embedding
+        except Exception as e:
+            logger.debug(f"EcapaFacade extraction failed: {e}")
         return None
 
     async def _extract_embedding_local(self, audio_data: bytes) -> Optional[Any]:
@@ -3229,16 +3171,12 @@ class VoiceBiometricIntelligence:
                 import numpy as np
 
                 # Extract embedding from current audio
-                # v300.1: EcapaFacade path for hot cache embedding extraction
+                # EcapaFacade path for hot cache embedding extraction (sole ECAPA owner)
                 try:
-                    if _USE_FACADE:
-                        from backend.core.ecapa_facade import get_ecapa_facade
-                        facade = await get_ecapa_facade()
-                        result = await facade.extract_embedding(audio_data)
-                        current_embedding = result.embedding if result.success else None
-                    else:
-                        from voice_unlock.ml_engine_registry import extract_speaker_embedding
-                        current_embedding = await extract_speaker_embedding(audio_data)
+                    from backend.core.ecapa_facade import get_ecapa_facade
+                    facade = await get_ecapa_facade()
+                    result = await facade.extract_embedding(audio_data)
+                    current_embedding = result.embedding if result.success else None
 
                     if current_embedding is not None and len(current_embedding) > 0:
                         # Ensure embeddings are same shape

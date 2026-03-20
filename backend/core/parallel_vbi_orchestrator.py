@@ -87,8 +87,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# v300.1: EcapaFacade feature flag (Phase 3a migration)
-_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+# Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 T = TypeVar("T")
 R = TypeVar("R")
@@ -924,23 +923,22 @@ class EmbeddingExtractionStage(VBIStage):
         strategy_timeout = min(self.timeout / 2, 8.0)  # Max 8s per strategy
 
         # =========================================================================
-        # v300.1: EcapaFacade path — delegate extraction to facade singleton
+        # EcapaFacade path — delegate extraction to facade singleton (sole owner)
         # =========================================================================
-        if _USE_FACADE:
-            try:
-                from backend.core.ecapa_facade import get_ecapa_facade
-                facade = await get_ecapa_facade()
-                result = await facade.extract_embedding(audio_bytes)
-                if result.success:
-                    context.embedding = result.embedding
-                    logger.info(f"✅ EcapaFacade extraction succeeded: {len(result.embedding)} dims")
-                    return result.embedding
-                else:
-                    errors.append(f"EcapaFacade: {result.error}")
-                    logger.debug(f"EcapaFacade extraction failed: {result.error}, falling through")
-            except Exception as e:
-                errors.append(f"EcapaFacade: {e}")
-                logger.debug(f"EcapaFacade extraction error: {e}, falling through")
+        try:
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            result = await facade.extract_embedding(audio_bytes)
+            if result.success:
+                context.embedding = result.embedding
+                logger.info(f"✅ EcapaFacade extraction succeeded: {len(result.embedding)} dims")
+                return result.embedding
+            else:
+                errors.append(f"EcapaFacade: {result.error}")
+                logger.debug(f"EcapaFacade extraction failed: {result.error}, falling through")
+        except Exception as e:
+            errors.append(f"EcapaFacade: {e}")
+            logger.debug(f"EcapaFacade extraction error: {e}, falling through")
 
         # =========================================================================
         # STRATEGY 1: Cloud ECAPA (fastest if available)

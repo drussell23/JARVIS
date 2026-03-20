@@ -62,8 +62,7 @@ from uuid import uuid4
 
 import numpy as np
 
-# v300.1: EcapaFacade feature flag (Phase 2 migration)
-_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+# Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 # Import managed executor for clean shutdown
 try:
@@ -391,26 +390,7 @@ def _get_langgraph_available():
     """Deprecated: Use is_langgraph_available() instead."""
     return _init_langgraph()
 
-# ML Engine Registry for singleton ECAPA-TDNN engine
-# This prevents multiple instances and runtime HuggingFace downloads
-try:
-    from voice_unlock.ml_engine_registry import (
-        get_ml_registry_sync,
-        get_ecapa_encoder_async,
-        is_voice_unlock_ready,
-        extract_speaker_embedding as registry_extract_embedding,
-        ensure_ecapa_available,  # CRITICAL: Proactive ECAPA loading
-    )
-    ML_REGISTRY_AVAILABLE = True
-    logger.info("ML Engine Registry available - using singleton ECAPA-TDNN")
-except ImportError:
-    ML_REGISTRY_AVAILABLE = False
-    get_ml_registry_sync = None
-    get_ecapa_encoder_async = None
-    is_voice_unlock_ready = lambda: True
-    registry_extract_embedding = None
-    ensure_ecapa_available = None  # Fallback
-    logger.info("ML Engine Registry not available - using local engine instance")
+# Phase 6: ML Engine Registry imports removed — EcapaFacade is sole ECAPA owner
 
 
 # ============================================================================
@@ -3448,68 +3428,20 @@ class SpeakerVerificationService:
         # This was missing and caused voice verification to return 0% confidence
         # because the ECAPA encoder never got loaded.
         # ========================================================================
-        # v300.1: EcapaFacade path — delegate readiness check to facade
-        if _USE_FACADE:
-            try:
-                from backend.core.ecapa_facade import get_ecapa_facade
-                ecapa_phase6_timeout = float(os.environ.get("ECAPA_PHASE6_TIMEOUT", "25.0"))
-                facade = await get_ecapa_facade()
-                ecapa_ok = await facade.ensure_ready(timeout=ecapa_phase6_timeout)
-                if ecapa_ok:
-                    self._use_registry_encoder = True
-                    self._ecapa_load_source = "facade"
-                    logger.info("✅ [FAST-INIT] ECAPA ready via EcapaFacade")
-                else:
-                    logger.warning("⚠️ [FAST-INIT] EcapaFacade not ready - will use SpeechBrain fallback")
-            except Exception as e:
-                logger.warning(f"⚠️ [FAST-INIT] EcapaFacade error: {e} - will use SpeechBrain fallback")
-        elif ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
-            logger.info("🔄 [FAST-INIT] Triggering ECAPA loading from ML Engine Registry...")
-            try:
-                # Start ECAPA loading as background task to keep init fast
-                # but ensure it gets loaded before first verification attempt
-                #
-                # v124.0: Cap ECAPA timeout for Phase 6 initialization
-                # Phase 6 has ~30s timeout per service, so we need to finish faster
-                # Use ECAPA_PHASE6_TIMEOUT (default 25s) which is the max time we'll
-                # wait during Phase 6, even if ECAPA_LOAD_TIMEOUT is higher.
-                ecapa_load_timeout = float(os.environ.get("ECAPA_LOAD_TIMEOUT", "60.0"))
-                ecapa_phase6_timeout = float(os.environ.get("ECAPA_PHASE6_TIMEOUT", "25.0"))
-                effective_timeout = min(ecapa_load_timeout, ecapa_phase6_timeout)
-                logger.info(f"   [FAST-INIT] ECAPA timeout: {effective_timeout:.1f}s (phase6 cap: {ecapa_phase6_timeout}s)")
-
-                # EDGE-NATIVE: In edge-native mode, NEVER allow cloud ECAPA
-                if self._edge_config.enabled and self._edge_config.local_ecapa_only:
-                    ecapa_allow_cloud = False
-                    logger.info("🌐 [EDGE-NATIVE] Cloud ECAPA disabled - local only")
-                else:
-                    ecapa_allow_cloud = os.environ.get("ECAPA_ALLOW_CLOUD", "true").lower() == "true"
-
-                # Use asyncio.create_task to load in background, but also await briefly
-                # to ensure the loading has at least started
-                success, message, encoder = await ensure_ecapa_available(
-                    timeout=effective_timeout,
-                    allow_cloud=ecapa_allow_cloud,
-                )
-
-                if success:
-                    self._use_registry_encoder = True
-                    self._ecapa_load_message = message
-
-                    if encoder is not None:
-                        self._ecapa_load_source = "local"
-                        logger.info(f"✅ [FAST-INIT] ECAPA loaded LOCALLY: {message}")
-                    else:
-                        self._ecapa_load_source = "cloud"
-                        logger.info(f"✅ [FAST-INIT] ECAPA available via CLOUD: {message}")
-                else:
-                    logger.warning(f"⚠️ [FAST-INIT] ECAPA not available: {message}")
-                    # Will fall back to SpeechBrain encoder
-            except Exception as e:
-                logger.warning(f"⚠️ [FAST-INIT] ECAPA loading error: {e}")
-                # Continue without ECAPA - will use SpeechBrain fallback
-        else:
-            logger.info("ℹ️ [FAST-INIT] ML Registry not available - using SpeechBrain encoder")
+        # EcapaFacade path — delegate readiness check to facade (sole ECAPA owner)
+        try:
+            from backend.core.ecapa_facade import get_ecapa_facade
+            ecapa_phase6_timeout = float(os.environ.get("ECAPA_PHASE6_TIMEOUT", "25.0"))
+            facade = await get_ecapa_facade()
+            ecapa_ok = await facade.ensure_ready(timeout=ecapa_phase6_timeout)
+            if ecapa_ok:
+                self._use_registry_encoder = True
+                self._ecapa_load_source = "facade"
+                logger.info("✅ [FAST-INIT] ECAPA ready via EcapaFacade")
+            else:
+                logger.warning("⚠️ [FAST-INIT] EcapaFacade not ready - will use SpeechBrain fallback")
+        except Exception as e:
+            logger.warning(f"⚠️ [FAST-INIT] EcapaFacade error: {e} - will use SpeechBrain fallback")
 
         # Create SpeechBrain engine but DON'T initialize it yet (deferred to background)
         # Lazy load the ML components
@@ -4020,134 +3952,19 @@ class SpeakerVerificationService:
         ecapa_retry_attempts = int(os.environ.get("ECAPA_RETRY_ATTEMPTS", "3"))
         ecapa_retry_delay = float(os.environ.get("ECAPA_RETRY_DELAY", "2.0"))
 
-        # v300.1: EcapaFacade path — delegate readiness to facade singleton
-        if _USE_FACADE:
-            try:
-                from backend.core.ecapa_facade import get_ecapa_facade
-                facade = await get_ecapa_facade()
-                ecapa_ok = await facade.ensure_ready(timeout=ecapa_load_timeout)
-                if ecapa_ok:
-                    self._use_registry_encoder = True
-                    self._ecapa_load_source = "facade"
-                    logger.info("✅ [INIT] ECAPA ready via EcapaFacade")
-                else:
-                    logger.warning("⚠️ [INIT] EcapaFacade not ready - falling back to local engine")
-            except Exception as e:
-                logger.warning(f"⚠️ [INIT] EcapaFacade error: {e} - falling back to local engine")
-        elif ML_REGISTRY_AVAILABLE and ensure_ecapa_available is not None:
-            logger.info("🔄 [INIT] ML Engine Registry available - proactively loading ECAPA...")
-
-            ecapa_loaded = False
-            last_error = None
-
-            # Retry loop with exponential backoff
-            for attempt in range(1, ecapa_retry_attempts + 1):
-                try:
-                    logger.info(f"🔄 [INIT] ECAPA load attempt {attempt}/{ecapa_retry_attempts}...")
-
-                    # Proactively ensure ECAPA is loaded (local or cloud)
-                    success, message, encoder = await ensure_ecapa_available(
-                        timeout=ecapa_load_timeout,
-                        allow_cloud=ecapa_allow_cloud,
-                    )
-
-                    if success:
-                        self._use_registry_encoder = True
-                        self._ecapa_load_message = message
-
-                        # Determine source (local vs cloud)
-                        if encoder is not None:
-                            self._ecapa_load_source = "local"
-                            logger.info(f"✅ [INIT] ECAPA loaded LOCALLY: {message}")
-                        else:
-                            self._ecapa_load_source = "cloud"
-                            logger.info(f"✅ [INIT] ECAPA available via CLOUD: {message}")
-
-                        ecapa_loaded = True
-                        break
-                    else:
-                        last_error = message
-                        logger.warning(f"⚠️ [INIT] ECAPA load attempt {attempt} failed: {message}")
-
-                        if attempt < ecapa_retry_attempts:
-                            # Exponential backoff with jitter
-                            import random
-                            delay = ecapa_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
-                            logger.info(f"⏳ [INIT] Retrying in {delay:.1f}s...")
-                            await asyncio.sleep(delay)
-
-                except asyncio.TimeoutError:
-                    last_error = f"Timeout after {ecapa_load_timeout}s"
-                    logger.warning(f"⚠️ [INIT] ECAPA load attempt {attempt} timed out")
-                except Exception as e:
-                    last_error = str(e)
-                    logger.warning(f"⚠️ [INIT] ECAPA load attempt {attempt} error: {e}")
-
-                    if attempt < ecapa_retry_attempts:
-                        import random
-                        delay = ecapa_retry_delay * (2 ** (attempt - 1)) + random.uniform(0, 1)
-                        await asyncio.sleep(delay)
-
-            if ecapa_loaded:
-                # ECAPA is ready - use registry encoder
-                # Still create SpeechBrain engine for other features (ASR, etc)
-                # but skip the encoder preload since registry already has it
-                self.speechbrain_engine = _SpeechBrainEngine(model_config)
-                await self.speechbrain_engine.initialize()
-                # Load speaker profiles
-                await self._load_speaker_profiles()
-                logger.info(
-                    f"✅ [INIT] Using registry ECAPA-TDNN ({self._ecapa_load_source}) - "
-                    f"unlock will be instant!"
-                )
+        # EcapaFacade path — delegate readiness to facade singleton (sole ECAPA owner)
+        try:
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            ecapa_ok = await facade.ensure_ready(timeout=ecapa_load_timeout)
+            if ecapa_ok:
+                self._use_registry_encoder = True
+                self._ecapa_load_source = "facade"
+                logger.info("✅ [INIT] ECAPA ready via EcapaFacade")
             else:
-                # All retry attempts failed - fall through to fallback
-                logger.warning(
-                    f"⚠️ [INIT] ECAPA not available after {ecapa_retry_attempts} attempts: "
-                    f"{last_error}. Falling back to local engine..."
-                )
-                # Don't set _use_registry_encoder - will use fallback below
-        elif ML_REGISTRY_AVAILABLE and is_voice_unlock_ready():
-            # Fallback: Registry available but ensure_ecapa_available not imported
-            # (shouldn't happen, but handle gracefully)
-            logger.info("✅ ML Engine Registry has ECAPA-TDNN loaded - using singleton!")
-            self._use_registry_encoder = True
-            self._ecapa_load_source = "registry"
-            self.speechbrain_engine = _SpeechBrainEngine(model_config)
-            await self.speechbrain_engine.initialize()
-            await self._load_speaker_profiles()
-            logger.info("✅ Using registry ECAPA-TDNN - unlock will be instant!")
-        else:
-            # Fallback: Load our own engine if registry not available
-            self.speechbrain_engine = _SpeechBrainEngine(model_config)
-
-            # OPTIMIZED: Initialize engine and start encoder pre-load in PARALLEL
-            # This significantly reduces startup time
-            if preload_encoder:
-                logger.info("🚀 Starting parallel initialization (engine + encoder + profiles)...")
-
-                # Start encoder pre-loading in background (non-blocking)
-                await self.speechbrain_engine.initialize()
-                encoder_task = await self.speechbrain_engine.preload_speaker_encoder_async()
-
-                # Load speaker profiles while encoder loads
-                await self._load_speaker_profiles()
-
-                # Wait for encoder if it's still loading
-                if encoder_task and not encoder_task.done():
-                    logger.info("⏳ Waiting for encoder pre-load to complete...")
-                    await encoder_task
-
-                # Mark encoder as preloaded (check the engine's state)
-                if self.speechbrain_engine.speaker_encoder_loaded:
-                    self._encoder_preloaded = True
-                    logger.info("✅ Speaker encoder pre-loaded - unlock will be instant!")
-                else:
-                    logger.warning("⚠️ Speaker encoder pre-load task completed but encoder not ready")
-            else:
-                await self.speechbrain_engine.initialize()
-                # Load speaker profiles from database
-                await self._load_speaker_profiles()
+                logger.warning("⚠️ [INIT] EcapaFacade not ready - falling back to local engine")
+        except Exception as e:
+            logger.warning(f"⚠️ [INIT] EcapaFacade error: {e} - falling back to local engine")
 
         self.initialized = True
         logger.info(
@@ -4174,75 +3991,16 @@ class SpeakerVerificationService:
         Returns:
             Embedding tensor or None on failure
         """
-        # v300.1: EcapaFacade path — single authoritative ECAPA lifecycle owner
-        if _USE_FACADE:
-            try:
-                from backend.core.ecapa_facade import get_ecapa_facade
-                facade = await get_ecapa_facade()
-                result = await facade.extract_embedding(audio_data)
-                if result.success:
-                    return result.embedding
-                return None
-            except Exception:
-                return None  # Facade unavailable, return None like old path
-
-        # --- Legacy path below (unchanged) ---
+        # EcapaFacade path — single authoritative ECAPA lifecycle owner
         try:
-            # Early validation: reject empty or invalid audio
-            if audio_data is None or len(audio_data) == 0:
-                logger.error("❌ _extract_speaker_embedding() called with 0 bytes or None audio")
-                return None
-
-            # Minimum size check
-            MIN_AUDIO_SIZE = 100
-            if len(audio_data) < MIN_AUDIO_SIZE:
-                logger.warning(f"⚠️ Audio too small for embedding extraction ({len(audio_data)} bytes)")
-                return None
-
-            # Prefer registry if available and we're configured to use it
-            if self._use_registry_encoder and ML_REGISTRY_AVAILABLE:
-                embedding = await registry_extract_embedding(audio_data)
-                if embedding is not None:
-                    # CRITICAL: Validate embedding for NaN values (handle both numpy and torch)
-                    try:
-                        import torch
-                        if isinstance(embedding, torch.Tensor):
-                            has_nan = torch.isnan(embedding).any().item()
-                        else:
-                            has_nan = np.any(np.isnan(np.asarray(embedding)))
-                    except Exception:
-                        has_nan = np.any(np.isnan(np.asarray(embedding).flatten()))
-
-                    if has_nan:
-                        logger.warning("⚠️ Registry embedding contains NaN - falling back to local engine")
-                    else:
-                        return embedding
-                # Fallback to local engine if registry fails
-                logger.warning("Registry embedding failed, falling back to local engine")
-
-            # Fallback to local SpeechBrain engine
-            embedding = await self.speechbrain_engine.extract_speaker_embedding(audio_data)
-
-            # Validate local embedding too (handle both numpy and torch)
-            if embedding is not None:
-                try:
-                    import torch
-                    if isinstance(embedding, torch.Tensor):
-                        has_nan = torch.isnan(embedding).any().item()
-                    else:
-                        has_nan = np.any(np.isnan(np.asarray(embedding)))
-                except Exception:
-                    has_nan = np.any(np.isnan(np.asarray(embedding).flatten()))
-
-                if has_nan:
-                    logger.error("❌ Local embedding also contains NaN!")
-                    return None
-
-            return embedding
-
-        except Exception as e:
-            logger.error(f"Embedding extraction failed: {e}")
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            result = await facade.extract_embedding(audio_data)
+            if result.success:
+                return result.embedding
             return None
+        except Exception:
+            return None  # Facade unavailable, return None like old path
 
     async def _detect_current_model_dimension(self):
         """

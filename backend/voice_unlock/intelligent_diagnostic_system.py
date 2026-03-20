@@ -34,8 +34,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
-# EcapaFacade feature flag (Phase 3b migration)
-_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+# Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 # =============================================================================
 # CONFIGURATION - Environment-driven, zero hardcoding
@@ -363,104 +362,36 @@ class IntelligentDiagnosticSystem:
     
     async def _check_ecapa_encoder(self) -> ComponentDiagnostic:
         """Check ECAPA encoder availability (dynamic, no hardcoding)."""
-        # --- EcapaFacade path (Phase 3b) ---
-        if _USE_FACADE:
-            try:
-                from backend.core.ecapa_facade import get_ecapa_facade
-                facade = await get_ecapa_facade()
-                status = facade.get_status()
-                tier = status.get("tier", "unavailable")
-                backend = status.get("active_backend", "unknown")
-                if tier == "ready":
-                    return ComponentDiagnostic(
-                        name="ecapa_encoder",
-                        status=ComponentStatus.HEALTHY,
-                        severity=Severity.INFO,
-                        message=f"ECAPA available via facade ({backend})",
-                        details=status,
-                    )
-                elif tier == "degraded":
-                    return ComponentDiagnostic(
-                        name="ecapa_encoder",
-                        status=ComponentStatus.DEGRADED,
-                        severity=Severity.MEDIUM,
-                        message=f"ECAPA degraded via facade ({backend})",
-                        details=status,
-                    )
-                else:
-                    return ComponentDiagnostic(
-                        name="ecapa_encoder",
-                        status=ComponentStatus.FAILED,
-                        severity=Severity.CRITICAL,
-                        message=f"ECAPA unavailable (facade tier: {tier})",
-                        details=status,
-                    )
-            except Exception as e:
-                logger.debug(f"EcapaFacade check failed, falling back to legacy: {e}")
-                pass  # Fall through to legacy check
-
-        # --- Legacy path (ML registry) ---
+        # EcapaFacade path (sole ECAPA owner)
         try:
-            # Try to get registry (may not exist)
-            sys.path.insert(0, str(Path(__file__).parent.parent))
-            from voice_unlock.ml_engine_registry import get_ml_registry_sync
-            
-            registry = get_ml_registry_sync()
-            if not registry:
-                return ComponentDiagnostic(
-                    name="ecapa_encoder",
-                    status=ComponentStatus.FAILED,
-                    severity=Severity.CRITICAL,
-                    message="ML Engine Registry not available",
-                    remediation_steps=[{
-                        "type": RemediationType.CONFIGURE.value,
-                        "description": "Initialize ML Engine Registry",
-                        "auto_remediable": False,
-                    }],
-                )
-            
-            status_dict = registry.get_ecapa_status()
-            available = status_dict.get("available", False)
-            source = status_dict.get("source")
-            error = status_dict.get("error")
-            
-            if available:
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            status = facade.get_status()
+            tier = status.get("tier", "unavailable")
+            backend = status.get("active_backend", "unknown")
+            if tier == "ready":
                 return ComponentDiagnostic(
                     name="ecapa_encoder",
                     status=ComponentStatus.HEALTHY,
                     severity=Severity.INFO,
-                    message=f"ECAPA encoder available via {source}",
-                    details=status_dict,
+                    message=f"ECAPA available via facade ({backend})",
+                    details=status,
+                )
+            elif tier == "degraded":
+                return ComponentDiagnostic(
+                    name="ecapa_encoder",
+                    status=ComponentStatus.DEGRADED,
+                    severity=Severity.MEDIUM,
+                    message=f"ECAPA degraded via facade ({backend})",
+                    details=status,
                 )
             else:
-                # Analyze why it's not available
-                local_loaded = status_dict.get("local_loaded", False)
-                cloud_verified = status_dict.get("cloud_verified", False)
-                local_error = status_dict.get("local_error")
-                
-                remediation_steps = []
-                
-                if not local_loaded and local_error:
-                    remediation_steps.append({
-                        "type": RemediationType.DOWNLOAD.value,
-                        "description": f"ECAPA model failed to load: {local_error}",
-                        "auto_remediable": False,
-                    })
-                
-                if not cloud_verified and registry.is_using_cloud:
-                    remediation_steps.append({
-                        "type": RemediationType.CONFIGURE.value,
-                        "description": "Cloud ECAPA backend not verified",
-                        "auto_remediable": False,
-                    })
-                
                 return ComponentDiagnostic(
                     name="ecapa_encoder",
                     status=ComponentStatus.FAILED,
                     severity=Severity.CRITICAL,
-                    message=error or "ECAPA encoder not available",
-                    details=status_dict,
-                    remediation_steps=remediation_steps,
+                    message=f"ECAPA unavailable (facade tier: {tier})",
+                    details=status,
                 )
         except Exception as e:
             return ComponentDiagnostic(

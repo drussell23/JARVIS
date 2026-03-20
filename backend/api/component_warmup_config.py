@@ -37,8 +37,7 @@ from core.component_warmup import ComponentPriority, get_warmup_system
 
 logger = logging.getLogger(__name__)
 
-# EcapaFacade feature flag (Phase 3b migration)
-_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+# Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 # Configuration
 WARMUP_MODE = os.getenv("WARMUP_MODE", "manual").lower()  # dynamic, hybrid, manual - DEFAULT TO MANUAL FOR LOW RAM
@@ -1048,85 +1047,19 @@ async def load_ecapa_prewarmer():
     3. Verifies the embedding is valid
     4. Marks the system as "warm" for instant future requests
     """
-    # --- EcapaFacade path (Phase 3b) ---
-    if _USE_FACADE:
-        try:
-            from backend.core.ecapa_facade import get_ecapa_facade
-            facade = await get_ecapa_facade()
-            ready = await facade.ensure_ready(timeout=60.0)
-            if ready:
-                logger.info("[WARMUP] ECAPA pre-warmed via facade")
-                return facade  # Return facade as the "prewarmer" object
-        except Exception as e:
-            logger.debug(f"EcapaFacade warmup failed, falling back to legacy: {e}")
-            pass  # Fall through to legacy prewarmer
-
-    # --- Legacy path ---
-    logger.info("[WARMUP] 🔥 Starting ECAPA-TDNN pre-warming at STARTUP...")
-    start_time = time.time()
-
+    # EcapaFacade path (sole ECAPA lifecycle owner)
     try:
-        # Import the pre-warmer and VBI orchestrator
-        from core.vbi_debug_tracer import ECAPAPreWarmer, get_vbi_orchestrator
-        
-        # Get or create the prewarmer (singleton)
-        prewarmer = ECAPAPreWarmer()
-        
-        # Check if already warm
-        if prewarmer.is_warm:
-            elapsed = time.time() - start_time
-            logger.info(f"[WARMUP] ✅ ECAPA already warm ({elapsed:.2f}s)")
-            return prewarmer
-        
-        # Perform the warmup - this is the slow part that should happen at STARTUP
-        logger.info("[WARMUP] 🔄 Warming up Cloud ECAPA endpoint (this may take 30-60s on cold start)...")
-        
-        warmup_result = await asyncio.wait_for(
-            prewarmer.warmup(force=False),
-            timeout=120.0  # 2 minute timeout for cold starts
-        )
-        
-        elapsed = time.time() - start_time
-        
-        if warmup_result.get("status") == "success":
-            logger.info(f"[WARMUP] ✅ ECAPA-TDNN PRE-WARMED SUCCESSFULLY in {elapsed:.2f}s!")
-            logger.info(f"[WARMUP]    └─ Endpoint: {warmup_result.get('stages', [{}])[0].get('endpoint', 'unknown')}")
-            logger.info(f"[WARMUP]    └─ Embedding dimensions: {warmup_result.get('stages', [{}])[-1].get('embedding_size', 192)}")
-            logger.info(f"[WARMUP]    └─ Voice unlock commands will now be INSTANT! 🚀")
-        elif warmup_result.get("status") == "already_warm":
-            logger.info(f"[WARMUP] ✅ ECAPA was already warm ({elapsed:.2f}s)")
+        from backend.core.ecapa_facade import get_ecapa_facade
+        facade = await get_ecapa_facade()
+        ready = await facade.ensure_ready(timeout=60.0)
+        if ready:
+            logger.info("[WARMUP] ECAPA pre-warmed via facade")
+            return facade  # Return facade as the "prewarmer" object
         else:
-            logger.warning(f"[WARMUP] ⚠️ ECAPA warmup status: {warmup_result.get('status')} ({elapsed:.2f}s)")
-            logger.warning(f"[WARMUP]    └─ Error: {warmup_result.get('error', 'unknown')}")
-            logger.warning(f"[WARMUP]    └─ Voice unlock will work but may be slow on first request")
-        
-        return prewarmer
-        
-    except asyncio.TimeoutError:
-        elapsed = time.time() - start_time
-        logger.warning(f"[WARMUP] ⏱️ ECAPA warmup timed out after {elapsed:.2f}s")
-        logger.warning("[WARMUP]    └─ Cloud endpoint may be cold, first unlock will be slower")
-        logger.warning("[WARMUP]    └─ Continuing startup - warmup will happen on first request")
-        
-        # Return the prewarmer anyway - it'll warm up on first request
-        try:
-            from core.vbi_debug_tracer import ECAPAPreWarmer
-            return ECAPAPreWarmer()
-        except Exception:
+            logger.warning("[WARMUP] EcapaFacade ensure_ready returned False")
             return None
-        
-    except ImportError as e:
-        logger.warning(f"[WARMUP] ⚠️ ECAPA pre-warmer not available: {e}")
-        logger.warning("[WARMUP]    └─ Voice unlock may be slower on first request")
-        return None
-        
     except Exception as e:
-        elapsed = time.time() - start_time
-        logger.error(f"[WARMUP] ❌ ECAPA pre-warmup failed: {e} ({elapsed:.2f}s)")
-        import traceback
-        logger.debug(traceback.format_exc())
-        
-        # Return None but don't crash - voice unlock will warm up on first request
+        logger.error(f"[WARMUP] EcapaFacade warmup failed: {e}")
         return None
 
 

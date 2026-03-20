@@ -24,8 +24,7 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
-# v300.1: EcapaFacade feature flag (Phase 3a migration)
-_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+# Phase 6: EcapaFacade is the sole ECAPA lifecycle owner (flag removed)
 
 
 class VBIStage(Enum):
@@ -550,58 +549,35 @@ class ECAPAPreWarmer:
             start_time = time.time()
             result = {"status": "unknown", "stages": [], "version": "2.0.0"}
 
-            # v300.1: EcapaFacade path — delegate warmup to facade singleton
-            if _USE_FACADE:
-                try:
-                    from backend.core.ecapa_facade import get_ecapa_facade
-                    facade = await get_ecapa_facade()
-                    ready = await facade.ensure_ready(timeout=float(self.warmup_timeout))
-                    self.warmup_duration_ms = (time.time() - start_time) * 1000
-                    if ready:
-                        self.is_warm = True
-                        self.last_warmup_time = time.time()
-                        self._record_success()
-                        status = facade.get_status()
-                        result["status"] = "success"
-                        result["total_duration_ms"] = self.warmup_duration_ms
-                        result["facade_tier"] = status.get("tier", "unknown")
-                        logger.info(f"[ECAPA-PREWARM] ✅ Facade warmup succeeded in {self.warmup_duration_ms:.0f}ms (tier: {status.get('tier')})")
-                        return result
-                    else:
-                        logger.warning("[ECAPA-PREWARM] Facade ensure_ready returned False, falling through to legacy warmup")
-                except Exception as e:
-                    logger.warning(f"[ECAPA-PREWARM] Facade warmup failed ({e}), falling through to legacy warmup")
-
+            # EcapaFacade path — delegate warmup to facade singleton (sole ECAPA owner)
             try:
-                # Wrap entire warmup in a timeout
-                warmup_result = await asyncio.wait_for(
-                    self._execute_warmup_stages(result),
-                    timeout=self.warmup_timeout
-                )
-                
-                if warmup_result.get("status") == "success":
-                    self._record_success()
-                else:
-                    self._record_failure()
-                    
-                return warmup_result
-
-            except asyncio.TimeoutError:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                ready = await facade.ensure_ready(timeout=float(self.warmup_timeout))
                 self.warmup_duration_ms = (time.time() - start_time) * 1000
-                result["status"] = "timeout"
-                result["total_duration_ms"] = self.warmup_duration_ms
-                result["error"] = f"Total warmup timeout after {self.warmup_timeout}s"
-                logger.error(f"[ECAPA-PREWARM] ⏱️ TIMEOUT after {self.warmup_duration_ms:.0f}ms")
-                logger.error(f"   Completed stages: {[s['stage'] for s in result.get('stages', [])]}")
-                self._record_failure()
-                return result
-
+                if ready:
+                    self.is_warm = True
+                    self.last_warmup_time = time.time()
+                    self._record_success()
+                    status = facade.get_status()
+                    result["status"] = "success"
+                    result["total_duration_ms"] = self.warmup_duration_ms
+                    result["facade_tier"] = status.get("tier", "unknown")
+                    logger.info(f"[ECAPA-PREWARM] ✅ Facade warmup succeeded in {self.warmup_duration_ms:.0f}ms (tier: {status.get('tier')})")
+                    return result
+                else:
+                    self.warmup_duration_ms = (time.time() - start_time) * 1000
+                    result["status"] = "failed"
+                    result["total_duration_ms"] = self.warmup_duration_ms
+                    result["error"] = "EcapaFacade ensure_ready returned False"
+                    logger.warning("[ECAPA-PREWARM] Facade ensure_ready returned False")
+                    self._record_failure()
+                    return result
             except asyncio.CancelledError:
                 logger.warning("[ECAPA-PREWARM] Warmup was cancelled")
                 result["status"] = "cancelled"
                 self._record_failure()
                 return result
-
             except Exception as e:
                 self.warmup_duration_ms = (time.time() - start_time) * 1000
                 result["status"] = "failed"
