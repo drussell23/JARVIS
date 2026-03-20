@@ -434,3 +434,30 @@ class TestGateOrchestratorIntegration:
             result = await orch.process("what time is it", context={}, trace_id="t1")
         assert result is None  # Non-proactive, but detector was called
         orch._detector.detect.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Agent init integration test
+# ---------------------------------------------------------------------------
+
+
+class TestAgentInitIntegration:
+    @pytest.mark.asyncio
+    async def test_gate_starts_and_reaches_active(self):
+        """Gate starts polling, transitions DISABLED->WAITING_DEPS->READY->ACTIVE."""
+        config = GateConfig(
+            activation_dwell_s=0.01,
+            min_state_dwell_s=0.01,
+            dep_poll_interval_s=0.05,
+        )
+        gate = ReasoningActivationGate(config=config)
+        gate._check_all_deps = AsyncMock(return_value=_mock_dep_statuses())
+
+        env = {"JARVIS_REASONING_CHAIN_ENABLED": "true"}
+        with patch.dict("os.environ", env, clear=False):
+            await gate.start()
+            await asyncio.sleep(0.5)  # Let several poll cycles run
+            await gate.stop()
+
+        assert gate.state == GateState.ACTIVE
+        assert gate.gate_sequence >= 3  # DISABLED->WAITING->READY->ACTIVE = 3 transitions
