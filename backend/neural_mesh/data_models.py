@@ -710,6 +710,60 @@ class WorkflowResult:
 
 
 # ============================================================================
+# CAPABILITY MANIFEST
+# ============================================================================
+
+
+@dataclass
+class CapabilityManifest:
+    """Rich runtime self-declaration of what an agent can do.
+
+    Agents populate this at startup by querying the local environment
+    (e.g., osascript for installed/running apps, Playwright for browser
+    support).  No values are hardcoded — they are discovered dynamically.
+
+    This manifest is stored in AgentRegistry and aggregated by
+    AgentCapabilityIndex, which exposes it to the J-Prime planning
+    pipeline via context["capability_index"].
+    """
+
+    agent_name: str
+    agent_type: str
+    # Flat capability tokens already registered in AgentRegistry
+    capabilities: Set[str] = field(default_factory=set)
+    # macOS app names this agent can drive (e.g. ["WhatsApp", "Spotify"])
+    supported_apps: List[str] = field(default_factory=list)
+    # Domain/URL glob patterns handled (e.g. ["*"] for VisualBrowserAgent)
+    supported_url_patterns: List[str] = field(default_factory=list)
+    # J-Prime SubGoal.task_type strings this agent can service
+    supported_task_types: List[str] = field(default_factory=list)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "agent_name": self.agent_name,
+            "agent_type": self.agent_type,
+            "capabilities": sorted(self.capabilities),
+            "supported_apps": self.supported_apps,
+            "supported_url_patterns": self.supported_url_patterns,
+            "supported_task_types": self.supported_task_types,
+            "metadata": self.metadata,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "CapabilityManifest":
+        return cls(
+            agent_name=d["agent_name"],
+            agent_type=d["agent_type"],
+            capabilities=set(d.get("capabilities", [])),
+            supported_apps=d.get("supported_apps", []),
+            supported_url_patterns=d.get("supported_url_patterns", []),
+            supported_task_types=d.get("supported_task_types", []),
+            metadata=d.get("metadata", {}),
+        )
+
+
+# ============================================================================
 # CALLBACK TYPES
 # ============================================================================
 

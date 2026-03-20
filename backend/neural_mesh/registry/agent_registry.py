@@ -39,6 +39,7 @@ from typing import (
 from ..data_models import (
     AgentInfo,
     AgentStatus,
+    CapabilityManifest,
     HealthStatus,
 )
 from ..config import AgentRegistryConfig, get_config
@@ -224,6 +225,9 @@ class AgentRegistry:
         self._dead_confirmation_threshold = int(
             os.environ.get("AGENT_DEAD_CONFIRMATION_THRESHOLD", "3")
         )
+
+        # Capability manifests: {agent_name: CapabilityManifest}
+        self._manifests: Dict[str, CapabilityManifest] = {}
 
         # v116.0: Mark as initialized
         self._initialized = True
@@ -708,6 +712,31 @@ class AgentRegistry:
     def get_metrics(self) -> RegistryMetrics:
         """Get current registry metrics."""
         return self._metrics
+
+    # ========================================================================
+    # Capability Manifest API
+    # ========================================================================
+
+    async def register_manifest(
+        self, agent_name: str, manifest: CapabilityManifest
+    ) -> None:
+        """Store or update a CapabilityManifest for a registered agent."""
+        self._manifests[agent_name] = manifest
+        logger.debug(
+            "Manifest registered: %s (%d apps, %d url_patterns, %d task_types)",
+            agent_name,
+            len(manifest.supported_apps),
+            len(manifest.supported_url_patterns),
+            len(manifest.supported_task_types),
+        )
+
+    async def get_manifest(self, agent_name: str) -> Optional[CapabilityManifest]:
+        """Return the CapabilityManifest for *agent_name*, or None."""
+        return self._manifests.get(agent_name)
+
+    async def get_all_manifests(self) -> Dict[str, CapabilityManifest]:
+        """Return a snapshot of all registered CapabilityManifests."""
+        return dict(self._manifests)
 
     # ========================================================================
     # v112.0: Dependency-Aware Health Checking
@@ -1423,6 +1452,161 @@ class AgentRegistry:
 # =============================================================================
 # Module-Level Singleton Accessors (v116.0)
 # =============================================================================
+
+
+class AgentCapabilityIndex:
+    """
+    Live aggregator of all registered CapabilityManifests.
+
+    Surfaces:
+    - to_planning_context(): JSON dict injected into J-Prime /v1/reason
+      so the reasoning pipeline can assign brain_assigned / tool_required
+      using real runtime information instead of a hardcoded table.
+    - resolve_capability(): local fallback when J-Prime is unavailable.
+
+    The index refreshes from AgentRegistry on demand with a TTL
+    (default 30 s, overridable via CAPABILITY_INDEX_TTL_S env var).
+    """
+
+    _instance: Optional["AgentCapabilityIndex"] = None
+    _instance_lock = threading.Lock()
+
+    def __new__(cls) -> "AgentCapabilityIndex":
+        with cls._instance_lock:
+            if cls._instance is None:
+                cls._instance = super().__new__(cls)
+                cls._instance._ci_initialized = False
+            return cls._instance
+
+    def __init__(self) -> None:
+        if getattr(self, "_ci_initialized", False):
+            return
+        self._manifests: Dict[str, CapabilityManifest] = {}
+        self._last_refresh: float = 0.0
+        self._ttl_s: float = float(os.environ.get("CAPABILITY_INDEX_TTL_S", "30"))
+        self._lock = asyncio.Lock()
+        self._ci_initialized = True
+
+    async def refresh(self, registry: AgentRegistry) -> None:
+        """Pull all manifests from the registry and rebuild the index."""
+        async with self._lock:
+            self._manifests = await registry.get_all_manifests()
+            self._last_refresh = time.time()
+            logger.debug(
+                "AgentCapabilityIndex refreshed: %d manifests",
+                len(self._manifests),
+            )
+
+    async def ensure_fresh(self, registry: AgentRegistry) -> None:
+        """Refresh if the TTL has expired."""
+        if time.time() - self._last_refresh > self._ttl_s:
+            await self.refresh(registry)
+
+    def to_planning_context(self) -> Dict[str, Any]:
+        """
+        Produce a JSON-serializable structure for J-Prime context injection.
+
+        J-Prime receives this under context["capability_index"] and uses it
+        to fill brain_assigned and tool_required for each SubGoal without
+        relying on a static tool map.
+        """
+        return {
+            "agents": [m.to_dict() for m in self._manifests.values()],
+            "refreshed_at": self._last_refresh,
+            "count": len(self._manifests),
+        }
+
+    def to_llm_summary(self) -> str:
+        """
+        Human-readable capability summary for LLM system prompts.
+
+        Replaces the hardcoded capability bullet list in _expand_with_llm().
+        """
+        if not self._manifests:
+            return "- computer_use: Generic fallback — can control any visible UI element"
+
+        lines = []
+        for manifest in self._manifests.values():
+            caps = ", ".join(sorted(manifest.capabilities))
+            extras = []
+            if manifest.supported_apps:
+                extras.append(f"apps: {', '.join(manifest.supported_apps[:8])}")
+            if manifest.supported_url_patterns:
+                extras.append("any URL" if "*" in manifest.supported_url_patterns else
+                              f"urls: {', '.join(manifest.supported_url_patterns[:3])}")
+            suffix = f" ({'; '.join(extras)})" if extras else ""
+            lines.append(f"- {caps}{suffix}")
+        return "\n".join(lines)
+
+    def resolve_capability(
+        self,
+        goal: str,
+        target_app: Optional[str],
+        task_type: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Dynamically derive (primary_capability, fallback_capability).
+
+        Resolution order:
+        1. target_app name matched against manifest.supported_apps.
+        2. task_type matched against manifest.supported_task_types.
+        3. URL signals in the goal → browser-capable agent.
+        4. Capability token found in goal text.
+        5. Universal fallback: "computer_use".
+        """
+        goal_lower = goal.lower()
+
+        if not self._manifests:
+            return "computer_use", None
+
+        # 1. App name match
+        if target_app:
+            app_lower = target_app.lower()
+            for manifest in self._manifests.values():
+                if any(
+                    app_lower == sa.lower() or app_lower in sa.lower() or sa.lower() in app_lower
+                    for sa in manifest.supported_apps
+                ):
+                    primary = next(iter(sorted(manifest.capabilities)), "computer_use")
+                    return primary, self._find_fallback(primary)
+
+        # 2. task_type match
+        if task_type:
+            tt_lower = task_type.lower()
+            for manifest in self._manifests.values():
+                if any(tt_lower == stt.lower() for stt in manifest.supported_task_types):
+                    primary = next(iter(sorted(manifest.capabilities)), "computer_use")
+                    return primary, self._find_fallback(primary)
+
+        # 3. URL / web signals in goal text
+        if any(pat in goal_lower for pat in ("http://", "https://", "www.", ".com", ".org", ".net")):
+            for manifest in self._manifests.values():
+                if manifest.supported_url_patterns:
+                    primary = next(iter(sorted(manifest.capabilities)), "visual_browser")
+                    return primary, "computer_use"
+
+        # 4. Capability token present in goal text
+        for manifest in self._manifests.values():
+            for cap in manifest.capabilities:
+                if cap.replace("_", " ") in goal_lower or cap in goal_lower:
+                    return cap, self._find_fallback(cap)
+
+        return "computer_use", None
+
+    def _find_fallback(self, primary: str) -> Optional[str]:
+        """Return the best fallback capability that differs from primary."""
+        for fb in ("visual_browser", "computer_use", "native_app_control"):
+            if fb == primary:
+                continue
+            for manifest in self._manifests.values():
+                if fb in manifest.capabilities:
+                    return fb
+        return None
+
+
+def get_capability_index() -> AgentCapabilityIndex:
+    """Return the singleton AgentCapabilityIndex."""
+    return AgentCapabilityIndex()
 
 
 def get_agent_registry(config: Optional[AgentRegistryConfig] = None) -> AgentRegistry:

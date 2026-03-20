@@ -34,6 +34,7 @@ from ..data_models import (
     AgentInfo,
     AgentMessage,
     AgentStatus,
+    CapabilityManifest,
     KnowledgeEntry,
     KnowledgeType,
     MessagePriority,
@@ -253,6 +254,17 @@ class BaseNeuralMeshAgent(ABC):
                     metadata={"config": self.config.__dict__},
                 )
 
+                # Register capability manifest for dynamic planning
+                try:
+                    manifest = await self.get_capability_manifest()
+                    await self.registry.register_manifest(self.agent_name, manifest)
+                except Exception as _manifest_err:
+                    logger.debug(
+                        "Agent %s manifest registration failed (non-fatal): %s",
+                        self.agent_name,
+                        _manifest_err,
+                    )
+
                 # Subscribe to task assignments
                 await self.message_bus.subscribe(
                     self.agent_name,
@@ -432,6 +444,26 @@ class BaseNeuralMeshAgent(ABC):
     async def on_stop(self) -> None:
         """Called when agent stops. Override for cleanup."""
         pass
+
+    async def get_capability_manifest(self) -> CapabilityManifest:
+        """
+        Return a runtime CapabilityManifest for this agent.
+
+        The default implementation builds the manifest from the static
+        capabilities set declared in __init__.  Subclasses (e.g.
+        NativeAppControlAgent, VisualBrowserAgent) override this to
+        populate supported_apps / supported_url_patterns dynamically by
+        querying the local environment at startup.
+        """
+        return CapabilityManifest(
+            agent_name=self.agent_name,
+            agent_type=self.agent_type,
+            capabilities=set(self.capabilities),
+            supported_apps=[],
+            supported_url_patterns=[],
+            supported_task_types=list(self.capabilities),
+            metadata={"version": self.version, "backend": self.backend},
+        )
 
     # =========================================================================
     # Messaging convenience methods

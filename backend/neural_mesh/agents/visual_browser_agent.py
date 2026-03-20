@@ -151,6 +151,29 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
         """No-op — browser and clients are launched lazily on first task."""
         logger.info("[VBA] VisualBrowserAgent ready (lazy init)")
 
+    async def get_capability_manifest(self):  # type: ignore[override]
+        """Return a CapabilityManifest declaring browser-driving capabilities."""
+        from ..data_models import CapabilityManifest
+
+        return CapabilityManifest(
+            agent_name=self.agent_name,
+            agent_type=self.agent_type,
+            capabilities=set(self.capabilities),
+            supported_apps=["Google Chrome", "Chrome", "Chromium"],
+            supported_url_patterns=["*"],  # can navigate to any URL
+            supported_task_types=[
+                "browser_navigation",
+                "vision_action",
+                "vision_verification",
+                "visual_browser",
+            ],
+            metadata={
+                "version": self.version,
+                "backend": self.backend,
+                "engine": "playwright",
+            },
+        )
+
     async def on_stop(self) -> None:
         """Graceful cleanup: close browser and playwright."""
         await self.cleanup()

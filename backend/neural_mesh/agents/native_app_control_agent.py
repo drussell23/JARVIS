@@ -233,6 +233,64 @@ class NativeAppControlAgent(BaseNeuralMeshAgent):
             )
             self._app_inventory_service = None
 
+        # Discover installed/running apps for capability manifest.
+        # AppInventoryService already enumerates apps; pull from it when
+        # available, otherwise fall back to a lightweight inline query.
+        self._discovered_apps: List[str] = []
+        try:
+            if self._app_inventory_service is not None:
+                all_apps = await self._app_inventory_service.list_installed_apps()
+                self._discovered_apps = [
+                    a if isinstance(a, str) else a.get("name", str(a))
+                    for a in (all_apps or [])
+                ]
+            if not self._discovered_apps:
+                # Best-effort: read running processes from System Events
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e",
+                    "tell application \"System Events\" to get name of "
+                    "every process whose background only is false",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+                if stdout:
+                    self._discovered_apps = [
+                        a.strip() for a in stdout.decode().split(",") if a.strip()
+                    ]
+        except Exception as _disc_err:
+            logger.debug(
+                "[NativeAppControlAgent] App discovery failed (non-fatal): %s",
+                _disc_err,
+            )
+
+    # ------------------------------------------------------------------
+    # Capability manifest — built from runtime-discovered app list
+    # ------------------------------------------------------------------
+
+    async def get_capability_manifest(self):  # type: ignore[override]
+        """Return a CapabilityManifest populated from the discovered app list."""
+        from ..data_models import CapabilityManifest
+
+        return CapabilityManifest(
+            agent_name=self.agent_name,
+            agent_type=self.agent_type,
+            capabilities=set(self.capabilities),
+            supported_apps=list(getattr(self, "_discovered_apps", [])),
+            supported_url_patterns=[],
+            supported_task_types=[
+                "system_command",
+                "vision_action",
+                "vision_verification",
+                "native_app_control",
+            ],
+            metadata={
+                "version": self.version,
+                "backend": self.backend,
+                "app_count": len(getattr(self, "_discovered_apps", [])),
+            },
+        )
+
     # ------------------------------------------------------------------
     # Task dispatch
     # ------------------------------------------------------------------

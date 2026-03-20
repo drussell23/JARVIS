@@ -238,6 +238,12 @@ class MultiAgentOrchestrator:
             strategy.value,
         )
 
+        # Emit WORKFLOW_STARTED to Reactor-Core EventBridge (fire-and-forget)
+        asyncio.create_task(
+            self._emit_workflow_event("started", workflow_id, name, len(tasks)),
+            name=f"wf_start_{workflow_id[:8]}",
+        )
+
         try:
             # Execute based on strategy
             if strategy == ExecutionStrategy.SEQUENTIAL:
@@ -290,11 +296,26 @@ class MultiAgentOrchestrator:
                 name=f"trinity_exp_{workflow_id[:8]}",
             )
 
+            # Emit WORKFLOW_COMPLETED to Reactor-Core EventBridge
+            asyncio.create_task(
+                self._emit_workflow_event(
+                    "completed", workflow_id, name, len(tasks),
+                    succeeded=len(workflow.completed_tasks),
+                    failed=len(workflow.failed_tasks),
+                ),
+                name=f"wf_done_{workflow_id[:8]}",
+            )
+
             return result
 
         except asyncio.TimeoutError:
             self._metrics.workflows_failed += 1
             logger.error("Workflow %s timed out", workflow_id[:8])
+
+            asyncio.create_task(
+                self._emit_workflow_event("failed", workflow_id, name, len(tasks), error="timeout"),
+                name=f"wf_fail_{workflow_id[:8]}",
+            )
 
             return WorkflowResult(
                 workflow_id=workflow_id,
@@ -310,6 +331,11 @@ class MultiAgentOrchestrator:
         except Exception as e:
             self._metrics.workflows_failed += 1
             logger.exception("Workflow %s failed: %s", workflow_id[:8], e)
+
+            asyncio.create_task(
+                self._emit_workflow_event("failed", workflow_id, name, len(tasks), error=str(e)),
+                name=f"wf_fail_{workflow_id[:8]}",
+            )
 
             return WorkflowResult(
                 workflow_id=workflow_id,
@@ -1033,6 +1059,65 @@ class MultiAgentOrchestrator:
         )
 
     # =========================================================================
+    # =========================================================================
+    # Wire 3b: Reactor-Core EventBridge lifecycle notifications
+    # =========================================================================
+
+    async def _emit_workflow_event(
+        self,
+        event: str,
+        workflow_id: str,
+        name: str,
+        task_count: int,
+        succeeded: int = 0,
+        failed: int = 0,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        Emit a workflow lifecycle event to the Reactor-Core EventBridge.
+
+        Fire-and-forget — exceptions are silently swallowed so the caller
+        is never blocked.  Uses dynamic import to avoid hard-coupling.
+        """
+        try:
+            from reactor_core.integration.event_bridge import EventBridge, EventSource, EventType
+
+            bridge = EventBridge.get_instance()
+            event_type_map = {
+                "started": EventType.WORKFLOW_STARTED,
+                "completed": EventType.WORKFLOW_COMPLETED,
+                "failed": EventType.WORKFLOW_FAILED,
+            }
+            et = event_type_map.get(event)
+            if et is None:
+                return
+
+            payload: Dict[str, Any] = {
+                "workflow_id": workflow_id,
+                "workflow_name": name,
+                "task_count": task_count,
+            }
+            if succeeded:
+                payload["succeeded"] = succeeded
+            if failed:
+                payload["failed"] = failed
+            if error:
+                payload["error"] = error
+
+            cross_event = bridge.create_event(
+                event_type=et,
+                source=EventSource.JARVIS,
+                payload=payload,
+            )
+            await bridge.emit(cross_event)
+
+        except ImportError:
+            pass  # Reactor-Core not installed in this environment
+        except Exception as _wfe_err:
+            logger.debug(
+                "Workflow event emission failed (non-fatal): %s", _wfe_err
+            )
+
     # Wire 3: Trinity Experience Pipeline Integration
     # =========================================================================
 
