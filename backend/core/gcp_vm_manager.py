@@ -158,7 +158,7 @@ T = TypeVar('T')
 # v235.0: Startup script version tag — bumped on every significant script change.
 # Embedded in VM metadata at creation. Running VMs with a stale version are
 # automatically recycled (deleted + recreated) to pick up the latest script.
-_STARTUP_SCRIPT_VERSION = "238.0"
+_STARTUP_SCRIPT_VERSION = "239.0"  # v296.0: /v1/reason/health capability check
 
 # v290.1: APARS checkpoints that indicate the startup script has given up.
 # When detected, the polling loop applies a grace period before returning
@@ -10105,49 +10105,76 @@ class APARSEnrichmentMiddleware:
         })
 
 # ─── Import J-Prime app and wrap it ───
+# v296.0: J-Prime uses a fast-startup pattern where `app` is assigned inside
+# main() via `global app`, so `app = None` at module-import time.  Attempting
+# to import and grab the app attribute will always return None.  We go straight
+# to the authoritative module-execution strategy so the full reasoning server
+# (including /v1/reason/* endpoints required by JARVIS-AI-Agent) is always used.
+# The APARS progress file is written by the startup script regardless, so the
+# supervisor retains full progress visibility via the file path.
+import subprocess as _subprocess
+
+_port = os.environ.get("JARVIS_PORT", "8000")
+_host = "0.0.0.0"
+
+# Try ASGI import first (works if a future version sets module-level app).
 _app = None
 _import_errors = []
-
-for _mod_path in ("jarvis_prime.server", "jarvis_prime.app", "server", "app"):
+for _mod_path in ("jarvis_prime.server", "jarvis_prime.app", "run_server", "app"):
     try:
         _mod = __import__(_mod_path, fromlist=["app"])
         _candidate = getattr(_mod, "app", None) or getattr(_mod, "application", None)
         if _candidate is not None:
+            print(
+                f"[APARS Launcher] Imported live app from {_mod_path!r} — "
+                "wrapping with APARS middleware",
+                flush=True,
+            )
             _app = _candidate
             break
-    except ImportError as e:
-        _import_errors.append(f"{_mod_path}: {e}")
-    except Exception as e:
-        _import_errors.append(f"{_mod_path}: {e}")
+    except ImportError as _e:
+        _import_errors.append(f"{_mod_path}: {_e}")
+    except Exception as _e:
+        _import_errors.append(f"{_mod_path}: {_e}")
 
-if _app is None:
-    # Fatal: can't find J-Prime app. Fall back to running module directly.
-    import subprocess
-    print(f"[APARS Launcher] Could not import J-Prime app: {_import_errors}", flush=True)
-    print("[APARS Launcher] Falling back to direct module execution", flush=True)
-    _port = os.environ.get("JARVIS_PORT", "8000")
-    sys.exit(subprocess.call([
-        sys.executable, "-m", "jarvis_prime.server",
-        "--host", "0.0.0.0", "--port", _port,
-    ]))
+if _app is not None:
+    wrapped_app = APARSEnrichmentMiddleware(_app)
 
-wrapped_app = APARSEnrichmentMiddleware(_app)
-
-if __name__ == "__main__":
-    import uvicorn
-    parser = argparse.ArgumentParser(description="APARS-enriched J-Prime launcher")
-    parser.add_argument("--host", default="0.0.0.0")
-    parser.add_argument(
-        "--port", type=int,
-        default=int(os.environ.get("JARVIS_PORT", "8000")),
-    )
-    args = parser.parse_args()
+    if __name__ == "__main__":
+        import uvicorn
+        import argparse as _ap
+        _parser = _ap.ArgumentParser(description="APARS-enriched J-Prime launcher")
+        _parser.add_argument("--host", default=_host)
+        _parser.add_argument("--port", type=int, default=int(_port))
+        _args = _parser.parse_args()
+        print(
+            f"[APARS Launcher] Starting J-Prime with APARS enrichment "
+            f"on {_args.host}:{_args.port} (APARS file: {APARS_FILE})",
+            flush=True,
+        )
+        uvicorn.run(wrapped_app, host=_args.host, port=_args.port)
+else:
+    # v296.0: app = None at import time (fast-startup design).
+    # Run the authoritative server directly — this is NOT a fallback, it is the
+    # correct path.  All /v1/reason/* endpoints are present in this server.
+    # APARS progress data continues to flow via the JSON file on disk.
+    if _import_errors:
+        print(f"[APARS Launcher] Import probes: {_import_errors}", flush=True)
     print(
-        f"[APARS Launcher] Starting J-Prime with APARS enrichment "
-        f"on {args.host}:{args.port} (file: {APARS_FILE})",
+        "[APARS Launcher] Running jarvis_prime.server directly "
+        f"(port {_port}) — APARS enrichment via progress file",
         flush=True,
     )
-    uvicorn.run(wrapped_app, host=args.host, port=args.port)
+    if __name__ == "__main__":
+        import argparse as _ap
+        _parser = _ap.ArgumentParser(description="APARS J-Prime direct launcher")
+        _parser.add_argument("--host", default=_host)
+        _parser.add_argument("--port", type=int, default=int(_port))
+        _args = _parser.parse_args()
+        sys.exit(_subprocess.call([
+            sys.executable, "-m", "jarvis_prime.server",
+            "--host", _args.host, "--port", str(_args.port),
+        ]))
 EOFLAUNCHER
 chmod +x "$APARS_LAUNCHER"
 log "Generated APARS enrichment launcher: $APARS_LAUNCHER"
@@ -10244,16 +10271,32 @@ except: sys.exit(1)
 done
 
 if [ "$READY" = true ]; then
-    update_apars 6 100 100 "inference_ready" true true
+    # v296.0: Capability check — verify /v1/reason/health is accessible.
+    # This confirms the correct server (jarvis_prime.server with Mind-Body
+    # protocol) is running, not just the quick-start wrapper.
+    REASON_HEALTH=$(curl -sf "http://localhost:${JARVIS_PORT}/v1/reason/health" 2>/dev/null || echo "")
+    if [ -n "$REASON_HEALTH" ]; then
+        log "✅ /v1/reason/health reachable — Mind-Body reasoning protocol active"
+        update_apars 6 100 100 "inference_ready" true true
+    else
+        log "⚠️  /v1/reason/health not reachable — wrong server entry point?"
+        log "   Expected: python -m jarvis_prime.server (reasoning endpoints included)"
+        log "   Got:      /health OK but /v1/reason/health missing"
+        log "   Fix:      Check ExecStart in jarvis-prime.service or APARS launcher"
+        # Still mark ready since /health passed — supervisor can operate in degraded mode
+        update_apars 6 100 98 "inference_ready_degraded" true true
+    fi
     log "═══════════════════════════════════════════════════════════════════════════════"
     ELAPSED=$(($(date +%s) - START_TIME))
     log "✅ GOLDEN IMAGE STARTUP COMPLETE in ${ELAPSED}s"
     log "   Port: $JARVIS_PORT | Mode: golden_image | Ready: true"
+    log "   Reasoning: ${REASON_HEALTH:+active}${REASON_HEALTH:-MISSING — check server entry point}"
     log "═══════════════════════════════════════════════════════════════════════════════"
 else
     update_apars 6 100 95 "service_start_timeout" null null '"service_health_check_failed"'
     log "⚠️  Service not responding after ${SERVICE_HEALTH_TIMEOUT}s — may need more time"
     log "   Check: curl http://localhost:${JARVIS_PORT}/health"
+    log "   Check: curl http://localhost:${JARVIS_PORT}/v1/reason/health"
     log "   Logs:  journalctl -u jarvis-prime.service"
 fi
 '''
