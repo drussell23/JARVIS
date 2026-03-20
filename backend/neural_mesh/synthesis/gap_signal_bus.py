@@ -112,7 +112,7 @@ if sys.version_info >= (3, 10):
 
             Used to track per-source resolution attempts without conflating sources.
             """
-            return _sha16(f"{self.dedupe_key}:{self.source}")
+            return _sha16(f"{self.dedupe_key}{self.source}")
 
 else:
     # Python 3.9 — frozen=True without slots=True.
@@ -172,7 +172,7 @@ else:
 
             Used to track per-source resolution attempts without conflating sources.
             """
-            return _sha16(f"{self.dedupe_key}:{self.source}")
+            return _sha16(f"{self.dedupe_key}{self.source}")
 
 
 # ---------------------------------------------------------------------------

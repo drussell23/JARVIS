@@ -80,6 +80,46 @@ def test_dedupe_key_varies_by_domain():
 
 
 # ===========================================================================
+# CapabilityGapEvent — attempt_key
+# ===========================================================================
+
+def test_attempt_key_is_hex16():
+    """attempt_key must be exactly 16 lowercase hex chars."""
+    event = CapabilityGapEvent(
+        goal="irrelevant",
+        task_type="Web Scraping",
+        target_app="Chrome",
+        source="test_source",
+    )
+    key = event.attempt_key
+    assert len(key) == 16
+    # valid hex: all chars in 0-9a-f
+    assert all(c in "0123456789abcdef" for c in key)
+
+
+def test_attempt_key_varies_by_source():
+    """Different sources must produce different attempt_keys for same domain."""
+    e1 = CapabilityGapEvent(
+        goal="g", task_type="File System", target_app="Finder", source="source_a"
+    )
+    e2 = CapabilityGapEvent(
+        goal="g", task_type="File System", target_app="Finder", source="source_b"
+    )
+    # Same domain but different sources should have different attempt_keys
+    assert e1.attempt_key != e2.attempt_key
+    # But they should have the same dedupe_key (same domain)
+    assert e1.dedupe_key == e2.dedupe_key
+
+
+def test_attempt_key_stable():
+    """Identical inputs always produce the same attempt_key."""
+    kwargs = dict(goal="g", task_type="Text Editing", target_app="VSCode", source="editor")
+    e1 = CapabilityGapEvent(**kwargs)
+    e2 = CapabilityGapEvent(**kwargs)
+    assert e1.attempt_key == e2.attempt_key
+
+
+# ===========================================================================
 # GapSignalBus — basic queue operations
 # ===========================================================================
 
