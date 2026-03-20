@@ -45,6 +45,9 @@ from backend.core.async_safety import LazyAsyncLock
 
 logger = logging.getLogger(__name__)
 
+# v300.1: EcapaFacade feature flag (Phase 3a migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
 # =============================================================================
 # PREWARMING CONFIGURATION
 # =============================================================================
@@ -161,6 +164,22 @@ async def _prewarm_ecapa() -> bool:
     voice verification doesn't incur the 5-10 second model load time.
     """
     global _prewarm_status
+
+    # v300.1: EcapaFacade path — delegate prewarming to facade singleton
+    if _USE_FACADE:
+        try:
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            ready = await facade.ensure_ready(timeout=60.0)
+            if ready:
+                _prewarm_status.ecapa_loaded = True
+                _prewarm_status.speaker_encoder_loaded = True
+                logger.info("✅ [PREWARM] ECAPA-TDNN prewarmed via EcapaFacade")
+                return True
+            else:
+                logger.warning("[PREWARM] EcapaFacade ensure_ready returned False, falling through to legacy")
+        except Exception as e:
+            logger.warning(f"[PREWARM] EcapaFacade prewarm failed ({e}), falling through to legacy")
 
     try:
         logger.info("🔥 [PREWARM] Loading ECAPA-TDNN speaker encoder...")

@@ -24,6 +24,9 @@ import traceback
 
 logger = logging.getLogger(__name__)
 
+# v300.1: EcapaFacade feature flag (Phase 3a migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
 
 class VBIStage(Enum):
     """Stages in the VBI pipeline"""
@@ -546,6 +549,28 @@ class ECAPAPreWarmer:
 
             start_time = time.time()
             result = {"status": "unknown", "stages": [], "version": "2.0.0"}
+
+            # v300.1: EcapaFacade path — delegate warmup to facade singleton
+            if _USE_FACADE:
+                try:
+                    from backend.core.ecapa_facade import get_ecapa_facade
+                    facade = await get_ecapa_facade()
+                    ready = await facade.ensure_ready(timeout=float(self.warmup_timeout))
+                    self.warmup_duration_ms = (time.time() - start_time) * 1000
+                    if ready:
+                        self.is_warm = True
+                        self.last_warmup_time = time.time()
+                        self._record_success()
+                        status = facade.get_status()
+                        result["status"] = "success"
+                        result["total_duration_ms"] = self.warmup_duration_ms
+                        result["facade_tier"] = status.get("tier", "unknown")
+                        logger.info(f"[ECAPA-PREWARM] ✅ Facade warmup succeeded in {self.warmup_duration_ms:.0f}ms (tier: {status.get('tier')})")
+                        return result
+                    else:
+                        logger.warning("[ECAPA-PREWARM] Facade ensure_ready returned False, falling through to legacy warmup")
+                except Exception as e:
+                    logger.warning(f"[ECAPA-PREWARM] Facade warmup failed ({e}), falling through to legacy warmup")
 
             try:
                 # Wrap entire warmup in a timeout

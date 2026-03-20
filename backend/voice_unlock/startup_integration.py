@@ -20,6 +20,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# v300.1: EcapaFacade feature flag (Phase 3a migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
 
 # =============================================================================
 # STARTUP VALIDATION TYPES
@@ -176,6 +179,27 @@ class VoiceBiometricStartupValidator:
 
     async def _check_ecapa_encoder(self) -> Tuple[bool, str, Dict]:
         """Check ECAPA encoder availability (with on-demand loading)"""
+        # v300.1: EcapaFacade path — delegate readiness check to facade singleton
+        if _USE_FACADE:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                status = facade.get_status()
+                tier = status.get("tier", "unavailable")
+                state = status.get("state", "unknown")
+                details = {
+                    "encoder_available": tier in ("ready", "degraded"),
+                    "encoder_type": "EcapaFacade",
+                    "mode": f"facade/{tier}",
+                    "facade_state": state,
+                }
+                if tier in ("ready", "degraded"):
+                    return True, f"ECAPA via facade (tier: {tier})", details
+                return False, f"ECAPA facade tier: {tier}", details
+            except Exception as e:
+                logger.warning(f"EcapaFacade check failed: {e}")
+                return False, f"Facade error: {e}", {}
+
         try:
             from voice_unlock.ml_engine_registry import ensure_ecapa_available
 
