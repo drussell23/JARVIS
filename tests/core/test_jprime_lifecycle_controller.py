@@ -527,3 +527,27 @@ class TestControllerSingleton:
         c2 = get_jprime_lifecycle_controller()
         assert c1 is c2
         mod._controller_instance = None
+
+
+# ---------------------------------------------------------------------------
+# Task 4: MindClient.update_endpoint() tests
+# ---------------------------------------------------------------------------
+
+
+class TestMindClientEndpointSync:
+    def test_update_endpoint(self):
+        from backend.core.mind_client import MindClient
+        mc = MindClient(mind_host="old-host", mind_port=9999)
+        assert "old-host" in mc._base_url
+        assert mc._port == 9999
+        mc.update_endpoint("new-host", 8000)
+        assert mc._base_url == "http://new-host:8000"
+        assert mc._host == "new-host"
+        assert mc._port == 8000
+
+    def test_update_endpoint_preserves_session(self):
+        from backend.core.mind_client import MindClient
+        mc = MindClient(mind_host="host1", mind_port=8000)
+        session_id = mc._session_id
+        mc.update_endpoint("host2", 8001)
+        assert mc._session_id == session_id  # Session preserved
