@@ -5,6 +5,7 @@ from backend.core.reasoning_chain_orchestrator import (
     ChainPhase,
     ChainConfig,
     ChainResult,
+    ChainTelemetry,
     ShadowMetrics,
 )
 
@@ -168,3 +169,81 @@ class TestShadowMetrics:
         assert "mind_plan_quality" in status
         assert "user_override_rate" in status
         assert "all_gates_pass" in status
+
+
+class TestChainTelemetry:
+    @pytest.mark.asyncio
+    async def test_emit_proactive_detection(self):
+        telemetry = ChainTelemetry()
+        event = await telemetry.emit_proactive_detection(
+            trace_id="t1", command="start my day", is_proactive=True,
+            confidence=0.92, signals=["workflow_trigger", "multi_task"], latency_ms=15.0,
+        )
+        assert event["event"] == "proactive_detection"
+        assert event["trace_id"] == "t1"
+        assert event["is_proactive"] is True
+        assert event["confidence"] == 0.92
+
+    @pytest.mark.asyncio
+    async def test_emit_intent_expansion(self):
+        telemetry = ChainTelemetry()
+        event = await telemetry.emit_intent_expansion(
+            trace_id="t1", original_query="start my day", expanded_count=3,
+            intents=["check email", "check calendar", "open Slack"],
+            confidence=0.88, latency_ms=120.0,
+        )
+        assert event["event"] == "intent_expansion"
+        assert event["expanded_count"] == 3
+
+    @pytest.mark.asyncio
+    async def test_emit_shadow_divergence(self):
+        telemetry = ChainTelemetry()
+        event = await telemetry.emit_shadow_divergence(
+            trace_id="t1", would_expand=True, actually_expanded=False, match=False,
+        )
+        assert event["event"] == "expansion_shadow_divergence"
+        assert event["would_expand"] is True
+        assert event["match"] is False
+
+    @pytest.mark.asyncio
+    async def test_emit_coordinator_delegation(self):
+        telemetry = ChainTelemetry()
+        event = await telemetry.emit_coordinator_delegation(
+            trace_id="t1", plan_id="p1", step_id="s1",
+            agent_name="GoogleWorkspaceAgent", capability="email_management",
+            latency_ms=50.0,
+        )
+        assert event["event"] == "coordinator_delegation"
+        assert event["agent_name"] == "GoogleWorkspaceAgent"
+
+    @pytest.mark.asyncio
+    async def test_emit_chain_complete(self):
+        telemetry = ChainTelemetry()
+        event = await telemetry.emit_chain_complete(
+            trace_id="t1", total_intents=3, total_steps=5,
+            total_ms=2500.0, success_rate=1.0,
+        )
+        assert event["event"] == "chain_complete"
+        assert event["total_intents"] == 3
+        assert event["success_rate"] == 1.0
+
+    @pytest.mark.asyncio
+    async def test_reactor_forwarding_best_effort(self):
+        """Telemetry forwarding to Reactor is fire-and-forget; failures don't propagate."""
+        telemetry = ChainTelemetry()
+        event = await telemetry.emit_proactive_detection(
+            trace_id="t1", command="test", is_proactive=False,
+            confidence=0.1, signals=[], latency_ms=5.0,
+        )
+        assert event is not None
+
+    @pytest.mark.asyncio
+    async def test_all_events_have_timestamp(self):
+        """Every event should include a timestamp."""
+        telemetry = ChainTelemetry()
+        event = await telemetry.emit_proactive_detection(
+            trace_id="t1", command="test", is_proactive=False,
+            confidence=0.1, signals=[], latency_ms=5.0,
+        )
+        assert "timestamp" in event
+        assert isinstance(event["timestamp"], float)

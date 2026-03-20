@@ -275,3 +275,115 @@ class ShadowMetrics:
                 and override_rate <= 0.2
             ),
         }
+
+
+class ChainTelemetry:
+    """Emits reasoning chain events and forwards to Reactor Core."""
+
+    async def _forward_to_reactor(self, event: Dict[str, Any]) -> None:
+        """Best-effort forward to Reactor Core for training. Never raises."""
+        try:
+            from backend.intelligence.cross_repo_experience_forwarder import (
+                get_experience_forwarder,
+            )
+            fwd = await get_experience_forwarder()
+            await fwd.forward_experience(
+                experience_type="reasoning_chain",
+                input_data={"event": event["event"], "trace_id": event["trace_id"]},
+                output_data=event,
+                quality_score=event.get("confidence", 0.0),
+                confidence=event.get("confidence", 0.0),
+                success=True,
+                component="reasoning_chain_orchestrator",
+            )
+        except Exception as exc:
+            logger.debug("[ChainTelemetry] Reactor forward failed (non-fatal): %s", exc)
+
+    async def _emit(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Log event and forward to Reactor (fire-and-forget)."""
+        logger.info(
+            "[ReasoningChain] %s trace_id=%s %s",
+            event["event"],
+            event["trace_id"],
+            {k: v for k, v in event.items() if k not in ("event", "trace_id")},
+        )
+        try:
+            asyncio.create_task(
+                self._forward_to_reactor(event),
+                name=f"chain_telemetry_{event['event']}",
+            )
+        except RuntimeError:
+            pass  # No running event loop (test context)
+        return event
+
+    async def emit_proactive_detection(
+        self, trace_id: str, command: str, is_proactive: bool,
+        confidence: float, signals: List[str], latency_ms: float,
+    ) -> Dict[str, Any]:
+        return await self._emit({
+            "event": "proactive_detection",
+            "trace_id": trace_id,
+            "command": command,
+            "is_proactive": is_proactive,
+            "confidence": confidence,
+            "signals": signals,
+            "latency_ms": latency_ms,
+            "timestamp": time.time(),
+        })
+
+    async def emit_intent_expansion(
+        self, trace_id: str, original_query: str, expanded_count: int,
+        intents: List[str], confidence: float, latency_ms: float,
+    ) -> Dict[str, Any]:
+        return await self._emit({
+            "event": "intent_expansion",
+            "trace_id": trace_id,
+            "original_query": original_query,
+            "expanded_count": expanded_count,
+            "intents": intents,
+            "confidence": confidence,
+            "latency_ms": latency_ms,
+            "timestamp": time.time(),
+        })
+
+    async def emit_shadow_divergence(
+        self, trace_id: str, would_expand: bool,
+        actually_expanded: bool, match: bool,
+    ) -> Dict[str, Any]:
+        return await self._emit({
+            "event": "expansion_shadow_divergence",
+            "trace_id": trace_id,
+            "would_expand": would_expand,
+            "actually_expanded": actually_expanded,
+            "match": match,
+            "timestamp": time.time(),
+        })
+
+    async def emit_coordinator_delegation(
+        self, trace_id: str, plan_id: str, step_id: str,
+        agent_name: str, capability: str, latency_ms: float,
+    ) -> Dict[str, Any]:
+        return await self._emit({
+            "event": "coordinator_delegation",
+            "trace_id": trace_id,
+            "plan_id": plan_id,
+            "step_id": step_id,
+            "agent_name": agent_name,
+            "capability": capability,
+            "latency_ms": latency_ms,
+            "timestamp": time.time(),
+        })
+
+    async def emit_chain_complete(
+        self, trace_id: str, total_intents: int, total_steps: int,
+        total_ms: float, success_rate: float,
+    ) -> Dict[str, Any]:
+        return await self._emit({
+            "event": "chain_complete",
+            "trace_id": trace_id,
+            "total_intents": total_intents,
+            "total_steps": total_steps,
+            "total_ms": total_ms,
+            "success_rate": success_rate,
+            "timestamp": time.time(),
+        })
