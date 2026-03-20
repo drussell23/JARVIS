@@ -313,3 +313,8 @@ from backend.core.ouroboros.governance.intake import (
     IntakeServiceState,
     IntakeNarrator,
 )
+
+# --- Reactor Bidirectional Bridge (P3) ---
+from backend.core.ouroboros.governance.reactor_event_consumer import (
+    ReactorEventConsumer,
+)
