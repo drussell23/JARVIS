@@ -9702,23 +9702,55 @@ class UnifiedCommandProcessor:
         """Execute one sub-goal from a Mind plan.
 
         Routes to existing execution methods based on tool_required field.
+        v295.0: Routes computer_use/visual_browser to VisionActionLoop when
+        available (real-time 30 FPS vision). Falls back to AppleScript.
         """
         goal = sub_goal.get("goal", "")
         tool = sub_goal.get("tool_required", "app_control")
+        task_type = sub_goal.get("task_type", "")
+        target_text = sub_goal.get("text_content", "")
 
         try:
             if tool == "app_control":
                 return await self._execute_system_command(goal)
+
             elif tool in ("visual_browser", "computer_use"):
-                # Route to computer use / browser action handler
+                # v295.0: Route to VisionActionLoop for real-time vision actions
+                # Falls back to AppleScript if vision loop not available
+                vision_loop = self._get_vision_action_loop()
+                if vision_loop is not None:
+                    try:
+                        _step_timeout = 30.0
+                        if deadline:
+                            _step_timeout = max(5.0, deadline - time.monotonic())
+                        result = await asyncio.wait_for(
+                            vision_loop.execute_action(
+                                target_description=goal,
+                                action_type="click",
+                                target_text=target_text,
+                            ),
+                            timeout=_step_timeout,
+                        )
+                        return {
+                            "success": result.success,
+                            "response": f"Vision action: {goal[:60]}",
+                            "coords": result.coords,
+                            "confidence": result.confidence,
+                            "tier_used": result.tier_used,
+                            "verification": result.verification_status,
+                        }
+                    except asyncio.TimeoutError:
+                        return {"success": False, "response": f"Vision step timed out: {goal[:60]}"}
+                    except Exception as exc:
+                        logger.warning("[MindPlan] Vision action failed: %s — falling back to system command", exc)
+                # Fallback: AppleScript
                 try:
-                    result = await asyncio.wait_for(
-                        self._execute_system_command(goal),
-                        timeout=30.0,
+                    return await asyncio.wait_for(
+                        self._execute_system_command(goal), timeout=30.0,
                     )
-                    return result
                 except asyncio.TimeoutError:
                     return {"success": False, "response": f"Step timed out: {goal[:60]}"}
+
             elif tool == "workspace_query":
                 ws_result = await self._try_workspace_fast_path(
                     goal, deadline=deadline
@@ -9726,14 +9758,34 @@ class UnifiedCommandProcessor:
                 if ws_result is not None:
                     return ws_result
                 return {"success": False, "response": f"Workspace action failed: {goal[:60]}"}
+
             elif tool in ("screen_capture", "vision_observe"):
                 return await self._handle_screen_observation(goal, deadline=deadline)
+
             else:
-                # Default: try system command
                 return await self._execute_system_command(goal)
+
         except Exception as exc:
             logger.warning("[MindPlan] Step execution failed: %s — %s", goal[:60], exc)
             return {"success": False, "response": str(exc), "error": str(exc)}
+
+    def _get_vision_action_loop(self):
+        """Get the VisionActionLoop from the supervisor singleton (if running).
+
+        Returns None gracefully if the loop isn't started or supervisor
+        doesn't have it — callers fall back to AppleScript.
+        """
+        try:
+            # The supervisor stores it on _vision_action_loop after boot
+            from backend.core.supervisor import get_supervisor
+            sup = get_supervisor()
+            if sup is not None:
+                loop = getattr(sup, '_vision_action_loop', None)
+                if loop is not None and getattr(loop, 'is_running', False):
+                    return loop
+        except Exception:
+            pass
+        return None
 
 
 # Singleton instance
