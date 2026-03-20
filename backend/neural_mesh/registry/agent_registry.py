@@ -230,14 +230,14 @@ class AgentRegistry:
         # Capability manifests: {agent_name: CapabilityManifest}
         self._manifests: Dict[str, CapabilityManifest] = {}
 
-        # v116.0: Mark as initialized
-        self._initialized = True
-
         # DAS Task 7: routing snapshot for rollback support
         self._stable_routes: Dict[str, str] = {}
         self._active_routes: Dict[str, str] = {}
         self._rollback_log: List[Dict[str, Any]] = []
         self._version: int = 0
+
+        # v116.0: Mark as initialized — must be set AFTER all attributes are ready
+        self._initialized = True
 
         logger.info("AgentRegistry v116.0 initialized (singleton + dependency-aware health checks)")
 
