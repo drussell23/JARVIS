@@ -1,0 +1,25 @@
+# backend/neural_mesh/synthesis/gap_resolution_policy.yaml
+# Per-domain gap resolution policy. Loaded at startup; reloaded on SIGHUP.
+# Domain overrides merge with defaults (override keys win; unspecified keys inherit).
+version: "1.0"
+
+defaults:
+  risk_class: "medium"      # "low" | "medium" | "high" | "critical"
+  idempotent: true
+  user_critical: false
+  read_only: false
+  assistive: false
+  slo_p99_ms: 5000          # default canary graduation latency SLO
+
+domain_overrides:
+  "file_edit:any":
+    risk_class: "high"
+    idempotent: false
+  "calendar_query:any":
+    idempotent: true
+    user_critical: true
+    slo_p99_ms: 3000
+  "screen_observation:any":
+    read_only: true
+    assistive: true
+    slo_p99_ms: 2000
