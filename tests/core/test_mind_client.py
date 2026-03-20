@@ -201,3 +201,83 @@ class TestHealthMonitor:
         assert client._health_task is not None
         await client.close()
         assert client._health_task is None
+
+
+class TestSendCommand:
+    @pytest.mark.asyncio
+    async def test_send_command_returns_plan(self, client):
+        mock_resp = {
+            "protocol_version": "1.0.0",
+            "request_id": "req-001",
+            "session_id": "sess-001",
+            "trace_id": "trace-001",
+            "status": "plan_ready",
+            "served_mode": "LEVEL_0_PRIMARY",
+            "classification": {
+                "intent": "system_command",
+                "complexity": "trivial",
+                "confidence": 0.95,
+                "brain_used": "phi3_lightweight",
+                "graph_depth": "fast",
+            },
+            "plan": {
+                "plan_id": "plan-abc123",
+                "plan_hash": "a" * 64,
+                "sub_goals": [
+                    {"step_id": "s1", "goal": "open Safari", "tool_required": "app_control"}
+                ],
+                "execution_strategy": "sequential",
+                "approval_required": False,
+            },
+        }
+        with patch.object(client, "_http_post", new_callable=AsyncMock, return_value=mock_resp):
+            result = await client.send_command("open Safari")
+            assert result is not None
+            assert result["status"] == "plan_ready"
+            assert len(result["plan"]["sub_goals"]) == 1
+
+    @pytest.mark.asyncio
+    async def test_send_command_returns_none_at_level_2(self, client):
+        # Force to level 2
+        for _ in range(3):
+            client._record_failure()
+        client._record_claude_failure()
+        assert client.current_level == OperationalLevel.LEVEL_2
+        result = await client.send_command("test")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_send_command_failure_returns_none(self, client):
+        with patch.object(client, "_http_post", new_callable=AsyncMock, side_effect=Exception("timeout")):
+            result = await client.send_command("test")
+            assert result is None
+
+    @pytest.mark.asyncio
+    async def test_send_command_failure_degrades(self, client):
+        with patch.object(client, "_http_post", new_callable=AsyncMock, side_effect=Exception("timeout")):
+            await client.send_command("test")
+        assert client._consecutive_failures >= 1
+
+    @pytest.mark.asyncio
+    async def test_send_command_circuit_blocks(self, client):
+        # Open the circuit
+        for _ in range(3):
+            client._circuit.record_failure()
+        assert not client._circuit.can_execute()
+        result = await client.send_command("test")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_send_command_with_context(self, client):
+        mock_resp = {
+            "request_id": "r1", "session_id": "s1", "trace_id": "t1",
+            "status": "plan_ready", "served_mode": "LEVEL_0_PRIMARY",
+            "plan": {"plan_id": "p1", "plan_hash": "h" * 64, "sub_goals": []},
+            "classification": {},
+        }
+        with patch.object(client, "_http_post", new_callable=AsyncMock, return_value=mock_resp) as mock_post:
+            await client.send_command("test", context={"speaker": "Derek"})
+            # Verify context was included in the request
+            call_args = mock_post.call_args
+            payload = call_args[1]["data"] if "data" in call_args[1] else call_args[0][1]
+            assert payload.get("context", {}).get("speaker") == "Derek"

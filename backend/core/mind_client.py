@@ -471,6 +471,83 @@ class MindClient:
             )
             return None
 
+    async def send_command(
+        self,
+        command: str,
+        context: Optional[Dict[str, Any]] = None,
+        deadline_ms: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """POST /v1/reason — send a command to J-Prime for full reasoning.
+
+        Returns a ReasonResponse dict containing ``plan``, ``classification``,
+        and metadata on success, or ``None`` when:
+          * The client is at LEVEL_2 (both J-Prime and Claude have failed).
+          * The circuit breaker is OPEN.
+          * Any HTTP or network error occurs (failure recorded; level may degrade).
+
+        Parameters
+        ----------
+        command:
+            The raw user command / utterance to reason about.
+        context:
+            Optional free-form context dict forwarded verbatim to J-Prime
+            (e.g. ``{"speaker": "Derek", "device": "mac"}``).
+        deadline_ms:
+            Optional wall-clock deadline in milliseconds from now.  Forwarded
+            to J-Prime so it can short-circuit expensive reasoning paths.
+        """
+        if self._level == OperationalLevel.LEVEL_2:
+            logger.debug(
+                "[MindClient] send_command skipped — at LEVEL_2 (reflex only)."
+            )
+            return None
+
+        if not self._circuit.can_execute():
+            logger.debug(
+                "[MindClient] send_command blocked — circuit %s",
+                self._circuit.state.value,
+            )
+            return None
+
+        request_id = str(uuid.uuid4())[:12]
+        trace_id = str(uuid.uuid4())[:12]
+
+        payload: Dict[str, Any] = {
+            "protocol_version": "1.0.0",
+            "request_id": request_id,
+            "session_id": self._session_id,
+            "trace_id": trace_id,
+            "command": command,
+            "context": context or {},
+        }
+
+        if deadline_ms is not None:
+            payload["constraints"] = {"deadline_ms": deadline_ms}
+
+        timeout = _env_float("MIND_CLIENT_REASON_TIMEOUT", 30.0)
+
+        try:
+            result = await self._http_post(
+                "/v1/reason",
+                data=payload,
+                timeout=timeout,
+            )
+            self._circuit.record_success()
+            self._record_success()
+            logger.debug(
+                "[MindClient] send_command OK — status=%s served_mode=%s",
+                result.get("status"),
+                result.get("served_mode"),
+            )
+            return result
+        except Exception as exc:
+            self._circuit.record_failure()
+            self._record_failure()
+            logger.warning(
+                "[MindClient] send_command failed (command=%r): %s", command, exc
+            )
+            return None
+
     # ------------------------------------------------------------------
     # Background health monitor
     # ------------------------------------------------------------------
