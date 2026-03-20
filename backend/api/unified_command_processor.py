@@ -2277,6 +2277,29 @@ class UnifiedCommandProcessor:
             except Exception as exc:
                 logger.debug("[v295] Remote brain selection unavailable: %s", exc)
 
+        # v295.0 Step 2: Full remote reasoning via MindClient
+        # Feature flag: JARVIS_USE_REMOTE_REASONING=true routes commands through
+        # J-Prime POST /v1/reason for full reasoning pipeline.
+        _use_remote_reasoning = os.getenv("JARVIS_USE_REMOTE_REASONING", "false").lower() == "true"
+
+        if _use_remote_reasoning:
+            try:
+                from backend.core.mind_client import get_mind_client
+                _mind = get_mind_client()
+                _reason_result = await _mind.send_command(
+                    command=command_text,
+                    context=_jprime_ctx,
+                    deadline_ms=int((deadline - time.monotonic()) * 1000) if deadline else None,
+                )
+                if _reason_result is not None:
+                    return await self._execute_mind_plan(
+                        _reason_result, command_text, websocket, deadline=deadline,
+                    )
+                # Mind unavailable — fall through to existing local path
+                logger.info("[v295] Mind unavailable, using local fallback path")
+            except Exception as exc:
+                logger.warning("[v295] Remote reasoning failed: %s — using local fallback", exc)
+
         response = await self._call_jprime(
             command_text, deadline=deadline, source_context=_jprime_ctx or None,
         )
@@ -9592,6 +9615,125 @@ class UnifiedCommandProcessor:
             )
         except Exception as exc:
             logger.debug("[v295] goal_inference experience forward failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # v295.0 Step 2: Mind plan execution
+    # ------------------------------------------------------------------
+
+    async def _execute_mind_plan(
+        self, reason_result: dict, command_text: str,
+        websocket=None, deadline=None,
+    ) -> Dict[str, Any]:
+        """Execute a plan received from J-Prime Mind (POST /v1/reason).
+
+        Routes each sub-goal to the appropriate existing execution method
+        based on tool_required. Collects results and returns unified response.
+        """
+        status = reason_result.get("status", "")
+        plan = reason_result.get("plan", {})
+        classification = reason_result.get("classification", {})
+
+        # Needs approval — return to caller for voice approval flow
+        if status == "needs_approval":
+            approval_reasons = plan.get("approval_reason_codes", [])
+            return {
+                "success": False,
+                "response": f"This action requires your approval. Reasons: {', '.join(approval_reasons)}",
+                "command_type": "mind_plan",
+                "plan": plan,
+                "needs_approval": True,
+                "approval_reason_codes": approval_reasons,
+            }
+
+        # Error from Mind
+        if status == "error":
+            error = reason_result.get("error", {})
+            return {
+                "success": False,
+                "response": error.get("message", "The Mind returned an error."),
+                "command_type": "mind_error",
+                "error": error,
+            }
+
+        # status == "plan_ready" — execute sub-goals
+        sub_goals = plan.get("sub_goals", [])
+        if not sub_goals:
+            return {
+                "success": True,
+                "response": "No actions needed.",
+                "command_type": "mind_plan",
+                "served_mode": reason_result.get("served_mode"),
+            }
+
+        results = []
+        for sg in sub_goals:
+            step_result = await self._execute_single_step(sg, deadline=deadline)
+            results.append(step_result)
+
+        success = all(r.get("success", False) for r in results)
+        # Use the last step's response as the main response
+        response_text = results[-1].get("response", "Done.") if results else "Done."
+
+        # Narrate result
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+            _narration = response_text if len(response_text) < 200 else response_text[:200]
+            asyncio.create_task(
+                safe_say(_narration, source="mind_plan"),
+                name="mind_plan_narration",
+            )
+        except Exception:
+            pass
+
+        return {
+            "success": success,
+            "response": response_text,
+            "command_type": "mind_plan",
+            "served_mode": reason_result.get("served_mode"),
+            "complexity": classification.get("complexity"),
+            "brain_used": classification.get("brain_used"),
+            "steps_executed": len(results),
+            "steps_succeeded": sum(1 for r in results if r.get("success")),
+            "plan_id": plan.get("plan_id"),
+            "plan_hash": plan.get("plan_hash"),
+        }
+
+    async def _execute_single_step(self, sub_goal: dict, deadline=None) -> dict:
+        """Execute one sub-goal from a Mind plan.
+
+        Routes to existing execution methods based on tool_required field.
+        """
+        goal = sub_goal.get("goal", "")
+        tool = sub_goal.get("tool_required", "app_control")
+
+        try:
+            if tool == "app_control":
+                return await self._execute_system_command(goal)
+            elif tool in ("visual_browser", "computer_use"):
+                # Route to computer use / browser action handler
+                try:
+                    result = await asyncio.wait_for(
+                        self._execute_system_command(goal),
+                        timeout=30.0,
+                    )
+                    return result
+                except asyncio.TimeoutError:
+                    return {"success": False, "response": f"Step timed out: {goal[:60]}"}
+            elif tool == "workspace_query":
+                ws_result = await self._try_workspace_fast_path(
+                    goal, deadline=deadline
+                )
+                if ws_result is not None:
+                    return ws_result
+                return {"success": False, "response": f"Workspace action failed: {goal[:60]}"}
+            elif tool in ("screen_capture", "vision_observe"):
+                return await self._handle_screen_observation(goal, deadline=deadline)
+            else:
+                # Default: try system command
+                return await self._execute_system_command(goal)
+        except Exception as exc:
+            logger.warning("[MindPlan] Step execution failed: %s — %s", goal[:60], exc)
+            return {"success": False, "response": str(exc), "error": str(exc)}
 
 
 # Singleton instance
