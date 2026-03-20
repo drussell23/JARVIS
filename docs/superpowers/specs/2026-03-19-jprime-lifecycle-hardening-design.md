@@ -53,15 +53,17 @@ Single responsibility: manage J-Prime's lifecycle from UNKNOWN to READY/TERMINAL
 | `PROBING` | `SVC_STARTING` | Health: HTTP 200, `ready=false` | - | Begin APARS polling |
 | `PROBING` | `VM_STARTING` | VM status: STOPPED/TERMINATED | - | `ensure_static_vm_ready()` |
 | `PROBING` | `UNHEALTHY` | Health: refused/timeout | - | Record failure, eval restart budget |
-| `PROBING` | `TERMINAL` | VM creation failed (budget/capacity) | - | Emit TERMINAL telemetry |
+| `PROBING` | `TERMINAL` | VM creation failed (budget/capacity/permanent GCP error) | - | Emit TERMINAL telemetry |
+| `PROBING` | `UNHEALTHY` | Transient GCP API error (500, timeout) | - | Route through UNHEALTHY->RECOVERING for retry |
 | `VM_STARTING` | `SVC_STARTING` | VM RUNNING, HTTP reachable | APARS responding | Switch to APARS polling |
-| `VM_STARTING` | `TERMINAL` | VM start timeout or creation error | 2 recycle attempts | `root_cause=vm_start_failed` |
+| `VM_STARTING` | `UNHEALTHY` | VM start timeout (transient) | recycle_count < 2 | Increment recycle counter, route to RECOVERING |
+| `VM_STARTING` | `TERMINAL` | VM start failed after 2 recycles | recycle_count >= 2 | `root_cause=vm_start_failed` |
 | `SVC_STARTING` | `READY` | APARS: `ready_for_inference=true` | - | `notify_ready()`, unblock boot gate |
 | `SVC_STARTING` | `UNHEALTHY` | APARS stalled >60s or startup timeout | progress delta <2% for 60s | `root_cause=startup_stall` |
 | `SVC_STARTING` | `TERMINAL` | Golden image broken, 2 recycles | - | `root_cause=image_broken` |
 | `READY` | `DEGRADED` | 3 consecutive slow/error responses | - | `notify_degraded()` |
 | `READY` | `UNHEALTHY` | 3 consecutive health failures | - | `notify_unhealthy()` |
-| `DEGRADED` | `READY` | 3 consecutive healthy responses | single failure resets counter | `notify_ready()` |
+| `DEGRADED` | `READY` | 3 of last 5 health checks healthy (rolling window) | - | `notify_ready()` |
 | `DEGRADED` | `UNHEALTHY` | 3 more consecutive failures | - | `notify_unhealthy()` |
 | `DEGRADED` | `RECOVERING` | Degraded >5 min | restarts remaining | Initiate restart |
 | `UNHEALTHY` | `RECOVERING` | Auto-recovery | `restarts_in_window < MAX` | Initiate restart |
@@ -91,7 +93,9 @@ Single responsibility: manage J-Prime's lifecycle from UNKNOWN to READY/TERMINAL
 | `RECOVERY_THRESHOLD` | 3 consecutive | `JPRIME_RECOVERY_THRESHOLD` |
 | `SLOW_RESPONSE_MS` | 5000 | `JPRIME_SLOW_RESPONSE_MS` |
 
-Backoff sequence: 10s, 20s, 40s, 80s, 160s (capped at 300s).
+Backoff sequence: 10s, 20s, 40s, 80s, 160s.
+
+Note: With default MAX_RESTARTS=5, MAX_BACKOFF (300s) is never reached since attempt 5 backoff is 160s < 300s. The cap exists for operators who increase MAX_RESTARTS via env override (attempt 6 would be min(320, 300) = 300s).
 
 Storm control invariant: at most 5 restart attempts in any 30-min sliding window. The 6th transitions to TERMINAL.
 
@@ -99,13 +103,7 @@ Storm control invariant: at most 5 restart attempts in any 30-min sliding window
 
 ## Fencing
 
-### Process-Level Lock
-
-```python
-# PID file: ~/.jarvis/jprime_lifecycle.pid
-# fcntl.LOCK_EX | LOCK_NB — fails fast if another process holds lock
-# Released on controller stop() or process exit
-```
+JARVIS runs as a single process (unified_supervisor.py). The fencing model protects against intra-process coroutine races, not multi-process contention.
 
 ### Coroutine-Level Idempotency
 
@@ -113,7 +111,11 @@ Storm control invariant: at most 5 restart attempts in any 30-min sliding window
 # _boot_future: Optional[asyncio.Future]
 # First caller creates Future, concurrent callers await same one
 # Resolves when READY, DEGRADED, or TERMINAL reached
-# After resolution, _boot_future = None (allows next boot cycle)
+#
+# TERMINAL behavior: _boot_future is NOT cleared.
+# Callers of ensure_ready() during TERMINAL immediately receive LEVEL_2.
+# _boot_future is only cleared when TERMINAL -> PROBING transition fires
+# (auto-reset after 30-min cooldown or manual reset).
 ```
 
 ### Transition Lock
@@ -122,6 +124,14 @@ Storm control invariant: at most 5 restart attempts in any 30-min sliding window
 # asyncio.Lock guards all state transitions
 # Only one transition executes at a time
 # Prevents race between health monitor and manual ensure_ready()
+```
+
+### Singleton
+
+```python
+# Module-level _controller_instance with get_jprime_lifecycle_controller()
+# No PID file needed (single-process model)
+# Controller created once, lives for process lifetime
 ```
 
 ---
@@ -159,7 +169,15 @@ Supervisor Zone 5.7 MUST block until one of:
   READY         -> proceed normally (LEVEL_0)
   DEGRADED      -> proceed with warning (LEVEL_1)
   TERMINAL      -> proceed with reflex only (LEVEL_2)
-  Timeout 600s  -> proceed with LEVEL_2
+  Timeout       -> proceed with LEVEL_2
+
+TIMEOUT DERIVATION (must coordinate with DMS):
+  boot_gate_timeout = effective_trinity_timeout - 30s (safety margin)
+  effective_trinity_timeout = GCP_VM_STARTUP_TIMEOUT(300) + fallback_buffer(120) + orchestration_buffer(90) = 510s
+  boot_gate_timeout = 510 - 30 = 480s
+
+  Override: JPRIME_BOOT_GATE_TIMEOUT_S (env var, defaults to computed value)
+  INVARIANT: boot_gate_timeout < DMS timeout to prevent DMS escalation during boot
 
 No downstream phase (Zone 6+) may assume J-Prime is available
 unless the gate resolved to READY.
@@ -203,13 +221,25 @@ The health loop runs for the lifetime of the controller. It respects the state m
 - Line 76: `JARVIS_PRIME_URL=http://136.113.252.164:8000`
 - Line 272: `JARVIS_PRIME_PORT=8002`
 
-**Resolution:** Single canonical source: `JPRIME_ENDPOINT`
+**Resolution:** Remove conflicting line, add endpoint sync.
 
 ```
-# Remove JARVIS_PRIME_PORT=8002 (line 272)
-# Keep JARVIS_PRIME_URL=http://136.113.252.164:8000 as canonical
-# JprimeLifecycleController reads JARVIS_PRIME_URL only
-# MindClient already resolves from JARVIS_PRIME_URL (line 76 takes priority)
+1. Remove JARVIS_PRIME_PORT=8002 (line 272 of .env)
+   - 40+ files read this var but all default to 8000 when unset
+   - With line 272 removed, all resolve to 8000 (correct)
+
+2. Keep JARVIS_PRIME_URL=http://136.113.252.164:8000 as canonical source
+
+3. MindClient endpoint synchronization:
+   - Add MindClient.update_endpoint(host, port) method
+   - Controller calls this when endpoint changes (READY/DEGRADED/UNHEALTHY)
+   - MindClient rebuilds _base_url from new host:port
+   - This replaces the current MindClient._resolve_prime_host/port() at-init-only pattern
+
+4. Notification flow:
+   Controller -> PrimeRouter.notify_ready(host, port)   -> routes inference
+   Controller -> MindClient.update_endpoint(host, port)  -> rebuilds _base_url
+   Both called atomically in the transition action
 ```
 
 ---
@@ -255,7 +285,15 @@ MindClient currently has its own `_health_task` (30s interval). With the lifecyc
 8. DEGRADED state notifies PrimeRouter with lower routing priority (new)
 9. All transitions emit telemetry with `from_state`, `to_state`, `reason_code`, `root_cause_id`
 10. TERMINAL auto-resets after 30-min cooldown
-11. Passes failure-injection tests (health timeout, restart failure, concurrent callers)
+11. Passes failure-injection tests:
+    - Health timeout during SVC_STARTING (APARS stall) -> UNHEALTHY
+    - Restart failure during RECOVERING -> COOLDOWN with correct backoff
+    - 5 concurrent ensure_ready() callers -> all await same Future
+    - TERMINAL auto-reset after 30-min cooldown -> back to PROBING
+    - Backoff progression: 10s, 20s, 40s, 80s, 160s verified
+    - VM_STARTING timeout with retry (recycle_count < 2) -> UNHEALTHY -> RECOVERING
+    - DEGRADED flapping (alternating healthy/unhealthy) -> rolling window recovery
+12. MindClient endpoint stays synchronized with controller's discovered endpoint
 
 ---
 
@@ -265,6 +303,7 @@ MindClient currently has its own `_health_task` (30s interval). With the lifecyc
 |---|---|
 | `backend/core/jprime_lifecycle_controller.py` | **NEW** — state machine, health monitor, fencing, restart policy |
 | `backend/core/prime_router.py` | **MODIFY** — add `notify_gcp_vm_degraded()` |
+| `backend/core/mind_client.py` | **MODIFY** — add `update_endpoint()`, disable `_health_task` when controller active |
 | `unified_supervisor.py` | **MODIFY** — Zone 5.7: use controller.ensure_ready() as boot gate |
 | `.env` | **MODIFY** — remove line 272 (`JARVIS_PRIME_PORT=8002`) |
 | `tests/core/test_jprime_lifecycle_controller.py` | **NEW** — state machine, fencing, restart policy, failure injection |
