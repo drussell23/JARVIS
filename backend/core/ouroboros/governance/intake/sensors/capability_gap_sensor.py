@@ -22,9 +22,7 @@ from backend.neural_mesh.synthesis.gap_resolution_protocol import (
 )
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
-log = logging.getLogger(__name__)
-
-_protocol = GapResolutionProtocol()
+logger = logging.getLogger(__name__)
 
 
 class CapabilityGapSensor:
@@ -53,8 +51,9 @@ class CapabilityGapSensor:
         self._router = intake_router
         self._repo = repo
         self._gap_bus: GapSignalBus = bus if bus is not None else get_gap_signal_bus()
+        self._protocol = GapResolutionProtocol()
 
-    def start(self) -> None:
+    async def start(self) -> None:
         """Schedule the background poll loop as an asyncio task."""
         asyncio.create_task(self._poll_loop(), name="capability_gap_sensor_poll")
 
@@ -67,7 +66,7 @@ class CapabilityGapSensor:
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.exception("CapabilityGapSensor: error in poll loop")
+                logger.exception("CapabilityGapSensor: error in poll loop")
 
     async def _poll_once(self) -> None:
         """Consume a single event — used in unit tests."""
@@ -75,7 +74,7 @@ class CapabilityGapSensor:
         await self._handle(event)
 
     async def _handle(self, event: CapabilityGapEvent) -> None:
-        mode = _protocol.classify_mode(event)
+        mode = self._protocol.classify_mode(event)
         urgency = "high" if mode == ResolutionMode.B else "low"
         requires_ack = mode == ResolutionMode.A
         try:
@@ -100,7 +99,7 @@ class CapabilityGapSensor:
             )
             await self._router.submit(envelope)
         except Exception:
-            log.exception(
+            logger.exception(
                 "CapabilityGapSensor: failed to submit envelope domain_id=%s",
                 event.domain_id,
             )
