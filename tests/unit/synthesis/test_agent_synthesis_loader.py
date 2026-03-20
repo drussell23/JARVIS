@@ -120,3 +120,47 @@ def test_side_effect_policy_read_only_consistency():
         read_only=True,
     )
     assert policy.read_only is True
+
+
+# Stage 1: os.system attribute access
+CODE_OS_SYSTEM = textwrap.dedent("""
+    import os
+    os.system("ls")
+""")
+
+
+def test_stage1_blocks_os_system():
+    loader = AgentSynthesisLoader()
+    with pytest.raises((AstScanError, SandboxImportError)):
+        loader.validate(CODE_OS_SYSTEM)
+
+
+# Stage 2: subprocess is always blocked
+CODE_IMPORTS_SUBPROCESS = textwrap.dedent("""
+    import subprocess
+    async def execute(goal, context):
+        return {}
+""")
+
+
+def test_stage2_blocks_subprocess():
+    loader = AgentSynthesisLoader()
+    with pytest.raises(SandboxImportError, match="subprocess"):
+        loader.validate(CODE_IMPORTS_SUBPROCESS)
+
+
+# Stage 3: partial contract (only 1 of 3 required names)
+CODE_PARTIAL_CONTRACT = textwrap.dedent("""
+    import asyncio
+
+    AGENT_MANIFEST = {"name": "partial"}
+
+    async def execute(goal, context):
+        return {}
+""")
+
+
+def test_stage3_rejects_partial_contract():
+    loader = AgentSynthesisLoader()
+    with pytest.raises(ContractGateError):
+        loader.validate(CODE_PARTIAL_CONTRACT)

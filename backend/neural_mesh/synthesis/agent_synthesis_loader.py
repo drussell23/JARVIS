@@ -75,6 +75,12 @@ _DANGEROUS_BUILTINS: FrozenSet[str] = frozenset({
     "__import__",
     "compile",
     "breakpoint",
+    "getattr",
+    "globals",
+    "locals",
+    "vars",
+    "setattr",
+    "delattr",
 })
 
 # Dangerous os-module attribute names (system, popen, execvp, execve, etc.)
@@ -107,17 +113,24 @@ _CONTRACT_NAMES = frozenset({"AGENT_MANIFEST", "side_effect_policy", "compensati
 
 
 def _load_allowlist() -> FrozenSet[str]:
-    try:
-        data = yaml.safe_load(_ALLOWLIST_PATH.read_text())
-        return frozenset(data.get("allowed_imports", []))
-    except Exception as exc:
-        log.error("Failed to load sandbox_allowlist.yaml: %s", exc)
-        return frozenset()
+    data = yaml.safe_load(_ALLOWLIST_PATH.read_text())
+    return frozenset(data.get("allowed_imports", []))
 
 
 class AgentSynthesisLoader:
     def __init__(self) -> None:
-        self._allowlist: FrozenSet[str] = _load_allowlist()
+        try:
+            self._allowlist: FrozenSet[str] = _load_allowlist()
+        except Exception as exc:
+            raise RuntimeError(
+                "AgentSynthesisLoader: failed to load sandbox_allowlist.yaml "
+                "at " + str(_ALLOWLIST_PATH) + ": " + str(exc)
+            ) from exc
+        if not self._allowlist:
+            raise RuntimeError(
+                "AgentSynthesisLoader: sandbox_allowlist.yaml has empty allowed_imports. "
+                "Refusing to start with empty allowlist."
+            )
 
     def validate(self, source: str) -> None:
         tree = ast.parse(source)
@@ -131,7 +144,17 @@ class AgentSynthesisLoader:
             if isinstance(node, ast.Assign):
                 for target in node.targets:
                     if isinstance(target, ast.Name) and target.id == "AGENT_MANIFEST":
-                        return _safe_literal_parse(node.value)
+                        try:
+                            result = _safe_literal_parse(node.value)
+                        except (ValueError, SyntaxError) as exc:
+                            raise ContractGateError(
+                                "AGENT_MANIFEST is not a static literal: " + str(exc)
+                            ) from exc
+                        if not isinstance(result, dict):
+                            raise ContractGateError(
+                                "AGENT_MANIFEST must be a dict, got " + type(result).__name__
+                            )
+                        return result
         raise ContractGateError("AGENT_MANIFEST not found")
 
     def _stage1_ast_scan(self, tree: ast.AST) -> None:
