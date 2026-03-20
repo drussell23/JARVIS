@@ -130,6 +130,10 @@ except ImportError:
     logger.debug("MemoryAwareStartup not available")
 
 
+# EcapaFacade feature flag (Phase 3b migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
+
 class MLBackend(Enum):
     """ML processing backend"""
     LOCAL = "local"
@@ -704,6 +708,35 @@ class CloudMLRouter:
         - Per-backend cost tracking with daily budget enforcement
         """
         start_time = time.time()
+
+        # ================================================================
+        # HIGHEST PRIORITY: Use EcapaFacade (Phase 3b)
+        # Facade provides unified backend selection with lifecycle mgmt
+        # ================================================================
+        if _USE_FACADE and request.operation == MLOperation.EMBEDDING_EXTRACTION:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                result = await facade.extract_embedding(request.audio_data)
+                if result.success:
+                    processing_time = (time.time() - start_time) * 1000
+                    return MLResponse(
+                        success=True,
+                        backend_used=MLBackend.GCP_CLOUD,
+                        operation=request.operation,
+                        result={
+                            "embedding": result.embedding.tolist() if hasattr(result.embedding, 'tolist') else list(result.embedding),
+                            "dimensions": len(result.embedding) if result.embedding is not None else 0,
+                            "backend": result.backend,
+                            "source": "ecapa_facade",
+                        },
+                        processing_time_ms=processing_time,
+                        cost_usd=0.0,
+                        request_id=request.request_id,
+                    )
+            except Exception as e:
+                logger.debug(f"EcapaFacade extraction failed, falling back to legacy: {e}")
+                pass  # Fall through to legacy cloud client
 
         # ================================================================
         # PRIORITY: Use CloudECAPAClient v18.2.0 for embedding extraction

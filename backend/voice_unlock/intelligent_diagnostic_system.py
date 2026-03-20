@@ -34,6 +34,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
+# EcapaFacade feature flag (Phase 3b migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
 
 # =============================================================================
 # CONFIGURATION - Environment-driven, zero hardcoding
@@ -361,6 +363,43 @@ class IntelligentDiagnosticSystem:
     
     async def _check_ecapa_encoder(self) -> ComponentDiagnostic:
         """Check ECAPA encoder availability (dynamic, no hardcoding)."""
+        # --- EcapaFacade path (Phase 3b) ---
+        if _USE_FACADE:
+            try:
+                from backend.core.ecapa_facade import get_ecapa_facade
+                facade = await get_ecapa_facade()
+                status = facade.get_status()
+                tier = status.get("tier", "unavailable")
+                backend = status.get("active_backend", "unknown")
+                if tier == "ready":
+                    return ComponentDiagnostic(
+                        name="ecapa_encoder",
+                        status=ComponentStatus.HEALTHY,
+                        severity=Severity.INFO,
+                        message=f"ECAPA available via facade ({backend})",
+                        details=status,
+                    )
+                elif tier == "degraded":
+                    return ComponentDiagnostic(
+                        name="ecapa_encoder",
+                        status=ComponentStatus.DEGRADED,
+                        severity=Severity.MEDIUM,
+                        message=f"ECAPA degraded via facade ({backend})",
+                        details=status,
+                    )
+                else:
+                    return ComponentDiagnostic(
+                        name="ecapa_encoder",
+                        status=ComponentStatus.FAILED,
+                        severity=Severity.CRITICAL,
+                        message=f"ECAPA unavailable (facade tier: {tier})",
+                        details=status,
+                    )
+            except Exception as e:
+                logger.debug(f"EcapaFacade check failed, falling back to legacy: {e}")
+                pass  # Fall through to legacy check
+
+        # --- Legacy path (ML registry) ---
         try:
             # Try to get registry (may not exist)
             sys.path.insert(0, str(Path(__file__).parent.parent))

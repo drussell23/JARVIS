@@ -37,6 +37,9 @@ from core.component_warmup import ComponentPriority, get_warmup_system
 
 logger = logging.getLogger(__name__)
 
+# EcapaFacade feature flag (Phase 3b migration)
+_USE_FACADE = os.getenv("ECAPA_USE_FACADE", "true").lower() in ("true", "1", "yes")
+
 # Configuration
 WARMUP_MODE = os.getenv("WARMUP_MODE", "manual").lower()  # dynamic, hybrid, manual - DEFAULT TO MANUAL FOR LOW RAM
 ENABLE_AUTO_DISCOVERY = WARMUP_MODE in ("dynamic", "hybrid")
@@ -1035,19 +1038,33 @@ async def check_screen_lock_detector_health(detector) -> bool:
 async def load_ecapa_prewarmer():
     """
     🔥 Pre-warm ECAPA-TDNN Cloud endpoint at STARTUP.
-    
+
     This ensures voice biometric verification is INSTANT when the user says
     "unlock my screen" - no more waiting for Cloud Run cold starts!
-    
+
     The warmup:
     1. Finds the Cloud ECAPA endpoint (Cloud Run or Spot VM)
     2. Sends a warmup request to trigger model loading
     3. Verifies the embedding is valid
     4. Marks the system as "warm" for instant future requests
     """
+    # --- EcapaFacade path (Phase 3b) ---
+    if _USE_FACADE:
+        try:
+            from backend.core.ecapa_facade import get_ecapa_facade
+            facade = await get_ecapa_facade()
+            ready = await facade.ensure_ready(timeout=60.0)
+            if ready:
+                logger.info("[WARMUP] ECAPA pre-warmed via facade")
+                return facade  # Return facade as the "prewarmer" object
+        except Exception as e:
+            logger.debug(f"EcapaFacade warmup failed, falling back to legacy: {e}")
+            pass  # Fall through to legacy prewarmer
+
+    # --- Legacy path ---
     logger.info("[WARMUP] 🔥 Starting ECAPA-TDNN pre-warming at STARTUP...")
     start_time = time.time()
-    
+
     try:
         # Import the pre-warmer and VBI orchestrator
         from core.vbi_debug_tracer import ECAPAPreWarmer, get_vbi_orchestrator
