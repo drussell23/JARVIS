@@ -385,3 +385,52 @@ class TestGateDegradedConfig:
         await gate._try_transition(GateState.WAITING_DEPS, "test", "setup")
         cfg = gate.get_degraded_config()
         assert cfg == {}
+
+
+# ---------------------------------------------------------------------------
+# Task 3: Gate <-> Orchestrator integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestGateOrchestratorIntegration:
+    @pytest.mark.asyncio
+    async def test_orchestrator_blocked_when_gate_inactive(self):
+        """process() returns None when gate is not active."""
+        from backend.core.reasoning_chain_orchestrator import (
+            ReasoningChainOrchestrator, ChainConfig, ChainPhase,
+        )
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        orch._detector = AsyncMock()
+        orch._detector.detect.return_value = MagicMock(
+            is_proactive=True, confidence=0.95, signals_detected=[], reasoning="test",
+        )
+
+        mock_gate = MagicMock()
+        mock_gate.is_active.return_value = False
+        with patch("backend.core.reasoning_activation_gate.get_reasoning_activation_gate", return_value=mock_gate):
+            result = await orch.process("start my day", context={}, trace_id="t1")
+        assert result is None
+        orch._detector.detect.assert_not_called()  # Gate blocked before detector
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_proceeds_when_gate_active(self):
+        """process() runs detector when gate is active."""
+        from backend.core.reasoning_chain_orchestrator import (
+            ReasoningChainOrchestrator, ChainConfig, ChainPhase,
+        )
+        config = ChainConfig(phase=ChainPhase.FULL_ENABLE, proactive_threshold=0.6, active=True)
+        orch = ReasoningChainOrchestrator(config=config)
+        orch._detector = AsyncMock()
+        orch._detector.detect.return_value = MagicMock(
+            is_proactive=False, confidence=0.1, signals_detected=[], reasoning="test",
+        )
+
+        mock_gate = MagicMock()
+        mock_gate.is_active.return_value = True
+        mock_gate.state = GateState.ACTIVE
+        mock_gate.get_degraded_config.return_value = {}
+        with patch("backend.core.reasoning_activation_gate.get_reasoning_activation_gate", return_value=mock_gate):
+            result = await orch.process("what time is it", context={}, trace_id="t1")
+        assert result is None  # Non-proactive, but detector was called
+        orch._detector.detect.assert_called_once()
