@@ -24,7 +24,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import yaml
 
@@ -123,7 +123,7 @@ class GapResolutionProtocol:
         return self._classify_mode(event, policy)
 
     def _classify_mode(
-        self, event: CapabilityGapEvent, policy: GapResolutionPolicy
+        self, _event: CapabilityGapEvent, policy: GapResolutionPolicy
     ) -> ResolutionMode:
         if policy.risk_class == "high" or not policy.idempotent:
             return ResolutionMode.A
@@ -185,7 +185,7 @@ class GapResolutionProtocol:
             self._in_flight.pop(dedupe_key, None)
 
     async def _synthesize(
-        self, event: CapabilityGapEvent, dedupe_key: str, retry_count: int = 0
+        self, event: CapabilityGapEvent, _dedupe_key: str, retry_count: int = 0
     ) -> None:
         """
         Drives the Ouroboros synthesis pipeline for one gap event.

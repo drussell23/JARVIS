@@ -63,7 +63,7 @@ async def test_single_flight_dedup_collapses_burst():
     protocol = GapResolutionProtocol()
     synthesis_calls = []
 
-    async def fake_synthesize(evt, dedupe_key):
+    async def fake_synthesize(_event, dedupe_key):
         synthesis_calls.append(dedupe_key)
         await asyncio.sleep(0.02)
 

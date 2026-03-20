@@ -1,5 +1,4 @@
 import time
-import pytest
 from backend.neural_mesh.synthesis.gap_signal_bus import CapabilityGapEvent
 from backend.neural_mesh.synthesis.synthesis_command_queue import (
     SynthesisCommandQueue,
