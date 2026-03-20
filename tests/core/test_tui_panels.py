@@ -260,3 +260,32 @@ class TestStatusBarData:
         s.update(_make_envelope("lifecycle.transition@1.0.0", {}))
         s.update(_make_envelope("reasoning.decision@1.0.0", {}))
         assert s.bus_emitted == 2
+
+
+# ---------------------------------------------------------------------------
+# JarvisDashboard app tests
+# ---------------------------------------------------------------------------
+
+
+class TestDashboardImport:
+    def test_app_importable(self):
+        from backend.core.tui.app import JarvisDashboard, start_dashboard
+        assert JarvisDashboard is not None
+        assert callable(start_dashboard)
+
+    def test_app_creates(self):
+        from backend.core.tui.app import JarvisDashboard
+        app = JarvisDashboard()
+        assert app is not None
+        assert app.pipeline_data is not None
+        assert app.agents_data is not None
+        assert app.system_data is not None
+        assert app.faults_data is not None
+
+    def test_start_dashboard_no_tty(self):
+        from backend.core.tui.app import start_dashboard
+        from unittest.mock import patch
+        with patch("sys.stdout") as mock_stdout:
+            mock_stdout.isatty.return_value = False
+            result = start_dashboard()
+        assert result is None
