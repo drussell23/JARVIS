@@ -277,6 +277,14 @@ UNAVAILABLE).
 
 ## Backend Selection Policy
 
+### Backend Definitions
+- **local**: SpeechBrain ECAPA-TDNN `EncoderClassifier` loaded in-process via
+  `safe_from_hparams()`. ~700MB RAM, ~4-12s cold load on M-series Mac.
+- **cloud_run**: GCP Cloud Run ECAPA service (remote HTTP). Zero local RAM,
+  ~100-500ms latency, pay-per-request.
+- **docker**: Local Docker container running the ECAPA service image. Same machine
+  but process-isolated. ~200-500ms latency, uses Docker-allocated RAM.
+
 ### Probe Order
 All backends are probed concurrently at startup. First healthy backend wins.
 
@@ -331,16 +339,7 @@ across restarts) that is out of scope for the initial facade.
 
 ### CapabilityCheck Response
 
-```python
-@dataclass(frozen=True)
-class CapabilityCheck:
-    allowed: bool
-    tier: EcapaTier
-    reason_code: str
-    constraints: Dict[str, Any]      # e.g. {"max_attempts": 1, "ttl_s": 600}
-    fallback: Optional[str]          # "password", "secondary_confirm", None
-    root_cause_id: Optional[str]
-```
+See `CapabilityCheck` dataclass in Core Type Definitions above.
 
 ## Warning-to-State Mapping
 
@@ -498,11 +497,10 @@ and logs but does not serve consumers). This allows bake-in before cutting over.
 - Behind `ECAPA_USE_FACADE` flag — old path as fallback
 - Validate: voice unlock works end-to-end via facade
 
-**Phase 3: Migrate secondary consumers (13 files)**
+**Phase 3: Migrate secondary consumers (16 files)**
 - `parallel_vbi_orchestrator.py`
 - `vbi_debug_tracer.py`
 - `speaker_aware_command_handler.py`
-- `mode_dispatcher.py`
 - `enroll_voice.py`
 - `neural_mesh/adapters/voice_adapter.py`
 - `startup_integration.py`
@@ -512,16 +510,22 @@ and logs but does not serve consumers). This allows bake-in before cutting over.
 - `voice_transparency_engine.py`
 - `voice_experience_collector.py`
 - `drift_detector.py`
+- `intelligent_diagnostic_system.py` (replace `_check_ecapa_encoder()` with `facade.get_status()`)
+- `cloud_ml_router.py` (replace direct CloudECAPAClient routing with facade)
+- `component_warmup_config.py` (replace `load_ecapa_prewarmer()` with facade)
+- `memory_aware_startup.py` (replace `skip_local_ecapa` flag with facade's adaptive policy)
 - Flip `ECAPA_USE_FACADE` default to `true`
 - Validate: all voice features work, no direct ECAPA imports remain
 
-**Phase 4: Delete old load paths (8 files)**
+**Phase 4: Delete old load paths (9 files)**
 - Delete direct `safe_from_hparams` ECAPA calls from:
   - `parallel_initializer.py` (load_ecapa_heavy)
   - `parallel_model_loader.py` (load_ecapa_encoder, load_all_voice_models)
   - `budgeted_loaders.py` (EcapaBudgetedLoader)
   - `unified_voice_cache_manager.py` (2 paths)
   - `ecapa_cloud_service.py` (subprocess + main process paths)
+  - `speechbrain_engine.py` (ECAPA-specific load paths — keep `safe_from_hparams`
+    for non-ECAPA models like x-vector)
 - Validate: only facade loads ECAPA models
 
 **Phase 5: Gut supervisor (~600 lines)**
@@ -555,6 +559,21 @@ After migration, the facade replaces this role entirely:
 - `picovoice_integration.py` — references ECAPA in config comments only,
   no runtime dependency
 - `feature_extraction.py` — mentions ECAPA embeddings in docstrings, no load path
+- `graceful_degradation.py` — has `TrinityFallbackTarget.ECAPA_TDNN` enum but
+  only for fallback chain routing display, no direct ECAPA loading. Will consume
+  facade tier via `check_capability()` after Phase 3.
+- `mode_dispatcher.py` — no direct ECAPA references. Dependency is indirect via
+  `voice_biometric_intelligence` (migrated in Phase 2). No changes needed.
+- `supervisor_gcp_controller.py` — references ECAPA components in GCP request
+  metadata only, no loading. No changes needed.
+- `ai_loader.py` — ECAPA model registration examples in comments, no runtime load.
+- `model_deployer.py` — has `ModelType.ECAPA_TDNN` enum for deployment tracking,
+  no runtime load. Will read facade status for deployment decisions.
+- `vbi_health_monitor.py` — has parallel ECAPA health tracking
+  (`ComponentType.ECAPA_CLIENT` circuit breaker). During Phase 5, this will
+  subscribe to facade state events instead of maintaining its own ECAPA health
+  state. Deconfliction: facade is authoritative for ECAPA health; VBI monitor
+  aggregates facade events into the broader VBI health picture.
 
 ### Cloud SQL Decoupling
 
