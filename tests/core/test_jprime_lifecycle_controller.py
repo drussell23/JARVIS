@@ -320,3 +320,210 @@ class TestHealthProbe:
         with patch.object(probe, "_http_get", return_value=mock_response):
             result = await probe.check()
         assert result.apars_progress is None
+
+
+# ---------------------------------------------------------------------------
+# Task 3: JprimeLifecycleController tests
+# ---------------------------------------------------------------------------
+
+from backend.core.jprime_lifecycle_controller import (
+    JprimeLifecycleController,
+    get_jprime_lifecycle_controller,
+)
+
+
+class TestControllerStateMachine:
+    def _make_controller(self, **overrides):
+        """Create a controller with mocked dependencies."""
+        policy = RestartPolicy(max_restarts=3, window_s=60.0, base_backoff_s=0.01)
+        ctrl = JprimeLifecycleController(
+            host="127.0.0.1", port=8000, restart_policy=policy,
+        )
+        ctrl._probe = AsyncMock()
+        ctrl._prime_router_notify = AsyncMock()
+        ctrl._mind_client_update = AsyncMock()
+        for k, v in overrides.items():
+            setattr(ctrl, k, v)
+        return ctrl
+
+    @pytest.mark.asyncio
+    async def test_initial_state_is_unknown(self):
+        ctrl = self._make_controller()
+        assert ctrl.state == LifecycleState.UNKNOWN
+
+    @pytest.mark.asyncio
+    async def test_probe_ready_transitions_to_ready(self):
+        ctrl = self._make_controller()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.READY, ready_for_inference=True,
+        )
+        await ctrl._do_probe()
+        assert ctrl.state == LifecycleState.READY
+
+    @pytest.mark.asyncio
+    async def test_probe_unreachable_transitions_to_unhealthy(self):
+        ctrl = self._make_controller()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.UNREACHABLE, error="connection_refused",
+        )
+        await ctrl._do_probe()
+        assert ctrl.state == LifecycleState.UNHEALTHY
+
+    @pytest.mark.asyncio
+    async def test_probe_alive_not_ready_transitions_to_svc_starting(self):
+        ctrl = self._make_controller()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.ALIVE_NOT_READY, apars_progress=45,
+        )
+        await ctrl._do_probe()
+        assert ctrl.state == LifecycleState.SVC_STARTING
+
+    @pytest.mark.asyncio
+    async def test_ready_to_unhealthy_after_consecutive_failures(self):
+        ctrl = self._make_controller()
+        ctrl._state = LifecycleState.READY
+        ctrl._state_entered_at = time.monotonic()
+        for _ in range(3):
+            await ctrl._record_health_result(HealthResult(
+                verdict=HealthVerdict.UNREACHABLE,
+            ))
+        assert ctrl.state == LifecycleState.UNHEALTHY
+
+    @pytest.mark.asyncio
+    async def test_ready_to_degraded_after_consecutive_slow(self):
+        ctrl = self._make_controller()
+        ctrl._state = LifecycleState.READY
+        ctrl._state_entered_at = time.monotonic()
+        for _ in range(3):
+            await ctrl._record_health_result(HealthResult(
+                verdict=HealthVerdict.READY, ready_for_inference=True,
+                response_time_ms=6000,
+            ))
+        assert ctrl.state == LifecycleState.DEGRADED
+
+    @pytest.mark.asyncio
+    async def test_degraded_to_ready_rolling_window(self):
+        ctrl = self._make_controller()
+        ctrl._state = LifecycleState.DEGRADED
+        ctrl._state_entered_at = time.monotonic()
+        results = [
+            HealthResult(verdict=HealthVerdict.READY, ready_for_inference=True, response_time_ms=100),
+            HealthResult(verdict=HealthVerdict.UNREACHABLE),
+            HealthResult(verdict=HealthVerdict.READY, ready_for_inference=True, response_time_ms=100),
+            HealthResult(verdict=HealthVerdict.READY, ready_for_inference=True, response_time_ms=100),
+        ]
+        for r in results:
+            await ctrl._record_health_result(r)
+        assert ctrl.state == LifecycleState.READY
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_to_recovering(self):
+        ctrl = self._make_controller()
+        ctrl._state = LifecycleState.UNHEALTHY
+        ctrl._state_entered_at = time.monotonic()
+        await ctrl._evaluate_recovery()
+        assert ctrl.state == LifecycleState.RECOVERING
+
+    @pytest.mark.asyncio
+    async def test_unhealthy_to_terminal_when_budget_exhausted(self):
+        ctrl = self._make_controller()
+        ctrl._state = LifecycleState.UNHEALTHY
+        ctrl._state_entered_at = time.monotonic()
+        now = time.monotonic()
+        ctrl._restart_timestamps = [now - i for i in range(3)]
+        await ctrl._evaluate_recovery()
+        assert ctrl.state == LifecycleState.TERMINAL
+
+    @pytest.mark.asyncio
+    async def test_transition_emits_telemetry(self):
+        ctrl = self._make_controller()
+        await ctrl._transition(
+            LifecycleState.PROBING, "boot", "initial_probe",
+        )
+        assert len(ctrl._transitions) == 1
+        assert ctrl._transitions[0].from_state == LifecycleState.UNKNOWN
+        assert ctrl._transitions[0].to_state == LifecycleState.PROBING
+
+    @pytest.mark.asyncio
+    async def test_same_state_transition_is_noop(self):
+        ctrl = self._make_controller()
+        ctrl._state = LifecycleState.READY
+        ctrl._state_entered_at = time.monotonic()
+        await ctrl._transition(LifecycleState.READY, "noop", "already_ready")
+        assert len(ctrl._transitions) == 0
+
+
+class TestControllerIdempotentBoot:
+    @pytest.mark.asyncio
+    async def test_concurrent_ensure_ready_collapses(self):
+        policy = RestartPolicy(max_restarts=3, window_s=60.0, base_backoff_s=0.01)
+        ctrl = JprimeLifecycleController(
+            host="127.0.0.1", port=8000, restart_policy=policy,
+        )
+        ctrl._probe = AsyncMock()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.READY, ready_for_inference=True,
+        )
+        ctrl._prime_router_notify = AsyncMock()
+        ctrl._mind_client_update = AsyncMock()
+
+        results = await asyncio.gather(
+            ctrl.ensure_ready(timeout=5),
+            ctrl.ensure_ready(timeout=5),
+            ctrl.ensure_ready(timeout=5),
+        )
+        assert all(r == results[0] for r in results)
+        # Probe called only once (idempotent)
+        assert ctrl._probe.check.call_count <= 2  # probe + maybe one poll
+
+    @pytest.mark.asyncio
+    async def test_ensure_ready_during_terminal_returns_level2(self):
+        policy = RestartPolicy(max_restarts=3, window_s=60.0)
+        ctrl = JprimeLifecycleController(
+            host="127.0.0.1", port=8000, restart_policy=policy,
+        )
+        ctrl._state = LifecycleState.TERMINAL
+        ctrl._state_entered_at = time.monotonic()
+        result = await ctrl.ensure_ready(timeout=5)
+        assert result == "LEVEL_2"
+
+    @pytest.mark.asyncio
+    async def test_ensure_ready_returns_level0_on_ready(self):
+        policy = RestartPolicy(max_restarts=3, window_s=60.0, base_backoff_s=0.01)
+        ctrl = JprimeLifecycleController(
+            host="127.0.0.1", port=8000, restart_policy=policy,
+        )
+        ctrl._probe = AsyncMock()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.READY, ready_for_inference=True,
+        )
+        ctrl._prime_router_notify = AsyncMock()
+        ctrl._mind_client_update = AsyncMock()
+        level = await ctrl.ensure_ready(timeout=10)
+        assert level == "LEVEL_0"
+        assert ctrl.state == LifecycleState.READY
+
+    @pytest.mark.asyncio
+    async def test_ensure_ready_timeout_returns_level2(self):
+        policy = RestartPolicy(max_restarts=1, window_s=60.0, base_backoff_s=0.01)
+        ctrl = JprimeLifecycleController(
+            host="127.0.0.1", port=8000, restart_policy=policy,
+        )
+        ctrl._probe = AsyncMock()
+        ctrl._probe.check.return_value = HealthResult(
+            verdict=HealthVerdict.UNREACHABLE, error="timeout",
+        )
+        ctrl._prime_router_notify = AsyncMock()
+        ctrl._mind_client_update = AsyncMock()
+        level = await ctrl.ensure_ready(timeout=1.0)
+        assert level == "LEVEL_2"
+
+
+class TestControllerSingleton:
+    def test_singleton(self):
+        import backend.core.jprime_lifecycle_controller as mod
+        mod._controller_instance = None
+        c1 = get_jprime_lifecycle_controller()
+        c2 = get_jprime_lifecycle_controller()
+        assert c1 is c2
+        mod._controller_instance = None
