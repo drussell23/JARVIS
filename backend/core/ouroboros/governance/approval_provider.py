@@ -39,6 +39,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum, auto
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import OperationContext
@@ -252,8 +253,9 @@ class CLIApprovalProvider:
     mutations happen within the event loop so no explicit locking is needed.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, project_root: Optional[Path] = None) -> None:
         self._requests: Dict[str, _PendingRequest] = {}
+        self._project_root = project_root
 
     # -- request --
 
@@ -347,9 +349,20 @@ class CLIApprovalProvider:
             decided_at=datetime.now(tz=timezone.utc),
             request_id=request_id,
         )
+        # GAP 8: auto-memory — persist rejection reason to OUROBOROS.md
+        if self._project_root is not None:
+            try:
+                from backend.core.ouroboros.governance.correction_writer import write_correction
+                write_correction(
+                    project_root=self._project_root,
+                    op_id=request_id,
+                    reason=reason,
+                )
+            except Exception as _exc:
+                logger.warning("[Approval] correction_writer failed for op=%s: %s", request_id, _exc)
         pending.result = result
         pending.event.set()
-        logger.info("[Approval] REJECTED: %s by %s reason=%s", request_id, approver, reason)
+        logger.info("[Approval] REJECTED: %s by %s reason=%r", request_id, approver, reason)
         return result
 
     # -- await_decision --

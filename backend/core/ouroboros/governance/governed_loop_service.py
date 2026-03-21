@@ -2193,7 +2193,9 @@ class GovernedLoopService:
         self._user_signal_bus = UserSignalBus()
 
         # Build approval provider
-        self._approval_provider = CLIApprovalProvider()
+        self._approval_provider = CLIApprovalProvider(
+            project_root=self._config.project_root,
+        )
 
         # Build ValidationRunner (LanguageRouter with Python + C++ adapters)
         from backend.core.ouroboros.governance.test_runner import (
