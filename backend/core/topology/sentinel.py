@@ -7,7 +7,7 @@ import shutil
 import time
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import Any, TYPE_CHECKING, Optional
 
 from backend.core.topology.resource_governor import PIDController, ResourceGovernor
 
@@ -103,10 +103,12 @@ class ExplorationSentinel:
         target: CuriosityTarget,
         hardware: HardwareEnvironmentState,
         max_runtime_seconds: float = DeadEndClassifier.MAX_RUNTIME_SECONDS,
+        strategy: Any = None,
     ) -> None:
         self._target = target
         self._hardware = hardware
         self._max_runtime = max_runtime_seconds
+        self._strategy = strategy
         self._sem = asyncio.Semaphore(hardware.max_shadow_harness_workers)
         self._governor = ResourceGovernor(
             PIDController(target_cpu_fraction=0.40),
@@ -161,16 +163,34 @@ class ExplorationSentinel:
             )
 
     async def _explore(self) -> str:
-        """The actual research loop. Override or replace for capability-specific logic.
+        """Run the exploration strategy if injected, otherwise raise.
 
-        Subclasses override this to implement domain-specific exploration.
+        When a strategy is provided via the constructor, it executes the full
+        4-phase pipeline (RESEARCH -> SYNTHESIZE -> VALIDATE -> PACKAGE) using
+        injected Trinity infrastructure (WebTool, PrimeClient, etc.).
+
         In tests, assign a coroutine function to ``sentinel._explore`` to inject
         behaviour without subclassing.
-
-        Returns a non-empty string of findings on success, empty string on
-        no-op exploration.
         """
-        raise NotImplementedError("Sentinel research logic is capability-specific")
+        if self._strategy is not None:
+            result = await self._strategy.run(
+                target=self._target,
+                hardware=self._hardware,
+                semaphore=self._sem,
+            )
+            # Return serialized result as findings string
+            import json
+            return json.dumps({
+                "success": result.success,
+                "phases_completed": result.phases_completed,
+                "failure_reason": result.failure_reason,
+                "elapsed_seconds": result.elapsed_seconds,
+                "generated_files": list(result.synthesis.generated_files.keys()) if result.synthesis else [],
+                "test_files": list(result.synthesis.test_files.keys()) if result.synthesis else [],
+                "test_passed": result.validation.test_passed if result.validation else None,
+                "explanation": result.synthesis.explanation[:500] if result.synthesis else "",
+            })
+        raise NotImplementedError("No exploration strategy provided")
 
     async def _cleanup_scratch(self) -> None:
         """Wipe scratch directory synchronously via executor to avoid blocking the loop.

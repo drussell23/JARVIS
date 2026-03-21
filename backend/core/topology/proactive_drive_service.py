@@ -61,10 +61,18 @@ class ProactiveDriveService:
         config: ProactiveDriveConfig,
         telemetry_bus: Any = None,
         topology: Optional[TopologyMap] = None,
+        prime_client: Any = None,
+        repo_registry: Any = None,
+        comm_protocol: Any = None,
+        web_tool: Any = None,
     ) -> None:
         self._config = config
         self._bus = telemetry_bus
         self._topology = topology or TopologyMap()
+        self._prime_client = prime_client
+        self._repo_registry = repo_registry
+        self._comm_protocol = comm_protocol
+        self._web_tool = web_tool
         self._state = ServiceState.INACTIVE
         self._hardware: Optional[HardwareEnvironmentState] = None
         self._verifiers: Dict[str, LittlesLawVerifier] = {}
