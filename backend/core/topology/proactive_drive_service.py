@@ -135,6 +135,20 @@ class ProactiveDriveService:
                 self._tick_loop(), name="proactive_drive_tick"
             )
 
+            # Start Prime metrics poller — feeds "prime" LittlesLawVerifier
+            self._prime_poller = None
+            try:
+                from backend.core.topology.prime_metrics_poller import PrimeMetricsPoller
+                _prime_verifier = self._verifiers.get("prime")
+                if _prime_verifier is not None:
+                    self._prime_poller = PrimeMetricsPoller(verifier=_prime_verifier)
+                    if self._prime_poller.is_enabled:
+                        await self._prime_poller.start()
+                    else:
+                        self._prime_poller = None
+            except Exception as _pm_exc:
+                logger.debug("[ProactiveDrive] PrimeMetricsPoller not available: %s", _pm_exc)
+
             self._state = ServiceState.ACTIVE
             logger.info("[ProactiveDrive] Started: state=%s", self._state.value)
         except Exception as exc:
@@ -146,6 +160,14 @@ class ProactiveDriveService:
         if self._state == ServiceState.INACTIVE:
             return
         self._state = ServiceState.STOPPING
+
+        # Stop Prime metrics poller first
+        if getattr(self, "_prime_poller", None) is not None:
+            try:
+                await self._prime_poller.stop()
+            except Exception:
+                pass
+            self._prime_poller = None
 
         if self._tick_task and not self._tick_task.done():
             self._tick_task.cancel()
