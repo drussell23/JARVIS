@@ -20,6 +20,7 @@ from backend.core.ouroboros.governance.intake.intent_envelope import make_envelo
 logger = logging.getLogger(__name__)
 
 _SECONDS_PER_HOUR = 3600.0
+_STOP_PHRASES = frozenset({"stop", "cancel", "abort", "halt"})
 
 
 @dataclass
@@ -58,19 +59,37 @@ class VoiceCommandSensor:
         repo: str,
         stt_confidence_threshold: float = 0.82,
         rate_limit_per_hour: int = 3,
+        signal_bus: Any = None,           # Optional[UserSignalBus]
     ) -> None:
         self._router = router
         self._repo = repo
         self._threshold = stt_confidence_threshold
         self._rate_limit = rate_limit_per_hour
         self._op_timestamps: List[float] = []
+        self._signal_bus = signal_bus
+
+    @staticmethod
+    def _is_stop_command(description: str) -> bool:
+        """Return True if the description contains a stop/cancel phrase."""
+        words = description.lower().split()
+        return any(w in _STOP_PHRASES for w in words)
 
     async def handle_voice_command(self, payload: VoiceCommandPayload) -> str:
         """Process one recognized voice command.
 
         Returns one of: ``"enqueued"``, ``"pending_ack"``,
-        ``"rate_limited"``, ``"error"``.
+        ``"rate_limited"``, ``"error"``, ``"stopped"``.
         """
+        # GAP 6: detect stop/cancel commands and fire UserSignalBus
+        if self._is_stop_command(payload.description):
+            if self._signal_bus is not None:
+                self._signal_bus.request_stop()
+                logger.info("VoiceCommandSensor: stop command detected — bus.request_stop() fired")
+                return "stopped"
+            else:
+                logger.warning("VoiceCommandSensor: stop command received but no signal_bus wired")
+                return "error"
+
         if not payload.target_files:
             logger.warning("VoiceCommandSensor: empty target_files, skipping")
             return "error"
