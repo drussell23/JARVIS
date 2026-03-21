@@ -72,6 +72,21 @@
   - [Advanced Edge Cases That Will Cause This to Fail](#advanced-edge-cases-that-will-cause-this-to-fail)
   - [The BDI Architecture Emerging Naturally](#the-bdi-architecture-emerging-naturally)
   - [Implementation Sequence — How to Build This Without Breaking What Works](#implementation-sequence--how-to-build-this-without-breaking-what-works)
+- [Part 10: Proactive Autonomous Drive — Synthetic Curiosity Engine](#part-10-proactive-autonomous-drive--synthetic-curiosity-engine)
+  - [Challenge 1: Contextual Self-Awareness Engine (Dynamic Topology)](#challenge-1-contextual-self-awareness-engine-dynamic-topology)
+  - [Challenge 2: Deterministic Triggering via Little's Law + State Machine](#challenge-2-deterministic-triggering-via-littles-law--state-machine)
+  - [Challenge 3: The Artificial Curiosity Loop (Shannon Entropy + UCB)](#challenge-3-the-artificial-curiosity-loop-shannon-entropy--ucb)
+  - [Challenge 4: The Exploration Sentinel Agent + PID Resource Governor](#challenge-4-the-exploration-sentinel-agent--pid-resource-governor)
+  - [Challenge 5 (Output Contract): The Architectural Proposal](#challenge-5-output-contract-the-architectural-proposal)
+  - [Engineering Mandate Compliance Audit](#engineering-mandate-compliance-audit)
+- [Part 11: Ouroboros Autonomous Evolution Roadmap](#part-11-ouroboros-autonomous-evolution-roadmap)
+  - [11.1 Current State — Ouroboros Is Fully Wired and Active](#111-current-state--ouroboros-is-fully-wired-and-active)
+  - [11.2 What's Built But Not Yet Connected](#112-whats-built-but-not-yet-connected)
+  - [11.3 Milestone 1: Wire the Topology Package into GLS](#113-milestone-1-wire-the-topology-package-into-gls)
+  - [11.4 Milestone 2: Research-Backed Quality Enhancements](#114-milestone-2-research-backed-quality-enhancements)
+  - [11.5 Milestone 3: Safety Hardening Before Autonomy Increase](#115-milestone-3-safety-hardening-before-autonomy-increase)
+  - [11.6 Milestone 4: L4 Advanced Multi-Agent Coordination](#116-milestone-4-l4-advanced-multi-agent-coordination)
+  - [11.7 The Autonomy Graduation Path](#117-the-autonomy-graduation-path)
 
 ---
 
@@ -3662,6 +3677,569 @@ Cross-repo invariants:
 6. **Cross-repo L verifier clock skew**: Each `LittlesLawVerifier` uses `time.monotonic()` independently. If JARVIS and Prime are on different hosts, their clocks may drift. This is not a problem because Little's Law operates over a rolling window local to each process — the drive requires all three to be simultaneously idle according to their *own* measurement, not a synchronized global clock.
 
 7. **Hardware probe at elevated privilege**: `nvidia-smi` may fail with permission errors in containerized environments. `_probe_gpu()` wraps this in `try/except` returning `None`, which correctly degrades to `LOCAL_CPU` tier. No hardcoded fallback. No `IS_CONTAINERIZED` flag.
+
+---
+
+## Part 11: Ouroboros Autonomous Evolution Roadmap
+
+> **Status**: Living Document — Updated 2026-03-21
+> **Purpose**: Map the complete journey from "reactive governance pipeline" to "genuinely self-directed autonomous agent." Every item here has a clear structural dependency chain — nothing is aspirational, everything is load-bearing.
+
+---
+
+### The Big Picture First
+
+Think of Ouroboros as a nervous system being built inside a living organism (JARVIS). Right now, the nervous system is *complete and transmitting signals* — sensory neurons (IntakeLayerService) detect stimuli, motor neurons (the 10-phase pipeline) execute responses, and the spinal cord (GovernedLoopService) coordinates the whole reflex arc. What's missing is the *prefrontal cortex* — the part of the brain that doesn't wait for pain to react, but instead looks around the room, notices what it doesn't understand, and proactively decides to learn about it.
+
+Part 10 designed that prefrontal cortex (the Topology package). Part 11 maps exactly how to wire it in, what safety checks must exist before increasing autonomy, and what the graduation path looks like from today's "ask permission for everything" mode to tomorrow's "propose, validate, and integrate capabilities while the Chief Architect sleeps."
+
+The analogy that governs every decision below: **you don't give a teenager the car keys before they've passed the driving test.** Each milestone is a driving lesson — master it before moving to the next.
+
+---
+
+### 11.1 Current State — Ouroboros Is Fully Wired and Active
+
+Ouroboros is not a prototype. It is a production governance pipeline integrated into `unified_supervisor.py` and actively processing operations.
+
+**Supervisor Integration Points:**
+
+| Zone | Line | Component | What It Does |
+|---|---|---|---|
+| 6.8 | ~86533 | `GovernedLoopService` | Starts the governance pipeline at boot. Runs the boot handshake with J-Prime to validate brain inventory. Hard-fails on contract violations — if the policy YAML says "require brain X" and X isn't responding, the gate stays closed. This is the immune system's first checkpoint. |
+| 6.9 | ~86598 | `IntakeLayerService` | The sensory layer. Fans out sensors per registered repo: `TestFailureSensor` watches for red CI, `OpportunityMinerSensor` scans for code smells and TODOs, `VoiceCommandSensor` listens for "hey JARVIS, fix the auth bug." Every sensor emits an `IntakeSignal` that enters the 10-phase pipeline. |
+
+**The analogy**: Zone 6.8 is hospital security — it checks every doctor's credentials at the door before they can touch a patient. Zone 6.9 is the triage desk — it receives every incoming patient (test failure, voice command, opportunity) and routes them to the right department.
+
+**Feature Flags — What's Active Today:**
+
+| Flag | Value | What It Controls |
+|---|---|---|
+| `JARVIS_GOVERNANCE_MODE` | `governed` | The master switch. In `governed` mode, every code change goes through the full CLASSIFY-ROUTE-GENERATE-VALIDATE-GATE-APPROVE-APPLY-VERIFY pipeline. In `sandbox` mode, changes are simulated but never applied. In `observe` mode, the pipeline runs but only logs what it *would* do. |
+| `JARVIS_GOVERNED_TOOL_USE_ENABLED` | `true` | Allows the pipeline to use tools (file reads, git operations, test runners) during the GENERATE and VERIFY phases. Without this, the pipeline can only think — it can't act. |
+| `JARVIS_GOVERNED_L3_ENABLED` | `true` | Enables the SubagentScheduler to split complex operations into parallel work units. A multi-file refactor becomes 3 independent subagents working simultaneously in isolated worktrees. This is the jump from "one thing at a time" to "parallel execution with merge coordination." |
+| `JARVIS_GOVERNED_L4_ENABLED` | not set | Off by default. L4 adds multi-agent *coordination* above L3's parallel *execution* — agents that negotiate, delegate, and handle cross-cutting concerns. Intentionally disabled until safety hardening (Milestone 3) is complete. |
+
+**The analogy**: Think of these flags as the stages of a rocket launch. `GOVERNANCE_MODE=governed` is "engines on." `TOOL_USE=true` is "clamps released." `L3=true` is "throttle to 70%." `L4` is "full throttle" — and you don't go full throttle until you've verified every sensor and every abort sequence.
+
+**All 10 Original Gaps — Closed:**
+
+The gap analysis from Parts 3-4 identified 10 architectural gaps and 6 disconnected wires. Every one is now resolved:
+
+| Component | Status | What It Means |
+|---|---|---|
+| ShadowHarness to orchestrator VALIDATE | Wired | Generated code runs in a sealed sandbox *before* any human review. The ShadowHarness monkey-patches dangerous builtins (file writes, subprocess spawns) so candidate code physically cannot alter system state during validation. If the shadow run diverges from expected behavior, the operation is killed before it reaches the GATE phase. |
+| Canary slice metrics post-op | Wired | After a change is applied, canary metrics (error rate, latency, resource consumption) are measured against the pre-change baseline. If the canary detects regression, the system auto-rolls back. This is the "did the surgery make the patient better or worse?" check. |
+| DegradationController to _preflight_check | Wired | Before any operation begins, the DegradationController checks system health. If RAM is at 95% or the event loop latency exceeds thresholds, the operation is rejected *before* it enters the pipeline — not after it's already consuming resources. |
+| PolicyEngine to orchestrator CLASSIFY | Wired | The PolicyEngine reads `brain_selection_policy.yaml` and determines which brain (J-Prime GPU, J-Prime CPU, Claude API) handles each operation based on file path, operation type, and trust level. A test fix goes to a fast brain; an architectural change goes to the most capable brain. |
+| ToolCallHookRegistry to ChangeEngine | Wired | Every tool call during code generation fires through a hook registry. The ChangeEngine intercepts these hooks to maintain a precise ledger of what was read, written, and executed — full audit trail, no gaps. |
+| UserSignalBus to GLS submit() race | Wired | Voice commands that arrive while an operation is in-flight are queued, not dropped. The race condition where two simultaneous "fix this" commands could corrupt the FSM is eliminated by the signal bus's serialization guarantee. |
+| SkillRegistry to ContextExpander | Wired | The ContextExpander (which gathers surrounding files, test suites, and dependency graphs before code generation) now queries the SkillRegistry to inject domain-specific knowledge. If you're fixing an audio bug, it pulls in the audio architecture context automatically. |
+| CorrectionWriter to approval_provider | Wired | When the Chief Architect approves an operation with corrections ("yes, but change the variable name"), those corrections are written back into the learning system so the same mistake isn't repeated. |
+| ConfigLoader to GLS from_env() | Wired | All governance configuration (timeouts, trust tiers, mode flags) flows through a single `from_env()` factory method. No scattered `os.environ.get()` calls with inconsistent defaults. One source of truth. |
+| Elicitation to ApprovalProvider | Wired | When the pipeline reaches the APPROVE gate and needs human input, it uses structured elicitation (not a raw yes/no prompt) — presenting the diff, the risk assessment, the test results, and specific questions about ambiguous decisions. |
+
+**Test Count**: 1,223 tests passing across the governance suite. This is not a prototype count — this is production-grade coverage including edge cases, race conditions, FSM state transitions, and cross-repo scenarios.
+
+---
+
+### 11.2 What's Built But Not Yet Connected
+
+Three systems are fully implemented with green test suites but have zero references from `unified_supervisor.py` or `GovernedLoopService`. They are islands with bridges designed but not yet laid.
+
+**The analogy**: Imagine a city with three new buildings completed — power, plumbing, and internet are installed inside each one — but the utility connections from the street haven't been run yet. The buildings work perfectly in isolation. They just aren't connected to the grid.
+
+#### Island 1: The Topology Package (`backend/core/topology/`)
+
+**What it is**: The Proactive Autonomous Drive — the system that makes Ouroboros seek out improvements instead of waiting for triggers. Contains 7 modules and 95 passing tests.
+
+| Module | Purpose | The Analogy |
+|---|---|---|
+| `HardwareEnvironmentState` | Discovers physical constraints (CPU, RAM, GPU, compute tier) at boot via psutil/nvidia-smi. No hardcoding. | Trinity looking in the mirror — "I have 8 cores, 16GB RAM, no GPU, I'm running on a Mac." |
+| `TopologyMap` | Live directed graph of every capability across JARVIS/Prime/Reactor. Tracks which are active, which are dormant, which have dependencies. | The hospital's master directory — "Cardiology: 4 of 7 procedures available. Neurology: 2 of 12." |
+| `LittlesLawVerifier` | Applies queuing theory (L = lambda * W) across a 120-second rolling window to mathematically prove the system is idle. | The accountant watching bed occupancy — "All three wings are below 30% capacity. We have spare resources." |
+| `ProactiveDrive` | State machine (REACTIVE-MEASURING-ELIGIBLE-EXPLORING-COOLDOWN) that transitions based on mathematical invariants, not timers. | The hospital board that only approves a research expedition when the accountant certifies surplus capacity. |
+| `CuriosityEngine` | Shannon Entropy quantifies ignorance per capability domain; UCB1 (Upper Confidence Bound) selects the single highest-value gap to explore. | The R&D director who uses information theory to rank which medical procedure the hospital is most ignorant about. |
+| `ResourceGovernor` + `PIDController` | PID feedback controller (Kp=0.5, Ki=0.1, Kd=0.05) that throttles CPU utilization to 40% during exploration. Anti-windup clamp prevents integral runaway. | The lab's thermostat — measures temperature every 5 seconds, adjusts airflow to keep the room at exactly 40% utilization. |
+| `ExplorationSentinel` | Async context manager that runs one exploration task inside a sealed sandbox. `DeadEndClassifier` deterministically classifies failures (paywall, timeout, OOM, sandbox violation) and executes per-class unwind protocols. | The PhD intern in the sealed lab — can read anything, write only to their scratch notebook, physically cannot touch any patient. |
+| `ArchitecturalProposal` | Frozen output contract with SHA-256 content hash, curiosity provenance (UCB score, entropy, feasibility), shadow test results. Committed to `proposals/` branch, never to main. | The formal grant proposal the intern hands you — you decide whether to accept it. |
+
+**Why it matters**: Without this package wired in, Ouroboros only acts when a human says "fix this" or a test goes red. With it, Ouroboros becomes genuinely self-directed — it identifies its own blind spots, mathematically verifies it has spare capacity, sends a sandboxed agent to research the gap, and presents a formal proposal for review. This is the difference between a thermostat (reactive) and a scientist (proactive).
+
+**What's needed to connect it**: A new supervisor Zone (e.g., Zone 6.10) that:
+1. Calls `HardwareEnvironmentState.discover()` at boot and emits `lifecycle.hardware@1.0.0` via TelemetryBus
+2. Creates `LittlesLawVerifier` instances that hook into each repo's event loop dequeue path
+3. Runs a background coroutine that calls `ProactiveDrive.tick()` every 10 seconds
+4. On ELIGIBLE state: calls `CuriosityEngine.select_target()`, spawns `ExplorationSentinel`, and on success commits `ArchitecturalProposal` to the proposals branch
+
+#### Island 2: WorktreeManager
+
+**What it is**: Git worktree lifecycle management for SubagentScheduler. Creates isolated filesystem copies of the repo so parallel L3 subagents can edit files simultaneously without merge conflicts.
+
+**The analogy**: Currently, L3 subagents are like three surgeons operating on the same patient at the same time — they have to be very careful not to bump into each other. WorktreeManager gives each surgeon their own operating room with a clone of the patient. They work independently, and the results are merged afterward.
+
+**What's needed to connect it**: Wire `WorktreeManager.create()` into `SubagentScheduler._execute_unit_guarded()` so each L3 work unit gets its own worktree, and `WorktreeManager.cleanup()` runs in the finally block.
+
+#### Island 3: OuroborosMCPServer
+
+**What it is**: A Model Context Protocol server that exposes Ouroboros operations to external AI agents (Claude Code, Cursor, other MCP clients). Built and tested, but has no transport layer — no FastAPI endpoint or stdio pipe serving it.
+
+**The analogy**: It's a phone with a working screen, battery, and processor — but no SIM card. It can do everything except make calls.
+
+**What's needed to connect it**: A thin FastAPI or stdio transport endpoint in a new file (e.g., `backend/core/ouroboros/governance/mcp_transport.py`) that bridges HTTP/stdio requests to `OuroborosMCPServer` method calls.
+
+---
+
+### 11.3 Milestone 1: Wire the Topology Package into GLS
+
+> **Priority**: HIGH — This is the autonomy unlock
+> **Estimated scope**: New supervisor Zone + 3 integration points
+> **Prerequisite**: None (all dependencies are already green)
+
+**Goal**: Transform Ouroboros from a reactive tool (waits for triggers) into an autonomous agent (finds its own work).
+
+**The analogy in full**: Right now, Ouroboros is a brilliant doctor who only sees patients when they walk through the door. After this milestone, the doctor also walks the hallways during quiet hours, reads the hospital's capability index, notices "we have no one trained in procedure X," sends a resident to research it in the library, and puts a formal proposal on the Chief of Medicine's desk by morning.
+
+**What changes in `unified_supervisor.py`**:
+
+A new Zone 6.10 ("Proactive Drive") that:
+1. **Boot-time hardware discovery**: `HardwareEnvironmentState.discover()` runs once. The frozen result is emitted as a `lifecycle.hardware@1.0.0` TelemetryEnvelope. Prime and Reactor subscribe to build their local TopologyMaps. No hardcoded `IS_LOCAL_MAC`. No env var overrides for compute tier. The system looks at itself.
+2. **Idle verification wiring**: Three `LittlesLawVerifier` instances (one per repo) are created. Each hooks into the dequeue path of its repo's event loop — every time a task is dequeued for processing, `verifier.record(depth, latency)` is called. This feeds the Little's Law computation with real queue telemetry. No polling. No cron jobs. The measurements are taken as a natural byproduct of work being done.
+3. **Drive tick loop**: A background coroutine calls `ProactiveDrive.tick()` every 10 seconds. The result (state + reason string) is emitted to TelemetryBus as `reasoning.proactive_drive@1.0.0`. The TUI dashboard (already built) can display this in the System tab. The tick is deterministic — same queue measurements always produce the same state transition.
+4. **Exploration dispatch**: When `ProactiveDrive.tick()` returns `ELIGIBLE`, the coroutine calls `CuriosityEngine.select_target()`. If a target exists, it spawns `ExplorationSentinel` inside the ShadowHarness. On `CLEAN_SUCCESS`, it calls `ArchitecturalProposal.create()` and commits the JSON to a `proposals/<capability_name>/` branch. On any failure, the `DeadEndClassifier` executes the appropriate unwind protocol and logs the outcome.
+
+**What the user sees**: In the TUI dashboard, the System tab shows:
+```
+PROACTIVE DRIVE
+  State:    MEASURING
+  Reason:   jarvis: L=0.142 < threshold=30.000; prime: L=0.023 < threshold=30.000; reactor: insufficient samples (3/10)
+  Next:     Waiting for reactor samples...
+```
+
+And later:
+```
+PROACTIVE DRIVE
+  State:    EXPLORING
+  Target:   parse_parquet (data_io domain)
+  Rationale: Domain 'data_io' has Shannon Entropy H=0.918 (coverage=33.3%). UCB=2.1547.
+  Sentinel: Running (elapsed: 47s, CPU: 38%)
+```
+
+---
+
+### 11.4 Milestone 2: Research-Backed Quality Enhancements
+
+> **Priority**: HIGH — Quality of autonomous operations
+> **Estimated scope**: 3 new modules, modifications to orchestrator retry logic
+> **Prerequisite**: Milestone 1 (Topology wiring — so the enhancements apply to proactive operations, not just reactive ones)
+
+From the 13-paper analysis (Part 8), three enhancements have the highest return on investment for Ouroboros's operation quality:
+
+#### Enhancement A: EpisodicFailureMemory (from Reflexion — Paper 2)
+
+**The problem**: When an Ouroboros operation fails at VALIDATE and retries, the retry prompt has zero context about *why* the previous attempt failed. It's like a student retaking an exam with no memory of which questions they got wrong.
+
+**The cure**: A per-file failure memory that persists across retries within the same operation. After each failed VALIDATE, the failure details (what assertion failed, which line, what the ShadowHarness observed) are written to an `EpisodicFailureMemory` entry. On the next GENERATE phase, this memory is injected into the prompt context.
+
+**The analogy**: Instead of "try again," the student gets "try again, and here's exactly what you got wrong last time: you assumed the function returns a list, but it returns a generator. Line 47."
+
+**Structural impact**: New module `backend/core/ouroboros/governance/episodic_memory.py`. Modifications to `orchestrator.py` to read/write the memory at VALIDATE/GENERATE phase boundaries. The memory is scoped to a single operation — it doesn't leak between operations. Frozen dataclass entries, keyed by file path + operation ID.
+
+#### Enhancement B: StructuredCritique (from Self-Refine — Paper 3)
+
+**The problem**: The VALIDATE phase currently produces a flat error string: `"ShadowHarness: output diverged from expected"`. This is almost useless for guiding the retry. The retrying brain doesn't know *what* diverged, *where*, or *why*.
+
+**The cure**: Replace the flat error with a `StructuredCritique` dataclass containing: (1) which specific assertion or behavior diverged, (2) the exact line number and file, (3) the observed vs. expected values, (4) a classification of the failure type (logic error, missing import, wrong return type, API misuse), and (5) a directional hint (not a solution — a direction: "the return type should be a generator, not a list").
+
+**The analogy**: The difference between a teacher writing "Wrong" on your paper and a teacher writing "Wrong — you used Newton's second law correctly but forgot to account for friction. The coefficient of friction is given in paragraph 2 of the problem statement."
+
+**Structural impact**: New module `backend/core/ouroboros/governance/structured_critique.py`. Modifications to `shadow_harness.py` to emit structured critique objects instead of flat strings. Modifications to `orchestrator.py` to pass the critique into the retry context.
+
+#### Enhancement C: OperationComplexityClassifier (from Agentless — Paper 7)
+
+**The problem**: A one-character typo fix and a 500-line architectural refactor both go through the same 10-phase pipeline. The typo fix doesn't need context expansion, parallel subagents, or shadow harness validation — it's burning resources on ceremony that doesn't add value.
+
+**The cure**: An `OperationComplexityClassifier` that runs at CLASSIFY and routes simple operations (typo fixes, import additions, comment updates, single-line changes) to a fast path that skips CONTEXT_EXPANSION, GENERATE (uses a simpler brain), and runs a lightweight VALIDATE. Complex operations go through the full pipeline.
+
+**The analogy**: The ER triage nurse. A papercut doesn't go to the ICU — it gets a bandaid at the front desk. A heart attack gets the full team. Same hospital, different pathways based on severity.
+
+**Structural impact**: New module `backend/core/ouroboros/governance/complexity_classifier.py`. Modification to `orchestrator.py` at CLASSIFY to invoke the classifier and set a `fast_path` flag on the operation context.
+
+---
+
+### 11.5 Milestone 3: Safety Hardening Before Autonomy Increase
+
+> **Priority**: CRITICAL — Must complete before enabling L4 or increasing ProactiveDrive autonomy
+> **Estimated scope**: 3 targeted fixes in existing modules
+> **Prerequisite**: None (these are independent safety fixes)
+
+**The principle**: Before you increase the speed limit, you fix the guardrails. These three gaps were identified during the Engineering Mandate audit and represent structural safety deficits that are tolerable at current autonomy levels but become dangerous as autonomy increases.
+
+#### Safety Fix A: GLS Re-entrancy Guard
+
+**The problem**: Calling `GovernedLoopService.start()` twice silently corrupts the FSM. The second call creates a new `_fsm_engine` while the first is still running, orphaning its background tasks and creating split-brain state.
+
+**The analogy**: Turning the ignition key on a car that's already running. Most cars prevent this mechanically. GLS doesn't.
+
+**The cure**: An `asyncio.Lock` in `start()` that checks `self._started` and raises `RuntimeError("GLS already running")` on re-entry. Idempotent `stop()` remains unchanged.
+
+#### Safety Fix B: Rollback Failure Handler
+
+**The problem**: If the APPLY phase detects a regression and triggers a rollback, but the rollback *itself* fails (git checkout fails, file is locked, permission denied), the behavior is undefined. The operation is stuck in a half-applied state with no escape hatch.
+
+**The analogy**: The surgeon's "undo" button breaks mid-undo. The patient is now half in the original state and half in the new state.
+
+**The cure**: If rollback fails, transition to an `EMERGENCY_STOP` state that: (1) emits a `fault.raised@1.0.0` with `terminal=True`, (2) logs the exact rollback failure with full stack trace, (3) disables further operations until the Chief Architect manually resolves the state, and (4) preserves the failed rollback state for forensic analysis (no cleanup, no retry).
+
+#### Safety Fix C: Cross-Repo Schema Version Check at Boot
+
+**The problem**: J-Prime's prompt schema version (e.g., `2c.1`) is currently discovered at runtime through failed parses. If J-Prime upgrades its schema and JARVIS hasn't been updated, the first failed operation is the discovery mechanism. This is "learn from the crash."
+
+**The analogy**: Discovering that your car's fuel type changed by filling up with the wrong gas and having the engine sputter.
+
+**The cure**: At Zone 6.8 boot, the handshake includes a `schema_version` field in the `/v1/brains` response. JARVIS compares this against its expected schema version range. If incompatible, the gate stays closed with a clear error: `"J-Prime schema v3.0 not supported — JARVIS requires 2b.1-2c.1"`.
+
+---
+
+### 11.6 Milestone 4: L4 Advanced Multi-Agent Coordination
+
+> **Priority**: MEDIUM — Enable after Milestones 1-3 are complete
+> **Estimated scope**: Enable existing code + integration testing
+> **Prerequisite**: Safety Hardening (Milestone 3) + WorktreeManager wiring
+
+**What L4 is**: L3 gives you parallel execution — three subagents working on three files simultaneously. L4 gives you *coordination* — agents that negotiate with each other, handle cross-cutting concerns (one agent's change breaks another agent's assumption), and dynamically reassign work when one agent finishes early.
+
+**The analogy**: L3 is three assembly line workers each building a different component independently. L4 is three workers who can see each other's stations, call out conflicts ("hey, I changed the API signature you're depending on"), and reassign tasks when Worker A finishes early and Worker B is behind.
+
+**What already exists**: The entire L4 system is built — `SubagentScheduler`, `AdvancedCoordination`, `ExecutionGraphStore`, `SagaMessages`, `FeedbackEngine`. It's behind `JARVIS_GOVERNED_L4_ENABLED=true`.
+
+**What's needed**:
+1. Complete Milestone 3 safety hardening (re-entrancy guard, rollback handler, schema check)
+2. Wire WorktreeManager into SubagentScheduler (Island 2 from Section 11.2)
+3. Integration test suite that exercises L4 coordination with WorktreeManager isolation
+4. Set `JARVIS_GOVERNED_L4_ENABLED=true` in `.env`
+
+**The gate**: L4 should only be enabled after running a burn-in period with L3 + WorktreeManager (at least 50 successful multi-file operations without rollback) to confirm the isolation layer is solid.
+
+---
+
+### 11.7 The Autonomy Graduation Path
+
+This is the full picture — where Ouroboros is, where it's going, and what gates must be passed at each level.
+
+```
+Level 0: OBSERVE (Where Ouroboros started)
+    The pipeline runs but only logs what it WOULD do.
+    No code is generated, no changes are applied.
+    Purpose: Validate that the FSM, sensors, and routing work correctly.
+    Gate: 100% of simulated operations produce sensible classifications.
+    Status: PASSED
+
+Level 1: SANDBOX (Ouroboros's second phase)
+    The pipeline generates code and validates it in the ShadowHarness.
+    Changes are NOT applied to the real filesystem.
+    Purpose: Validate that code generation and validation work correctly.
+    Gate: 90% of sandbox operations produce valid code that passes shadow tests.
+    Status: PASSED
+
+Level 2: GOVERNED (Where Ouroboros is today)
+    The full pipeline runs. Changes ARE applied, but only after human approval
+    at the APPROVE gate. Every operation requires the Chief Architect to say "yes."
+    Tool use is enabled. L3 parallel subagents are enabled.
+    Purpose: Build trust through demonstrated reliability under supervision.
+    Gate: 50 consecutive successful operations with zero rollbacks.
+    Status: ACTIVE — accumulating track record
+
+Level 3: PROACTIVE GOVERNED (Milestone 1 — next target)
+    Everything in Level 2, PLUS the Topology package is wired in.
+    Ouroboros now identifies its own work (curiosity-driven exploration)
+    in addition to reacting to triggers. BUT: all proactive operations still
+    require human approval. The system proposes, the human disposes.
+    Purpose: Validate that the proactive drive identifies genuinely useful
+    capability gaps and doesn't waste resources on dead ends.
+    Gate: 20 proactive proposals where >80% are accepted by the Chief Architect.
+    Status: NOT YET — waiting for Milestone 1 wiring
+
+Level 4: SEMI-AUTONOMOUS (Milestone 2+3 — after quality + safety)
+    Everything in Level 3, PLUS:
+    - EpisodicFailureMemory makes retries dramatically more effective
+    - StructuredCritique makes validation feedback actionable
+    - OperationComplexityClassifier routes simple ops to a fast path
+    - Safety hardening (re-entrancy, rollback handler, schema check) is complete
+
+    At this level, SIMPLE operations (typo fixes, import additions) can be
+    auto-approved without human review. COMPLEX operations still require
+    human approval. ARCHITECTURAL operations (new capabilities from the
+    CuriosityEngine) always require human review.
+    Purpose: Reduce the human bottleneck for low-risk operations while
+    maintaining full oversight for high-risk ones.
+    Gate: 100 auto-approved simple operations with zero rollbacks.
+    Status: NOT YET — waiting for Milestones 2 and 3
+
+Level 5: AUTONOMOUS WITH OVERSIGHT (Milestone 4 — L4 coordination)
+    Everything in Level 4, PLUS:
+    - L4 multi-agent coordination enabled
+    - WorktreeManager provides filesystem isolation
+    - Complex operations can be auto-approved if they pass ALL of:
+      (a) ShadowHarness validation
+      (b) Canary metrics show no regression
+      (c) Risk score below threshold
+      (d) All shadow tests passing
+
+    ARCHITECTURAL operations (new capabilities) still require human review.
+    The Chief Architect reviews proposals, not routine fixes.
+    Purpose: Ouroboros handles its own maintenance and improvement.
+    The human focuses on strategy, not execution.
+    Gate: Sustained autonomous operation for 7 days with <2% rollback rate.
+    Status: NOT YET — waiting for Milestone 4
+
+Level 6: FULL AUTONOMY (Future — the endgame)
+    Ouroboros proposes AND implements new capabilities autonomously.
+    ArchitecturalProposals are auto-merged if they pass:
+    (a) All shadow tests
+    (b) Integration tests in an isolated worktree
+    (c) LLM-as-a-Judge security review (Part 9, Challenge 2)
+    (d) 24-hour canary period with auto-rollback
+
+    The Chief Architect receives a daily digest of what Ouroboros did,
+    not a queue of things waiting for approval.
+    Purpose: True self-programming AI that improves itself continuously.
+    Gate: This is the destination, not a milestone. Reached when all
+    preceding levels have been sustained without regression for 30 days.
+    Status: ARCHITECTURAL DESIGN ONLY — not yet planned for implementation
+```
+
+**Where we are on this map**: Firmly at **Level 2 (GOVERNED)**, with **Level 3 (PROACTIVE GOVERNED)** as the immediate next target. The Topology package (95 tests green) is the bridge from Level 2 to Level 3. Once wired in, Ouroboros begins proposing its own work for the first time.
+
+---
+
+### 11.8 Tri-Partite Microkernel — Cross-Repo Execution Architecture
+
+> **Status**: Architectural Blueprint — The execution model that powers Milestones 1-4
+> **Constraint**: Zero LLM dependency in the orchestration layer. Pure async IPC, cryptographic validation, and PID control theory.
+> **Engineering Mandate**: Strict async boundaries, no implicit timing, deterministic unwind on all paths.
+
+The Tri-Partite Microkernel is the execution substrate beneath everything described above. Every Ouroboros operation — reactive or proactive — ultimately flows through three physical systems:
+
+1. **JARVIS (Edge/Senses)** — The 16GB Mac. Runs `unified_supervisor.py`. Handles audio capture, voice recognition, TUI dashboard, user interaction. Detects *what needs to happen*.
+2. **J-Prime (Cloud/Mind)** — The GCP g2-standard-4 + L4 GPU at `136.113.252.164`. Runs Qwen2.5-7B. Performs code synthesis, architectural reasoning, context expansion. Decides *how to do it*.
+3. **Reactor Core (Compute/Sandbox)** — Currently co-located with JARVIS but architecturally independent. Runs the ShadowHarness, WorktreeManager, and ExplorationSentinel. Executes *in isolation*.
+
+**The analogy**: JARVIS is the field hospital's radio operator — it hears the incoming call and routes it. J-Prime is the surgeon — it decides what to do and writes the surgical plan. Reactor Core is the sterile operating room — the plan is executed inside it, and nothing that happens inside can contaminate the rest of the hospital.
+
+#### Challenge 1: The Cross-Repo Handoff Contract (`IntentEnvelope`)
+
+**The problem**: When J-Prime finishes code synthesis (Phase 2), it must send the generated code to Reactor Core for sandbox execution (Phase 3). This handoff crosses a trust boundary — Reactor Core cannot blindly execute code just because something *claims* to be J-Prime. A malicious local process could inject code into the IPC channel.
+
+**The structural design**:
+
+```python
+# backend/core/topology/intent_envelope.py
+
+@dataclass(frozen=True)
+class IntentEnvelope:
+    """Cryptographically signed handoff payload between Trinity components.
+
+    The CommProtocol serializes this to JSON for IPC transport.
+    Reactor Core validates the HMAC before executing anything.
+    """
+    envelope_id: str                    # UUID4
+    operation_id: str                   # Ouroboros operation this belongs to
+    source_component: str               # "jprime", "jarvis", "reactor"
+    target_component: str               # where this is headed
+    phase: str                          # "GENERATE_COMPLETE", "VALIDATE_REQUEST", etc.
+
+    # Payload
+    generated_files: Dict[str, str]     # filename -> content
+    test_files: Dict[str, str]          # test filename -> content
+    metadata: Dict[str, str]            # schema_version, brain_used, etc.
+
+    # Provenance
+    created_at: float
+    trace_id: str
+    parent_envelope_id: Optional[str]
+
+    # Integrity
+    content_hash: str                   # SHA-256 of sorted(generated_files + test_files)
+    hmac_signature: str                 # HMAC-SHA256(content_hash, shared_secret)
+
+    @classmethod
+    def create(cls, ..., shared_secret: bytes) -> IntentEnvelope:
+        content = json.dumps({**generated_files, **test_files}, sort_keys=True)
+        content_hash = hashlib.sha256(content.encode()).hexdigest()
+        signature = hmac.new(shared_secret, content_hash.encode(), hashlib.sha256).hexdigest()
+        return cls(...)
+
+    def verify(self, shared_secret: bytes) -> bool:
+        """Reactor Core calls this before executing anything."""
+        expected = hmac.new(shared_secret, self.content_hash.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(self.hmac_signature, expected)
+```
+
+**How it works**: J-Prime creates an `IntentEnvelope` with the generated code, signs it with HMAC-SHA256 using a shared secret (derived from `JARVIS_CROSS_REPO_SECRET` env var, rotated per boot). The envelope travels over the existing `CommProtocol` transport (JSONL over stdout/HTTP). Reactor Core calls `envelope.verify(secret)` and only proceeds if the HMAC matches. A malicious process without the shared secret cannot forge a valid envelope.
+
+**The analogy**: A sealed diplomatic pouch. The surgeon (J-Prime) seals the surgical plan in an envelope with a wax stamp. The operating room (Reactor Core) checks the stamp before opening the pouch. If the stamp doesn't match, the pouch is rejected and a security alert fires.
+
+#### Challenge 2: PID-Governed Sandbox Execution
+
+**The problem**: Reactor Core must execute untrusted code (from J-Prime's synthesis) inside the ShadowHarness. If the code contains an infinite loop, allocates 100GB of RAM, or forks a subprocess that escapes the sandbox, the host system is compromised.
+
+**The structural design**: The `ResourceGovernor` + `PIDController` from the Topology package (already implemented, 11 tests passing) provides the control loop. Here's how it integrates with the ShadowHarness execution via a `GovernedSandbox`:
+
+```python
+# backend/core/topology/governed_sandbox.py
+
+@dataclass(frozen=True)
+class ResourceSnapshot:
+    """Captured at 5-second intervals during sandbox execution."""
+    timestamp: float
+    cpu_percent: float
+    rss_mb: float          # resident set size
+    vms_mb: float          # virtual memory size
+    open_fds: int
+    child_processes: int
+
+
+@dataclass(frozen=True)
+class HarnessResult:
+    """The complete output contract from a ShadowHarness run."""
+    exit_code: int
+    stdout: str
+    stderr: str
+    peak_rss_mb: float
+    peak_cpu_percent: float
+    resource_snapshots: list      # List[ResourceSnapshot]
+    elapsed_seconds: float
+    killed_by_governor: bool      # True if PID controller triggered SIGKILL
+    dead_end_class: Optional[DeadEndClass]
+
+
+class GovernedSandbox:
+    HARD_RSS_LIMIT_MB = 4096       # 4 GB absolute ceiling
+    HARD_CPU_LIMIT = 0.90          # 90% sustained = runaway
+    KILL_THRESHOLD_SECONDS = 30    # Sustained overload for 30s triggers kill
+
+    async def execute(self, command, cwd, env=None) -> HarnessResult:
+        proc = await asyncio.create_subprocess_exec(*command, cwd=cwd, ...)
+        monitor_task = asyncio.create_task(self._monitor_loop(proc))
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=...)
+        except asyncio.TimeoutError:
+            self._kill_process_tree(proc.pid)
+        finally:
+            monitor_task.cancel()
+            await monitor_task  # deterministic cleanup — no orphans
+
+    async def _monitor_loop(self, proc):
+        """Sample psutil every 5s. PID controller adjusts. Kill on threshold breach."""
+        while proc.returncode is None:
+            await asyncio.sleep(5.0)
+            ps = psutil.Process(proc.pid)
+            rss_mb = ps.memory_info().rss / (1024 * 1024)
+            cpu = ps.cpu_percent(interval=None) / 100.0
+
+            self._pid_controller.update(cpu)  # PID tracks error against target
+
+            if rss_mb > self.HARD_RSS_LIMIT_MB:     # immediate kill
+                self._kill_process_tree(proc.pid)
+                return
+            if cpu > self.HARD_CPU_LIMIT:            # start sustained-overload timer
+                if sustained > self.KILL_THRESHOLD_SECONDS:
+                    self._kill_process_tree(proc.pid)
+                    return
+
+    def _kill_process_tree(self, pid):
+        """Kill parent + all children. No orphans. No zombies."""
+        parent = psutil.Process(pid)
+        for child in parent.children(recursive=True):
+            child.kill()
+        parent.kill()
+        psutil.wait_procs([parent] + parent.children(), timeout=5)
+```
+
+**The PID control math**:
+```
+error(t)   = target_cpu (0.40) - measured_cpu
+u(t)       = Kp * error + Ki * integral(error) + Kd * derivative(error)
+
+u(t) > 0   -> system underloaded -> allow faster processing
+u(t) < 0   -> system overloaded  -> throttle (reduce concurrency)
+u(t) << 0  -> sustained overload -> SIGKILL the process tree
+```
+
+The PID controller doesn't prevent overload — it *measures and responds* to it. The hard limits (4GB RSS, 90% CPU sustained for 30s) are the circuit breakers. The PID controller is the fine-grained throttle that keeps things smooth under normal operation. Together, they form a two-layer defense: the PID keeps the room at 40%, and the hard limits trip the fire alarm if the room hits 90%.
+
+**The analogy**: The PID controller is a pressure valve on a boiler. It measures steam pressure (CPU/RAM) every 5 seconds, adjusts the valve to maintain target pressure (40%), and if pressure exceeds the redline (90% CPU sustained or 4GB RAM), it trips the emergency shutoff. The boiler (sandbox process) is killed, the steam (resources) is vented, and a detailed incident report (HarnessResult) is filed.
+
+#### Challenge 3: Deterministic Async Unwind and Return
+
+**The problem**: When the ShadowHarness finishes — whether the code passed, failed, was killed by the PID controller, or timed out — the state must return cleanly to J-Prime for security review. No orphaned async tasks. No leaked file handles. No zombie processes. No half-cleaned worktrees.
+
+**The structural design**:
+
+```python
+# backend/core/topology/phase3_orchestrator.py
+
+@dataclass(frozen=True)
+class Phase3Result:
+    """Complete return contract from Phase 3 (Blast Chamber) to Phase 4 (Security Review)."""
+    harness_result: HarnessResult
+    intent_envelope: IntentEnvelope       # original signed envelope (provenance)
+    worktree_preserved: bool              # True if kept for forensics
+    cleanup_actions: list                  # audit trail of cleanup steps
+
+
+class Phase3Orchestrator:
+    """Orchestrates: receive envelope -> verify HMAC -> sandbox -> unwind -> return.
+
+    Guarantees:
+    1. No orphaned async tasks on ANY exit path
+    2. No leaked file handles or zombie processes
+    3. Worktree destroyed on failure, preserved on success
+    4. HarnessResult ALWAYS returned, even on catastrophic failure
+    5. Original IntentEnvelope returned with result (provenance chain)
+    """
+
+    async def execute(self, envelope: IntentEnvelope) -> Phase3Result:
+        # Step 1: Verify HMAC — reject unsigned envelopes
+        if not envelope.verify(self._secret):
+            return Phase3Result(harness=REJECTED, cleanup=["hmac_rejected"])
+
+        try:
+            # Step 2: Create ephemeral worktree, write generated files
+            worktree = tempfile.mkdtemp(prefix="reactor_sandbox_")
+            write_files(envelope.generated_files, worktree)
+            write_files(envelope.test_files, worktree)
+
+            # Step 3: Execute in GovernedSandbox (PID-controlled)
+            sandbox = GovernedSandbox(max_runtime=..., max_rss=...)
+            result = await sandbox.execute(["python3", "-m", "pytest", "-v"], cwd=worktree)
+
+            # Step 4: Preserve on success, destroy on failure
+            if result.exit_code == 0 and not result.killed_by_governor:
+                return Phase3Result(result, envelope, preserved=True, [...])
+            else:
+                shutil.rmtree(worktree)
+                return Phase3Result(result, envelope, preserved=False, [...])
+
+        except BaseException as exc:
+            # Step 5: Catastrophic unwind — clean EVERYTHING
+            shutil.rmtree(worktree, ignore_errors=True)
+            return Phase3Result(CATASTROPHIC_RESULT, envelope, preserved=False, [...])
+```
+
+**The five exit paths and their guarantees**:
+
+| Exit Path | What Happens | Worktree | Orphaned Tasks |
+|---|---|---|---|
+| **Normal success** | Tests pass, PID never triggered | Preserved for security review | Zero — monitor task cancelled in `finally` |
+| **Test failure** | Tests fail but within resource limits | Destroyed (failed code has no review value) | Zero |
+| **PID kill (OOM)** | RSS exceeds 4GB, process tree killed | Destroyed | Zero — `_kill_process_tree` waits for all children |
+| **PID kill (CPU)** | 90% CPU sustained for 30s, killed | Destroyed | Zero |
+| **Catastrophic failure** | Python exception in orchestrator | Emergency destroyed | Zero — `except BaseException` catches `CancelledError` too |
+
+**The guarantee**: `Phase3Orchestrator.execute()` ALWAYS returns a `Phase3Result`. There is no code path that raises an exception to the caller. Every failure mode is caught, classified, cleaned up, and returned as structured data. The caller (unified_supervisor.py) never has to guess what happened.
+
+**The analogy**: Think of the operating room's shutdown protocol. Normal completion: surgeon finishes, instruments are sterilized, patient goes to recovery. Complication: surgeon stops, instruments are accounted for, patient is stabilized, incident report filed. Catastrophic failure (earthquake): everything stops, the room is evacuated, all instruments are accounted for, no equipment is left behind, and a full incident report is filed from whatever data was captured. In all three cases, **the room is clean when it's done**.
 
 ---
 
