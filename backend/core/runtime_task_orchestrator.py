@@ -750,18 +750,42 @@ class RuntimeTaskOrchestrator:
                 model_name=None,
                 task_profile=None,
             )
-            # For now, log what was synthesized (actual execution in sandbox is future work)
             logger.info(
-                "[RuntimeTask] Synthesized %s tool for: %s (%d tokens)",
+                "[RuntimeTask] J-Prime synthesized %s tool for: %s (%d tokens)",
                 "ephemeral" if ephemeral else "persistent",
                 goal[:50],
                 response.tokens_used,
             )
+
+            # Execute the synthesized code in the SandboxedExecutor blast chamber
+            from backend.core.topology.sandboxed_executor import SandboxedExecutor
+            executor = SandboxedExecutor(
+                reactor_client=None,  # ReactorCoreClient injected when available
+                telemetry_bus=self._bus,
+            )
+            exec_result = await executor.execute(
+                code=response.content,
+                goal=goal,
+                context=step,
+                ephemeral=ephemeral,
+            )
+
+            logger.info(
+                "[RuntimeTask] Execution result: %s (mode=%s, %.1fs)",
+                exec_result.outcome.value,
+                exec_result.mode.value,
+                exec_result.elapsed_seconds,
+            )
+
             return {
-                "status": "synthesized",
+                "status": exec_result.outcome.value,
                 "ephemeral": ephemeral,
                 "goal": goal,
-                "code_preview": response.content[:200],
+                "return_value": exec_result.return_value,
+                "stdout": exec_result.stdout[:500] if exec_result.stdout else "",
+                "code_hash": exec_result.code_hash,
+                "execution_mode": exec_result.mode.value,
+                "error": exec_result.error_message,
             }
         except Exception as exc:
             return {"status": "error", "error": f"Synthesis failed: {exc}"}
