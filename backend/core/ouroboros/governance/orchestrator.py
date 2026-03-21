@@ -284,6 +284,31 @@ class GovernedOrchestrator:
         classification = self._stack.risk_engine.classify(profile)
         risk_tier = classification.tier
 
+        # ---- Complexity + Persistence classification (Assimilation Gate) ----
+        _complexity_result = None
+        try:
+            from backend.core.ouroboros.governance.complexity_classifier import (
+                OperationComplexityClassifier,
+            )
+            _classifier = OperationComplexityClassifier(
+                topology=getattr(self._stack, "topology", None),
+                ledger=getattr(self._stack, "ledger", None),
+            )
+            _complexity_result = _classifier.classify(
+                description=ctx.description,
+                target_files=list(ctx.target_files),
+            )
+            logger.info(
+                "[Orchestrator] Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",
+                _complexity_result.complexity.value,
+                _complexity_result.persistence.value,
+                _complexity_result.auto_approve_eligible,
+                _complexity_result.fast_path_eligible,
+                ctx.op_id,
+            )
+        except Exception:
+            logger.debug("[Orchestrator] ComplexityClassifier not available", exc_info=True)
+
         # ---- Policy engine check (declarative YAML rules) ----
         # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
         # explicit deny rules in policy files can override the risk engine.
@@ -386,9 +411,17 @@ class GovernedOrchestrator:
             # Expansion disabled: skip directly from ROUTE to GENERATE
             ctx = ctx.advance(OperationPhase.GENERATE)
 
-        # ---- Phase 3: GENERATE (with retry) ----
+        # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
         generation: Optional[GenerationResult] = None
         generate_retries_remaining = self._config.max_generate_retries
+
+        # Episodic failure memory — per-operation, injected into retries
+        _episodic_memory = None
+        try:
+            from backend.core.ouroboros.governance.episodic_memory import EpisodicFailureMemory
+            _episodic_memory = EpisodicFailureMemory(ctx.op_id)
+        except ImportError:
+            pass
 
         for attempt in range(1 + self._config.max_generate_retries):
             try:
@@ -430,8 +463,21 @@ class GovernedOrchestrator:
                         {"reason": "generation_failed", "error": str(exc)},
                     )
                     return ctx
-                # Retry: advance to GENERATE_RETRY
-                ctx = ctx.advance(OperationPhase.GENERATE_RETRY)
+                # Retry: advance to GENERATE_RETRY with episodic memory context
+                _retry_ctx_kwargs = {}
+                if _episodic_memory is not None and _episodic_memory.has_failures():
+                    _failure_context = _episodic_memory.format_for_prompt()
+                    if _failure_context:
+                        # Inject into strategic_memory_prompt so the generator sees it
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        _retry_ctx_kwargs["strategic_memory_prompt"] = (
+                            f"{_existing}\n\n{_failure_context}" if _existing else _failure_context
+                        )
+                        logger.info(
+                            "[Orchestrator] Injecting %d episodic failure(s) into retry context [%s]",
+                            _episodic_memory.total_episodes, ctx.op_id,
+                        )
+                ctx = ctx.advance(OperationPhase.GENERATE_RETRY, **_retry_ctx_kwargs)
 
         assert generation is not None  # guaranteed by loop logic
 
@@ -563,6 +609,33 @@ class GovernedOrchestrator:
                 # test/build failure: track for ledger; try next candidate
                 best_validation = validation
 
+                # ---- Record failure in episodic memory + build structured critique ----
+                if _episodic_memory is not None and validation.failure_class in ("test", "build"):
+                    try:
+                        from backend.core.ouroboros.governance.structured_critique import CritiqueBuilder
+                        critique_report = CritiqueBuilder.from_validation_output(
+                            file_path=candidate.get("file_path", "unknown"),
+                            failure_class=validation.failure_class or "test",
+                            error_text=validation.error or "",
+                            test_output=validation.short_summary or "",
+                        )
+                        _episodic_memory.record(
+                            file_path=candidate.get("file_path", "unknown"),
+                            attempt=self._config.max_validate_retries - validate_retries_remaining + 1,
+                            failure_class=validation.failure_class or "test",
+                            error_summary=critique_report.summary,
+                            specific_errors=[c.what_failed for c in critique_report.critiques],
+                            line_numbers=[c.line_number for c in critique_report.critiques if c.line_number],
+                        )
+                        logger.info(
+                            "[Orchestrator] Episodic memory recorded: %s — %s [%s]",
+                            candidate.get("file_path", "?"),
+                            critique_report.summary,
+                            ctx.op_id,
+                        )
+                    except Exception:
+                        logger.debug("[Orchestrator] Episodic/critique recording failed", exc_info=True)
+
             if best_candidate is not None:
                 break  # at least one candidate passed
 
@@ -602,8 +675,16 @@ class GovernedOrchestrator:
                 )
                 return ctx
 
-            # Retry: advance to VALIDATE_RETRY
-            ctx = ctx.advance(OperationPhase.VALIDATE_RETRY)
+            # Retry: advance to VALIDATE_RETRY with episodic memory context
+            _vr_kwargs = {}
+            if _episodic_memory is not None and _episodic_memory.has_failures():
+                _vr_context = _episodic_memory.format_for_prompt()
+                if _vr_context:
+                    _existing_vr = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    _vr_kwargs["strategic_memory_prompt"] = (
+                        f"{_existing_vr}\n\n{_vr_context}" if _existing_vr else _vr_context
+                    )
+            ctx = ctx.advance(OperationPhase.VALIDATE_RETRY, **_vr_kwargs)
 
         assert best_candidate is not None  # guaranteed by loop logic
         assert best_validation is not None
