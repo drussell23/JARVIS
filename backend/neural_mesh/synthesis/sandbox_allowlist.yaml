@@ -1,0 +1,25 @@
+# backend/neural_mesh/synthesis/sandbox_allowlist.yaml
+# Permitted imports for synthesized agent modules (Stage 2 safety gate).
+# Any import not on this list raises SandboxImportError and quarantines the artifact.
+allowed_imports:
+  # Standard library
+  - asyncio
+  - collections
+  - dataclasses
+  - datetime
+  - enum
+  - functools
+  - hashlib
+  - inspect
+  - json
+  - logging
+  - math
+  - pathlib
+  - re
+  - time
+  - typing
+  - uuid
+  # JARVIS internal (explicit allowlist — top-level and qualified)
+  - backend.neural_mesh.base.base_neural_mesh_agent
+  - backend.neural_mesh.data_models
+  - backend.neural_mesh.registry.agent_registry

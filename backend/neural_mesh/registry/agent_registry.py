@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from ..data_models import (
     HealthStatus,
 )
 from ..config import AgentRegistryConfig, get_config
+from ..synthesis.gap_signal_bus import CapabilityGapEvent, get_gap_signal_bus
 
 logger = logging.getLogger(__name__)
 
@@ -229,7 +231,13 @@ class AgentRegistry:
         # Capability manifests: {agent_name: CapabilityManifest}
         self._manifests: Dict[str, CapabilityManifest] = {}
 
-        # v116.0: Mark as initialized
+        # DAS Task 7: routing snapshot for rollback support
+        self._stable_routes: Dict[str, str] = {}
+        self._active_routes: Dict[str, str] = {}
+        self._rollback_log: List[Dict[str, Any]] = []
+        self._version: int = 0
+
+        # v116.0: Mark as initialized — must be set AFTER all attributes are ready
         self._initialized = True
 
         logger.info("AgentRegistry v116.0 initialized (singleton + dependency-aware health checks)")
@@ -1437,6 +1445,126 @@ class AgentRegistry:
 
         except Exception as e:
             logger.exception("Failed to load registry: %s", e)
+
+    # ------------------------------------------------------------------
+    # DAS Task 7: capability resolution (delegates to AgentCapabilityIndex)
+    # ------------------------------------------------------------------
+
+    def _resolve_internal(
+        self,
+        goal: str,
+        target_app: Optional[str],
+        task_type: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Verbatim delegation to AgentCapabilityIndex.resolve_capability.
+
+        Extracted so the public wrapper can detect the universal-fallback
+        case without duplicating resolution logic.
+        """
+        # AgentCapabilityIndex is defined later in this same module; no import needed.
+        return AgentCapabilityIndex().resolve_capability(goal, target_app, task_type)
+
+    def resolve_capability(
+        self,
+        goal: str,
+        target_app: Optional[str],
+        task_type: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        """
+        Resolve (primary_capability, fallback_capability) for a goal.
+
+        Wraps _resolve_internal and emits a CapabilityGapEvent on the
+        GapSignalBus whenever the universal fallback ``computer_use`` is
+        returned with no specific fallback — indicating no registered agent
+        covers the requested capability.
+        """
+        primary, fallback = self._resolve_internal(goal, target_app, task_type)
+        if primary == "computer_use" and fallback is None:
+            get_gap_signal_bus().emit(CapabilityGapEvent(
+                goal=goal,
+                task_type=task_type or "",
+                target_app=target_app or "",
+                source="primary_fallback",
+            ))
+        return primary, fallback
+
+    async def rollback_agent(self, domain_id: str, reason: str) -> None:
+        """
+        Roll back the active route for *domain_id* to its last stable snapshot.
+
+        Records the rollback in the append-only log and bumps the registry
+        version counter.  In-flight executions complete normally — this
+        method does NOT evict modules or cancel tasks.
+
+        Args:
+            domain_id: The capability domain being rolled back
+                       (same format as CapabilityGapEvent.domain_id).
+            reason:    Human-readable explanation for the rollback.
+        """
+        async with self._lock:
+            self._version += 1
+            self._rollback_log.append({
+                "domain_id": domain_id,
+                "version": self._version,
+                "reason": reason,
+                "timestamp_ms": int(time.time() * 1000),
+            })
+            if domain_id in self._stable_routes:
+                self._active_routes[domain_id] = self._stable_routes[domain_id]
+            logger.info(
+                "rollback_agent: domain=%s version=%d reason=%s",
+                domain_id,
+                self._version,
+                reason,
+            )
+
+    def _route_to_canary(self, domain_id: str, das_canary_key: str) -> bool:
+        """Return True if this (domain_id, das_canary_key) pair should hit the canary.
+
+        Uses a stable bucket hash — same pair always maps to the same bucket,
+        enabling reproducible debugging and preventing flapping on retries.
+        Bucket percentage is read from DAS_CANARY_TRAFFIC_PCT (default 10).
+        """
+        pct = max(0, min(100, int(os.environ.get("DAS_CANARY_TRAFFIC_PCT", "10"))))
+        bucket = int(hashlib.sha256(f"{domain_id}:{das_canary_key}".encode()).hexdigest(), 16) % 100
+        return bucket < pct
+
+    def _check_graduation(self, domain_id: str) -> bool:
+        """Return True when the canary for *domain_id* meets all graduation gates.
+
+        Gates are read from environment variables so they can be tuned without
+        a code deploy.  In the absence of live telemetry the method returns
+        False conservatively — external callers are expected to supply
+        per-domain metrics via the DomainTrustLedger.
+
+        Current implementation: reads env-var thresholds and checks the
+        in-memory active-route counters.  Full metric-driven graduation is
+        wired via DomainTrustLedger in the synthesis pipeline.
+        """
+        min_requests = int(os.environ.get("DAS_CANARY_MIN_REQUESTS", "10"))
+        min_elapsed_s = float(os.environ.get("DAS_CANARY_MIN_ELAPSED_S", "300"))
+        min_sessions = int(os.environ.get("DAS_CANARY_MIN_SESSIONS", "3"))
+        max_error_rate = float(os.environ.get("DAS_CANARY_MAX_ERROR_RATE", "0.01"))
+
+        # Retrieve per-domain canary stats stored by the synthesis pipeline.
+        # Keys: _canary_stats[domain_id] = {"requests": int, "errors": int,
+        #        "start_ts": float, "distinct_sessions": set}
+        stats = getattr(self, "_canary_stats", {}).get(domain_id)
+        if stats is None:
+            return False
+
+        requests: int = stats.get("requests", 0)
+        errors: int = stats.get("errors", 0)
+        start_ts: float = stats.get("start_ts", 0.0)
+        distinct_sessions: int = len(stats.get("distinct_sessions", set()))
+        elapsed_s: float = time.time() - start_ts
+        error_rate: float = errors / requests if requests > 0 else 1.0
+
+        volume_ok = requests >= min_requests or (
+            elapsed_s >= min_elapsed_s and distinct_sessions >= min_sessions
+        )
+        return volume_ok and error_rate <= max_error_rate
 
     def __repr__(self) -> str:
         """String representation."""

@@ -10,6 +10,7 @@ v88.0: Ultra Protection Integration
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -3015,6 +3016,11 @@ class UnifiedCommandProcessor:
 
         # Guardrail 2: Build and validate payload
         _cmd_id = command_id or uuid.uuid4().hex
+        session_id = str(uuid.uuid4())
+        _normalized_cmd = re.sub(r"\s+", " ", command_text.lower().strip())
+        _das_canary_raw = f"{session_id}:{_normalized_cmd}"
+        das_canary_key = hashlib.sha256(_das_canary_raw.encode()).hexdigest()
+        logger.debug("[DAS] canary_key=%s session_id=%s", das_canary_key[:12], session_id[:8])
         payload = self._build_compose_payload(
             artifacts=artifacts,
             ordered_outcomes=ordered_outcomes,
@@ -3541,6 +3547,11 @@ class UnifiedCommandProcessor:
 
         # Build response stub (same pattern as _attempt_workspace_failover)
         command_id = uuid.uuid4().hex
+        session_id = str(uuid.uuid4())
+        _normalized_cmd = re.sub(r"\s+", " ", command_text.lower().strip())
+        _das_canary_raw = f"{session_id}:{_normalized_cmd}"
+        das_canary_key = hashlib.sha256(_das_canary_raw.encode()).hexdigest()
+        logger.debug("[DAS] canary_key=%s session_id=%s", das_canary_key[:12], session_id[:8])
         response_stub = SimpleNamespace(
             intent="action",
             domain="workspace",
