@@ -189,6 +189,18 @@ class ProactiveDriveService:
                 self._emit_drive_tick(state, reason)
 
                 if state == "ELIGIBLE" and self._engine:
+                    # Gate: check consciousness health before exploring
+                    _cb = getattr(self, "_consciousness_bridge", None)
+                    if _cb is not None:
+                        _healthy, _reason = _cb.is_system_healthy_for_exploration()
+                        if not _healthy:
+                            logger.info(
+                                "[ProactiveDrive] Exploration blocked by consciousness: %s",
+                                _reason,
+                            )
+                            self._emit_drive_tick("MEASURING", f"Blocked: {_reason}")
+                            continue
+
                     target = self._engine.select_target()
                     if target:
                         logger.info(

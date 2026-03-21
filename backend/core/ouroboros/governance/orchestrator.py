@@ -500,6 +500,19 @@ class GovernedOrchestrator:
                             "[Orchestrator] Injecting %d episodic failure(s) into retry context [%s]",
                             _episodic_memory.total_episodes, ctx.op_id,
                         )
+                # Inject consciousness fragile-file memory into retry context
+                if _consciousness_bridge is not None:
+                    try:
+                        _fragile_ctx = _consciousness_bridge.get_fragile_file_context(
+                            ctx.target_files
+                        )
+                        if _fragile_ctx:
+                            _existing_mem = _retry_ctx_kwargs.get("strategic_memory_prompt", "")
+                            _retry_ctx_kwargs["strategic_memory_prompt"] = (
+                                f"{_existing_mem}\n\n{_fragile_ctx}" if _existing_mem else _fragile_ctx
+                            )
+                    except Exception:
+                        pass
                 ctx = ctx.advance(OperationPhase.GENERATE_RETRY, **_retry_ctx_kwargs)
 
         assert generation is not None  # guaranteed by loop logic
