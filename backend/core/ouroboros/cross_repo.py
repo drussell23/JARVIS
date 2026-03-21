@@ -97,6 +97,15 @@ class EventType(Enum):
     HEALTH_CHECK = "health_check"
     SYNC_REQUEST = "sync_request"
 
+    # Dynamic Agent Synthesis events (DAS)
+    AGENT_SYNTHESIS_REQUESTED       = "agent_synthesis_requested"
+    AGENT_SYNTHESIS_CANARY_ACTIVE   = "agent_synthesis_canary_active"
+    AGENT_SYNTHESIS_COMPLETED       = "agent_synthesis_completed"
+    AGENT_SYNTHESIS_FAILED          = "agent_synthesis_failed"
+    CAPABILITY_GAP_UNRESOLVED       = "capability_gap_unresolved"
+    AGENT_SYNTHESIS_CONFLICT        = "agent_synthesis_conflict"
+    ROUTING_OSCILLATION_DETECTED    = "routing_oscillation_detected"
+
     # Refactoring events (v10.0 Advanced Refactoring Patterns)
     REFACTORING_STARTED = "refactoring_started"
     REFACTORING_COMPLETED = "refactoring_completed"

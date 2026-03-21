@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -1517,6 +1518,53 @@ class AgentRegistry:
                 self._version,
                 reason,
             )
+
+    def _route_to_canary(self, domain_id: str, das_canary_key: str) -> bool:
+        """Return True if this (domain_id, das_canary_key) pair should hit the canary.
+
+        Uses a stable bucket hash — same pair always maps to the same bucket,
+        enabling reproducible debugging and preventing flapping on retries.
+        Bucket percentage is read from DAS_CANARY_TRAFFIC_PCT (default 10).
+        """
+        pct = max(0, min(100, int(os.environ.get("DAS_CANARY_TRAFFIC_PCT", "10"))))
+        bucket = int(hashlib.sha256(f"{domain_id}:{das_canary_key}".encode()).hexdigest(), 16) % 100
+        return bucket < pct
+
+    def _check_graduation(self, domain_id: str) -> bool:
+        """Return True when the canary for *domain_id* meets all graduation gates.
+
+        Gates are read from environment variables so they can be tuned without
+        a code deploy.  In the absence of live telemetry the method returns
+        False conservatively — external callers are expected to supply
+        per-domain metrics via the DomainTrustLedger.
+
+        Current implementation: reads env-var thresholds and checks the
+        in-memory active-route counters.  Full metric-driven graduation is
+        wired via DomainTrustLedger in the synthesis pipeline.
+        """
+        min_requests = int(os.environ.get("DAS_CANARY_MIN_REQUESTS", "10"))
+        min_elapsed_s = float(os.environ.get("DAS_CANARY_MIN_ELAPSED_S", "300"))
+        min_sessions = int(os.environ.get("DAS_CANARY_MIN_SESSIONS", "3"))
+        max_error_rate = float(os.environ.get("DAS_CANARY_MAX_ERROR_RATE", "0.01"))
+
+        # Retrieve per-domain canary stats stored by the synthesis pipeline.
+        # Keys: _canary_stats[domain_id] = {"requests": int, "errors": int,
+        #        "start_ts": float, "distinct_sessions": set}
+        stats = getattr(self, "_canary_stats", {}).get(domain_id)
+        if stats is None:
+            return False
+
+        requests: int = stats.get("requests", 0)
+        errors: int = stats.get("errors", 0)
+        start_ts: float = stats.get("start_ts", 0.0)
+        distinct_sessions: int = len(stats.get("distinct_sessions", set()))
+        elapsed_s: float = time.time() - start_ts
+        error_rate: float = errors / requests if requests > 0 else 1.0
+
+        volume_ok = requests >= min_requests or (
+            elapsed_s >= min_elapsed_s and distinct_sessions >= min_sessions
+        )
+        return volume_ok and error_rate <= max_error_rate
 
     def __repr__(self) -> str:
         """String representation."""

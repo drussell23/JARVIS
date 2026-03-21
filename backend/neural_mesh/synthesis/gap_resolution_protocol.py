@@ -35,6 +35,12 @@ log = logging.getLogger(__name__)
 
 _POLICY_PATH = Path(__file__).parent / "gap_resolution_policy.yaml"
 
+# TRINITY_DREAM_DAS_ENABLED: reserved for future DreamEngine/ProphecyEngine integration.
+# Defaults to false; setting to true is a no-op in this implementation iteration.
+_TRINITY_DREAM_DAS_ENABLED: bool = os.environ.get(
+    "TRINITY_DREAM_DAS_ENABLED", "false"
+).lower() in ("true", "1")
+
 
 class ResolutionMode(str, Enum):
     A = "A"  # Fail Fast
@@ -212,3 +218,16 @@ class GapResolutionProtocol:
             self.classify_mode(event).value,
             retry_count,
         )
+        # Trinity observer hooks — fire-and-forget, observer-only.
+        # All calls wrapped in try/except so Trinity unavailability never
+        # blocks or breaks the DAS synthesis path.
+        try:
+            from backend.core.ouroboros.consciousness.health_cortex import HealthCortex  # noqa: PLC0415
+            HealthCortex().get_snapshot()  # touch health cortex to register DAS activity
+        except Exception:
+            pass
+        try:
+            from backend.core.ouroboros.consciousness.memory_engine import MemoryEngine  # noqa: PLC0415
+            MemoryEngine().ingest_outcome(event.domain_id)  # record domain synthesis attempt
+        except Exception:
+            pass
