@@ -411,17 +411,58 @@ class RuntimeTaskOrchestrator:
         plan_steps: List[Dict[str, Any]],
         ctx: Dict[str, Any],
     ) -> List[StepResolution]:
-        """Execute all resolved steps, using MultiAgentOrchestrator if available."""
-        executed: List[StepResolution] = []
+        """Execute all resolved steps using the DAG execution engine.
 
-        # Try MultiAgentOrchestrator for parallel execution
+        Primary: DAGPlanner builds a dependency graph → DAGExecutor runs it
+        with event-driven concurrency (independent nodes run in parallel).
+        Fallback: MultiAgentOrchestrator or sequential execution.
+        """
+        # Primary: DAG execution engine (event-driven concurrency)
+        try:
+            from backend.core.dag_execution_engine import DAGPlanner, DAGExecutor, NodeState
+            dag_plan = DAGPlanner.build(plan_steps, self._make_dag_node_executor(resolutions))
+            dag_executor = DAGExecutor(max_concurrency=8)
+            dag_result = await dag_executor.execute(dag_plan, workflow_context=ctx)
+
+            # Map DAG results back to StepResolutions
+            executed = []
+            for i, (resolution, step) in enumerate(zip(resolutions, plan_steps)):
+                node = dag_result.nodes.get(f"node-{i}")
+                if node and node.state == NodeState.COMPLETED:
+                    executed.append(StepResolution(
+                        step_goal=step["goal"],
+                        resolution=resolution.resolution,
+                        agent_name=resolution.agent_name,
+                        capability_used=resolution.capability_used,
+                        synthesized=resolution.synthesized,
+                        result=node.result,
+                        elapsed_s=node.elapsed_s,
+                    ))
+                elif node and node.state in (NodeState.FAILED, NodeState.BLOCKED):
+                    executed.append(StepResolution(
+                        step_goal=step["goal"],
+                        resolution=resolution.resolution,
+                        agent_name=resolution.agent_name,
+                        capability_used=resolution.capability_used,
+                        synthesized=resolution.synthesized,
+                        error=node.error,
+                        elapsed_s=node.elapsed_s,
+                    ))
+                else:
+                    executed.append(resolution)
+            return executed
+
+        except Exception as exc:
+            logger.warning("[RuntimeTask] DAG execution failed: %s — falling back", exc)
+
+        # Fallback 1: MultiAgentOrchestrator
         if self._orchestrator is not None and self._planner is not None:
             try:
                 return await self._execute_via_orchestrator(resolutions, plan_steps)
             except Exception as exc:
-                logger.warning("[RuntimeTask] Orchestrator execution failed: %s — falling back to sequential", exc)
+                logger.warning("[RuntimeTask] Orchestrator fallback failed: %s", exc)
 
-        # Fallback: sequential execution
+        # Fallback 2: sequential execution
         for resolution, step in zip(resolutions, plan_steps):
             result = await self._execute_single(resolution, step, ctx)
             executed.append(result)
