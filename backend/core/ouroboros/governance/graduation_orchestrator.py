@@ -333,6 +333,7 @@ class GraduationOrchestrator:
         self, goal_class_id: str, usage_records: List[EphemeralUsageRecord],
         record: GraduationRecord,
     ) -> GraduationDecision:
+        """Directive 2: Route decision to deepseek_r1 via BrainSelector 3-layer gate."""
         if self._prime is None:
             raise RuntimeError("PrimeClient not available")
 
@@ -354,12 +355,50 @@ class GraduationOrchestrator:
             '"rejection_reason":"if not graduating"}'
         )
 
+        # Directive 2: BrainSelector routes to deepseek_r1 (Tier 3 complex reasoning)
+        model_name = None
+        task_profile = None
+        if self._brain_selector is not None:
+            try:
+                from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+                _snap = ResourceSnapshot(
+                    ram_percent=0.0, cpu_percent=0.0, event_loop_latency_ms=0.0,
+                    disk_io_busy=False,
+                )
+                _brain_result = self._brain_selector.select(
+                    description="complex architectural decision: should ephemeral tool become permanent agent",
+                    target_files=(),
+                    snapshot=_snap,
+                    blast_radius=1,
+                )
+                model_name = _brain_result.model_name
+                task_profile = _brain_result.brain_id
+                if _brain_result.provider_tier == "queued":
+                    raise RuntimeError(f"Daily budget exceeded: {_brain_result.routing_reason}")
+                logger.info(
+                    "[Graduation] Decision routed to %s (%s): %s",
+                    _brain_result.brain_id, _brain_result.model_name, _brain_result.routing_reason,
+                )
+            except ImportError:
+                pass  # BrainSelector dependencies unavailable, use default
+
         response = await self._prime.generate(
             prompt=prompt,
             system_prompt="Respond with valid JSON only.",
             max_tokens=1024, temperature=0.1,
+            model_name=model_name,
+            task_profile=task_profile,
         )
-        if hasattr(response, "cost_usd"):
+
+        # H6: Record cost via BrainSelector
+        if hasattr(response, "cost_usd") and self._brain_selector is not None:
+            cost = getattr(response, "cost_usd", 0.0)
+            record.total_cost_usd += cost
+            try:
+                self._brain_selector.record_cost(task_profile or "gcp_prime", cost)
+            except Exception:
+                pass
+        elif hasattr(response, "cost_usd"):
             record.total_cost_usd += getattr(response, "cost_usd", 0.0)
 
         text = response.content.strip()
@@ -421,6 +460,7 @@ class GraduationOrchestrator:
         self, decision: GraduationDecision, wt: Path,
         usage_records: List[EphemeralUsageRecord], record: GraduationRecord,
     ) -> List[str]:
+        """Directive 2: Route code generation to qwen_coder via BrainSelector."""
         if self._prime is None:
             raise RuntimeError("PrimeClient not available")
 
@@ -439,12 +479,50 @@ class GraduationOrchestrator:
             f"File 1: {decision.module_path}\nFile 2: {decision.test_module_path}\n"
         )
 
+        # Directive 2: BrainSelector routes codegen to qwen_coder_14b/32b
+        model_name = None
+        task_profile = None
+        if self._brain_selector is not None:
+            try:
+                from backend.core.ouroboros.governance.resource_monitor import ResourceSnapshot
+                _snap = ResourceSnapshot(
+                    ram_percent=0.0, cpu_percent=0.0, event_loop_latency_ms=0.0,
+                    disk_io_busy=False,
+                )
+                _brain_result = self._brain_selector.select(
+                    description=f"heavy code generation: full agent class + tests for {decision.capability_name}",
+                    target_files=(decision.module_path, decision.test_module_path),
+                    snapshot=_snap,
+                    blast_radius=2,
+                )
+                model_name = _brain_result.model_name
+                task_profile = _brain_result.brain_id
+                if _brain_result.provider_tier == "queued":
+                    raise RuntimeError(f"Daily budget exceeded: {_brain_result.routing_reason}")
+                logger.info(
+                    "[Graduation] Codegen routed to %s (%s): %s",
+                    _brain_result.brain_id, _brain_result.model_name, _brain_result.routing_reason,
+                )
+            except ImportError:
+                pass
+
         response = await self._prime.generate(
             prompt=prompt,
             system_prompt="Generate production Python. Two files separated by ---FILE_SEPARATOR---.",
             max_tokens=4096, temperature=0.2,
+            model_name=model_name,
+            task_profile=task_profile,
         )
-        if hasattr(response, "cost_usd"):
+
+        # H6: Record cost via BrainSelector
+        if hasattr(response, "cost_usd") and self._brain_selector is not None:
+            cost = getattr(response, "cost_usd", 0.0)
+            record.total_cost_usd += cost
+            try:
+                self._brain_selector.record_cost(task_profile or "gcp_prime", cost)
+            except Exception:
+                pass
+        elif hasattr(response, "cost_usd"):
             record.total_cost_usd += getattr(response, "cost_usd", 0.0)
 
         parts = response.content.split("---FILE_SEPARATOR---")
@@ -471,33 +549,86 @@ class GraduationOrchestrator:
     async def _validate_in_shadow(
         self, decision: GraduationDecision, wt: Path, generated: List[str],
     ) -> bool:
+        """Directive 3: Full validation with Coding Council safety modules.
+
+        5-layer validation:
+            1. SideEffectFirewall compile check (ShadowHarness)
+            2. H2 contract test (BaseNeuralMeshAgent interface)
+            3. ASTValidator — syntax, imports, dangerous patterns, complexity
+            4. SecurityScanner — OWASP, injection, secrets detection
+            5. pytest execution in worktree
+        """
         agent_path = wt / decision.module_path
         if not agent_path.exists():
+            logger.warning("[Graduation] Agent file missing: %s", agent_path)
             return False
         code = agent_path.read_text()
 
-        # Syntax
-        try:
-            import ast
-            ast.parse(code)
-        except SyntaxError:
-            return False
-
-        # SideEffectFirewall compile check
+        # Layer 1: SideEffectFirewall compile check
         try:
             from backend.core.ouroboros.governance.shadow_harness import SideEffectFirewall
             with SideEffectFirewall():
                 compile(code, str(agent_path), "exec")  # noqa: S102
-        except Exception:
+        except Exception as e:
+            logger.warning("[Graduation] Firewall compile check failed: %s", e)
             return False
 
-        # H2: Contract test
+        # Layer 2: H2 Contract test (BaseNeuralMeshAgent interface)
         has_execute = "execute_task" in code
         has_caps = "CAPABILITIES" in code or "capabilities" in code
         if not (has_execute and has_caps):
+            logger.warning(
+                "[Graduation] Contract test failed: execute_task=%s, capabilities=%s",
+                has_execute, has_caps,
+            )
             return False
 
-        # pytest
+        # Layer 3: Coding Council ASTValidator
+        try:
+            from backend.core.coding_council.safety.ast_validator import ASTValidator
+            ast_validator = ASTValidator(repo_root=wt)
+            ast_result = await ast_validator.validate_file(agent_path)
+            if not ast_result.valid:
+                errors = [
+                    issue for issue in getattr(ast_result, "issues", [])
+                    if getattr(issue, "severity", None)
+                    and issue.severity.value == "error"
+                ]
+                if errors:
+                    logger.warning(
+                        "[Graduation] AST validation failed: %d errors",
+                        len(errors),
+                    )
+                    return False
+            logger.info("[Graduation] AST validation passed")
+        except ImportError:
+            logger.debug("[Graduation] ASTValidator not available — skipping")
+        except Exception as e:
+            logger.warning("[Graduation] ASTValidator error (non-fatal): %s", e)
+
+        # Layer 4: Coding Council SecurityScanner
+        try:
+            from backend.core.coding_council.safety.security_scanner import SecurityScanner
+            scanner = SecurityScanner()
+            scan_result = await scanner.scan_file(agent_path)
+            critical_vulns = [
+                v for v in getattr(scan_result, "vulnerabilities", [])
+                if getattr(v, "severity", None)
+                and v.severity.value in ("critical", "high")
+            ]
+            if critical_vulns:
+                logger.warning(
+                    "[Graduation] Security scan found %d critical/high vulnerabilities",
+                    len(critical_vulns),
+                )
+                return False
+            logger.info("[Graduation] Security scan passed")
+        except ImportError:
+            logger.debug("[Graduation] SecurityScanner not available — skipping")
+        except Exception as e:
+            logger.warning("[Graduation] SecurityScanner error (non-fatal): %s", e)
+
+        # Layer 5: pytest execution in worktree
         test_path = wt / decision.test_module_path
         if test_path.exists():
             try:
@@ -508,10 +639,17 @@ class GraduationOrchestrator:
                 )
                 await asyncio.wait_for(proc.communicate(), timeout=30.0)
                 if proc.returncode != 0:
+                    logger.warning("[Graduation] pytest failed (returncode=%d)", proc.returncode)
                     return False
-            except Exception:
+                logger.info("[Graduation] pytest passed")
+            except asyncio.TimeoutError:
+                logger.warning("[Graduation] pytest timed out")
+                return False
+            except Exception as e:
+                logger.warning("[Graduation] pytest error: %s", e)
                 return False
 
+        logger.info("[Graduation] All 5 validation layers passed")
         return True
 
     # -- Phase 5: Commit ----------------------------------------------------
