@@ -120,6 +120,16 @@ class AutonomyFeedbackEngine:
         self._rollback_counts: Dict[str, int] = defaultdict(int)
         self._brain_hint_threshold: int = 3
 
+        # Selection engine for scoring and ranking brain candidates
+        try:
+            from backend.core.ouroboros.governance.autonomy.selection_strategies import (
+                SelectionEngine,
+                SelectionStrategy,
+            )
+            self._selection_engine = SelectionEngine(default_strategy=SelectionStrategy.TOURNAMENT)
+        except ImportError:
+            self._selection_engine = None
+
         # Load persisted cursor on construction
         self._load_cursor()
 

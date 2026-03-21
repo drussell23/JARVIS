@@ -295,8 +295,9 @@ def _build_comm_protocol(
 
     # DurableJSONLTransport — persistent event log on disk
     try:
-        from backend.core.ouroboros.governance.comms.durable_jsonl_transport import DurableJsonlTransport
-        transports.append(DurableJsonlTransport())
+        from backend.core.ouroboros.governance.comms.durable_jsonl_transport import DurableJSONLTransport
+        _jsonl_dir = Path.home() / ".jarvis" / "ouroboros" / "event_log"
+        transports.append(DurableJSONLTransport(log_dir=_jsonl_dir))
         logger.info("[Integration] DurableJsonlTransport added to CommProtocol")
     except ImportError:
         logger.debug("[Integration] DurableJsonlTransport skipped: module not available")

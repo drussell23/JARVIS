@@ -353,6 +353,9 @@ class RuntimeTaskOrchestrator:
         # Code patterns
         if any(w in goal_lower for w in ("code", "fix bug", "implement", "refactor", "write function")):
             keywords.extend(["code_generation", "code_edit"])
+        # Shell/terminal patterns
+        if any(w in goal_lower for w in ("run", "terminal", "command", "shell", "npm", "pip", "git")):
+            keywords.extend(["bash", "shell_execution", "terminal"])
         # Vision patterns
         if any(w in goal_lower for w in ("screen", "screenshot", "what's on", "look at")):
             keywords.extend(["vision", "screen_capture", "visual_monitor"])

@@ -86,16 +86,22 @@ _SYSTEM_PROMPT = (
     '  "done": <bool>,          // true when the goal is fully achieved\n'
     '  "action_type": <str>,    // one of: click|fill|type|press|scroll|navigate\n'
     '  "detail": {              // action-specific parameters\n'
-    '    "x": <int>,            // for click (page coordinates)\n'
+    '    "element": <str>,      // PREFERRED for click: visible label/name of the element\n'
+    '    "role": <str>,         // PREFERRED for click: ARIA role (button, link, textbox, etc.)\n'
+    '    "text": <str>,         // for click: visible text content. For fill/type: text to enter\n'
+    '    "near_text": <str>,    // for click: text near the target element (disambiguation)\n'
+    '    "x": <int>,            // FALLBACK for click: pixel coordinates (use only if element/text unavailable)\n'
     '    "y": <int>,\n'
     '    "selector": <str>,     // CSS selector for fill\n'
-    '    "text": <str>,         // for fill / type\n'
     '    "key": <str>,          // for press (e.g. "Enter", "Tab")\n'
     '    "delta": <int>,        // for scroll (positive = down)\n'
     '    "url": <str>           // for navigate\n'
     "  },\n"
     '  "message": <str>         // brief explanation of what you\'re doing\n'
     "}\n\n"
+    "IMPORTANT: For click actions, ALWAYS prefer 'element' + 'role' over pixel coordinates. "
+    "The element name and role allow precise accessibility-based clicking. "
+    "Only use x/y pixel coordinates as a last resort when the element has no visible label.\n\n"
     "Only include relevant keys in 'detail'. "
     "When done=true, action_type and detail are ignored."
 )
@@ -425,11 +431,88 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
     async def _execute_action(
         self, page: Any, action_type: str, detail: Dict[str, Any]
     ) -> None:
-        """Dispatch a single Playwright action."""
+        """Dispatch a single Playwright action.
+
+        For click actions, uses a 3-tier fallback chain:
+            1. Accessibility: ARIA role/name selector (most precise, no coords needed)
+            2. Text content: Playwright text selector (finds visible text)
+            3. Pixel coordinates: raw mouse.click(x, y) (least precise, vision-only)
+
+        The vision model can return either:
+            - {"element": "Search", "role": "button"} → accessibility path
+            - {"x": 450, "y": 320} → pixel path (legacy fallback)
+            - {"text": "Download"} → text selector path
+        """
         if action_type == "click":
-            x = int(detail.get("x", 0))
-            y = int(detail.get("y", 0))
-            await page.mouse.click(x, y)
+            clicked = False
+
+            # Tier 1: Accessibility selector (ARIA role + name)
+            element_name = detail.get("element", "")
+            element_role = detail.get("role", "")
+            near_text = detail.get("near_text", "")
+            if element_name and not clicked:
+                try:
+                    # Playwright ARIA selector: role[name="..."]
+                    if element_role:
+                        selector = f'role={element_role}[name="{element_name}"]'
+                    else:
+                        selector = f'role=button[name="{element_name}"]'
+                    locator = page.locator(selector).first
+                    if await locator.count() > 0:
+                        await locator.click(timeout=5000)
+                        clicked = True
+                        logger.info("[VBA] Click via ARIA: %s (role=%s)", element_name, element_role)
+                except Exception as ax_err:
+                    logger.debug("[VBA] ARIA click failed for %r: %s", element_name, ax_err)
+
+            # Tier 1b: macOS AccessibilityResolver for native browser chrome
+            if not clicked and element_name:
+                try:
+                    from backend.neural_mesh.agents.accessibility_resolver import (
+                        get_accessibility_resolver,
+                    )
+                    resolver = get_accessibility_resolver()
+                    coords = await resolver.resolve(
+                        description=element_name,
+                        app_name="Google Chrome",
+                        role=element_role or None,
+                        near_text=near_text or None,
+                    )
+                    if coords:
+                        await page.mouse.click(coords["x"], coords["y"])
+                        clicked = True
+                        logger.info(
+                            "[VBA] Click via AccessibilityResolver: %s at (%d, %d)",
+                            element_name, coords["x"], coords["y"],
+                        )
+                except ImportError:
+                    pass
+                except Exception as resolver_err:
+                    logger.debug("[VBA] AccessibilityResolver failed: %s", resolver_err)
+
+            # Tier 2: Text content selector
+            text_content = detail.get("text", "")
+            if not clicked and text_content:
+                try:
+                    locator = page.get_by_text(text_content, exact=False).first
+                    if await locator.count() > 0:
+                        await locator.click(timeout=5000)
+                        clicked = True
+                        logger.info("[VBA] Click via text: %r", text_content)
+                except Exception as text_err:
+                    logger.debug("[VBA] Text click failed for %r: %s", text_content, text_err)
+
+            # Tier 3: Pixel coordinates (vision-only fallback)
+            if not clicked:
+                x = int(detail.get("x", 0))
+                y = int(detail.get("y", 0))
+                if x > 0 and y > 0:
+                    await page.mouse.click(x, y)
+                    clicked = True
+                    logger.info("[VBA] Click via pixel: (%d, %d)", x, y)
+
+            if not clicked:
+                logger.warning("[VBA] Click failed — no valid selector or coordinates in: %s", detail)
 
         elif action_type == "fill":
             selector: str = detail.get("selector", "")
