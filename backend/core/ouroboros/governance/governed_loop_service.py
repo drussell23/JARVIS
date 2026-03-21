@@ -1379,6 +1379,10 @@ class GovernedLoopService:
                         return result
 
                     elif not _done:
+                        # Timeout: cancel op_task to stop the orphaned orchestrator run.
+                        _op_task.cancel()
+                        # Reset bus in case stop was signalled just as timeout fired.
+                        self._user_signal_bus.reset()
                         # Timeout: neither finished — build CANCELLED result and return.
                         duration = time.monotonic() - start_time
                         result = OperationResult(
