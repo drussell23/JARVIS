@@ -105,6 +105,7 @@ class RuntimeTaskOrchestrator:
         consciousness: Any = None,
         gls: Any = None,
         prime_client: Any = None,
+        telemetry_bus: Any = None,
     ) -> None:
         self._registry = registry
         self._orchestrator = orchestrator
@@ -115,6 +116,7 @@ class RuntimeTaskOrchestrator:
         self._consciousness = consciousness
         self._gls = gls
         self._prime = prime_client
+        self._bus = telemetry_bus
 
     async def execute(self, query: str, context: Optional[Dict[str, Any]] = None) -> TaskResult:
         """Execute any user request. The universal entry point.
@@ -165,7 +167,7 @@ class RuntimeTaskOrchestrator:
         summary = self._build_summary(query, executed)
         logger.info("[RuntimeTask] %s: %s (%.1fs)", task_id, "SUCCESS" if success else "PARTIAL", elapsed)
 
-        return TaskResult(
+        result = TaskResult(
             task_id=task_id,
             original_query=query,
             steps=executed,
@@ -174,6 +176,12 @@ class RuntimeTaskOrchestrator:
             total_elapsed_s=elapsed,
             plan_reasoning=plan_reasoning,
         )
+
+        # --- Step 5: Emit telemetry for Trinity-wide observability ---
+        # This feeds: EliteDashboard ticker, LifecycleVoiceNarrator, ConsciousnessBridge
+        self._emit_task_telemetry(result)
+
+        return result
 
     # -----------------------------------------------------------------------
     # Step 1: Goal Decomposition
@@ -809,6 +817,42 @@ class RuntimeTaskOrchestrator:
             parts.append(f"{failed} failed: {'; '.join(errors[:3])}")
 
         return " | ".join(parts)
+
+    # -----------------------------------------------------------------------
+    # Step 5: Telemetry — Trinity-wide observability
+    # -----------------------------------------------------------------------
+
+    def _emit_task_telemetry(self, result: TaskResult) -> None:
+        """Emit a TelemetryEnvelope so all Trinity systems see action outcomes.
+
+        Feeds: EliteDashboard ticker, LifecycleVoiceNarrator, ConsciousnessBridge,
+        MacOSHostObserver, and any TelemetryBus subscriber.
+        """
+        if self._bus is None:
+            return
+        try:
+            from backend.core.telemetry_contract import TelemetryEnvelope
+            agents_used = [s.agent_name for s in result.steps if s.agent_name]
+            envelope = TelemetryEnvelope.create(
+                event_schema="reasoning.decision@1.0.0",
+                source="runtime_task_orchestrator",
+                trace_id=result.task_id,
+                span_id="execution_complete",
+                partition_key="reasoning",
+                payload={
+                    "command": result.original_query[:200],
+                    "success": result.success,
+                    "steps_total": len(result.steps),
+                    "steps_succeeded": sum(1 for s in result.steps if s.error is None),
+                    "agents_used": agents_used,
+                    "synthesized_count": sum(1 for s in result.steps if s.synthesized),
+                    "elapsed_s": round(result.total_elapsed_s, 2),
+                    "plan_reasoning": result.plan_reasoning[:200],
+                },
+            )
+            self._bus.emit(envelope)
+        except Exception as exc:
+            logger.debug("[RuntimeTask] Telemetry emit failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
