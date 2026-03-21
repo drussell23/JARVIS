@@ -1388,6 +1388,27 @@ class GovernedLoopService:
                 terminal_class=_tc,
             )
 
+            # ── Canary slice metrics ─────────────────────────────────────────────────
+            # record_operation matches file paths against registered slice prefixes.
+            # Must be called after duration and _rollback_occurred are computed.
+            if self._stack is not None and self._stack.canary is not None:
+                _canary_success = terminal_ctx.phase is OperationPhase.COMPLETE
+                _canary_files = (
+                    getattr(terminal_ctx, "target_files", None) or ctx.target_files
+                )
+                for _canary_fp in (_canary_files or ()):
+                    try:
+                        self._stack.canary.record_operation(
+                            file_path=str(_canary_fp),
+                            success=_canary_success,
+                            latency_s=duration,
+                            rolled_back=_rollback_occurred,
+                        )
+                    except Exception as _canary_exc:
+                        logger.debug(
+                            "[GovernedLoop] canary.record_operation error: %s", _canary_exc
+                        )
+
             self._completed_ops[dedupe_key] = result
             if self._ledger is not None:
                 _proof = _build_proof_artifact(
