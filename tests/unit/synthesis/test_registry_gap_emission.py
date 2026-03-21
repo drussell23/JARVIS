@@ -91,7 +91,7 @@ def test_no_gap_when_capability_found(registry):
 
 
 def test_das_canary_key_generation():
-    """das_canary_key = sha256(cmd_id:normalized_command) — verify formula."""
+    """das_canary_key = sha256(session_id:normalized_command) — verify formula."""
     import hashlib
     import re
 
