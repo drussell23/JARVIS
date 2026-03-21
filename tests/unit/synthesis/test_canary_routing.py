@@ -92,3 +92,20 @@ def test_check_graduation_fails_high_error_rate(monkeypatch):
         }
     }
     assert not registry._check_graduation("vision_action:xcode")
+
+def test_check_graduation_time_based_path(monkeypatch):
+    """_check_graduation passes via time+sessions OR-branch even when below min_requests."""
+    monkeypatch.setenv("DAS_CANARY_MIN_REQUESTS", "50")  # high threshold, won't be met
+    monkeypatch.setenv("DAS_CANARY_MIN_ELAPSED_S", "300")
+    monkeypatch.setenv("DAS_CANARY_MIN_SESSIONS", "3")
+    monkeypatch.setenv("DAS_CANARY_MAX_ERROR_RATE", "0.01")
+    registry = AgentRegistry()
+    registry._canary_stats = {
+        "vision_action:xcode": {
+            "requests": 8,  # below min_requests=50
+            "errors": 0,
+            "start_ts": time.time() - 400,  # elapsed > 300s
+            "distinct_sessions": {"s1", "s2", "s3", "s4"},  # sessions >= 3
+        }
+    }
+    assert registry._check_graduation("vision_action:xcode")
