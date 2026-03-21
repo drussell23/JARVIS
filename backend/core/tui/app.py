@@ -167,6 +167,20 @@ class JarvisDashboard(App):
             deps_str = "  ".join(f"{k}={v}" for k, v in self.system_data.gate_deps.items())
             log.write(f"  Deps:     {deps_str}")
         log.write("")
+        # --- TELEMETRY BUS (spec: only exception to envelopes-only rule) ---
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus
+            m = get_telemetry_bus().get_metrics()
+            log.write("[bold]TELEMETRY BUS[/]")
+            log.write(f"  Emitted:     {m.get('emitted', 0):,}")
+            log.write(f"  Delivered:   {m.get('delivered', 0):,}")
+            log.write(f"  Dropped:     {m.get('dropped', 0):,}")
+            log.write(f"  Deduped:     {m.get('deduped', 0):,}")
+            log.write(f"  Dead-letter: {m.get('dead_letter', 0):,}")
+            log.write(f"  Queue:       {m.get('queue_size', 0):,}")
+        except Exception:
+            log.write("[dim]TELEMETRY BUS  (unavailable)[/]")
+        log.write("")
         log.write("[bold]RECENT TRANSITIONS[/]")
         for t in list(self.system_data.recent_transitions)[-10:]:
             ts = datetime.fromtimestamp(t.timestamp).strftime("%H:%M:%S")
