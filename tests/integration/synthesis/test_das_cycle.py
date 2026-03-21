@@ -7,7 +7,6 @@ They use asyncio but stay in-process — no external services required.
 """
 import asyncio
 import pytest
-from unittest.mock import AsyncMock, patch
 
 from backend.neural_mesh.synthesis.gap_signal_bus import CapabilityGapEvent, GapSignalBus
 from backend.neural_mesh.synthesis.gap_resolution_protocol import (
@@ -189,7 +188,11 @@ def test_appendix_b_trinity_emit_has_noop_fallback():
 
 
 def test_appendix_b_event_type_both_repos():
-    """Check 10: 7 DAS EventType values exist in both JARVIS cross_repo.py and Reactor-Core."""
+    """Check 10: 7 DAS EventType values exist in JARVIS cross_repo.py AND Reactor-Core.
+
+    Reactor-Core is checked via pytest.importorskip — skipped when reactor_core is
+    not installed in the current environment (it lives in a separate repo).
+    """
     from backend.core.ouroboros.cross_repo import EventType as JarvisEventType
     das_events = [
         "AGENT_SYNTHESIS_REQUESTED",
@@ -202,3 +205,8 @@ def test_appendix_b_event_type_both_repos():
     ]
     for name in das_events:
         assert hasattr(JarvisEventType, name), f"Missing JARVIS EventType: {name}"
+    # Reactor-Core side — verified when reactor-core is installed
+    eb = pytest.importorskip("reactor_core.integration.event_bridge")
+    ReactorEventType = eb.EventType
+    for name in das_events:
+        assert hasattr(ReactorEventType, name), f"Missing Reactor-Core EventType: {name}"
