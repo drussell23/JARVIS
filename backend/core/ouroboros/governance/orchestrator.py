@@ -59,6 +59,7 @@ from backend.core.ouroboros.governance.risk_engine import (
     RiskClassification,
     RiskTier,
 )
+from backend.core.ouroboros.governance.policy_engine import PolicyEngine, PolicyDecision
 from backend.core.ouroboros.governance.saga.saga_apply_strategy import SagaApplyStrategy
 from backend.core.ouroboros.governance.saga.cross_repo_verifier import CrossRepoVerifier
 from backend.core.ouroboros.governance.saga.saga_types import RepoPatch, SagaTerminalState
@@ -282,6 +283,29 @@ class GovernedOrchestrator:
         profile = self._build_profile(ctx)
         classification = self._stack.risk_engine.classify(profile)
         risk_tier = classification.tier
+
+        # ---- Policy engine check (declarative YAML rules) ----
+        # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
+        # explicit deny rules in policy files can override the risk engine.
+        # Wrapped in hasattr + try/except so the pipeline is never broken
+        # by a missing or misconfigured policy_engine attribute.
+        if hasattr(self._stack, "policy_engine") and self._stack.policy_engine is not None:
+            try:
+                _policy_engine: PolicyEngine = self._stack.policy_engine
+                for _tf in ctx.target_files:
+                    _policy_decision = _policy_engine.classify(tool="edit", target=str(_tf))
+                    if _policy_decision is PolicyDecision.BLOCKED:
+                        logger.info(
+                            "[Orchestrator] PolicyEngine BLOCKED op=%s target=%r",
+                            ctx.op_id, _tf,
+                        )
+                        risk_tier = RiskTier.BLOCKED
+                        break
+            except Exception:
+                logger.warning(
+                    "[Orchestrator] PolicyEngine raised during CLASSIFY for op=%s; continuing",
+                    ctx.op_id, exc_info=True,
+                )
 
         if risk_tier is RiskTier.BLOCKED:
             ctx = ctx.advance(

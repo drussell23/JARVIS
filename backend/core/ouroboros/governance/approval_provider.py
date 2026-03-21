@@ -120,6 +120,10 @@ class _PendingRequest:
     result: Optional[ApprovalResult]
     event: asyncio.Event
     created_at: datetime
+    elicitation_question: Optional[str] = None
+    elicitation_options: Optional[List[str]] = None
+    elicitation_answer: Optional[str] = None
+    elicitation_event: Optional[asyncio.Event] = None
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +230,42 @@ class ApprovalProvider(Protocol):
         Returns
         -------
         ApprovalResult
+
+        Raises
+        ------
+        KeyError
+            If *request_id* is unknown.
+        """
+        ...  # pragma: no cover
+
+    async def elicit(
+        self,
+        request_id: str,
+        question: str,
+        options: Optional[List[str]] = None,
+        timeout_s: float = 300.0,
+    ) -> Optional[str]:
+        """Ask a clarifying question mid-operation and await a human answer.
+
+        Blocks until :meth:`_set_elicitation_answer` is called or *timeout_s*
+        expires.  Never raises on timeout — returns ``None`` instead so callers
+        can decide how to proceed without an answer.
+
+        Parameters
+        ----------
+        request_id:
+            The request identifier returned by :meth:`request`.
+        question:
+            The free-text question to present to the operator.
+        options:
+            Optional list of acceptable answers to guide the human.
+        timeout_s:
+            Maximum seconds to wait for a response (default 300).
+
+        Returns
+        -------
+        Optional[str]
+            The answer string, or ``None`` if the timeout expired.
 
         Raises
         ------
@@ -422,6 +462,85 @@ class CLIApprovalProvider:
                 }
             )
         return result
+
+    # -- elicitation --
+
+    def _set_elicitation_answer(self, request_id: str, answer: str) -> None:
+        """Programmatically supply an answer for a pending elicitation.
+
+        Intended for use by API handlers, TUI callbacks, or tests.  Sets the
+        answer on the ``_PendingRequest`` and signals the waiting ``elicit()``
+        coroutine via the per-elicitation :class:`asyncio.Event`.
+
+        Parameters
+        ----------
+        request_id:
+            The request identifier returned by :meth:`request`.
+        answer:
+            The answer string to deliver to the waiting ``elicit()`` call.
+
+        Raises
+        ------
+        KeyError
+            If *request_id* is unknown.
+        """
+        pending = self._get_or_raise(request_id)
+        pending.elicitation_answer = answer
+        if pending.elicitation_event is not None:
+            pending.elicitation_event.set()
+
+    async def elicit(
+        self,
+        request_id: str,
+        question: str,
+        options: Optional[List[str]] = None,
+        timeout_s: float = 300.0,
+    ) -> Optional[str]:
+        """Ask a clarifying question mid-operation and await a human answer.
+
+        Sets the elicitation fields on the ``_PendingRequest``, then waits on
+        a fresh :class:`asyncio.Event` until :meth:`_set_elicitation_answer`
+        delivers an answer or *timeout_s* elapses.
+
+        Parameters
+        ----------
+        request_id:
+            The request identifier returned by :meth:`request`.
+        question:
+            The free-text question to present to the operator.
+        options:
+            Optional list of acceptable answers to guide the human.
+        timeout_s:
+            Maximum seconds to wait (default 300).
+
+        Returns
+        -------
+        Optional[str]
+            The answer string, or ``None`` if the timeout expired.
+
+        Raises
+        ------
+        KeyError
+            If *request_id* is unknown.
+        """
+        pending = self._get_or_raise(request_id)
+        pending.elicitation_question = question
+        pending.elicitation_options = options
+        pending.elicitation_event = asyncio.Event()
+        pending.elicitation_answer = None
+        logger.info(
+            "[Approval] ELICIT: %s question=%r options=%r",
+            request_id, question, options,
+        )
+        try:
+            await asyncio.wait_for(pending.elicitation_event.wait(), timeout=timeout_s)
+            return pending.elicitation_answer
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Approval] ELICIT TIMEOUT: %s after %.1fs — no answer received",
+                request_id, timeout_s,
+            )
+            return None
 
     # -- internal --
 

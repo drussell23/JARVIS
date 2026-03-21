@@ -585,12 +585,32 @@ class GovernedLoopConfig:
 
     @classmethod
     def from_env(cls, args: Any = None, project_root: Optional[Path] = None) -> GovernedLoopConfig:
-        """Build config from environment variables with safe defaults."""
+        """Build config from environment variables with safe defaults.
+
+        Resolution order (highest priority wins):
+          1. Environment variables
+          2. <repo_root>/.jarvis/governance.local.yaml
+          3. <repo_root>/.jarvis/governance.yaml
+          4. ~/.jarvis/governance.yaml  (global defaults)
+          5. Hard-coded defaults below
+        """
         import os
+        from backend.core.ouroboros.governance.config_loader import load_layered_config
 
         resolved_root = project_root if project_root is not None else Path(
             os.getenv("JARVIS_PROJECT_ROOT", os.getcwd())
         )
+        _yaml_cfg = load_layered_config(global_root=Path.home(), repo_root=resolved_root)
+
+        def _cfg(key: str, env_var: str, default: str) -> str:
+            env_val = os.environ.get(env_var)
+            if env_val is not None:
+                return env_val
+            yaml_val = _yaml_cfg.get(key)
+            if yaml_val is not None:
+                return str(yaml_val)
+            return default
+
         return cls(
             project_root=resolved_root,
             claude_api_key=os.getenv("ANTHROPIC_API_KEY"),
@@ -604,24 +624,24 @@ class GovernedLoopConfig:
                 os.getenv("JARVIS_GOVERNED_CLAUDE_DAILY_BUDGET", "10.00")
             ),
             generation_timeout_s=float(
-                os.getenv("JARVIS_GOVERNED_GENERATION_TIMEOUT", "120.0")
+                _cfg("generation_timeout_s", "JARVIS_GENERATION_TIMEOUT_S", "120")
             ),
             context_expansion_timeout_s=float(
                 os.getenv("JARVIS_GOVERNED_EXPANSION_TIMEOUT", "30.0")
             ),
             approval_timeout_s=float(
-                os.getenv("JARVIS_GOVERNED_APPROVAL_TIMEOUT", "600.0")
+                _cfg("approval_timeout_s", "JARVIS_APPROVAL_TIMEOUT_S", "600")
             ),
             health_probe_interval_s=float(
                 os.getenv("JARVIS_GOVERNED_HEALTH_PROBE_INTERVAL", "30.0")
             ),
             max_concurrent_ops=int(
-                os.getenv("JARVIS_GOVERNED_MAX_CONCURRENT_OPS", "2")
+                _cfg("max_concurrent_ops", "JARVIS_GOVERNED_MAX_CONCURRENT_OPS", "2")
             ),
             cold_start_grace_s=float(os.environ.get("JARVIS_COLD_START_GRACE_S", "300")),
             approval_ttl_s=float(os.environ.get("JARVIS_APPROVAL_TTL_S", "1800")),
             pipeline_timeout_s=float(
-                os.environ.get("JARVIS_PIPELINE_TIMEOUT_S", "600.0")
+                _cfg("pipeline_timeout_s", "JARVIS_PIPELINE_TIMEOUT_S", "600.0")
             ),
             tool_use_enabled=os.environ.get("JARVIS_GOVERNED_TOOL_USE_ENABLED", "false").lower() == "true",
             max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "5")),
