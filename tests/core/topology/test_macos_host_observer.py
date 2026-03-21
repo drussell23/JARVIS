@@ -1,7 +1,5 @@
 """Tests for MacOSHostObserver — passive host environment daemon."""
-import asyncio
 import os
-import tempfile
 import time
 
 import pytest
