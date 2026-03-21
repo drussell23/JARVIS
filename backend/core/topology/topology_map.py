@@ -9,7 +9,7 @@ if TYPE_CHECKING:
     from backend.core.topology.hardware_env import HardwareEnvironmentState
 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class CapabilityNode:
     """A discrete capability known to Trinity."""
     name: str
