@@ -33,6 +33,17 @@ from backend.core.topology.architectural_proposal import (
     ArchitecturalProposal,
     ShadowTestResult,
 )
+from backend.core.topology.macos_host_observer import (
+    EnvironmentChange,
+    HostEvent,
+    MacOSHostObserver,
+    get_host_observer,
+)
+from backend.core.topology.tendril_manager import (
+    TendrilManager,
+    TendrilOutcome,
+    TendrilState,
+)
 
 __all__ = [
     "ComputeTier", "GPUState", "HardwareEnvironmentState",
@@ -42,4 +53,6 @@ __all__ = [
     "PIDController", "ResourceGovernor",
     "DeadEndClass", "DeadEndClassifier", "ExplorationSentinel", "SentinelOutcome",
     "ArchitecturalProposal", "ShadowTestResult",
+    "EnvironmentChange", "HostEvent", "MacOSHostObserver", "get_host_observer",
+    "TendrilManager", "TendrilOutcome", "TendrilState",
 ]
