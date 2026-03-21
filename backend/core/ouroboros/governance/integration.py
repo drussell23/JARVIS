@@ -293,6 +293,24 @@ def _build_comm_protocol(
         except Exception as exc:
             logger.debug("[Integration] LangfuseTransport skipped: %s", exc)
 
+    # RemoteHTTPTransport — forwards events to J-Prime (cross-repo visibility)
+    _prime_comm_endpoint = os.environ.get("JARVIS_PRIME_COMM_ENDPOINT", "")
+    if _prime_comm_endpoint:
+        try:
+            from backend.core.ouroboros.governance.comms.remote_http_transport import (
+                RemoteHTTPTransport,
+            )
+            _remote = RemoteHTTPTransport(endpoint=_prime_comm_endpoint)
+            transports.append(_remote)
+            logger.info(
+                "[Integration] RemoteHTTPTransport added to CommProtocol: %s",
+                _prime_comm_endpoint,
+            )
+        except ImportError:
+            logger.debug("[Integration] RemoteHTTPTransport skipped: module not available")
+        except Exception as exc:
+            logger.debug("[Integration] RemoteHTTPTransport skipped: %s", exc)
+
     # Extra transports (for testing / future extension)
     if extra_transports:
         transports.extend(extra_transports)
