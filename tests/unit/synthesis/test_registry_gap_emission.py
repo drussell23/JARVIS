@@ -100,11 +100,9 @@ def test_das_canary_key_generation():
 
     session_id = "test-session-abc"
     command_text = "  Open My Email  "
-    expected = hashlib.sha256(
-        f"{session_id}:{_normalize_command(command_text)}".encode()
-    ).hexdigest()
+    # Pre-computed oracle: sha256("test-session-abc:open my email")
+    expected = "6310ac6e73d38d72990dd5cd62dcd59a117917da963fd9a0c01fd21b45d1714a"
 
-    # Verify the formula is deterministic and matches expected hash
     result = hashlib.sha256(
         f"{session_id}:{_normalize_command(command_text)}".encode()
     ).hexdigest()
