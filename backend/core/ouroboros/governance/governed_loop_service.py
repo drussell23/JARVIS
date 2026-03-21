@@ -1105,6 +1105,10 @@ class GovernedLoopService:
 
         # Execute pipeline
         self._active_ops.add(dedupe_key)
+        # --- Proactive Drive telemetry hook (entry) ---
+        _pds = getattr(self, "_proactive_drive_service", None)
+        if _pds is not None:
+            _pds.record_sample("jarvis", depth=len(self._active_ops), latency_ms=0.0)
         _locked_files: list = []
         for _fp in ctx.target_files:
             _canonical = str(__import__("pathlib").Path(_fp).resolve())
@@ -1635,6 +1639,11 @@ class GovernedLoopService:
 
         finally:
             self._active_ops.discard(dedupe_key)
+            # --- Proactive Drive telemetry hook (completion) ---
+            _pds = getattr(self, "_proactive_drive_service", None)
+            if _pds is not None:
+                _elapsed_ms = (time.monotonic() - start_time) * 1000.0
+                _pds.record_sample("jarvis", depth=len(self._active_ops), latency_ms=_elapsed_ms)
             for _canonical in _locked_files:
                 self._active_file_ops.discard(_canonical)
             # Phase 4: clean up per-op FSM context
