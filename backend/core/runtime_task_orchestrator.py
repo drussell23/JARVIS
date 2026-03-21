@@ -117,6 +117,7 @@ class RuntimeTaskOrchestrator:
         self._gls = gls
         self._prime = prime_client
         self._bus = telemetry_bus
+        self._live_agents: Dict[str, Any] = {}  # lazy agent instance cache
 
     async def execute(self, query: str, context: Optional[Dict[str, Any]] = None) -> TaskResult:
         """Execute any user request. The universal entry point.
@@ -659,6 +660,40 @@ class RuntimeTaskOrchestrator:
                 elapsed_s=time.monotonic() - start,
             )
 
+    # Lazy-instantiated agent cache — maps agent_name → live agent instance
+    _live_agents: Dict[str, Any] = {}
+
+    # Agent class registry — maps agent_name → (module_path, class_name)
+    _AGENT_CLASSES: Dict[str, Tuple[str, str]] = {
+        "visual_browser_agent": ("backend.neural_mesh.agents.visual_browser_agent", "VisualBrowserAgent"),
+        "web_search_agent": ("backend.neural_mesh.agents.web_search_agent", "WebSearchAgent"),
+        "native_app_control_agent": ("backend.neural_mesh.agents.native_app_control_agent", "NativeAppControlAgent"),
+        "google_workspace_agent": ("backend.neural_mesh.agents.google_workspace_agent", "GoogleWorkspaceAgent"),
+        "spatial_awareness_agent": ("backend.neural_mesh.agents.spatial_awareness_agent", "SpatialAwarenessAgent"),
+    }
+
+    async def _get_live_agent(self, agent_name: str) -> Any:
+        """Get or lazily create a live agent instance for dispatch."""
+        if agent_name in self._live_agents:
+            return self._live_agents[agent_name]
+
+        entry = self._AGENT_CLASSES.get(agent_name)
+        if entry is None:
+            return None
+
+        module_path, class_name = entry
+        try:
+            import importlib
+            mod = importlib.import_module(module_path)
+            cls = getattr(mod, class_name)
+            instance = cls()
+            self._live_agents[agent_name] = instance
+            logger.info("[RuntimeTask] Lazy-instantiated live agent: %s", agent_name)
+            return instance
+        except Exception as exc:
+            logger.warning("[RuntimeTask] Failed to instantiate %s: %s", agent_name, exc)
+            return None
+
     async def _dispatch_to_agent(
         self, agent_name: str, goal: str, step: Dict[str, Any],
     ) -> Any:
@@ -666,10 +701,10 @@ class RuntimeTaskOrchestrator:
         if self._registry is None:
             raise RuntimeError("AgentRegistry not available")
 
-        # Build payload for the agent
+        # Build payload for the agent — do NOT set "action" key;
+        # each agent's execute_task() decides its own default action.
         payload = {
             "goal": goal,
-            "action": "execute_task",
         }
         if step.get("target_app"):
             payload["app_name"] = step["target_app"]
@@ -678,28 +713,33 @@ class RuntimeTaskOrchestrator:
         if "url" in goal.lower() or "youtube" in goal.lower() or "browse" in goal.lower():
             payload["url"] = self._extract_url(goal)
 
-        # Use CoordinatorAgent for delegation if available
+        # --- Primary: Get a live agent instance and call execute_task() ---
+        live_agent = await self._get_live_agent(agent_name)
+        if live_agent is not None and hasattr(live_agent, "execute_task"):
+            logger.info("[RuntimeTask] Dispatching to live agent %s: %s", agent_name, goal[:80])
+            return await live_agent.execute_task(payload)
+
+        # --- Fallback: Try coordinator delegation ---
         try:
-            agent_info = await self._registry.get_agent("coordinator_agent")
-            if agent_info:
-                from backend.neural_mesh.base.base_neural_mesh_agent import MessageType
-                # Delegate through coordinator
-                coordinator = await self._registry.get_agent("coordinator_agent")
-                if coordinator and hasattr(coordinator, "request"):
-                    return await coordinator.request(
-                        to_agent=agent_name,
-                        payload=payload,
-                        timeout=60.0,
-                    )
+            coordinator_info = await self._registry.get_agent("coordinator_agent")
+            if coordinator_info and hasattr(coordinator_info, "request"):
+                return await coordinator_info.request(
+                    to_agent=agent_name,
+                    payload=payload,
+                    timeout=60.0,
+                )
         except Exception:
             pass
 
-        # Direct dispatch fallback
+        # --- Fallback: Direct dispatch if registry entry has execute_task ---
         agent_info = await self._registry.get_agent(agent_name)
         if agent_info and hasattr(agent_info, "execute_task"):
             return await agent_info.execute_task(payload)
 
-        return {"status": "dispatched", "agent": agent_name, "goal": goal}
+        raise RuntimeError(
+            f"Agent '{agent_name}' has no live instance and cannot be instantiated. "
+            f"Goal: {goal}"
+        )
 
     async def _dispatch_to_governance(self, goal: str, step: Dict[str, Any]) -> Any:
         """Route a code change request to Ouroboros governance pipeline."""
@@ -812,15 +852,46 @@ class RuntimeTaskOrchestrator:
 
     @staticmethod
     def _extract_url(goal: str) -> str:
-        """Extract a URL from a goal string, or construct one."""
+        """Extract a URL from a goal string, or construct a search URL."""
         import re
+        from urllib.parse import quote_plus
+
         url_match = re.search(r'https?://\S+', goal)
         if url_match:
             return url_match.group(0)
-        if "youtube" in goal.lower():
+
+        goal_lower = goal.lower()
+
+        # YouTube search — extract the search term from the goal
+        if "youtube" in goal_lower:
+            # Remove common command prefixes to isolate the search query
+            search_term = re.sub(
+                r"^(search|find|look up|browse|go to|open|play)\s+",
+                "", goal_lower,
+            )
+            search_term = re.sub(
+                r"\b(on|for|in|at|from)\s+(youtube|yt)\b",
+                "", search_term,
+            )
+            search_term = re.sub(r"\byoutube\b", "", search_term).strip()
+            if search_term:
+                return f"https://www.youtube.com/results?search_query={quote_plus(search_term)}"
             return "https://www.youtube.com"
-        if "google" in goal.lower():
+
+        if "google" in goal_lower:
+            search_term = re.sub(
+                r"^(search|find|look up|browse)\s+",
+                "", goal_lower,
+            )
+            search_term = re.sub(
+                r"\b(on|for|in|at|from)\s+google\b",
+                "", search_term,
+            )
+            search_term = re.sub(r"\bgoogle\b", "", search_term).strip()
+            if search_term:
+                return f"https://www.google.com/search?q={quote_plus(search_term)}"
             return "https://www.google.com"
+
         return ""
 
     # -----------------------------------------------------------------------
