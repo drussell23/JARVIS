@@ -29,8 +29,9 @@ async def test_wait_for_stop_resolves_after_request_stop():
         await asyncio.sleep(0.01)
         bus.request_stop()
 
-    asyncio.create_task(trigger())
+    trigger_task = asyncio.create_task(trigger())
     await asyncio.wait_for(bus.wait_for_stop(), timeout=1.0)
+    await trigger_task  # ensure trigger completed cleanly
     assert bus.is_stop_requested()
 
 

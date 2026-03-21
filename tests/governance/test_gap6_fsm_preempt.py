@@ -53,3 +53,37 @@ def test_suspended_ev_preempt_is_noop():
     # Unhandled event in SUSPENDED_PREEMPTED -> same state, not terminal
     assert decision.to_state == LoopState.SUSPENDED_PREEMPTED
     assert not decision.terminal
+
+
+def test_rehydrating_ev_preempt_transitions_to_failed_permanent():
+    engine = PreemptionFsmEngine()
+    ctx = LoopRuntimeContext(op_id="test-op-3", state=LoopState.REHYDRATING)
+    budget = RetryBudget()
+    ti = build_transition_input(
+        op_id="test-op-3",
+        phase="GENERATE",
+        event=LoopEvent.EV_PREEMPT,
+        ctx=ctx,
+        checkpoint_seq=1,
+        metadata={},
+    )
+    decision = engine.decide(ctx, ti, budget)
+    assert decision.to_state == LoopState.FAILED_PERMANENT
+    assert decision.terminal
+
+
+def test_resumed_ev_preempt_transitions_to_failed_permanent():
+    engine = PreemptionFsmEngine()
+    ctx = LoopRuntimeContext(op_id="test-op-4", state=LoopState.RESUMED)
+    budget = RetryBudget()
+    ti = build_transition_input(
+        op_id="test-op-4",
+        phase="GENERATE",
+        event=LoopEvent.EV_PREEMPT,
+        ctx=ctx,
+        checkpoint_seq=1,
+        metadata={},
+    )
+    decision = engine.decide(ctx, ti, budget)
+    assert decision.to_state == LoopState.FAILED_PERMANENT
+    assert decision.terminal

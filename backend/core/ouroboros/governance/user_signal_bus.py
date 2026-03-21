@@ -10,7 +10,11 @@ import asyncio
 
 
 class UserSignalBus:
-    """Thread-safe (event-loop-safe) stop signal for in-flight operations.
+    """Event-loop-safe stop signal for in-flight operations.
+
+    All callers must be running in the same asyncio event loop.
+    NOT safe to call request_stop() from a non-async thread without
+    loop.call_soon_threadsafe().
 
     Usage:
         bus = UserSignalBus()

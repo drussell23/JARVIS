@@ -330,6 +330,9 @@ class PreemptionFsmEngine(FsmEngine):
         if ev == LoopEvent.EV_CANCELLED:
             return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
 
+        if ev == LoopEvent.EV_PREEMPT:
+            return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
+
         return self._noop(cs, ev, ctx.retry_index)
 
     def _from_resumed(
@@ -353,6 +356,9 @@ class PreemptionFsmEngine(FsmEngine):
             )
 
         if ev == LoopEvent.EV_CANCELLED:
+            return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
+
+        if ev == LoopEvent.EV_PREEMPT:
             return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
 
         return self._noop(cs, ev, ctx.retry_index)
