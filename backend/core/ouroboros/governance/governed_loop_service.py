@@ -1650,6 +1650,19 @@ class GovernedLoopService:
             if _pds is not None:
                 _elapsed_ms = (time.monotonic() - start_time) * 1000.0
                 _pds.record_sample("jarvis", depth=len(self._active_ops), latency_ms=_elapsed_ms)
+            # --- Graduation tracker hook (record outcome) ---
+            _grad = getattr(self, "_graduation_tracker", None)
+            if _grad is not None:
+                try:
+                    _success = hasattr(result, "terminal_phase") and str(getattr(result.terminal_phase, "name", "")).upper() == "COMPLETE"
+                    _rolled = hasattr(result, "rolled_back") and getattr(result, "rolled_back", False)
+                    _grad.record_operation_outcome(
+                        op_id=ctx.op_id,
+                        success=_success,
+                        rolled_back=_rolled,
+                    )
+                except Exception:
+                    pass
             for _canonical in _locked_files:
                 self._active_file_ops.discard(_canonical)
             # Phase 4: clean up per-op FSM context

@@ -843,6 +843,43 @@ class GovernedOrchestrator:
             )
             return ctx
 
+        # ---- Security Review (LLM-as-a-Judge) before APPROVE gate ----
+        try:
+            from backend.core.ouroboros.governance.security_reviewer import SecurityReviewer, SecurityVerdict
+            _sec_client = getattr(self._stack, "prime_client", None)
+            if _sec_client is None:
+                _sec_client = getattr(self, "_generator", None)
+                if hasattr(_sec_client, "_client"):
+                    _sec_client = _sec_client._client
+            _sec_reviewer = SecurityReviewer(prime_client=_sec_client)
+            if _sec_reviewer.is_enabled and best_candidate is not None:
+                _sec_result = await _sec_reviewer.review(
+                    candidate=best_candidate,
+                    target_files=list(ctx.target_files),
+                    description=ctx.description,
+                )
+                if _sec_result.verdict == SecurityVerdict.BLOCK:
+                    logger.warning(
+                        "[Orchestrator] Security review BLOCKED: %s [%s]",
+                        _sec_result.summary, ctx.op_id,
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="security_review_blocked",
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.BLOCKED,
+                        {"reason": "security_review_blocked", "summary": _sec_result.summary},
+                    )
+                    return ctx
+                elif _sec_result.verdict == SecurityVerdict.WARN:
+                    logger.info(
+                        "[Orchestrator] Security review WARN: %s [%s]",
+                        _sec_result.summary, ctx.op_id,
+                    )
+        except Exception:
+            logger.debug("[Orchestrator] SecurityReviewer not available", exc_info=True)
+
         # Autonomy tier gate: frozen at submit() to prevent TrustGraduator race.
         # "observe" → force APPROVAL_REQUIRED regardless of risk_tier.
         _frozen_tier = getattr(ctx, "frozen_autonomy_tier", "governed")
