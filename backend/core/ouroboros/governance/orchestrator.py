@@ -402,6 +402,29 @@ class GovernedOrchestrator:
         )
 
         # ---- Phase 2: ROUTE ----
+
+        # Telemetry host-binding enforcement for remote routes (split-brain guard)
+        _routing = getattr(ctx, "routing", None)
+        if _routing is not None and str(getattr(_routing, "name", "")).upper() in ("GCP_PRIME", "REMOTE"):
+            try:
+                from backend.core.ouroboros.governance.telemetry_contextualizer import (
+                    TelemetryContextualizer,
+                )
+                _tc = TelemetryContextualizer()
+                _exec_host = str(getattr(_routing, "endpoint", "local"))
+                _tel_host = str(getattr(ctx, "telemetry_host", _exec_host))
+                await _tc.assert_host_binding(
+                    execution_host=_exec_host,
+                    telemetry_host=_tel_host,
+                )
+            except RuntimeError as _bind_err:
+                logger.warning(
+                    "[Orchestrator] Telemetry host-binding violation: %s [%s]",
+                    _bind_err, ctx.op_id,
+                )
+            except Exception:
+                logger.debug("[Orchestrator] TelemetryContextualizer not available", exc_info=True)
+
         if self._config.context_expansion_enabled:
             ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
 
@@ -900,6 +923,25 @@ class GovernedOrchestrator:
 
         # ---- Phase 7: APPLY ----
         ctx = ctx.advance(OperationPhase.APPLY)
+
+        # Deploy gate: canary preflight before applying changes
+        try:
+            from backend.core.ouroboros.governance.deploy_gate import DeployGate
+            _canary = getattr(self._stack, "canary_controller", None)
+            if _canary is not None:
+                _gate = DeployGate(canary=_canary)
+                _preflight = _gate.preflight(
+                    service=ctx.primary_repo,
+                    target_files=list(ctx.target_files),
+                )
+                if not _preflight.passed:
+                    logger.warning(
+                        "[Orchestrator] DeployGate preflight FAILED: %s [%s]",
+                        _preflight.reason, ctx.op_id,
+                    )
+                    # Don't block — log warning. Gate is advisory until graduation gate passes.
+        except Exception:
+            logger.debug("[Orchestrator] DeployGate not available", exc_info=True)
 
         # Cross-repo saga path
         if ctx.cross_repo:
