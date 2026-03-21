@@ -32,6 +32,7 @@ class LoopEvent(str, Enum):
     EV_RETRY_BUDGET_EXHAUSTED = "EV_RETRY_BUDGET_EXHAUSTED"
     EV_ABORT_POLICY_VIOLATION = "EV_ABORT_POLICY_VIOLATION"
     EV_CANCELLED = "EV_CANCELLED"
+    EV_PREEMPT = "EV_PREEMPT"          # user-initiated preemption (voice/CLI stop)
 
 
 class ReasonCode(str, Enum):

@@ -79,6 +79,7 @@ from backend.core.ouroboros.governance.autonomy.safety_net import (
     ProductionSafetyNet,
     SafetyNetConfig,
 )
+from backend.core.ouroboros.governance.user_signal_bus import UserSignalBus
 
 try:
     from backend.core.ouroboros.oracle import TheOracle as TheOracle
@@ -681,6 +682,9 @@ class GovernedLoopService:
         self._fsm_executor: Optional[PreemptionFsmExecutor] = None
         self._fsm_contexts: Dict[str, LoopRuntimeContext] = {}
         self._fsm_checkpoint_seq: Dict[str, int] = {}
+
+        # GAP 6: user-initiated stop signal bus (created in _build_components)
+        self._user_signal_bus: Optional[UserSignalBus] = None
 
         # Built during start()
         self._orchestrator: Optional[GovernedOrchestrator] = None
@@ -1309,17 +1313,131 @@ class GovernedLoopService:
                 self._config.pipeline_timeout_s + 60.0
             )  # +60s grace beyond deadline for post-COMPLETE bookkeeping
             try:
-                # P1-6: shielded_wait_for — orchestrator.run() is a must-complete
-                # path (ledger writes, WAL commits, COMPLETE phase bookkeeping).
-                # The inner coroutine MUST NOT be cancelled on timeout; it runs to
-                # completion in the background while we surface TimeoutError to the
-                # outer result handler.
-                from backend.core.async_safety import shielded_wait_for as _shielded_wf
-                terminal_ctx = await _shielded_wf(
-                    self._orchestrator.run(ctx),
-                    timeout=_pipeline_timeout,
-                    name=f"orchestrator.run/{ctx.op_id}",
-                )
+                # GAP 6: race orchestrator against user stop signal when bus is present.
+                # The no-bus path uses shielded_wait_for so ledger writes survive timeout.
+                if self._user_signal_bus is not None:
+                    _op_task = asyncio.create_task(
+                        self._orchestrator.run(ctx),
+                        name=f"orchestrator/{ctx.op_id}",
+                    )
+                    _stop_task = asyncio.create_task(
+                        self._user_signal_bus.wait_for_stop(),
+                        name=f"stop-signal/{ctx.op_id}",
+                    )
+                    try:
+                        _done, _pending = await asyncio.wait(
+                            [_op_task, _stop_task],
+                            timeout=_pipeline_timeout,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        if not _stop_task.done():
+                            _stop_task.cancel()
+
+                    if _stop_task in _done:
+                        # User stop: cancel orchestrator, fire EV_PREEMPT, return CANCELLED.
+                        # _op_task.cancel() is fire-and-forget — the task will raise
+                        # CancelledError at its next await point and unwind cleanly.
+                        _op_task.cancel()
+                        self._user_signal_bus.reset()
+                        _fsm_ctx_now = self._fsm_contexts.get(ctx.op_id)
+                        if self._fsm_executor is not None and _fsm_ctx_now is not None:
+                            _preempt_seq = self._fsm_checkpoint_seq.get(ctx.op_id, 0) + 1
+                            self._fsm_checkpoint_seq[ctx.op_id] = _preempt_seq
+                            _preempt_ti = build_transition_input(
+                                op_id=ctx.op_id,
+                                phase="GENERATE",
+                                event=LoopEvent.EV_PREEMPT,
+                                ctx=_fsm_ctx_now,
+                                checkpoint_seq=_preempt_seq,
+                                metadata={"source": "user_signal_bus"},
+                            )
+                            try:
+                                await self._fsm_executor.apply(_fsm_ctx_now, _preempt_ti)
+                            except Exception as _exc:
+                                logger.debug("[GovernedLoop] FSM EV_PREEMPT apply failed: %s", _exc)
+                        duration = time.monotonic() - start_time
+                        result = OperationResult(
+                            op_id=ctx.op_id,
+                            terminal_phase=OperationPhase.CANCELLED,
+                            total_duration_s=duration,
+                            reason_code="user_stop",
+                            trigger_source=trigger_source,
+                            routing_reason=brain.routing_reason,
+                            terminal_class=_classify_terminal(
+                                OperationPhase.CANCELLED, None, "user_stop", is_noop=False
+                            ),
+                        )
+                        self._completed_ops[dedupe_key] = result
+                        await self._emit_terminal_events(
+                            ctx=ctx,
+                            result=result,
+                            brain_id=brain.brain_id,
+                            model_name=brain.model_name,
+                            rollback_reason="user_stop",
+                        )
+                        return result
+
+                    elif not _done:
+                        # Timeout: cancel op_task to stop the orphaned orchestrator run.
+                        _op_task.cancel()
+                        # Reset bus in case stop was signalled just as timeout fired.
+                        self._user_signal_bus.reset()
+                        # Timeout: neither finished — build CANCELLED result and return.
+                        duration = time.monotonic() - start_time
+                        result = OperationResult(
+                            op_id=ctx.op_id,
+                            terminal_phase=OperationPhase.CANCELLED,
+                            total_duration_s=duration,
+                            reason_code="pipeline_timeout",
+                            trigger_source=trigger_source,
+                            routing_reason=brain.routing_reason,
+                            terminal_class=_classify_terminal(
+                                OperationPhase.CANCELLED, None, "pipeline_timeout", is_noop=False
+                            ),
+                        )
+                        self._completed_ops[dedupe_key] = result
+                        if self._ledger is not None:
+                            _proof = _build_proof_artifact(
+                                op_id=ctx.op_id,
+                                terminal_phase=result.terminal_phase,
+                                terminal_class=result.terminal_class,
+                                provider_used=result.provider_used,
+                                model_id=None,
+                                compute_class=self._vm_capability.get("compute_class") if self._vm_capability else None,
+                                execution_host=self._vm_capability.get("host") if self._vm_capability else None,
+                                fallback_active=False,
+                                phase_trail=[p.name for p in getattr(ctx, "phase_trail", []) if hasattr(p, "name")],
+                                generation_duration_s=0.0,
+                                total_duration_s=result.total_duration_s or 0.0,
+                            )
+                            await _record_ledger(ctx, self._ledger, OperationState.FAILED, _proof)
+                        await self._emit_terminal_events(
+                            ctx=ctx,
+                            result=result,
+                            brain_id=brain.brain_id,
+                            model_name=brain.model_name,
+                            rollback_reason="pipeline_timeout",
+                        )
+                        logger.error(
+                            "[GovernedLoop] orchestrator.run() exceeded %.0fs hard timeout for op=%s",
+                            _pipeline_timeout, ctx.op_id,
+                        )
+                        return result
+
+                    else:
+                        # Op completed normally — retrieve result.
+                        terminal_ctx = _op_task.result()
+
+                else:
+                    # No signal bus: existing shielded path (ledger writes survive timeout).
+                    from backend.core.async_safety import shielded_wait_for as _shielded_wf
+                    terminal_ctx = await _shielded_wf(
+                        self._orchestrator.run(ctx),
+                        timeout=_pipeline_timeout,
+                        name=f"orchestrator.run/{ctx.op_id}",
+                    )
+
             except asyncio.TimeoutError:
                 logger.error(
                     "[GovernedLoop] orchestrator.run() exceeded %.0fs hard timeout for op=%s"
@@ -2071,8 +2189,13 @@ class GovernedLoopService:
             except Exception as exc:
                 logger.warning("[GovernedLoop] L2 RepairEngine build failed: %s", exc)
 
+        # GAP 6: instantiate user signal bus (always present; silent until request_stop() called)
+        self._user_signal_bus = UserSignalBus()
+
         # Build approval provider
-        self._approval_provider = CLIApprovalProvider()
+        self._approval_provider = CLIApprovalProvider(
+            project_root=self._config.project_root,
+        )
 
         # Build ValidationRunner (LanguageRouter with Python + C++ adapters)
         from backend.core.ouroboros.governance.test_runner import (

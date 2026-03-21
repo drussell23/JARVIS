@@ -338,10 +338,13 @@ class GovernedOrchestrator:
                 expansion_deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=self._config.context_expansion_timeout_s
                 )
+                from backend.core.ouroboros.governance.skill_registry import SkillRegistry as _SkillRegistry
+                _skill_registry = _SkillRegistry(self._config.project_root)
                 expander = ContextExpander(
                     generator=self._generator,
                     repo_root=self._config.project_root,
                     oracle=getattr(self._stack, "oracle", None),
+                    skill_registry=_skill_registry,
                 )
                 ctx = await asyncio.wait_for(
                     expander.expand(ctx, expansion_deadline),

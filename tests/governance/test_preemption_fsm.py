@@ -43,6 +43,7 @@ def test_loop_event_enum_is_frozen() -> None:
         "EV_RETRY_BUDGET_EXHAUSTED",
         "EV_ABORT_POLICY_VIOLATION",
         "EV_CANCELLED",
+        "EV_PREEMPT",
     }
 
 

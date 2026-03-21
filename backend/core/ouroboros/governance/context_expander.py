@@ -50,10 +50,12 @@ class ContextExpander:
         generator: Any,
         repo_root: Path,
         oracle: Optional[Any] = None,
+        skill_registry: Optional[Any] = None,   # Optional[SkillRegistry]
     ) -> None:
         self._generator = generator
         self._repo_root = repo_root
         self._oracle = oracle
+        self._skill_registry = skill_registry
 
     async def expand(
         self,
@@ -81,7 +83,8 @@ class ContextExpander:
         """
         if self._oracle is None or not self._oracle.is_ready():
             logger.info("[ContextExpander] Oracle not ready \u2014 using blind baseline")
-            return ctx
+            # Still apply skill_registry.match() even without oracle expansion
+            return self._inject_skill_instructions(ctx)
 
         # Freshness check: warn if index is stale (> 5 minutes old)
         age_s = self._oracle.index_age_s()
@@ -156,18 +159,19 @@ class ContextExpander:
                 ctx.op_id, round_num + 1, len(confirmed), len(accumulated),
             )
 
-        if not accumulated:
-            return ctx
+        if accumulated:
+            # Deduplicate while preserving insertion order
+            seen: set = set()
+            deduped: List[str] = []
+            for p in accumulated:
+                if p not in seen:
+                    seen.add(p)
+                    deduped.append(p)
+            ctx = ctx.with_expanded_files(tuple(deduped))
 
-        # Deduplicate while preserving insertion order
-        seen: set = set()
-        deduped: List[str] = []
-        for p in accumulated:
-            if p not in seen:
-                seen.add(p)
-                deduped.append(p)
-
-        return ctx.with_expanded_files(tuple(deduped))
+        # GAP 4: inject matching skill instructions into human_instructions
+        # Calls self._skill_registry.match(ctx.target_files) to find applicable skills.
+        return self._inject_skill_instructions(ctx)
 
     def _build_expansion_prompt(
         self,
@@ -309,6 +313,36 @@ class ContextExpander:
             valid = valid[:MAX_FILES_PER_ROUND]
 
         return valid
+
+    def _inject_skill_instructions(self, ctx: "OperationContext") -> "OperationContext":
+        """Append matched skill instructions to ctx.human_instructions (GAP 4).
+
+        No-ops if skill_registry is None or no skills match.
+        Never raises — errors are logged and ctx is returned unchanged.
+        """
+        if self._skill_registry is None:
+            return ctx
+        try:
+            skill_instr = self._skill_registry.match(ctx.target_files)
+            if not skill_instr:
+                return ctx
+            existing = getattr(ctx, "human_instructions", "") or ""
+            combined = (
+                (existing.strip() + "\n\n" + skill_instr).strip()
+                if existing.strip()
+                else skill_instr
+            )
+            ctx = ctx.with_human_instructions(combined)
+            logger.debug(
+                "[ContextExpander] op=%s: injected %d char skill instructions",
+                ctx.op_id, len(skill_instr),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[ContextExpander] op=%s skill_registry.match failed: %s",
+                ctx.op_id, exc,
+            )
+        return ctx
 
     def _resolve_files(self, paths: List[str]) -> List[str]:
         """Return paths that exist on disk within repo_root.

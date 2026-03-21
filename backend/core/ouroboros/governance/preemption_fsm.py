@@ -224,6 +224,20 @@ class PreemptionFsmEngine(FsmEngine):
                 actions=list(_STATE_CHANGE_ACTIONS),
             )
 
+        # User-initiated preemption → suspend (allow rehydrate/resume later)
+        if ev == LoopEvent.EV_PREEMPT:
+            backoff = _compute_backoff_ms(ctx.retry_index, budget)
+            return TransitionDecision(
+                from_state=cs,
+                to_state=LoopState.SUSPENDED_PREEMPTED,
+                event=ev,
+                reason_code=ReasonCode.FSM_SUSPENDED_PREEMPTED,
+                retry_index=ctx.retry_index,
+                backoff_ms=backoff,
+                terminal=False,
+                actions=list(_STATE_CHANGE_ACTIONS),
+            )
+
         # Policy violation → permanent failure
         if ev == LoopEvent.EV_ABORT_POLICY_VIOLATION:
             return self._terminal(
@@ -316,6 +330,9 @@ class PreemptionFsmEngine(FsmEngine):
         if ev == LoopEvent.EV_CANCELLED:
             return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
 
+        if ev == LoopEvent.EV_PREEMPT:
+            return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
+
         return self._noop(cs, ev, ctx.retry_index)
 
     def _from_resumed(
@@ -339,6 +356,9 @@ class PreemptionFsmEngine(FsmEngine):
             )
 
         if ev == LoopEvent.EV_CANCELLED:
+            return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
+
+        if ev == LoopEvent.EV_PREEMPT:
             return self._terminal(cs, ev, ctx.retry_index, reason_code=None)
 
         return self._noop(cs, ev, ctx.retry_index)
