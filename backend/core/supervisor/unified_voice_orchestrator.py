@@ -1281,9 +1281,66 @@ def global_speech_dedup_check(text: str, window: Optional[float] = None) -> bool
 #   3. `say -o tempfile` (never opens the audio device)
 #   4. AudioBus / afplay routing (safe single-stream playback)
 #   5. Tempfile cleanup
+#   6. Voice availability detection with fallback (v304.0)
 #
 # Callers that bypass this function bypass ALL safety guarantees.
 # ===========================================================================
+
+# v304.0: Voice fallback — "Daniel" may not exist on macOS 25.3+ (Tahoe).
+_validated_voice: Optional[str] = None
+
+
+async def _resolve_voice(preferred: str) -> str:
+    """Validate voice availability with cached fallback.
+
+    Enumerates installed voices via ``say -v ?`` and selects the preferred
+    voice if available, otherwise falls back through a preference list.
+    Caches the result for the session lifetime.
+    """
+    global _validated_voice
+    if _validated_voice is not None:
+        return _validated_voice
+
+    fallback_preferences = ["Daniel", "Samantha", "Alex", "Fred"]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "say", "-v", "?",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+        if proc.returncode == 0 and stdout:
+            available = set()
+            for line in stdout.decode("utf-8", errors="replace").splitlines():
+                parts = line.split()
+                if parts:
+                    available.add(parts[0])
+
+            if preferred in available:
+                _validated_voice = preferred
+                return preferred
+
+            for voice in fallback_preferences:
+                if voice in available:
+                    logger.info(
+                        "[safe_say] Voice '%s' unavailable, using '%s' (%d voices installed)",
+                        preferred, voice, len(available),
+                    )
+                    _validated_voice = voice
+                    return voice
+
+            if available:
+                first = sorted(available)[0]
+                logger.warning("[safe_say] No preferred voice found, using '%s'", first)
+                _validated_voice = first
+                return first
+    except (asyncio.TimeoutError, OSError) as exc:
+        logger.debug("[safe_say] Voice enumeration failed: %s", exc)
+
+    logger.warning("[safe_say] Could not enumerate voices, using '%s' as-is", preferred)
+    _validated_voice = preferred
+    return preferred
+
 
 async def safe_say(
     text: str,
@@ -1330,6 +1387,9 @@ async def safe_say(
     async def _do_say() -> bool:
         _temp_path: Optional[str] = None
         try:
+            # v304.0: Resolve voice with fallback (cached after first call)
+            resolved_voice = await _resolve_voice(voice)
+
             # 2. Synthesize to tempfile (NEVER opens audio device).
             #
             # v293.0: Force output sample rate to match FullDuplexDevice so
@@ -1352,7 +1412,7 @@ async def safe_say(
 
             proc = await asyncio.create_subprocess_exec(
                 "say",
-                "-v", voice,
+                "-v", resolved_voice,
                 "-r", str(rate),
                 "-o", _temp_path,
                 "--data-format", f"LEI16@{_say_sr}",
