@@ -293,6 +293,16 @@ def _build_comm_protocol(
         except Exception as exc:
             logger.debug("[Integration] LangfuseTransport skipped: %s", exc)
 
+    # DurableJSONLTransport — persistent event log on disk
+    try:
+        from backend.core.ouroboros.governance.comms.durable_jsonl_transport import DurableJsonlTransport
+        transports.append(DurableJsonlTransport())
+        logger.info("[Integration] DurableJsonlTransport added to CommProtocol")
+    except ImportError:
+        logger.debug("[Integration] DurableJsonlTransport skipped: module not available")
+    except Exception as exc:
+        logger.debug("[Integration] DurableJsonlTransport skipped: %s", exc)
+
     # RemoteHTTPTransport — forwards events to J-Prime (cross-repo visibility)
     _prime_comm_endpoint = os.environ.get("JARVIS_PRIME_COMM_ENDPOINT", "")
     if _prime_comm_endpoint:
