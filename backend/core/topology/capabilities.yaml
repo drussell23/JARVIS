@@ -1,0 +1,353 @@
+# Trinity Capability Registry
+# ===========================
+# Hand-curated mapping of capabilities across JARVIS/Prime/Reactor.
+# Fed into TopologyMap at boot. CuriosityEngine scores inactive capabilities
+# using Shannon Entropy + UCB1 to identify the highest-value exploration targets.
+#
+# Fields:
+#   name:         snake_case unique identifier
+#   domain:       capability grouping (used for Shannon Entropy per-domain)
+#   repo_owner:   jarvis | prime | reactor
+#   active:       true if currently wired and functional
+#   dependencies: list of capability names this depends on (optional)
+#
+# Domains:
+#   llm_routing      — model selection, inference backends, brain routing
+#   voice            — STT, TTS, voice auth, audio processing
+#   vision           — screen capture, OCR, vision analysis
+#   governance       — pipeline phases, sensors, autonomy tiers
+#   infrastructure   — GCP VM lifecycle, Cloud SQL, cost tracking
+#   neural_mesh      — neural mesh agent capabilities
+#   data_io          — embeddings, persistence, semantic search
+#   exploration      — proactive drive, curiosity engine, sentinel
+
+capabilities:
+
+  # -----------------------------------------------------------------------
+  # LLM Routing (7 capabilities, 5 active)
+  # -----------------------------------------------------------------------
+  - name: route_prime_gpu
+    domain: llm_routing
+    repo_owner: prime
+    active: true
+
+  - name: route_claude_api
+    domain: llm_routing
+    repo_owner: jarvis
+    active: true
+
+  - name: route_phi3_lightweight
+    domain: llm_routing
+    repo_owner: prime
+    active: true
+
+  - name: route_qwen_coder_7b
+    domain: llm_routing
+    repo_owner: prime
+    active: true
+
+  - name: route_deepseek_r1
+    domain: llm_routing
+    repo_owner: prime
+    active: true
+
+  - name: route_qwen_coder_32b
+    domain: llm_routing
+    repo_owner: prime
+    active: false
+
+  - name: route_mistral_fallback
+    domain: llm_routing
+    repo_owner: prime
+    active: false
+
+  # -----------------------------------------------------------------------
+  # Voice (10 capabilities, 7 active)
+  # -----------------------------------------------------------------------
+  - name: stt_hybrid_router
+    domain: voice
+    repo_owner: jarvis
+    active: true
+
+  - name: stt_streaming
+    domain: voice
+    repo_owner: jarvis
+    active: true
+
+  - name: vad_unified
+    domain: voice
+    repo_owner: jarvis
+    active: true
+
+  - name: tts_optimized
+    domain: voice
+    repo_owner: jarvis
+    active: true
+
+  - name: voice_auth_ecapa
+    domain: voice
+    repo_owner: jarvis
+    active: true
+    dependencies: [infrastructure_cloud_sql]
+
+  - name: voice_command_sensor
+    domain: voice
+    repo_owner: jarvis
+    active: true
+
+  - name: voice_narrator
+    domain: voice
+    repo_owner: jarvis
+    active: true
+
+  - name: voice_anti_spoofing
+    domain: voice
+    repo_owner: jarvis
+    active: false
+    dependencies: [voice_auth_ecapa]
+
+  - name: voice_emotion_detection
+    domain: voice
+    repo_owner: jarvis
+    active: false
+    dependencies: [stt_hybrid_router]
+
+  - name: voice_multi_speaker
+    domain: voice
+    repo_owner: jarvis
+    active: false
+    dependencies: [voice_auth_ecapa, vad_unified]
+
+  # -----------------------------------------------------------------------
+  # Vision (8 capabilities, 4 active)
+  # -----------------------------------------------------------------------
+  - name: vision_screen_capture
+    domain: vision
+    repo_owner: jarvis
+    active: true
+
+  - name: vision_router
+    domain: vision
+    repo_owner: jarvis
+    active: true
+
+  - name: vision_gpu_llava
+    domain: vision
+    repo_owner: prime
+    active: true
+
+  - name: vision_claude_api
+    domain: vision
+    repo_owner: jarvis
+    active: true
+    dependencies: [route_claude_api]
+
+  - name: vision_ocr_native
+    domain: vision
+    repo_owner: jarvis
+    active: false
+
+  - name: vision_activity_recognition
+    domain: vision
+    repo_owner: jarvis
+    active: false
+    dependencies: [vision_screen_capture]
+
+  - name: vision_spatial_awareness
+    domain: vision
+    repo_owner: jarvis
+    active: false
+    dependencies: [vision_screen_capture, vision_router]
+
+  - name: vision_change_detection
+    domain: vision
+    repo_owner: jarvis
+    active: false
+    dependencies: [vision_screen_capture]
+
+  # -----------------------------------------------------------------------
+  # Governance (10 capabilities, 8 active)
+  # -----------------------------------------------------------------------
+  - name: pipeline_classify
+    domain: governance
+    repo_owner: jarvis
+    active: true
+
+  - name: pipeline_generate
+    domain: governance
+    repo_owner: jarvis
+    active: true
+    dependencies: [route_prime_gpu]
+
+  - name: pipeline_validate_shadow
+    domain: governance
+    repo_owner: jarvis
+    active: true
+
+  - name: pipeline_gate_approve
+    domain: governance
+    repo_owner: jarvis
+    active: true
+
+  - name: sensor_test_failure
+    domain: governance
+    repo_owner: jarvis
+    active: true
+
+  - name: sensor_opportunity_miner
+    domain: governance
+    repo_owner: jarvis
+    active: true
+
+  - name: sensor_backlog
+    domain: governance
+    repo_owner: jarvis
+    active: true
+
+  - name: oracle_semantic_index
+    domain: governance
+    repo_owner: jarvis
+    active: true
+
+  - name: complexity_classifier
+    domain: governance
+    repo_owner: jarvis
+    active: false
+
+  - name: episodic_failure_memory
+    domain: governance
+    repo_owner: jarvis
+    active: false
+    dependencies: [pipeline_validate_shadow]
+
+  # -----------------------------------------------------------------------
+  # Infrastructure (6 capabilities, 5 active)
+  # -----------------------------------------------------------------------
+  - name: infrastructure_gcp_vm
+    domain: infrastructure
+    repo_owner: jarvis
+    active: true
+
+  - name: infrastructure_cloud_sql
+    domain: infrastructure
+    repo_owner: jarvis
+    active: true
+
+  - name: infrastructure_cost_tracker
+    domain: infrastructure
+    repo_owner: jarvis
+    active: true
+
+  - name: infrastructure_health_probe
+    domain: infrastructure
+    repo_owner: jarvis
+    active: true
+
+  - name: infrastructure_secret_manager
+    domain: infrastructure
+    repo_owner: jarvis
+    active: true
+
+  - name: infrastructure_golden_image
+    domain: infrastructure
+    repo_owner: jarvis
+    active: false
+    dependencies: [infrastructure_gcp_vm]
+
+  # -----------------------------------------------------------------------
+  # Neural Mesh (8 capabilities, 5 active)
+  # -----------------------------------------------------------------------
+  - name: mesh_coordinator
+    domain: neural_mesh
+    repo_owner: jarvis
+    active: true
+
+  - name: mesh_predictive_planner
+    domain: neural_mesh
+    repo_owner: jarvis
+    active: true
+
+  - name: mesh_memory_agent
+    domain: neural_mesh
+    repo_owner: jarvis
+    active: true
+
+  - name: mesh_web_search
+    domain: neural_mesh
+    repo_owner: jarvis
+    active: true
+
+  - name: mesh_error_analyzer
+    domain: neural_mesh
+    repo_owner: jarvis
+    active: true
+
+  - name: mesh_google_workspace
+    domain: neural_mesh
+    repo_owner: reactor
+    active: false
+
+  - name: mesh_native_app_control
+    domain: neural_mesh
+    repo_owner: jarvis
+    active: false
+
+  - name: mesh_pattern_recognition
+    domain: neural_mesh
+    repo_owner: jarvis
+    active: false
+
+  # -----------------------------------------------------------------------
+  # Data I/O (5 capabilities, 3 active)
+  # -----------------------------------------------------------------------
+  - name: embeddings_openai
+    domain: data_io
+    repo_owner: jarvis
+    active: true
+
+  - name: embeddings_local_sbert
+    domain: data_io
+    repo_owner: jarvis
+    active: true
+
+  - name: semantic_matcher
+    domain: data_io
+    repo_owner: jarvis
+    active: true
+    dependencies: [embeddings_openai]
+
+  - name: parse_parquet
+    domain: data_io
+    repo_owner: reactor
+    active: false
+
+  - name: parse_pdf
+    domain: data_io
+    repo_owner: reactor
+    active: false
+
+  # -----------------------------------------------------------------------
+  # Exploration (4 capabilities, 2 active)
+  # -----------------------------------------------------------------------
+  - name: proactive_drive
+    domain: exploration
+    repo_owner: jarvis
+    active: true
+
+  - name: curiosity_engine
+    domain: exploration
+    repo_owner: jarvis
+    active: true
+    dependencies: [proactive_drive]
+
+  - name: exploration_sentinel
+    domain: exploration
+    repo_owner: reactor
+    active: false
+    dependencies: [curiosity_engine, proactive_drive]
+
+  - name: proposal_delivery
+    domain: exploration
+    repo_owner: jarvis
+    active: false
+    dependencies: [exploration_sentinel]
