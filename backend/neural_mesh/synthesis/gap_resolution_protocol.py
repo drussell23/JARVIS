@@ -219,15 +219,13 @@ class GapResolutionProtocol:
             retry_count,
         )
         # Trinity observer hooks — fire-and-forget, observer-only.
-        # All calls wrapped in try/except so Trinity unavailability never
-        # blocks or breaks the DAS synthesis path.
-        try:
-            from backend.core.ouroboros.consciousness.health_cortex import HealthCortex  # noqa: PLC0415
-            HealthCortex().get_snapshot()  # touch health cortex to register DAS activity
-        except Exception:
-            pass
-        try:
-            from backend.core.ouroboros.consciousness.memory_engine import MemoryEngine  # noqa: PLC0415
-            MemoryEngine().ingest_outcome(event.domain_id)  # record domain synthesis attempt
-        except Exception:
-            pass
+        # HealthCortex and MemoryEngine require full dependency injection at
+        # construction time; direct instantiation here would always raise
+        # TypeError.  Full wiring is deferred to the Trinity integration
+        # follow-up spec.  The TRINITY_DREAM_DAS_ENABLED env var is defined
+        # but is a no-op in this implementation iteration.
+        log.debug(
+            "GapResolutionProtocol: synthesis complete for domain_id=%s "
+            "(Trinity observer hooks: deferred pending full Trinity wiring)",
+            event.domain_id,
+        )
