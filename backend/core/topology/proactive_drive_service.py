@@ -203,18 +203,99 @@ class ProactiveDriveService:
                             target_name=target.capability.name,
                             target_domain=target.capability.domain,
                         )
-                        # Sentinel dispatch is a future milestone.
-                        # For now, log and cycle through to COOLDOWN.
                         self._drive.begin_exploration()
+                        await self._run_exploration(target)
                         self._drive.end_exploration()
-                        logger.info(
-                            "[ProactiveDrive] Exploration cycle complete "
-                            "(sentinel not yet wired). Cooldown."
-                        )
             except Exception as exc:
                 logger.warning(
                     "[ProactiveDrive] Tick error: %s", exc, exc_info=True
                 )
+
+    async def _run_exploration(self, target: Any) -> None:
+        """Spawn ExplorationSentinel with strategy, run, log outcome."""
+        from backend.core.topology.sentinel import ExplorationSentinel
+        from backend.core.topology.exploration_strategy import (
+            ExplorationConfig,
+            ExplorationStrategy,
+        )
+        from backend.core.topology.architectural_proposal import (
+            ArchitecturalProposal,
+            ShadowTestResult,
+        )
+
+        scratch = f".jarvis/ouroboros/exploration_sandbox/{target.capability.name}/"
+        strategy = ExplorationStrategy(
+            config=ExplorationConfig.from_env(),
+            scratch_path=scratch,
+            web_tool=self._web_tool,
+            prime_client=self._prime_client,
+            repo_registry=self._repo_registry,
+            comm_protocol=self._comm_protocol,
+        )
+
+        try:
+            async with ExplorationSentinel(
+                target=target,
+                hardware=self._hardware,
+                strategy=strategy,
+            ) as sentinel:
+                outcome = await sentinel.run()
+
+            logger.info(
+                "[ProactiveDrive] Exploration complete: %s -> %s (%.1fs)",
+                target.capability.name,
+                outcome.dead_end_class.value,
+                outcome.elapsed_seconds,
+            )
+
+            # On success: build ArchitecturalProposal
+            if outcome.dead_end_class.value == "clean_success" and outcome.partial_findings:
+                import json as _json
+                try:
+                    findings = _json.loads(outcome.partial_findings)
+                    generated = findings.get("generated_files", [])
+                    test_passed = findings.get("test_passed", False)
+
+                    # Build shadow test results from findings
+                    shadow_results = []
+                    if test_passed is not None:
+                        shadow_results.append(ShadowTestResult(
+                            test_name="exploration_tests",
+                            passed=bool(test_passed),
+                            duration_ms=outcome.elapsed_seconds * 1000,
+                            output=findings.get("explanation", ""),
+                        ))
+
+                    proposal = ArchitecturalProposal.create(
+                        target=target,
+                        hardware=self._hardware,
+                        generated_files=[f"{scratch}{f}" for f in generated],
+                        shadow_results=shadow_results,
+                        sentinel_elapsed=outcome.elapsed_seconds,
+                    )
+                    logger.info(
+                        "[ProactiveDrive] Proposal created: %s",
+                        proposal.summary(),
+                    )
+                except (_json.JSONDecodeError, Exception) as e:
+                    logger.warning("[ProactiveDrive] Proposal creation failed: %s", e)
+            else:
+                logger.info(
+                    "[ProactiveDrive] Exploration did not succeed: %s — %s",
+                    outcome.dead_end_class.value,
+                    outcome.partial_findings[:200] if outcome.partial_findings else "no findings",
+                )
+
+            # Increment exploration attempts on the topology node
+            node = self._topology.nodes.get(target.capability.name)
+            if node is not None:
+                node.exploration_attempts += 1
+
+        except Exception as exc:
+            logger.error(
+                "[ProactiveDrive] Sentinel dispatch failed for %s: %s",
+                target.capability.name, exc, exc_info=True,
+            )
 
     def _emit_hardware(self) -> None:
         if self._bus is None or self._hardware is None:
