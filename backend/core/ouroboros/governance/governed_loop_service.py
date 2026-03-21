@@ -1701,6 +1701,35 @@ class GovernedLoopService:
                 )
                 return ctx.advance(OperationPhase.CANCELLED)
 
+        # ── Degradation mode gate ────────────────────────────────────────────────
+        _deg_ctrl = getattr(getattr(self, "_stack", None), "degradation", None)
+        if _deg_ctrl is not None:
+            from backend.core.ouroboros.governance.degradation import DegradationMode
+            _deg_mode = _deg_ctrl.mode
+            if _deg_mode >= DegradationMode.READ_ONLY_PLANNING:
+                logger.warning(
+                    "[GovernedLoop] Preflight: degradation_mode=%s blocks op %s",
+                    _deg_mode.name,
+                    ctx.op_id,
+                )
+                return ctx.advance(OperationPhase.CANCELLED)
+            if _deg_mode == DegradationMode.REDUCED_AUTONOMY:
+                # Only SAFE_AUTO ops are allowed in reduced autonomy mode.
+                # risk_tier is set during the CLASSIFY phase — it is None at preflight
+                # time for the normal pipeline flow.  Treat None as non-SAFE_AUTO
+                # (fail-safe): the risk has not been evaluated yet, so we cannot
+                # confirm the op is safe to proceed without full autonomy.
+                from backend.core.ouroboros.governance.risk_engine import RiskTier
+                _risk_tier = ctx.risk_tier
+                if _risk_tier != RiskTier.SAFE_AUTO:
+                    logger.warning(
+                        "[GovernedLoop] Preflight: REDUCED_AUTONOMY blocks non-SAFE_AUTO op %s "
+                        "(risk_tier=%s — None means not yet classified; fail-safe block)",
+                        ctx.op_id,
+                        _risk_tier,
+                    )
+                    return ctx.advance(OperationPhase.CANCELLED)
+
         # ── Compute-class admission gate ──────────────────────────────────────
         if self._vm_capability is not None:
             _brain_id = (
