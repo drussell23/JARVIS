@@ -922,6 +922,18 @@ class OperationContext:
         new_hash = _compute_hash(fields_for_hash)
         return dataclasses.replace(intermediate, context_hash=new_hash)
 
+    def with_shadow_result(self, result: "ShadowResult") -> "OperationContext":
+        """Attach shadow harness result to context (no phase change, hash updates)."""
+        intermediate = dataclasses.replace(
+            self,
+            shadow=result,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
 
 # ---------------------------------------------------------------------------
 # Internal helpers

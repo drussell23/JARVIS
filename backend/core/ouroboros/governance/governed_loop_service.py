@@ -2138,6 +2138,20 @@ class GovernedLoopService:
             self._saga_bus = None
             logger.debug("[GovernedLoop] SagaMessageBus unavailable — saga_messages not found")
 
+        # Shadow harness — enabled via JARVIS_SHADOW_HARNESS_ENABLED=true
+        _shadow_harness = None
+        if os.environ.get("JARVIS_SHADOW_HARNESS_ENABLED", "false").lower() in ("true", "1"):
+            from backend.core.ouroboros.governance.shadow_harness import ShadowHarness
+            _shadow_harness = ShadowHarness(
+                confidence_threshold=float(os.environ.get("JARVIS_SHADOW_CONFIDENCE_THRESHOLD", "0.7")),
+                disqualify_after=int(os.environ.get("JARVIS_SHADOW_DISQUALIFY_AFTER", "3")),
+            )
+            logger.info(
+                "[GovernedLoop] ShadowHarness wired: confidence_threshold=%.2f, disqualify_after=%d",
+                float(os.environ.get("JARVIS_SHADOW_CONFIDENCE_THRESHOLD", "0.7")),
+                int(os.environ.get("JARVIS_SHADOW_DISQUALIFY_AFTER", "3")),
+            )
+
         # Build orchestrator
         orch_config = OrchestratorConfig(
             project_root=self._config.project_root,
@@ -2148,6 +2162,7 @@ class GovernedLoopService:
             message_bus=self._saga_bus,
             repair_engine=_repair_engine,
             execution_graph_scheduler=self._subagent_scheduler,
+            shadow_harness=_shadow_harness,
         )
         self._orchestrator = GovernedOrchestrator(
             stack=self._stack,

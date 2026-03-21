@@ -134,6 +134,10 @@ class OrchestratorConfig:
     repair_engine: Optional[Any] = None
     execution_graph_scheduler: Optional[Any] = None
 
+    # Shadow harness — optional; set by GovernedLoopService when
+    # JARVIS_SHADOW_HARNESS_ENABLED=true in .env
+    shadow_harness: Optional[Any] = None
+
     def resolve_repo_roots(
         self,
         repo_scope: Tuple[str, ...],
@@ -604,6 +608,54 @@ class GovernedOrchestrator:
             "model": getattr(generation, "model_id", ""),
             "total_candidates_tried": len(generation.candidates),
         })
+
+        # ── Shadow harness check (soft advisory — never hard-blocks GATE) ──────
+        # Evaluates candidate structural integrity before GATE. Uses AST comparison
+        # between the candidate's proposed content and itself (firewall-only path).
+        # If the harness is disqualified, logs a warning — GATE still proceeds.
+        if self._config.shadow_harness is not None and best_candidate is not None:
+            import time as _sh_time
+            from backend.core.ouroboros.governance.shadow_harness import (
+                OutputComparator,
+                SideEffectFirewall,
+                CompareMode,
+            )
+            from backend.core.ouroboros.governance.op_context import ShadowResult
+            _sh_start = _sh_time.monotonic()
+            _violations: list = []
+            _confidence = 0.0
+            try:
+                _content = (
+                    best_candidate.get("full_content")
+                    or best_candidate.get("unified_diff")
+                    or ""
+                )
+                with SideEffectFirewall():
+                    _confidence = OutputComparator().compare(
+                        _content, _content, CompareMode.AST
+                    )
+            except Exception as _sh_exc:
+                _violations.append(str(_sh_exc))
+                _confidence = 0.0
+            _sh_dur = _sh_time.monotonic() - _sh_start
+            self._config.shadow_harness.record_run(_confidence)
+            _shadow_result = ShadowResult(
+                confidence=_confidence,
+                comparison_mode="ast",
+                violations=tuple(_violations),
+                shadow_duration_s=_sh_dur,
+                production_match=(_confidence >= 0.7),
+                disqualified=self._config.shadow_harness.is_disqualified,
+            )
+            ctx = ctx.with_shadow_result(_shadow_result)
+            if self._config.shadow_harness.is_disqualified:
+                logger.warning(
+                    "[Orchestrator] ShadowHarness disqualified for op=%s "
+                    "(confidence=%.2f, violations=%d) — proceeding to GATE with advisory",
+                    ctx.op_id,
+                    _confidence,
+                    len(_violations),
+                )
 
         # Store compact validation result in context; full output is in ledger
         ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
