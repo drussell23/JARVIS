@@ -93,8 +93,9 @@ class UnifiedIntakeRouter:
     - Dead-letter queue after max retries are exhausted
     """
 
-    def __init__(self, gls: Any, config: IntakeRouterConfig) -> None:
+    def __init__(self, gls: Any, config: IntakeRouterConfig, runtime_orchestrator: Any = None) -> None:
         self._gls = gls
+        self._runtime_orchestrator = runtime_orchestrator
         self._config = config
         self._wal = WAL(config.resolved_wal_path)
         self._queue: asyncio.PriorityQueue[Tuple[int, float, IntentEnvelope]] = (
@@ -255,8 +256,72 @@ class UnifiedIntakeRouter:
             finally:
                 self._queue.task_done()
 
+    @staticmethod
+    def _is_runtime_task(envelope: IntentEnvelope) -> bool:
+        """Classify an envelope as a runtime task (NOT a code change).
+
+        Runtime tasks: browse, search, email, play, open app, schedule, etc.
+        Code changes: fix bug, implement, refactor, add feature, etc.
+
+        Uses description analysis — no hardcoded mapping. The classification
+        is based on the ABSENCE of code-change signals, not the presence of
+        runtime signals (open-world assumption: anything not obviously code
+        is treated as a runtime task if there are no target files).
+        """
+        desc = envelope.description.lower()
+        # Code change indicators — if present, route to GLS
+        _CODE_SIGNALS = (
+            "fix bug", "implement", "refactor", "add feature", "update code",
+            "write function", "create module", "modify file", "change the code",
+            "add test", "fix the", "patch", "debug", "commit", "merge",
+        )
+        if any(signal in desc for signal in _CODE_SIGNALS):
+            return False
+        # If there are target files, it's likely a code operation
+        if envelope.target_files:
+            return False
+        # Everything else is a runtime task
+        return True
+
     async def _dispatch_one(self, envelope: IntentEnvelope) -> None:
-        """Attempt to dispatch a single envelope to GLS, with retry on failure."""
+        """Route an envelope to either RuntimeTaskOrchestrator or GLS.
+
+        Decision: If the envelope describes a runtime task (no target files,
+        no code-change signals), dispatch to RuntimeTaskOrchestrator.
+        Otherwise, dispatch to GovernedLoopService for code changes.
+        """
+        ikey = envelope.idempotency_key
+
+        # --- Route to RuntimeTaskOrchestrator for runtime tasks ---
+        if self._runtime_orchestrator is not None and self._is_runtime_task(envelope):
+            try:
+                result = await asyncio.wait_for(
+                    self._runtime_orchestrator.execute(
+                        query=envelope.description,
+                        context={
+                            "source": envelope.source,
+                            "envelope_id": envelope.causal_id,
+                            "repo": getattr(envelope, "repo", "jarvis"),
+                        },
+                    ),
+                    timeout=self._config.dispatch_timeout_s,
+                )
+                self._wal.update_status(envelope.lease_id, "acked")
+                self._retry_count.pop(ikey, None)
+                logger.info(
+                    "[Router] Runtime task dispatched: %s -> %s (%d steps)",
+                    envelope.description[:50],
+                    "SUCCESS" if result.success else "PARTIAL",
+                    len(result.steps),
+                )
+                return
+            except Exception as exc:
+                logger.warning(
+                    "[Router] Runtime dispatch failed, falling back to GLS: %s", exc,
+                )
+                # Fall through to GLS as fallback
+
+        # --- Route to GLS for code changes ---
         from backend.core.ouroboros.governance.op_context import OperationContext
 
         ctx = OperationContext.create(
@@ -264,7 +329,6 @@ class UnifiedIntakeRouter:
             description=envelope.description,
             op_id=envelope.causal_id,
         )
-        ikey = envelope.idempotency_key
         try:
             await asyncio.wait_for(
                 self._gls.submit(ctx, trigger_source=envelope.source),

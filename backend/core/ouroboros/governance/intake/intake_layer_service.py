@@ -328,7 +328,13 @@ class IntakeLayerService:
             project_root=self._config.project_root,
             dedup_window_s=self._config.dedup_window_s,
         )
-        self._router = UnifiedIntakeRouter(gls=self._gls, config=router_config)
+        # Inject RuntimeTaskOrchestrator if available (for runtime task dispatch)
+        _rto = getattr(self._gls, "_runtime_task_orchestrator", None)
+        self._router = UnifiedIntakeRouter(
+            gls=self._gls,
+            config=router_config,
+            runtime_orchestrator=_rto,
+        )
 
         # A-narrator: salience-gated preflight awareness
         if self._config.a_narrator_enabled and self._say_fn is not None:

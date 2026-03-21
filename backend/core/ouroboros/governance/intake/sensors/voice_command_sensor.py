@@ -90,8 +90,10 @@ class VoiceCommandSensor:
                 logger.warning("VoiceCommandSensor: stop command received but no signal_bus wired")
                 return "error"
 
-        if not payload.target_files:
-            logger.warning("VoiceCommandSensor: empty target_files, skipping")
+        # Runtime tasks (browse, search, email, etc.) have no target files.
+        # Only reject if description is also empty — that's a genuine error.
+        if not payload.description.strip():
+            logger.warning("VoiceCommandSensor: empty description, skipping")
             return "error"
 
         # Rate limit: evict timestamps older than 1 hour
