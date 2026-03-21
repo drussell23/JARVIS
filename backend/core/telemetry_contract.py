@@ -29,8 +29,10 @@ ENVELOPE_VERSION = "1.0.0"
 V1_EVENT_SCHEMAS: List[str] = [
     "lifecycle.transition@1.0.0",
     "lifecycle.health@1.0.0",
+    "lifecycle.hardware@1.0.0",
     "reasoning.activation@1.0.0",
     "reasoning.decision@1.0.0",
+    "reasoning.proactive_drive@1.0.0",
     "scheduler.graph_state@1.0.0",
     "scheduler.unit_state@1.0.0",
     "recovery.attempt@1.0.0",
