@@ -51,15 +51,23 @@ class GenerationSubagentExecutor:
         generator: Any,
         validation_runner: Any,
         repo_roots: Dict[str, Path],
+        worktree_manager: Any = None,
     ) -> None:
         self._generator = generator
         self._validation_runner = validation_runner
         self._repo_roots = {name: Path(root) for name, root in repo_roots.items()}
+        self._worktree_manager = worktree_manager
 
     async def execute(self, graph: ExecutionGraph, unit: WorkUnitSpec) -> WorkUnitResult:
-        """Generate and validate a single work-unit patch."""
+        """Generate and validate a single work-unit patch.
+
+        When a WorktreeManager is provided, each unit executes in an isolated
+        git worktree — preventing filesystem conflicts between parallel units.
+        The worktree is always cleaned up in the finally block.
+        """
         started_at_ns = time.monotonic_ns()
         causal_parent_id = graph.causal_trace_id
+        _worktree_path: Optional[Path] = None
         try:
             if len(unit.target_files) != 1:
                 raise RuntimeError(
@@ -69,6 +77,24 @@ class GenerationSubagentExecutor:
             repo_root = self._repo_roots.get(unit.repo)
             if repo_root is None:
                 raise RuntimeError(f"unknown_repo_root:{unit.repo}")
+
+            # --- Worktree isolation: create isolated copy for this unit ---
+            if self._worktree_manager is not None:
+                _branch = f"unit-{unit.unit_id}-{graph.graph_id}"
+                try:
+                    _worktree_path = await self._worktree_manager.create(_branch)
+                    logger.info(
+                        "[SubagentExecutor] Worktree created: %s -> %s",
+                        _branch, _worktree_path,
+                    )
+                    # Override repo_root to the isolated worktree
+                    repo_root = _worktree_path
+                except Exception as wt_exc:
+                    logger.warning(
+                        "[SubagentExecutor] Worktree creation failed: %s — falling back to shared repo",
+                        wt_exc,
+                    )
+                    _worktree_path = None
 
             op_id = f"{graph.op_id}:{unit.unit_id}"
             subctx = OperationContext.create(
@@ -151,6 +177,16 @@ class GenerationSubagentExecutor:
                 error=str(exc),
                 causal_parent_id=causal_parent_id,
             )
+        finally:
+            # --- Worktree cleanup: always runs, even on exception/cancellation ---
+            if _worktree_path is not None and self._worktree_manager is not None:
+                try:
+                    await self._worktree_manager.cleanup(_worktree_path)
+                    logger.info("[SubagentExecutor] Worktree cleaned: %s", _worktree_path)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "[SubagentExecutor] Worktree cleanup failed: %s", cleanup_exc
+                    )
 
     async def _validate_candidate(
         self,
