@@ -70,15 +70,22 @@ class ProactiveDrive:
     """
 
     STATES = ("REACTIVE", "MEASURING", "ELIGIBLE", "EXPLORING", "COOLDOWN")
-    COOLDOWN_SECONDS = 3600.0
-    MIN_ELIGIBLE_SECONDS = 60.0
 
     def __init__(
         self,
         jarvis_verifier: LittlesLawVerifier,
         prime_verifier: LittlesLawVerifier,
         reactor_verifier: LittlesLawVerifier,
+        cooldown_seconds: Optional[float] = None,
+        min_eligible_seconds: Optional[float] = None,
     ) -> None:
+        import os
+        self.COOLDOWN_SECONDS = cooldown_seconds or float(
+            os.environ.get("JARVIS_PROACTIVE_COOLDOWN_S", "3600.0")
+        )
+        self.MIN_ELIGIBLE_SECONDS = min_eligible_seconds or float(
+            os.environ.get("JARVIS_PROACTIVE_ELIGIBLE_S", "60.0")
+        )
         self._verifiers = {
             "jarvis": jarvis_verifier,
             "prime": prime_verifier,
