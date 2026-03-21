@@ -783,11 +783,17 @@ class GovernedLoopService:
     async def start(self) -> None:
         """Initialize providers, orchestrator, and canary slices.
 
-        Idempotent — second call is no-op if already ACTIVE/DEGRADED.
+        Idempotent — second call is no-op if already ACTIVE/DEGRADED/STARTING.
         On failure, sets state to FAILED with structured reason.
+        Re-entrancy guard: raises RuntimeError if called concurrently.
         """
         if self._state in (ServiceState.ACTIVE, ServiceState.DEGRADED):
             return
+        if self._state == ServiceState.STARTING:
+            raise RuntimeError(
+                "GLS re-entrancy detected: start() called while already STARTING. "
+                "This would corrupt the FSM — aborting second call."
+            )
 
         self._state = ServiceState.STARTING
         try:

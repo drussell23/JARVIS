@@ -377,10 +377,38 @@ class JprimeRuntimeInventoryProvider:
                 f"RUNTIME_INVENTORY_STALE: GET {url} unexpected error — {exc}"
             ) from exc
 
+    # Inventory schema versions this JARVIS build understands.
+    # Expand when J-Prime introduces new inventory formats.
+    SUPPORTED_INVENTORY_SCHEMAS = frozenset({"1.0.0"})
+
     @staticmethod
     def _parse_inventory(data: dict) -> RuntimeInventory:
-        """Convert the raw /v1/brains JSON dict into a RuntimeInventory dataclass."""
+        """Convert the raw /v1/brains JSON dict into a RuntimeInventory dataclass.
+
+        Validates schema_version against SUPPORTED_INVENTORY_SCHEMAS before
+        parsing. Raises RuntimeError on missing, empty, or incompatible versions
+        so the boot handshake fails cleanly instead of silently misinterpreting
+        a future schema format.
+        """
         schema_version: str = str(data.get("schema_version", ""))
+
+        # Validate schema version — cure the disease, not the symptom.
+        # Without this, a J-Prime upgrade could return schema 2.0.0 and
+        # we'd silently parse it as 1.0.0, missing fields or misinterpreting
+        # structure. Fail hard at boot, not soft at runtime.
+        if not schema_version or schema_version in ("", "None"):
+            raise RuntimeError(
+                "RUNTIME_INVENTORY_SCHEMA_INVALID: /v1/brains response missing "
+                "or null schema_version — cannot proceed with handshake"
+            )
+        if schema_version not in JprimeRuntimeInventoryProvider.SUPPORTED_INVENTORY_SCHEMAS:
+            raise RuntimeError(
+                f"RUNTIME_INVENTORY_SCHEMA_INCOMPATIBLE: /v1/brains returned "
+                f"schema_version={schema_version!r} but this JARVIS build only "
+                f"supports {JprimeRuntimeInventoryProvider.SUPPORTED_INVENTORY_SCHEMAS}. "
+                f"Update JARVIS or roll back J-Prime."
+            )
+
         contract_version: str = str(data.get("contract_version", ""))
         generated_at_epoch_s: int = int(data.get("generated_at_epoch_s", 0))
 

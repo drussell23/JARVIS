@@ -488,12 +488,72 @@ class ChangeEngine:
                 )
 
             if not verify_passed:
-                # Automatic rollback
+                # Automatic rollback — with failure handler for rollback itself
                 logger.warning(
                     "Post-apply verification failed for %s -- rolling back",
                     op_id,
                 )
-                rollback.apply(target)
+                _rollback_succeeded = False
+                try:
+                    rollback.apply(target)
+                    _rollback_succeeded = True
+                except BaseException as rb_exc:
+                    # EMERGENCY: Rollback failed — file may be in corrupted intermediate state.
+                    # Log CRITICAL, record in ledger, emit emergency postmortem.
+                    # Do NOT re-raise — always return a structured ChangeResult.
+                    logger.critical(
+                        "ROLLBACK FAILED for %s: %s — file may be corrupted. "
+                        "Manual intervention required.",
+                        op_id, rb_exc, exc_info=True,
+                    )
+                    await self._ledger.append(
+                        LedgerEntry(
+                            op_id=op_id,
+                            state=OperationState.ROLLED_BACK,
+                            data={
+                                "reason": "rollback_apply_failed",
+                                "error": str(rb_exc),
+                                "emergency": True,
+                            },
+                        )
+                    )
+                    await self._comm.emit_postmortem(
+                        op_id=op_id,
+                        root_cause=f"rollback_failed:{type(rb_exc).__name__}:{rb_exc}",
+                        failed_phase="ROLLBACK",
+                        next_safe_action="manual_intervention_required",
+                    )
+                    # Emit fault to TelemetryBus if available
+                    try:
+                        from backend.core.telemetry_contract import TelemetryEnvelope, get_telemetry_bus
+                        bus = get_telemetry_bus()
+                        bus.emit(TelemetryEnvelope.create(
+                            event_schema="fault.raised@1.0.0",
+                            source="change_engine",
+                            trace_id=op_id,
+                            span_id="rollback_failure",
+                            partition_key="fault",
+                            payload={
+                                "fault_class": "rollback_failed",
+                                "component": "change_engine",
+                                "message": f"Rollback failed for {op_id}: {rb_exc}",
+                                "recovery_policy": "manual_intervention",
+                                "terminal": True,
+                            },
+                            severity="critical",
+                        ))
+                    except Exception:
+                        pass  # telemetry is best-effort
+
+                    return ChangeResult(
+                        op_id=op_id,
+                        success=False,
+                        phase_reached=ChangePhase.VERIFY,
+                        risk_tier=risk_tier,
+                        rolled_back=False,  # rollback FAILED — not rolled back
+                    )
+
+                # Rollback succeeded — normal flow
                 await self._ledger.append(
                     LedgerEntry(
                         op_id=op_id,
