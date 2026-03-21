@@ -743,9 +743,20 @@ class GraduationOrchestrator:
     # -- Phase 8: Post-merge (H5: readiness probe) -------------------------
 
     async def _register_after_merge(self, record: GraduationRecord) -> None:
-        if not record.pr_url:
+        """Directive 4: Post-merge hot-load without system reboot.
+
+        Sequence:
+            1. Poll GitHub for merge status (every 60s)
+            2. git pull on the repo's main branch (fetch merged code)
+            3. H5: Readiness probe (import + class check + execute_task verify)
+            4. AgentRegistry.register() — agent is live immediately
+            5. TopologyMap marks capability ACTIVE
+            6. Voice narration: "Agent X is now live"
+        """
+        if not record.pr_url or not record.decision:
             return
 
+        # Step 1: Poll for merge
         while True:
             await asyncio.sleep(60.0)
             try:
@@ -759,30 +770,71 @@ class GraduationOrchestrator:
                     break
                 if state == "CLOSED":
                     record.phase = GraduationPhase.REJECTED
+                    self._total_rejected += 1
                     self._save_record(record)
+                    await self._narrate("PR was closed without merge. Agent discarded.")
                     return
             except Exception:
                 continue
 
-        # H5: Readiness probe
-        if record.decision:
-            try:
-                import importlib
-                mod_name = record.decision.module_path.replace("/", ".").replace(".py", "")
-                mod = importlib.import_module(mod_name)
-                cls = getattr(mod, record.decision.agent_class_name, None)
-                if cls is None or not hasattr(cls, "execute_task"):
-                    record.phase = GraduationPhase.FAILED
-                    record.error = "Readiness probe failed: class or execute_task not found"
-                    self._save_record(record)
-                    return
-            except ImportError as exc:
+        # Step 2: git pull on the target repo to fetch merged code
+        repo_path = self._resolve_repo_path(record.decision.repo_owner)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "git", "pull", "--ff-only", "origin", "main",
+                cwd=str(repo_path),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.warning(
+                    "[Graduation] git pull failed on %s: %s",
+                    record.decision.repo_owner, stderr.decode()[:200],
+                )
+                # Non-fatal: code might already be up to date from another pull
+        except Exception as exc:
+            logger.warning("[Graduation] git pull error: %s", exc)
+
+        # Step 3: H5 Readiness probe — import the new module and verify interface
+        record.phase = GraduationPhase.REGISTERING
+        try:
+            import importlib
+            mod_name = record.decision.module_path.replace("/", ".").replace(".py", "")
+
+            # Invalidate cached module if it was previously imported
+            if mod_name in __import__("sys").modules:
+                del __import__("sys").modules[mod_name]
+
+            mod = importlib.import_module(mod_name)
+            cls = getattr(mod, record.decision.agent_class_name, None)
+
+            if cls is None:
                 record.phase = GraduationPhase.FAILED
-                record.error = f"Readiness probe failed: {exc}"
+                record.error = f"Readiness probe: {record.decision.agent_class_name} not found in {mod_name}"
                 self._save_record(record)
+                await self._narrate(f"Readiness probe failed. Class not found after merge.")
                 return
 
-        if self._agent_registry and record.decision:
+            if not hasattr(cls, "execute_task"):
+                record.phase = GraduationPhase.FAILED
+                record.error = "Readiness probe: execute_task method not found"
+                self._save_record(record)
+                await self._narrate("Readiness probe failed. Agent missing execute_task method.")
+                return
+
+            logger.info(
+                "[Graduation] Readiness probe passed: %s.%s has execute_task",
+                mod_name, record.decision.agent_class_name,
+            )
+        except ImportError as exc:
+            record.phase = GraduationPhase.FAILED
+            record.error = f"Readiness probe import failed: {exc}"
+            self._save_record(record)
+            await self._narrate(f"Readiness probe failed: could not import the new agent.")
+            return
+
+        # Step 4: Register in AgentRegistry — agent is live immediately
+        if self._agent_registry:
             try:
                 await self._agent_registry.register(
                     agent_name=record.decision.capability_name,
@@ -790,10 +842,15 @@ class GraduationOrchestrator:
                     capabilities={record.decision.capability_name},
                     backend="local",
                 )
-            except Exception:
-                pass
+                logger.info(
+                    "[Graduation] AgentRegistry: %s registered",
+                    record.decision.capability_name,
+                )
+            except Exception as exc:
+                logger.warning("[Graduation] AgentRegistry failed: %s", exc)
 
-        if self._topology and record.decision:
+        # Step 5: TopologyMap marks capability ACTIVE
+        if self._topology:
             try:
                 from backend.core.topology.topology_map import CapabilityNode
                 self._topology.register(CapabilityNode(
@@ -802,14 +859,21 @@ class GraduationOrchestrator:
                     repo_owner=record.decision.repo_owner,
                     active=True,
                 ))
-            except Exception:
-                pass
+                logger.info(
+                    "[Graduation] TopologyMap: %s → ACTIVE in %s domain",
+                    record.decision.capability_name, record.decision.capability_domain,
+                )
+            except Exception as exc:
+                logger.warning("[Graduation] TopologyMap update failed: %s", exc)
 
+        # Step 6: Terminal state + narration
         record.phase = GraduationPhase.GRADUATED
         self._total_graduated += 1
+        self._emit(record, f"Graduated: {record.decision.capability_name}")
         await self._narrate(
-            f"Agent {record.decision.agent_class_name} is live. "
-            f"{record.decision.capability_domain} capability active."
+            f"Agent {record.decision.agent_class_name} is now live. "
+            f"The {record.decision.capability_domain} capability is active. "
+            f"No reboot required."
         )
         self._save_record(record)
 
