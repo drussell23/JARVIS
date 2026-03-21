@@ -51,6 +51,12 @@ class ResourceGovernor:
     Runs as a background asyncio task while the Sentinel is active.
     """
 
+    # During the first BURST_WINDOW_S seconds, sample at BURST_INTERVAL_S
+    # to catch pathological processes that allocate gigabytes in <1 second.
+    # After the burst window, relax to the configured poll_interval.
+    BURST_INTERVAL_S = 1.0
+    BURST_WINDOW_S = 30.0
+
     def __init__(
         self,
         controller: PIDController,
@@ -61,8 +67,10 @@ class ResourceGovernor:
         self._sem = sentinel_semaphore
         self._poll_interval = poll_interval
         self._task: Optional[asyncio.Task] = None
+        self._started_at: float = 0.0
 
     async def start(self) -> None:
+        self._started_at = time.monotonic()
         self._task = asyncio.create_task(self._loop(), name="resource_governor")
 
     async def stop(self) -> None:
@@ -77,6 +85,9 @@ class ResourceGovernor:
     async def _loop(self) -> None:
         import psutil
         while True:
-            await asyncio.sleep(self._poll_interval)
+            # Adaptive interval: fast sampling during burst window, relaxed after
+            elapsed = time.monotonic() - self._started_at
+            interval = self.BURST_INTERVAL_S if elapsed < self.BURST_WINDOW_S else self._poll_interval
+            await asyncio.sleep(interval)
             cpu = psutil.cpu_percent(interval=None) / 100.0
             self._pid.update(cpu)

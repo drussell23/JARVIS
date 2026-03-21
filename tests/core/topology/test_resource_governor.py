@@ -96,3 +96,29 @@ class TestResourceGovernor:
         await asyncio.sleep(0.15)
         await gov.stop()
         assert pid._prev_time > 0
+
+    @pytest.mark.asyncio
+    async def test_burst_window_uses_fast_interval(self):
+        """During the first BURST_WINDOW_S seconds, governor polls at 1s interval."""
+        pid = PIDController()
+        sem = asyncio.Semaphore(4)
+        gov = ResourceGovernor(pid, sem, poll_interval=5.0)
+        assert gov.BURST_INTERVAL_S == 1.0
+        assert gov.BURST_WINDOW_S == 30.0
+        await gov.start()
+        # Governor should be using burst interval (1s) not normal (5s)
+        # so within 2s we should get at least 1 PID update
+        await asyncio.sleep(1.5)
+        await gov.stop()
+        # PID should have been called at least once during burst window
+        assert pid._prev_time > 0
+
+    @pytest.mark.asyncio
+    async def test_started_at_is_set(self):
+        pid = PIDController()
+        sem = asyncio.Semaphore(4)
+        gov = ResourceGovernor(pid, sem)
+        assert gov._started_at == 0.0
+        await gov.start()
+        assert gov._started_at > 0.0
+        await gov.stop()
