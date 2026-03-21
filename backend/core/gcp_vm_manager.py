@@ -9492,6 +9492,10 @@ print(hashlib.sha256('|'.join(versions).encode()).hexdigest()[:16])
 STARTUP_SCRIPT_VERSION="__STARTUP_SCRIPT_VERSION__"
 STARTUP_SCRIPT_METADATA_VERSION=""
 
+# Phase durations for golden image ETA calculation (seconds)
+# Same table used by APARS stub health handler (_calc_eta)
+_PD0=5; _PD1=20; _PD4=30; _PD5=120; _PD6=30
+
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
 }
@@ -9537,6 +9541,18 @@ update_apars() {
     local now=$(date +%s)
     local elapsed=$((now - START_TIME))
 
+    # ETA calculation from phase durations
+    local eta=10
+    case $phase in
+        0) eta=$(( _PD0 * (100 - phase_progress) / 100 + _PD1 + _PD4 + _PD5 + _PD6 )) ;;
+        1) eta=$(( _PD1 * (100 - phase_progress) / 100 + _PD4 + _PD5 + _PD6 )) ;;
+        4) eta=$(( _PD4 * (100 - phase_progress) / 100 + _PD5 + _PD6 )) ;;
+        5) eta=$(( _PD5 * (100 - phase_progress) / 100 + _PD6 )) ;;
+        6) eta=$(( _PD6 * (100 - phase_progress) / 100 )) ;;
+        *) eta=$(( _PD0 + _PD1 + _PD4 + _PD5 + _PD6 - elapsed )) ;;
+    esac
+    [ "$eta" -lt 0 ] 2>/dev/null && eta=0
+
     local tmp_file="${PROGRESS_FILE}.tmp.$$"
 
     # Verify atomic rename safety (same filesystem)
@@ -9557,6 +9573,7 @@ update_apars() {
     "model_loaded": ${model_loaded},
     "ready_for_inference": ${ready},
     "error": ${error},
+    "eta_seconds": ${eta},
     "updated_at": ${now},
     "elapsed_seconds": ${elapsed},
     "deployment_mode": "golden_image",
