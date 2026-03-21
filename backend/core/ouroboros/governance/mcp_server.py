@@ -194,3 +194,70 @@ class OuroborosMCPServer:
         except Exception as exc:  # noqa: BLE001
             logger.error("[MCPServer] approve_operation failed: %s", exc, exc_info=True)
             return {"request_id": request_id, "status": "error", "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # reject_operation (GAP 5: completes approval lifecycle)
+    # ------------------------------------------------------------------
+
+    async def reject_operation(
+        self,
+        request_id: str,
+        approver: str = "mcp_client",
+        reason: str = "",
+    ) -> Dict[str, Any]:
+        """Reject a pending operation with an optional correction reason.
+
+        The reason is persisted to OUROBOROS.md via CorrectionWriter so the
+        brain learns from the rejection on subsequent operations.
+        """
+        try:
+            rejection = await self._gls._approval_provider.reject(
+                request_id, approver, reason
+            )
+            decided_at_str = (
+                rejection.decided_at.isoformat()
+                if rejection.decided_at is not None
+                else None
+            )
+            return {
+                "request_id": rejection.request_id,
+                "status": rejection.status.name.lower(),
+                "approver": rejection.approver,
+                "reason": reason,
+                "decided_at": decided_at_str,
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[MCPServer] reject_operation failed: %s", exc, exc_info=True)
+            return {"request_id": request_id, "status": "error", "error": str(exc)}
+
+    # ------------------------------------------------------------------
+    # elicit_answer (GAP 5: structured mid-operation input)
+    # ------------------------------------------------------------------
+
+    async def elicit_answer(
+        self,
+        request_id: str,
+        answer: str,
+    ) -> Dict[str, Any]:
+        """Deliver an answer to a pending structured elicitation.
+
+        Called by external systems (voice, TUI, web UI) when the pipeline
+        has paused to ask the user a question via elicit().
+        """
+        try:
+            provider = self._gls._approval_provider
+            if hasattr(provider, "_set_elicitation_answer"):
+                provider._set_elicitation_answer(request_id, answer)
+                return {
+                    "request_id": request_id,
+                    "status": "answered",
+                    "answer": answer,
+                }
+            return {
+                "request_id": request_id,
+                "status": "error",
+                "error": "Approval provider does not support elicitation",
+            }
+        except Exception as exc:  # noqa: BLE001
+            logger.error("[MCPServer] elicit_answer failed: %s", exc, exc_info=True)
+            return {"request_id": request_id, "status": "error", "error": str(exc)}

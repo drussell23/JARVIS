@@ -414,10 +414,13 @@ class IntakeLayerService:
             ]
 
         # VoiceCommandSensor has no start/stop lifecycle; store as attribute only.
+        # Wire UserSignalBus so "JARVIS stop" voice commands trigger FSM preemption.
+        _signal_bus = getattr(self._gls, "_user_signal_bus", None)
         self._voice_sensor = VoiceCommandSensor(
             router=self._router,
             repo="jarvis",
             stt_confidence_threshold=self._config.voice_stt_confidence_threshold,
+            signal_bus=_signal_bus,
         )
 
         # Sensors with start/stop lifecycle
