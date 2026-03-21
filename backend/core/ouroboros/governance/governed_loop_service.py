@@ -1243,6 +1243,23 @@ class GovernedLoopService:
                         exc,
                     )
 
+            # ── OUROBOROS.md human instruction injection ─────────────────────────
+            # Load 3-tier instruction hierarchy and stamp onto ctx before pipeline.
+            # Providers prepend this block to every generation prompt.
+            try:
+                from backend.core.ouroboros.governance.context_memory_loader import (
+                    ContextMemoryLoader,
+                )
+                _instructions = ContextMemoryLoader(
+                    project_root=self._config.project_root,
+                ).load()
+                if _instructions:
+                    ctx = ctx.with_human_instructions(_instructions)
+            except Exception as _cml_exc:
+                logger.debug(
+                    "[GovernedLoop] ContextMemoryLoader error (non-fatal): %s", _cml_exc
+                )
+
             # Connectivity preflight (spends from deadline budget)
             if self._generator is not None and self._ledger is not None:
                 early_exit = await self._preflight_check(ctx)

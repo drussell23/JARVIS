@@ -510,6 +510,9 @@ class OperationContext:
     # ---- Autonomy tier frozen at submit() — gate reads this, never re-queries TrustGraduator ----
     frozen_autonomy_tier: str = "governed"  # "governed" | "observe"; default = backward compat
 
+    # ---- Human-authored instructions from OUROBOROS.md hierarchy (injected at submit time) ----
+    human_instructions: str = ""  # injected from OUROBOROS.md hierarchy at submit time
+
     # ---- Reasoning chain result (stamped at CLASSIFY if chain is active) ----
     reasoning_chain_result: Optional[Dict[str, Any]] = None
 
@@ -927,6 +930,18 @@ class OperationContext:
         intermediate = dataclasses.replace(
             self,
             shadow=result,
+            previous_hash=self.context_hash,
+            context_hash="",
+        )
+        fields_for_hash = _context_to_hash_dict(intermediate)
+        new_hash = _compute_hash(fields_for_hash)
+        return dataclasses.replace(intermediate, context_hash=new_hash)
+
+    def with_human_instructions(self, instructions: str) -> "OperationContext":
+        """Stamp human-authored OUROBOROS.md instructions onto context."""
+        intermediate = dataclasses.replace(
+            self,
+            human_instructions=instructions,
             previous_hash=self.context_hash,
             context_hash="",
         )

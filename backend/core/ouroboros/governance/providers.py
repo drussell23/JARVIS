@@ -834,9 +834,18 @@ Rules:
 
     # ── 4. Assemble final prompt ─────────────────────────────────────────
     file_block = "\n\n".join(file_sections) if file_sections else "_No target files._"
-    parts = [
-        f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}",
-    ]
+    parts = []
+    # Human instructions from OUROBOROS.md hierarchy — always first in prompt
+    _human_instr = getattr(ctx, "human_instructions", "") or ""
+    if not isinstance(_human_instr, str):
+        _human_instr = ""
+    if _human_instr and _human_instr.strip():
+        parts.append(
+            "## Human Instructions\n\n"
+            + _human_instr.strip()
+            + "\n\n---"
+        )
+    parts.append(f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}")
     sys_ctx_block = _build_system_context_block(ctx)
     if sys_ctx_block is not None:
         parts.append(sys_ctx_block)
