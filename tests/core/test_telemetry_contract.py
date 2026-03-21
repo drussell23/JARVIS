@@ -166,11 +166,13 @@ class TestEventRegistry:
         assert registry.is_registered("recovery.attempt@1.0.0")
         assert registry.is_registered("fault.raised@1.0.0")
         assert registry.is_registered("fault.resolved@1.0.0")
+        assert registry.is_registered("host.environment_change@1.0.0")
+        assert registry.is_registered("exploration.tendril@1.0.0")
 
     def test_v1_has_expected_event_count(self):
         registry = EventRegistry.with_v1_defaults()
-        # 9 original + 2 topology (lifecycle.hardware, reasoning.proactive_drive) = 11
-        assert len(registry._schemas) == 11
+        # 9 original + 2 topology + 2 symbiote (host.environment_change, exploration.tendril) = 13
+        assert len(registry._schemas) == 13
 
 
 class TestTelemetryBus:
