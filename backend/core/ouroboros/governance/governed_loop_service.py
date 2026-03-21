@@ -1388,6 +1388,27 @@ class GovernedLoopService:
                 terminal_class=_tc,
             )
 
+            # ── Canary slice metrics ─────────────────────────────────────────────────
+            # record_operation matches file paths against registered slice prefixes.
+            # Must be called after duration and _rollback_occurred are computed.
+            if self._stack is not None and self._stack.canary is not None:
+                _canary_success = terminal_ctx.phase is OperationPhase.COMPLETE
+                _canary_files = (
+                    getattr(terminal_ctx, "target_files", None) or ctx.target_files
+                )
+                for _canary_fp in (_canary_files or ()):
+                    try:
+                        self._stack.canary.record_operation(
+                            file_path=str(_canary_fp),
+                            success=_canary_success,
+                            latency_s=duration,
+                            rolled_back=_rollback_occurred,
+                        )
+                    except Exception as _canary_exc:
+                        logger.debug(
+                            "[GovernedLoop] canary.record_operation error: %s", _canary_exc
+                        )
+
             self._completed_ops[dedupe_key] = result
             if self._ledger is not None:
                 _proof = _build_proof_artifact(
@@ -1700,6 +1721,35 @@ class GovernedLoopService:
                     ctx.op_id,
                 )
                 return ctx.advance(OperationPhase.CANCELLED)
+
+        # ── Degradation mode gate ────────────────────────────────────────────────
+        _deg_ctrl = getattr(getattr(self, "_stack", None), "degradation", None)
+        if _deg_ctrl is not None:
+            from backend.core.ouroboros.governance.degradation import DegradationMode
+            _deg_mode = _deg_ctrl.mode
+            if _deg_mode >= DegradationMode.READ_ONLY_PLANNING:
+                logger.warning(
+                    "[GovernedLoop] Preflight: degradation_mode=%s blocks op %s",
+                    _deg_mode.name,
+                    ctx.op_id,
+                )
+                return ctx.advance(OperationPhase.CANCELLED)
+            if _deg_mode == DegradationMode.REDUCED_AUTONOMY:
+                # Only SAFE_AUTO ops are allowed in reduced autonomy mode.
+                # risk_tier is set during the CLASSIFY phase — it is None at preflight
+                # time for the normal pipeline flow.  Treat None as non-SAFE_AUTO
+                # (fail-safe): the risk has not been evaluated yet, so we cannot
+                # confirm the op is safe to proceed without full autonomy.
+                from backend.core.ouroboros.governance.risk_engine import RiskTier
+                _risk_tier = ctx.risk_tier
+                if _risk_tier != RiskTier.SAFE_AUTO:
+                    logger.warning(
+                        "[GovernedLoop] Preflight: REDUCED_AUTONOMY blocks non-SAFE_AUTO op %s "
+                        "(risk_tier=%s — None means not yet classified; fail-safe block)",
+                        ctx.op_id,
+                        _risk_tier,
+                    )
+                    return ctx.advance(OperationPhase.CANCELLED)
 
         # ── Compute-class admission gate ──────────────────────────────────────
         if self._vm_capability is not None:
@@ -2088,6 +2138,20 @@ class GovernedLoopService:
             self._saga_bus = None
             logger.debug("[GovernedLoop] SagaMessageBus unavailable — saga_messages not found")
 
+        # Shadow harness — enabled via JARVIS_SHADOW_HARNESS_ENABLED=true
+        _shadow_harness = None
+        if os.environ.get("JARVIS_SHADOW_HARNESS_ENABLED", "false").lower() in ("true", "1"):
+            from backend.core.ouroboros.governance.shadow_harness import ShadowHarness
+            _shadow_harness = ShadowHarness(
+                confidence_threshold=float(os.environ.get("JARVIS_SHADOW_CONFIDENCE_THRESHOLD", "0.7")),
+                disqualify_after=int(os.environ.get("JARVIS_SHADOW_DISQUALIFY_AFTER", "3")),
+            )
+            logger.info(
+                "[GovernedLoop] ShadowHarness wired: confidence_threshold=%.2f, disqualify_after=%d",
+                float(os.environ.get("JARVIS_SHADOW_CONFIDENCE_THRESHOLD", "0.7")),
+                int(os.environ.get("JARVIS_SHADOW_DISQUALIFY_AFTER", "3")),
+            )
+
         # Build orchestrator
         orch_config = OrchestratorConfig(
             project_root=self._config.project_root,
@@ -2098,6 +2162,7 @@ class GovernedLoopService:
             message_bus=self._saga_bus,
             repair_engine=_repair_engine,
             execution_graph_scheduler=self._subagent_scheduler,
+            shadow_harness=_shadow_harness,
         )
         self._orchestrator = GovernedOrchestrator(
             stack=self._stack,
