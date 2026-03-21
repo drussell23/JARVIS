@@ -2461,6 +2461,89 @@ class UnifiedWebSocketManager:
 
             logger.info(f"[WS] Processing voice command: {command_text}")
 
+            # ============== E1 BRIDGE: Intent Classification ==============
+            # Deterministic classifier routes ACTION commands to RuntimeTaskOrchestrator
+            # (Neural Mesh agents, browser, apps, tools) and QUERY commands to
+            # HybridOrchestrator (J-Prime text Q&A). Zero LLM dependency.
+            try:
+                from backend.core.intent_classifier import get_intent_classifier, CommandIntent
+                from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
+
+                _classifier = get_intent_classifier()
+                _classification = _classifier.classify(command_text)
+
+                if _classification.intent == CommandIntent.ACTION:
+                    _rto = get_runtime_task_orchestrator()
+                    if _rto is not None:
+                        logger.info(
+                            "[WS] E1 Bridge: ACTION detected (signal='%s', category='%s', conf=%.2f) → RuntimeTaskOrchestrator",
+                            _classification.matched_signal,
+                            _classification.action_category,
+                            _classification.confidence,
+                        )
+                        try:
+                            _task_result = await _rto.execute(
+                                query=command_text,
+                                context={
+                                    "client_id": client_id,
+                                    "source": "voice_command",
+                                    "action_category": _classification.action_category,
+                                    "timestamp": datetime.now().isoformat(),
+                                },
+                            )
+
+                            # Build response from TaskResult
+                            _steps_ok = sum(1 for s in _task_result.steps if s.error is None)
+                            _response_text = _task_result.summary
+                            if _task_result.success and not _response_text:
+                                _response_text = "Done, Sir."
+
+                            # Narrate the action via lifecycle narrator
+                            try:
+                                from backend.core.supervisor.lifecycle_narrator import get_lifecycle_narrator
+                                _narrator = get_lifecycle_narrator()
+                                from backend.core.supervisor.lifecycle_narrator import NarrationPriority
+                                _narrator.enqueue(
+                                    f"Executing: {command_text[:80]}",
+                                    NarrationPriority.NORMAL,
+                                    category="voice_action",
+                                )
+                            except Exception:
+                                pass
+
+                            return {
+                                "type": "response",
+                                "text": _response_text,
+                                "status": "success" if _task_result.success else "partial",
+                                "command_type": "action",
+                                "speak": True,
+                                "routing": {
+                                    "routed_to": "runtime_task_orchestrator",
+                                    "intent": "action",
+                                    "action_category": _classification.action_category,
+                                    "confidence": _classification.confidence,
+                                    "steps_completed": _steps_ok,
+                                    "total_steps": len(_task_result.steps),
+                                    "plan_reasoning": _task_result.plan_reasoning[:200],
+                                },
+                            }
+                        except Exception as _rto_exc:
+                            logger.warning(
+                                "[WS] E1 Bridge: RTO execution failed (%s) — falling back to HybridOrchestrator",
+                                _rto_exc,
+                            )
+                            # Fall through to HybridOrchestrator below
+                    else:
+                        logger.debug("[WS] E1 Bridge: ACTION detected but RTO not initialized — using HybridOrchestrator")
+                else:
+                    logger.debug(
+                        "[WS] E1 Bridge: QUERY detected (signal='%s', conf=%.2f) → HybridOrchestrator",
+                        _classification.matched_signal,
+                        _classification.confidence,
+                    )
+            except ImportError:
+                logger.debug("[WS] E1 Bridge: IntentClassifier not available — using HybridOrchestrator")
+
             # ============== PHASE 2: Hybrid Orchestrator Integration ==============
             # Route commands through hybrid orchestrator for intelligent local/GCP routing
             # based on memory pressure, command complexity, and available resources

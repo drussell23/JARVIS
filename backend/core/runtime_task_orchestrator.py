@@ -809,3 +809,26 @@ class RuntimeTaskOrchestrator:
             parts.append(f"{failed} failed: {'; '.join(errors[:3])}")
 
         return " | ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Module-level singleton
+# ---------------------------------------------------------------------------
+
+_rto_instance: Optional[RuntimeTaskOrchestrator] = None
+
+
+def get_runtime_task_orchestrator() -> Optional[RuntimeTaskOrchestrator]:
+    """Get the singleton RuntimeTaskOrchestrator (set by Zone 6.12 at boot).
+
+    Returns None if the supervisor hasn't initialized it yet.
+    Use ``set_runtime_task_orchestrator()`` to register the instance.
+    """
+    return _rto_instance
+
+
+def set_runtime_task_orchestrator(instance: RuntimeTaskOrchestrator) -> None:
+    """Register the singleton RuntimeTaskOrchestrator (called by Zone 6.12)."""
+    global _rto_instance
+    _rto_instance = instance
+    logger.info("[RuntimeTask] Singleton registered")
