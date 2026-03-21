@@ -2284,6 +2284,23 @@ class GovernedLoopService:
                 MergeCoordinator,
             )
 
+            # --- Worktree isolation for parallel subagents ---
+            _wt_manager = None
+            if getattr(self._config, "l3_enable_worktree_isolation", True):
+                try:
+                    from backend.core.ouroboros.governance.worktree_manager import WorktreeManager
+                    _wt_base = getattr(
+                        self._config, "l3_worktree_base",
+                        Path.home() / ".jarvis" / "ouroboros" / "worktrees",
+                    )
+                    _wt_manager = WorktreeManager(
+                        repo_root=self._config.project_root,
+                        worktree_base=_wt_base,
+                    )
+                    logger.info("[GovernedLoop] WorktreeManager wired: base=%s", _wt_base)
+                except ImportError:
+                    logger.debug("[GovernedLoop] WorktreeManager not available — shared repo mode")
+
             self._subagent_scheduler = SubagentScheduler(
                 store=ExecutionGraphStore(self._config.execution_graph_state_dir),
                 command_bus=self._command_bus,
@@ -2292,6 +2309,7 @@ class GovernedLoopService:
                     generator=self._generator,
                     validation_runner=validation_runner,
                     repo_roots=repo_roots_map,
+                    worktree_manager=_wt_manager,
                 ),
                 merge_coordinator=MergeCoordinator(),
                 max_concurrent_graphs=self._config.max_concurrent_execution_graphs,
