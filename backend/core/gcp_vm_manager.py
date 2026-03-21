@@ -10251,7 +10251,7 @@ fi
 # with status="starting" immediately — but model may not be loaded yet.
 # Check ready_for_inference OR model_loaded in the JSON response.
 # Configurable health check timeout (same env var supervisor respects)
-SERVICE_HEALTH_TIMEOUT=${GCP_SERVICE_HEALTH_TIMEOUT:-90}
+SERVICE_HEALTH_TIMEOUT=${GCP_SERVICE_HEALTH_TIMEOUT:-120}
 HEALTH_CHECK_INTERVAL=2
 MAX_ATTEMPTS=$((SERVICE_HEALTH_TIMEOUT / HEALTH_CHECK_INTERVAL))
 log "Health check: ${MAX_ATTEMPTS} attempts x ${HEALTH_CHECK_INTERVAL}s = ${SERVICE_HEALTH_TIMEOUT}s timeout"
@@ -10656,6 +10656,10 @@ fi
         self._current_process_epoch = None  # v237.1: Reset process epoch for fresh polling
         _consecutive_ready = 0
         _consecutive_not_ready = 0
+        # v304.0: Adaptive hysteresis — golden image deployments use reduced
+        # hysteresis since their readiness signals are reliable (pre-baked deps).
+        _detected_deployment_mode: Optional[str] = None
+        _effective_hysteresis = self.config.readiness_hysteresis_up
         # v290.1: APARS terminal detection with grace period
         _apars_terminal_detected_at: Optional[float] = None
         _apars_grace_seconds = float(os.getenv(
@@ -10680,7 +10684,7 @@ fi
             if verdict == HealthVerdict.READY:
                 _consecutive_ready += 1
                 _consecutive_not_ready = 0
-                if _consecutive_ready >= self.config.readiness_hysteresis_up:
+                if _consecutive_ready >= _effective_hysteresis:
                     if progress_callback:
                         try:
                             progress_callback(100, "ready", f"VM ready at {ip}")
@@ -10690,7 +10694,7 @@ fi
                 else:
                     logger.info(
                         f"☁️ [InvincibleNode] Health READY ({_consecutive_ready}/"
-                        f"{self.config.readiness_hysteresis_up} for hysteresis)"
+                        f"{_effective_hysteresis} for hysteresis)"
                     )
             else:
                 _consecutive_not_ready += 1
@@ -10707,6 +10711,19 @@ fi
                 has_seen_any_response = True  # v235.3
                 consecutive_errors = 0  # v235.0: Reset on successful response
                 apars = health_data["apars"]
+                # v304.0: Detect deployment mode for adaptive hysteresis
+                if _detected_deployment_mode is None:
+                    _dm = apars.get("deployment_mode", "")
+                    if _dm:
+                        _detected_deployment_mode = _dm
+                        if _dm == "golden_image":
+                            _effective_hysteresis = max(1, int(os.getenv(
+                                "GCP_GOLDEN_HYSTERESIS_UP", "1"
+                            )))
+                            logger.info(
+                                f"☁️ [InvincibleNode] Golden image detected — "
+                                f"readiness hysteresis reduced to {_effective_hysteresis}"
+                            )
                 # v237.0: Validate boot session — discard stale APARS from previous boots
                 apars_session = apars.get("boot_session_id", "unknown")
                 if self._current_boot_session_id:
