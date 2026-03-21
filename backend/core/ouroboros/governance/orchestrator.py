@@ -309,6 +309,29 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] ComplexityClassifier not available", exc_info=True)
 
+        # ---- Consciousness regression detection (ProphecyEngine + MemoryEngine) ----
+        _consciousness_bridge = getattr(self._stack, "consciousness_bridge", None)
+        if _consciousness_bridge is None:
+            # Check if GLS has the bridge (wired by Zone 6.12)
+            _gls = getattr(self._stack, "governed_loop_service", None)
+            if _gls is not None:
+                _consciousness_bridge = getattr(_gls, "_consciousness_bridge", None)
+        if _consciousness_bridge is not None:
+            try:
+                _regression = await _consciousness_bridge.assess_regression_risk(
+                    list(ctx.target_files)
+                )
+                if _regression and _regression.get("risk_level") in ("high", "critical"):
+                    logger.warning(
+                        "[Orchestrator] Consciousness regression alert: %s risk for %s — %s [%s]",
+                        _regression["risk_level"],
+                        ctx.target_files,
+                        _regression.get("reasoning", ""),
+                        ctx.op_id,
+                    )
+            except Exception:
+                logger.debug("[Orchestrator] Consciousness regression check failed", exc_info=True)
+
         # ---- Policy engine check (declarative YAML rules) ----
         # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
         # explicit deny rules in policy files can override the risk engine.
