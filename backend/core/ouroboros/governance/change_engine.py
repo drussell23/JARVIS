@@ -51,6 +51,10 @@ from backend.core.ouroboros.governance.risk_engine import (
     RiskEngine,
     RiskTier,
 )
+from backend.core.ouroboros.governance.tool_hook_registry import (
+    HookDecision,
+    ToolCallHookRegistry,
+)
 
 logger = logging.getLogger("Ouroboros.ChangeEngine")
 
@@ -189,6 +193,10 @@ class ChangeEngine:
         Break-glass manager for BLOCKED operation promotion.
     risk_engine:
         Risk classifier (defaults to standard RiskEngine).
+    tool_hook_registry:
+        Optional ToolCallHookRegistry whose pre-hooks run before every file
+        write and whose post-hooks run after.  Pass ``None`` to disable hook
+        interception (default).
     """
 
     def __init__(
@@ -199,6 +207,7 @@ class ChangeEngine:
         lock_manager: Optional[GovernanceLockManager] = None,
         break_glass: Optional[BreakGlassManager] = None,
         risk_engine: Optional[RiskEngine] = None,
+        tool_hook_registry: Optional[Any] = None,
     ) -> None:
         self._project_root = Path(project_root)
         self._ledger = ledger
@@ -206,6 +215,7 @@ class ChangeEngine:
         self._lock_manager = lock_manager or GovernanceLockManager()
         self._break_glass = break_glass or BreakGlassManager()
         self._risk_engine = risk_engine or RiskEngine()
+        self._tool_hook_registry: Optional[ToolCallHookRegistry] = tool_hook_registry
 
     async def execute(self, request: ChangeRequest) -> ChangeResult:
         """Execute the 8-phase transactional change pipeline.
@@ -386,6 +396,33 @@ class ChangeEngine:
                 )
             )
 
+            # Pre-hook check: allow registries to block the write
+            if self._tool_hook_registry is not None:
+                hook_decision = await self._tool_hook_registry.run_pre(
+                    "edit",
+                    {
+                        "file": str(target),
+                        "op_id": op_id,
+                        "goal": request.goal,
+                    },
+                )
+                if hook_decision == HookDecision.BLOCK:
+                    logger.warning(
+                        "Pre-hook BLOCKED file write for op=%s target=%s",
+                        op_id,
+                        target,
+                    )
+                    await self._ledger.append(
+                        LedgerEntry(
+                            op_id=op_id,
+                            state=OperationState.FAILED,
+                            data={"reason": "pre_hook_blocked", "target_file": str(target)},
+                        )
+                    )
+                    raise RuntimeError(
+                        f"Tool hook blocked file write for {target} (op={op_id})"
+                    )
+
             # Acquire file lock for the write
             async with self._lock_manager.acquire(
                 level=LockLevel.FILE_LOCK,
@@ -395,6 +432,23 @@ class ChangeEngine:
                 target.write_text(
                     request.proposed_content, encoding="utf-8"
                 )
+
+            # Post-hook notification (fire-and-forget; errors swallowed by registry)
+            if self._tool_hook_registry is not None:
+                try:
+                    await self._tool_hook_registry.run_post(
+                        "edit",
+                        {
+                            "file": str(target),
+                            "op_id": op_id,
+                            "goal": request.goal,
+                        },
+                        result="applied",
+                    )
+                except Exception:
+                    logger.exception(
+                        "Post-hook error for op=%s target=%s (ignored)", op_id, target
+                    )
 
             # Phase 6: LEDGER -- record applied state
             await self._comm.emit_heartbeat(
