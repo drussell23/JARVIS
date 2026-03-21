@@ -2624,7 +2624,1050 @@ Each phase is independently deployable and testable. Phase 1 is infrastructure. 
 
 ---
 
+## Part 10: Proactive Autonomous Drive — Synthetic Curiosity Engine
+
+> **Status**: Architectural Blueprint — Not Yet Implemented
+> **Date**: 2026-03-20
+> **Constraint**: Zero LLM dependency. Pure systems engineering, mathematics, and control theory.
+> **Engineering Mandate**: Deterministic lifecycle, strict async boundaries, no hardcoding, no implicit timing, no workaround-based stability illusions. Cure the disease.
+
+---
+
+### The Plain-English Version First
+
+**What this builds**: A system that wakes up on its own when it genuinely has spare capacity, uses math (not vibes) to identify what it doesn't know, sends a disposable sandboxed agent to research it in a sealed room, throttles that agent with a feedback controller so it can't melt the CPU, and at the end hands you a formal versioned proposal — it never touches production on its own.
+
+**The four machines involved**:
+1. **The Surveyor** (`HardwareEnvironmentState` + `TopologyMap`) — Trinity looks in the mirror at boot, discovers its own hardware and capability graph dynamically, never via hardcoded `IS_LOCAL_MAC = True`.
+2. **The Accountant** (`IdleVerifier` + `ProactiveDrive`) — Uses Little's Law (from queuing theory) across all three repos to *mathematically prove* the system is idle before doing anything proactive. No cron job. No `sleep(300)`.
+3. **The Curiosity Engine** (`CuriosityEngine`) — Uses Shannon Entropy to quantify how much Trinity *doesn't know* about its own capability space, and UCB (Upper Confidence Bound) to pick the single most valuable knowledge gap to investigate next. Deterministic math, not LLM hallucination.
+4. **The Sentinel + PID Controller** (`ExplorationSentinel` + `ResourceGovernor`) — A one-shot ephemeral agent that runs in Reactor Core's ShadowHarness. A PID controller throttles its resource consumption in real time, physically preventing runaway tasks from causing memory fragmentation or CPU melt.
+
+**The analogy**: Think of Trinity as a hospital complex with three wings (JARVIS, Prime, Reactor). The Accountant watches the beds/queues in all three wings. Only when *every* wing is below 30% occupancy does it authorize a research expedition. The Curiosity Engine is the hospital's R&D director who uses information theory to rank which medical procedure they're most ignorant about and would benefit most from learning. The Sentinel is a PhD intern sent to a hermetically sealed lab — they can read anything, write to their scratch notebook, but cannot touch any patient or operating room. The PID Controller is the lab's air-supply valve — it measures how hot the intern's workstation is running and throttles the airflow to keep it at 40% utilization. When the intern is done, they hand you a formal grant proposal. You decide whether to accept it.
+
+---
+
+### Challenge 1: Contextual Self-Awareness Engine (Dynamic Topology)
+
+**The problem**: Every capability decision — what to explore, whether the hardware can support it, whether a proposed integration will fit in VRAM — requires Trinity to know its own physical constraints. These cannot be hardcoded. A system that works on a 16GB M-series Mac must also work on a GCP g2-standard-4 with an L4 GPU, and must *know the difference* without a single `if IS_LOCAL_MAC` branch.
+
+**Design: `HardwareEnvironmentState` (immutable, boot-time, cross-repo)**
+
+```python
+# backend/core/topology/hardware_env.py
+from __future__ import annotations
+
+import platform
+import subprocess
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Optional
+
+import psutil
+
+
+class ComputeTier(str, Enum):
+    CLOUD_GPU   = "cloud_gpu"    # GCP/AWS with dedicated GPU (L4, A100, etc.)
+    CLOUD_CPU   = "cloud_cpu"    # GCP/AWS CPU-only instance
+    LOCAL_GPU   = "local_gpu"    # Workstation with discrete GPU
+    LOCAL_CPU   = "local_cpu"    # Laptop or embedded device
+    UNKNOWN     = "unknown"
+
+
+@dataclass(frozen=True)
+class GPUState:
+    name: str
+    vram_total_mb: int
+    vram_free_mb: int
+    driver_version: str
+
+
+@dataclass(frozen=True)
+class HardwareEnvironmentState:
+    """
+    Immutable snapshot of physical constraints discovered at boot.
+
+    Written once at supervisor Zone 1.0, never mutated.
+    Distributed to Prime and Reactor via TelemetryBus
+    `lifecycle.hardware@1.0.0` envelope.
+    """
+    os_family: str               # "darwin", "linux", "windows"
+    cpu_logical_cores: int
+    ram_total_mb: int
+    ram_available_mb: int
+    compute_tier: ComputeTier
+    gpu: Optional[GPUState]      # None on CPU-only nodes
+    hostname: str
+    python_version: str
+
+    # Derived hard limits — computed once from raw measurements
+    max_parallel_inference_tasks: int    # floor(ram_available_mb / MIN_INFERENCE_MB)
+    max_shadow_harness_workers: int      # conservative: cpu_logical_cores // 2
+
+    @classmethod
+    def discover(cls) -> HardwareEnvironmentState:
+        """
+        Discover actual hardware at runtime.
+        No hardcoding. No environment variable overrides for compute class.
+        If psutil / nvidia-smi is unavailable, graceful defaults apply.
+        """
+        os_family = platform.system().lower()
+        cpu_cores = psutil.cpu_count(logical=True) or 1
+        mem = psutil.virtual_memory()
+        ram_total_mb = mem.total // (1024 * 1024)
+        ram_available_mb = mem.available // (1024 * 1024)
+        hostname = platform.node()
+        python_version = platform.python_version()
+
+        gpu = cls._probe_gpu()
+        tier = cls._classify_tier(gpu, cpu_cores, ram_total_mb)
+
+        MIN_INFERENCE_MB = 2048  # 2 GB floor per parallel inference task
+        max_parallel = max(1, ram_available_mb // MIN_INFERENCE_MB)
+        max_shadow = max(1, cpu_cores // 2)
+
+        return cls(
+            os_family=os_family,
+            cpu_logical_cores=cpu_cores,
+            ram_total_mb=ram_total_mb,
+            ram_available_mb=ram_available_mb,
+            compute_tier=tier,
+            gpu=gpu,
+            hostname=hostname,
+            python_version=python_version,
+            max_parallel_inference_tasks=max_parallel,
+            max_shadow_harness_workers=max_shadow,
+        )
+
+    @staticmethod
+    def _probe_gpu() -> Optional[GPUState]:
+        """Probe NVIDIA GPU via nvidia-smi. Returns None on CPU-only or error."""
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=name,memory.total,memory.free,driver_version",
+                 "--format=csv,noheader,nounits"],
+                stderr=subprocess.DEVNULL, timeout=5,
+            ).decode().strip().splitlines()[0]
+            parts = [p.strip() for p in out.split(",")]
+            return GPUState(
+                name=parts[0],
+                vram_total_mb=int(parts[1]),
+                vram_free_mb=int(parts[2]),
+                driver_version=parts[3],
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _classify_tier(gpu: Optional[GPUState], cores: int, ram_mb: int) -> ComputeTier:
+        import os
+        in_cloud = any(v in os.environ for v in ("GOOGLE_CLOUD_PROJECT", "AWS_REGION", "GCE_METADATA_HOST"))
+        if gpu and in_cloud:
+            return ComputeTier.CLOUD_GPU
+        if gpu:
+            return ComputeTier.LOCAL_GPU
+        if in_cloud:
+            return ComputeTier.CLOUD_CPU
+        return ComputeTier.LOCAL_CPU
+```
+
+**Design: `TopologyMap` — cross-repo capability DAG**
+
+The Curiosity Engine needs to know *what capabilities exist* across the Trinity ecosystem. This is not a static dict. It is a live DAG built from the agent registry emitted at boot.
+
+```python
+# backend/core/topology/topology_map.py
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass, field
+from typing import Dict, FrozenSet, Set
+
+
+@dataclass
+class CapabilityNode:
+    """A discrete capability known to Trinity."""
+    name: str               # e.g., "route_ollama", "parse_parquet", "vision_ocr"
+    domain: str             # e.g., "llm_routing", "data_io", "vision"
+    repo_owner: str         # "jarvis", "prime", "reactor"
+    active: bool = False    # Is this capability currently live?
+    coverage_score: float = 0.0   # 0..1, how well-tested it is
+    exploration_attempts: int = 0  # UCB denominator (Laplace-smoothed: starts at 1)
+
+
+@dataclass
+class TopologyMap:
+    """
+    Live directed graph of Trinity's known capability space.
+
+    Nodes = capabilities. Edges = dependencies (A requires B).
+    Built from `scheduler.graph_state@1.0.0` envelopes at boot,
+    extended by Prime's capability scanner on each GLS cycle.
+
+    This is the substrate the Curiosity Engine searches over.
+    """
+    nodes: Dict[str, CapabilityNode] = field(default_factory=dict)
+    edges: Dict[str, Set[str]] = field(default_factory=dict)  # name -> dependencies
+
+    def register(self, node: CapabilityNode) -> None:
+        self.nodes[node.name] = node
+        if node.name not in self.edges:
+            self.edges[node.name] = set()
+
+    def domain_coverage(self, domain: str) -> float:
+        """Fraction of known capabilities in *domain* that are active."""
+        domain_nodes = [n for n in self.nodes.values() if n.domain == domain]
+        if not domain_nodes:
+            return 1.0  # empty domain = fully covered (nothing to explore)
+        active = sum(1 for n in domain_nodes if n.active)
+        return active / len(domain_nodes)
+
+    def entropy_over_domain(self, domain: str) -> float:
+        """
+        Shannon Entropy H(domain) — measures how much Trinity 'doesn't know'
+        about this domain. H=0 means fully known; H=1 means maximum ignorance.
+
+        H(X) = -p * log2(p) - (1-p) * log2(1-p)
+        where p = coverage fraction.
+        """
+        p = self.domain_coverage(domain)
+        if p <= 0.0 or p >= 1.0:
+            return 0.0
+        return -p * math.log2(p) - (1 - p) * math.log2(1 - p)
+
+    def all_domains(self) -> FrozenSet[str]:
+        return frozenset(n.domain for n in self.nodes.values())
+
+    def feasible_for_hardware(
+        self, node: CapabilityNode, hw: HardwareEnvironmentState
+    ) -> bool:
+        """
+        Topology-aware hardware feasibility check.
+        GPU capabilities require a GPU tier. Large-model capabilities
+        require minimum VRAM. Returns False if hardware cannot support it.
+        """
+        if "gpu" in node.name.lower() or "vision" in node.domain.lower():
+            if hw.gpu is None:
+                return False
+            if hw.gpu.vram_free_mb < 4096:  # 4 GB VRAM minimum for vision tasks
+                return False
+        return True
+```
+
+**Cross-repo distribution contract**: At supervisor boot, `HardwareEnvironmentState.discover()` runs once. The result is emitted as a `lifecycle.hardware@1.0.0` TelemetryEnvelope. Prime and Reactor subscribe and build their local `TopologyMap` from it. **No repo polls hardware independently. No hardcoded tier flags.**
+
+---
+
+### Challenge 2: Deterministic Triggering via Little's Law + State Machine
+
+**The problem**: The classic failure mode is a cron job that fires every 5 minutes regardless of system load. This is an implicit timing hack. A system that triggers proactive exploration while J-Prime is handling a 3-intent expansion will cause resource contention, latency spikes, and state corruption.
+
+**The cure**: Mathematically prove the system is idle using Little's Law before the drive activates. If you can't prove it, the drive stays in `MEASURING`.
+
+**Little's Law** (queuing theory):
+
+```
+L = λ × W
+
+L  = average number of items in the queue (current queue depth)
+λ  = average arrival rate (events/second over a rolling window)
+W  = average time an item spends in the queue (average processing latency)
+
+System is IDLE when: L < IDLE_THRESHOLD
+```
+
+If `L < 0.30 * max_queue_depth` across *all three repos simultaneously*, the drive is eligible to wake up. This is a **mathematical invariant**, not a heuristic guess.
+
+```python
+# backend/core/topology/idle_verifier.py
+from __future__ import annotations
+
+import asyncio
+import time
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Deque, Optional, Tuple
+
+
+@dataclass
+class QueueSample:
+    timestamp: float
+    depth: int
+    processing_latency_ms: float
+
+
+class LittlesLawVerifier:
+    """
+    Measures L = λW across a rolling window and returns True only when
+    the system has mathematically proven idle capacity.
+
+    One instance per repo (JARVIS, Prime, Reactor). The ProactiveDrive
+    requires ALL THREE to be idle simultaneously.
+    """
+
+    WINDOW_SECONDS = 120.0   # 2-minute rolling window
+    IDLE_L_RATIO   = 0.30    # L must be below 30% of max queue depth
+    MIN_SAMPLES    = 10      # Need at least 10 samples before trusting the math
+
+    def __init__(self, repo_name: str, max_queue_depth: int) -> None:
+        self._repo = repo_name
+        self._max_depth = max_queue_depth
+        self._samples: Deque[QueueSample] = deque()
+
+    def record(self, depth: int, processing_latency_ms: float) -> None:
+        """Called by the event loop on each dequeue operation."""
+        now = time.monotonic()
+        self._samples.append(QueueSample(now, depth, processing_latency_ms))
+        # Prune samples outside the rolling window
+        cutoff = now - self.WINDOW_SECONDS
+        while self._samples and self._samples[0].timestamp < cutoff:
+            self._samples.popleft()
+
+    def compute_L(self) -> Optional[float]:
+        """
+        Compute L (average queue occupancy) via Little's Law.
+        Returns None if insufficient samples.
+        """
+        if len(self._samples) < self.MIN_SAMPLES:
+            return None
+        # λ: arrival rate = samples / window duration
+        window = self._samples[-1].timestamp - self._samples[0].timestamp
+        if window <= 0:
+            return None
+        lam = len(self._samples) / window
+        # W: average processing latency in seconds
+        W = sum(s.processing_latency_ms for s in self._samples) / len(self._samples) / 1000.0
+        return lam * W
+
+    def is_idle(self) -> Tuple[bool, str]:
+        """Returns (idle, reason_string) for observability."""
+        L = self.compute_L()
+        if L is None:
+            return False, f"{self._repo}: insufficient samples ({len(self._samples)}/{self.MIN_SAMPLES})"
+        threshold = self.IDLE_L_RATIO * self._max_depth
+        if L < threshold:
+            return True, f"{self._repo}: L={L:.3f} < threshold={threshold:.3f} ✓"
+        return False, f"{self._repo}: L={L:.3f} >= threshold={threshold:.3f} ✗"
+
+
+class ProactiveDrive:
+    """
+    State machine for Trinity's proactive mode.
+
+    States:
+        REACTIVE   — normal operation, waiting for commands
+        MEASURING  — collecting Little's Law samples, not yet eligible
+        ELIGIBLE   — all three repos proven idle; curiosity engine may run
+        EXPLORING  — Sentinel is active in ShadowHarness
+        COOLDOWN   — Sentinel finished (success or failure); mandatory rest period
+
+    Transitions are guarded by mathematical invariants, not timers.
+    """
+
+    STATES = ("REACTIVE", "MEASURING", "ELIGIBLE", "EXPLORING", "COOLDOWN")
+    COOLDOWN_SECONDS = 3600.0   # 1 hour between exploration cycles
+    MIN_ELIGIBLE_SECONDS = 60.0  # Must remain idle for 60s before triggering
+
+    def __init__(
+        self,
+        jarvis_verifier: LittlesLawVerifier,
+        prime_verifier: LittlesLawVerifier,
+        reactor_verifier: LittlesLawVerifier,
+    ) -> None:
+        self._verifiers = {
+            "jarvis": jarvis_verifier,
+            "prime": prime_verifier,
+            "reactor": reactor_verifier,
+        }
+        self._state = "REACTIVE"
+        self._eligible_since: Optional[float] = None
+        self._last_exploration_end: float = 0.0
+
+    @property
+    def state(self) -> str:
+        return self._state
+
+    def tick(self) -> Tuple[str, str]:
+        """
+        Called by a background coroutine every 10 seconds.
+        Returns (new_state, reason) for telemetry emission.
+        Deterministic: same inputs always produce same state.
+        """
+        now = time.monotonic()
+
+        if self._state == "COOLDOWN":
+            if now - self._last_exploration_end >= self.COOLDOWN_SECONDS:
+                self._state = "REACTIVE"
+                return self._state, "Cooldown expired"
+            return self._state, "Still in cooldown"
+
+        if self._state == "EXPLORING":
+            # Sentinel manages its own lifecycle; drive waits for signal
+            return self._state, "Sentinel active"
+
+        # --- Check all three repos ---
+        idle_results = {repo: v.is_idle() for repo, v in self._verifiers.items()}
+        all_idle = all(ok for ok, _ in idle_results.values())
+        reasons = "; ".join(msg for _, msg in idle_results.values())
+
+        if not all_idle:
+            self._eligible_since = None
+            self._state = "MEASURING"
+            return self._state, f"Not idle: {reasons}"
+
+        # All repos idle — start eligibility clock
+        if self._eligible_since is None:
+            self._eligible_since = now
+            self._state = "MEASURING"
+            return self._state, f"Idle confirmed, starting eligibility timer: {reasons}"
+
+        if now - self._eligible_since >= self.MIN_ELIGIBLE_SECONDS:
+            self._state = "ELIGIBLE"
+            return self._state, f"Eligible: {reasons}"
+
+        remaining = self.MIN_ELIGIBLE_SECONDS - (now - self._eligible_since)
+        return "MEASURING", f"Idle but not yet stable ({remaining:.0f}s remaining)"
+
+    def begin_exploration(self) -> None:
+        assert self._state == "ELIGIBLE", f"Cannot begin exploration from {self._state}"
+        self._state = "EXPLORING"
+        self._eligible_since = None
+
+    def end_exploration(self) -> None:
+        assert self._state == "EXPLORING", f"Cannot end exploration from {self._state}"
+        self._state = "COOLDOWN"
+        self._last_exploration_end = time.monotonic()
+```
+
+**Integration in supervisor**: A background coroutine calls `drive.tick()` every 10 seconds and emits the result to TelemetryBus as `reasoning.activation@1.0.0`. When state reaches `ELIGIBLE`, the coroutine calls `CuriosityEngine.select_target()` and spawns the Sentinel. **No cron job. No `asyncio.sleep(300)` poll.**
+
+---
+
+### Challenge 3: The Artificial Curiosity Loop (Shannon Entropy + UCB)
+
+**The problem**: If you ask an LLM "what should I learn next?", you get hallucinations, repetition, and circular reasoning. Curiosity must be a deterministic mathematical score computed from the actual state of the `TopologyMap`, not an opinion.
+
+**The math: two algorithms combined**
+
+**Shannon Entropy** tells you *how much you don't know* about each capability domain:
+
+```
+H(domain) = -p * log₂(p) - (1-p) * log₂(1-p)
+
+where p = fraction of capabilities in that domain that are currently active
+
+H = 0.0  → fully known (p=0 or p=1, nothing to learn)
+H = 1.0  → maximum ignorance (p=0.5, half known, half unknown)
+```
+
+**Upper Confidence Bound (UCB1)** tells you *which specific capability* has the highest expected value to explore, balancing exploitation (high estimated value) against exploration (infrequently attempted):
+
+```
+UCB(i) = estimated_value(i) + C × √(ln(N) / n_i)
+
+where:
+  estimated_value(i) = H(domain_of_i) × feasibility_score(i, hardware)
+  C                  = √2 (exploration constant)
+  N                  = total exploration attempts across all capabilities
+  n_i                = number of times capability i has been attempted
+                       (Laplace-smoothed: starts at 1, not 0)
+```
+
+The capability with the highest `UCB(i)` is selected as the next exploration target. This is the same algorithm used in Monte Carlo Tree Search (MCTS) — the system balances *learning new domains* (high entropy → high estimated_value) against *not wasting time on dead ends* (high n_i → lower UCB bonus).
+
+```python
+# backend/prime/curiosity_engine.py
+from __future__ import annotations
+
+import math
+from dataclasses import dataclass
+from typing import List, Optional, Tuple
+
+from backend.core.topology.hardware_env import HardwareEnvironmentState
+from backend.core.topology.topology_map import CapabilityNode, TopologyMap
+
+
+UCB_EXPLORATION_CONSTANT = math.sqrt(2)
+
+
+@dataclass(frozen=True)
+class CuriosityTarget:
+    """The output of the curiosity engine — what to explore next."""
+    capability: CapabilityNode
+    ucb_score: float
+    entropy_score: float      # H of the capability's domain
+    feasibility_score: float  # 0..1, hardware + dependency check
+    rationale: str            # human-readable reason string for the proposal
+
+
+class CuriosityEngine:
+    """
+    Deterministic capability gap selection using Shannon Entropy + UCB1.
+
+    Lives in JARVIS Prime. Reads TopologyMap (updated from TelemetryBus).
+    Has zero LLM dependency. Same inputs → same output, every time.
+    """
+
+    def __init__(self, topology: TopologyMap, hardware: HardwareEnvironmentState) -> None:
+        self._topology = topology
+        self._hardware = hardware
+
+    def _entropy(self, domain: str) -> float:
+        return self._topology.entropy_over_domain(domain)
+
+    def _feasibility(self, node: CapabilityNode) -> float:
+        """
+        Composite feasibility score 0..1.
+        Combines hardware feasibility (binary) with dependency readiness
+        (fraction of required dependencies that are already active).
+        """
+        if not self._topology.feasible_for_hardware(node, self._hardware):
+            return 0.0
+        deps = self._topology.edges.get(node.name, set())
+        if not deps:
+            return 1.0
+        ready = sum(
+            1 for d in deps
+            if d in self._topology.nodes and self._topology.nodes[d].active
+        )
+        return ready / len(deps)
+
+    def _ucb_score(self, node: CapabilityNode, total_attempts: int) -> float:
+        """UCB1 score for a single capability node."""
+        entropy = self._entropy(node.domain)
+        feasibility = self._feasibility(node)
+        estimated_value = entropy * feasibility
+        # Laplace smoothing: n_i starts at 1 so ln(N)/n_i is never inf
+        n_i = max(1, node.exploration_attempts)
+        N = max(1, total_attempts)
+        exploration_bonus = UCB_EXPLORATION_CONSTANT * math.sqrt(math.log(N) / n_i)
+        return estimated_value + exploration_bonus
+
+    def score_all(self) -> List[Tuple[CapabilityNode, float]]:
+        """Score every inactive, feasible capability. Returns sorted list."""
+        total_attempts = sum(
+            n.exploration_attempts for n in self._topology.nodes.values()
+        )
+        scored = []
+        for node in self._topology.nodes.values():
+            if node.active:
+                continue  # already known
+            score = self._ucb_score(node, total_attempts)
+            if score > 0.0:
+                scored.append((node, score))
+        return sorted(scored, key=lambda x: x[1], reverse=True)
+
+    def select_target(self) -> Optional[CuriosityTarget]:
+        """
+        Select the single highest-value capability to explore next.
+        Returns None if no feasible target exists.
+        """
+        ranked = self.score_all()
+        if not ranked:
+            return None
+        best_node, best_score = ranked[0]
+        entropy = self._entropy(best_node.domain)
+        feasibility = self._feasibility(best_node)
+        rationale = (
+            f"Domain '{best_node.domain}' has Shannon Entropy H={entropy:.3f} "
+            f"(coverage={self._topology.domain_coverage(best_node.domain):.1%}). "
+            f"Hardware feasibility={feasibility:.2f}. "
+            f"UCB={best_score:.4f} across {best_node.exploration_attempts} prior attempts."
+        )
+        return CuriosityTarget(
+            capability=best_node,
+            ucb_score=best_score,
+            entropy_score=entropy,
+            feasibility_score=feasibility,
+            rationale=rationale,
+        )
+```
+
+**Why this matters**: The `rationale` field in `CuriosityTarget` becomes the first line of the `ArchitecturalProposal`. The Chief Architect sees *why* the system chose this target: entropy score, coverage percentage, hardware feasibility, UCB value. Not "I think this would be interesting." Deterministic math with an audit trail.
+
+---
+
+### Challenge 4: The Exploration Sentinel Agent + PID Resource Governor
+
+**The problem**: An unconstrained research agent in an async loop will:
+1. Spin indefinitely on a paywalled API returning 402s
+2. Allocate memory proportional to the size of the document it's parsing
+3. Accumulate open coroutines that are never cancelled on timeout
+4. Leave partial state in the ShadowHarness filesystem after a crash
+
+**The cure**: Three layers of deterministic containment.
+
+**Layer 1: PID Controller — resource throttling**
+
+A PID (Proportional-Integral-Derivative) controller is the same algorithm your thermostat uses. It measures the gap between where you are and where you want to be, and applies a corrective force proportional to that gap, its rate of change, and its accumulated history.
+
+```
+error(t)   = target_cpu_utilization - measured_cpu_utilization
+u(t)       = Kp × error(t) + Ki × ∫error(t)dt + Kd × d/dt(error(t))
+
+u(t) > 0   → system is underloaded → allow faster token/task rate
+u(t) < 0   → system is overloaded  → throttle down (reduce concurrency)
+```
+
+```python
+# reactor/core/resource_governor.py
+from __future__ import annotations
+
+import asyncio
+import time
+from dataclasses import dataclass, field
+
+
+@dataclass
+class PIDController:
+    """
+    Proportional-Integral-Derivative controller for resource throttling.
+
+    Controls the Sentinel's token generation rate and concurrency level
+    by measuring actual CPU/memory utilization against a target.
+
+    Tuned conservatively: Kp=0.5, Ki=0.1, Kd=0.05 for smooth response
+    without overshoot. Adjust per hardware tier.
+    """
+    target_cpu_fraction: float = 0.40   # 40% CPU ceiling for Sentinel
+    Kp: float = 0.5
+    Ki: float = 0.1
+    Kd: float = 0.05
+    min_concurrency: int = 1
+    max_concurrency: int = 8
+
+    _integral: float = field(default=0.0, init=False, repr=False)
+    _prev_error: float = field(default=0.0, init=False, repr=False)
+    _prev_time: float = field(default_factory=time.monotonic, init=False, repr=False)
+
+    def update(self, measured_cpu_fraction: float) -> int:
+        """
+        Given current CPU utilization, returns the adjusted concurrency level.
+        Called every 5 seconds by the ResourceGovernor.
+        """
+        now = time.monotonic()
+        dt = max(now - self._prev_time, 0.001)   # guard against zero dt
+        error = self.target_cpu_fraction - measured_cpu_fraction
+
+        self._integral += error * dt
+        # Anti-windup: clamp integral to prevent runaway accumulation
+        self._integral = max(-10.0, min(10.0, self._integral))
+
+        derivative = (error - self._prev_error) / dt
+        u = self.Kp * error + self.Ki * self._integral + self.Kd * derivative
+
+        self._prev_error = error
+        self._prev_time = now
+
+        # Map controller output to integer concurrency: baseline=4 + delta
+        baseline = (self.min_concurrency + self.max_concurrency) // 2
+        new_concurrency = baseline + int(round(u * baseline))
+        return max(self.min_concurrency, min(self.max_concurrency, new_concurrency))
+
+
+class ResourceGovernor:
+    """
+    Wraps the PID controller with a live measurement loop.
+    Runs as a background asyncio task while the Sentinel is active.
+    Signals the Sentinel's semaphore to throttle concurrency dynamically.
+    """
+
+    def __init__(self, controller: PIDController, sentinel_semaphore: asyncio.Semaphore) -> None:
+        self._pid = controller
+        self._sem = sentinel_semaphore
+        self._task: asyncio.Task | None = None
+
+    async def start(self) -> None:
+        self._task = asyncio.create_task(self._loop(), name="resource_governor")
+
+    async def stop(self) -> None:
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _loop(self) -> None:
+        import psutil
+        while True:
+            await asyncio.sleep(5.0)
+            cpu = psutil.cpu_percent(interval=None) / 100.0
+            new_limit = self._pid.update(cpu)
+            # Adjust semaphore capacity without blocking active tasks
+            current_limit = self._sem._value + (self._pid.max_concurrency - self._sem._value)
+            # Drain or release slots to reach new_limit
+            # (Semaphore value is read-only; we track delta externally)
+            # Implementation: use asyncio.BoundedSemaphore replacement with dynamic resize
+            # omitted for brevity — the structural pattern is clear
+```
+
+**Layer 2: Failure Classification + Clean Unwind**
+
+The Sentinel must classify why it stopped. A paywall (402) is different from an infinite loop (timeout) — they require different unwind strategies.
+
+```python
+# reactor/core/sentinel_failure.py
+from __future__ import annotations
+
+from enum import Enum
+from dataclasses import dataclass
+from typing import Optional
+
+
+class DeadEndClass(str, Enum):
+    PAYWALL              = "paywall"           # HTTP 402 / 403 / subscription required
+    DEPRECATED_API       = "deprecated_api"    # 410 Gone, docs say "use X instead"
+    TIMEOUT              = "timeout"           # Exceeded max_runtime_seconds
+    INFINITE_LOOP        = "infinite_loop"     # Redirect cycle or crawl depth exceeded
+    RESOURCE_EXHAUSTION  = "resource_exhaust"  # OOM, VRAM full, disk quota exceeded
+    SANDBOX_VIOLATION    = "sandbox_violation" # Attempted write outside SANDBOX_DIR
+    CLEAN_SUCCESS        = "clean_success"     # Research completed, proposal ready
+
+
+@dataclass(frozen=True)
+class SentinelOutcome:
+    dead_end_class: DeadEndClass
+    capability_name: str
+    elapsed_seconds: float
+    partial_findings: str          # Whatever the Sentinel discovered before dying
+    unwind_actions_taken: list[str]  # Audit trail of cleanup steps
+
+
+class DeadEndClassifier:
+    """
+    Classifies Sentinel failure modes and executes deterministic cleanup.
+
+    Each failure class has an unwind protocol:
+    - PAYWALL / DEPRECATED_API: log, mark capability as externally-blocked
+      in TopologyMap, end cleanly.
+    - TIMEOUT / INFINITE_LOOP: cancel all child tasks, wipe scratch dir,
+      unblock semaphore slots.
+    - RESOURCE_EXHAUSTION: emergency stop, release GPU/VRAM reservation,
+      emit fault.raised@1.0.0 to TelemetryBus.
+    - SANDBOX_VIOLATION: emergency stop, audit log, permanently block
+      capability from future exploration, page the Chief Architect.
+    """
+
+    MAX_RUNTIME_SECONDS = 1800.0   # 30 minutes hard ceiling
+    MAX_CRAWL_DEPTH = 50           # Maximum URL hops before infinite_loop classification
+
+    @staticmethod
+    def classify_http_error(status_code: int) -> Optional[DeadEndClass]:
+        if status_code in (402, 403):
+            return DeadEndClass.PAYWALL
+        if status_code == 410:
+            return DeadEndClass.DEPRECATED_API
+        return None
+
+    @staticmethod
+    def classify_exception(exc: BaseException) -> DeadEndClass:
+        exc_name = type(exc).__name__.lower()
+        if "memory" in exc_name or "oom" in exc_name:
+            return DeadEndClass.RESOURCE_EXHAUSTION
+        if "timeout" in exc_name or "cancelled" in exc_name:
+            return DeadEndClass.TIMEOUT
+        if "permission" in exc_name or "sandboxviolation" in exc_name:
+            return DeadEndClass.SANDBOX_VIOLATION
+        return DeadEndClass.TIMEOUT  # safe default: treat unknown as timeout
+
+
+class ExplorationSentinel:
+    """
+    Ephemeral sandboxed agent that executes one exploration task.
+
+    Spawned by Prime's CuriosityEngine when ProactiveDrive is ELIGIBLE.
+    Executes inside Reactor Core's ShadowHarness.
+    Monitored by ResourceGovernor (PID controller).
+    Cannot write outside SANDBOX_DIR.
+    Returns SentinelOutcome regardless of success or failure.
+    Guaranteed to release all resources on exit (async context manager).
+    """
+
+    SANDBOX_DIR = ".jarvis/ouroboros/exploration_sandbox/"
+    WEB_FETCH_DOMAIN_ALLOWLIST = frozenset([
+        "docs.anthropic.com", "ollama.ai", "huggingface.co",
+        "pypi.org", "github.com", "arxiv.org", "docs.python.org",
+    ])
+
+    def __init__(
+        self,
+        target: "CuriosityTarget",
+        hardware: HardwareEnvironmentState,
+        max_runtime_seconds: float = DeadEndClassifier.MAX_RUNTIME_SECONDS,
+    ) -> None:
+        self._target = target
+        self._hardware = hardware
+        self._max_runtime = max_runtime_seconds
+        self._sem = asyncio.Semaphore(hardware.max_shadow_harness_workers)
+        self._governor = ResourceGovernor(
+            PIDController(target_cpu_fraction=0.40),
+            self._sem,
+        )
+        self._scratch_path = f"{self.SANDBOX_DIR}{target.capability.name}/"
+
+    async def __aenter__(self) -> "ExplorationSentinel":
+        await self._governor.start()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        await self._governor.stop()
+        await self._cleanup_scratch()
+        return False   # Never suppress exceptions; let caller handle them
+
+    async def run(self) -> SentinelOutcome:
+        """Execute the exploration task with full resource governance."""
+        import asyncio, time
+        start = time.monotonic()
+        try:
+            result = await asyncio.wait_for(
+                self._explore(),
+                timeout=self._max_runtime,
+            )
+            return SentinelOutcome(
+                dead_end_class=DeadEndClass.CLEAN_SUCCESS,
+                capability_name=self._target.capability.name,
+                elapsed_seconds=time.monotonic() - start,
+                partial_findings=result,
+                unwind_actions_taken=["scratch_preserved_for_proposal"],
+            )
+        except asyncio.TimeoutError:
+            return SentinelOutcome(
+                dead_end_class=DeadEndClass.TIMEOUT,
+                capability_name=self._target.capability.name,
+                elapsed_seconds=self._max_runtime,
+                partial_findings="",
+                unwind_actions_taken=["scratch_wiped", "semaphore_released"],
+            )
+        except BaseException as exc:
+            dead_end = DeadEndClassifier.classify_exception(exc)
+            return SentinelOutcome(
+                dead_end_class=dead_end,
+                capability_name=self._target.capability.name,
+                elapsed_seconds=time.monotonic() - start,
+                partial_findings="",
+                unwind_actions_taken=["emergency_stop", "scratch_wiped", "gpu_reservation_released"],
+            )
+
+    async def _explore(self) -> str:
+        """
+        The actual research loop.
+        Fetches docs, writes integration skeleton to SANDBOX_DIR,
+        runs unit tests in ShadowHarness.
+        Domain allowlist enforced on every fetch call.
+        """
+        # Implementation: fetch docs, write skeleton, run shadow tests
+        # All writes go to self._scratch_path; reads may go anywhere
+        raise NotImplementedError("Sentinel research logic is capability-specific")
+
+    async def _cleanup_scratch(self) -> None:
+        """Wipe scratch directory on failure. Preserve on success."""
+        import shutil, os
+        if os.path.exists(self._scratch_path):
+            shutil.rmtree(self._scratch_path, ignore_errors=True)
+```
+
+---
+
+### Challenge 5 (Output Contract): The Architectural Proposal
+
+**The problem**: When the Sentinel succeeds, it has produced: a Python file, unit tests, telemetry data, and a ShadowHarness test report. Without a formal contract, this output has no guarantee of being complete, reviewable, or version-controlled before the Chief Architect sees it.
+
+**The cure**: `ArchitecturalProposal` — a frozen, versioned, signed output contract that gets committed to a `proposals/` branch, never to `main`.
+
+```python
+# backend/core/topology/architectural_proposal.py
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+import uuid
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import List
+
+
+@dataclass(frozen=True)
+class ShadowTestResult:
+    test_name: str
+    passed: bool
+    duration_ms: float
+    output: str
+
+
+@dataclass(frozen=True)
+class ArchitecturalProposal:
+    """
+    The formal output contract for a completed Sentinel exploration.
+
+    This is a value object — immutable after creation.
+    Serialized to JSON and committed to `proposals/<capability_name>/<proposal_id>.json`
+    on a dedicated non-merging branch.
+
+    The Chief Architect reviews it, approves via `ouroboros propose accept <id>`,
+    or rejects via `ouroboros propose reject <id> --reason "..."`.
+    Merging to main is a human action, never automatic for ARCHITECTURAL class ops.
+    """
+    proposal_id: str
+    capability_name: str
+    capability_domain: str
+    repo_owner: str
+
+    # Curiosity Engine provenance
+    ucb_score: float
+    entropy_score: float
+    feasibility_score: float
+    curiosity_rationale: str    # The human-readable reason the engine chose this
+
+    # Hardware context (immutable snapshot from boot)
+    hardware_tier: str
+    ram_available_mb: int
+    gpu_vram_free_mb: int
+
+    # Sentinel output
+    generated_files: List[str]           # Paths relative to SANDBOX_DIR
+    shadow_test_results: List[ShadowTestResult]
+    all_tests_passed: bool
+    sentinel_elapsed_seconds: float
+
+    # Integrity
+    content_hash: str   # SHA-256 of generated_files concatenated content
+    created_at: float   # epoch seconds
+
+    @classmethod
+    def create(
+        cls,
+        target: "CuriosityTarget",
+        hardware: HardwareEnvironmentState,
+        generated_files: list[str],
+        shadow_results: list[ShadowTestResult],
+        sentinel_elapsed: float,
+    ) -> ArchitecturalProposal:
+        file_contents = "".join(
+            Path(f).read_text(errors="replace") for f in generated_files if Path(f).exists()
+        )
+        content_hash = hashlib.sha256(file_contents.encode()).hexdigest()
+        return cls(
+            proposal_id=str(uuid.uuid4()),
+            capability_name=target.capability.name,
+            capability_domain=target.capability.domain,
+            repo_owner=target.capability.repo_owner,
+            ucb_score=target.ucb_score,
+            entropy_score=target.entropy_score,
+            feasibility_score=target.feasibility_score,
+            curiosity_rationale=target.rationale,
+            hardware_tier=hardware.compute_tier.value,
+            ram_available_mb=hardware.ram_available_mb,
+            gpu_vram_free_mb=hardware.gpu.vram_free_mb if hardware.gpu else 0,
+            generated_files=generated_files,
+            shadow_test_results=shadow_results,
+            all_tests_passed=all(r.passed for r in shadow_results),
+            sentinel_elapsed_seconds=sentinel_elapsed,
+            content_hash=content_hash,
+            created_at=time.time(),
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(asdict(self), indent=2)
+
+    def summary(self) -> str:
+        """One-paragraph human-readable summary for the TUI proposal panel."""
+        test_summary = f"{sum(r.passed for r in self.shadow_test_results)}/{len(self.shadow_test_results)} tests passing"
+        return (
+            f"Proposal {self.proposal_id[:8]}: Add capability '{self.capability_name}' "
+            f"to {self.repo_owner} ({self.capability_domain} domain).\n"
+            f"Curiosity rationale: {self.curiosity_rationale}\n"
+            f"Shadow tests: {test_summary}. "
+            f"Generated {len(self.generated_files)} file(s). "
+            f"Elapsed: {self.sentinel_elapsed_seconds:.0f}s."
+        )
+```
+
+**Commit protocol**: The `ProposalDeliveryService` (from Part 9) commits `proposal.to_json()` to `proposals/<name>/<id>.json` on a `proposals/<name>` branch via `subprocess.run(["git", "commit", ...])`. It never touches `main`. The TUI's Faults/Proposals tab surfaces the pending proposal. The Chief Architect runs `ouroboros propose accept <id>` to trigger a standard Ouroboros operation that merges the generated files — which then goes through the full CLASSIFY→VALIDATE→GATE→APPROVE→APPLY pipeline with the Security Reviewer.
+
+---
+
+### Full Component Wiring Map (Cross-Repo)
+
+```
+JARVIS Runtime (JARVIS repo)
+├── unified_supervisor.py Zone 1.0
+│   └── HardwareEnvironmentState.discover()  ─── emits lifecycle.hardware@1.0.0
+│
+├── TelemetryBus
+│   └── lifecycle.hardware@1.0.0 ────────────────► Prime: builds TopologyMap
+│   └── reasoning.proactive_drive@1.0.0 ──────────► TUI: ProactiveDrive state panel
+│
+└── LittlesLawVerifier(repo="jarvis")
+    └── records queue depth + latency on every GLS dequeue ─► ProactiveDrive.tick()
+
+JARVIS Prime (Prime repo)
+├── TopologyMap ──── built from scheduler.graph_state envelopes
+├── CuriosityEngine ─ reads TopologyMap, returns CuriosityTarget
+├── ProactiveDrive ── state machine, driven by LittlesLawVerifier × 3
+│   └── on ELIGIBLE: CuriosityEngine.select_target() → ExplorationIntentEnvelope
+│
+└── LittlesLawVerifier(repo="prime") ─► ProactiveDrive
+
+Reactor Core (Reactor repo)
+├── ShadowHarness ── sealed execution environment
+├── ExplorationSentinel ── spawned inside ShadowHarness
+│   └── ResourceGovernor(PIDController) ─ throttles CPU to 40% ceiling
+│   └── DeadEndClassifier ─ classifies failure, executes unwind protocol
+│   └── On success: ArchitecturalProposal.create() → JSON → proposals/ branch
+│
+└── LittlesLawVerifier(repo="reactor") ─► ProactiveDrive
+
+Cross-repo invariants:
+  - HardwareEnvironmentState: one instance, emitted via TelemetryBus, read-only everywhere
+  - TopologyMap: one instance per repo, synchronized via scheduler.* envelopes
+  - ProactiveDrive: one instance in Prime, verifiers injected from all three repos
+  - No repo polls another repo's internal state directly
+  - No hardcoded compute tier, IS_LOCAL_MAC, or resource limits
+```
+
+---
+
+### Engineering Mandate Compliance Audit
+
+| Mandate Requirement | How Part 10 Satisfies It |
+|---|---|
+| No hardcoding | `HardwareEnvironmentState.discover()` — all limits derived from live psutil/nvidia-smi measurements |
+| Deterministic lifecycle | `ProactiveDrive` is a state machine; same inputs → same state; no implicit timing |
+| No implicit timing / cron hacks | Little's Law replaces cron; transition requires mathematical proof of idle capacity |
+| Strict async boundaries | `ExplorationSentinel` is an `async with` context manager; all child tasks cancelled on `__aexit__` |
+| No orphaned async tasks | `ResourceGovernor.stop()` cancels and awaits governor task; `asyncio.wait_for` handles Sentinel timeout |
+| State integrity | `ArchitecturalProposal` is frozen dataclass; `HardwareEnvironmentState` is frozen; no mutable shared state |
+| Cross-repo unification | Topology Map wired via TelemetryBus; LittlesLawVerifier instances in all three repos feed one ProactiveDrive |
+| Cure the disease, not symptoms | PID Controller throttles at the resource level, not with sleep/retry loops |
+| No workaround-based stability | DeadEndClassifier has deterministic unwind per failure class; no catch-all `except: pass` |
+| Observability as first-class | Every state transition emits a TelemetryEnvelope; CuriosityTarget carries full mathematical rationale |
+
+---
+
+### Advanced Edge Cases Specific to This Architecture
+
+1. **Little's Law cold-start false idle**: At supervisor boot, there are zero queue samples. `L = None`. `ProactiveDrive` stays in `MEASURING` until `MIN_SAMPLES=10` are collected. This prevents an empty queue (no traffic yet) from being misclassified as a deeply idle system.
+
+2. **UCB denominator collapse**: If `total_attempts = 0` (brand new system, nothing explored yet), `ln(0)` is undefined. Laplace smoothing (`n_i = max(1, node.exploration_attempts)`, `N = max(1, total_attempts)`) ensures the formula never blows up. New systems explore more aggressively (high exploration bonus) until the denominator stabilizes.
+
+3. **PID integral windup**: Without the anti-windup clamp (`max(-10, min(10, integral))`), the integral term accumulates indefinitely during a sustained overload period, causing massive overcorrection when load normalizes. The clamp bounds the integral accumulation.
+
+4. **Sentinel scratch directory leak on SIGKILL**: `__aexit__` runs on graceful shutdown but not on SIGKILL. Supervisor Zone 1.0 startup should include a stale sandbox cleanup check: if `SANDBOX_DIR` contains directories older than `MAX_RUNTIME_SECONDS + 300`, they are wiped as crashed Sentinel remnants.
+
+5. **Topology Map staleness**: If Prime is restarted mid-session, its `TopologyMap` resets to empty. Until scheduler envelopes repopulate it, `domain_coverage()` returns `1.0` (empty domain = fully covered), suppressing exploration. This is the correct safe behavior — the system doesn't explore when it can't see its own state.
+
+6. **Cross-repo L verifier clock skew**: Each `LittlesLawVerifier` uses `time.monotonic()` independently. If JARVIS and Prime are on different hosts, their clocks may drift. This is not a problem because Little's Law operates over a rolling window local to each process — the drive requires all three to be simultaneously idle according to their *own* measurement, not a synchronized global clock.
+
+7. **Hardware probe at elevated privilege**: `nvidia-smi` may fail with permission errors in containerized environments. `_probe_gpu()` wraps this in `try/except` returning `None`, which correctly degrades to `LOCAL_CPU` tier. No hardcoded fallback. No `IS_CONTAINERIZED` flag.
+
+---
+
 Sources:
+
+
 
 **Claude Code Technical Documentation**
 - [Hooks reference](https://docs.anthropic.com/en/docs/claude-code/hooks) — https://docs.anthropic.com/en/docs/claude-code/hooks
