@@ -777,6 +777,26 @@ class RuntimeTaskOrchestrator:
                 exec_result.elapsed_seconds,
             )
 
+            # Record usage for graduation tracking
+            if exec_result.outcome.value == "success":
+                _tracker = getattr(self, "_graduation_tracker", None)
+                if _tracker is not None:
+                    _gcid = await _tracker.record_usage(
+                        goal=goal,
+                        code_hash=exec_result.code_hash,
+                        outcome=exec_result.outcome.value,
+                        elapsed_s=exec_result.elapsed_seconds,
+                    )
+                    # Threshold reached — trigger graduation in background
+                    if _gcid is not None:
+                        _grad = getattr(self, "_graduation_orchestrator", None)
+                        if _grad is not None:
+                            _records = _tracker.get_records(_gcid)
+                            asyncio.create_task(
+                                _grad.evaluate_graduation(_gcid, _records),
+                                name=f"graduation_{_gcid}",
+                            )
+
             return {
                 "status": exec_result.outcome.value,
                 "ephemeral": ephemeral,
