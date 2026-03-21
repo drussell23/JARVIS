@@ -463,11 +463,50 @@ class RuntimeTaskOrchestrator:
                 logger.warning("[RuntimeTask] Orchestrator fallback failed: %s", exc)
 
         # Fallback 2: sequential execution
+        executed: List[StepResolution] = []
         for resolution, step in zip(resolutions, plan_steps):
             result = await self._execute_single(resolution, step, ctx)
             executed.append(result)
 
         return executed
+
+    def _make_dag_node_executor(
+        self, resolutions: List[StepResolution],
+    ) -> Any:
+        """Create a DAG node executor that routes to the right dispatch method.
+
+        Returns an async callable(node, context) -> result that the DAGExecutor
+        calls for each node. The executor captures `self` and `resolutions` in
+        closure so each node is dispatched according to its resolution type.
+        """
+        resolution_map = {f"node-{i}": r for i, r in enumerate(resolutions)}
+        orchestrator = self
+
+        async def _executor(node: Any, context: Dict[str, Any]) -> Any:
+            resolution = resolution_map.get(node.node_id)
+            if resolution is None:
+                return {"error": f"No resolution for {node.node_id}"}
+
+            step = context  # DAG passes metadata as context
+
+            if resolution.resolution == TaskResolution.EXISTING_AGENT:
+                return await orchestrator._dispatch_to_agent(
+                    resolution.agent_name or "", node.goal, step,
+                )
+            elif resolution.resolution == TaskResolution.GOVERNANCE_OP:
+                return await orchestrator._dispatch_to_governance(node.goal, step)
+            elif resolution.resolution in (
+                TaskResolution.EPHEMERAL_TOOL,
+                TaskResolution.PERSISTENT_PROPOSAL,
+            ):
+                return await orchestrator._synthesize_and_execute(
+                    node.goal, step,
+                    ephemeral=(resolution.resolution == TaskResolution.EPHEMERAL_TOOL),
+                )
+            else:
+                return {"error": f"Unresolvable: {node.goal}"}
+
+        return _executor
 
     async def _execute_via_orchestrator(
         self,
