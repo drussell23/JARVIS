@@ -42,11 +42,105 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+class _BootCLINarrator:
+    """Projects parallel DAG execution into sequential CLI output.
+
+    The parallel boot runs phases concurrently, but the terminal shows a
+    clean sequential narrative matching the kernel's structured format:
+
+        ━━━━━━━━━ 🚀 BOOT │ Phase 1: Preflight  ⏱ +15293ms ━━━━━━━━━━
+        💎 [INFO] +  16189ms │   [Kernel] Cleaning orphaned semaphores...
+        ─────────────────── ✅ BOOT completed in 4842.0ms ───────────────
+
+    Phases are narrated in LOGICAL order (clean_slate → preflight →
+    resources → backend → intelligence) even if they resolve out of order.
+    The narrator queues out-of-order completions and emits them when all
+    preceding phases have finished.
+    """
+
+    # Logical phase order for narrative presentation
+    PHASE_SEQUENCE = [
+        ("clean_slate",        "Phase -1: Clean Slate",       "🧹"),
+        ("preflight",          "Phase 1: Preflight",          "🚀"),
+        ("resources",          "Phase 2: Resources",          "📦"),
+        ("loading_experience", "Phase 0: Loading Experience", "🖥️"),
+        ("backend",            "Phase 3: Backend Server",     "⚙️"),
+        ("intelligence",       "Phase 4: Intelligence",       "🧠"),
+    ]
+
+    def __init__(self, kernel_logger) -> None:
+        self._log = kernel_logger
+        self._boot_start = time.monotonic()
+        self._narrated: set = set()       # Phases already narrated
+        self._resolved: Dict[str, float] = {}  # phase -> elapsed_s
+        self._failed: Dict[str, str] = {}      # phase -> error
+
+    def _elapsed_ms(self) -> float:
+        return (time.monotonic() - self._boot_start) * 1000
+
+    def phase_start(self, phase_name: str) -> None:
+        """Emit a phase start banner (immediate — not queued)."""
+        for name, title, icon in self.PHASE_SEQUENCE:
+            if name == phase_name:
+                elapsed = self._elapsed_ms()
+                sep = "━" * 13
+                self._log.info(f"\n{sep} {icon} BOOT │ {title}  ⏱ +{elapsed:.0f}ms {sep}\n")
+                return
+
+    def phase_resolved(self, phase_name: str, _total_elapsed: float = 0) -> None:
+        """Record a phase completion. Emit narrative in order."""
+        # Use the DAG node's own elapsed time for accuracy
+        try:
+            from backend.core.progressive_readiness import get_readiness
+            pr = get_readiness()
+            node = pr._nodes.get(phase_name)
+            if node and node.elapsed_s > 0:
+                self._resolved[phase_name] = node.elapsed_s
+            else:
+                self._resolved[phase_name] = _total_elapsed
+        except Exception:
+            self._resolved[phase_name] = _total_elapsed
+        self._flush_narrative()
+
+    def phase_failed(self, phase_name: str, error: str) -> None:
+        """Record a phase failure. Emit narrative in order."""
+        self._failed[phase_name] = error
+        self._resolved[phase_name] = 0.0
+        self._flush_narrative()
+
+    def _flush_narrative(self) -> None:
+        """Emit queued phase completions in logical order.
+
+        If phases 1,2,3 resolve but we've only narrated 1, this emits
+        2 and 3 in order. If 3 resolves before 2, it waits.
+        """
+        for name, title, icon in self.PHASE_SEQUENCE:
+            if name in self._narrated:
+                continue
+            if name not in self._resolved:
+                break  # Can't narrate this yet — predecessor hasn't resolved
+            elapsed = self._resolved[name]
+            error = self._failed.get(name)
+            sep = "─" * 19
+            if error:
+                self._log.info(f"{sep} ❌ {icon} {title} FAILED ({error}) {sep}")
+            else:
+                self._log.info(f"{sep} ✅ {icon} {title} completed in {elapsed * 1000:.1f}ms {sep}")
+            self._narrated.add(name)
+
+    def active_local_reached(self, elapsed_s: float) -> None:
+        """Emit the ACTIVE_LOCAL milestone banner."""
+        self._log.info(
+            f"\n{'━' * 20} 🟢 ACTIVE_LOCAL reached in {elapsed_s:.1f}s {'━' * 20}\n"
+        )
+
+
 class ParallelBootOrchestrator:
     """Runs the boot DAG with true async concurrency.
 
     Calls the existing phase methods on the kernel — no reimplementation.
     Tracks state via ProgressiveReadiness — no synthetic progress.
+    CLI output follows a sequential narrative via _BootCLINarrator.
     """
 
     def __init__(self, kernel: Any) -> None:
@@ -54,6 +148,7 @@ class ParallelBootOrchestrator:
         self._start_time = time.monotonic()
         self._phase_results: Dict[str, bool] = {}
         self._phase_errors: Dict[str, str] = {}
+        self._narrator = _BootCLINarrator(kernel.logger)
 
     async def run(self) -> int:
         """Execute the parallel boot DAG. Returns exit code."""
@@ -80,6 +175,7 @@ class ParallelBootOrchestrator:
         # ============================================================
         # Phase 1: Clean Slate (must be first — cleanup)
         # ============================================================
+        self._narrator.phase_start("clean_slate")
         try:
             await k._safe_broadcast(
                 stage="starting", message="Cleaning up previous session...",
@@ -91,9 +187,11 @@ class ParallelBootOrchestrator:
         pr.mark_running("clean_slate", "Cleanup and state recovery")
         ok = await self._run_phase("clean_slate", k._phase_clean_slate, timeout=30.0)
         if not ok:
+            self._narrator.phase_failed("clean_slate", "startup failure")
             logger.error("[ParallelBoot] Clean Slate FAILED — cannot continue")
             return 1
         await pr.mark_resolved("clean_slate")
+        self._narrator.phase_resolved("clean_slate", time.time() - t0)
 
         # ============================================================
         # Phase 2: PARALLEL — Preflight + Resources + Loading Experience
@@ -108,6 +206,7 @@ class ParallelBootOrchestrator:
             pass
 
         logger.info("[ParallelBoot] Launching parallel group: preflight + resources + loading")
+        self._narrator.phase_start("preflight")
         pr.mark_running("preflight", "DMS, IPC, locks")
         pr.mark_running("resources", "Docker, GCP client, ports")
         pr.mark_running("loading_experience", "Loading page server")
@@ -130,10 +229,27 @@ class ParallelBootOrchestrator:
             _pf_task, _rs_task, _le_task,
         )
 
-        # Mark resolved/failed
-        await pr.mark_resolved("preflight") if _pf_ok else await pr.mark_failed("preflight", self._phase_errors.get("preflight", ""))
-        await pr.mark_resolved("resources") if _rs_ok else await pr.mark_failed("resources", self._phase_errors.get("resources", ""))
-        await pr.mark_resolved("loading_experience") if _le_ok else await pr.mark_failed("loading_experience", self._phase_errors.get("loading_experience", ""))
+        # Mark resolved/failed and narrate in logical order
+        if _pf_ok:
+            await pr.mark_resolved("preflight")
+            self._narrator.phase_resolved("preflight", time.time() - t0)
+        else:
+            await pr.mark_failed("preflight", self._phase_errors.get("preflight", ""))
+            self._narrator.phase_failed("preflight", self._phase_errors.get("preflight", "unknown"))
+
+        if _rs_ok:
+            await pr.mark_resolved("resources")
+            self._narrator.phase_resolved("resources", time.time() - t0)
+        else:
+            await pr.mark_failed("resources", self._phase_errors.get("resources", ""))
+            self._narrator.phase_failed("resources", self._phase_errors.get("resources", "unknown"))
+
+        if _le_ok:
+            await pr.mark_resolved("loading_experience")
+            self._narrator.phase_resolved("loading_experience", time.time() - t0)
+        else:
+            await pr.mark_failed("loading_experience", self._phase_errors.get("loading_experience", ""))
+            self._narrator.phase_failed("loading_experience", self._phase_errors.get("loading_experience", "unknown"))
 
         parallel_elapsed = time.time() - t0
         logger.info(
@@ -159,18 +275,22 @@ class ParallelBootOrchestrator:
         except Exception:
             pass
 
+        self._narrator.phase_start("backend")
         pr.mark_running("backend", "uvicorn + FastAPI")
         _be_ok = await self._run_phase("backend", k._phase_backend, timeout=300.0)
         if _be_ok:
             await pr.mark_resolved("backend")
+            self._narrator.phase_resolved("backend", time.time() - t0)
         else:
             await pr.mark_failed("backend", self._phase_errors.get("backend", ""))
+            self._narrator.phase_failed("backend", self._phase_errors.get("backend", "unknown"))
             logger.error("[ParallelBoot] Backend FAILED — cannot continue")
             return 1
 
         # ============================================================
         # Phase 4: Intelligence (needs Backend)
         # ============================================================
+        self._narrator.phase_start("intelligence")
         try:
             await k._safe_broadcast(
                 stage="intelligence", message="Loading intelligence layer...",
@@ -183,6 +303,7 @@ class ParallelBootOrchestrator:
         _in_ok = await self._run_phase("intelligence", k._phase_intelligence, timeout=120.0)
         if _in_ok:
             await pr.mark_resolved("intelligence")
+            self._narrator.phase_resolved("intelligence", time.time() - t0)
         else:
             await pr.mark_failed("intelligence", self._phase_errors.get("intelligence", ""))
             logger.error("[ParallelBoot] Intelligence FAILED — continuing degraded")
@@ -195,6 +316,7 @@ class ParallelBootOrchestrator:
         # via _evaluate_tier_advancement(). The user can now interact with JARVIS.
 
         local_elapsed = time.time() - t0
+        self._narrator.active_local_reached(local_elapsed)
         logger.info(
             "[ParallelBoot] ACTIVE_LOCAL reached in %.1fs (vs ~100s sequential)",
             local_elapsed,
