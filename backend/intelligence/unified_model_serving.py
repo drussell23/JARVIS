@@ -131,8 +131,20 @@ PRIME_CONTEXT_LENGTH = int(os.getenv("JARVIS_PRIME_CONTEXT_LENGTH", "4096"))
 THRASH_GCP_OFFLOAD_COOLDOWN_SECONDS = float(
     os.getenv("JARVIS_THRASH_GCP_OFFLOAD_COOLDOWN_SECONDS", "180.0")
 )
+# v304.0: On machines with <= 16GB RAM, the first emergency event should
+# immediately trigger GCP offload — there's no headroom for a second event.
+# The old default of 2 meant the system transitioned emergency → thrashing
+# before the second event could fire, so GCP offload was never triggered
+# via the emergency path on constrained hardware.
+_default_thrash_events = "2"
+try:
+    import psutil as _psutil_thrash
+    if _psutil_thrash.virtual_memory().total < 20 * 1024 ** 3:  # < 20GB
+        _default_thrash_events = "1"
+except Exception:
+    pass
 THRASH_EMERGENCY_EVENTS_BEFORE_OFFLOAD = int(
-    os.getenv("JARVIS_THRASH_EMERGENCY_EVENTS_BEFORE_OFFLOAD", "2")
+    os.getenv("JARVIS_THRASH_EMERGENCY_EVENTS_BEFORE_OFFLOAD", _default_thrash_events)
 )
 PRIME_TIMEOUT_SECONDS = float(os.getenv("JARVIS_PRIME_TIMEOUT_SECONDS", "60.0"))
 

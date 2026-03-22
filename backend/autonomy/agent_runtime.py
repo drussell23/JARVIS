@@ -460,7 +460,8 @@ class UnifiedAgentRuntime:
 
         # Email triage integration — last run timestamp (monotonic clock).
         # Sentinel 0.0 means "never ran" — first call always passes cooldown.
-        self._last_email_triage_run: float = 0.0
+        self._last_email_triage_run: float = 0.0  # monotonic time of cycle COMPLETION
+        self._triage_in_flight: bool = False      # True while a cycle is executing
         self._triage_pressure_skip_count: int = 0
         # v284.0: Log triage-disabled once, not every cycle
         self._triage_disabled_logged: bool = False
@@ -2814,19 +2815,20 @@ class UnifiedAgentRuntime:
                 self._triage_disabled_logged = True
             return
 
-        # v291.2: Serialize cooldown check + timestamp update under a lock.
-        # Without this, two concurrent housekeeping loops can both read
-        # _last_email_triage_run before either writes it, causing double
-        # execution of the same triage cycle.
-        if self._triage_lock.locked():
-            return  # Another cycle is already running — skip without blocking
+        # ── In-flight + cooldown gate ─────────────────────────────
+        # _triage_in_flight prevents re-entry while a cycle is executing.
+        # _last_email_triage_run records cycle COMPLETION time so the
+        # cooldown interval measures idle time, not time-since-start.
+        if self._triage_in_flight:
+            return  # Cycle already executing — skip instantly, no lock needed
         async with self._triage_lock:
+            if self._triage_in_flight:
+                return  # Double-check under lock
             now = time.monotonic()
             interval = _env_float("EMAIL_TRIAGE_POLL_INTERVAL_S", 60.0)
             if self._last_email_triage_run > 0.0 and now - self._last_email_triage_run < interval:
                 return
-
-            self._last_email_triage_run = now
+            self._triage_in_flight = True  # Mark in-flight BEFORE releasing lock
 
         # ── Memory pressure routing gate ──────────────────────────
         # Under memory pressure, PrimeRouter._decide_route() already
@@ -2903,9 +2905,14 @@ class UnifiedAgentRuntime:
             lock_ttl = timeout + 10.0
 
             lock_manager = await get_lock_manager()
+            # DLM lock timeout: fast-fail (0.5s).  In-process contention is
+            # already prevented by _triage_in_flight.  The DLM lock only
+            # guards cross-process coordination (multi-instance deployment).
+            # If the lock is held by another PROCESS, we skip immediately
+            # rather than waiting the full cycle duration.
             async with lock_manager.acquire_unified(
                 "email_triage_cycle",
-                timeout=2.0,
+                timeout=0.5,
                 ttl=lock_ttl,
                 enable_keepalive=False,
             ) as (acquired, lock_meta):
@@ -2964,12 +2971,11 @@ class UnifiedAgentRuntime:
                     if not self._experience_processor_started:
                         await self._start_experience_processor()
         except asyncio.TimeoutError:
-            # v291.2: Use _last_email_triage_run (set under lock) as cycle start
-            _elapsed = time.monotonic() - self._last_email_triage_run if self._last_email_triage_run else 0
+            _cycle_start = time.monotonic() - timeout if 'timeout' in dir() else 0
             logger.warning(
                 "[AgentRuntime] Email triage cycle timed out after %.1fs "
                 "(timeout=%.0fs, warmed=%s)",
-                _elapsed,
+                timeout if 'timeout' in dir() else 0,
                 _env_float("EMAIL_TRIAGE_CYCLE_TIMEOUT_S", 30.0),
                 getattr(runner, '_warmed_up', '?') if 'runner' in dir() else '?',
             )
@@ -2988,6 +2994,11 @@ class UnifiedAgentRuntime:
                     logger.warning("[AgentRuntime] Email triage unguarded cycle also failed: %s", inner)
             else:
                 logger.warning("[AgentRuntime] Email triage cycle failed (fail-closed): %s", e)
+        finally:
+            # Always clear in-flight and set cooldown at COMPLETION,
+            # regardless of success/failure/timeout.
+            self._triage_in_flight = False
+            self._last_email_triage_run = time.monotonic()
 
     # ─────────────────────────────────────────────────────────
     # v240.0: Heartbeat Context Gathering

@@ -207,7 +207,17 @@ VM_MIN_ACTIVE_REQUESTS = int(os.getenv("VM_MIN_ACTIVE_REQUESTS", "1"))  # Min re
 
 # v266.0: Pressure-driven VM lifecycle hysteresis
 GCP_RELEASE_RAM_PERCENT = float(os.getenv("GCP_RELEASE_RAM_PERCENT", "70.0"))
-GCP_TRIGGER_READINGS_REQUIRED = int(os.getenv("GCP_TRIGGER_READINGS_REQUIRED", "3"))
+# v304.0: On <= 16GB machines, trigger GCP on first critical reading.
+# Memory jumps healthy → emergency instantly on constrained hardware —
+# waiting for 3 readings means cascading damage is already done.
+_default_trigger_readings = "3"
+try:
+    import psutil as _psutil_trigger
+    if _psutil_trigger.virtual_memory().total < 20 * 1024 ** 3:  # < 20GB
+        _default_trigger_readings = "1"
+except Exception:
+    pass
+GCP_TRIGGER_READINGS_REQUIRED = int(os.getenv("GCP_TRIGGER_READINGS_REQUIRED", _default_trigger_readings))
 GCP_TRIGGER_READINGS_WINDOW = int(os.getenv("GCP_TRIGGER_READINGS_WINDOW", "5"))
 GCP_ACTIVE_STABILITY_CHECKS = int(os.getenv("GCP_ACTIVE_STABILITY_CHECKS", "3"))
 GCP_COOLING_GRACE_SECONDS = float(os.getenv("GCP_COOLING_GRACE_SECONDS", "120.0"))
@@ -1091,7 +1101,10 @@ class GCPHybridPrimeRouter:
             new_name = new_tier.value if hasattr(new_tier, 'value') else str(new_tier)
             new_sev = tier_severity.get(new_name.lower(), 0)
 
-            if new_sev >= 4 and self._vm_lifecycle_state == VMLifecycleState.IDLE:
+            # v304.0: On constrained hardware (<= 16GB), trigger at sev >= 3
+            # (constrained). On larger machines, trigger at sev >= 4 (critical).
+            _trigger_sev = 3 if _default_trigger_readings == "1" else 4
+            if new_sev >= _trigger_sev and self._vm_lifecycle_state == VMLifecycleState.IDLE:
                 self.logger.info(
                     f"[VMLifecycle] MemoryQuantizer tier change: {old_name} -> {new_name}"
                 )
