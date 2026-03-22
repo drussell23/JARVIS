@@ -3128,6 +3128,14 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
 
         # Wait for backend to start accepting connections
         await asyncio.sleep(10)
+        _active_local_since: Optional[float] = None
+        _completion_sent = False
+        # After 120s at ACTIVE_LOCAL without FULLY_OPERATIONAL, send
+        # stage="complete" anyway — the user shouldn't stare at 85% for
+        # 10 minutes while Trinity warms up. JARVIS is usable at ACTIVE_LOCAL.
+        _ACTIVE_LOCAL_GRACE_S = float(os.environ.get(
+            "JARVIS_ACTIVE_LOCAL_GRACE_S", "120"
+        ))
 
         while not self._shutdown_requested:
             try:
@@ -3182,9 +3190,13 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
                 dag_progress = 5 + (raw_progress * 0.90)
                 dag_progress = min(95, max(5, dag_progress))
 
-                # ACTIVE_LOCAL confirmed = 95%
-                if tier_value >= 1:
+                # Tier-based progress milestones (override DAG calculation)
+                if tier_value >= 3:  # FULLY_OPERATIONAL
+                    dag_progress = 100
+                elif tier_value >= 2:  # ACTIVE_FULL (Trinity resolved)
                     dag_progress = 95
+                elif tier_value >= 1:  # ACTIVE_LOCAL (user can interact)
+                    dag_progress = max(dag_progress, 85)
 
                 # Find the latest resolved node in narrative order for stage name
                 current_stage = "starting"
@@ -3231,13 +3243,49 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
                     # Broadcast to WebSocket clients
                     await self._broadcast_progress()
 
-                # Detect tier advancement
-                if tier_value > _last_tier_value and tier_value >= 1:
+                # Detect tier advancement and update narrative
+                if tier_value > _last_tier_value:
                     _last_tier_value = tier_value
                     logger.info(
-                        "[v350.4] Readiness tier advanced to %s — DAG progress %.0f%%",
+                        "[v350.5] Readiness tier advanced to %s — progress %.0f%%",
                         tier_name, dag_progress,
                     )
+
+                    # Update stage name based on tier
+                    if tier_value >= 3:  # FULLY_OPERATIONAL
+                        self._phase = "complete"
+                        self._message = "JARVIS is online!"
+                        self._progress = 100
+                        self._sequence_number += 1
+                        await self._broadcast_progress()
+                        logger.info("[v350.5] FULLY_OPERATIONAL — broadcasting stage=complete")
+                    elif tier_value >= 2:  # ACTIVE_FULL
+                        self._phase = "active_full"
+                        self._message = "Cloud intelligence connected"
+                    elif tier_value >= 1:  # ACTIVE_LOCAL
+                        self._phase = "active_local"
+                        self._message = "Local systems ready — cloud warming up..."
+                        if _active_local_since is None:
+                            _active_local_since = time.time()
+
+                # Grace timeout: if stuck at ACTIVE_LOCAL too long, complete anyway
+                if (
+                    tier_value >= 1 and tier_value < 3
+                    and _active_local_since is not None
+                    and not _completion_sent
+                    and (time.time() - _active_local_since) > _ACTIVE_LOCAL_GRACE_S
+                ):
+                    logger.info(
+                        "[v350.5] ACTIVE_LOCAL grace period expired (%.0fs) — "
+                        "sending completion. JARVIS is usable.",
+                        time.time() - _active_local_since,
+                    )
+                    self._phase = "complete"
+                    self._message = "JARVIS is online!"
+                    self._progress = 100
+                    self._sequence_number += 1
+                    await self._broadcast_progress()
+                    _completion_sent = True
 
             except asyncio.CancelledError:
                 break

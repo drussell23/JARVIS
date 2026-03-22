@@ -324,118 +324,41 @@ class ParallelBootOrchestrator:
 
         # Set JARVIS_STARTUP_COMPLETE for the local tier
         os.environ["JARVIS_STARTUP_COMPLETE"] = "true"
-        # v350.4: Set phase to "finalizing" so _broadcast_startup_progress
-        # allows progress to advance past the old ceiling. The monotonic
-        # guard in _broadcast_startup_progress only updates _current_progress
-        # for stages in _STARTUP_STAGES or when _current_startup_phase is
-        # "complete"/"finalizing". Without this, the completion broadcast
-        # (stage="complete", progress=100) is silently dropped.
-        k._current_startup_phase = "finalizing"
-        k._current_startup_progress = 90
+        k._current_startup_phase = "active_local"
+        k._current_startup_progress = 85
 
-        # Broadcast progress stages incrementally — NO stage="complete" yet.
-        # The loading page smoothly animates through these stages.
+        # v350.5: DO NOT broadcast stage="complete" here.
+        #
+        # The loading server's _background_readiness_tier_task is the SOLE
+        # driver of frontend progress. It polls /health/readiness-tier and
+        # maps tier advancement to progress:
+        #   BOOTING           → 5-80%  (DAG nodes resolving)
+        #   ACTIVE_LOCAL      → 85%    (local systems ready)
+        #   ACTIVE_FULL       → 95%    (cloud connected)
+        #   FULLY_OPERATIONAL → 100%   (stage="complete")
+        #
+        # If we broadcast stage="complete" here, the loading server's
+        # monotonic progress guard locks at 100% and the readiness-tier
+        # polling can never correct it. The frontend shows 100% while
+        # Trinity is still booting — which is exactly the misalignment
+        # the user sees.
+        #
+        # Instead, broadcast "active_local" at 85% to update the stage
+        # name without poisoning the progress to 100%.
         try:
             await k._safe_broadcast(
-                stage="finalizing",
-                message="Verifying backend readiness...",
-                progress=90,
-                metadata={"icon": "gear", "phase": "finalizing"},
+                stage="active_local",
+                message="Local systems ready — cloud warming up...",
+                progress=85,
+                metadata={
+                    "icon": "check",
+                    "phase": "active_local",
+                    "parallel_boot": True,
+                    "boot_elapsed_s": round(time.time() - t0, 1),
+                },
             )
         except Exception:
             pass
-
-        # Wait for /health/readiness-tier to confirm ACTIVE_LOCAL before
-        # telling the frontend to transition. The readiness-tier endpoint
-        # is the SINGLE SOURCE OF TRUTH driven by the ProgressiveReadiness
-        # DAG. We NEVER broadcast stage="complete" unless the tier confirms.
-        _ready_verified = False
-        _port = int(os.environ.get("JARVIS_PORT", "8010"))
-        for _attempt in range(20):  # max 10 seconds
-            try:
-                import aiohttp
-                async with aiohttp.ClientSession() as _sess:
-                    async with _sess.get(
-                        f"http://127.0.0.1:{_port}/health/readiness-tier",
-                        timeout=aiohttp.ClientTimeout(total=2),
-                    ) as _resp:
-                        if _resp.status == 200:
-                            _tier_data = await _resp.json()
-                            _tier_val = _tier_data.get("tier_value", 0)
-                            if _tier_val >= 1:  # ACTIVE_LOCAL or higher
-                                _ready_verified = True
-                                logger.info(
-                                    "[ParallelBoot] Readiness tier confirmed: %s (value=%d)",
-                                    _tier_data.get("tier", "?"), _tier_val,
-                                )
-                                break
-            except Exception:
-                pass
-            await asyncio.sleep(0.5)
-
-        if not _ready_verified:
-            # If tier didn't confirm, also try /health/ready as fallback
-            for _attempt in range(6):  # 3 more seconds
-                try:
-                    async with aiohttp.ClientSession() as _sess:
-                        async with _sess.head(
-                            f"http://127.0.0.1:{_port}/health/ready",
-                            timeout=aiohttp.ClientTimeout(total=2),
-                        ) as _resp:
-                            if _resp.status == 200:
-                                _ready_verified = True
-                                break
-                except Exception:
-                    pass
-                await asyncio.sleep(0.5)
-
-        if _ready_verified:
-            # v350.4: Set phase to "complete" so the monotonic guard in
-            # _broadcast_startup_progress allows _current_progress to reach 100.
-            k._current_startup_phase = "complete"
-            k._current_startup_progress = 100
-            # Verified: broadcast stage="complete" — gated on actual readiness
-            try:
-                await k._safe_broadcast(
-                    stage="complete",
-                    message="JARVIS is online!",
-                    progress=100,
-                    metadata={
-                        "icon": "check",
-                        "phase": "complete",
-                        "final": True,
-                        "supervisor_verified": True,
-                        "readiness_tier_verified": True,
-                        "authority": "unified_supervisor",
-                        "parallel_boot": True,
-                        "frontend_optional": True,
-                        "boot_elapsed_s": round(time.time() - t0, 1),
-                    },
-                )
-            except Exception:
-                pass
-        else:
-            # NOT verified: broadcast "finalizing" NOT "complete" — the
-            # frontend will independently poll /health/readiness-tier and
-            # transition when the tier actually confirms.
-            logger.warning(
-                "[ParallelBoot] Readiness tier not confirmed after 13s — "
-                "staying at 'finalizing'. Frontend will poll readiness-tier."
-            )
-            try:
-                await k._safe_broadcast(
-                    stage="finalizing",
-                    message="Backend started, verifying readiness...",
-                    progress=92,
-                    metadata={
-                        "icon": "gear",
-                        "phase": "finalizing",
-                        "parallel_boot": True,
-                        "awaiting_readiness_tier": True,
-                    },
-                )
-            except Exception:
-                pass
 
         # Voice announcement
         try:
