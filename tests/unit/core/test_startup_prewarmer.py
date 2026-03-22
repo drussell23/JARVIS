@@ -170,3 +170,133 @@ class TestReleaseAndShutdown:
         assert status in (PreWarmStatus.PENDING, PreWarmStatus.OK)
 
         pw.shutdown(timeout=2.0)
+
+
+import tempfile
+import pathlib
+from unittest.mock import patch, AsyncMock
+
+
+class TestPreWarmTasks:
+    def test_docker_probe_success(self):
+        pw = StartupPreWarmer(config=MagicMock())
+        pw._started = True
+        pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
+
+        mock_sock = MagicMock()
+        mock_sock.recv.return_value = b"HTTP/1.1 200 OK"
+        mock_sock.__enter__ = MagicMock(return_value=mock_sock)
+        mock_sock.__exit__ = MagicMock(return_value=False)
+
+        with patch("socket.socket", return_value=mock_sock):
+            pw._start_docker_probe()
+            pw.shutdown(timeout=5.0)
+
+        r = pw._results.get("docker_probe")
+        assert r is not None
+        assert r.status == PreWarmStatus.OK
+        assert r.value is True
+
+    def test_docker_probe_failure(self):
+        pw = StartupPreWarmer(config=MagicMock())
+        pw._started = True
+        pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
+
+        mock_sock = MagicMock()
+        mock_sock.__enter__ = MagicMock(side_effect=ConnectionRefusedError("Docker not running"))
+        mock_sock.__exit__ = MagicMock(return_value=False)
+
+        with patch("socket.socket", return_value=mock_sock):
+            pw._start_docker_probe()
+            pw.shutdown(timeout=5.0)
+
+        r = pw._results.get("docker_probe")
+        assert r is not None
+        assert r.status == PreWarmStatus.FAILED
+
+    def test_gguf_scan_finds_models(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (pathlib.Path(tmpdir) / "model-7b.gguf").write_bytes(b"fake")
+            (pathlib.Path(tmpdir) / "model-13b.gguf").write_bytes(b"fake2")
+            (pathlib.Path(tmpdir) / "readme.txt").write_bytes(b"not a model")
+
+            pw = StartupPreWarmer(config=MagicMock())
+            pw._started = True
+            pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
+            pw._start_gguf_scan(models_dir=tmpdir)
+            pw.shutdown(timeout=5.0)
+
+        r = pw._results.get("gguf_scan")
+        assert r is not None
+        assert r.status == PreWarmStatus.OK
+        assert len(r.value) == 2
+        assert all(entry[0].endswith(".gguf") for entry in r.value)
+
+    def test_gguf_scan_empty_dir_is_valid(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pw = StartupPreWarmer(config=MagicMock())
+            pw._started = True
+            pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
+            pw._start_gguf_scan(models_dir=tmpdir)
+            pw.shutdown(timeout=5.0)
+
+        r = pw._results.get("gguf_scan")
+        assert r is not None
+        assert r.status == PreWarmStatus.OK
+        assert r.value == []
+
+    @pytest.mark.asyncio
+    async def test_gcp_vm_async_submission(self):
+        pw = StartupPreWarmer(config=MagicMock())
+        pw._started = True
+        pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
+
+        with patch("backend.core.startup_prewarmer.get_gcp_vm_manager") as mock_mgr_fn:
+            mock_instance = AsyncMock()
+            mock_instance.is_static_vm_mode = False
+            mock_mgr_fn.return_value = mock_instance
+
+            pw._start_gcp_vm()
+            assert pw.get_status("gcp_vm_start") == PreWarmStatus.PENDING
+            await asyncio.sleep(0.1)
+            assert pw.get_status("gcp_vm_start") == PreWarmStatus.OK
+            pw.shutdown(timeout=2.0)
+
+    @pytest.mark.asyncio
+    async def test_submit_async_cancellation_stores_failed(self):
+        pw = StartupPreWarmer(config=MagicMock())
+        pw._started = True
+
+        async def slow():
+            await asyncio.sleep(100)
+            return "should not reach"
+
+        pw._submit_async("slow_task", slow)
+        assert pw.get_status("slow_task") == PreWarmStatus.PENDING
+        # Yield one iteration so the event loop starts wrapper() and it reaches
+        # the `await coro_fn()` suspension point inside asyncio.sleep(100).
+        await asyncio.sleep(0)
+        pw._async_tasks["slow_task"].cancel()
+        # Yield again so the CancelledError is delivered into slow()'s sleep,
+        # propagates to wrapper()'s except block, which writes FAILED and re-raises.
+        try:
+            await pw._async_tasks["slow_task"]
+        except (asyncio.CancelledError, Exception):
+            pass
+
+        r = pw._results.get("slow_task")
+        assert r is not None
+        assert r.status == PreWarmStatus.FAILED
+        assert r.error == "cancelled"
+
+    def test_native_preload_succeeds(self):
+        pw = StartupPreWarmer(config=MagicMock())
+        pw._started = True
+        pw._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="test")
+        pw._start_native_preload(modules=["json", "os", "sys"])
+        pw.shutdown(timeout=5.0)
+
+        r = pw._results.get("native_libs")
+        assert r is not None
+        assert r.status == PreWarmStatus.OK
+        assert set(r.value) == {"json", "os", "sys"}

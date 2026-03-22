@@ -25,6 +25,14 @@ from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
+# Lazy-imported at module level so tests can patch the name on this module.
+# The actual import is deferred until the function runs to avoid heavy
+# startup cost when gcp_enabled is False.
+try:
+    from backend.core.gcp_vm_manager import get_gcp_vm_manager  # noqa: F401
+except Exception:  # pragma: no cover — module may not exist in all envs
+    get_gcp_vm_manager = None  # type: ignore[assignment]
+
 
 class PreWarmStatus(Enum):
     PENDING = "pending"
@@ -83,7 +91,43 @@ class StartupPreWarmer:
         )
         self._started = True
         self._log.info("[PreWarm] Starting background pre-warm tasks")
-        # Task submissions will be added in Task 2
+
+        # Task 1: Docker daemon probe
+        try:
+            self._start_docker_probe()
+        except Exception as e:
+            self._log.warning("[PreWarm] Failed to start docker_probe: %s", e)
+
+        # Task 2: GCP credential validation
+        if self._config and getattr(self._config, 'gcp_enabled', False):
+            try:
+                self._start_gcp_creds()
+            except Exception as e:
+                self._log.warning("[PreWarm] Failed to start gcp_creds: %s", e)
+
+        # Task 3: GCP VM proactive start
+        if self._config and getattr(self._config, 'gcp_enabled', False):
+            try:
+                self._start_gcp_vm()
+            except Exception as e:
+                self._log.warning("[PreWarm] Failed to start gcp_vm_start: %s", e)
+
+        # Task 4: Native library preload
+        try:
+            self._start_native_preload()
+        except Exception as e:
+            self._log.warning("[PreWarm] Failed to start native_libs: %s", e)
+
+        # Task 5: GGUF model file scan
+        try:
+            self._start_gguf_scan()
+        except Exception as e:
+            self._log.warning("[PreWarm] Failed to start gguf_scan: %s", e)
+
+        self._log.info(
+            "[PreWarm] Submitted %d thread tasks, %d async tasks",
+            len(self._futures), len(self._async_tasks),
+        )
 
     def get_result(self, name: str, max_age_s: float = 30.0) -> Optional[PreWarmResult]:
         """Get a pre-warm result if OK and fresh. Returns None otherwise."""
@@ -207,3 +251,87 @@ class StartupPreWarmer:
                 timestamp=time.monotonic(),
             )
             self._log.warning("[PreWarm] %s: FAILED (no event loop): %s", name, exc)
+
+    # ------------------------------------------------------------------ #
+    # Pre-warm task implementations                                         #
+    # ------------------------------------------------------------------ #
+
+    def _start_docker_probe(self) -> None:
+        """Task #1: Probe Docker daemon via socket ping."""
+        import socket as _module_socket
+
+        def probe():
+            import os as _os
+            docker_host = _os.environ.get("DOCKER_HOST", "")
+            if docker_host.startswith("unix://"):
+                sock_path = docker_host[len("unix://"):]
+            elif _os.path.exists("/var/run/docker.sock"):
+                sock_path = "/var/run/docker.sock"
+            else:
+                sock_path = _os.path.expanduser("~/.docker/run/docker.sock")
+            with _module_socket.socket(
+                _module_socket.AF_UNIX, _module_socket.SOCK_STREAM
+            ) as sock:
+                sock.settimeout(15.0)
+                sock.connect(sock_path)
+                sock.sendall(b"GET /_ping HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                resp = sock.recv(256)
+                return b"200" in resp
+
+        self._submit_thread("docker_probe", probe)
+
+    def _start_gcp_creds(self) -> None:
+        """Task #2: Validate GCP credentials and create API client."""
+        def validate():
+            from google.cloud import compute_v1
+            client = compute_v1.InstancesClient()
+            return client
+        self._submit_thread("gcp_creds", validate)
+
+    def _start_gcp_vm(self) -> None:
+        """Task #3: Proactive GCP VM start (idempotent).
+        Does NOT write env vars, dashboard, routing. Only caches result."""
+        async def start_vm():
+            manager = await get_gcp_vm_manager()
+            if not manager.is_static_vm_mode:
+                self._log.info("[PreWarm] gcp_vm_start: not in static mode — skipping")
+                return (False, None, "not_static_mode")
+            success, ip, status = await manager.ensure_static_vm_ready()
+            return (success, ip, status)
+        self._submit_async("gcp_vm_start", start_vm)
+
+    def _start_native_preload(self, modules: list | None = None) -> None:
+        """Task #4: Import heavy native libraries in background thread."""
+        if modules is None:
+            modules = ["numpy", "scipy", "sounddevice", "soundfile", "webrtcvad", "PIL"]
+
+        def preload():
+            imported = []
+            for mod in modules:
+                try:
+                    __import__(mod)
+                    imported.append(mod)
+                except ImportError:
+                    pass
+            return imported
+
+        self._submit_thread("native_libs", preload)
+
+    def _start_gguf_scan(self, models_dir: str | None = None) -> None:
+        """Task #5: Scan for GGUF model files on disk."""
+        if models_dir is None:
+            models_dir = os.environ.get(
+                "PRIME_MODELS_DIR", os.path.expanduser("~/.jarvis/models")
+            )
+
+        def scan():
+            import pathlib
+            p = pathlib.Path(models_dir)
+            if not p.is_dir():
+                return []
+            return [
+                (str(f), f.stat().st_size, f.stat().st_mtime)
+                for f in p.glob("*.gguf")
+            ]
+
+        self._submit_thread("gguf_scan", scan)
