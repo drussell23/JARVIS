@@ -136,11 +136,10 @@ def _render_health_matrix(state: DashboardState) -> Any:
         expand=True,
         padding=(0, 1),
     )
-    table.add_column("Component", style="bold", min_width=18)
-    table.add_column("Status", min_width=10, justify="center")
-    table.add_column("Port", min_width=6, justify="center")
-    table.add_column("Latency", min_width=8, justify="right")
-    table.add_column("Last Seen", min_width=12, justify="right")
+    table.add_column("Component", style="bold", no_wrap=True)
+    table.add_column("Status", justify="center", no_wrap=True)
+    table.add_column("Port", justify="center", no_wrap=True)
+    table.add_column("Latency", justify="right", no_wrap=True)
 
     status_styles = {
         "ONLINE": ("bold green", "ONLINE"),
@@ -157,15 +156,6 @@ def _render_health_matrix(state: DashboardState) -> Any:
         style, label = status_styles.get(repo.status, ("dim", repo.status))
         status_text = Text(label, style=style)
 
-        if repo.last_heartbeat > 0:
-            age = time.monotonic() - repo.last_heartbeat
-            if age < 60:
-                last_seen = f"{age:.0f}s ago"
-            else:
-                last_seen = f"{age / 60:.0f}m ago"
-        else:
-            last_seen = "--"
-
         latency = f"{repo.latency_ms:.0f}ms" if repo.latency_ms > 0 else "--"
 
         table.add_row(
@@ -173,7 +163,6 @@ def _render_health_matrix(state: DashboardState) -> Any:
             status_text,
             str(repo.port) if repo.port else "--",
             latency,
-            last_seen,
         )
 
     return table
@@ -293,10 +282,61 @@ def _render_stats_bar(state: DashboardState) -> Any:
     return Text.from_markup("  |  ".join(parts))
 
 
+def _render_system_metrics(state: DashboardState) -> Any:
+    """Render system metrics panel with live data."""
+    from rich.table import Table
+
+    uptime_s = max(1, time.monotonic() - state.uptime_start)
+    table = Table(
+        title="System Metrics",
+        title_style="bold bright_cyan",
+        border_style="bright_black",
+        expand=True,
+        show_lines=False,
+        padding=(0, 1),
+    )
+    table.add_column("Metric", style="bold green")
+    table.add_column("Value", justify="right", style="bright_white")
+
+    # Performance
+    table.add_row("Envelopes/s", f"{state.total_envelopes / uptime_s:.1f}")
+    table.add_row("Total Events", str(state.total_envelopes))
+    table.add_row("", "")
+
+    # Agents
+    table.add_row("Agents", f"{state.initialized_agents}/{state.total_agents}")
+    table.add_row("Gov Ops", str(state.governance_ops))
+    table.add_row("Explorations", str(state.proactive_explorations))
+    table.add_row("", "")
+
+    # Health
+    table.add_row("Faults", f"[bold red]{state.total_faults}[/]" if state.total_faults else "0")
+    table.add_row("Recoveries", f"[bold green]{state.total_recoveries}[/]" if state.total_recoveries else "0")
+    table.add_row("", "")
+
+    # Configuration
+    table.add_row("Gov Mode", os.environ.get("JARVIS_GOVERNANCE_MODE", "sandbox"))
+    table.add_row("Proactive", os.environ.get("JARVIS_PROACTIVE_COOLDOWN_S", "3600") + "s")
+
+    # Memory (if available)
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        avail_gb = mem.available / (1024 ** 3)
+        used_pct = mem.percent
+        style = "bold red" if used_pct > 90 else "yellow" if used_pct > 80 else "green"
+        table.add_row("RAM", f"[{style}]{avail_gb:.1f}GB free ({used_pct:.0f}%)[/]")
+    except Exception:
+        pass
+
+    return table
+
+
 def _build_layout(state: DashboardState) -> Any:
     """Build the full dashboard layout."""
     from rich.layout import Layout
     from rich.panel import Panel
+    from rich.text import Text
 
     layout = Layout()
     layout.split_column(
@@ -306,7 +346,6 @@ def _build_layout(state: DashboardState) -> Any:
     )
 
     # Header: title bar
-    from rich.text import Text
     header_text = Text(
         "  JARVIS UNIFIED SUPERVISOR  --  ELITE DASHBOARD  ",
         style="bold white on dark_blue",
@@ -314,17 +353,17 @@ def _build_layout(state: DashboardState) -> Any:
     )
     layout["header"].update(header_text)
 
-    # Body: three columns
+    # Body: three columns (left wider for health + boot)
     layout["body"].split_row(
-        Layout(name="left", ratio=2),
-        Layout(name="center", ratio=3),
-        Layout(name="right", ratio=2),
+        Layout(name="left", ratio=3),
+        Layout(name="center", ratio=4),
+        Layout(name="right", ratio=3),
     )
 
     # Left: Health Matrix + Boot Tree
     layout["left"].split_column(
-        Layout(name="health"),
-        Layout(name="boot"),
+        Layout(name="health", ratio=2),
+        Layout(name="boot", ratio=3),
     )
     layout["health"].update(Panel(
         _render_health_matrix(state),
@@ -333,6 +372,7 @@ def _build_layout(state: DashboardState) -> Any:
     layout["boot"].update(Panel(
         _render_boot_tree(state),
         title="Boot Progress",
+        title_align="left",
         border_style="green" if state.boot_complete else "yellow",
     ))
 
@@ -342,16 +382,11 @@ def _build_layout(state: DashboardState) -> Any:
         border_style="magenta",
     ))
 
-    # Right: placeholder for future panels (governance, memory, etc.)
-    from rich.table import Table
-    future = Table(title="System Metrics", border_style="bright_black", expand=True)
-    future.add_column("Metric", style="bold")
-    future.add_column("Value", justify="right")
-    future.add_row("Envelopes/s", f"{state.total_envelopes / max(1, time.monotonic() - state.uptime_start):.1f}")
-    future.add_row("Queue Load", "nominal")
-    future.add_row("Gov Mode", os.environ.get("JARVIS_GOVERNANCE_MODE", "sandbox"))
-    future.add_row("Proactive", os.environ.get("JARVIS_PROACTIVE_COOLDOWN_S", "3600") + "s")
-    layout["right"].update(Panel(future, title="Metrics", border_style="bright_black"))
+    # Right: System Metrics
+    layout["right"].update(Panel(
+        _render_system_metrics(state),
+        border_style="bright_black",
+    ))
 
     # Footer: stats bar
     layout["footer"].update(Panel(
@@ -577,6 +612,10 @@ class EliteDashboard:
         except Exception as exc:
             logger.warning("[EliteDashboard] TelemetryBus subscribe failed: %s", exc)
 
+        # Install a logging handler that routes WARNING+ into the ticker
+        # so important log messages appear in the dashboard even with screen=True.
+        self._install_log_handler()
+
         # Start render thread
         self._stop_flag.clear()
         self._thread = threading.Thread(
@@ -586,6 +625,34 @@ class EliteDashboard:
         )
         self._thread.start()
         logger.info("[EliteDashboard] Render thread started")
+
+    def _install_log_handler(self) -> None:
+        """Route WARNING+ log messages into the event ticker."""
+        dashboard = self
+
+        class _DashboardLogHandler(logging.Handler):
+            """Captures WARNING+ logs and injects them into the ticker."""
+
+            def emit(self, record: logging.LogRecord) -> None:
+                try:
+                    category = "fault" if record.levelno >= logging.ERROR else "lifecycle"
+                    severity = "error" if record.levelno >= logging.ERROR else "warn"
+                    msg = record.getMessage()
+                    # Truncate long messages for the ticker
+                    if len(msg) > 120:
+                        msg = msg[:117] + "..."
+                    dashboard._state.events.append(TickerEvent(
+                        timestamp=time.time(),
+                        category=category,
+                        message=f"[{record.name.split('.')[-1]}] {msg}",
+                        severity=severity,
+                    ))
+                except Exception:
+                    pass  # Never crash the logging system
+
+        handler = _DashboardLogHandler()
+        handler.setLevel(logging.WARNING)
+        logging.getLogger().addHandler(handler)
 
     async def stop(self) -> None:
         """Stop the render thread."""
@@ -626,7 +693,13 @@ class EliteDashboard:
     # ------------------------------------------------------------------
 
     def _render_loop(self) -> None:
-        """Daemon thread: drain queue, update state, render via rich.Live."""
+        """Daemon thread: drain queue, update state, render via rich.Live.
+
+        Uses ``screen=True`` for full terminal control — prevents the
+        dashboard from stacking/duplicating when log output interleaves.
+        Log messages are streamed into the Live Event Ticker panel
+        instead of competing with the dashboard for cursor position.
+        """
         try:
             from rich.live import Live
             from rich.console import Console
@@ -638,8 +711,7 @@ class EliteDashboard:
                 _build_layout(self._state),
                 console=console,
                 refresh_per_second=_REFRESH_HZ,
-                screen=False,
-                transient=True,
+                screen=True,
             ) as live:
                 while not self._stop_flag.is_set():
                     # Drain envelope queue
