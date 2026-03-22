@@ -72,7 +72,9 @@ class StartupProgressManager:
     Manages WebSocket connections for startup progress updates.
 
     v2.0 - Now delegates state to UnifiedStartupProgressHub.
-    This ensures all progress tracking systems show the same data.
+    v3.0 - Wires ProgressiveReadiness as the authoritative state source.
+           Readiness tier messages are broadcast directly to clients so
+           the frontend can gate transitions on actual DAG resolution.
     """
 
     def __init__(self):
@@ -85,6 +87,17 @@ class StartupProgressManager:
             self._hub = get_progress_hub()
             # Register for state updates
             self._hub.register_sync_target(self._on_hub_update)
+
+        # Wire ProgressiveReadiness → WebSocket broadcast
+        # This makes readiness tier state available to the frontend
+        # as the single source of truth for transition decisions.
+        try:
+            from backend.core.progressive_readiness import get_readiness
+            pr = get_readiness()
+            pr.set_ws_broadcast(self._on_readiness_state)
+            logger.info("[StartupProgressAPI] Wired ProgressiveReadiness → WebSocket broadcast")
+        except ImportError:
+            logger.debug("[StartupProgressAPI] ProgressiveReadiness not available")
 
         # Fallback state (used if hub not available)
         self._fallback_status: Dict = {
@@ -111,6 +124,19 @@ class StartupProgressManager:
             loop.create_task(self._broadcast_to_clients(state))
         except RuntimeError:
             # No running loop - skip broadcasting
+            pass
+
+    def _on_readiness_state(self, state: Dict):
+        """Callback from ProgressiveReadiness when DAG state changes.
+
+        Broadcasts readiness_state messages to all WebSocket clients.
+        The frontend uses these to gate transition decisions on actual
+        DAG resolution rather than synthetic progress values.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._broadcast_to_clients(state))
+        except RuntimeError:
             pass
 
     async def _broadcast_to_clients(self, status: Dict):

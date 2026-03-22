@@ -1823,6 +1823,13 @@ class JARVISLoadingManager {
         // Start smooth progress animation
         this.startSmoothProgress();
 
+        // v350.4: Start readiness-tier polling — the SINGLE SOURCE OF TRUTH
+        // for boot completion. Even if WebSocket/broadcast messages arrive
+        // with stage="complete", the loading page verifies readiness-tier
+        // before redirecting. This polling also acts as a fallback trigger
+        // if the broadcast doesn't arrive at all.
+        this.startReadinessTierPolling();
+
         // Make details panel visible immediately and add initial log
         if (this.elements.detailsPanel) {
             this.elements.detailsPanel.classList.add('visible');
@@ -3430,11 +3437,24 @@ class JARVISLoadingManager {
         this.updateUI();
         this.updateDetailedStatus();
 
-        // Handle completion
+        // Handle completion — gated on readiness-tier verification.
+        // v350.4: The loading page MUST verify that ProgressiveReadiness
+        // has reached ACTIVE_LOCAL (tier_value >= 1) before triggering
+        // the redirect. This prevents the race where stage="complete"
+        // arrives before the backend is actually ready.
         if (stage === 'complete' || progress >= 100) {
             const success = metadata.success !== false;
             const redirectUrl = metadata.redirect_url || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
-            this.handleCompletion(success, redirectUrl, message, metadata);
+
+            // If supervisor already verified readiness-tier, proceed immediately
+            if (metadata.readiness_tier_verified === true) {
+                console.log('[v350.4] Readiness tier pre-verified by supervisor — completing');
+                this.handleCompletion(success, redirectUrl, message, metadata);
+            } else {
+                // Verify readiness-tier before completing — single source of truth
+                console.log('[v350.4] Verifying readiness tier before completion...');
+                this._verifyReadinessTierThenComplete(success, redirectUrl, message, metadata);
+            }
         }
 
         // v5.0: Handle PARTIAL completion (supervisor FALLBACK 5)
@@ -4375,6 +4395,148 @@ class JARVISLoadingManager {
         return baseRedirectUrl.includes('?')
             ? `${baseRedirectUrl}&${params.toString()}`
             : `${baseRedirectUrl}?${params.toString()}`;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // v350.4: READINESS TIER VERIFICATION
+    // ProgressiveReadiness is the SINGLE SOURCE OF TRUTH for boot state.
+    // The loading page MUST verify tier >= ACTIVE_LOCAL before redirecting.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    async _verifyReadinessTierThenComplete(success, redirectUrl, message, metadata) {
+        /**
+         * Poll /health/readiness-tier on the backend to verify the
+         * ProgressiveReadiness DAG has actually reached ACTIVE_LOCAL.
+         * Only then trigger the completion flow.
+         *
+         * This is the gate that prevents the loading page from racing
+         * ahead when stage="complete" arrives before the backend is ready.
+         */
+        if (this._readinessTierVerifyActive) {
+            console.log('[v350.4] Readiness tier verification already active');
+            return;
+        }
+        this._readinessTierVerifyActive = true;
+
+        const backendPort = this.config.backendPort || 8010;
+        const tierUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/health/readiness-tier`;
+        const maxAttempts = 30;  // 15 seconds max
+        const pollInterval = 500;  // 500ms between polls
+
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+
+                const resp = await fetch(tierUrl, { signal: controller.signal });
+                clearTimeout(timeoutId);
+
+                if (resp.ok) {
+                    const tierData = await resp.json();
+                    const tierValue = tierData.tier_value || 0;
+                    const tierName = tierData.tier || 'BOOTING';
+
+                    if (tierValue >= 1) {
+                        // ACTIVE_LOCAL confirmed — proceed with completion
+                        console.log(`[v350.4] Readiness tier verified: ${tierName} (value=${tierValue})`);
+                        this._readinessTierVerifyActive = false;
+                        // Enrich metadata with tier verification
+                        metadata.readiness_tier_verified = true;
+                        metadata.readiness_tier = tierName;
+                        this.handleCompletion(success, redirectUrl, message, metadata);
+                        return;
+                    }
+
+                    // Not ready yet — update progress based on DAG nodes
+                    const resolvedCount = (tierData.resolved || []).length;
+                    const pendingCount = (tierData.pending || []).length;
+                    const totalNodes = resolvedCount + pendingCount;
+                    if (totalNodes > 0) {
+                        // Map DAG resolution to display progress (80-98%)
+                        const dagProgress = Math.round(80 + (resolvedCount / totalNodes) * 18);
+                        if (dagProgress > this.state.targetProgress && dagProgress < 100) {
+                            this.state.targetProgress = dagProgress;
+                        }
+                    }
+
+                    console.log(`[v350.4] Tier ${tierName} (${resolvedCount}/${totalNodes} nodes resolved), attempt ${attempt + 1}/${maxAttempts}`);
+                }
+            } catch (e) {
+                // Backend not reachable yet — keep trying
+                console.debug(`[v350.4] Readiness tier poll failed (attempt ${attempt + 1}): ${e.message}`);
+            }
+
+            await new Promise(resolve => setTimeout(resolve, pollInterval));
+        }
+
+        // Exhausted retries — fall through to completion anyway
+        // (the handleCompletion flow has its own backend/frontend checks)
+        console.warn('[v350.4] Readiness tier not confirmed after 15s — falling through to completion');
+        this._readinessTierVerifyActive = false;
+        this.handleCompletion(success, redirectUrl, message, metadata);
+    }
+
+    /**
+     * v350.4: Start background readiness-tier polling.
+     * Called during initialization. If the tier reaches ACTIVE_LOCAL
+     * before a stage="complete" broadcast arrives, this triggers
+     * completion proactively — ensuring the loading page transitions
+     * as soon as the backend is actually ready, not when a broadcast
+     * happens to arrive.
+     */
+    startReadinessTierPolling() {
+        if (this._readinessTierPollingActive) return;
+        this._readinessTierPollingActive = true;
+
+        const backendPort = this.config.backendPort || 8010;
+        const tierUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/health/readiness-tier`;
+
+        const poll = async () => {
+            if (this.state.redirecting || this._completionPromise) {
+                // Already completing — stop polling
+                this._readinessTierPollingActive = false;
+                return;
+            }
+
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 2000);
+
+                const resp = await fetch(tierUrl, { signal: controller.signal });
+                clearTimeout(timeoutId);
+
+                if (resp.ok) {
+                    const tierData = await resp.json();
+                    const tierValue = tierData.tier_value || 0;
+
+                    if (tierValue >= 1 && !this.state.redirecting && !this._completionPromise) {
+                        // ACTIVE_LOCAL reached — trigger completion
+                        console.log(`[v350.4] Readiness tier polling detected ACTIVE_LOCAL — triggering completion`);
+                        this._readinessTierPollingActive = false;
+                        const redirectUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
+                        this.handleCompletion(true, redirectUrl, 'JARVIS is online!', {
+                            readiness_tier_verified: true,
+                            readiness_tier: tierData.tier,
+                            final: true,
+                            supervisor_verified: true,
+                        });
+                        return;
+                    }
+                }
+            } catch (e) {
+                // Backend not up yet — normal during early boot
+            }
+
+            // Continue polling every 2 seconds
+            if (!this.state.redirecting && !this._completionPromise) {
+                setTimeout(poll, 2000);
+            } else {
+                this._readinessTierPollingActive = false;
+            }
+        };
+
+        // Start after 10 seconds (backend needs time to start)
+        setTimeout(poll, 10000);
     }
 
     _isSupervisorAuthoritativeCompletion(metadata = {}) {
