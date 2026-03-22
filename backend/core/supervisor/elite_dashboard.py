@@ -598,22 +598,40 @@ class EliteDashboard:
         self._narrator_hook_installed = False
 
     async def start(self) -> None:
-        """Subscribe to TelemetryBus and start the render thread."""
+        """Subscribe to TelemetryBus and start buffering events.
+
+        The render thread does NOT start yet — it starts when
+        ``activate_display()`` is called after boot completes.
+        This prevents the dashboard from showing a half-empty UI
+        during the boot process while log output is still streaming.
+        Events are buffered in the queue so no data is lost.
+        """
         if not self._enabled:
             logger.info("[EliteDashboard] Disabled (no TTY or env)")
             return
 
-        # Subscribe to TelemetryBus
+        # Subscribe to TelemetryBus — start buffering events immediately
         try:
             from backend.core.telemetry_contract import get_telemetry_bus
             bus = get_telemetry_bus()
             bus.subscribe("*", self._on_envelope)
-            logger.info("[EliteDashboard] Subscribed to TelemetryBus")
+            logger.info("[EliteDashboard] Subscribed to TelemetryBus (buffering, display deferred)")
         except Exception as exc:
             logger.warning("[EliteDashboard] TelemetryBus subscribe failed: %s", exc)
 
-        # Install a logging handler that routes WARNING+ into the ticker
-        # so important log messages appear in the dashboard even with screen=True.
+    def activate_display(self) -> None:
+        """Start the render thread — called AFTER boot completes.
+
+        The supervisor calls this when JARVIS is fully online and ready
+        for user interaction. Events buffered since ``start()`` are
+        drained and rendered immediately.
+        """
+        if not self._enabled:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return  # Already active
+
+        # Install log handler so WARNING+ appears in ticker
         self._install_log_handler()
 
         # Start render thread
@@ -624,7 +642,7 @@ class EliteDashboard:
             daemon=True,
         )
         self._thread.start()
-        logger.info("[EliteDashboard] Render thread started")
+        logger.info("[EliteDashboard] Display activated (JARVIS online)")
 
     def _install_log_handler(self) -> None:
         """Route WARNING+ log messages into the event ticker."""
