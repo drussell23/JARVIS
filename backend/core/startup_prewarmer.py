@@ -62,7 +62,7 @@ class StartupPreWarmer:
         self._results: Dict[str, PreWarmResult] = {}
         self._futures: Dict[str, Future] = {}
         self._async_tasks: Dict[str, asyncio.Task] = {}
-        self._released_tasks: set = set()
+        self._released_tasks: set[str] = set()
         self._started = False
         self._disabled = os.environ.get(
             "JARVIS_PREWARM_DISABLED", ""
@@ -70,7 +70,11 @@ class StartupPreWarmer:
 
     def start(self) -> None:
         """Fire all background pre-warm tasks. Non-blocking.
-        No-op if disabled. Registers PENDING for each task before submission."""
+        No-op if disabled. Registers PENDING for each task before submission.
+
+        MUST be called from within a running event loop (the same loop that
+        runs _startup_impl), so that asyncio.create_task() in _submit_async
+        attaches tasks to that loop."""
         if self._disabled:
             self._log.info("[PreWarm] Disabled via JARVIS_PREWARM_DISABLED")
             return
@@ -163,12 +167,12 @@ class StartupPreWarmer:
                     status=PreWarmStatus.FAILED, error=str(exc)[:200],
                     timestamp=time.monotonic(),
                 )
-                self._log.warning("[PreWarm] %s: FAILED: %s", name, exc)
+                self._log.warning("[PreWarm] %s: FAILED", name, exc_info=True)
 
         self._futures[name] = self._executor.submit(wrapper)
 
     def _submit_async(self, name: str, coro_fn: Callable) -> None:
-        """Submit an async task with exception wrapping."""
+        """Submit an async task. MUST be called from a running event loop."""
         self._register_pending(name)
 
         async def wrapper():
@@ -190,8 +194,16 @@ class StartupPreWarmer:
                     status=PreWarmStatus.FAILED, error=str(exc)[:200],
                     timestamp=time.monotonic(),
                 )
-                self._log.warning("[PreWarm] %s: FAILED: %s", name, exc)
+                self._log.warning("[PreWarm] %s: FAILED", name, exc_info=True)
 
-        self._async_tasks[name] = asyncio.create_task(
-            wrapper(), name=f"prewarm_{name}"
-        )
+        try:
+            self._async_tasks[name] = asyncio.create_task(
+                wrapper(), name=f"prewarm_{name}"
+            )
+        except RuntimeError as exc:
+            # No running event loop — mark as failed, not stuck at PENDING
+            self._results[name] = PreWarmResult(
+                status=PreWarmStatus.FAILED, error=f"no event loop: {exc}"[:200],
+                timestamp=time.monotonic(),
+            )
+            self._log.warning("[PreWarm] %s: FAILED (no event loop): %s", name, exc)
