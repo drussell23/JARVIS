@@ -2473,6 +2473,34 @@ class UnifiedWebSocketManager:
                 _classification = _classifier.classify(command_text)
 
                 if _classification.intent == CommandIntent.ACTION:
+                    # Directive 2: Check Progressive Readiness before dispatching ACTION
+                    _action_ready = True
+                    try:
+                        from backend.core.progressive_readiness import get_readiness, ReadinessTier
+                        _pr = get_readiness()
+                        if _pr.tier < ReadinessTier.ACTIVE_FULL:
+                            # Neural Mesh / J-Prime not ready yet — inform user
+                            _eta = _pr.estimated_time_to_full()
+                            _eta_msg = f"about {int(_eta)} seconds" if _eta and _eta > 0 else "a moment"
+                            return {
+                                "type": "response",
+                                "text": (
+                                    f"Local systems are online, but my cloud intelligence core "
+                                    f"is still booting. Please allow {_eta_msg}. "
+                                    f"I can answer questions right now — just not execute actions yet."
+                                ),
+                                "status": "warming_up",
+                                "command_type": "action_deferred",
+                                "speak": True,
+                                "routing": {
+                                    "routed_to": "progressive_readiness_gate",
+                                    "tier": _pr.tier.name,
+                                    "eta_seconds": _eta,
+                                },
+                            }
+                    except ImportError:
+                        pass  # Module not available — proceed normally
+
                     _rto = get_runtime_task_orchestrator()
                     if _rto is not None:
                         logger.info(
