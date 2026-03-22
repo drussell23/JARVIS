@@ -198,6 +198,14 @@ class ParallelBootOrchestrator:
         await pr.mark_resolved("clean_slate")
         self._narrator.phase_resolved("clean_slate", time.time() - t0)
 
+        # v350.5: Print the JARVIS startup banner AFTER Clean Slate —
+        # matching the sequential boot's order. The user sees:
+        # 1. Clean Slate output
+        # 2. JARVIS ASCII art banner + Zone Architecture map
+        # 3. Then the remaining zones progress in order
+        if hasattr(k, '_print_startup_banner'):
+            k._print_startup_banner()
+
         # ============================================================
         # Phase 2: PARALLEL — Preflight + Resources + Loading Experience
         # These are independent after Clean Slate.
