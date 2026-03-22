@@ -3074,6 +3074,179 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
             await self._broadcast_progress()
 
     # =========================================================================
+    # v350.4: READINESS-TIER PROGRESS PROJECTION
+    #
+    # The parallel boot DAG runs phases concurrently, but the loading page
+    # needs a sequential narrative (0% → 100%). This task polls the
+    # authoritative /health/readiness-tier endpoint and projects DAG node
+    # resolution into weighted linear progress.
+    #
+    # The mapping is deterministic — each DAG node has a weight based on
+    # typical duration. As nodes resolve (in any order), progress increases
+    # smoothly. The stage name follows the LAST resolved node to give a
+    # sequential feel: "Preflight → Resources → Backend → Intelligence → Ready"
+    # =========================================================================
+
+    # DAG node weights (proportional to typical duration)
+    _DAG_NODE_WEIGHTS = {
+        "clean_slate": 3,        # ~3s
+        "preflight": 5,          # ~5s
+        "resources": 15,         # ~15s
+        "loading_experience": 3, # ~3s
+        "backend": 35,           # ~35s (heaviest — uvicorn + FastAPI init)
+        "intelligence": 8,       # ~8s
+    }
+    _DAG_TOTAL_WEIGHT = sum(_DAG_NODE_WEIGHTS.values())
+
+    # Sequential narrative: when a node resolves, show this stage/message
+    _DAG_NODE_NARRATIVE = {
+        "clean_slate":        ("cleanup",       "Cleaning up previous session..."),
+        "preflight":          ("preflight",     "System preflight checks..."),
+        "loading_experience": ("loading",       "Loading experience ready..."),
+        "resources":          ("resources",     "Initializing resources..."),
+        "backend":            ("backend",       "Backend server starting..."),
+        "intelligence":       ("intelligence",  "Intelligence layer initializing..."),
+    }
+
+    # Ordered sequence for narrative (the order we PRESENT, not execute)
+    _DAG_NARRATIVE_ORDER = [
+        "clean_slate", "preflight", "resources",
+        "loading_experience", "backend", "intelligence",
+    ]
+
+    async def _background_readiness_tier_task(self):
+        """Poll /health/readiness-tier and project DAG state into linear progress.
+
+        This is the SINGLE SOURCE OF TRUTH for progress during parallel boot.
+        The loading page sees a clean sequential narrative even though the
+        backend executes phases concurrently.
+        """
+        backend_port = int(os.environ.get("JARVIS_PORT", "8010"))
+        tier_url = f"http://127.0.0.1:{backend_port}/health/readiness-tier"
+        poll_interval = 1.5
+        _last_tier_value = -1
+
+        # Wait for backend to start accepting connections
+        await asyncio.sleep(10)
+
+        while not self._shutdown_requested:
+            try:
+                # Use urllib (stdlib) — no aiohttp dependency needed.
+                # Run in executor to avoid blocking the event loop.
+                import urllib.request
+                import urllib.error
+
+                def _fetch_tier():
+                    req = urllib.request.Request(tier_url, method="GET")
+                    req.add_header("Accept", "application/json")
+                    with urllib.request.urlopen(req, timeout=2) as resp:
+                        if resp.status != 200:
+                            return None
+                        return json.loads(resp.read().decode())
+
+                data = await asyncio.get_running_loop().run_in_executor(None, _fetch_tier)
+                if data is None:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                nodes = data.get("nodes", {})
+                tier_value = data.get("tier_value", 0)
+                tier_name = data.get("tier", "BOOTING")
+
+                if not nodes:
+                    await asyncio.sleep(poll_interval)
+                    continue
+
+                # Calculate weighted progress from DAG resolution
+                resolved_weight = 0
+                running_weight = 0
+                for node_name, weight in self._DAG_NODE_WEIGHTS.items():
+                    node = nodes.get(node_name)
+                    if not node:
+                        continue
+                    status = node.get("status", "pending")
+                    if status in ("resolved", "skipped"):
+                        resolved_weight += weight
+                    elif status == "running":
+                        # Give partial credit for running nodes based on elapsed time
+                        elapsed = node.get("elapsed_s", 0)
+                        # Estimate completion fraction (cap at 80% to avoid false 100%)
+                        typical_duration = weight  # weight ≈ typical seconds
+                        fraction = min(0.8, elapsed / max(1, typical_duration))
+                        running_weight += weight * fraction
+                    elif status == "failed":
+                        resolved_weight += weight  # Failed still counts for progress
+
+                raw_progress = ((resolved_weight + running_weight) / self._DAG_TOTAL_WEIGHT) * 100
+                # Map to 5-95% range (0-5% for pre-boot, 95-100% for completion verification)
+                dag_progress = 5 + (raw_progress * 0.90)
+                dag_progress = min(95, max(5, dag_progress))
+
+                # ACTIVE_LOCAL confirmed = 95%
+                if tier_value >= 1:
+                    dag_progress = 95
+
+                # Find the latest resolved node in narrative order for stage name
+                current_stage = "starting"
+                current_message = "Starting JARVIS..."
+                for node_name in self._DAG_NARRATIVE_ORDER:
+                    node = nodes.get(node_name)
+                    if node and node.get("status") == "running":
+                        stage, msg = self._DAG_NODE_NARRATIVE.get(
+                            node_name, (node_name, f"{node_name}...")
+                        )
+                        current_stage = stage
+                        current_message = msg
+                        break
+                    elif node and node.get("status") in ("resolved", "skipped", "failed"):
+                        stage, msg = self._DAG_NODE_NARRATIVE.get(
+                            node_name, (node_name, f"{node_name} complete")
+                        )
+                        current_stage = stage
+                        current_message = msg.replace("...", " complete")
+
+                # Build component status for the loading page
+                components = {}
+                for node_name in self._DAG_NODE_WEIGHTS:
+                    node = nodes.get(node_name)
+                    if node:
+                        components[node_name] = {
+                            "status": node.get("status", "pending"),
+                            "detail": f"{node.get('elapsed_s', 0):.1f}s",
+                        }
+
+                # Update loading server state (monotonic — never decrease)
+                if dag_progress >= self._progress:
+                    self._progress = dag_progress
+                    self._phase = current_stage
+                    self._message = current_message
+                    self._components = components
+
+                    # Update ETA engine
+                    self._eta_engine.update_progress(dag_progress)
+
+                    # Increment sequence for frontend tracking
+                    self._sequence_number += 1
+
+                    # Broadcast to WebSocket clients
+                    await self._broadcast_progress()
+
+                # Detect tier advancement
+                if tier_value > _last_tier_value and tier_value >= 1:
+                    _last_tier_value = tier_value
+                    logger.info(
+                        "[v350.4] Readiness tier advanced to %s — DAG progress %.0f%%",
+                        tier_name, dag_progress,
+                    )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.debug("[v350.4] Readiness tier poll: %s", e)
+
+            await asyncio.sleep(poll_interval)
+
+    # =========================================================================
     # Server Lifecycle
     # =========================================================================
 
@@ -3114,6 +3287,10 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
         self._background_tasks = [
             create_safe_task(self._background_ping_task(), name="background_ping"),
             create_safe_task(self._background_eta_update_task(), name="background_eta_update"),
+            # v350.4: Poll readiness-tier for authoritative DAG-driven progress.
+            # This projects the parallel boot's concurrent execution into a
+            # sequential narrative for the loading page.
+            create_safe_task(self._background_readiness_tier_task(), name="readiness_tier_poll"),
         ]
 
         # Start server
