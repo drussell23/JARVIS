@@ -4605,6 +4605,129 @@ class JARVISLoadingManager {
         );
     }
 
+    _activateTransitionOverlay(redirectUrl) {
+        const overlay = document.getElementById('transition-overlay');
+        if (!overlay) {
+            console.warn('[Transition] Overlay not found, falling back to redirect');
+            this._fallbackRedirect(redirectUrl);
+            return;
+        }
+        console.log('[Transition] Activating transition overlay');
+        overlay.classList.add('active');
+
+        const nodeToCapId = {
+            'backend': 'cap-core',
+            'intelligence': 'cap-intelligence',
+            'trinity': 'cap-cloud',
+            'governance': 'cap-governance',
+        };
+        const voiceRow = document.getElementById('cap-voice');
+        const tierBadge = document.getElementById('transition-tier-badge');
+        const launchBtn = document.getElementById('transition-launch-btn');
+        const subtitle = overlay.querySelector('.transition-subtitle');
+        const backendPort = this.config.backendPort || 8010;
+        const frontendPort = this.config.mainAppPort || 3000;
+        let launchUrl = null;
+
+        window._jarvisTransitionLaunch = () => {
+            if (launchUrl) { this.cleanup(); window.location.href = launchUrl; }
+        };
+
+        const statusLabels = {
+            'pending': 'Pending', 'running': 'Loading...',
+            'resolved': 'Online', 'failed': 'Failed', 'skipped': 'Skipped',
+        };
+        const tierLabels = {
+            'BOOTING': 'INITIALIZING', 'ACTIVE_LOCAL': 'LOCAL SYSTEMS ONLINE',
+            'ACTIVE_FULL': 'CLOUD CONNECTED', 'FULLY_OPERATIONAL': 'FULLY OPERATIONAL',
+        };
+
+        const pollTier = async () => {
+            try {
+                const resp = await fetch(
+                    `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/health/readiness-tier`,
+                    { signal: AbortSignal.timeout(3000) }
+                );
+                if (!resp.ok) { setTimeout(pollTier, 1500); return; }
+                const data = await resp.json();
+                const nodes = data.nodes || {};
+                const tierValue = data.tier_value || 0;
+                const tierName = data.tier || 'BOOTING';
+
+                // Tier badge — real tier from DAG
+                if (tierBadge) {
+                    tierBadge.textContent = tierLabels[tierName] || tierName;
+                    tierBadge.classList.toggle('active', tierValue >= 1);
+                }
+                if (tierValue >= 1 && subtitle) {
+                    subtitle.textContent = 'SYSTEMS ONLINE';
+                }
+
+                // Update each capability from REAL node data
+                for (const [nodeName, capId] of Object.entries(nodeToCapId)) {
+                    const row = document.getElementById(capId);
+                    if (!row) continue;
+                    const node = nodes[nodeName];
+                    const statusEl = row.querySelector('[data-status]');
+                    const elapsedEl = row.querySelector('[data-elapsed]');
+                    if (!node) {
+                        row.className = 'capability-row';
+                        if (statusEl) statusEl.textContent = 'Pending';
+                        continue;
+                    }
+                    row.className = 'capability-row ' + node.status;
+                    if (statusEl) statusEl.textContent = statusLabels[node.status] || node.status;
+                    if (elapsedEl && node.elapsed_s > 0) elapsedEl.textContent = node.elapsed_s.toFixed(1) + 's';
+                }
+                // Voice follows intelligence
+                if (voiceRow) {
+                    const intNode = nodes['intelligence'];
+                    if (intNode) {
+                        voiceRow.className = 'capability-row ' + intNode.status;
+                        const vs = voiceRow.querySelector('[data-status]');
+                        if (vs) vs.textContent = intNode.status === 'resolved' ? 'Online' : intNode.status === 'running' ? 'Loading...' : 'Pending';
+                    }
+                }
+
+                // Show launch button when tier confirmed
+                if (tierValue >= 1 && !launchUrl) {
+                    try {
+                        const fResp = await fetch(
+                            `${this.config.httpProtocol}//${this.config.hostname}:${frontendPort}`,
+                            { method: 'HEAD', signal: AbortSignal.timeout(2000) }
+                        );
+                        if (fResp.ok) {
+                            launchUrl = this._buildReadyRedirectUrl(`${this.config.httpProtocol}//${this.config.hostname}:${frontendPort}`);
+                        }
+                    } catch (e) {
+                        launchUrl = this._buildReadyRedirectUrl(`${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`);
+                    }
+                    if (launchUrl && launchBtn) {
+                        launchBtn.classList.add('visible');
+                        setTimeout(() => {
+                            if (launchUrl) {
+                                console.log('[Transition] Auto-launching to ' + launchUrl);
+                                this.cleanup();
+                                window.location.href = launchUrl;
+                            }
+                        }, 3000);
+                    }
+                }
+            } catch (e) { /* backend not up yet */ }
+            if (!this._transitionStopped) setTimeout(pollTier, 1500);
+        };
+
+        this._transitionStopped = false;
+        pollTier();
+    }
+
+    _fallbackRedirect(redirectUrl) {
+        const bp = this.config.backendPort || 8010;
+        const url = redirectUrl || `${this.config.httpProtocol}//${this.config.hostname}:${bp}`;
+        this.cleanup();
+        window.location.href = this._buildReadyRedirectUrl(url);
+    }
+
     async _runFastCompletionChecks(metadata = {}) {
         const frontendOptionalByMetadata = metadata.frontend_optional === true;
         const frontendRequired = !this.config.frontendOptional && !frontendOptionalByMetadata;
