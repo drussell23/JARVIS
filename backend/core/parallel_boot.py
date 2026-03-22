@@ -202,8 +202,14 @@ class ParallelBootOrchestrator:
 
         # Set JARVIS_STARTUP_COMPLETE for the local tier
         os.environ["JARVIS_STARTUP_COMPLETE"] = "true"
-        k._current_startup_phase = "active_local"
-        k._current_startup_progress = 80
+        # v350.4: Set phase to "finalizing" so _broadcast_startup_progress
+        # allows progress to advance past the old ceiling. The monotonic
+        # guard in _broadcast_startup_progress only updates _current_progress
+        # for stages in _STARTUP_STAGES or when _current_startup_phase is
+        # "complete"/"finalizing". Without this, the completion broadcast
+        # (stage="complete", progress=100) is silently dropped.
+        k._current_startup_phase = "finalizing"
+        k._current_startup_progress = 90
 
         # Broadcast progress stages incrementally — NO stage="complete" yet.
         # The loading page smoothly animates through these stages.
@@ -262,6 +268,10 @@ class ParallelBootOrchestrator:
                 await asyncio.sleep(0.5)
 
         if _ready_verified:
+            # v350.4: Set phase to "complete" so the monotonic guard in
+            # _broadcast_startup_progress allows _current_progress to reach 100.
+            k._current_startup_phase = "complete"
+            k._current_startup_progress = 100
             # Verified: broadcast stage="complete" — gated on actual readiness
             try:
                 await k._safe_broadcast(

@@ -4482,6 +4482,10 @@ class JARVISLoadingManager {
                         // Enrich metadata with tier verification
                         metadata.readiness_tier_verified = true;
                         metadata.readiness_tier = tierName;
+                        // Frontend is optional when tier is verified — parallel
+                        // boot doesn't start the React dev server. The redirect
+                        // will target the backend if frontend isn't available.
+                        metadata.frontend_optional = true;
                         this.handleCompletion(success, redirectUrl, message, metadata);
                         return;
                     }
@@ -4552,12 +4556,16 @@ class JARVISLoadingManager {
                         // ACTIVE_LOCAL reached — trigger completion
                         console.log(`[v350.4] Readiness tier polling detected ACTIVE_LOCAL — triggering completion`);
                         this._readinessTierPollingActive = false;
+                        // Use backend port as redirect target — frontend may
+                        // not be running in parallel boot mode. The completion
+                        // flow will try frontend first, fall back to backend.
                         const redirectUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
                         this.handleCompletion(true, redirectUrl, 'JARVIS is online!', {
                             readiness_tier_verified: true,
                             readiness_tier: tierData.tier,
                             final: true,
                             supervisor_verified: true,
+                            frontend_optional: true,
                         });
                         return;
                     }
@@ -4648,7 +4656,16 @@ class JARVISLoadingManager {
             const fastChecksPassed = await this._runFastCompletionChecks(metadata);
 
             if (fastChecksPassed) {
-                const finalRedirectUrl = this._buildReadyRedirectUrl(redirectUrl);
+                // v350.4: If frontend isn't available, redirect to backend instead
+                let effectiveRedirectUrl = redirectUrl;
+                const frontendAvailable = await this.checkFrontendReady();
+                if (!frontendAvailable) {
+                    const backendPort = this.config.backendPort || 8010;
+                    effectiveRedirectUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
+                    console.log(`[v350.4] Frontend not available — redirecting to backend at ${effectiveRedirectUrl}`);
+                }
+
+                const finalRedirectUrl = this._buildReadyRedirectUrl(effectiveRedirectUrl);
                 this.elements.subtitle.textContent = 'SYSTEM READY';
                 this.elements.statusMessage.textContent = message || 'JARVIS is online!';
                 this.updateStatusText('System ready', 'ready');
