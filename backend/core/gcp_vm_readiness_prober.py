@@ -236,6 +236,20 @@ class GCPVMReadinessProber(ReadinessProber):
                         detail="model warm",
                         data=data,
                     )
+                # v304.0: 404 means /v1/warm_check doesn't exist on this
+                # J-Prime version. If health probe already passed (model
+                # loaded, status healthy), the model IS warm — treat as pass.
+                if resp.status == 404:
+                    logger.info(
+                        "probe_warm_model: /v1/warm_check returned 404 "
+                        "(pre-v300 J-Prime). Treating as passed — "
+                        "health probe already confirmed readiness."
+                    )
+                    return HandshakeResult(
+                        step=HandshakeStep.WARM_MODEL,
+                        passed=True,
+                        detail="warm_check_404_health_passed",
+                    )
                 return HandshakeResult(
                     step=HandshakeStep.WARM_MODEL,
                     passed=False,
