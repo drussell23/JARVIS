@@ -3130,11 +3130,14 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
         await asyncio.sleep(10)
         _active_local_since: Optional[float] = None
         _completion_sent = False
-        # After 120s at ACTIVE_LOCAL without FULLY_OPERATIONAL, send
-        # stage="complete" anyway — the user shouldn't stare at 85% for
-        # 10 minutes while Trinity warms up. JARVIS is usable at ACTIVE_LOCAL.
+        # After 15s at ACTIVE_LOCAL without FULLY_OPERATIONAL, send
+        # stage="complete". JARVIS is fully usable at ACTIVE_LOCAL —
+        # Trinity warming up in the background doesn't block the user.
+        # 15s gives the readiness-tier polling time to confirm the tier
+        # and smoothly transition from 85% to 100% without the loading
+        # page's supervisor crash detector (60s timeout) firing.
         _ACTIVE_LOCAL_GRACE_S = float(os.environ.get(
-            "JARVIS_ACTIVE_LOCAL_GRACE_S", "120"
+            "JARVIS_ACTIVE_LOCAL_GRACE_S", "15"
         ))
 
         while not self._shutdown_requested:
@@ -3233,6 +3236,13 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
                     self._phase = current_stage
                     self._message = current_message
                     self._components = components
+
+                    # v350.5: CRITICAL — refresh supervisor heartbeat timestamp.
+                    # The loading page's crash detector checks _last_supervisor_update.
+                    # During parallel boot, heartbeat broadcasts are suppressed (the
+                    # DAG drives progress). Without this refresh, the loading page
+                    # declares "SUPERVISOR CRASH DETECTED" after 30s of no broadcasts.
+                    self._last_supervisor_update = time.time()
 
                     # Update ETA engine
                     self._eta_engine.update_progress(dag_progress)
