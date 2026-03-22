@@ -1823,13 +1823,6 @@ class JARVISLoadingManager {
         // Start smooth progress animation
         this.startSmoothProgress();
 
-        // v350.4: Start readiness-tier polling — the SINGLE SOURCE OF TRUTH
-        // for boot completion. Even if WebSocket/broadcast messages arrive
-        // with stage="complete", the loading page verifies readiness-tier
-        // before redirecting. This polling also acts as a fallback trigger
-        // if the broadcast doesn't arrive at all.
-        this.startReadinessTierPolling();
-
         // Make details panel visible immediately and add initial log
         if (this.elements.detailsPanel) {
             this.elements.detailsPanel.classList.add('visible');
@@ -2387,45 +2380,6 @@ class JARVISLoadingManager {
                         return; // Don't process heartbeat as progress update
                     }
 
-                    // ═══════════════════════════════════════════════════════
-                    // v350.4: READINESS STATE — authoritative tier from DAG
-                    // ProgressiveReadiness broadcasts these when DAG nodes
-                    // resolve or tier advances. Use this to update progress
-                    // display based on ACTUAL resolution, not synthetic %.
-                    // ═══════════════════════════════════════════════════════
-                    if (data.type === 'readiness_state') {
-                        const tierValue = data.tier_value || 0;
-                        const tierName = data.tier || 'BOOTING';
-                        const nodes = data.nodes || {};
-
-                        // Count resolved vs total for display progress
-                        let resolved = 0, total = 0;
-                        for (const [, node] of Object.entries(nodes)) {
-                            total++;
-                            if (node.status === 'resolved' || node.status === 'skipped') resolved++;
-                        }
-
-                        // Map DAG resolution to display progress
-                        if (total > 0) {
-                            const dagProgress = Math.round(80 + (resolved / total) * 18);
-                            if (dagProgress > this.state.targetProgress && dagProgress < 100) {
-                                this.state.targetProgress = dagProgress;
-                            }
-                        }
-
-                        console.log(`[v350.4] Readiness state: ${tierName} (${resolved}/${total} nodes)`);
-
-                        // Update message based on tier
-                        if (tierValue >= 1 && tierValue < 2) {
-                            this.state.message = 'Local systems online...';
-                        } else if (tierValue >= 2) {
-                            this.state.message = 'Cloud intelligence connected...';
-                        }
-
-                        this.updateUI();
-                        return; // Don't process as regular progress update
-                    }
-
                     if (data.type !== 'pong') {
                         // ═══════════════════════════════════════════════════════
                         // v185.0: NORMALIZE WEBSOCKET PAYLOAD
@@ -2435,8 +2389,6 @@ class JARVISLoadingManager {
                         if (data.data) {
                             // WebSocket wraps payload in data.data
                             const inner = data.data;
-                            // v350.4: Extract completion_mode flags for frontend_optional
-                            const cm = inner.completion_mode || {};
                             normalized = {
                                 stage: inner.stage || inner.phase,
                                 message: inner.message,
@@ -2449,12 +2401,7 @@ class JARVISLoadingManager {
                                     components: inner.components || (inner.metadata || {}).components,
                                     trinity: inner.trinity || (inner.metadata || {}).trinity,
                                     trinity_ready: inner.trinity_ready ?? (inner.metadata || {}).trinity_ready,
-                                    init_progress: inner.init_progress || (inner.metadata || {}).init_progress,  // v225.0: Prime v2 phase data
-                                    // v350.4: Propagate parallel boot completion flags
-                                    frontend_optional: cm.frontend_optional || (inner.metadata || {}).frontend_optional,
-                                    readiness_tier_verified: cm.readiness_tier_verified || (inner.metadata || {}).readiness_tier_verified,
-                                    frontend_failed: cm.frontend_failed || (inner.metadata || {}).frontend_failed,
-                                    api_only: cm.api_only || (inner.metadata || {}).api_only,
+                                    init_progress: inner.init_progress || (inner.metadata || {}).init_progress  // v225.0: Prime v2 phase data
                                 }
                             };
                         } else {
@@ -2694,9 +2641,6 @@ class JARVISLoadingManager {
             if (data.completion_mode.frontend_failed) data.metadata.frontend_failed = true;
             if (data.completion_mode.api_only) data.metadata.api_only = true;
             if (data.completion_mode.frontend_timeout) data.metadata.frontend_timeout = true;
-            // v350.4: Propagate parallel boot flags
-            if (data.completion_mode.frontend_optional) data.metadata.frontend_optional = true;
-            if (data.completion_mode.readiness_tier_verified) data.metadata.readiness_tier_verified = true;
         }
 
         // Process the data
@@ -3486,24 +3430,11 @@ class JARVISLoadingManager {
         this.updateUI();
         this.updateDetailedStatus();
 
-        // Handle completion — gated on readiness-tier verification.
-        // v350.4: The loading page MUST verify that ProgressiveReadiness
-        // has reached ACTIVE_LOCAL (tier_value >= 1) before triggering
-        // the redirect. This prevents the race where stage="complete"
-        // arrives before the backend is actually ready.
+        // Handle completion
         if (stage === 'complete' || progress >= 100) {
             const success = metadata.success !== false;
             const redirectUrl = metadata.redirect_url || `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
-
-            // If supervisor already verified readiness-tier, proceed immediately
-            if (metadata.readiness_tier_verified === true) {
-                console.log('[v350.4] Readiness tier pre-verified by supervisor — completing');
-                this.handleCompletion(success, redirectUrl, message, metadata);
-            } else {
-                // Verify readiness-tier before completing — single source of truth
-                console.log('[v350.4] Verifying readiness tier before completion...');
-                this._verifyReadinessTierThenComplete(success, redirectUrl, message, metadata);
-            }
+            this.handleCompletion(success, redirectUrl, message, metadata);
         }
 
         // v5.0: Handle PARTIAL completion (supervisor FALLBACK 5)
@@ -4446,300 +4377,12 @@ class JARVISLoadingManager {
             : `${baseRedirectUrl}?${params.toString()}`;
     }
 
-    // ═══════════════════════════════════════════════════════════════════════════
-    // v350.4: READINESS TIER VERIFICATION
-    // ProgressiveReadiness is the SINGLE SOURCE OF TRUTH for boot state.
-    // The loading page MUST verify tier >= ACTIVE_LOCAL before redirecting.
-    // ═══════════════════════════════════════════════════════════════════════════
-
-    async _verifyReadinessTierThenComplete(success, redirectUrl, message, metadata) {
-        /**
-         * Poll /health/readiness-tier on the backend to verify the
-         * ProgressiveReadiness DAG has actually reached ACTIVE_LOCAL.
-         * Only then trigger the completion flow.
-         *
-         * This is the gate that prevents the loading page from racing
-         * ahead when stage="complete" arrives before the backend is ready.
-         */
-        if (this._readinessTierVerifyActive) {
-            console.log('[v350.4] Readiness tier verification already active');
-            return;
-        }
-        this._readinessTierVerifyActive = true;
-
-        const backendPort = this.config.backendPort || 8010;
-        const tierUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/health/readiness-tier`;
-        const maxAttempts = 30;  // 15 seconds max
-        const pollInterval = 500;  // 500ms between polls
-
-        for (let attempt = 0; attempt < maxAttempts; attempt++) {
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 2000);
-
-                const resp = await fetch(tierUrl, { signal: controller.signal });
-                clearTimeout(timeoutId);
-
-                if (resp.ok) {
-                    const tierData = await resp.json();
-                    const tierValue = tierData.tier_value || 0;
-                    const tierName = tierData.tier || 'BOOTING';
-
-                    if (tierValue >= 1) {
-                        // ACTIVE_LOCAL confirmed — proceed with completion
-                        console.log(`[v350.4] Readiness tier verified: ${tierName} (value=${tierValue})`);
-                        this._readinessTierVerifyActive = false;
-                        // Enrich metadata with tier verification
-                        metadata.readiness_tier_verified = true;
-                        metadata.readiness_tier = tierName;
-                        // Frontend is optional when tier is verified — parallel
-                        // boot doesn't start the React dev server. The redirect
-                        // will target the backend if frontend isn't available.
-                        metadata.frontend_optional = true;
-                        this.handleCompletion(success, redirectUrl, message, metadata);
-                        return;
-                    }
-
-                    // Not ready yet — update progress based on DAG nodes
-                    const resolvedCount = (tierData.resolved || []).length;
-                    const pendingCount = (tierData.pending || []).length;
-                    const totalNodes = resolvedCount + pendingCount;
-                    if (totalNodes > 0) {
-                        // Map DAG resolution to display progress (80-98%)
-                        const dagProgress = Math.round(80 + (resolvedCount / totalNodes) * 18);
-                        if (dagProgress > this.state.targetProgress && dagProgress < 100) {
-                            this.state.targetProgress = dagProgress;
-                        }
-                    }
-
-                    console.log(`[v350.4] Tier ${tierName} (${resolvedCount}/${totalNodes} nodes resolved), attempt ${attempt + 1}/${maxAttempts}`);
-                }
-            } catch (e) {
-                // Backend not reachable yet — keep trying
-                console.debug(`[v350.4] Readiness tier poll failed (attempt ${attempt + 1}): ${e.message}`);
-            }
-
-            await new Promise(resolve => setTimeout(resolve, pollInterval));
-        }
-
-        // Exhausted retries — fall through to completion anyway
-        // (the handleCompletion flow has its own backend/frontend checks)
-        console.warn('[v350.4] Readiness tier not confirmed after 15s — falling through to completion');
-        this._readinessTierVerifyActive = false;
-        this.handleCompletion(success, redirectUrl, message, metadata);
-    }
-
-    /**
-     * v350.4: Start background readiness-tier polling.
-     * Called during initialization. If the tier reaches ACTIVE_LOCAL
-     * before a stage="complete" broadcast arrives, this triggers
-     * completion proactively — ensuring the loading page transitions
-     * as soon as the backend is actually ready, not when a broadcast
-     * happens to arrive.
-     */
-    startReadinessTierPolling() {
-        if (this._readinessTierPollingActive) return;
-        this._readinessTierPollingActive = true;
-
-        const backendPort = this.config.backendPort || 8010;
-        const tierUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/health/readiness-tier`;
-
-        const poll = async () => {
-            if (this.state.redirecting || this._completionPromise) {
-                // Already completing — stop polling
-                this._readinessTierPollingActive = false;
-                return;
-            }
-
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 2000);
-
-                const resp = await fetch(tierUrl, { signal: controller.signal });
-                clearTimeout(timeoutId);
-
-                if (resp.ok) {
-                    const tierData = await resp.json();
-                    const tierValue = tierData.tier_value || 0;
-
-                    if (tierValue >= 1 && !this.state.redirecting && !this._completionPromise) {
-                        // ACTIVE_LOCAL reached — trigger completion
-                        console.log(`[v350.4] Readiness tier polling detected ACTIVE_LOCAL — triggering completion`);
-                        this._readinessTierPollingActive = false;
-                        // Use backend port as redirect target — frontend may
-                        // not be running in parallel boot mode. The completion
-                        // flow will try frontend first, fall back to backend.
-                        const redirectUrl = `${this.config.httpProtocol}//${this.config.hostname}:${this.config.mainAppPort}`;
-                        this.handleCompletion(true, redirectUrl, 'JARVIS is online!', {
-                            readiness_tier_verified: true,
-                            readiness_tier: tierData.tier,
-                            final: true,
-                            supervisor_verified: true,
-                            frontend_optional: true,
-                        });
-                        return;
-                    }
-                }
-            } catch (e) {
-                // Backend not up yet — normal during early boot
-            }
-
-            // Continue polling every 2 seconds
-            if (!this.state.redirecting && !this._completionPromise) {
-                setTimeout(poll, 2000);
-            } else {
-                this._readinessTierPollingActive = false;
-            }
-        };
-
-        // Start after 10 seconds (backend needs time to start)
-        setTimeout(poll, 10000);
-    }
-
     _isSupervisorAuthoritativeCompletion(metadata = {}) {
         return (
             metadata.final === true ||
             metadata.supervisor_verified === true ||
-            metadata.authority === 'unified_supervisor' ||
-            metadata.readiness_tier_verified === true  // v350.4: tier-verified is authoritative
+            metadata.authority === 'unified_supervisor'
         );
-    }
-
-    _activateTransitionOverlay(redirectUrl) {
-        const overlay = document.getElementById('transition-overlay');
-        if (!overlay) {
-            console.warn('[Transition] Overlay not found, falling back to redirect');
-            this._fallbackRedirect(redirectUrl);
-            return;
-        }
-        console.log('[Transition] Activating transition overlay');
-        overlay.classList.add('active');
-
-        const nodeToCapId = {
-            'backend': 'cap-core',
-            'intelligence': 'cap-intelligence',
-            'trinity': 'cap-cloud',
-            'governance': 'cap-governance',
-        };
-        const voiceRow = document.getElementById('cap-voice');
-        const tierBadge = document.getElementById('transition-tier-badge');
-        const launchBtn = document.getElementById('transition-launch-btn');
-        const subtitle = overlay.querySelector('.transition-subtitle');
-        const backendPort = this.config.backendPort || 8010;
-        const frontendPort = this.config.mainAppPort || 3000;
-        let launchUrl = null;
-
-        window._jarvisTransitionLaunch = () => {
-            if (launchUrl) { this.cleanup(); window.location.href = launchUrl; }
-        };
-
-        const statusLabels = {
-            'pending': 'Pending', 'running': 'Loading...',
-            'resolved': 'Online', 'failed': 'Failed', 'skipped': 'Skipped',
-        };
-        const tierLabels = {
-            'BOOTING': 'INITIALIZING', 'ACTIVE_LOCAL': 'LOCAL SYSTEMS ONLINE',
-            'ACTIVE_FULL': 'CLOUD CONNECTED', 'FULLY_OPERATIONAL': 'FULLY OPERATIONAL',
-        };
-
-        const pollTier = async () => {
-            try {
-                const resp = await fetch(
-                    `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/health/readiness-tier`,
-                    { signal: AbortSignal.timeout(3000) }
-                );
-                if (!resp.ok) { setTimeout(pollTier, 1500); return; }
-                const data = await resp.json();
-                const nodes = data.nodes || {};
-                const tierValue = data.tier_value || 0;
-                const tierName = data.tier || 'BOOTING';
-
-                // Tier badge — real tier from DAG
-                if (tierBadge) {
-                    tierBadge.textContent = tierLabels[tierName] || tierName;
-                    tierBadge.classList.toggle('active', tierValue >= 1);
-                }
-                if (tierValue >= 1 && subtitle) {
-                    subtitle.textContent = 'SYSTEMS ONLINE';
-                }
-
-                // Update each capability from REAL node data
-                for (const [nodeName, capId] of Object.entries(nodeToCapId)) {
-                    const row = document.getElementById(capId);
-                    if (!row) continue;
-                    const node = nodes[nodeName];
-                    const statusEl = row.querySelector('[data-status]');
-                    const elapsedEl = row.querySelector('[data-elapsed]');
-                    if (!node) {
-                        row.className = 'capability-row';
-                        if (statusEl) statusEl.textContent = 'Pending';
-                        continue;
-                    }
-                    row.className = 'capability-row ' + node.status;
-                    if (statusEl) statusEl.textContent = statusLabels[node.status] || node.status;
-                    if (elapsedEl && node.elapsed_s > 0) elapsedEl.textContent = node.elapsed_s.toFixed(1) + 's';
-                }
-                // Voice follows intelligence
-                if (voiceRow) {
-                    const intNode = nodes['intelligence'];
-                    if (intNode) {
-                        voiceRow.className = 'capability-row ' + intNode.status;
-                        const vs = voiceRow.querySelector('[data-status]');
-                        if (vs) vs.textContent = intNode.status === 'resolved' ? 'Online' : intNode.status === 'running' ? 'Loading...' : 'Pending';
-                    }
-                }
-
-                // Show launch button when tier confirmed
-                if (tierValue >= 1 && !launchUrl) {
-                    let frontendUp = false;
-                    try {
-                        const fResp = await fetch(
-                            `${this.config.httpProtocol}//${this.config.hostname}:${frontendPort}`,
-                            { method: 'HEAD', signal: AbortSignal.timeout(2000) }
-                        );
-                        frontendUp = fResp.ok;
-                    } catch (e) { /* frontend not running */ }
-
-                    if (frontendUp) {
-                        // Frontend available — auto-redirect after 3s
-                        launchUrl = this._buildReadyRedirectUrl(
-                            `${this.config.httpProtocol}//${this.config.hostname}:${frontendPort}`
-                        );
-                        if (launchBtn) {
-                            launchBtn.textContent = 'LAUNCH DASHBOARD';
-                            launchBtn.classList.add('visible');
-                        }
-                        setTimeout(() => {
-                            if (launchUrl) {
-                                console.log('[Transition] Auto-launching to frontend');
-                                this.cleanup();
-                                window.location.href = launchUrl;
-                            }
-                        }, 3000);
-                    } else {
-                        // No frontend — stay on transition overlay (it IS the UI).
-                        // Show button to open API docs, but do NOT auto-redirect
-                        // to raw JSON. The overlay shows real-time subsystem status.
-                        launchUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/docs`;
-                        if (launchBtn) {
-                            launchBtn.textContent = 'OPEN API CONSOLE';
-                            launchBtn.classList.add('visible');
-                        }
-                    }
-                }
-            } catch (e) { /* backend not up yet */ }
-            if (!this._transitionStopped) setTimeout(pollTier, 1500);
-        };
-
-        this._transitionStopped = false;
-        pollTier();
-    }
-
-    _fallbackRedirect(redirectUrl) {
-        const bp = this.config.backendPort || 8010;
-        const url = redirectUrl || `${this.config.httpProtocol}//${this.config.hostname}:${bp}`;
-        this.cleanup();
-        window.location.href = this._buildReadyRedirectUrl(url);
     }
 
     async _runFastCompletionChecks(metadata = {}) {
@@ -4803,14 +4446,15 @@ class JARVISLoadingManager {
             const fastChecksPassed = await this._runFastCompletionChecks(metadata);
 
             if (fastChecksPassed) {
-                // v350.4: Show transition overlay instead of immediate redirect.
-                // The overlay polls /health/readiness-tier for real-time capability
-                // status and shows the user exactly what's online. It auto-redirects
-                // when the target URL becomes available.
+                const finalRedirectUrl = this._buildReadyRedirectUrl(redirectUrl);
+                this.elements.subtitle.textContent = 'SYSTEM READY';
+                this.elements.statusMessage.textContent = message || 'JARVIS is online!';
+                this.updateStatusText('System ready', 'ready');
                 this.state.progress = 100;
                 this.state.targetProgress = 100;
                 this.updateProgressBar();
-                this._activateTransitionOverlay(redirectUrl);
+                this.cleanup();
+                window.location.href = finalRedirectUrl;
                 return;
             }
 
