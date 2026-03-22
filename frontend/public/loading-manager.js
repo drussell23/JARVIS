@@ -2435,6 +2435,8 @@ class JARVISLoadingManager {
                         if (data.data) {
                             // WebSocket wraps payload in data.data
                             const inner = data.data;
+                            // v350.4: Extract completion_mode flags for frontend_optional
+                            const cm = inner.completion_mode || {};
                             normalized = {
                                 stage: inner.stage || inner.phase,
                                 message: inner.message,
@@ -2447,7 +2449,12 @@ class JARVISLoadingManager {
                                     components: inner.components || (inner.metadata || {}).components,
                                     trinity: inner.trinity || (inner.metadata || {}).trinity,
                                     trinity_ready: inner.trinity_ready ?? (inner.metadata || {}).trinity_ready,
-                                    init_progress: inner.init_progress || (inner.metadata || {}).init_progress  // v225.0: Prime v2 phase data
+                                    init_progress: inner.init_progress || (inner.metadata || {}).init_progress,  // v225.0: Prime v2 phase data
+                                    // v350.4: Propagate parallel boot completion flags
+                                    frontend_optional: cm.frontend_optional || (inner.metadata || {}).frontend_optional,
+                                    readiness_tier_verified: cm.readiness_tier_verified || (inner.metadata || {}).readiness_tier_verified,
+                                    frontend_failed: cm.frontend_failed || (inner.metadata || {}).frontend_failed,
+                                    api_only: cm.api_only || (inner.metadata || {}).api_only,
                                 }
                             };
                         } else {
@@ -2687,6 +2694,9 @@ class JARVISLoadingManager {
             if (data.completion_mode.frontend_failed) data.metadata.frontend_failed = true;
             if (data.completion_mode.api_only) data.metadata.api_only = true;
             if (data.completion_mode.frontend_timeout) data.metadata.frontend_timeout = true;
+            // v350.4: Propagate parallel boot flags
+            if (data.completion_mode.frontend_optional) data.metadata.frontend_optional = true;
+            if (data.completion_mode.readiness_tier_verified) data.metadata.readiness_tier_verified = true;
         }
 
         // Process the data
@@ -4656,24 +4666,14 @@ class JARVISLoadingManager {
             const fastChecksPassed = await this._runFastCompletionChecks(metadata);
 
             if (fastChecksPassed) {
-                // v350.4: If frontend isn't available, redirect to backend instead
-                let effectiveRedirectUrl = redirectUrl;
-                const frontendAvailable = await this.checkFrontendReady();
-                if (!frontendAvailable) {
-                    const backendPort = this.config.backendPort || 8010;
-                    effectiveRedirectUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
-                    console.log(`[v350.4] Frontend not available — redirecting to backend at ${effectiveRedirectUrl}`);
-                }
-
-                const finalRedirectUrl = this._buildReadyRedirectUrl(effectiveRedirectUrl);
-                this.elements.subtitle.textContent = 'SYSTEM READY';
-                this.elements.statusMessage.textContent = message || 'JARVIS is online!';
-                this.updateStatusText('System ready', 'ready');
+                // v350.4: Show transition overlay instead of immediate redirect.
+                // The overlay polls /health/readiness-tier for real-time capability
+                // status and shows the user exactly what's online. It auto-redirects
+                // when the target URL becomes available.
                 this.state.progress = 100;
                 this.state.targetProgress = 100;
                 this.updateProgressBar();
-                this.cleanup();
-                window.location.href = finalRedirectUrl;
+                this._activateTransitionOverlay(redirectUrl);
                 return;
             }
 

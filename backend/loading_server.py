@@ -2068,11 +2068,13 @@ class LoadingServer:
         if self._startup_timeout_ms is not None:
             result["startup_timeout_ms"] = self._startup_timeout_ms
         # v271.2: Include degraded completion flags so frontend can adjust behavior
-        if self._frontend_failed or self._api_only or self._frontend_timeout:
+        if self._frontend_failed or self._api_only or self._frontend_timeout or getattr(self, '_frontend_optional', False):
             result["completion_mode"] = {
                 "frontend_failed": self._frontend_failed,
                 "api_only": self._api_only,
                 "frontend_timeout": self._frontend_timeout,
+                "frontend_optional": getattr(self, '_frontend_optional', False),
+                "readiness_tier_verified": getattr(self, '_readiness_tier_verified', False),
             }
         # v271.2: Include Prime endpoint info for frontend health display
         if hasattr(self, "_health_aggregator") and self._health_aggregator._prime_is_gcp:
@@ -2390,6 +2392,11 @@ class LoadingServer:
                     self._api_only = True
                 if metadata.get("frontend_timeout"):
                     self._frontend_timeout = True
+                # v350.4: Persist frontend_optional from parallel boot
+                if metadata.get("frontend_optional"):
+                    self._frontend_optional = True
+                if metadata.get("readiness_tier_verified"):
+                    self._readiness_tier_verified = True
 
             self._eta_engine.update_progress(self._progress)
 

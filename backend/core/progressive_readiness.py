@@ -298,8 +298,43 @@ _instance: Optional[ProgressiveReadiness] = None
 
 
 def get_readiness() -> ProgressiveReadiness:
-    """Get the singleton ProgressiveReadiness instance."""
+    """Get the singleton ProgressiveReadiness instance.
+
+    v350.4: CRITICAL — Python module singleton split fix.
+    When the same file is imported via two paths (e.g., 'backend.core.X'
+    from the supervisor and 'core.X' from uvicorn), Python creates two
+    separate module objects with two separate _instance globals. This
+    function cross-references the alternate module path so both paths
+    return the SAME ProgressiveReadiness instance. Without this, the
+    /health/readiness-tier endpoint sees an empty DAG while the parallel
+    boot wrote nodes to the other instance.
+    """
     global _instance
     if _instance is None:
+        # Check if the alternate import path already created an instance
+        _alt_instance = _get_alternate_instance()
+        if _alt_instance is not None:
+            _instance = _alt_instance
+            return _instance
         _instance = ProgressiveReadiness()
     return _instance
+
+
+def _get_alternate_instance() -> Optional[ProgressiveReadiness]:
+    """Check the alternate module path for an existing singleton.
+
+    If this module was loaded as 'core.progressive_readiness', check
+    'backend.core.progressive_readiness' and vice versa.
+    """
+    import sys
+    alt_paths = [
+        "backend.core.progressive_readiness",
+        "core.progressive_readiness",
+    ]
+    for alt in alt_paths:
+        mod = sys.modules.get(alt)
+        if mod is not None and mod is not sys.modules.get(__name__):
+            alt_inst = getattr(mod, "_instance", None)
+            if alt_inst is not None:
+                return alt_inst
+    return None

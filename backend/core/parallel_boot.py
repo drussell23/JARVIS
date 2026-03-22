@@ -286,6 +286,7 @@ class ParallelBootOrchestrator:
                         "readiness_tier_verified": True,
                         "authority": "unified_supervisor",
                         "parallel_boot": True,
+                        "frontend_optional": True,
                         "boot_elapsed_s": round(time.time() - t0, 1),
                     },
                 )
