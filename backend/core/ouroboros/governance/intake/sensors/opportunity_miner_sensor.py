@@ -82,35 +82,42 @@ class OpportunityMinerSensor:
         self._running = False
         self._seen_file_paths: set[str] = set()
 
+    # v350.4: Third-party / non-project directory segments that must
+    # never be scanned. These are structural boundaries — scanning torch,
+    # numpy, or joblib source is not production governance.
+    _NON_PROJECT_SEGMENTS = frozenset({
+        "venv", ".venv", "env", ".env",
+        "site-packages", "dist-packages",
+        "node_modules", ".git", "__pycache__",
+        ".tox", ".nox", ".mypy_cache", ".pytest_cache",
+    })
+
     def _is_production_code(self, py_file: Path, scan_root: Path) -> bool:
         """Return True if the file is production code, not a loose script.
 
-        Structural heuristic — zero hardcoded exclusion lists.
-        Depth is measured from the **repo root**, not the scan root.
-        Files at depth <= 1 from repo root (e.g. ``backend/demo.py``)
-        are skipped — they are standalone scripts, demos, migration
-        tools, and one-off utilities.  Files at depth >= 2
-        (e.g. ``backend/core/prime_router.py``) are production code
-        inside proper sub-packages.
+        Structural heuristic with boundary enforcement:
+        1. Files inside third-party directories (venv, site-packages,
+           node_modules) are always excluded — they are not project code.
+        2. Depth is measured from the **repo root**. Files at depth <= 1
+           (e.g. ``backend/demo.py``) are skipped as loose scripts.
+        3. Files at depth >= 2 are production code inside sub-packages.
 
-        This automatically adapts: when someone creates a new package
-        ``backend/new_feature/``, its files are included.  When someone
-        drops a one-off script in ``backend/``, it's excluded.
-
-        When the scan path itself is already a sub-package
-        (e.g. ``backend/core/``), all files inside are at depth >= 2
-        and are admitted.
-
-        Special files (__init__.py, conftest.py) at any depth are admitted.
+        Special files (__init__.py, conftest.py) at any depth are admitted
+        (but still rejected if inside a third-party directory).
         """
+        # Structural boundary: never scan third-party code
+        parts = py_file.relative_to(self._repo_root).parts if self._repo_root in py_file.parents else py_file.parts
+        if self._NON_PROJECT_SEGMENTS.intersection(parts):
+            return False
+
         name = py_file.name
         if name in ("__init__.py", "__main__.py", "conftest.py"):
             return True
         try:
             relative = py_file.relative_to(self._repo_root)
             depth = len(relative.parts) - 1  # -1 for the filename itself
-            return depth >= 2  # e.g. backend/core/foo.py = depth 2 ✓
-                               #      backend/demo.py     = depth 1 ✗
+            return depth >= 2  # e.g. backend/core/foo.py = depth 2
+                               #      backend/demo.py     = depth 1
         except ValueError:
             return True  # Not under repo_root — admit conservatively
 
