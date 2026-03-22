@@ -38,11 +38,19 @@ class CommandIntent(str, Enum):
 
 @dataclass(frozen=True)
 class ClassificationResult:
-    """Result of intent classification with reasoning."""
+    """Result of intent classification with reasoning.
+
+    Structured fields (provider, search_query, url) are emitted here so the
+    orchestrator never needs to scrape goal strings for routing data.
+    """
     intent: CommandIntent
     confidence: float       # 0.0-1.0, higher = more certain
     matched_signal: str     # which pattern triggered the classification
     action_category: str    # "browser", "app_control", "system", "communication", etc.
+    provider: str = ""      # "youtube", "google", "spotify", etc.
+    search_query: str = ""  # extracted search term (e.g. "nba" from "search youtube for nba")
+    url: str = ""           # pre-resolved URL if deterministic
+    target_app: str = ""    # native app name (e.g. "apple music")
 
 
 # ---------------------------------------------------------------------------
