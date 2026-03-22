@@ -118,7 +118,17 @@ class MLConfig:
     # HYBRID CLOUD CONFIGURATION
     # Integrates with MemoryAwareStartup for automatic cloud routing
     # ==========================================================================
-    CLOUD_FIRST_MODE = os.getenv("JARVIS_CLOUD_FIRST_ML", "false").lower() == "true"
+    # v304.0: Auto-detect cloud-first mode on constrained hardware.
+    # On <= 16GB RAM, loading local ML models (torch, speechbrain)
+    # causes memory emergency. Use GCP cloud inference instead.
+    _default_cloud_first = "false"
+    try:
+        import psutil as _psutil_mlcfg
+        if _psutil_mlcfg.virtual_memory().total < 20 * 1024 ** 3:
+            _default_cloud_first = "true"
+    except ImportError:
+        pass
+    CLOUD_FIRST_MODE = os.getenv("JARVIS_CLOUD_FIRST_ML", _default_cloud_first).lower() == "true"
     CLOUD_FALLBACK_ENABLED = os.getenv("JARVIS_CLOUD_FALLBACK", "true").lower() == "true"
     CLOUD_API_FAILURE_BACKOFF_BASE = float(
         os.getenv("JARVIS_CLOUD_API_FAILURE_BACKOFF_BASE", "20.0")
