@@ -2767,14 +2767,15 @@ class JARVISLoadingManager {
             console.debug(`[Progress] Skipped backward: ${effectiveProgress}% (current: ${currentMax}%) - ${stage}: ${message}`);
         }
 
-        // Update target progress ONLY if it increases (monotonic progress)
+        // Update target progress ONLY if it increases (monotonic + integer-only)
         if (typeof progress === 'number' && progress >= 0 && progress <= 100) {
+            const intProgress = Math.round(progress);
             // Allow progress to increase or stay the same, never decrease
             // Exception: 'complete' stage always sets to 100%
             if (stage === 'complete') {
                 this.state.targetProgress = 100;
-            } else if (progress > this.state.targetProgress) {
-                this.state.targetProgress = progress;
+            } else if (intProgress > this.state.targetProgress) {
+                this.state.targetProgress = intProgress;
             }
             // If progress is less than current, ignore it (out-of-order message)
 
@@ -3692,14 +3693,16 @@ class JARVISLoadingManager {
         this.state.smoothProgressInterval = setInterval(() => {
             if (this.state.progress < this.state.targetProgress) {
                 const diff = this.state.targetProgress - this.state.progress;
-                const increment = Math.max(0.3, diff / 15);
+                const increment = Math.max(1, diff / 10);
                 const newProgress = Math.min(
                     this.state.progress + increment,
                     this.state.targetProgress
                 );
-                // STRICT MONOTONIC: never display lower than the max we've shown
-                this.state.progress = Math.max(newProgress, this._maxDisplayedProgress);
-                this._maxDisplayedProgress = this.state.progress;
+                // STRICT MONOTONIC + INTEGER ONLY: never display lower than
+                // max, and always round to whole numbers (no decimals in UI)
+                const rounded = Math.round(Math.max(newProgress, this._maxDisplayedProgress));
+                this.state.progress = rounded;
+                this._maxDisplayedProgress = rounded;
                 this.updateProgressBar();
             }
         }, this.config.smoothProgress.incrementDelay);
@@ -4241,11 +4244,11 @@ class JARVISLoadingManager {
     }
 
     updateProgressBar() {
-        // v350.3: Enforce strict monotonic display — never show lower than max
+        // v350.3: Enforce strict monotonic display + integer-only (no decimals)
         const rawProgress = Math.round(this.state.progress);
-        const displayProgress = Math.max(rawProgress, this._maxDisplayedProgress || 0);
+        const displayProgress = Math.min(100, Math.max(rawProgress, this._maxDisplayedProgress || 0));
         this._maxDisplayedProgress = displayProgress;
-        this.state.progress = displayProgress; // sync state to prevent future regressions
+        this.state.progress = displayProgress;
         this.elements.progressBar.style.width = `${displayProgress}%`;
         this.elements.progressPercentage.textContent = `${displayProgress}%`;
 

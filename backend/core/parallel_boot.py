@@ -80,6 +80,14 @@ class ParallelBootOrchestrator:
         # ============================================================
         # Phase 1: Clean Slate (must be first — cleanup)
         # ============================================================
+        try:
+            await k._safe_broadcast(
+                stage="starting", message="Cleaning up previous session...",
+                progress=5, metadata={"icon": "broom", "phase": 0},
+            )
+        except Exception:
+            pass
+
         pr.mark_running("clean_slate", "Cleanup and state recovery")
         ok = await self._run_phase("clean_slate", k._phase_clean_slate, timeout=30.0)
         if not ok:
@@ -91,6 +99,14 @@ class ParallelBootOrchestrator:
         # Phase 2: PARALLEL — Preflight + Resources + Loading Experience
         # These are independent after Clean Slate.
         # ============================================================
+        try:
+            await k._safe_broadcast(
+                stage="resources", message="Initializing systems in parallel...",
+                progress=15, metadata={"icon": "bolt", "phase": 1, "parallel": True},
+            )
+        except Exception:
+            pass
+
         logger.info("[ParallelBoot] Launching parallel group: preflight + resources + loading")
         pr.mark_running("preflight", "DMS, IPC, locks")
         pr.mark_running("resources", "Docker, GCP client, ports")
@@ -135,6 +151,14 @@ class ParallelBootOrchestrator:
         # ============================================================
         # Phase 3: Backend (needs Resources for port + database)
         # ============================================================
+        try:
+            await k._safe_broadcast(
+                stage="backend", message="Starting backend server...",
+                progress=40, metadata={"icon": "server", "phase": 2},
+            )
+        except Exception:
+            pass
+
         pr.mark_running("backend", "uvicorn + FastAPI")
         _be_ok = await self._run_phase("backend", k._phase_backend, timeout=300.0)
         if _be_ok:
@@ -147,6 +171,14 @@ class ParallelBootOrchestrator:
         # ============================================================
         # Phase 4: Intelligence (needs Backend)
         # ============================================================
+        try:
+            await k._safe_broadcast(
+                stage="intelligence", message="Loading intelligence layer...",
+                progress=70, metadata={"icon": "sparkles", "phase": 3},
+            )
+        except Exception:
+            pass
+
         pr.mark_running("intelligence", "ML routing, model serving")
         _in_ok = await self._run_phase("intelligence", k._phase_intelligence, timeout=120.0)
         if _in_ok:
@@ -173,7 +205,45 @@ class ParallelBootOrchestrator:
         k._current_startup_phase = "active_local"
         k._current_startup_progress = 80
 
-        # Broadcast to frontend — loading page can transition
+        # Broadcast progress stages incrementally — NO stage="complete" yet.
+        # The loading page smoothly animates through these stages.
+        try:
+            await k._safe_broadcast(
+                stage="finalizing",
+                message="Verifying backend readiness...",
+                progress=90,
+                metadata={"icon": "gear", "phase": "finalizing"},
+            )
+        except Exception:
+            pass
+
+        # Wait for /health/ready to actually return 200 before telling
+        # the frontend to transition. This prevents the loading page from
+        # racing ahead while ReadinessStateManager hasn't caught up.
+        _ready_verified = False
+        for _attempt in range(10):  # max 5 seconds
+            try:
+                import aiohttp
+                async with aiohttp.ClientSession() as _sess:
+                    _port = int(os.environ.get("JARVIS_PORT", "8010"))
+                    async with _sess.head(
+                        f"http://127.0.0.1:{_port}/health/ready",
+                        timeout=aiohttp.ClientTimeout(total=2),
+                    ) as _resp:
+                        if _resp.status == 200:
+                            _ready_verified = True
+                            break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+
+        if not _ready_verified:
+            logger.warning(
+                "[ParallelBoot] /health/ready not confirming after 5s — "
+                "broadcasting complete anyway"
+            )
+
+        # NOW broadcast stage="complete" — the backend is verified ready
         try:
             await k._safe_broadcast(
                 stage="complete",
@@ -186,7 +256,7 @@ class ParallelBootOrchestrator:
                     "supervisor_verified": True,
                     "authority": "unified_supervisor",
                     "parallel_boot": True,
-                    "boot_elapsed_s": round(local_elapsed, 1),
+                    "boot_elapsed_s": round(time.time() - t0, 1),
                 },
             )
         except Exception:
