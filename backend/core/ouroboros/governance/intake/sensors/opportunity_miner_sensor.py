@@ -90,6 +90,8 @@ class OpportunityMinerSensor:
         "site-packages", "dist-packages",
         "node_modules", ".git", "__pycache__",
         ".tox", ".nox", ".mypy_cache", ".pytest_cache",
+        "tests", "test", "testing", "fixtures",
+        "build", "dist", "eggs", ".eggs",
     })
 
     def _is_production_code(self, py_file: Path, scan_root: Path) -> bool:
