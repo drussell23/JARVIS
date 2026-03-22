@@ -146,8 +146,8 @@ class OpportunityMinerSensor:
                 except SyntaxError:
                     logger.debug("OpportunityMinerSensor: syntax error in %s, skipping", rel)
                     continue
-                except OSError as exc:
-                    logger.warning("OpportunityMinerSensor: cannot read %s: %s", rel, exc)
+                except (OSError, UnicodeDecodeError) as exc:
+                    logger.debug("OpportunityMinerSensor: cannot read %s: %s", rel, exc)
                     continue
 
                 cc = _cyclomatic_complexity(tree)

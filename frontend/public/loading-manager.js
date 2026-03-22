@@ -4691,26 +4691,40 @@ class JARVISLoadingManager {
 
                 // Show launch button when tier confirmed
                 if (tierValue >= 1 && !launchUrl) {
+                    let frontendUp = false;
                     try {
                         const fResp = await fetch(
                             `${this.config.httpProtocol}//${this.config.hostname}:${frontendPort}`,
                             { method: 'HEAD', signal: AbortSignal.timeout(2000) }
                         );
-                        if (fResp.ok) {
-                            launchUrl = this._buildReadyRedirectUrl(`${this.config.httpProtocol}//${this.config.hostname}:${frontendPort}`);
+                        frontendUp = fResp.ok;
+                    } catch (e) { /* frontend not running */ }
+
+                    if (frontendUp) {
+                        // Frontend available — auto-redirect after 3s
+                        launchUrl = this._buildReadyRedirectUrl(
+                            `${this.config.httpProtocol}//${this.config.hostname}:${frontendPort}`
+                        );
+                        if (launchBtn) {
+                            launchBtn.textContent = 'LAUNCH DASHBOARD';
+                            launchBtn.classList.add('visible');
                         }
-                    } catch (e) {
-                        launchUrl = this._buildReadyRedirectUrl(`${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`);
-                    }
-                    if (launchUrl && launchBtn) {
-                        launchBtn.classList.add('visible');
                         setTimeout(() => {
                             if (launchUrl) {
-                                console.log('[Transition] Auto-launching to ' + launchUrl);
+                                console.log('[Transition] Auto-launching to frontend');
                                 this.cleanup();
                                 window.location.href = launchUrl;
                             }
                         }, 3000);
+                    } else {
+                        // No frontend — stay on transition overlay (it IS the UI).
+                        // Show button to open API docs, but do NOT auto-redirect
+                        // to raw JSON. The overlay shows real-time subsystem status.
+                        launchUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}/docs`;
+                        if (launchBtn) {
+                            launchBtn.textContent = 'OPEN API CONSOLE';
+                            launchBtn.classList.add('visible');
+                        }
                     }
                 }
             } catch (e) { /* backend not up yet */ }
