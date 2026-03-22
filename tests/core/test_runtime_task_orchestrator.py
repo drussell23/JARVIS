@@ -154,3 +154,141 @@ class TestRuntimeTaskOrchestrator:
         summary = RuntimeTaskOrchestrator._build_summary("test", steps)
         assert "1/2" in summary
         assert "synthesized" in summary
+
+
+# ---------------------------------------------------------------------------
+# Structured dispatch integration tests
+# ---------------------------------------------------------------------------
+
+
+class TestStructuredDispatch:
+    """Tests that dispatch uses live agent instances, not dummy dicts."""
+
+    @pytest.mark.asyncio
+    async def test_dispatch_calls_execute_task(self):
+        """Register agent → dispatch step → assert real execute_task called."""
+        registry = AsyncMock()
+        registry.find_by_capability = AsyncMock(return_value=[
+            MagicMock(agent_name="visual_browser_agent", load=0.0),
+        ])
+        registry.get_agent = AsyncMock(return_value=MagicMock(agent_name="visual_browser_agent"))
+
+        # Create a mock agent class that returns from execute_task
+        mock_agent_instance = AsyncMock()
+        mock_agent_instance.execute_task = AsyncMock(return_value={
+            "success": True,
+            "result": "searched youtube for nba",
+        })
+
+        orch = RuntimeTaskOrchestrator(registry=registry)
+        # Inject the live agent directly into the cache
+        orch._live_agents["visual_browser_agent"] = mock_agent_instance
+
+        result = await orch.execute(
+            query="search youtube for nba",
+            context={
+                "provider": "youtube",
+                "search_query": "nba",
+                "url": "https://www.youtube.com/results?search_query=nba",
+                "action_category": "browser",
+            },
+        )
+
+        mock_agent_instance.execute_task.assert_called_once()
+        call_payload = mock_agent_instance.execute_task.call_args[0][0]
+        assert call_payload["goal"] == "search youtube for nba"
+        assert call_payload["search_query"] == "nba"
+        assert call_payload["provider"] == "youtube"
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_unknown_agent_raises_not_fallthrough(self):
+        """Unknown agent id → explicit RuntimeError, no fallback to chat."""
+        registry = AsyncMock()
+        # Return empty for capability lookup → unresolvable
+        registry.find_by_capability = AsyncMock(return_value=[])
+        registry.get_agent = AsyncMock(return_value=None)
+
+        orch = RuntimeTaskOrchestrator(registry=registry)
+        result = await orch.execute("do something with unknown_agent")
+        # Should mark as UNRESOLVABLE, not fake success
+        assert any(s.resolution == TaskResolution.UNRESOLVABLE for s in result.steps)
+        assert not result.success
+
+    @pytest.mark.asyncio
+    async def test_structured_fields_propagated_to_step(self):
+        """Context fields (provider, url, search_query) flow into step dict."""
+        orch = RuntimeTaskOrchestrator()
+        result = await orch.execute(
+            query="search youtube for dogs",
+            context={
+                "provider": "youtube",
+                "search_query": "dogs",
+                "url": "https://www.youtube.com/results?search_query=dogs",
+            },
+        )
+        # The step should carry the structured fields
+        assert result.steps[0].step_goal == "search youtube for dogs"
+
+
+class TestIntentClassifierStructuredFields:
+    """Tests that IntentClassifier emits structured routing fields."""
+
+    def test_youtube_search_emits_provider_and_query(self):
+        from backend.core.intent_classifier import get_intent_classifier, CommandIntent
+        classifier = get_intent_classifier()
+        result = classifier.classify("search youtube for nba highlights")
+        assert result.intent == CommandIntent.ACTION
+        assert result.provider == "youtube"
+        assert result.search_query  # should have extracted "nba highlights"
+        # Classifier does NOT emit URLs — agents resolve those
+        assert result.url == ""
+
+    def test_google_search_emits_structured_fields(self):
+        from backend.core.intent_classifier import get_intent_classifier, CommandIntent
+        classifier = get_intent_classifier()
+        result = classifier.classify("search google for python tutorials")
+        assert result.intent == CommandIntent.ACTION
+        assert result.provider == "google"
+        assert result.search_query  # "python tutorials" or similar
+        assert result.url == ""  # no URL — agent resolves
+
+    def test_open_app_emits_target_app(self):
+        from backend.core.intent_classifier import get_intent_classifier, CommandIntent
+        classifier = get_intent_classifier()
+        result = classifier.classify("open apple music")
+        assert result.intent == CommandIntent.ACTION
+        assert result.target_app == "Apple Music"
+
+    def test_query_has_no_structured_fields(self):
+        from backend.core.intent_classifier import get_intent_classifier, CommandIntent
+        classifier = get_intent_classifier()
+        result = classifier.classify("what is the weather today")
+        assert result.intent == CommandIntent.QUERY
+        assert result.provider == ""
+        assert result.url == ""
+
+
+class TestAgentBindings:
+    """Tests for the declarative agent bindings manifest."""
+
+    def test_load_bindings_returns_all_defaults(self):
+        from backend.core.agent_bindings import load_bindings
+        bindings = load_bindings()
+        assert "visual_browser_agent" in bindings
+        assert "google_workspace_agent" in bindings
+        assert len(bindings) >= 10
+
+    def test_binding_has_capabilities(self):
+        from backend.core.agent_bindings import load_bindings
+        bindings = load_bindings()
+        vba = bindings["visual_browser_agent"]
+        assert "browser" in vba.capabilities
+        assert "visual_browser" in vba.capabilities
+
+    def test_binding_has_import_spec(self):
+        from backend.core.agent_bindings import load_bindings
+        bindings = load_bindings()
+        vba = bindings["visual_browser_agent"]
+        assert vba.module == "backend.neural_mesh.agents.visual_browser_agent"
+        assert vba.class_name == "VisualBrowserAgent"

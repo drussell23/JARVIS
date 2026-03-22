@@ -529,7 +529,7 @@ class RuntimeTaskOrchestrator:
                     ephemeral=(resolution.resolution == TaskResolution.EPHEMERAL_TOOL),
                 )
             else:
-                return {"error": f"Unresolvable: {node.goal}"}
+                raise RuntimeError(f"Unresolvable: {node.goal}")
 
         return _executor
 
@@ -733,10 +733,11 @@ class RuntimeTaskOrchestrator:
                 return await agent_info.execute_task(payload)
 
         # --- No fake success — propagate typed failure ---
+        from backend.core.agent_bindings import get_agent_bindings
+        has_binding = agent_name in get_agent_bindings()
         raise RuntimeError(
             f"Agent '{agent_name}' has no live instance and cannot be instantiated. "
-            f"Binding exists: {agent_name in (get_agent_bindings() if True else {})}. "
-            f"Goal: {goal}"
+            f"Binding exists: {has_binding}. Goal: {goal}"
         )
 
     async def _dispatch_to_governance(self, goal: str, step: Dict[str, Any]) -> Any:

@@ -8733,55 +8733,27 @@ class GCPVMManager:
                     logger.info(f"☁️ [InvincibleNode] VM is starting: {instance_status}")
 
                 elif instance_status == "RUNNING":
-                    # VM is running but health check failed
-                    # v235.0: Check startup script version — a running VM with a stale
-                    # startup script will never reach ready_for_inference. Detect and
-                    # recycle early instead of polling until timeout.
+                    # VM is running but health check failed — proceed to polling.
+                    # v304.0: With INV-3, version mismatch is ADVISORY. J-Prime's
+                    # internal state is authoritative for readiness regardless of
+                    # startup script version. A VM with an older script can still
+                    # serve inference — only APARS metadata format differs.
                     vm_script_version = (
                         vm_metadata.get("jarvis-startup-script-version", "")
                         if vm_metadata else ""
                     )
-                    if vm_script_version != _STARTUP_SCRIPT_VERSION:
-                        self._version_mismatch_count += 1
-                        if self._version_mismatch_terminal:
-                            logger.warning(
-                                f"🚫 [InvincibleNode] Version mismatch TERMINAL "
-                                f"(vm={vm_script_version or 'pre-v235'}, "
-                                f"expected={_STARTUP_SCRIPT_VERSION}, "
-                                f"attempts={self._version_mismatch_count}). "
-                                f"Skipping recycle — golden image needs rebuild."
-                            )
-                            return False, static_ip, (
-                                f"VERSION_MISMATCH_TERMINAL: {vm_script_version} "
-                                f"(recycled {self._version_mismatch_count}x, still mismatched)"
-                            )
-
-                        _max_recycles = int(os.getenv("JARVIS_GCP_MAX_VERSION_RECYCLES", "2"))
-                        if self._version_mismatch_count > _max_recycles:
-                            self._version_mismatch_terminal = True
-                            logger.warning(
-                                f"🚫 [InvincibleNode] Version mismatch after "
-                                f"{self._version_mismatch_count} recycle attempts "
-                                f"(vm={vm_script_version or 'pre-v235'}, "
-                                f"expected={_STARTUP_SCRIPT_VERSION}). "
-                                f"Marking TERMINAL — golden image needs rebuild."
-                            )
-                            return False, static_ip, (
-                                f"VERSION_MISMATCH_TERMINAL: {vm_script_version} "
-                                f"(recycled {self._version_mismatch_count}x, still mismatched)"
-                            )
-
+                    if vm_script_version and vm_script_version != _STARTUP_SCRIPT_VERSION:
                         logger.info(
-                            f"🔄 [InvincibleNode] Running VM has stale startup script "
-                            f"(vm={vm_script_version or 'pre-v235'}, "
-                            f"current={_STARTUP_SCRIPT_VERSION}). "
-                            f"Recycling with updated script "
-                            f"(attempt {self._version_mismatch_count}/{_max_recycles})."
+                            f"☁️ [InvincibleNode] Running VM has startup script "
+                            f"v{vm_script_version or 'pre-v235'} "
+                            f"(current: v{_STARTUP_SCRIPT_VERSION}). "
+                            f"ADVISORY: Golden image rebuild recommended. "
+                            f"Proceeding to health poll — INV-3 active."
                         )
                         if progress_callback:
                             progress_callback(
                                 0, "gcp",
-                                f"Recycling VM: startup script "
+                                f"VM running (script v{vm_script_version}), polling health"
                                 f"({vm_script_version or 'pre-v235'} → {_STARTUP_SCRIPT_VERSION})"
                             )
 
@@ -10779,26 +10751,23 @@ fi
                     has_seen_version = True  # v235.3: Valid version received
                     if elapsed > 60:  # v235.3: Grace period for stale files
                         if script_version != _STARTUP_SCRIPT_VERSION:
-                            self._version_mismatch_count += 1
-                            _terminal_tag = ""
-                            _max_poll_mismatches = int(os.getenv(
-                                "JARVIS_GCP_MAX_POLL_VERSION_MISMATCHES", "3"
-                            ))
-                            if self._version_mismatch_count >= _max_poll_mismatches:
-                                self._version_mismatch_terminal = True
-                                _terminal_tag = " [TERMINAL]"
-                            logger.warning(
-                                f"☁️ [InvincibleNode] Startup script version mismatch "
-                                f"(vm={script_version}, expected={_STARTUP_SCRIPT_VERSION}, "
-                                f"elapsed={int(elapsed)}s — past 60s grace period, "
-                                f"count={self._version_mismatch_count}).{_terminal_tag}"
-                            )
-                            _status = (
-                                f"VERSION_MISMATCH_TERMINAL: {script_version}"
-                                if self._version_mismatch_terminal
-                                else f"SCRIPT_VERSION_MISMATCH: {script_version}"
-                            )
-                            return False, _status
+                            # v304.0: Version mismatch is now ADVISORY, not fatal.
+                            # With INV-3, J-Prime's internal state is authoritative
+                            # for readiness — the startup script version only affects
+                            # APARS metadata format, not actual readiness. A VM with
+                            # an older startup script can still serve inference.
+                            # Log once and recommend golden image rebuild.
+                            if not hasattr(self, '_version_mismatch_warned'):
+                                self._version_mismatch_warned = False
+                            if not self._version_mismatch_warned:
+                                self._version_mismatch_warned = True
+                                logger.warning(
+                                    f"☁️ [InvincibleNode] Startup script version mismatch "
+                                    f"(vm={script_version}, expected={_STARTUP_SCRIPT_VERSION}). "
+                                    f"ADVISORY: Golden image rebuild recommended. "
+                                    f"Continuing polling — INV-3 ensures J-Prime readiness "
+                                    f"is authoritative regardless of startup script version."
+                                )
                         if (
                             metadata_version
                             and metadata_version not in ("unknown", "none", "null")

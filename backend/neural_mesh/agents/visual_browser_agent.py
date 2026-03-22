@@ -188,30 +188,89 @@ class VisualBrowserAgent(BaseNeuralMeshAgent):
     # Public entry point
     # ------------------------------------------------------------------
 
+    async def _resolve_url(
+        self, provider: str, search_query: str, goal: str,
+    ) -> str:
+        """Resolve a URL from structured intent fields.
+
+        The agent owns URL knowledge — the classifier only provides
+        (provider, search_query).  Unknown providers fall back to
+        J-Prime synthesis or a generic search.
+        """
+        from urllib.parse import quote_plus
+
+        if not provider:
+            return ""
+
+        q = quote_plus(search_query) if search_query else ""
+
+        # Ask J-Prime for unknown providers (future: query a provider registry)
+        # For now, the agent has built-in knowledge for common providers.
+        if provider == "youtube":
+            return f"https://www.youtube.com/results?search_query={q}" if q else "https://www.youtube.com"
+        if provider == "google":
+            return f"https://www.google.com/search?q={q}" if q else "https://www.google.com"
+        if provider == "reddit":
+            return f"https://www.reddit.com/search/?q={q}" if q else "https://www.reddit.com"
+        if provider == "github":
+            return f"https://github.com/search?q={q}" if q else "https://github.com"
+        if provider == "linkedin":
+            return f"https://www.linkedin.com/search/results/all/?keywords={q}" if q else "https://www.linkedin.com"
+        if provider == "twitter":
+            return f"https://twitter.com/search?q={q}" if q else "https://twitter.com"
+        if provider == "amazon":
+            return f"https://www.amazon.com/s?k={q}" if q else "https://www.amazon.com"
+
+        # Unknown provider — try J-Prime for URL resolution
+        try:
+            from backend.core.prime_client import get_prime_client
+            prime = get_prime_client()
+            if prime is not None:
+                resp = await prime.generate(
+                    prompt=(
+                        f"What is the search URL for the website '{provider}'? "
+                        f"Return ONLY the URL template with {{q}} as the query placeholder. "
+                        f"Example: https://www.youtube.com/results?search_query={{q}}"
+                    ),
+                    system_prompt="Return only a URL. No explanation.",
+                    max_tokens=128,
+                    temperature=0.0,
+                )
+                url_text = resp.content.strip()
+                if url_text.startswith("http"):
+                    resolved = url_text.replace("{q}", q) if q else url_text.split("?")[0]
+                    logger.info("[VBA] J-Prime resolved URL for provider '%s': %s", provider, resolved)
+                    return resolved
+        except Exception as exc:
+            logger.debug("[VBA] J-Prime URL resolution failed for '%s': %s", provider, exc)
+
+        # Last resort: google search for the provider
+        if q:
+            return f"https://www.google.com/search?q={quote_plus(f'{provider} {search_query}')}"
+        return f"https://www.google.com/search?q={quote_plus(provider)}"
+
     async def execute_task(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute a browse_and_interact task.
 
-        Required payload keys (at least one):
-          url  (str) — starting URL
-          goal (str) — natural-language goal to accomplish
+        Accepts structured payload from TaskEnvelope:
+          goal          (str) — natural-language goal
+          provider      (str) — "youtube", "google", etc. (optional)
+          search_query  (str) — extracted search term (optional)
+          url           (str) — explicit URL if user provided one (optional)
 
-        Returns:
-          {
-            "success": bool,
-            "goal": str,
-            "url": str,
-            "steps_taken": int,
-            "actions": list[dict],
-            "final_message": str,
-          }
+        The agent resolves URLs from (provider, search_query) — the classifier
+        and orchestrator never hardcode URLs.
         """
-        action = payload.get("action", "browse_and_interact")
-        if action != "browse_and_interact":
-            raise ValueError(f"Unknown action: {action!r}")
-
         url: str = payload.get("url", "").strip()
         goal: str = payload.get("goal", "").strip()
+        provider: str = payload.get("provider", "").strip()
+        search_query: str = payload.get("search_query", "").strip()
+
+        # Resolve URL from structured fields if not explicitly provided
+        if not url and provider:
+            url = await self._resolve_url(provider, search_query, goal)
+            logger.info("[VBA] Resolved URL from provider=%s, query=%s → %s", provider, search_query, url)
 
         if not url and not goal:
             return {

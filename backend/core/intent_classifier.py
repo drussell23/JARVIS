@@ -332,23 +332,25 @@ class IntentClassifier:
             action_category="",
         )
 
-    # --- Structured field extraction (no heuristics in the orchestrator) ---
+    # --- Structured field extraction ---
+    # The classifier identifies WHAT the user wants (provider + search_query).
+    # It does NOT resolve HOW to get there (URLs) — that's the agent's job.
 
-    # Provider patterns: keyword in goal → (provider, url_template)
-    _PROVIDER_PATTERNS: List[Tuple[str, str, str]] = [
-        ("youtube", "youtube", "https://www.youtube.com/results?search_query={q}"),
-        ("google", "google", "https://www.google.com/search?q={q}"),
-        ("spotify", "spotify", ""),
-        ("apple music", "apple_music", ""),
-        ("linkedin", "linkedin", "https://www.linkedin.com/search/results/all/?keywords={q}"),
-        ("twitter", "twitter", "https://twitter.com/search?q={q}"),
-        ("reddit", "reddit", "https://www.reddit.com/search/?q={q}"),
-        ("github", "github", "https://github.com/search?q={q}"),
-        ("amazon", "amazon", "https://www.amazon.com/s?k={q}"),
+    # Provider detection: keyword → provider name (no URLs — agents resolve those)
+    _PROVIDER_KEYWORDS: List[Tuple[str, str]] = [
+        ("youtube", "youtube"),
+        ("google", "google"),
+        ("spotify", "spotify"),
+        ("apple music", "apple_music"),
+        ("linkedin", "linkedin"),
+        ("twitter", "twitter"),
+        ("reddit", "reddit"),
+        ("github", "github"),
+        ("amazon", "amazon"),
     ]
 
-    # App patterns: keyword in goal → target_app
-    _APP_PATTERNS: List[Tuple[str, str]] = [
+    # App detection: keyword → canonical app name
+    _APP_KEYWORDS: List[Tuple[str, str]] = [
         ("apple music", "Apple Music"),
         ("spotify", "Spotify"),
         ("safari", "Safari"),
@@ -368,40 +370,32 @@ class IntentClassifier:
     def _extract_structured_fields(
         self, cmd: str, category: str,
     ) -> dict:
-        """Extract provider, search_query, url, target_app from command text.
+        """Extract provider, search_query, target_app from command text.
 
-        Called once per classification; results are frozen into ClassificationResult
-        so the orchestrator never parses goal strings.
+        Emits semantic intent only — no URLs, no hardcoded paths.
+        The executing agent (VisualBrowserAgent, etc.) decides HOW to reach
+        the provider, including URL resolution via its own knowledge or J-Prime.
         """
-        from urllib.parse import quote_plus
-
         result: dict = {}
 
-        # --- Provider + search_query + url ---
+        # --- Provider + search_query ---
         if category == "browser":
-            for keyword, provider, url_template in self._PROVIDER_PATTERNS:
+            for keyword, provider in self._PROVIDER_KEYWORDS:
                 if keyword in cmd:
                     result["provider"] = provider
                     search_term = self._isolate_search_term(cmd, keyword)
                     if search_term:
                         result["search_query"] = search_term
-                        if url_template:
-                            result["url"] = url_template.replace("{q}", quote_plus(search_term))
-                    elif url_template:
-                        # No search term → provider home page
-                        base = url_template.split("/results")[0].split("/search")[0]
-                        result["url"] = base
                     break
 
-            # Explicit URL in the command
-            if not result.get("url"):
-                url_match = re.search(r'https?://\S+', cmd)
-                if url_match:
-                    result["url"] = url_match.group(0)
+            # Explicit URL in the command (user said "go to https://...")
+            url_match = re.search(r'https?://\S+', cmd)
+            if url_match:
+                result["url"] = url_match.group(0)
 
         # --- target_app ---
         if category == "app_control":
-            for keyword, app_name in self._APP_PATTERNS:
+            for keyword, app_name in self._APP_KEYWORDS:
                 if keyword in cmd:
                     result["target_app"] = app_name
                     break
@@ -411,14 +405,11 @@ class IntentClassifier:
     @staticmethod
     def _isolate_search_term(cmd: str, provider_keyword: str) -> str:
         """Extract just the search term from a command like 'search youtube for nba highlights'."""
-        # Remove the provider keyword
         without_provider = cmd.replace(provider_keyword, " ")
-        # Remove command verbs and prepositions
         cleaned = re.sub(
             r'\b(search|find|look up|browse|go to|open|play|on|for|in|at|from|the|some|please)\b',
             ' ', without_provider,
         )
-        # Collapse whitespace and strip
         return re.sub(r'\s+', ' ', cleaned).strip()
 
 
