@@ -549,84 +549,73 @@ class GraduationOrchestrator:
     async def _validate_in_shadow(
         self, decision: GraduationDecision, wt: Path, generated: List[str],
     ) -> bool:
-        """Directive 3: Full validation with Coding Council safety modules.
+        """Defense-grade validation pipeline with deterministic rejection.
 
-        5-layer validation:
-            1. SideEffectFirewall compile check (ShadowHarness)
+        5-layer validation — Layers 3-4 run in PARALLEL via asyncio.gather:
+            1. SideEffectFirewall compile check (synchronous gate)
             2. H2 contract test (BaseNeuralMeshAgent interface)
             3. ASTValidator — syntax, imports, dangerous patterns, complexity
-            4. SecurityScanner — OWASP, injection, secrets detection
+            4. SecurityScanner — OWASP, injection, secrets detection      ├─ PARALLEL
             5. pytest execution in worktree
+
+        HARD-FAIL semantics: If ANY layer fails, graduation HALTS.
+        No soft-skip on ImportError — if safety modules aren't available,
+        we refuse to graduate (fail-closed, not fail-open).
+
+        On failure: emits failure reason to TelemetryBus + narrates via voice.
         """
         agent_path = wt / decision.module_path
         if not agent_path.exists():
-            logger.warning("[Graduation] Agent file missing: %s", agent_path)
+            await self._emit_validation_failure(
+                decision, "agent_file_missing", f"File not found: {decision.module_path}",
+            )
             return False
         code = agent_path.read_text()
 
-        # Layer 1: SideEffectFirewall compile check
+        # Layer 1: SideEffectFirewall compile check (synchronous gate)
         try:
             from backend.core.ouroboros.governance.shadow_harness import SideEffectFirewall
             with SideEffectFirewall():
                 compile(code, str(agent_path), "exec")  # noqa: S102
+        except SyntaxError as e:
+            await self._emit_validation_failure(
+                decision, "compile_error", f"Syntax error: {e}",
+            )
+            return False
         except Exception as e:
-            logger.warning("[Graduation] Firewall compile check failed: %s", e)
+            await self._emit_validation_failure(
+                decision, "firewall_blocked", f"SideEffectFirewall rejected: {e}",
+            )
             return False
 
         # Layer 2: H2 Contract test (BaseNeuralMeshAgent interface)
         has_execute = "execute_task" in code
         has_caps = "CAPABILITIES" in code or "capabilities" in code
         if not (has_execute and has_caps):
-            logger.warning(
-                "[Graduation] Contract test failed: execute_task=%s, capabilities=%s",
-                has_execute, has_caps,
+            await self._emit_validation_failure(
+                decision, "contract_violation",
+                f"Missing interface: execute_task={has_execute}, capabilities={has_caps}",
             )
             return False
 
-        # Layer 3: Coding Council ASTValidator
+        # Layers 3+4: ASTValidator + SecurityScanner — PARALLEL execution
         try:
-            from backend.core.coding_council.safety.ast_validator import ASTValidator
-            ast_validator = ASTValidator(repo_root=wt)
-            ast_result = await ast_validator.validate_file(agent_path)
-            if not ast_result.valid:
-                errors = [
-                    issue for issue in getattr(ast_result, "issues", [])
-                    if getattr(issue, "severity", None)
-                    and issue.severity.value == "error"
-                ]
-                if errors:
-                    logger.warning(
-                        "[Graduation] AST validation failed: %d errors",
-                        len(errors),
-                    )
-                    return False
-            logger.info("[Graduation] AST validation passed")
-        except ImportError:
-            logger.debug("[Graduation] ASTValidator not available — skipping")
+            (ast_passed, ast_detail), (sec_passed, sec_detail) = await asyncio.gather(
+                self._run_ast_validation(agent_path, wt),
+                self._run_security_scan(agent_path),
+            )
         except Exception as e:
-            logger.warning("[Graduation] ASTValidator error (non-fatal): %s", e)
+            await self._emit_validation_failure(
+                decision, "parallel_validation_error", str(e),
+            )
+            return False
 
-        # Layer 4: Coding Council SecurityScanner
-        try:
-            from backend.core.coding_council.safety.security_scanner import SecurityScanner
-            scanner = SecurityScanner()
-            scan_result = await scanner.scan_file(agent_path)
-            critical_vulns = [
-                v for v in getattr(scan_result, "vulnerabilities", [])
-                if getattr(v, "severity", None)
-                and v.severity.value in ("critical", "high")
-            ]
-            if critical_vulns:
-                logger.warning(
-                    "[Graduation] Security scan found %d critical/high vulnerabilities",
-                    len(critical_vulns),
-                )
-                return False
-            logger.info("[Graduation] Security scan passed")
-        except ImportError:
-            logger.debug("[Graduation] SecurityScanner not available — skipping")
-        except Exception as e:
-            logger.warning("[Graduation] SecurityScanner error (non-fatal): %s", e)
+        if not ast_passed:
+            await self._emit_validation_failure(decision, "ast_validation_failed", ast_detail)
+            return False
+        if not sec_passed:
+            await self._emit_validation_failure(decision, "security_scan_failed", sec_detail)
+            return False
 
         # Layer 5: pytest execution in worktree
         test_path = wt / decision.test_module_path
@@ -637,20 +626,120 @@ class GraduationOrchestrator:
                     cwd=str(wt),
                     stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
                 )
-                await asyncio.wait_for(proc.communicate(), timeout=30.0)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30.0)
                 if proc.returncode != 0:
-                    logger.warning("[Graduation] pytest failed (returncode=%d)", proc.returncode)
+                    detail = stderr.decode()[-300:] if stderr else "returncode != 0"
+                    await self._emit_validation_failure(decision, "pytest_failed", detail)
                     return False
                 logger.info("[Graduation] pytest passed")
             except asyncio.TimeoutError:
-                logger.warning("[Graduation] pytest timed out")
+                await self._emit_validation_failure(decision, "pytest_timeout", "30s exceeded")
                 return False
             except Exception as e:
-                logger.warning("[Graduation] pytest error: %s", e)
+                await self._emit_validation_failure(decision, "pytest_error", str(e))
                 return False
 
         logger.info("[Graduation] All 5 validation layers passed")
         return True
+
+    # -- Parallel validation sub-tasks (Directive 2) --------------------------
+
+    async def _run_ast_validation(
+        self, agent_path: Path, wt: Path,
+    ) -> tuple:
+        """Run ASTValidator. Returns (passed: bool, detail: str)."""
+        try:
+            from backend.core.coding_council.safety.ast_validator import ASTValidator
+            validator = ASTValidator(repo_root=wt)
+            result = await validator.validate_file(agent_path)
+            if not result.valid:
+                errors = [
+                    issue for issue in getattr(result, "issues", [])
+                    if getattr(issue, "severity", None)
+                    and issue.severity.value == "error"
+                ]
+                if errors:
+                    detail = "; ".join(str(e) for e in errors[:5])
+                    return False, f"{len(errors)} AST errors: {detail}"
+            logger.info("[Graduation] AST validation passed")
+            return True, ""
+        except ImportError:
+            # HARD-FAIL: safety modules MUST be available for graduation
+            return False, "ASTValidator not installed — graduation requires safety modules"
+        except Exception as e:
+            return False, f"ASTValidator crashed: {e}"
+
+    async def _run_security_scan(self, agent_path: Path) -> tuple:
+        """Run SecurityScanner. Returns (passed: bool, detail: str)."""
+        try:
+            from backend.core.coding_council.safety.security_scanner import SecurityScanner
+            scanner = SecurityScanner()
+            result = await scanner.scan_file(agent_path)
+            critical = [
+                v for v in getattr(result, "vulnerabilities", [])
+                if getattr(v, "severity", None)
+                and v.severity.value in ("critical", "high")
+            ]
+            if critical:
+                detail = "; ".join(
+                    f"{v.severity.value}: {getattr(v, 'description', str(v))[:80]}"
+                    for v in critical[:5]
+                )
+                return False, f"{len(critical)} vulnerabilities: {detail}"
+            logger.info("[Graduation] Security scan passed")
+            return True, ""
+        except ImportError:
+            return False, "SecurityScanner not installed — graduation requires safety modules"
+        except Exception as e:
+            return False, f"SecurityScanner crashed: {e}"
+
+    # -- Directive 3: Deterministic rejection with telemetry + voice ----------
+
+    async def _emit_validation_failure(
+        self, decision: GraduationDecision, reason_code: str, detail: str,
+    ) -> None:
+        """Emit validation failure to TelemetryBus + narrate via voice.
+
+        Deterministic rejection contract: every failure is logged, emitted,
+        and narrated. The worktree cleanup happens in the finally block of
+        evaluate_graduation().
+        """
+        logger.warning(
+            "[Graduation] VALIDATION FAILED: %s — %s (agent=%s)",
+            reason_code, detail[:200], decision.capability_name,
+        )
+
+        # Emit to TelemetryBus for dashboard/consciousness/reactor
+        if self._bus is not None:
+            try:
+                from backend.core.telemetry_contract import TelemetryEnvelope
+                envelope = TelemetryEnvelope(
+                    event_schema="graduation.validation_failed@1.0.0",
+                    source="graduation_orchestrator",
+                    payload={
+                        "capability_name": decision.capability_name,
+                        "reason_code": reason_code,
+                        "detail": detail[:500],
+                        "module_path": decision.module_path,
+                        "repo": decision.repo_owner,
+                    },
+                )
+                await self._bus.publish(envelope)
+            except Exception:
+                pass  # Telemetry emission must never block graduation
+
+        # Narrate via voice — human-readable failure reason
+        reason_messages = {
+            "compile_error": "Graduation failed. The generated code has a syntax error.",
+            "firewall_blocked": "Graduation failed. The code was blocked by the security firewall.",
+            "contract_violation": "Graduation failed. The agent doesn't implement the required interface.",
+            "ast_validation_failed": "Graduation failed. AST validation found structural issues.",
+            "security_scan_failed": "Graduation failed. Security vulnerability detected in generated code.",
+            "pytest_failed": "Graduation failed. The generated tests did not pass.",
+            "pytest_timeout": "Graduation failed. Tests timed out.",
+        }
+        message = reason_messages.get(reason_code, f"Graduation failed: {reason_code}.")
+        await self._narrate(message)
 
     # -- Phase 5: Commit ----------------------------------------------------
 
