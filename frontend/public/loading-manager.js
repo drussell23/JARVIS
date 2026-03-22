@@ -2387,6 +2387,45 @@ class JARVISLoadingManager {
                         return; // Don't process heartbeat as progress update
                     }
 
+                    // ═══════════════════════════════════════════════════════
+                    // v350.4: READINESS STATE — authoritative tier from DAG
+                    // ProgressiveReadiness broadcasts these when DAG nodes
+                    // resolve or tier advances. Use this to update progress
+                    // display based on ACTUAL resolution, not synthetic %.
+                    // ═══════════════════════════════════════════════════════
+                    if (data.type === 'readiness_state') {
+                        const tierValue = data.tier_value || 0;
+                        const tierName = data.tier || 'BOOTING';
+                        const nodes = data.nodes || {};
+
+                        // Count resolved vs total for display progress
+                        let resolved = 0, total = 0;
+                        for (const [, node] of Object.entries(nodes)) {
+                            total++;
+                            if (node.status === 'resolved' || node.status === 'skipped') resolved++;
+                        }
+
+                        // Map DAG resolution to display progress
+                        if (total > 0) {
+                            const dagProgress = Math.round(80 + (resolved / total) * 18);
+                            if (dagProgress > this.state.targetProgress && dagProgress < 100) {
+                                this.state.targetProgress = dagProgress;
+                            }
+                        }
+
+                        console.log(`[v350.4] Readiness state: ${tierName} (${resolved}/${total} nodes)`);
+
+                        // Update message based on tier
+                        if (tierValue >= 1 && tierValue < 2) {
+                            this.state.message = 'Local systems online...';
+                        } else if (tierValue >= 2) {
+                            this.state.message = 'Cloud intelligence connected...';
+                        }
+
+                        this.updateUI();
+                        return; // Don't process as regular progress update
+                    }
+
                     if (data.type !== 'pong') {
                         // ═══════════════════════════════════════════════════════
                         // v185.0: NORMALIZE WEBSOCKET PAYLOAD
@@ -4543,7 +4582,8 @@ class JARVISLoadingManager {
         return (
             metadata.final === true ||
             metadata.supervisor_verified === true ||
-            metadata.authority === 'unified_supervisor'
+            metadata.authority === 'unified_supervisor' ||
+            metadata.readiness_tier_verified === true  // v350.4: tier-verified is authoritative
         );
     }
 
