@@ -310,10 +310,7 @@ class ParallelBootOrchestrator:
                 return
 
             logger.info("[ParallelBoot] GCP VM: proactive start at T=0")
-            success, ip, status = await manager.ensure_static_vm_ready(
-                reason="parallel_boot_t0",
-                caller="ParallelBootOrchestrator",
-            )
+            success, ip, status = await manager.ensure_static_vm_ready()
             if success:
                 logger.info("[ParallelBoot] GCP VM ready at %s", ip)
             else:

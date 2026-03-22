@@ -3685,14 +3685,21 @@ class JARVISLoadingManager {
     startSmoothProgress() {
         if (!this.config.smoothProgress.enabled) return;
 
+        // v350.3: Track the highest progress ever displayed to enforce
+        // strict monotonic progress — the bar NEVER goes backward.
+        this._maxDisplayedProgress = this.state.progress || 0;
+
         this.state.smoothProgressInterval = setInterval(() => {
             if (this.state.progress < this.state.targetProgress) {
                 const diff = this.state.targetProgress - this.state.progress;
                 const increment = Math.max(0.3, diff / 15);
-                this.state.progress = Math.min(
+                const newProgress = Math.min(
                     this.state.progress + increment,
                     this.state.targetProgress
                 );
+                // STRICT MONOTONIC: never display lower than the max we've shown
+                this.state.progress = Math.max(newProgress, this._maxDisplayedProgress);
+                this._maxDisplayedProgress = this.state.progress;
                 this.updateProgressBar();
             }
         }, this.config.smoothProgress.incrementDelay);
@@ -4234,7 +4241,11 @@ class JARVISLoadingManager {
     }
 
     updateProgressBar() {
-        const displayProgress = Math.round(this.state.progress);
+        // v350.3: Enforce strict monotonic display — never show lower than max
+        const rawProgress = Math.round(this.state.progress);
+        const displayProgress = Math.max(rawProgress, this._maxDisplayedProgress || 0);
+        this._maxDisplayedProgress = displayProgress;
+        this.state.progress = displayProgress; // sync state to prevent future regressions
         this.elements.progressBar.style.width = `${displayProgress}%`;
         this.elements.progressPercentage.textContent = `${displayProgress}%`;
 
@@ -4414,18 +4425,21 @@ class JARVISLoadingManager {
         this.state.redirecting = true;
         console.log('[Complete] Starting completion verification...');
 
-        // Update UI to show we're finalizing
-        this.elements.subtitle.textContent = 'FINALIZING';
-        this.state.progress = 95;
-        this.state.targetProgress = 95;
-        this.updateProgressBar();
-
-        // Fast path: supervisor has already verified readiness and emitted completion.
-        // We keep a short local sanity check, then redirect immediately.
+        // v350.3: Supervisor-authoritative completion — NEVER regress progress.
+        // When the supervisor has verified readiness and emitted completion with
+        // final=true, skip the 95% "FINALIZING" regression entirely.
+        // The progress bar stays at 100% while we run a quick sanity check.
         const authoritativeCompletion = this._isSupervisorAuthoritativeCompletion(metadata);
         if (authoritativeCompletion) {
-            console.log('[Complete] Supervisor-authoritative completion detected - running fast checks');
-            this.updateStatusText('Finalizing redirect...', 'verifying');
+            console.log('[Complete] Supervisor-authoritative completion — skipping FINALIZING regression');
+
+            // Keep progress at current level (never regress) while verifying
+            this.state.progress = Math.max(this.state.progress, 98);
+            this.state.targetProgress = 100;
+            this.elements.subtitle.textContent = 'VERIFYING';
+            this.updateProgressBar();
+
+            this.updateStatusText('Verifying connection...', 'verifying');
             const fastChecksPassed = await this._runFastCompletionChecks(metadata);
 
             if (fastChecksPassed) {
@@ -4442,6 +4456,14 @@ class JARVISLoadingManager {
             }
 
             console.warn('[Complete] Fast-path checks failed, falling back to full verification flow');
+        }
+
+        // Non-authoritative completion — show FINALIZING at 95% while verifying
+        if (!authoritativeCompletion) {
+            this.elements.subtitle.textContent = 'FINALIZING';
+            this.state.progress = 95;
+            this.state.targetProgress = 95;
+            this.updateProgressBar();
         }
 
         // ═══════════════════════════════════════════════════════════════════════════
