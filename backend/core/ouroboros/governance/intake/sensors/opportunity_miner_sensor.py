@@ -82,9 +82,49 @@ class OpportunityMinerSensor:
         self._running = False
         self._seen_file_paths: set[str] = set()
 
+    def _is_production_code(self, py_file: Path, scan_root: Path) -> bool:
+        """Return True if the file is production code, not a loose script.
+
+        Structural heuristic — zero hardcoded exclusion lists.
+        Depth is measured from the **repo root**, not the scan root.
+        Files at depth <= 1 from repo root (e.g. ``backend/demo.py``)
+        are skipped — they are standalone scripts, demos, migration
+        tools, and one-off utilities.  Files at depth >= 2
+        (e.g. ``backend/core/prime_router.py``) are production code
+        inside proper sub-packages.
+
+        This automatically adapts: when someone creates a new package
+        ``backend/new_feature/``, its files are included.  When someone
+        drops a one-off script in ``backend/``, it's excluded.
+
+        When the scan path itself is already a sub-package
+        (e.g. ``backend/core/``), all files inside are at depth >= 2
+        and are admitted.
+
+        Special files (__init__.py, conftest.py) at any depth are admitted.
+        """
+        name = py_file.name
+        if name in ("__init__.py", "__main__.py", "conftest.py"):
+            return True
+        try:
+            relative = py_file.relative_to(self._repo_root)
+            depth = len(relative.parts) - 1  # -1 for the filename itself
+            return depth >= 2  # e.g. backend/core/foo.py = depth 2 ✓
+                               #      backend/demo.py     = depth 1 ✗
+        except ValueError:
+            return True  # Not under repo_root — admit conservatively
+
     async def scan_once(self) -> List[StaticCandidate]:
-        """Run one static analysis scan. Returns candidates above threshold."""
+        """Run one static analysis scan. Returns candidates above threshold.
+
+        Only scans files that belong to Python packages — loose scripts,
+        demos, migration tools, and one-off fixes are automatically
+        excluded by structural detection (no hardcoded patterns).
+        """
         candidates: List[StaticCandidate] = []
+        scanned = 0
+        skipped_non_package = 0
+
         for scan_path in self._scan_paths:
             root = self._repo_root / scan_path
             if not root.exists():
@@ -93,6 +133,13 @@ class OpportunityMinerSensor:
                 rel = str(py_file.relative_to(self._repo_root))
                 if rel in self._seen_file_paths:
                     continue
+
+                # Structural filter: only scan production code, not loose scripts.
+                if not self._is_production_code(py_file, root):
+                    skipped_non_package += 1
+                    continue
+
+                scanned += 1
                 try:
                     source = py_file.read_text(encoding="utf-8")
                     tree = ast.parse(source)
@@ -146,6 +193,12 @@ class OpportunityMinerSensor:
                         "OpportunityMinerSensor: ingest failed for %s", rel
                     )
 
+        if skipped_non_package > 0:
+            logger.info(
+                "OpportunityMinerSensor: scanned %d package files, "
+                "skipped %d non-package scripts, queued %d candidates",
+                scanned, skipped_non_package, len(candidates),
+            )
         return candidates
 
     async def start(self) -> None:
