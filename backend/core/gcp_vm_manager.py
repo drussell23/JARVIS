@@ -9805,104 +9805,25 @@ export PYTHONPATH="${JARVIS_DIR}:${PYTHONPATH:-}"
 update_apars 1 80 18 "env_ready_deps_prebaked"
 update_apars 1 100 35 "golden_ready_for_validation"
 
-# ─── Validate pre-baked integrity ───
-update_apars 4 0 40 "validating_prebaked"
+# ═══════════════════════════════════════════════════════════════════════════════
+# v304.0: PARALLEL STARTUP — Start J-Prime BEFORE validation.
+# Model loading (~60s) is the bottleneck. By starting J-Prime immediately
+# after env loading, it begins loading the model while validation runs
+# concurrently. This saves ~30s on golden image boots.
+#
+# Timeline:
+#   Phase 1: Env loading (done above)
+#   Phase 5: Start J-Prime NOW (begins model loading in background)
+#   Phase 4: Validate code + model (runs CONCURRENTLY with model loading)
+#   Phase 6: Health check (model likely already loaded during phase 4)
+# ═══════════════════════════════════════════════════════════════════════════════
 
-VALIDATION_OK=true
+update_apars 5 10 38 "early_service_start" true false
+JPRIME_STARTED=false
 
-# Check code exists and is compatible with current startup script
-if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
-    log "✅ jarvis_prime module found"
-    # v235.3: Verify code freshness — ASGI middleware requires module-level app export.
-    # Golden images may have old J-Prime code without this. If missing, pull latest.
-    if cd "$JARVIS_DIR" && "$JARVIS_DIR/venv/bin/python" -c "from jarvis_prime.server import app" 2>/dev/null; then
-        log "✅ jarvis_prime.server.app importable (v235.3+ code)"
-        update_apars 4 25 45 "code_validated"
-    else
-        log "⚠️  jarvis_prime.server.app not importable — code is stale (pre-v235.3)"
-        update_apars 4 15 43 "code_stale_pulling"
-        REPO_URL=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \\
-            http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-repo-url \\
-            2>/dev/null || echo "${JARVIS_PRIME_REPO_URL:-}")
-        if [ -n "$REPO_URL" ] && [ -d "$JARVIS_DIR/.git" ]; then
-            log "   Pulling latest from: $REPO_URL (timeout 60s)"
-            if timeout 60 git -C "$JARVIS_DIR" pull --ff-only 2>&1 | tee -a "$LOG_FILE"; then
-                log "✅ Code updated via git pull"
-                update_apars 4 25 45 "code_updated"
-            else
-                log "⚠️  git pull failed — trying fresh clone"
-                if timeout 120 git clone --depth 1 "$REPO_URL" /tmp/jprime-update 2>&1 | tee -a "$LOG_FILE"; then
-                    cp -a /tmp/jprime-update/jarvis_prime/* "$JARVIS_DIR/jarvis_prime/" 2>/dev/null
-                    cp -a /tmp/jprime-update/run_server.py "$JARVIS_DIR/" 2>/dev/null
-                    rm -rf /tmp/jprime-update
-                    log "✅ Code rescued via fresh clone"
-                    update_apars 4 25 45 "code_rescued"
-                else
-                    log "❌ Code update failed — proceeding with stale code (reverse proxy fallback)"
-                    rm -rf /tmp/jprime-update 2>/dev/null
-                    update_apars 4 25 44 "code_stale_proceeding"
-                fi
-            fi
-        elif [ -n "$REPO_URL" ]; then
-            log "   No .git dir — cloning fresh (timeout 120s)"
-            if timeout 120 git clone --depth 1 "$REPO_URL" /tmp/jprime-update 2>&1 | tee -a "$LOG_FILE"; then
-                cp -a /tmp/jprime-update/jarvis_prime/* "$JARVIS_DIR/jarvis_prime/" 2>/dev/null
-                cp -a /tmp/jprime-update/run_server.py "$JARVIS_DIR/" 2>/dev/null
-                rm -rf /tmp/jprime-update
-                log "✅ Code updated via clone"
-                update_apars 4 25 45 "code_cloned"
-            else
-                log "❌ Clone failed — proceeding with stale code"
-                rm -rf /tmp/jprime-update 2>/dev/null
-                update_apars 4 25 44 "code_stale_proceeding"
-            fi
-        else
-            log "⚠️  No repo URL — proceeding with stale code (reverse proxy fallback)"
-            update_apars 4 25 44 "code_stale_no_repo"
-        fi
-    fi
-else
-    log "⚠️  jarvis_prime module NOT found — pulling latest code"
-    update_apars 4 15 43 "code_rescue_starting"
-    REPO_URL=$(timeout 5 curl -s -H 'Metadata-Flavor: Google' \\
-        http://metadata.google.internal/computeMetadata/v1/instance/attributes/jarvis-repo-url \\
-        2>/dev/null || echo "${JARVIS_PRIME_REPO_URL:-}")
-    if [ -n "$REPO_URL" ]; then
-        log "   Cloning from: $REPO_URL (timeout 120s)"
-        # v233.3: Add timeout to prevent indefinite hang on DNS/network issues
-        if timeout 120 git clone --depth 1 "$REPO_URL" /tmp/jprime-rescue 2>&1 | tee -a "$LOG_FILE"; then
-            cp -a /tmp/jprime-rescue/* "$JARVIS_DIR/" 2>/dev/null && \\
-                rm -rf /tmp/jprime-rescue && \\
-                log "✅ Code rescued via git clone"
-            update_apars 4 40 50 "code_rescue_complete"
-        else
-            log "❌ Git clone failed or timed out after 120s"
-            update_apars 4 40 48 "code_rescue_failed"
-            rm -rf /tmp/jprime-rescue 2>/dev/null
-        fi
-    else
-        VALIDATION_OK=false
-        log "❌ No repo URL available — cannot rescue code"
-    fi
-fi
-
-update_apars 4 60 55 "checking_model_cache"
-
-# Check model cache
-MODEL_CACHE="${JARVIS_MODEL_CACHE:-$JARVIS_DIR/models}"
-if [ -d "$MODEL_CACHE" ] && [ "$(ls -A "$MODEL_CACHE" 2>/dev/null)" ]; then
-    # v233.3: Add timeout to prevent hang on network mounts
-    MODEL_SIZE=$(timeout 10 du -sm "$MODEL_CACHE" 2>/dev/null | cut -f1 || echo "0")
-    log "✅ Model cache: ${MODEL_SIZE}MB"
-    update_apars 4 80 65 "model_size_calculated"
-    update_apars 5 50 70 "model_cache_verified" true false
-else
-    log "⚠️  Model cache empty — models will download on first use"
-    update_apars 5 50 70 "model_cache_empty" false false
-fi
-
-# ─── Start the service ───
-update_apars 5 80 85 "starting_service" true false
+# v304.0: Skip old sequential validation — validation now runs AFTER J-Prime
+# starts (see parallel validation block after service start below).
+# Proceed directly to APARS launcher generation and service start.
 
 # v235.2: Generate APARS enrichment launcher
 # After the APARS stub is killed, J-Prime takes over the port.
@@ -10173,6 +10094,64 @@ else
         --host 0.0.0.0 --port "$JARVIS_PORT" \\
         > /var/log/jarvis-prime.log 2>&1 &
     log "Started directly with APARS enrichment (port $JARVIS_PORT, PID: $!)"
+fi
+
+JPRIME_STARTED=true
+log "J-Prime starting in background — running validation concurrently..."
+
+# ─── Phase 4: Validate pre-baked integrity (PARALLEL with model loading) ───
+# v304.0: Validation runs WHILE J-Prime loads the model in the background.
+# On golden images, model loading is the bottleneck (~60s). By starting
+# J-Prime first, the model begins loading immediately. Validation checks
+# code integrity concurrently, saving ~30s of sequential wait time.
+update_apars 4 0 55 "validating_prebaked_parallel"
+
+VALIDATION_OK=true
+VALIDATION_START=$(date +%s)
+
+if [ -d "$JARVIS_DIR/jarvis_prime" ]; then
+    log "✅ jarvis_prime module found"
+    if cd "$JARVIS_DIR" && "$JARVIS_DIR/venv/bin/python" -c "from jarvis_prime.server import app" 2>/dev/null; then
+        log "✅ jarvis_prime.server.app importable"
+        update_apars 4 50 60 "code_validated_parallel"
+    else
+        log "⚠️  jarvis_prime.server.app not importable — stale code"
+        update_apars 4 25 58 "code_stale_parallel"
+        # Code pull would disrupt running J-Prime — skip, it can still serve
+        # Golden image code should be fresh; stale code is ADVISORY not fatal
+        log "   ADVISORY: Golden image code may be stale. Rebuild recommended."
+    fi
+else
+    VALIDATION_OK=false
+    log "❌ jarvis_prime module NOT found — critical validation failure"
+    update_apars 4 50 58 "code_missing_critical"
+fi
+
+# Check model cache (quick, non-blocking)
+MODEL_CACHE="${JARVIS_MODEL_CACHE:-$JARVIS_DIR/models}"
+if [ -d "$MODEL_CACHE" ] && [ "$(ls -A "$MODEL_CACHE" 2>/dev/null)" ]; then
+    MODEL_SIZE=$(timeout 10 du -sm "$MODEL_CACHE" 2>/dev/null | cut -f1 || echo "0")
+    log "✅ Model cache: ${MODEL_SIZE}MB"
+    update_apars 4 100 65 "model_cache_verified_parallel" true false
+else
+    log "⚠️  Model cache empty — models will download on first use"
+    update_apars 4 100 65 "model_cache_empty_parallel" false false
+fi
+
+VALIDATION_ELAPSED=$(($(date +%s) - VALIDATION_START))
+log "Validation completed in ${VALIDATION_ELAPSED}s (parallel with model loading)"
+
+# v304.0: If critical validation failed AND J-Prime started, stop it
+if [ "$VALIDATION_OK" != "true" ] && [ "$JPRIME_STARTED" = "true" ]; then
+    log "❌ Critical validation failed — stopping early-started J-Prime"
+    if systemctl is-enabled jarvis-prime.service 2>/dev/null; then
+        systemctl stop jarvis-prime.service 2>/dev/null || true
+    else
+        pkill -f "$APARS_LAUNCHER" 2>/dev/null || true
+    fi
+    update_apars 4 100 60 "validation_failed_service_stopped" false false '"code_validation_failed"'
+    log "GOLDEN IMAGE STARTUP FAILED: critical validation"
+    exit 1
 fi
 
 # ─── Verify service health with retries ───

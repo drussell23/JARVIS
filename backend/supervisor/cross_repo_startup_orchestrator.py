@@ -15843,15 +15843,31 @@ class ProcessOrchestrator:
         memory_status: MemoryStatus,
     ) -> bool:
         """
-        v93.9: Determine if service should be routed to GCP instead of local.
+        v93.9 + v304.0: Determine if service should be routed to GCP.
 
         Decision factors:
         - Available memory vs model requirements
+        - CPU pressure (v304.0: at >85% CPU, local inference is degraded)
         - GCP fallback enabled
         - GCP VM availability
         """
         if not self.config.gcp_fallback_enabled:
             return False
+
+        # v304.0: CPU pressure detection — at high CPU, local model loading
+        # and inference are severely degraded. GCP offload is preferred.
+        try:
+            import psutil as _psutil_gcp
+            _cpu_pct = _psutil_gcp.cpu_percent(interval=0.1)
+            _cpu_threshold = float(os.environ.get("GCP_CPU_PRESSURE_THRESHOLD", "85"))
+            if _cpu_pct > _cpu_threshold:
+                logger.info(
+                    f"    📊 CPU pressure {_cpu_pct:.0f}%% > {_cpu_threshold:.0f}%% threshold, "
+                    f"routing to GCP recommended (local inference would be degraded)"
+                )
+                return True
+        except Exception:
+            pass
 
         # Check if memory is critically low
         if memory_status.available_gb < self.config.memory_route_to_gcp_threshold_gb:
