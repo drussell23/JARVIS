@@ -2482,12 +2482,18 @@ class UnifiedWebSocketManager:
                             _classification.confidence,
                         )
                         try:
+                            # Pass structured fields from classification so the
+                            # orchestrator never needs to scrape goal strings.
                             _task_result = await _rto.execute(
                                 query=command_text,
                                 context={
                                     "client_id": client_id,
                                     "source": "voice_command",
                                     "action_category": _classification.action_category,
+                                    "provider": getattr(_classification, "provider", ""),
+                                    "search_query": getattr(_classification, "search_query", ""),
+                                    "url": getattr(_classification, "url", ""),
+                                    "target_app": getattr(_classification, "target_app", ""),
                                     "timestamp": datetime.now().isoformat(),
                                 },
                             )

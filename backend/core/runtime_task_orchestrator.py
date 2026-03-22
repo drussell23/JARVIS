@@ -213,8 +213,21 @@ class RuntimeTaskOrchestrator:
             except Exception as exc:
                 logger.warning("[RuntimeTask] PredictivePlanner failed: %s — using single step", exc)
 
-        # Fallback: treat entire query as one step
-        return [{"goal": query, "priority": 1, "dependencies": []}], "single-step fallback"
+        # Fallback: treat entire query as one step.
+        # Propagate structured fields from context so _dispatch_to_agent
+        # receives provider/url/search_query without scraping goal text.
+        step: Dict[str, Any] = {
+            "goal": query,
+            "priority": 1,
+            "dependencies": [],
+        }
+        for field_name in ("provider", "url", "search_query", "target_app",
+                           "workspace_service", "action_category"):
+            val = ctx.get(field_name)
+            if val:
+                step[field_name] = val
+
+        return [step], "single-step fallback"
 
     # -----------------------------------------------------------------------
     # Step 2: Capability Resolution
@@ -660,35 +673,35 @@ class RuntimeTaskOrchestrator:
                 elapsed_s=time.monotonic() - start,
             )
 
-    # Lazy-instantiated agent cache — maps agent_name → live agent instance
-    _live_agents: Dict[str, Any] = {}
-
-    # Agent class registry — maps agent_name → (module_path, class_name)
-    _AGENT_CLASSES: Dict[str, Tuple[str, str]] = {
-        "visual_browser_agent": ("backend.neural_mesh.agents.visual_browser_agent", "VisualBrowserAgent"),
-        "web_search_agent": ("backend.neural_mesh.agents.web_search_agent", "WebSearchAgent"),
-        "native_app_control_agent": ("backend.neural_mesh.agents.native_app_control_agent", "NativeAppControlAgent"),
-        "google_workspace_agent": ("backend.neural_mesh.agents.google_workspace_agent", "GoogleWorkspaceAgent"),
-        "spatial_awareness_agent": ("backend.neural_mesh.agents.spatial_awareness_agent", "SpatialAwarenessAgent"),
-    }
+    async def shutdown_agents(self) -> None:
+        """Dispose of all live agent instances (called by supervisor on shutdown)."""
+        for name, agent in self._live_agents.items():
+            try:
+                if hasattr(agent, "stop"):
+                    await agent.stop()
+                elif hasattr(agent, "close"):
+                    await agent.close()
+            except Exception as exc:
+                logger.debug("[RuntimeTask] Agent %s cleanup failed: %s", name, exc)
+        self._live_agents.clear()
+        logger.info("[RuntimeTask] All live agents disposed (%d)", len(self._live_agents))
 
     async def _get_live_agent(self, agent_name: str) -> Any:
-        """Get or lazily create a live agent instance for dispatch."""
+        """Get or lazily create a live agent instance from AgentBindings."""
         if agent_name in self._live_agents:
             return self._live_agents[agent_name]
 
-        entry = self._AGENT_CLASSES.get(agent_name)
-        if entry is None:
+        from backend.core.agent_bindings import get_agent_bindings
+        bindings = get_agent_bindings()
+        binding = bindings.get(agent_name)
+        if binding is None:
             return None
 
-        module_path, class_name = entry
         try:
-            import importlib
-            mod = importlib.import_module(module_path)
-            cls = getattr(mod, class_name)
-            instance = cls()
+            instance = binding.instantiate()
             self._live_agents[agent_name] = instance
-            logger.info("[RuntimeTask] Lazy-instantiated live agent: %s", agent_name)
+            logger.info("[RuntimeTask] Lazy-instantiated live agent: %s (%s.%s)",
+                        agent_name, binding.module, binding.class_name)
             return instance
         except Exception as exc:
             logger.warning("[RuntimeTask] Failed to instantiate %s: %s", agent_name, exc)
@@ -697,21 +710,15 @@ class RuntimeTaskOrchestrator:
     async def _dispatch_to_agent(
         self, agent_name: str, goal: str, step: Dict[str, Any],
     ) -> Any:
-        """Dispatch a task to an existing Neural Mesh agent."""
-        if self._registry is None:
-            raise RuntimeError("AgentRegistry not available")
+        """Dispatch a task to an existing Neural Mesh agent.
 
-        # Build payload for the agent — do NOT set "action" key;
-        # each agent's execute_task() decides its own default action.
-        payload = {
-            "goal": goal,
-        }
-        if step.get("target_app"):
-            payload["app_name"] = step["target_app"]
-        if step.get("workspace_service"):
-            payload["service"] = step["workspace_service"]
-        if "url" in goal.lower() or "youtube" in goal.lower() or "browse" in goal.lower():
-            payload["url"] = self._extract_url(goal)
+        Builds a TaskEnvelope from the structured step dict (populated by the
+        intent classifier / planner).  Never scrapes goal strings for URLs.
+        """
+        from backend.core.task_envelope import TaskEnvelope
+
+        envelope = TaskEnvelope.from_step(step)
+        payload = envelope.to_dict()
 
         # --- Primary: Get a live agent instance and call execute_task() ---
         live_agent = await self._get_live_agent(agent_name)
@@ -719,25 +726,16 @@ class RuntimeTaskOrchestrator:
             logger.info("[RuntimeTask] Dispatching to live agent %s: %s", agent_name, goal[:80])
             return await live_agent.execute_task(payload)
 
-        # --- Fallback: Try coordinator delegation ---
-        try:
-            coordinator_info = await self._registry.get_agent("coordinator_agent")
-            if coordinator_info and hasattr(coordinator_info, "request"):
-                return await coordinator_info.request(
-                    to_agent=agent_name,
-                    payload=payload,
-                    timeout=60.0,
-                )
-        except Exception:
-            pass
+        # --- Fallback: Registry entry with execute_task (live agent registered) ---
+        if self._registry is not None:
+            agent_info = await self._registry.get_agent(agent_name)
+            if agent_info and hasattr(agent_info, "execute_task"):
+                return await agent_info.execute_task(payload)
 
-        # --- Fallback: Direct dispatch if registry entry has execute_task ---
-        agent_info = await self._registry.get_agent(agent_name)
-        if agent_info and hasattr(agent_info, "execute_task"):
-            return await agent_info.execute_task(payload)
-
+        # --- No fake success — propagate typed failure ---
         raise RuntimeError(
             f"Agent '{agent_name}' has no live instance and cannot be instantiated. "
+            f"Binding exists: {agent_name in (get_agent_bindings() if True else {})}. "
             f"Goal: {goal}"
         )
 

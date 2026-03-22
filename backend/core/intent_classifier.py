@@ -265,7 +265,8 @@ class IntentClassifier:
     def classify(self, command: str) -> ClassificationResult:
         """Classify a voice command as ACTION or QUERY.
 
-        Returns ClassificationResult with intent, confidence, and reasoning.
+        Returns ClassificationResult with intent, confidence, structured
+        routing fields (provider, search_query, url, target_app).
         """
         if not command or not command.strip():
             return ClassificationResult(
@@ -292,22 +293,26 @@ class IntentClassifier:
         # --- Rule 2: Multi-word action phrases (high specificity) ---
         for phrase, category in self._action_phrases:
             if phrase in cmd:
+                fields = self._extract_structured_fields(cmd, category)
                 return ClassificationResult(
                     intent=CommandIntent.ACTION,
                     confidence=0.90,
                     matched_signal=phrase,
                     action_category=category,
+                    **fields,
                 )
 
         # --- Rule 3: Action verb at start of command ---
         first_word = cmd.split()[0] if cmd.split() else ""
         for verb, category in self._action_verbs:
             if first_word == verb:
+                fields = self._extract_structured_fields(cmd, category)
                 return ClassificationResult(
                     intent=CommandIntent.ACTION,
                     confidence=0.75,
                     matched_signal=verb,
                     action_category=category,
+                    **fields,
                 )
 
         # --- Rule 4: Question mark → likely a query ---
@@ -326,6 +331,95 @@ class IntentClassifier:
             matched_signal="default_fallback",
             action_category="",
         )
+
+    # --- Structured field extraction (no heuristics in the orchestrator) ---
+
+    # Provider patterns: keyword in goal → (provider, url_template)
+    _PROVIDER_PATTERNS: List[Tuple[str, str, str]] = [
+        ("youtube", "youtube", "https://www.youtube.com/results?search_query={q}"),
+        ("google", "google", "https://www.google.com/search?q={q}"),
+        ("spotify", "spotify", ""),
+        ("apple music", "apple_music", ""),
+        ("linkedin", "linkedin", "https://www.linkedin.com/search/results/all/?keywords={q}"),
+        ("twitter", "twitter", "https://twitter.com/search?q={q}"),
+        ("reddit", "reddit", "https://www.reddit.com/search/?q={q}"),
+        ("github", "github", "https://github.com/search?q={q}"),
+        ("amazon", "amazon", "https://www.amazon.com/s?k={q}"),
+    ]
+
+    # App patterns: keyword in goal → target_app
+    _APP_PATTERNS: List[Tuple[str, str]] = [
+        ("apple music", "Apple Music"),
+        ("spotify", "Spotify"),
+        ("safari", "Safari"),
+        ("chrome", "Google Chrome"),
+        ("firefox", "Firefox"),
+        ("finder", "Finder"),
+        ("terminal", "Terminal"),
+        ("slack", "Slack"),
+        ("discord", "Discord"),
+        ("messages", "Messages"),
+        ("notes", "Notes"),
+        ("mail", "Mail"),
+        ("calendar", "Calendar"),
+        ("settings", "System Preferences"),
+    ]
+
+    def _extract_structured_fields(
+        self, cmd: str, category: str,
+    ) -> dict:
+        """Extract provider, search_query, url, target_app from command text.
+
+        Called once per classification; results are frozen into ClassificationResult
+        so the orchestrator never parses goal strings.
+        """
+        from urllib.parse import quote_plus
+
+        result: dict = {}
+
+        # --- Provider + search_query + url ---
+        if category == "browser":
+            for keyword, provider, url_template in self._PROVIDER_PATTERNS:
+                if keyword in cmd:
+                    result["provider"] = provider
+                    search_term = self._isolate_search_term(cmd, keyword)
+                    if search_term:
+                        result["search_query"] = search_term
+                        if url_template:
+                            result["url"] = url_template.replace("{q}", quote_plus(search_term))
+                    elif url_template:
+                        # No search term → provider home page
+                        base = url_template.split("/results")[0].split("/search")[0]
+                        result["url"] = base
+                    break
+
+            # Explicit URL in the command
+            if not result.get("url"):
+                url_match = re.search(r'https?://\S+', cmd)
+                if url_match:
+                    result["url"] = url_match.group(0)
+
+        # --- target_app ---
+        if category == "app_control":
+            for keyword, app_name in self._APP_PATTERNS:
+                if keyword in cmd:
+                    result["target_app"] = app_name
+                    break
+
+        return result
+
+    @staticmethod
+    def _isolate_search_term(cmd: str, provider_keyword: str) -> str:
+        """Extract just the search term from a command like 'search youtube for nba highlights'."""
+        # Remove the provider keyword
+        without_provider = cmd.replace(provider_keyword, " ")
+        # Remove command verbs and prepositions
+        cleaned = re.sub(
+            r'\b(search|find|look up|browse|go to|open|play|on|for|in|at|from|the|some|please)\b',
+            ' ', without_provider,
+        )
+        # Collapse whitespace and strip
+        return re.sub(r'\s+', ' ', cleaned).strip()
 
 
 # ---------------------------------------------------------------------------
