@@ -112,26 +112,15 @@ class StartupPreWarmer:
             return
         self._started = False
 
-        # 1. Cancel un-released async tasks
-        cancelled_any = False
+        # 1. Cancel un-released async tasks.
+        # Note: task.cancelled() becomes True only after the event loop
+        # processes the cancellation (one await point).  Callers that need
+        # to confirm cancellation should await asyncio.sleep(0) after this
+        # method returns (only relevant inside a running event loop).
         for name, task in list(self._async_tasks.items()):
             if name not in self._released_tasks and not task.done():
                 task.cancel()
-                cancelled_any = True
                 self._log.info("[PreWarm] Cancelled async task: %s", name)
-
-        # Drain one event-loop iteration so tasks transition from "cancelling"
-        # to "cancelled" state synchronously.  This matters when shutdown() is
-        # called from a synchronous frame inside a running event loop (e.g.
-        # pytest-asyncio tests).  _run_once() is a private but stable CPython
-        # implementation detail used only as a best-effort drain.
-        if cancelled_any:
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    loop._run_once()  # type: ignore[attr-defined]
-            except Exception:
-                pass
 
         # 2. Shutdown thread executor (Python 3.9+)
         if self._executor:

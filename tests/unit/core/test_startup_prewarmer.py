@@ -128,6 +128,9 @@ class TestReleaseAndShutdown:
         pw._register_pending("test_task")
 
         pw.shutdown(timeout=1.0)
+        # Yield one event-loop iteration so the cancellation propagates from
+        # "cancelling" to "cancelled" state — required by CPython asyncio.
+        await asyncio.sleep(0)
         assert task.cancelled()
 
     @pytest.mark.asyncio
