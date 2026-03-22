@@ -6180,56 +6180,67 @@ async def health_ready():
     }
 
 
-# v152.0: Progressive Readiness Tier endpoint
+# v350.2: Progressive Readiness Tier — authoritative DAG-driven state
 @app.api_route("/health/readiness-tier", methods=["GET", "HEAD"])
 async def health_readiness_tier():
     """
-    v152.0: Returns the current progressive readiness tier.
+    v350.2: Returns the authoritative progressive readiness state.
 
-    Progressive readiness tiers:
-    - STARTING: System is starting up
-    - INTERACTIVE: API ready, basic endpoints functional (~30s target)
-    - WARMUP: Frontend ready, jarvis-prime loading in background (~120s target)
-    - FULL: Complete system ready including 70B model inference (~900s possible)
+    Driven by the ProgressiveReadiness DAG — each node represents a boot
+    phase with actual resolution status. The UI subscribes to this to
+    know exactly what's ready and what's still booting.
 
-    This allows clients to determine what capabilities are available
-    and whether the system can handle their request.
+    Tiers (from ProgressiveReadiness):
+        BOOTING           — startup in progress
+        ACTIVE_LOCAL      — Backend + Intelligence resolved, Claude API fallback
+        ACTIVE_FULL       — Trinity resolved, J-Prime + Neural Mesh available
+        FULLY_OPERATIONAL — Governance + Dashboard + Graduation online
     """
+    # Primary: use the in-process ProgressiveReadiness singleton
+    try:
+        from backend.core.progressive_readiness import get_readiness
+        pr = get_readiness()
+        state = pr.snapshot()
+        tier = state["tier"]
+
+        capabilities = {
+            "api_ready": pr.is_local_ready,
+            "voice_ready": pr.is_local_ready,
+            "query_ready": pr.is_local_ready,
+            "action_ready": pr.is_full_ready,
+            "jprime_ready": pr.is_full_ready,
+            "governance_ready": pr.is_fully_operational,
+        }
+        return {
+            "tier": tier,
+            "tier_value": state["tier_value"],
+            "elapsed_s": state["elapsed_s"],
+            "capabilities": capabilities,
+            "nodes": state["nodes"],
+            "pending": state["pending"],
+            "resolved": state["resolved"],
+            "eta_to_full_s": pr.estimated_time_to_full(),
+        }
+    except ImportError:
+        pass
+
+    # Fallback: legacy file-based state
     import json
     from pathlib import Path
-
-    # Read readiness state from shared file
     state_file = Path.home() / ".jarvis" / "trinity" / "readiness_state.json"
-
-    tier = "STARTING"
-    tier_details = {
-        "interactive_at": None,
-        "warmup_at": None,
-        "full_at": None,
-        "prime_loading_progress": 0.0,
-        "prime_ready": False,
-    }
-
+    tier = "BOOTING"
     try:
         if state_file.exists():
             state_data = json.loads(state_file.read_text())
-            tier = state_data.get("tier", "starting").upper()
-            tier_details["interactive_at"] = state_data.get("interactive_at")
-            tier_details["warmup_at"] = state_data.get("warmup_at")
-            tier_details["full_at"] = state_data.get("full_at")
-            tier_details["prime_loading_progress"] = state_data.get("prime_loading_progress", 0.0)
-            tier_details["prime_ready"] = state_data.get("prime_ready", False)
+            tier = state_data.get("tier", "BOOTING").upper()
     except Exception:
         pass
-
-    # Also check environment variables (set by supervisor)
     env_tier = os.getenv("JARVIS_READINESS_TIER", "").upper()
-    if env_tier and env_tier != tier:
+    if env_tier:
         tier = env_tier
 
-    # Determine capabilities based on tier
     capabilities = {
-        "api_ready": tier in ("INTERACTIVE", "WARMUP", "FULL"),
+        "api_ready": tier in ("ACTIVE_LOCAL", "ACTIVE_FULL", "FULLY_OPERATIONAL"),
         "frontend_ready": tier in ("WARMUP", "FULL"),
         "prime_inference_ready": tier == "FULL",
         "full_features_ready": tier == "FULL",
