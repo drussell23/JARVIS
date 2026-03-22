@@ -3443,36 +3443,57 @@ class SpeakerVerificationService:
         except Exception as e:
             logger.warning(f"⚠️ [FAST-INIT] EcapaFacade error: {e} - will use SpeechBrain fallback")
 
-        # Create SpeechBrain engine but DON'T initialize it yet (deferred to background)
-        # Lazy load the ML components
-        _init_ml_components()
-        model_config = _ModelConfig(
-            name="speechbrain-wav2vec2",
-            engine=_STTEngine.SPEECHBRAIN,
-            disk_size_mb=380,
-            ram_required_gb=2.0,
-            vram_required_gb=1.8,
-            expected_accuracy=0.96,
-            avg_latency_ms=150,
-            supports_fine_tuning=True,
-            model_path="speechbrain/asr-wav2vec2-commonvoice-en",
-        )
+        # v304.0: In SLIM/cloud mode, skip local SpeechBrain engine entirely.
+        # SpeechBrain imports torch (~2GB) which causes memory emergency on
+        # 16GB hardware. Voice verification uses cloud ECAPA via GCP instead.
+        _slim_skip_speechbrain = False
+        try:
+            import psutil as _psutil_svs
+            if _psutil_svs.virtual_memory().total < 20 * 1024 ** 3:
+                _slim_skip_speechbrain = True
+        except ImportError:
+            _slim_skip_speechbrain = os.environ.get(
+                "JARVIS_ENABLE_SLIM_MODE", ""
+            ).lower() in ("true", "1", "yes", "on")
 
-        self.speechbrain_engine = _SpeechBrainEngine(model_config)
-        # DON'T call initialize() here - defer to background thread
+        if not _slim_skip_speechbrain:
+            # Create SpeechBrain engine but DON'T initialize it yet (deferred to background)
+            # Lazy load the ML components
+            _init_ml_components()
+            model_config = _ModelConfig(
+                name="speechbrain-wav2vec2",
+                engine=_STTEngine.SPEECHBRAIN,
+                disk_size_mb=380,
+                ram_required_gb=2.0,
+                vram_required_gb=1.8,
+                expected_accuracy=0.96,
+                avg_latency_ms=150,
+                supports_fine_tuning=True,
+                model_path="speechbrain/asr-wav2vec2-commonvoice-en",
+            )
+            self.speechbrain_engine = _SpeechBrainEngine(model_config)
+        else:
+            self.speechbrain_engine = None
+            logger.info(
+                "⚡ [FAST-INIT] SpeechBrain SKIPPED (SLIM mode — "
+                "cloud ECAPA via GCP handles voice verification)"
+            )
 
         # Load speaker profiles from database
         await self._load_speaker_profiles()
 
         self.initialized = True
-        ecapa_status = "ECAPA ready" if self._use_registry_encoder else "SpeechBrain fallback"
+        ecapa_status = "ECAPA ready" if self._use_registry_encoder else (
+            "cloud ECAPA (SLIM)" if _slim_skip_speechbrain else "SpeechBrain fallback"
+        )
         logger.info(
             f"✅ Speaker Verification Service ready - {len(self.speaker_profiles)} profiles loaded ({ecapa_status})"
         )
 
         # Start background initialization of SpeechBrain engine (as fallback)
-        logger.info("🔄 Loading SpeechBrain encoder in background thread...")
-        self._start_background_preload()
+        if self.speechbrain_engine is not None:
+            logger.info("🔄 Loading SpeechBrain encoder in background thread...")
+            self._start_background_preload()
 
         # Initialize enhanced components in background
         asyncio.create_task(self._initialize_enhanced_components())
