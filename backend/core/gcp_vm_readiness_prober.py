@@ -147,10 +147,28 @@ class GCPVMReadinessProber(ReadinessProber):
             return cached
 
         try:
-            # We pass empty defaults — the real adapter layer will provide
-            # the actual instance name and metadata from VM state.
+            # v304.0: If health probe already passed, the VM is alive and
+            # serving. Lineage check (which needs GCP metadata API) adds
+            # latency and can fail with SCHEMA_MISMATCH when metadata is
+            # unavailable. With INV-3, J-Prime's readiness is authoritative
+            # regardless of golden image lineage — skip lineage check when
+            # we already know the VM is healthy.
+            _health_cached = self._get_cached(HandshakeStep.HEALTH)
+            if _health_cached and _health_cached.passed:
+                result = HandshakeResult(
+                    step=HandshakeStep.CAPABILITIES,
+                    passed=True,
+                    detail="health_passed_lineage_skipped",
+                )
+                self._put_cache(HandshakeStep.CAPABILITIES, result)
+                return result
+
+            _instance_name = getattr(
+                getattr(self._vm_manager, 'config', None),
+                'static_instance_name', None
+            ) or "jarvis-prime-node"
             should_recreate, reason = await self._vm_manager.check_lineage(
-                "", None,
+                _instance_name, None,
             )
             if not should_recreate:
                 result = HandshakeResult(
