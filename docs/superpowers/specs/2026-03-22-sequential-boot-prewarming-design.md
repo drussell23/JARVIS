@@ -1,7 +1,7 @@
 # Sequential Boot with Background Pre-Warming
 
 **Date:** 2026-03-22
-**Status:** Draft
+**Status:** Ready for implementation
 **Scope:** PR 1 of 2 — boot stability + pre-warming. PR 2 (follow-up): `backend.main` import audit + refactor.
 
 ## Problem
@@ -110,6 +110,9 @@ class StartupPreWarmer:
         # by the async event loop. In CPython, single-key dict assignment is
         # atomic under the GIL. If porting to a non-GIL runtime, add a
         # threading.Lock around _results access.
+        # IMPORTANT: if any code needs to ITERATE _results (e.g., shutdown
+        # logging), snapshot the keys first: list(self._results.keys()) to
+        # avoid RuntimeError from concurrent dict modification.
         self._results: Dict[str, PreWarmResult] = {}
         self._futures: Dict[str, Future] = {}  # thread pool futures
         self._async_tasks: Dict[str, asyncio.Task] = {}
@@ -124,6 +127,12 @@ class StartupPreWarmer:
         """Fire all background pre-warm tasks. Non-blocking.
         No-op if disabled via JARVIS_PREWARM_DISABLED.
         Must be called from the same event loop as _startup_impl.
+
+        Registration contract: for each task, start() MUST store
+        PreWarmResult(PENDING) in _results BEFORE submitting work
+        to the executor or creating the async task. This ensures
+        get_status() never sees "missing" vs "not started" ambiguity.
+
         Each thread callable is wrapped in try/except to always
         produce a PreWarmResult (never swallows exceptions silently)."""
 
@@ -153,12 +162,21 @@ class StartupPreWarmer:
         already released by a prior call.
 
         The caller becomes the sole owner and is responsible for
-        awaiting or cancelling the task."""
+        awaiting or cancelling the task.
+
+        Ownership rule: release_task() should ONLY be called at the
+        entry of the consuming phase (e.g., _phase_trinity). If boot
+        fails before that phase runs, the task stays unreleased and
+        shutdown() cancels it normally — no orphan possible. If the
+        phase is entered but crashes/times out after release, the
+        phase's own try/finally must cancel the adopted task."""
 
     def shutdown(self, timeout: float = 5.0) -> None:
         """Stop scheduling new work.
         1. Cancel un-released async tasks (released tasks are not touched).
-        2. Call executor.shutdown(wait=False, cancel_futures=True) (Python 3.9+).
+        2. Call executor.shutdown(wait=False, cancel_futures=True).
+           Requires Python 3.9+. This project targets 3.10+ (verified
+           via pyproject.toml / runtime checks).
         3. Wait up to `timeout` seconds for thread futures via
            concurrent.futures.wait(futures, timeout=timeout).
         4. Log any threads still alive after timeout (stragglers).
@@ -243,15 +261,21 @@ else:
 
 **Critical:** After `release_task()`, the pre-warmer no longer cancels that task on `shutdown()`. Only one owner at a time. The existing `ensure_static_vm_ready()` call in `_phase_trinity` (~line 77390) is replaced by this handoff pattern — not duplicated.
 
-**Orphan prevention:** `_phase_trinity` must wrap the entire handoff in `try/finally` so that if Trinity itself is cancelled (e.g., boot timeout), the adopted `gcp_task` is also cancelled. Otherwise there is an orphan window between `release_task()` and task completion where no owner will cancel it.
+**Orphan prevention:** `_phase_trinity` must wrap the entire handoff in `try/finally` so that if Trinity itself is cancelled (e.g., boot timeout, CancelledError), the adopted `gcp_task` is also cancelled. Otherwise there is an orphan window between `release_task()` and task completion where no owner will cancel it.
+
+**Cancel only on abandonment:** The `finally` block should cancel `gcp_task` only when the handoff is being abandoned (timeout, failure, phase teardown) — NOT after a successful full Trinity GCP path where the VM result has been consumed and follow-up work depends on the completed operation. Use a flag:
 
 ```python
 # In _phase_trinity():
 gcp_task = self._prewarm.release_task("gcp_vm_start") if self._prewarm else None
+gcp_handoff_consumed = False
 try:
-    # ... handoff logic as above ...
+    # ... handoff logic ...
+    # After successful result processing + re-verification:
+    gcp_handoff_consumed = True
+    # ... env writes, routing, dashboard (these depend on VM being ready) ...
 finally:
-    if gcp_task and not gcp_task.done():
+    if gcp_task and not gcp_task.done() and not gcp_handoff_consumed:
         gcp_task.cancel()
 ```
 
@@ -334,12 +358,12 @@ if self._prewarm is not None:
 
 ### Code to Remove from unified_supervisor.py
 - Lines ~70622-70658: `JARVIS_PARALLEL_BOOT` gate, `ParallelBootOrchestrator` import/call/fallback block (37 lines)
-- Lines ~93373-93389: Entire parallel boot heartbeat suppression block (not just the env-var read)
+- Lines ~93373-93389: Entire parallel boot heartbeat suppression block (not just the env-var read). After removal, re-verify that the sequential heartbeat task only relays `_startup_state` and does not contain any residual parallel-boot progress adjustment logic.
 
 ### Proactive GCP Start Consolidation
 - Remove `_proactive_gcp_vm_start()` definition and call site (~lines 73230-73365, ~120 lines)
 - Remove the `ensure_static_vm_ready()` call inside `_phase_trinity` (~line 77390) and replace with the handoff consumer pattern
-- Only one code path calls `ensure_static_vm_ready()` during boot: the pre-warmer's task #3
+- At most one **concurrent** provisioning pipeline: the pre-warmer's task #3 calls `ensure_static_vm_ready()` first. If it succeeds, Trinity re-verifies and skips. If it fails, Trinity may call `ensure_static_vm_ready()` again as a retry — this is the same idempotent function, not a duplicate implementation. The key constraint is: no two concurrent calls to `ensure_static_vm_ready()`.
 
 ### References to Grep and Clean
 ```bash
@@ -358,10 +382,10 @@ Verified: `_BootCLINarrator` is only referenced in `parallel_boot.py` (goes with
 ### Fix
 After final readiness tier, resolve redirect URL via ordered strategy:
 
-1. **`FRONTEND_URL` env var** (if set) — explicit override, used directly
+1. **`JARVIS_FRONTEND_URL` env var** (if set) — explicit override, used directly. For backwards compatibility, also check `FRONTEND_URL` as fallback. Precedence: `JARVIS_FRONTEND_URL` > `FRONTEND_URL` > probe.
 2. **`JARVIS_FRONTEND_PROBE_URLS` env var** (if set) — comma-separated list of URLs to probe
 3. **Default probe list** derived from config: `http://localhost:{config.frontend_port}` (default 3000)
-4. **HTTP readiness probe** — probe all candidate URLs concurrently (asyncio.gather), first 2xx wins, 5s aggregate timeout. This prevents sequential worst-case (N urls * 3s each).
+4. **HTTP readiness probe** — probe all candidate URLs concurrently (`asyncio.gather(return_exceptions=True)`), first 2xx wins, 5s aggregate timeout. Use `return_exceptions=True` so one bad URL doesn't kill the whole probe set. This prevents sequential worst-case (N urls * 3s each).
 5. **Fallback** — if no frontend responds, show degraded-exit message in loading page:
    `"JARVIS is online — API available at http://localhost:{config.backend_port}"`
    with a clickable link. Loading page stops spinning, shows success state with API-only message.
@@ -430,7 +454,7 @@ The heartbeat task must ONLY relay `_startup_state`. If it currently has any log
 ### Test 5: GCP VM Handoff
 - Boot with GCP enabled
 - Verify: pre-warmer starts VM, Trinity adopts the task
-- Verify: only one `ensure_static_vm_ready()` call happens (not two)
+- Verify: at most one concurrent `ensure_static_vm_ready()` call. Trinity may retry on pre-warm failure (sequential, not concurrent).
 - Verify: if pre-warm VM fails, Trinity retries independently
 - Verify: env var writes and routing notifications happen in `_phase_trinity`, not pre-warmer
 
@@ -443,7 +467,7 @@ The heartbeat task must ONLY relay `_startup_state`. If it currently has any log
 
 | File | Action | Lines Changed (est.) |
 |------|--------|---------------------|
-| `backend/core/startup_prewarmer.py` | **New** | ~350-400 |
+| `backend/core/startup_prewarmer.py` | **New** (placed alongside other lifecycle modules like `startup_transaction.py`, `startup_state_machine.py`) | ~350-400 |
 | `backend/core/parallel_boot.py` | **Delete** | -500 |
 | `unified_supervisor.py` | Edit: remove parallel boot gate (~37), remove proactive GCP start (~120), remove heartbeat suppression (~17), add pre-warmer hook (~20), add consumer checks in 3 phases (~30), update startup_state pattern (~15) | ~120 net removed |
 | `loading_server.py` | Edit: fix redirect with concurrent probe + fallback | ~50 |
