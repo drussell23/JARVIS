@@ -113,6 +113,16 @@ class OpportunityMinerSensor:
             return False
 
         name = py_file.name
+
+        # Test files are not production code regardless of directory.
+        # Standard Python convention: test_*.py and *_test.py are tests.
+        if name.startswith("test_") or name.endswith("_test.py"):
+            return False
+
+        # Scripts directory segments — utility/tooling, not production
+        if "scripts" in parts:
+            return False
+
         if name in ("__init__.py", "__main__.py", "conftest.py"):
             return True
         try:
