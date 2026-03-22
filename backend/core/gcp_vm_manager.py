@@ -8754,54 +8754,11 @@ class GCPVMManager:
                             progress_callback(
                                 0, "gcp",
                                 f"VM running (script v{vm_script_version}), polling health"
-                                f"({vm_script_version or 'pre-v235'} → {_STARTUP_SCRIPT_VERSION})"
-                            )
-
-                        del_success, del_error = await self._delete_instance(
-                            instance_name, zone=current_zone
-                        )
-                        if del_success:
-                            create_success, create_error = await self._create_static_vm(
-                                instance_name, static_ip_name, target_port, zone=current_zone
-                            )
-                            if not create_success:
-                                # v292.0: Zone failover on recycle create failure
-                                if self._is_zone_capacity_error(str(create_error)):
-                                    self._zone_fallback.blacklist_zone(
-                                        current_zone,
-                                        f"Recycle create failed: {str(create_error)[:100]}"
-                                    )
-                                    _next = self._zone_fallback.get_next_zone()
-                                    if _next:
-                                        current_zone = _next
-                                        self._invincible_node_zone = current_zone
-                                        _need_zone_retry = True
-                                    else:
-                                        _last_error = (
-                                            f"SCRIPT_UPGRADE_FAILED (all zones exhausted): "
-                                            f"{create_error}"
-                                        )
-                                else:
-                                    _last_error = f"SCRIPT_UPGRADE_FAILED: {create_error}"
-
-                                if _need_zone_retry:
-                                    continue
-                                return False, static_ip, _last_error
-
-                            if progress_callback:
-                                progress_callback(
-                                    5, "gcp",
-                                    f"VM recreated with v{_STARTUP_SCRIPT_VERSION} script, booting"
-                                )
-                        else:
-                            logger.warning(
-                                f"⚠️ [InvincibleNode] Delete failed ({del_error}), "
-                                f"proceeding with stale VM (will likely timeout)"
                             )
                     else:
                         logger.info(
                             f"☁️ [InvincibleNode] VM running "
-                            f"(script v{vm_script_version}) but not healthy yet"
+                            f"(script v{vm_script_version or 'current'}) — polling health"
                         )
 
                 elif instance_status == "ERROR":
