@@ -1980,23 +1980,30 @@ class JARVISLoadingManager {
 
     async quickBackendCheck() {
         /**
-         * Quick backend health check for recovery scenarios.
-         * Returns true if backend is responsive.
-         * Uses a short timeout to avoid blocking.
+         * v350.1: Backend READINESS check — not just "is the server up?"
+         *
+         * Uses /health/ready which checks ReadinessStateManager.
+         * Returns true ONLY when JARVIS is ready for USER INTERACTION
+         * (all agents initialized, RTO wired, governance online).
+         *
+         * Previously used /health which returns 200 as soon as FastAPI
+         * starts (Zone 6.1), long before RTO, agents, and governance
+         * are initialized. This caused the loading page to redirect
+         * while the backend couldn't actually handle commands.
          */
         const backendPort = this.config.backendPort || 8010;
         const backendUrl = `${this.config.httpProtocol}//${this.config.hostname}:${backendPort}`;
         try {
-            const response = await fetch(`${backendUrl}/health`, {
-                method: 'GET',
+            const response = await fetch(`${backendUrl}/health/ready`, {
+                method: 'HEAD',
                 cache: 'no-cache',
-                signal: AbortSignal.timeout(2000)
+                signal: AbortSignal.timeout(3000)
             });
             const isReady = response.ok;
-            console.log(`[Recovery] Quick backend check: ${isReady ? 'UP' : 'DOWN'}`);
+            console.log(`[Recovery] Backend readiness check: ${isReady ? 'READY' : 'NOT_READY'} (${response.status})`);
             return isReady;
         } catch (e) {
-            console.debug('[Recovery] Quick backend check failed:', e.message);
+            console.debug('[Recovery] Backend readiness check failed:', e.message);
             return false;
         }
     }
