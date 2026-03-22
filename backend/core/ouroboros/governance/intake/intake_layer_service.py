@@ -50,7 +50,7 @@ class IntakeLayerConfig:
     dedup_window_s: float = 60.0
     backlog_scan_interval_s: float = 30.0
     miner_scan_interval_s: float = 300.0
-    miner_complexity_threshold: int = 10
+    miner_complexity_threshold: int = 75
     miner_auto_submit_threshold: float = 0.75
     miner_scan_paths: List[str] = field(default_factory=lambda: ["backend/", "tests/"])
     voice_stt_confidence_threshold: float = 0.70

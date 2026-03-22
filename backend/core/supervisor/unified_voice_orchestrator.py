@@ -1080,20 +1080,17 @@ class UnifiedVoiceOrchestrator:
             logger.error(f"[UnifiedVoice] Final speech fallback failed: {fallback_err}")
 
     async def _execute_say_via_afplay(self, text: str) -> None:
-        """Synthesize with `say -o` and play with `afplay` — no Python audio callback.
+        """Synthesize with ``say -o`` and play with ``afplay``.
 
-        v279.0: Originally a startup-only path to bypass AudioBus/PortAudio.
-        v283.0: Now the PRIMARY playback path whenever FullDuplexDevice holds the
-        audio device. The PortAudio output callback needs the GIL every ~20ms to
-        read from PlaybackRingBuffer. ANY GIL-heavy operation (ML inference, vision,
-        heavy imports, GC) starves it → buffer underflows → audible static.
-
-        afplay is a native macOS process with its own audio pipeline — no GIL,
-        no Python callback, no xruns. CoreAudio's HAL mixer handles coexistence
-        with the PortAudio stream that AudioBus may have already opened (multiple
-        CoreAudio clients can output simultaneously — this is how system sounds
-        play alongside music apps). FullDuplexDevice's output callback safely
-        outputs silence (outdata[:] = 0.0) when the PlaybackRingBuffer is empty.
+        v350.1: Unified with safe_say() audio pipeline fixes:
+        1. ``--data-format LEI16@{device_sr}`` matches FullDuplexDevice sample
+           rate so CoreAudio HAL mixer never does real-time SRC (root cause of
+           static/crackle artifacts).
+        2. Settle window wait before afplay launch prevents clicks/pops from
+           PortAudio PLL stabilization.
+        3. Voice resolution with fallback prevents ``say exited 1`` when the
+           configured voice is not installed.
+        4. Exit code check prevents playing empty/corrupt audio files.
         """
         import tempfile as _tmpmod
 
@@ -1102,21 +1099,52 @@ class UnifiedVoiceOrchestrator:
         )
         os.close(_temp_fd)
         try:
-            cmd = [
+            # Match sample rate to FullDuplexDevice — eliminates HAL mixer SRC static
+            _say_sr: int = 48000
+            try:
+                from backend.audio.full_duplex_device import _device_sample_rate
+                _say_sr = _device_sample_rate if _device_sample_rate > 0 else 48000
+            except Exception:
+                _say_sr = int(os.environ.get("JARVIS_AUDIO_SAMPLE_RATE", "48000"))
+
+            # Resolve voice with fallback (cached after first call)
+            resolved_voice = self.config.voice
+            try:
+                resolved_voice = await _resolve_voice(self.config.voice)
+            except Exception:
+                pass
+
+            self._current_process = await asyncio.create_subprocess_exec(
                 "say",
-                "-v", self.config.voice,
+                "-v", resolved_voice,
                 "-r", str(self.config.rate),
                 "-o", _temp_path,
+                "--data-format", f"LEI16@{_say_sr}",
                 text,
-            ]
-            self._current_process = await asyncio.create_subprocess_exec(
-                *cmd,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True,
             )
             await self._current_process.wait()
+
+            if self._current_process.returncode != 0:
+                logger.warning(
+                    "[UnifiedVoice] say exited %d (voice=%s) — skipping playback",
+                    self._current_process.returncode, resolved_voice,
+                )
+                self._current_process = None
+                return
             self._current_process = None
+
+            # Wait for FullDuplexDevice settle window before launching afplay
+            try:
+                import time as _time_settle
+                from backend.audio.full_duplex_device import _device_settled_after
+                _settle_remaining = _device_settled_after - _time_settle.monotonic()
+                if 0 < _settle_remaining <= 1.0:
+                    await asyncio.sleep(_settle_remaining)
+            except Exception:
+                pass
 
             _play_proc = await asyncio.create_subprocess_exec(
                 "afplay", _temp_path,
@@ -1127,7 +1155,7 @@ class UnifiedVoiceOrchestrator:
         except FileNotFoundError:
             logger.error("[UnifiedVoice] macOS 'say' command not found")
         except Exception as e:
-            logger.warning("[UnifiedVoice] Startup afplay path failed: %s", e)
+            logger.warning("[UnifiedVoice] afplay path failed: %s", e)
         finally:
             self._current_process = None
             try:
