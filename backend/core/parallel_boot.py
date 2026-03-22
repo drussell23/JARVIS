@@ -58,14 +58,16 @@ class _BootCLINarrator:
     preceding phases have finished.
     """
 
-    # Logical phase order for narrative presentation
+    # Zone-based narrative matching the sequential boot's zone architecture.
+    # The user sees Zone 0 → Zone 6 in order. Parallel is invisible.
+    # Format: (dag_node, zone_id, zone_icon_title, zone_description)
     PHASE_SEQUENCE = [
-        ("clean_slate",        "Phase -1: Clean Slate",       "🧹"),
-        ("preflight",          "Phase 1: Preflight",          "🚀"),
-        ("resources",          "Phase 2: Resources",          "📦"),
-        ("loading_experience", "Phase 0: Loading Experience", "🖥️"),
-        ("backend",            "Phase 3: Backend Server",     "⚙️"),
-        ("intelligence",       "Phase 4: Intelligence",       "🧠"),
+        ("clean_slate",        "Zone 0",   "🛡️  Early Protection",  "Signal guards, cleanup, crash recovery"),
+        ("preflight",          "Zone 5.1", "🎯 Orchestration",      "DMS, IPC, locks, signal handlers"),
+        ("loading_experience", "Zone 5.2", "🖥️  Loading Experience", "Loading page server"),
+        ("resources",          "Zone 3",   "☁️  Resources",          "Docker, GCP VM, ports, storage"),
+        ("backend",            "Zone 6.1", "⚡ The Kernel",          "uvicorn + FastAPI backend server"),
+        ("intelligence",       "Zone 4",   "🧠 Intelligence",       "ML routing, model serving, vision"),
     ]
 
     def __init__(self, kernel_logger) -> None:
@@ -79,12 +81,14 @@ class _BootCLINarrator:
         return (time.monotonic() - self._boot_start) * 1000
 
     def phase_start(self, phase_name: str) -> None:
-        """Emit a phase start banner (immediate — not queued)."""
-        for name, title, icon in self.PHASE_SEQUENCE:
+        """Emit a zone start banner matching the sequential boot format."""
+        for name, zone, icon_title, desc in self.PHASE_SEQUENCE:
             if name == phase_name:
                 elapsed = self._elapsed_ms()
                 sep = "━" * 13
-                self._log.info(f"\n{sep} {icon} BOOT │ {title}  ⏱ +{elapsed:.0f}ms {sep}\n")
+                self._log.info(
+                    f"\n{sep} {icon_title} │ {zone} | {desc}  ⏱ +{elapsed:.0f}ms {sep}\n"
+                )
                 return
 
     def phase_resolved(self, phase_name: str, _total_elapsed: float = 0) -> None:
@@ -114,24 +118,25 @@ class _BootCLINarrator:
         If phases 1,2,3 resolve but we've only narrated 1, this emits
         2 and 3 in order. If 3 resolves before 2, it waits.
         """
-        for name, title, icon in self.PHASE_SEQUENCE:
+        for name, zone, icon_title, _desc in self.PHASE_SEQUENCE:
             if name in self._narrated:
                 continue
             if name not in self._resolved:
-                break  # Can't narrate this yet — predecessor hasn't resolved
+                break  # Can't narrate — predecessor zone hasn't resolved
             elapsed = self._resolved[name]
             error = self._failed.get(name)
             sep = "─" * 19
             if error:
-                self._log.info(f"{sep} ❌ {icon} {title} FAILED ({error}) {sep}")
+                self._log.info(f"{sep} ❌ {icon_title} │ {zone} FAILED: {error} ({elapsed:.1f}s) {sep}")
             else:
-                self._log.info(f"{sep} ✅ {icon} {title} completed in {elapsed * 1000:.1f}ms {sep}")
+                self._log.info(f"{sep} ✅ {icon_title} │ {zone} completed in {elapsed:.1f}s {sep}")
             self._narrated.add(name)
 
     def active_local_reached(self, elapsed_s: float) -> None:
         """Emit the ACTIVE_LOCAL milestone banner."""
-        self._log.info(
-            f"\n{'━' * 20} 🟢 ACTIVE_LOCAL reached in {elapsed_s:.1f}s {'━' * 20}\n"
+        sep = "━" * 20
+        self._log.info(f"\n{sep} 🟢 ACTIVE_LOCAL │ System ready in {elapsed_s:.1f}s {sep}")
+        self._log.info(f"{'':>24}Local systems online — cloud warming up in background\n"
         )
 
 
