@@ -2345,10 +2345,26 @@ class UnifiedCommandProcessor:
                     _classification.target_app,
                 )
 
-                # Try RTO first (full Ouroboros path)
+                # Try RTO (full Ouroboros path). Lazy-create if Zone 6.12 didn't fire.
                 try:
-                    from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
+                    from backend.core.runtime_task_orchestrator import (
+                        get_runtime_task_orchestrator, set_runtime_task_orchestrator,
+                        RuntimeTaskOrchestrator,
+                    )
                     _rto = get_runtime_task_orchestrator()
+
+                    # Lazy RTO creation — Zone 6.12 may not have fired (OOM, timing)
+                    # but we still need the RTO for action dispatch.
+                    if _rto is None:
+                        try:
+                            from backend.core.prime_client import get_prime_client
+                            _lazy_pc = await get_prime_client()
+                            _rto = RuntimeTaskOrchestrator(prime_client=_lazy_pc)
+                            set_runtime_task_orchestrator(_rto)
+                            logger.info("[Pillar5] Lazy-created minimal RTO (Zone 6.12 bypass)")
+                        except Exception as _lazy_exc:
+                            logger.debug("[Pillar5] Lazy RTO creation failed: %s", _lazy_exc)
+
                     if _rto is not None:
                         logger.info("[Pillar5] Dispatching to RTO")
                         _rto_result = await asyncio.wait_for(
