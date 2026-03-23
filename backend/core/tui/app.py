@@ -37,53 +37,49 @@ class StatusBar(Static):
         self.update(self._data.to_string())
 
 
-class _ThreadSafeLinuxDriver:
-    """Mixin that skips SIGTSTP/SIGCONT registration when not on the main thread.
+def _safe_signal(signum, handler):
+    """Register a signal handler only if on the main thread.
 
     Root cause: Textual's LinuxDriver.__init__ unconditionally calls
-    signal.signal(SIGTSTP, ...) which raises ValueError from non-main threads.
-    Python only allows signal handlers in the main thread.
+    signal.signal(SIGTSTP/SIGCONT) which raises ValueError from non-main
+    threads. Python only allows signal handlers in the main thread.
 
-    This driver is identical to LinuxDriver except it wraps the signal calls
-    in a main-thread guard. When on a daemon thread, Ctrl+Z suspend is simply
-    not available — which is correct for JARVIS (it manages its own lifecycle).
+    This wrapper is a no-op from daemon threads — Ctrl+Z suspend is
+    unavailable but the TUI renders normally.
     """
-
-    @staticmethod
-    def _safe_signal(signum, handler):
-        """Register a signal handler only if on the main thread."""
-        if threading.current_thread() is threading.main_thread():
-            return signal.signal(signum, handler)
-        return signal.getsignal(signum)  # return existing handler, no-op
+    if threading.current_thread() is threading.main_thread():
+        return signal.signal(signum, handler)
+    return signal.getsignal(signum)
 
 
-def _patch_driver_class():
-    """Create a thread-safe LinuxDriver by patching signal registration."""
-    try:
+class JarvisDashboard(App):
+    """JARVIS Live Agent Dashboard."""
+
+    def get_driver_class(self):
+        """Override Textual's driver selection to use a thread-safe variant.
+
+        Textual's App.__init__ calls self.get_driver_class() to resolve
+        driver_class. We intercept this to return a subclass of LinuxDriver
+        that wraps signal.signal() with a main-thread guard. This is the
+        ONLY reliable injection point — class-level driver_class is
+        overwritten by App.__init__.
+        """
         from textual.drivers.linux_driver import LinuxDriver
 
+        outer_safe_signal = _safe_signal
+
         class ThreadSafeLinuxDriver(LinuxDriver):
+            """LinuxDriver that skips SIGTSTP/SIGCONT from non-main threads."""
+
             def __init__(self, *args, **kwargs):
-                # Temporarily replace signal.signal with our safe version
                 _orig = signal.signal
-                signal.signal = _ThreadSafeLinuxDriver._safe_signal
+                signal.signal = outer_safe_signal
                 try:
                     super().__init__(*args, **kwargs)
                 finally:
                     signal.signal = _orig
 
         return ThreadSafeLinuxDriver
-    except ImportError:
-        return None
-
-
-class JarvisDashboard(App):
-    """JARVIS Live Agent Dashboard."""
-
-    # Use our thread-safe driver that skips signal registration from daemon threads.
-    _thread_safe_driver = _patch_driver_class()
-    if _thread_safe_driver is not None:
-        driver_class = _thread_safe_driver
 
     TITLE = "JARVIS Dashboard"
     CSS = """
