@@ -12,6 +12,8 @@ import threading
 from datetime import datetime
 from typing import Optional
 
+import signal
+
 from textual.app import App, ComposeResult
 from textual.widgets import Header, Footer, Static, TabbedContent, TabPane, RichLog
 
@@ -35,8 +37,53 @@ class StatusBar(Static):
         self.update(self._data.to_string())
 
 
+class _ThreadSafeLinuxDriver:
+    """Mixin that skips SIGTSTP/SIGCONT registration when not on the main thread.
+
+    Root cause: Textual's LinuxDriver.__init__ unconditionally calls
+    signal.signal(SIGTSTP, ...) which raises ValueError from non-main threads.
+    Python only allows signal handlers in the main thread.
+
+    This driver is identical to LinuxDriver except it wraps the signal calls
+    in a main-thread guard. When on a daemon thread, Ctrl+Z suspend is simply
+    not available — which is correct for JARVIS (it manages its own lifecycle).
+    """
+
+    @staticmethod
+    def _safe_signal(signum, handler):
+        """Register a signal handler only if on the main thread."""
+        if threading.current_thread() is threading.main_thread():
+            return signal.signal(signum, handler)
+        return signal.getsignal(signum)  # return existing handler, no-op
+
+
+def _patch_driver_class():
+    """Create a thread-safe LinuxDriver by patching signal registration."""
+    try:
+        from textual.drivers.linux_driver import LinuxDriver
+
+        class ThreadSafeLinuxDriver(LinuxDriver):
+            def __init__(self, *args, **kwargs):
+                # Temporarily replace signal.signal with our safe version
+                _orig = signal.signal
+                signal.signal = _ThreadSafeLinuxDriver._safe_signal
+                try:
+                    super().__init__(*args, **kwargs)
+                finally:
+                    signal.signal = _orig
+
+        return ThreadSafeLinuxDriver
+    except ImportError:
+        return None
+
+
 class JarvisDashboard(App):
     """JARVIS Live Agent Dashboard."""
+
+    # Use our thread-safe driver that skips signal registration from daemon threads.
+    _thread_safe_driver = _patch_driver_class()
+    if _thread_safe_driver is not None:
+        driver_class = _thread_safe_driver
 
     TITLE = "JARVIS Dashboard"
     CSS = """
@@ -232,14 +279,11 @@ def start_dashboard() -> Optional[threading.Thread]:
 
         bus.subscribe("*", bus_handler)
 
-        # Run headless=True from daemon thread to avoid
-        # "signal only works in main thread" ValueError.
-        # Textual's headless driver skips SIGTSTP/SIGCONT registration.
-        _is_main_thread = threading.current_thread() is threading.main_thread()
-
+        # JarvisDashboard uses ThreadSafeLinuxDriver which skips signal
+        # registration from non-main threads. No headless mode needed.
         def _run_dashboard():
             try:
-                app.run(headless=not _is_main_thread)
+                app.run()
             except Exception as exc:
                 logger.warning("[TUI] Dashboard crashed: %s", exc)
 
@@ -249,7 +293,7 @@ def start_dashboard() -> Optional[threading.Thread]:
             daemon=True,
         )
         thread.start()
-        logger.info("[TUI] Dashboard started in daemon thread (headless=%s)", not _is_main_thread)
+        logger.info("[TUI] Dashboard started in daemon thread")
         return thread
     except Exception as exc:
         logger.warning("[TUI] Dashboard failed to start: %s", exc)
