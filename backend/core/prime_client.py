@@ -244,8 +244,15 @@ class PrimeClientConfig:
 
     @property
     def health_url(self) -> str:
-        """Get the health check URL."""
-        return f"http://{self.prime_host}:{self.prime_port}/health"
+        """Get the health check URL.
+
+        Uses /v1/models (OpenAI-compatible) as the health probe since
+        llama-cpp-python doesn't serve /health. Falls back to env override.
+        """
+        override = os.environ.get("JARVIS_PRIME_HEALTH_ENDPOINT")
+        if override:
+            return f"http://{self.prime_host}:{self.prime_port}{override}"
+        return f"http://{self.prime_host}:{self.prime_port}/v1/models"
 
     @property
     def vision_base_url(self) -> str:

@@ -534,7 +534,8 @@ class PrimeRouter:
             return RoutingDecision.GCP_PRIME
 
         # -- Priority 2: Cloud Claude (reliable paid fallback) --
-        if self._config.enable_cloud_fallback:
+        # Only route to cloud if the client is actually available (anthropic installed)
+        if self._config.enable_cloud_fallback and self._cloud_client is not None:
             return RoutingDecision.CLOUD_CLAUDE
 
         # -- Priority 3: Local Prime (last resort, blocked during emergency) --
