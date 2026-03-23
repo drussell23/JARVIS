@@ -7102,7 +7102,10 @@ async def system_health_watchdog():
                         100,
                         {
                             "success": True,
-                            "redirect_url": f"http://localhost:{config.frontend_port}",
+                            "redirect_url": await _resolve_redirect_url(
+                                frontend_port=config.frontend_port,
+                                backend_port=config.backend_port,
+                            ),
                             "backend_ready": True,
                             "frontend_ready": True,
                             "watchdog_triggered": True
@@ -7557,6 +7560,70 @@ async def main():
 
 
 # =============================================================================
+# Redirect URL Resolution
+# =============================================================================
+
+async def _resolve_redirect_url(
+    frontend_port: int = 3000,
+    backend_port: int = 8010,
+    timeout: float = 5.0,
+) -> str:
+    """Resolve the redirect URL after boot completion.
+
+    Precedence:
+    1. JARVIS_FRONTEND_URL env var
+    2. FRONTEND_URL env var (legacy)
+    3. JARVIS_FRONTEND_PROBE_URLS (comma-separated, concurrent probe)
+    4. Default probe: http://localhost:{frontend_port}
+    5. Fallback: API-only URL
+    """
+    # 1. Explicit override
+    url = os.getenv("JARVIS_FRONTEND_URL", "").strip()
+    if url:
+        return url
+
+    # 2. Legacy fallback
+    url = os.getenv("FRONTEND_URL", "").strip()
+    if url:
+        return url
+
+    # 3+4. Probe candidate URLs concurrently
+    probe_env = os.getenv("JARVIS_FRONTEND_PROBE_URLS", "").strip()
+    if probe_env:
+        candidates = [u.strip() for u in probe_env.split(",") if u.strip()]
+    else:
+        candidates = [f"http://localhost:{frontend_port}"]
+
+    async def _probe(session, candidate_url):
+        try:
+            async with session.get(
+                candidate_url,
+                timeout=aiohttp.ClientTimeout(total=3.0),
+            ) as resp:
+                if resp.status < 400:
+                    return candidate_url
+        except Exception:
+            pass
+        return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            tasks = [_probe(session, u) for u in candidates]
+            results = await asyncio.wait_for(
+                asyncio.gather(*tasks, return_exceptions=True),
+                timeout=timeout,
+            )
+            for r in results:
+                if isinstance(r, str):
+                    return r
+    except Exception:
+        pass
+
+    # 5. Fallback — no frontend responded
+    return f"http://localhost:{backend_port}"
+
+
+# =============================================================================
 # StartupProgressReporter - For start_system.py to import and use
 # =============================================================================
 
@@ -7695,7 +7762,10 @@ class StartupProgressReporter:
         success: bool = True
     ) -> bool:
         """Report startup complete"""
-        frontend_url = os.getenv('FRONTEND_URL', 'http://localhost:3000')
+        frontend_url = await _resolve_redirect_url(
+            frontend_port=config.frontend_port,
+            backend_port=config.backend_port,
+        )
         metadata = {
             "success": success,
             "redirect_url": redirect_url or frontend_url,
