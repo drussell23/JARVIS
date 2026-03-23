@@ -2326,6 +2326,49 @@ class UnifiedCommandProcessor:
             except Exception as exc:
                 logger.warning("[v295] Remote reasoning failed: %s — using local fallback", exc)
 
+        # Pillar 5: Agentic pre-route via IntentClassifier + RTO.
+        # If the Mind classifies the command as ACTION, dispatch to the
+        # RuntimeTaskOrchestrator directly — don't let J-Prime's
+        # classify_and_complete conflate classification with generation.
+        try:
+            from backend.core.intent_classifier import get_intent_classifier, CommandIntent
+            from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
+
+            _ic = get_intent_classifier()
+            _classification = await _ic.classify_async(command_text)
+
+            if _classification.intent == CommandIntent.ACTION:
+                _rto = get_runtime_task_orchestrator()
+                if _rto is not None:
+                    logger.info(
+                        "[Pillar5] IntentClassifier → ACTION (conf=%.2f, category=%s). "
+                        "Dispatching to RTO instead of J-Prime classify_and_complete.",
+                        _classification.confidence, _classification.action_category,
+                    )
+                    _rto_result = await _rto.execute(
+                        query=command_text,
+                        context={
+                            "intent": "action",
+                            "action_category": _classification.action_category,
+                            "provider": _classification.provider,
+                            "search_query": _classification.search_query,
+                            "target_app": _classification.target_app,
+                            "source": "unified_command_processor.pillar5_preroute",
+                        },
+                    )
+                    if _rto_result is not None:
+                        _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
+                        return {
+                            "success": True,
+                            "response": _summary,
+                            "command_type": "ACTION",
+                            "source": "rto_pillar5",
+                        }
+        except ImportError:
+            pass
+        except Exception as _ic_exc:
+            logger.debug("[Pillar5] IntentClassifier/RTO pre-route failed: %s", _ic_exc)
+
         response = await self._call_jprime(
             command_text, deadline=deadline, source_context=_jprime_ctx or None,
         )
