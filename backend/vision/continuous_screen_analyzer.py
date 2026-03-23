@@ -368,23 +368,34 @@ class MemoryAwareScreenAnalyzer:
                 logger.error("Error in monitoring loop: %s", e)
                 await asyncio.sleep(self.current_interval)
 
-    async def _phase1_capture_and_detect(self) -> Optional[Dict[str, Any]]:
+    async def _phase1_capture_and_detect(
+        self,
+        injected_image: Optional["Image.Image"] = None,
+        injected_timestamp: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
         """Phase 1: Lightweight capture + local detection (~7MB, never skip).
 
         Returns dict with capture data and whether full analysis is needed,
         or None if capture failed (display off, etc.).
+
+        When *injected_image* is provided the screencapture subprocess is
+        skipped entirely — the caller (e.g. VisionCortex / Ferrari Engine)
+        supplies the frame directly.  *injected_timestamp* preserves the
+        original capture time so there is no timing skew.
         """
-        capture_result = await self.vision_handler.capture_screen()
-        if capture_result is None:
-            return None
-
-        current_time = time.time()
-
-        # Convert to consistent format
-        if hasattr(capture_result, 'success'):
-            if not capture_result.success:
+        if injected_image is not None:
+            screenshot = injected_image
+        else:
+            capture_result = await self.vision_handler.capture_screen()
+            if capture_result is None:
                 return None
-        screenshot = capture_result
+
+            if hasattr(capture_result, 'success'):
+                if not capture_result.success:
+                    return None
+            screenshot = capture_result
+
+        current_time = injected_timestamp if injected_timestamp is not None else time.time()
 
         # Store capture with size tracking
         capture_data = {
@@ -481,6 +492,22 @@ class MemoryAwareScreenAnalyzer:
             'needs_full_analysis': needs_full or frame_diff_changed,
             'timestamp': current_time,
         }
+
+    async def inject_frame(
+        self, pil_image: "Image.Image", timestamp: float,
+    ) -> None:
+        """Accept an externally-captured frame (from Ferrari Engine via VisionCortex).
+
+        Runs the same Phase 1 fingerprinting + Phase 2 analysis pipeline as the
+        internal monitoring loop, but skips the screencapture subprocess.
+        The timestamp from the original capture is preserved (no timing skew).
+        """
+        phase1 = await self._phase1_capture_and_detect(
+            injected_image=pil_image,
+            injected_timestamp=timestamp,
+        )
+        if phase1 and phase1.get('needs_full_analysis'):
+            await self._phase2_analyze_if_memory_allows(phase1)
 
     async def _phase2_analyze_if_memory_allows(
         self, phase1: Dict[str, Any]
