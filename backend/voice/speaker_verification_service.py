@@ -4031,8 +4031,19 @@ class SpeakerVerificationService:
         if self.current_model_dimension is not None:
             return self.current_model_dimension
 
+        # Guard: engine must be initialized before we can probe it.
+        # If called before _start_background_preload completes, fall through
+        # to the except block which applies the 192D fallback.
+        if self.speechbrain_engine is None:
+            logger.warning(
+                "SpeechBrain engine not initialized — cannot detect dimension, "
+                "using 192D fallback. Dimension will be re-detected when engine is ready."
+            )
+            self.current_model_dimension = 192
+            return self.current_model_dimension
+
         try:
-            logger.info("🔍 Detecting current model embedding dimension...")
+            logger.info("Detecting current model embedding dimension...")
 
             # Create realistic test audio (pink noise for better model response)
             # Pink noise has more speech-like frequency distribution than white noise

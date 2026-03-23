@@ -208,6 +208,14 @@ def start_dashboard() -> Optional[threading.Thread]:
     """Start the TUI dashboard in a daemon thread.
 
     Returns the thread if started, None if no terminal.
+
+    Root cause fix (2026-03-22): Textual's LinuxDriver.__init__ calls
+    signal.signal(SIGTSTP, ...) which raises ValueError when not on the
+    main thread. The fix is to run with headless=True from a daemon thread —
+    this skips the signal handler registration while still rendering to the
+    terminal via the headless driver. The dashboard still receives telemetry
+    and updates panels; it just can't handle Ctrl+Z suspend/resume (which
+    is fine — JARVIS manages its own lifecycle).
     """
     if not sys.stdout.isatty():
         logger.info("[TUI] No terminal -- dashboard skipped")
@@ -224,13 +232,24 @@ def start_dashboard() -> Optional[threading.Thread]:
 
         bus.subscribe("*", bus_handler)
 
+        # Run headless=True from daemon thread to avoid
+        # "signal only works in main thread" ValueError.
+        # Textual's headless driver skips SIGTSTP/SIGCONT registration.
+        _is_main_thread = threading.current_thread() is threading.main_thread()
+
+        def _run_dashboard():
+            try:
+                app.run(headless=not _is_main_thread)
+            except Exception as exc:
+                logger.warning("[TUI] Dashboard crashed: %s", exc)
+
         thread = threading.Thread(
-            target=app.run,
+            target=_run_dashboard,
             name="jarvis-tui-dashboard",
             daemon=True,
         )
         thread.start()
-        logger.info("[TUI] Dashboard started in daemon thread")
+        logger.info("[TUI] Dashboard started in daemon thread (headless=%s)", not _is_main_thread)
         return thread
     except Exception as exc:
         logger.warning("[TUI] Dashboard failed to start: %s", exc)
