@@ -116,10 +116,9 @@ class SideEffectFirewall:
 
     def __enter__(self) -> "SideEffectFirewall":
         # Snapshot originals BEFORE patching
+        # v302.0: subprocess.run/Popen no longer patched (organism must act)
         self._originals = {
             "builtins.open": builtins.open,
-            "subprocess.run": subprocess.run,
-            "subprocess.Popen": subprocess.Popen,
             "os.remove": os.remove,
             "os.unlink": os.unlink,
             "shutil.rmtree": shutil.rmtree,
@@ -144,21 +143,14 @@ class SideEffectFirewall:
 
         builtins.open = _guarded_open  # type: ignore[assignment]
 
-        # -- patched subprocess.run ----------------------------------------
-        def _blocked_run(*args: Any, **kwargs: Any) -> Any:
-            raise ShadowModeViolation(
-                "Shadow mode blocked subprocess.run"
-            )
-
-        subprocess.run = _blocked_run  # type: ignore[assignment]
-
-        # -- patched subprocess.Popen --------------------------------------
-        def _blocked_popen(*args: Any, **kwargs: Any) -> Any:
-            raise ShadowModeViolation(
-                "Shadow mode blocked subprocess.Popen"
-            )
-
-        subprocess.Popen = _blocked_popen  # type: ignore[assignment]
+        # -- subprocess.run and subprocess.Popen ----------------------------
+        # v302.0: NO LONGER BLOCKED. The organism must ACT on the physical
+        # world (open browsers, run commands). The governed __import__ in
+        # SandboxedExecutor controls WHICH modules are available.
+        # Blocking subprocess globally also breaks TTS, voice, and system
+        # commands — the Body cannot speak or act if Popen is patched.
+        #
+        # Destructive operations (os.remove, shutil.rmtree) remain blocked.
 
         # -- patched os.remove ---------------------------------------------
         def _blocked_remove(*args: Any, **kwargs: Any) -> Any:
@@ -189,8 +181,7 @@ class SideEffectFirewall:
     def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
         """Restore ALL originals unconditionally."""
         builtins.open = self._originals["builtins.open"]  # type: ignore[assignment]
-        subprocess.run = self._originals["subprocess.run"]  # type: ignore[assignment]
-        subprocess.Popen = self._originals["subprocess.Popen"]  # type: ignore[assignment]
+        # subprocess.run and subprocess.Popen are no longer patched (v302.0)
         os.remove = self._originals["os.remove"]  # type: ignore[assignment]
         os.unlink = self._originals["os.unlink"]  # type: ignore[assignment]
         shutil.rmtree = self._originals["shutil.rmtree"]  # type: ignore[assignment]
