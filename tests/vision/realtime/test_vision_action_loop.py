@@ -339,3 +339,13 @@ class TestCoordsHint:
         )
         assert len(captured_queries) >= 1
         assert captured_queries[0].coords_hint == (50, 50)
+
+
+def test_frame_pipeline_property(loop):
+    """VisionCortex needs access to the frame pipeline."""
+    assert loop.frame_pipeline is not None
+
+
+def test_knowledge_fabric_property(loop):
+    """VisionCortex needs access to the knowledge fabric for L1 cache updates."""
+    assert loop.knowledge_fabric is not None

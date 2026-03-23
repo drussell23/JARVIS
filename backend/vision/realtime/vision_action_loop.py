@@ -115,6 +115,12 @@ class VisionActionLoop:
 
     Wires every vision subsystem into a coherent async pipeline.
 
+    Singleton access: the running instance self-registers on ``__init__``
+    so that any subsystem (RTO, Ouroboros, TelemetryBus) can retrieve it
+    via ``VisionActionLoop.get_instance()`` without import-time coupling.
+    This follows Manifesto §1 (Unified Organism): the nervous system must
+    be discoverable by any organ without hard-wired references.
+
     Parameters
     ----------
     use_sck:
@@ -123,6 +129,24 @@ class VisionActionLoop:
         Optional pre-built fabric instance.  Created automatically if
         ``None``.
     """
+
+    # --- Singleton registry (Manifesto §1: single nervous system) ---
+    _instance: Optional["VisionActionLoop"] = None
+
+    @classmethod
+    def get_instance(cls) -> Optional["VisionActionLoop"]:
+        """Return the running VisionActionLoop, or ``None`` if not started."""
+        return cls._instance
+
+    @classmethod
+    def set_instance(cls, instance: Optional["VisionActionLoop"]) -> None:
+        """Explicitly set (or clear) the singleton.
+
+        Called by the supervisor after construction.  Also called
+        automatically in ``__init__`` as a safety net so that callers
+        who bypass the supervisor factory still register.
+        """
+        cls._instance = instance
 
     def __init__(
         self,
@@ -144,6 +168,10 @@ class VisionActionLoop:
         # --- Metrics callback ---
         self.on_action_record: Optional[Callable[[dict], None]] = None
 
+        # --- Self-register singleton (Manifesto §1) ---
+        # The __init__ MUST self-register — callers WILL bypass factory.
+        VisionActionLoop._instance = self
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -152,6 +180,16 @@ class VisionActionLoop:
     def state(self) -> VisionState:
         """Current state of the underlying state machine."""
         return self._state_machine.state
+
+    @property
+    def frame_pipeline(self) -> "FramePipeline":
+        """The underlying frame capture pipeline. Used by VisionCortex for continuous awareness."""
+        return self._frame_pipeline
+
+    @property
+    def knowledge_fabric(self) -> "KnowledgeFabric":
+        """The scene graph fabric. Used by VisionCortex to populate L1 cache from continuous analysis."""
+        return self._knowledge_fabric
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -172,11 +210,15 @@ class VisionActionLoop:
         """Stop the loop and return to IDLE.
 
         Idempotent -- safe to call when already stopped.
+        Clears the singleton registry so stale references are not returned.
         """
         if self._state_machine.state == VisionState.IDLE:
             return
         await self._frame_pipeline.stop()
         self._state_machine.transition(VisionEvent.STOP)
+        # Clear singleton so get_instance() returns None while stopped.
+        if VisionActionLoop._instance is self:
+            VisionActionLoop._instance = None
         logger.info("VisionActionLoop stopped (state=%s)", self.state)
 
     # ------------------------------------------------------------------
