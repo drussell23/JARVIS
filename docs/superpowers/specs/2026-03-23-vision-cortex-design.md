@@ -71,7 +71,7 @@ unified_supervisor.py (Zone 6.5)
 
 ## Adaptive Perception Throttle
 
-Perception intensity adapts to environmental stimulus (Manifesto §6). The throttle computes a `content_change_rate` from Phase 1 fingerprint diffs over a 60-second sliding window.
+Perception intensity adapts to environmental stimulus (Manifesto §6). The throttle computes a `content_change_rate` from Phase 1 fingerprint diffs over a 60-second sliding window, stored as a `collections.deque(maxlen=120)` of `(timestamp, changed: bool)` tuples — bounded memory regardless of activity level.
 
 | Level | Rate threshold | Phase 1 interval | Phase 2 | Description |
 |-------|---------------|-------------------|---------|-------------|
@@ -89,13 +89,27 @@ All thresholds sourced from env vars:
 - `VISION_CORTEX_NORMAL_INTERVAL` (default `3.0`)
 - `VISION_CORTEX_HIGH_INTERVAL` (default `1.0`)
 
-**Memory pressure override:** If process RSS exceeds `VISION_MEMORY_LIMIT_MB` (default 1500), the throttle forces IDLE regardless of activity.
+**Memory pressure override:** If process RSS exceeds `VISION_MEMORY_LIMIT_MB` (default 1500), the throttle forces IDLE regardless of activity. Note: this is the same env var used by MemoryAwareScreenAnalyzer for its own memory gating — both read a single process RSS value, which is correct since they share one process.
 
 **Phase 2 gating:** Even in HIGH mode, Phase 2 only fires when the content fingerprint actually changed (existing `content_similarity_threshold=0.92`).
 
 ## Frame Bridge: Ferrari Engine → MemoryAwareScreenAnalyzer
 
-The perception loop reads from Ferrari Engine's frame queue and injects frames into the analyzer.
+### Frame access: last-frame cache (no queue contention)
+
+VisionCortex does NOT call `get_frame()` on FramePipeline's queue. `get_frame()` is a destructive dequeue — if VisionCortex consumed a frame, VisionActionLoop's `execute_action()` could miss it during pre-action or verification captures, causing INCONCLUSIVE verifications.
+
+Instead, FramePipeline exposes a **`latest_frame`** property — a non-destructive read of the most recently enqueued frame. FramePipeline stores `self._latest_frame: Optional[FrameData]` on every `_enqueue_frame()` call (~5 lines added). VisionCortex reads this property; VisionActionLoop keeps using `get_frame()` from the queue. Zero contention.
+
+```python
+# In FramePipeline (new, ~5 lines):
+@property
+def latest_frame(self) -> Optional[FrameData]:
+    """Non-destructive read of the most recent frame. Thread-safe."""
+    return self._latest_frame
+```
+
+### Perception loop
 
 ```python
 async def _perception_loop(self):
@@ -103,8 +117,8 @@ async def _perception_loop(self):
         interval = self._compute_interval()
         await asyncio.sleep(interval)
 
-        # Read latest frame from Ferrari Engine
-        frame = await self._frame_pipeline.get_frame(timeout_s=0.5)
+        # Non-destructive read — does NOT consume from queue
+        frame = self._frame_pipeline.latest_frame
         if frame is None:
             continue
 
@@ -117,7 +131,7 @@ async def _perception_loop(self):
 
 **Fallback:** If Ferrari Engine is unavailable (no SCK, no screen recording permission), VisionCortex starts MemoryAwareScreenAnalyzer with its own `_monitoring_loop()` using `screencapture` subprocess.
 
-**Queue sharing:** Both VisionCortex and VisionActionLoop read from the same frame queue. The 30fps supply vastly exceeds the 0.1-1fps analysis demand. Drop-oldest semantics ensure VisionActionLoop always gets fresh frames.
+**No queue contention:** VisionCortex reads `latest_frame` (non-destructive). VisionActionLoop reads `get_frame()` (destructive dequeue). They never compete for the same frame.
 
 ## Callback Wiring
 
@@ -137,8 +151,16 @@ VisionCortex registers itself as a callback consumer on both MemoryAwareScreenAn
 
 ### Workspace events (from MultiSpaceMonitor)
 
-| Event | Action |
-|-------|--------|
+VisionCortex registers handlers via `monitor.register_event_handler(event_type, handler)` for each `MonitorEventType` it cares about. Handlers receive a single `MonitorEvent` dataclass argument (not a tuple):
+
+```python
+async def _on_workspace_event(self, event: MonitorEvent) -> None:
+```
+
+Registered event types:
+
+| MonitorEventType | Action |
+|------------------|--------|
 | `SPACE_SWITCHED` | Force immediate Phase 1 capture (new space = new content) |
 | `APP_LAUNCHED` / `APP_CLOSED` / `APP_MOVED` | Feed context to analyzer |
 | `WORKFLOW_DETECTED` | TelemetryBus + ConsciousnessBridge record |
@@ -168,12 +190,21 @@ if _get_env_bool("JARVIS_VISION_CORTEX_ENABLED",
     try:
         from backend.vision.realtime.vision_cortex import VisionCortex
         self._vision_cortex = VisionCortex()
+        VisionCortex.set_instance(self._vision_cortex)
         await asyncio.wait_for(
             self._vision_cortex.awaken(),
             timeout=_get_env_float("JARVIS_VISION_CORTEX_START_TIMEOUT", 10.0),
         )
-    except (asyncio.TimeoutError, ImportError, Exception) as exc:
+    except asyncio.TimeoutError:
+        logger.warning("[VisionCortex] Start timed out — continuing without")
+        VisionCortex.set_instance(None)
+        self._vision_cortex = None
+    except ImportError as ie:
+        logger.info("[VisionCortex] Not available: %s", ie)
+        self._vision_cortex = None
+    except Exception as exc:
         logger.warning("[VisionCortex] Start failed: %s — continuing without", exc)
+        VisionCortex.set_instance(None)
         self._vision_cortex = None
 ```
 
@@ -216,7 +247,7 @@ class VisionCortex:
 
     # Callback dispatchers (no if/elif chains)
     async def _on_screen_event(event_type: str, data: dict) -> None
-    async def _on_workspace_event(event_type, data) -> None
+    async def _on_workspace_event(event: MonitorEvent) -> None
 
     # Frame bridge
     async def _inject_frame_to_analyzer(frame: FrameData) -> None
@@ -230,17 +261,29 @@ class VisionCortex:
     @property is_awake -> bool
 ```
 
-### Modified files (3)
+### Modified files (4)
 
-**`backend/vision/continuous_screen_analyzer.py`** (~30 lines added)
-- Add `inject_frame(pil_image: Image, timestamp: float)` method
-- Runs Phase 1 fingerprinting + Phase 2 analysis on the injected frame
-- Same logic as internal `_capture_and_analyze()` but skips the `screencapture` subprocess call
+**`backend/vision/continuous_screen_analyzer.py`** (~40 lines added)
+- Refactor `_phase1_capture_and_detect()` to accept optional `injected_image: Optional[Image.Image] = None` parameter
+- When `injected_image` is provided, skip the `capture_screen()` call and use the injected image directly
+- All subsequent logic (fingerprinting, `_quick_screen_analysis()` for focused app via NSWorkspace, event firing) runs identically
+- Add thin public `inject_frame()` wrapper:
+  ```python
+  async def inject_frame(self, pil_image: Image.Image, timestamp: float) -> None:
+      phase1 = await self._phase1_capture_and_detect(injected_image=pil_image)
+      if phase1 and phase1.get('needs_full_analysis'):
+          await self._phase2_analyze_if_memory_allows(phase1)
+  ```
 
-**`unified_supervisor.py`** (~25 lines added at Zone 6.5)
+**`backend/vision/realtime/frame_pipeline.py`** (~8 lines added)
+- Add `self._latest_frame: Optional[FrameData] = None` in `__init__`
+- Set `self._latest_frame = frame` in `_enqueue_frame()` before queue insertion
+- Add `@property latest_frame` — non-destructive read for VisionCortex
+
+**`unified_supervisor.py`** (~30 lines added at Zone 6.5)
 - After VisionActionLoop start, create and awaken VisionCortex
-- Same try/except/timeout pattern as VisionActionLoop
-- Failure paths clear singleton
+- Three-branch exception pattern (TimeoutError, ImportError, Exception) matching VisionActionLoop
+- Failure paths clear singleton via `VisionCortex.set_instance(None)`
 
 **`backend/vision/realtime/vision_action_loop.py`** (~6 lines added)
 - Add `@property frame_pipeline` — exposes `_frame_pipeline` for VisionCortex to share the frame source
@@ -248,7 +291,6 @@ class VisionCortex:
 
 ### Not modified
 
-- FramePipeline — unchanged, VisionCortex reads its queue
 - VisionRouter — unchanged, VisionCortex calls it for Phase 2
 - ActionExecutor / Ghost Hands — unchanged
 - ActionVerifier — unchanged
@@ -282,4 +324,5 @@ All existing `VISION_*` env vars from MemoryAwareScreenAnalyzer, FramePipeline, 
 - Test callback wiring: fire screen events, verify voice/telemetry dispatched
 - Test graceful degradation: start without Ferrari Engine, verify screencapture fallback
 - Test failure isolation: crash analyzer mid-loop, verify cortex continues
+- Test frame contention: VisionCortex reads `latest_frame` while VisionActionLoop calls `get_frame()` concurrently — verify VisionActionLoop always gets its frames for pre-action and verification captures
 - Existing VisionActionLoop tests pass unchanged (14/14)
