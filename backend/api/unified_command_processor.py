@@ -2326,35 +2326,40 @@ class UnifiedCommandProcessor:
             except Exception as exc:
                 logger.warning("[v295] Remote reasoning failed: %s — using local fallback", exc)
 
-        # Pillar 5: Agentic pre-route via IntentClassifier + RTO.
-        # If the Mind classifies the command as ACTION, dispatch to the
-        # RuntimeTaskOrchestrator directly — don't let J-Prime's
-        # classify_and_complete conflate classification with generation.
+        # Pillar 5 + Pillar 2: Reflex-arc pre-route to RTO.
+        # Use instant reflex classification (<1ms) to detect ACTION commands,
+        # then dispatch directly to the RTO — bypassing J-Prime's slow
+        # classify_and_complete which conflates thinking with doing.
+        # The RTO will use J-Prime for planning/synthesis with its own budget.
         try:
             from backend.core.intent_classifier import get_intent_classifier, CommandIntent
             from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
 
-            _ic = get_intent_classifier()
-            _classification = await _ic.classify_async(command_text)
+            _rto = get_runtime_task_orchestrator()
+            if _rto is not None:
+                _ic = get_intent_classifier()
+                _classification = _ic.classify(command_text)  # Reflex: <1ms, no J-Prime call
 
-            if _classification.intent == CommandIntent.ACTION:
-                _rto = get_runtime_task_orchestrator()
-                if _rto is not None:
+                if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
                     logger.info(
-                        "[Pillar5] IntentClassifier → ACTION (conf=%.2f, category=%s). "
-                        "Dispatching to RTO instead of J-Prime classify_and_complete.",
+                        "[Pillar5] Reflex → ACTION (conf=%.2f, category=%s, provider=%s). "
+                        "Dispatching to RTO.",
                         _classification.confidence, _classification.action_category,
+                        _classification.provider,
                     )
-                    _rto_result = await _rto.execute(
-                        query=command_text,
-                        context={
-                            "intent": "action",
-                            "action_category": _classification.action_category,
-                            "provider": _classification.provider,
-                            "search_query": _classification.search_query,
-                            "target_app": _classification.target_app,
-                            "source": "unified_command_processor.pillar5_preroute",
-                        },
+                    _rto_result = await asyncio.wait_for(
+                        _rto.execute(
+                            query=command_text,
+                            context={
+                                "intent": "action",
+                                "action_category": _classification.action_category,
+                                "provider": _classification.provider,
+                                "search_query": _classification.search_query,
+                                "target_app": _classification.target_app,
+                                "source": "unified_command_processor.pillar5_preroute",
+                            },
+                        ),
+                        timeout=60.0,  # RTO gets its own generous budget
                     )
                     if _rto_result is not None:
                         _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
@@ -2366,6 +2371,8 @@ class UnifiedCommandProcessor:
                         }
         except ImportError:
             pass
+        except asyncio.TimeoutError:
+            logger.warning("[Pillar5] RTO execution timed out after 60s")
         except Exception as _ic_exc:
             logger.debug("[Pillar5] IntentClassifier/RTO pre-route failed: %s", _ic_exc)
 

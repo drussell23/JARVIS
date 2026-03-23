@@ -371,8 +371,10 @@ class MindClient:
     # ------------------------------------------------------------------
 
     async def check_health(self) -> Dict[str, Any]:
-        """GET /v1/reason/health — returns {status, protocol_version, brains_loaded}.
+        """Health check via /v1/models (OpenAI-compatible).
 
+        Uses /v1/models instead of /v1/reason/health because llama-cpp-python
+        on the GCP golden image doesn't serve the reason endpoint.
         Records success/failure in the state machine and circuit breaker.
         Raises the underlying exception on failure (callers may catch it).
         """
@@ -381,9 +383,11 @@ class MindClient:
                 f"[MindClient] Circuit OPEN — health check blocked "
                 f"(cooldown {self._circuit._cooldown_s}s not elapsed)"
             )
+        import os
+        _health_path = os.environ.get("JARVIS_PRIME_HEALTH_ENDPOINT", "/v1/models")
         try:
             result = await self._http_get(
-                "/v1/reason/health",
+                _health_path,
                 timeout=_env_float("MIND_CLIENT_HEALTH_TIMEOUT", 10.0),
             )
             self._circuit.record_success()
