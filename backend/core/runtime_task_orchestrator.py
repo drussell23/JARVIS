@@ -185,6 +185,25 @@ class RuntimeTaskOrchestrator:
         # This feeds: EliteDashboard ticker, LifecycleVoiceNarrator, ConsciousnessBridge
         self._emit_task_telemetry(result)
 
+        # --- Step 5.5: Voice feedback — tell the user what happened ---
+        # v305.0: Fire-and-forget voice announcement on success so the user
+        # gets audible confirmation that JARVIS completed their request.
+        if result.success:
+            asyncio.create_task(
+                self._speak_completion(result),
+                name=f"voice_completion_{task_id}",
+            )
+
+        # --- Step 5.6: Graduation analysis — offer persistence for synthesized tools ---
+        # v305.0: If any step synthesized an ephemeral tool, check whether it
+        # should be proposed for permanent assimilation (Symbiotic Manifesto §6).
+        _synthesized_steps = [s for s in executed if s.synthesized and s.error is None]
+        if _synthesized_steps:
+            asyncio.create_task(
+                self._analyze_and_offer_persistence(result, _synthesized_steps),
+                name=f"graduation_{task_id}",
+            )
+
         return result
 
     # -----------------------------------------------------------------------
@@ -959,20 +978,152 @@ class RuntimeTaskOrchestrator:
 
     @staticmethod
     def _build_summary(query: str, steps: List[StepResolution]) -> str:
-        """Build a human-readable summary of what happened."""
+        """Build a natural, speakable summary of what happened.
+
+        v305.0: Rewritten to produce human-readable text that sounds good
+        via TTS, not robot metrics like "1/1 steps completed | 0 failed".
+        This text goes to the frontend via WebSocket and gets spoken aloud.
+        """
         total = len(steps)
         succeeded = sum(1 for s in steps if s.error is None)
         failed = total - succeeded
         synthesized = sum(1 for s in steps if s.synthesized)
 
-        parts = [f"{succeeded}/{total} steps completed"]
-        if synthesized:
-            parts.append(f"{synthesized} tool(s) synthesized on-the-fly")
-        if failed:
-            errors = [s.error for s in steps if s.error]
-            parts.append(f"{failed} failed: {'; '.join(errors[:3])}")
+        if failed == 0:
+            # All good — natural completion message
+            agents = [s.agent_name for s in steps if s.agent_name]
+            if total == 1 and agents:
+                summary = f"Done. Handled via {agents[0]}."
+            elif total == 1:
+                summary = f"Done."
+            else:
+                summary = f"Done. All {total} steps completed."
 
-        return " | ".join(parts)
+            if synthesized > 0:
+                summary += f" {synthesized} tool{'s' if synthesized > 1 else ''} synthesized on the fly."
+        else:
+            # Partial failure
+            if succeeded > 0:
+                summary = f"Partially done. {succeeded} of {total} steps succeeded."
+            else:
+                errors = [s.error for s in steps if s.error]
+                summary = f"That didn't work. {errors[0]}" if errors else "That didn't work."
+
+        return summary
+
+    # -----------------------------------------------------------------------
+    # Step 5.5: Voice completion feedback
+    # -----------------------------------------------------------------------
+
+    async def _speak_completion(self, result: TaskResult) -> None:
+        """Speak a brief completion message so the user gets audible feedback.
+
+        v305.0: Fire-and-forget — never blocks task return. Uses safe_say
+        which routes through say -o tempfile → afplay (no GIL, no device contention).
+        """
+        try:
+            from backend.core.supervisor.unified_voice_orchestrator import safe_say
+
+            # Build a natural, concise spoken summary
+            query_short = result.original_query[:60]
+            n_steps = len(result.steps)
+            agents = [s.agent_name for s in result.steps if s.agent_name]
+            synthesized = sum(1 for s in result.steps if s.synthesized)
+
+            if n_steps == 1 and agents:
+                msg = f"Done. Handled via {agents[0]}."
+            elif synthesized > 0:
+                msg = f"Done. Completed {n_steps} steps, {synthesized} synthesized on the fly."
+            else:
+                msg = f"Done. {n_steps} steps completed for: {query_short}."
+
+            await safe_say(
+                msg,
+                source="runtime_task_completion",
+                skip_dedup=True,  # Always speak task results
+            )
+        except Exception as exc:
+            logger.debug("[RuntimeTask] Voice completion failed (non-fatal): %s", exc)
+
+    # -----------------------------------------------------------------------
+    # Step 5.6: Graduation — ephemeral tool persistence analysis
+    # -----------------------------------------------------------------------
+
+    async def _analyze_and_offer_persistence(
+        self,
+        result: TaskResult,
+        synthesized_steps: List[StepResolution],
+    ) -> None:
+        """Check if synthesized ephemeral tools should be offered for permanent assimilation.
+
+        Symbiotic Manifesto §6 — Threshold-Triggered Neuroplasticity:
+        If an ephemeral tool is requested 3+ times, propose permanent integration.
+        Tracked via a simple file-based counter in .jarvis/ouroboros/graduation/.
+
+        v305.0: Fire-and-forget — never blocks task return.
+        """
+        try:
+            from pathlib import Path
+            import json as _json
+
+            grad_dir = Path.home() / ".jarvis" / "ouroboros" / "graduation"
+            grad_dir.mkdir(parents=True, exist_ok=True)
+            ledger_path = grad_dir / "ephemeral_usage.json"
+
+            # Load or init ledger
+            ledger: Dict[str, int] = {}
+            if ledger_path.exists():
+                try:
+                    ledger = _json.loads(ledger_path.read_text())
+                except Exception:
+                    ledger = {}
+
+            graduation_threshold = int(os.environ.get("JARVIS_GRADUATION_THRESHOLD", "3"))
+            candidates = []
+
+            for step in synthesized_steps:
+                key = step.capability_used or step.step_goal
+                ledger[key] = ledger.get(key, 0) + 1
+                if ledger[key] >= graduation_threshold:
+                    candidates.append(key)
+
+            # Persist updated counts
+            ledger_path.write_text(_json.dumps(ledger, indent=2))
+
+            if candidates:
+                from backend.core.supervisor.unified_voice_orchestrator import safe_say
+
+                names = ", ".join(candidates[:3])
+                msg = (
+                    f"I've used {names} {graduation_threshold} or more times now. "
+                    f"Want me to create a persistent agent and open a PR?"
+                )
+                await safe_say(msg, source="graduation_offer", skip_dedup=True)
+
+                # Emit telemetry for dashboard visibility
+                if self._bus is not None:
+                    from backend.core.telemetry_contract import TelemetryEnvelope
+                    envelope = TelemetryEnvelope.create(
+                        event_schema="graduation.offer@1.0.0",
+                        source="runtime_task_orchestrator",
+                        trace_id=result.task_id,
+                        span_id="graduation_offer",
+                        partition_key="reasoning",
+                        payload={
+                            "candidates": candidates,
+                            "threshold": graduation_threshold,
+                            "query": result.original_query[:200],
+                        },
+                    )
+                    self._bus.emit(envelope)
+
+                logger.info(
+                    "[RuntimeTask] Graduation candidates: %s (threshold=%d)",
+                    candidates, graduation_threshold,
+                )
+
+        except Exception as exc:
+            logger.debug("[RuntimeTask] Graduation analysis failed (non-fatal): %s", exc)
 
     # -----------------------------------------------------------------------
     # Step 5: Telemetry — Trinity-wide observability
@@ -989,6 +1140,22 @@ class RuntimeTaskOrchestrator:
         try:
             from backend.core.telemetry_contract import TelemetryEnvelope
             agents_used = [s.agent_name for s in result.steps if s.agent_name]
+            # v305.0: Emit task.completed schema so LifecycleVoiceNarrator can
+            # pick up the summary for narration (it now filters to this event).
+            task_envelope = TelemetryEnvelope.create(
+                event_schema="task.completed@1.0.0",
+                source="runtime_task_orchestrator",
+                trace_id=result.task_id,
+                span_id="task_completed",
+                partition_key="reasoning",
+                payload={
+                    "summary": result.summary,
+                    "success": result.success,
+                    "query": result.original_query[:200],
+                },
+            )
+            self._bus.emit(task_envelope)
+
             envelope = TelemetryEnvelope.create(
                 event_schema="reasoning.decision@1.0.0",
                 source="runtime_task_orchestrator",

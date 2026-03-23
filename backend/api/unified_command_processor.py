@@ -2156,13 +2156,14 @@ class UnifiedCommandProcessor:
                     _p5log(f"RTO result: {_rto_result}")
 
                     if _rto_result is not None:
-                        _has_error = False
-                        if hasattr(_rto_result, 'steps'):
-                            for _step in _rto_result.steps:
-                                _sr = getattr(_step, 'result', {}) or {}
-                                if isinstance(_sr, dict) and _sr.get('error'):
-                                    _has_error = True
-                                    _p5log(f"Step error: {_sr['error']}")
+                        # v305.0: Use TaskResult.success (checks StepResolution.error
+                        # field) instead of drilling into step.result dicts. The old
+                        # check falsely flagged steps as errored when their result dict
+                        # had an 'error' key set to None/empty, causing the pipeline to
+                        # fall through to J-Prime even on successful RTO execution.
+                        _has_error = not getattr(_rto_result, 'success', False)
+                        if _has_error:
+                            _p5log(f"RTO reported failure: {_rto_result.summary if hasattr(_rto_result, 'summary') else _rto_result}")
 
                         if not _has_error:
                             _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)

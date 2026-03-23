@@ -98,12 +98,27 @@ class TestLifecycleVoiceNarrator:
             assert n._task is None
 
     @pytest.mark.asyncio
-    async def test_envelope_lifecycle_transition(self):
+    async def test_envelope_lifecycle_transition_ignored(self):
+        """v305.0: Routine lifecycle transitions are no longer narrated
+        (they caused false-positive announcements). Only fault.raised
+        and task.completed events are narrated now."""
         n = LifecycleVoiceNarrator(enabled=True)
 
         class FakeEnvelope:
             event_schema = "lifecycle.transition@1.0.0"
             payload = {"from_state": "PROBING", "to_state": "READY"}
+
+        await n._on_envelope(FakeEnvelope())
+        assert n._queue.qsize() == 0  # no longer narrated
+
+    @pytest.mark.asyncio
+    async def test_envelope_task_completed(self):
+        """v305.0: task.completed events ARE narrated."""
+        n = LifecycleVoiceNarrator(enabled=True)
+
+        class FakeEnvelope:
+            event_schema = "task.completed@1.0.0"
+            payload = {"summary": "Done. Searched YouTube for NBA.", "success": True}
 
         await n._on_envelope(FakeEnvelope())
         assert n._queue.qsize() == 1

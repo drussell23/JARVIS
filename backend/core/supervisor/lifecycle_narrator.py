@@ -312,65 +312,30 @@ class LifecycleVoiceNarrator:
     # ------------------------------------------------------------------
 
     async def _on_envelope(self, envelope: Any) -> None:
-        """Handle a TelemetryEnvelope from the bus."""
+        """Handle a TelemetryEnvelope from the bus.
+
+        v305.0: Stripped down to user-relevant events only.
+        Removed: routine lifecycle transitions (PROBING/DEGRADED/DEAD cycle
+        spammed every health check), proactive drive chatter, agent graph
+        state, and recovery attempts. These caused constant false-positive
+        announcements. Only fault.raised and task completion are narrated now.
+        Startup-complete narration is handled separately via narrate_startup_complete().
+        """
         try:
             schema = envelope.event_schema
             payload = envelope.payload
 
-            if schema.startswith("lifecycle.transition"):
-                to_state = payload.get("to_state", "")
-                templates = _LIFECYCLE_MESSAGES.get(to_state)
-                if templates:
-                    self.enqueue(
-                        random.choice(templates),
-                        NarrationPriority.NORMAL,
-                        category=f"lifecycle:{to_state}",
-                    )
-
-            elif schema.startswith("fault.raised"):
+            # Only narrate genuine faults (not routine state churn)
+            if schema.startswith("fault.raised"):
                 fault_class = payload.get("fault_class", "unknown fault")
                 msg = random.choice(_FAULT_MESSAGES).format(detail=fault_class)
                 self.enqueue(msg, NarrationPriority.HIGH, category="fault")
 
-            elif schema.startswith("fault.resolved"):
-                self.enqueue(
-                    random.choice(_RECOVERY_MESSAGES),
-                    NarrationPriority.HIGH,
-                    category="recovery",
-                )
-
-            elif schema.startswith("recovery.attempt"):
-                target = payload.get("target", "component")
-                self.enqueue(
-                    f"Recovery attempt on {target}.",
-                    NarrationPriority.HIGH,
-                    category="recovery",
-                )
-
-            elif schema.startswith("reasoning.proactive_drive"):
-                state = payload.get("state", "")
-                if state == "ELIGIBLE":
-                    self.enqueue(
-                        "Proactive exploration opportunity detected.",
-                        NarrationPriority.NORMAL,
-                        category="proactive",
-                    )
-                elif state == "EXPLORING":
-                    self.enqueue(
-                        "Beginning autonomous exploration.",
-                        NarrationPriority.NORMAL,
-                        category="proactive",
-                    )
-
-            elif schema.startswith("scheduler.graph_state"):
-                total = payload.get("total_agents", 0)
-                init = payload.get("initialized", 0)
-                if total > 0 and init == total:
-                    self.enqueue(
-                        f"All {total} agents initialized and reporting.",
-                        NarrationPriority.NORMAL,
-                        category="agents_ready",
-                    )
+            # Task completion narration (fed by RuntimeTaskOrchestrator)
+            elif schema.startswith("task.completed"):
+                summary = payload.get("summary", "")
+                if summary:
+                    self.enqueue(summary, NarrationPriority.HIGH, category="task_complete")
 
         except Exception as exc:
             logger.debug("[LifecycleNarrator] Envelope handler error: %s", exc)

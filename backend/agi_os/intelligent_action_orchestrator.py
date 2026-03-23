@@ -207,7 +207,7 @@ class IntelligentActionOrchestrator:
             'narrate_all_detections': os.getenv(
                 'JARVIS_ORCH_NARRATE_ALL', '').lower() in ('1', 'true', 'yes'),
             'narrate_high_confidence': os.getenv(
-                'JARVIS_ORCH_NARRATE_HIGH', '1').lower() not in ('0', 'false', 'no'),
+                'JARVIS_ORCH_NARRATE_HIGH', '0').lower() not in ('0', 'false', 'no'),
             'enable_proactive_loop': _orch_env_bool(
                 'JARVIS_ORCH_PROACTIVE_ENABLED', True),
             'proactive_interval_seconds': max(

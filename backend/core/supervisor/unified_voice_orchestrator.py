@@ -1508,11 +1508,15 @@ async def safe_say(
             logger.debug("[safe_say:%s] Error: %s", source, exc)
             return False
         finally:
-            # 4. Cleanup tempfile
+            # 4. Cleanup tempfile — small delay to let CoreAudio HAL
+            # finish reading the file. afplay.wait() returns when the
+            # process exits, but the HAL may still have pending reads.
+            # v305.0: 150ms buffer prevents silent playback failures.
             if _temp_path:
                 try:
+                    await asyncio.sleep(0.15)
                     os.unlink(_temp_path)
-                except OSError:
+                except (OSError, asyncio.CancelledError):
                     pass
 
     # 5. Acquire global speech gate (one voice at a time)

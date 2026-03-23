@@ -442,8 +442,17 @@ class ProactiveEventStream:
         # Find relevant subscriptions
         relevant_subs = self._get_relevant_subscriptions(event)
 
-        # Narrate if needed
-        if event.requires_narration or event.priority.value >= EventPriority.HIGH.value:
+        # Narrate if needed — only CRITICAL events auto-narrate.
+        # v305.0: HIGH and below were causing false-positive announcements
+        # (generic "event occurred" text when data was missing). Gate with
+        # JARVIS_AGI_NARRATION_ENABLED env var (default: false).
+        _agi_narration_enabled = os.environ.get(
+            "JARVIS_AGI_NARRATION_ENABLED", "false"
+        ).lower() in ("true", "1", "yes")
+        if _agi_narration_enabled and (
+            event.requires_narration
+            and event.priority.value >= EventPriority.CRITICAL.value
+        ):
             await self._narrate_event(event)
 
         # Call handlers
