@@ -2326,55 +2326,121 @@ class UnifiedCommandProcessor:
             except Exception as exc:
                 logger.warning("[v295] Remote reasoning failed: %s — using local fallback", exc)
 
-        # Pillar 5 + Pillar 2: Reflex-arc pre-route to RTO.
-        # Use instant reflex classification (<1ms) to detect ACTION commands,
-        # then dispatch directly to the RTO — bypassing J-Prime's slow
-        # classify_and_complete which conflates thinking with doing.
-        # The RTO will use J-Prime for planning/synthesis with its own budget.
+        # Pillar 5 + Pillar 2: Reflex-arc pre-route.
+        # Use instant reflex classification (<1ms) to detect ACTION commands.
+        # If RTO is available, dispatch there. Otherwise, execute directly
+        # via ApplicationLauncherExecutor (browser actions) or system controller.
         try:
             from backend.core.intent_classifier import get_intent_classifier, CommandIntent
-            from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
 
-            _rto = get_runtime_task_orchestrator()
-            if _rto is not None:
-                _ic = get_intent_classifier()
-                _classification = _ic.classify(command_text)  # Reflex: <1ms, no J-Prime call
+            _ic = get_intent_classifier()
+            _classification = _ic.classify(command_text)  # Reflex: <1ms
 
-                if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
-                    logger.info(
-                        "[Pillar5] Reflex → ACTION (conf=%.2f, category=%s, provider=%s). "
-                        "Dispatching to RTO.",
-                        _classification.confidence, _classification.action_category,
-                        _classification.provider,
-                    )
-                    _rto_result = await asyncio.wait_for(
-                        _rto.execute(
-                            query=command_text,
-                            context={
-                                "intent": "action",
-                                "action_category": _classification.action_category,
-                                "provider": _classification.provider,
-                                "search_query": _classification.search_query,
-                                "target_app": _classification.target_app,
-                                "source": "unified_command_processor.pillar5_preroute",
-                            },
-                        ),
-                        timeout=60.0,  # RTO gets its own generous budget
-                    )
-                    if _rto_result is not None:
-                        _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
+            if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
+                logger.info(
+                    "[Pillar5] Reflex → ACTION (conf=%.2f, category=%s, provider=%s, "
+                    "search_query=%s, target_app=%s)",
+                    _classification.confidence, _classification.action_category,
+                    _classification.provider, _classification.search_query,
+                    _classification.target_app,
+                )
+
+                # Try RTO first (full Ouroboros path)
+                try:
+                    from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
+                    _rto = get_runtime_task_orchestrator()
+                    if _rto is not None:
+                        logger.info("[Pillar5] Dispatching to RTO")
+                        _rto_result = await asyncio.wait_for(
+                            _rto.execute(
+                                query=command_text,
+                                context={
+                                    "intent": "action",
+                                    "action_category": _classification.action_category,
+                                    "provider": _classification.provider,
+                                    "search_query": _classification.search_query,
+                                    "target_app": _classification.target_app,
+                                    "source": "pillar5_preroute",
+                                },
+                            ),
+                            timeout=60.0,
+                        )
+                        if _rto_result is not None:
+                            _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
+                            return {
+                                "success": True,
+                                "response": _summary,
+                                "command_type": "ACTION",
+                                "source": "rto_pillar5",
+                            }
+                except Exception as _rto_exc:
+                    logger.info("[Pillar5] RTO unavailable (%s), using direct execution", _rto_exc)
+
+                # Direct execution fallback — browser search actions
+                if _classification.action_category == "browser" and _classification.search_query:
+                    try:
+                        from backend.api.action_executors import ApplicationLauncherExecutor
+                        from backend.api.workflow_engine import ExecutionContext
+                        from datetime import datetime as _dt
+
+                        _launcher = ApplicationLauncherExecutor()
+                        _ctx = ExecutionContext(
+                            workflow_id="pillar5_direct",
+                            start_time=_dt.now(),
+                            user_id="voice",
+                        )
+                        _provider = _classification.provider or "google"
+                        _query = _classification.search_query
+
+                        # Resolve search URL via AI or construct directly
+                        _search_url = await _launcher.resolve_search_url(_provider, _query)
+                        if _search_url:
+                            await _launcher._open_url_in_browser(
+                                _search_url, _provider, _ctx,
+                                message=f"Searching {_provider} for {_query}",
+                            )
+                            logger.info(
+                                "[Pillar5] Direct execution: opened %s", _search_url
+                            )
+                            return {
+                                "success": True,
+                                "response": f"Searching {_provider} for {_query}",
+                                "command_type": "ACTION",
+                                "source": "pillar5_direct_browser",
+                            }
+                    except Exception as _direct_exc:
+                        logger.warning("[Pillar5] Direct browser execution failed: %s", _direct_exc)
+
+                # Direct execution fallback — app control
+                if _classification.action_category == "app_control" and _classification.target_app:
+                    try:
+                        from backend.api.action_executors import ApplicationLauncherExecutor
+                        from backend.api.workflow_parser import WorkflowAction, ActionType
+                        from backend.api.workflow_engine import ExecutionContext
+                        from datetime import datetime as _dt
+
+                        _launcher = ApplicationLauncherExecutor()
+                        _ctx = ExecutionContext(
+                            workflow_id="pillar5_direct",
+                            start_time=_dt.now(),
+                            user_id="voice",
+                        )
+                        _action = WorkflowAction(ActionType.OPEN_APP, _classification.target_app)
+                        _result = await _launcher.execute(_action, _ctx)
+                        logger.info("[Pillar5] Direct execution: %s", _result)
                         return {
                             "success": True,
-                            "response": _summary,
+                            "response": _result.get("message", f"Opened {_classification.target_app}"),
                             "command_type": "ACTION",
-                            "source": "rto_pillar5",
+                            "source": "pillar5_direct_app",
                         }
+                    except Exception as _direct_exc:
+                        logger.warning("[Pillar5] Direct app execution failed: %s", _direct_exc)
+
         except ImportError:
             pass
-        except asyncio.TimeoutError:
-            logger.warning("[Pillar5] RTO execution timed out after 60s")
         except Exception as _ic_exc:
-            logger.debug("[Pillar5] IntentClassifier/RTO pre-route failed: %s", _ic_exc)
+            logger.debug("[Pillar5] Pre-route failed: %s", _ic_exc)
 
         response = await self._call_jprime(
             command_text, deadline=deadline, source_context=_jprime_ctx or None,
