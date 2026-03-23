@@ -121,7 +121,12 @@ class WorkflowCommandProcessor:
             logger.info(f"Processing workflow command: '{command.text}'")
 
             # Parse the command into workflow
-            workflow = self.parser.parse_command(command.text)
+            # Pillar 5: Use agentic decomposition when Mind is available,
+            # graceful degradation to reflex-arc regex if unavailable.
+            if hasattr(self.parser, 'parse_command_async'):
+                workflow = await self.parser.parse_command_async(command.text)
+            else:
+                workflow = self.parser.parse_command(command.text)
 
             if not workflow.actions:
                 return {

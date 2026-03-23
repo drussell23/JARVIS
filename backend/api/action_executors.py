@@ -7,6 +7,8 @@ import asyncio
 import subprocess
 import os
 import json
+import uuid
+import time
 import aiohttp
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
@@ -17,6 +19,22 @@ from pathlib import Path
 
 from .workflow_parser import WorkflowAction, ActionType
 from .workflow_engine import ExecutionContext
+
+# Telemetry integration (Pillar 7: Absolute Observability)
+try:
+    from backend.core.telemetry_contract import TelemetryEnvelope, get_telemetry_bus
+    _HAS_TELEMETRY = True
+except ImportError:
+    _HAS_TELEMETRY = False
+
+# Capability gap signaling (Pillar 6: Neuroplasticity)
+try:
+    from backend.neural_mesh.synthesis.gap_signal_bus import (
+        CapabilityGapEvent, get_gap_signal_bus,
+    )
+    _HAS_GAP_BUS = True
+except ImportError:
+    _HAS_GAP_BUS = False
 
 logger = logging.getLogger(__name__)
 
@@ -120,129 +138,438 @@ class SystemUnlockExecutor(BaseActionExecutor):
 
 
 class ApplicationLauncherExecutor(BaseActionExecutor):
-    """Executor for launching applications"""
-    
+    """Executor for launching applications — agentically resolves ANY target.
+
+    Resolution chain:
+      1. Check native_apps seed cache (instant, config-driven)
+      2. Check web_services seed cache (instant, config-driven)
+      3. Attempt native macOS app launch (fast, system call)
+      4. If all static paths fail → ask J-Prime/Claude to resolve dynamically
+      5. Cache the AI-resolved result for future instant lookups
+    """
+
+    _RESOLVE_SYSTEM_PROMPT = (
+        "You are a target resolver for a macOS desktop assistant. "
+        "Given a target name the user wants to open, determine:\n"
+        "1. Is it a native macOS application (.app) or a web service/website?\n"
+        "2. If native app: what is the exact macOS application name?\n"
+        "3. If web service: what is the URL, and the search URL template "
+        "(use {query} as placeholder)?\n\n"
+        "Respond ONLY with valid JSON, no markdown, no explanation:\n"
+        '{"type": "native_app", "app_name": "Google Chrome"}\n'
+        "OR\n"
+        '{"type": "web_service", "url": "https://www.youtube.com", '
+        '"search_url_template": "https://www.youtube.com/results?search_query={query}"}\n\n'
+        "If uncertain, prefer web_service with the most likely URL."
+    )
+
     def __init__(self, config: Dict[str, Any] = None):
         super().__init__(config)
-        # Load app mappings from config
-        self.app_mappings = self._load_app_mappings()
-        
-    def _load_app_mappings(self) -> Dict[str, str]:
-        """Load application name mappings from config"""
-        config_path = os.path.join(
+        self._config_path = os.path.join(
             os.path.dirname(__file__), 'config', 'app_mappings.json'
         )
-        
-        default_mappings = {
-            "safari": "Safari",
-            "chrome": "Google Chrome",
-            "firefox": "Firefox",
-            "mail": "Mail",
-            "calendar": "Calendar",
-            "notes": "Notes",
-            "finder": "Finder",
-            "terminal": "Terminal",
-            "vscode": "Visual Studio Code",
-            "slack": "Slack",
-            "zoom": "zoom.us",
-            "teams": "Microsoft Teams"
-        }
-        
+        raw = self._load_raw_config()
+        self.native_app_mappings: Dict[str, str] = raw["native_apps"]
+        self.web_services: Dict[str, Dict[str, Any]] = raw["web_services"]
+        self._web_alias_index: Dict[str, str] = self._build_web_alias_index()
+        # In-memory cache for AI-resolved targets (survives across calls in same process)
+        self._ai_resolution_cache: Dict[str, Dict[str, Any]] = {}
+        # Pillar 6: Resolution frequency tracker for neuroplasticity graduation
+        # key -> count. When count >= GRADUATION_THRESHOLD, the target has been
+        # resolved often enough that GapSignalBus will trigger permanent assimilation.
+        self._resolution_hit_count: Dict[str, int] = {}
+
+    def _load_raw_config(self) -> Dict[str, Any]:
+        """Load the structured app_mappings.json config (seed cache)."""
+        fallback: Dict[str, Any] = {"native_apps": {}, "web_services": {}}
         try:
-            if os.path.exists(config_path):
-                with open(config_path, 'r') as f:
-                    loaded_mappings = json.load(f)
-                    default_mappings.update(loaded_mappings)
+            if os.path.exists(self._config_path):
+                with open(self._config_path, 'r') as f:
+                    data = json.load(f)
+                if "native_apps" in data:
+                    return data
+                return {"native_apps": data, "web_services": {}}
         except Exception as e:
             logger.error(f"Failed to load app mappings: {e}")
-            
-        return default_mappings
-        
-    async def execute(self, action: WorkflowAction, context: ExecutionContext) -> Any:
-        """Launch the specified application"""
-        try:
-            app_name = action.target
-            
-            # Normalize app name
-            normalized_name = self.app_mappings.get(app_name.lower(), app_name)
-            
-            # Platform-specific launch
-            if os.uname().sysname == "Darwin":  # macOS
-                result = await self._launch_macos_app(normalized_name, context)
-            else:
-                result = await self._launch_generic_app(normalized_name, context)
-                
-            return result
-            
-        except Exception as e:
-            logger.error(f"Failed to launch application {action.target}: {e}")
-            raise
-            
-    async def _launch_macos_app(self, app_name: str, context: ExecutionContext) -> Dict[str, Any]:
-        """Launch macOS application"""
-        try:
-            # Check if app is already running
-            check_cmd = ['pgrep', '-f', app_name]
-            check_result = subprocess.run(check_cmd, capture_output=True)
-            
-            if check_result.returncode == 0:
-                # App is running, bring to front
-                script = f'''
-                tell application "{app_name}"
-                    activate
-                end tell
-                '''
-                subprocess.run(['osascript', '-e', script])
-                return {"status": "activated", "message": f"{app_name} brought to front"}
-            else:
-                # Launch app
-                subprocess.run(['open', '-a', app_name], check=True)
-                
-                # Wait for app to start
-                await self._wait_for_app_start(app_name, timeout=5)
-                
-                context.set_variable(f'app_{app_name.lower()}_pid', 'running')
-                return {"status": "launched", "message": f"{app_name} launched successfully"}
-                
-        except subprocess.CalledProcessError:
-            # Try alternative launch methods
-            try:
-                subprocess.run(['open', f'/Applications/{app_name}.app'], check=True)
-                return {"status": "launched", "message": f"{app_name} launched via direct path"}
-            except Exception:
-                raise Exception(f"Could not launch {app_name}")
-                
-    async def _launch_generic_app(self, app_name: str, context: ExecutionContext) -> Dict[str, Any]:
-        """Launch application on generic platform"""
-        try:
-            # Try common launch commands
-            launch_commands = [
-                app_name.lower(),
-                app_name.lower().replace(' ', '-'),
-                app_name.lower().replace(' ', '_')
-            ]
-            
-            for cmd in launch_commands:
-                try:
-                    subprocess.Popen([cmd])
-                    return {"status": "launched", "message": f"{app_name} launched"}
-                except Exception:
-                    continue
+        return fallback
 
-            raise Exception(f"Could not find launch command for {app_name}")
-            
+    def _build_web_alias_index(self) -> Dict[str, str]:
+        """Build alias -> canonical key index for O(1) web-service lookups."""
+        index: Dict[str, str] = {}
+        for key, svc in self.web_services.items():
+            index[key.lower()] = key
+            for alias in svc.get("aliases", []):
+                index[alias.lower()] = key
+        return index
+
+    def resolve_from_cache(self, raw_name: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+        """Fast-path: resolve from seed cache + AI resolution cache.
+
+        Returns (resolved_name, web_service_entry_or_None).
+        """
+        lower = raw_name.strip().lower()
+
+        # 1. Native app seed cache
+        native = self.native_app_mappings.get(lower)
+        if native:
+            return native, None
+
+        # 2. Web service seed cache (canonical + aliases)
+        canonical_key = self._web_alias_index.get(lower)
+        if canonical_key:
+            return canonical_key, self.web_services[canonical_key]
+
+        # 3. AI resolution cache (learned from previous dynamic resolutions)
+        cached = self._ai_resolution_cache.get(lower)
+        if cached:
+            return cached.get("resolved_name", raw_name), cached
+
+        return raw_name, None
+
+    async def _resolve_via_ai(self, raw_target: str) -> Dict[str, Any]:
+        """Ask J-Prime/Claude to dynamically resolve an unknown target.
+
+        Pillar 5 (Intelligence-Driven Routing): agentic resolution via PrimeRouter.
+        Pillar 6 (Neuroplasticity): fires CapabilityGapEvent for graduation tracking.
+        Pillar 7 (Observability): emits reasoning.decision telemetry envelope.
+        """
+        trace_id = str(uuid.uuid4())[:12]
+
+        # Pillar 6: Signal a capability gap — the system encountered an unknown
+        self._emit_capability_gap(raw_target, trace_id)
+
+        try:
+            from backend.core.prime_router import get_prime_router
+            router = await get_prime_router()
+
+            response = await router.generate(
+                prompt=f'Resolve this target: "{raw_target}"',
+                system_prompt=self._RESOLVE_SYSTEM_PROMPT,
+                max_tokens=256,
+                temperature=0.0,
+                deadline=asyncio.get_event_loop().time() + 5.0,
+            )
+
+            result = json.loads(response.content)
+            logger.info(
+                f"AI resolved '{raw_target}' -> {result} "
+                f"(source={response.source}, latency={response.latency_ms:.0f}ms)"
+            )
+
+            # Cache the resolution for instant future lookups
+            lower = raw_target.strip().lower()
+            result["resolved_name"] = raw_target
+            self._ai_resolution_cache[lower] = result
+
+            # Persist to seed cache so next restart is instant
+            await self._persist_ai_resolution(lower, result)
+
+            # Pillar 7: Emit observable telemetry for this cognitive decision
+            self._emit_resolution_telemetry(
+                raw_target, result, response.source,
+                response.latency_ms, trace_id,
+            )
+
+            return result
+
         except Exception as e:
-            raise Exception(f"Failed to launch {app_name}: {str(e)}")
-            
+            logger.warning(f"AI resolution failed for '{raw_target}': {e}")
+            # Pillar 7: Emit failure telemetry
+            self._emit_resolution_telemetry(
+                raw_target, {"type": "unknown"}, "failed",
+                0.0, trace_id, error=str(e),
+            )
+            return {"type": "unknown"}
+
+    def _emit_resolution_telemetry(
+        self, target: str, result: Dict[str, Any],
+        source: str, latency_ms: float, trace_id: str,
+        error: Optional[str] = None,
+    ):
+        """Pillar 7: Emit a reasoning.decision event for target resolution."""
+        if not _HAS_TELEMETRY:
+            return
+        try:
+            envelope = TelemetryEnvelope.create(
+                event_schema="reasoning.decision@1.0.0",
+                source="application_launcher.ai_resolve",
+                trace_id=trace_id,
+                span_id=str(uuid.uuid4())[:8],
+                partition_key="reasoning",
+                severity="error" if error else "info",
+                payload={
+                    "decision_type": "target_resolution",
+                    "raw_target": target,
+                    "resolved_type": result.get("type", "unknown"),
+                    "resolved_url": result.get("url", ""),
+                    "resolved_app": result.get("app_name", ""),
+                    "inference_source": source,
+                    "latency_ms": latency_ms,
+                    "error": error,
+                    "cached_after": True,
+                },
+            )
+            get_telemetry_bus().emit(envelope)
+        except Exception:
+            pass  # Telemetry must never block runtime
+
+    def _emit_capability_gap(self, target: str, trace_id: str):
+        """Pillar 6: Fire a CapabilityGapEvent so Ouroboros can track and graduate.
+
+        Tracks resolution frequency. Each AI resolution increments the counter.
+        The GapSignalBus → CapabilityGapSensor → GapResolutionProtocol pipeline
+        handles the graduation threshold (default count=3 via JARVIS_GRADUATION_THRESHOLD).
+        """
+        lower = target.strip().lower()
+        self._resolution_hit_count[lower] = self._resolution_hit_count.get(lower, 0) + 1
+        count = self._resolution_hit_count[lower]
+
+        if not _HAS_GAP_BUS:
+            return
+        try:
+            event = CapabilityGapEvent(
+                goal=f"open_or_resolve:{target}",
+                task_type="target_resolution",
+                target_app=target,
+                source="application_launcher",
+                resolution_mode="pending",
+            )
+            get_gap_signal_bus().emit(event)
+            logger.info(
+                f"Capability gap signaled for '{target}' "
+                f"(resolution #{count}, trace={trace_id})"
+            )
+        except Exception:
+            pass  # Gap signaling must never block runtime
+
+    async def _persist_ai_resolution(self, key: str, resolution: Dict[str, Any]):
+        """Persist AI-resolved target back to app_mappings.json seed cache."""
+        try:
+            import aiofiles as _aio
+
+            raw = self._load_raw_config()
+            res_type = resolution.get("type")
+
+            if res_type == "native_app":
+                raw["native_apps"][key] = resolution.get("app_name", key)
+            elif res_type == "web_service":
+                raw["web_services"][key] = {
+                    "url": resolution.get("url", f"https://www.{key}.com"),
+                    "search_url_template": resolution.get("search_url_template"),
+                    "aliases": [],
+                }
+
+            async with _aio.open(self._config_path, 'w') as f:
+                await f.write(json.dumps(raw, indent=2))
+
+            logger.info(f"Persisted AI resolution for '{key}' to seed cache")
+        except Exception as e:
+            logger.warning(f"Failed to persist AI resolution: {e}")
+
+    # ------------------------------------------------------------------
+    # Execute
+    # ------------------------------------------------------------------
+
+    async def execute(self, action: WorkflowAction, context: ExecutionContext) -> Any:
+        """Launch the specified application or web service."""
+        raw_target = action.target
+        resolved_name, cached_entry = self.resolve_from_cache(raw_target)
+
+        # Fast path: known web service (from seed or AI cache)
+        if cached_entry and cached_entry.get("type") == "web_service":
+            url = cached_entry.get("url", f"https://www.{raw_target.lower()}.com")
+            return await self._open_url_in_browser(
+                url, raw_target, context,
+                message=f"Opened {raw_target} in browser"
+            )
+
+        # Fast path: known native app from cache
+        if cached_entry is None:
+            # Try native app launch
+            try:
+                if os.uname().sysname == "Darwin":
+                    return await self._launch_macos_app(resolved_name, context)
+                else:
+                    return await self._launch_generic_app(resolved_name, context)
+            except Exception:
+                logger.info(
+                    f"Native app '{resolved_name}' not found. "
+                    f"Asking AI to resolve '{raw_target}' dynamically..."
+                )
+
+        # Agentic resolution: ask J-Prime/Claude what this target is
+        ai_result = await self._resolve_via_ai(raw_target)
+        res_type = ai_result.get("type")
+
+        if res_type == "native_app":
+            app_name = ai_result.get("app_name", raw_target)
+            try:
+                return await self._launch_macos_app(app_name, context)
+            except Exception:
+                logger.warning(f"AI suggested native app '{app_name}' but launch failed")
+
+        if res_type == "web_service":
+            url = ai_result.get("url", f"https://www.{raw_target.lower()}.com")
+            return await self._open_url_in_browser(
+                url, raw_target, context,
+                message=f"Opened {raw_target} in browser"
+            )
+
+        # Final fallback: heuristic URL
+        heuristic_url = f"https://www.{raw_target.lower().replace(' ', '')}.com"
+        logger.info(f"All resolution failed, heuristic fallback: {heuristic_url}")
+        return await self._open_url_in_browser(
+            heuristic_url, raw_target, context,
+            message=f"Opened {raw_target} in browser (heuristic)"
+        )
+
+    # ------------------------------------------------------------------
+    # Browser launch
+    # ------------------------------------------------------------------
+
+    async def _open_url_in_browser(
+        self, url: str, label: str, context: ExecutionContext,
+        message: str = ""
+    ) -> Dict[str, Any]:
+        """Open a URL in the user's preferred browser."""
+        browser = context.get_variable(
+            "preferred_browser",
+            os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "open", "-a", browser, url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception:
+            proc = await asyncio.create_subprocess_exec(
+                "open", url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+
+        context.set_variable(f"app_{label.lower()}_pid", "running")
+        context.set_variable("last_navigation_url", url)
+        return {
+            "status": "launched",
+            "type": "web_service",
+            "message": message or f"Opened {url}",
+            "url": url,
+        }
+
+    # ------------------------------------------------------------------
+    # Native macOS app launch
+    # ------------------------------------------------------------------
+
+    async def _launch_macos_app(self, app_name: str, context: ExecutionContext) -> Dict[str, Any]:
+        """Launch macOS application using async subprocess."""
+        check = await asyncio.create_subprocess_exec(
+            "pgrep", "-f", app_name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await check.wait()
+
+        if check.returncode == 0:
+            script = f'tell application "{app_name}" to activate'
+            await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return {"status": "activated", "message": f"{app_name} brought to front"}
+
+        proc = await asyncio.create_subprocess_exec(
+            "open", "-a", app_name,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate()
+
+        if proc.returncode == 0:
+            await self._wait_for_app_start(app_name, timeout=5)
+            context.set_variable(f"app_{app_name.lower()}_pid", "running")
+            return {"status": "launched", "message": f"{app_name} launched successfully"}
+
+        app_path = f"/Applications/{app_name}.app"
+        if os.path.exists(app_path):
+            proc2 = await asyncio.create_subprocess_exec(
+                "open", app_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc2.wait()
+            if proc2.returncode == 0:
+                context.set_variable(f"app_{app_name.lower()}_pid", "running")
+                return {"status": "launched", "message": f"{app_name} launched via direct path"}
+
+        raise Exception(f"Could not launch native app: {app_name}")
+
+    async def _launch_generic_app(self, app_name: str, context: ExecutionContext) -> Dict[str, Any]:
+        """Launch application on generic (non-macOS) platform."""
+        launch_commands = [
+            app_name.lower(),
+            app_name.lower().replace(' ', '-'),
+            app_name.lower().replace(' ', '_'),
+        ]
+        for cmd in launch_commands:
+            try:
+                subprocess.Popen([cmd])
+                return {"status": "launched", "message": f"{app_name} launched"}
+            except Exception:
+                continue
+        raise Exception(f"Could not find launch command for {app_name}")
+
     async def _wait_for_app_start(self, app_name: str, timeout: int = 5):
-        """Wait for application to start"""
+        """Wait for application process to appear."""
         start_time = datetime.now()
         while (datetime.now() - start_time).total_seconds() < timeout:
-            check_cmd = ['pgrep', '-f', app_name]
-            result = subprocess.run(check_cmd, capture_output=True)
-            if result.returncode == 0:
+            check = await asyncio.create_subprocess_exec(
+                "pgrep", "-f", app_name,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await check.wait()
+            if check.returncode == 0:
                 return
             await asyncio.sleep(0.5)
+
+    # ------------------------------------------------------------------
+    # Public helpers for cross-executor use
+    # ------------------------------------------------------------------
+
+    def get_web_service(self, name: str) -> Optional[Dict[str, Any]]:
+        """Look up a web service entry by name or alias (seed + AI cache)."""
+        lower = name.strip().lower()
+        canonical = self._web_alias_index.get(lower)
+        if canonical:
+            return self.web_services[canonical]
+        cached = self._ai_resolution_cache.get(lower)
+        if cached and cached.get("type") == "web_service":
+            return cached
+        return None
+
+    async def resolve_search_url(self, service_name: str, query: str) -> Optional[str]:
+        """Build a search URL for a service — resolves via AI if needed."""
+        from urllib.parse import quote_plus
+
+        # Check seed cache
+        svc = self.get_web_service(service_name)
+        if svc:
+            template = svc.get("search_url_template")
+            if template:
+                return template.replace("{query}", quote_plus(query))
+
+        # Not cached — ask AI
+        ai_result = await self._resolve_via_ai(service_name)
+        template = ai_result.get("search_url_template")
+        if template:
+            return template.replace("{query}", quote_plus(query))
+
+        return None
 
 
 class NavigationExecutor(BaseActionExecutor):
@@ -534,7 +861,10 @@ class SearchExecutor(BaseActionExecutor):
         """Perform web search"""
         try:
             # Ensure browser is open
-            browser = context.get_variable('preferred_browser', 'Safari')
+            browser = context.get_variable(
+                'preferred_browser',
+                os.getenv("JARVIS_DEFAULT_BROWSER", "Google Chrome")
+            )
             
             # Open browser if needed
             if not context.get_variable(f'app_{browser.lower()}_pid'):
@@ -630,28 +960,40 @@ class SearchExecutor(BaseActionExecutor):
             raise Exception(f"Mail search failed: {str(e)}")
             
     async def _search_in_app(self, query: str, app: str, context: ExecutionContext) -> Dict[str, Any]:
-        """Search within specific application"""
+        """Search within a specific application or web service.
+
+        Resolution chain:
+          1. Check if 'app' is a web service with a search URL template → open URL
+          2. If AI can resolve a search URL for it → open URL
+          3. Fall back to native app Cmd+F approach
+        """
+        launcher = ApplicationLauncherExecutor()
+
+        # Try to get a search URL (checks seed cache + AI resolution)
+        search_url = await launcher.resolve_search_url(app, query)
+        if search_url:
+            return await launcher._open_url_in_browser(
+                search_url, app, context,
+                message=f"Searching for '{query}' on {app}"
+            )
+
+        # Not a web service — fall back to native app + keyboard search
         try:
-            # Ensure app is open
-            launcher = ApplicationLauncherExecutor()
             await launcher.execute(
-                WorkflowAction(ActionType.OPEN_APP, app), 
+                WorkflowAction(ActionType.OPEN_APP, app),
                 context
             )
             await asyncio.sleep(1)
-            
-            # Use keyboard shortcut for search (Cmd+F)
+
             pyautogui.hotkey('cmd', 'f')
             await asyncio.sleep(0.5)
-            
-            # Type search query
             pyautogui.typewrite(query)
-            
+
             return {
                 "status": "success",
                 "message": f"Searching for '{query}' in {app}"
             }
-            
+
         except Exception as e:
             raise Exception(f"App search failed: {str(e)}")
 

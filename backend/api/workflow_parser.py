@@ -1,11 +1,21 @@
 """
 JARVIS Workflow Parser - Multi-Command Decomposition Engine
 Parses complex natural language commands into executable workflow steps
+
+Pillar 2 (Progressive Awakening): parse_command() provides instant local parsing
+via reflex-arc regex. parse_command_async() enhances with agentic DAG planning
+via J-Prime when the Mind is available.
+
+Pillar 5 (Intelligence-Driven Routing): parse_command_async() delegates full
+command decomposition to PrimeRouter, letting the AI semantically understand
+intent, dependencies, and context propagation.
 """
 
+import asyncio
+import json
 import os
 import re
-from typing import List, Dict, Any, Tuple, Optional
+from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 from enum import Enum
 import logging
@@ -148,28 +158,45 @@ class WorkflowParser:
             compiled[action_type] = [re.compile(p, re.IGNORECASE) for p in patterns]
         return compiled
         
+    # System prompt for agentic command decomposition (Pillar 5)
+    _DECOMPOSE_SYSTEM_PROMPT = (
+        "You are a command decomposition engine for a macOS desktop assistant. "
+        "Given a natural language command, decompose it into an ordered list of actions.\n\n"
+        "Each action has:\n"
+        '- "action_type": one of: unlock, open_app, search, navigate, create, check, '
+        "set, mute, start, stop, read, write, send, schedule, analyze, organize, monitor, prepare\n"
+        '- "target": what to act upon (app name, service name, file, etc.)\n'
+        '- "parameters": dict of extra params (e.g. {"query": "NBA", "platform": "youtube"})\n'
+        '- "dependencies": list of action indices this depends on (0-indexed)\n'
+        '- "description": human-readable description\n\n'
+        "IMPORTANT: If an open/launch action precedes a search, the search should:\n"
+        "1. Depend on the open action (add its index to dependencies)\n"
+        "2. Set platform parameter to the opened target\n\n"
+        "Respond ONLY with valid JSON array, no markdown:\n"
+        '[{"action_type": "open_app", "target": "youtube", "parameters": {}, '
+        '"dependencies": [], "description": "Open YouTube"}]\n'
+    )
+
     def parse_command(self, command: str) -> Workflow:
-        """Parse a natural language command into a workflow"""
-        logger.info(f"Parsing multi-command: '{command}'")
-        
-        # Clean and normalize the command
+        """Sync parse — reflex-arc decomposition (Pillar 2: instant local capability).
+
+        Uses regex patterns for instant parsing. For agentic decomposition
+        with AI-powered DAG planning, use parse_command_async() instead.
+        """
+        logger.info(f"Parsing multi-command (reflex): '{command}'")
+
         command = self._normalize_command(command)
-        
-        # Split into potential sub-commands
         sub_commands = self._split_commands(command)
         logger.info(f"Split into {len(sub_commands)} sub-commands")
-        
-        # Parse each sub-command into actions
+
         actions = []
         for i, sub_cmd in enumerate(sub_commands):
             action = self._parse_single_command(sub_cmd, i)
             if action:
                 actions.append(action)
-                
-        # Analyze dependencies between actions
+
         self._analyze_dependencies(actions)
-        
-        # Create workflow
+
         workflow = Workflow(
             original_command=command,
             actions=actions,
@@ -177,9 +204,74 @@ class WorkflowParser:
             estimated_duration=self._estimate_duration(actions),
             confidence=self._calculate_confidence(actions)
         )
-        
+
         logger.info(f"Created workflow with {len(actions)} actions, complexity: {workflow.complexity}")
         return workflow
+
+    async def parse_command_async(self, command: str) -> Workflow:
+        """Async parse — agentic decomposition via J-Prime (Pillar 5).
+
+        Asks the Mind to semantically decompose the command into a DAG.
+        Falls back to reflex-arc (sync parse) if the Mind is unavailable.
+        """
+        logger.info(f"Parsing multi-command (agentic): '{command}'")
+
+        try:
+            from backend.core.prime_router import get_prime_router
+            router = await get_prime_router()
+
+            response = await router.generate(
+                prompt=f'Decompose this command into actions: "{command}"',
+                system_prompt=self._DECOMPOSE_SYSTEM_PROMPT,
+                max_tokens=1024,
+                temperature=0.0,
+                deadline=asyncio.get_event_loop().time() + 5.0,
+            )
+
+            raw_actions = json.loads(response.content)
+            actions = self._actions_from_ai(raw_actions)
+
+            if actions:
+                workflow = Workflow(
+                    original_command=command,
+                    actions=actions,
+                    complexity=self._determine_complexity(actions),
+                    estimated_duration=self._estimate_duration(actions),
+                    confidence=0.95,
+                )
+                logger.info(
+                    f"AI decomposed '{command}' into {len(actions)} actions "
+                    f"(source={response.source}, latency={response.latency_ms:.0f}ms)"
+                )
+                return workflow
+
+        except Exception as e:
+            logger.warning(f"Agentic decomposition failed, falling back to reflex: {e}")
+
+        # Graceful degradation: reflex-arc fallback
+        return self.parse_command(command)
+
+    def _actions_from_ai(self, raw_actions: List[Dict[str, Any]]) -> List[WorkflowAction]:
+        """Convert AI-generated action dicts into WorkflowAction objects."""
+        actions = []
+        for raw in raw_actions:
+            try:
+                action_type_str = raw.get("action_type", "unknown")
+                try:
+                    action_type = ActionType(action_type_str)
+                except ValueError:
+                    action_type = ActionType.UNKNOWN
+
+                actions.append(WorkflowAction(
+                    action_type=action_type,
+                    target=raw.get("target", ""),
+                    parameters=raw.get("parameters", {}),
+                    dependencies=raw.get("dependencies", []),
+                    description=raw.get("description", ""),
+                ))
+            except Exception as e:
+                logger.warning(f"Skipping malformed AI action: {raw} ({e})")
+        return actions
         
     def _normalize_command(self, command: str) -> str:
         """Normalize command text for parsing"""
@@ -330,23 +422,43 @@ class WorkflowParser:
         )
         
     def _analyze_dependencies(self, actions: List[WorkflowAction]):
-        """Analyze and set dependencies between actions"""
-        # Simple dependency rules
+        """Analyze and set dependencies between actions.
+
+        Also propagates context: if a SEARCH follows an OPEN_APP and has no
+        explicit platform, the search inherits the opened app/service as its
+        platform so "open youtube and search for NBA" searches ON youtube.
+        """
         for i, action in enumerate(actions):
             # Unlock must happen before anything else
             if i > 0 and actions[0].action_type == ActionType.UNLOCK:
                 action.dependencies.append(0)
-                
+
             # Opening an app before searching in it
             if action.action_type == ActionType.SEARCH:
-                # Look for previous open app action
-                for j in range(i):
-                    if (actions[j].action_type == ActionType.OPEN_APP and 
-                        action.parameters.get("platform", "").lower() in 
-                        actions[j].target.lower()):
+                explicit_platform = action.parameters.get("platform", "")
+                # Look for the nearest preceding OPEN_APP
+                for j in range(i - 1, -1, -1):
+                    if actions[j].action_type != ActionType.OPEN_APP:
+                        continue
+
+                    open_target = actions[j].target.lower()
+
+                    # Explicit platform match
+                    if explicit_platform and explicit_platform.lower() in open_target:
                         action.dependencies.append(j)
                         break
-                        
+
+                    # Context propagation: no explicit platform (defaulted to "web")
+                    # and there's a preceding OPEN_APP → inherit it as the platform
+                    if not explicit_platform or explicit_platform.lower() == "web":
+                        action.parameters["platform"] = actions[j].target
+                        action.dependencies.append(j)
+                        logger.info(
+                            f"Propagated search platform from action {j} "
+                            f"('{actions[j].target}') to search action {i}"
+                        )
+                        break
+
             # Creating something requires app to be open
             if action.action_type == ActionType.CREATE:
                 for j in range(i):

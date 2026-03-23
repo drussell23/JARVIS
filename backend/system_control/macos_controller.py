@@ -603,69 +603,104 @@ class MacOSController:
     # Application Control Methods
 
     async def open_application_pipeline(self, app_name: str) -> Tuple[bool, str]:
-        """Open application through async pipeline (NEW METHOD)"""
+        """Open application through async pipeline — delegates to ApplicationLauncherExecutor
+        for unified native app + web service resolution with agentic fallback."""
         # Check if screen is locked
         if await self._check_screen_lock_status_async():
             should_proceed, message = self._handle_locked_screen_command("open_application")
             if not should_proceed:
                 return False, message
 
-        # Resolve aliases
-        app_name = self.app_aliases.get(app_name.lower(), app_name)
+        # Resolve aliases (local fast-path for known native apps)
+        resolved = self.app_aliases.get(app_name.lower(), app_name)
 
         # Check if blocked
-        if app_name in self.blocked_apps:
-            return False, f"Opening {app_name} is blocked for safety"
+        if resolved in self.blocked_apps:
+            return False, f"Opening {resolved} is blocked for safety"
 
         try:
-            # Use async pipeline for app control
-            result = await self.pipeline.process_async(
-                text=f"Open application {app_name}",
-                metadata={"action": "open", "app_name": app_name, "stage": "app_control"},
+            # Delegate to ApplicationLauncherExecutor which handles:
+            # 1. Native app seed cache → instant launch
+            # 2. Web service seed cache → open URL in browser
+            # 3. Native macOS app launch attempt
+            # 4. AI-powered dynamic resolution via J-Prime/Claude
+            # 5. Heuristic URL fallback
+            from backend.api.action_executors import ApplicationLauncherExecutor
+            from backend.api.workflow_parser import WorkflowAction, ActionType
+            from backend.api.workflow_engine import ExecutionContext
+
+            launcher = ApplicationLauncherExecutor()
+            ctx = ExecutionContext(
+                workflow_id="macos_controller",
+                start_time=__import__("datetime").datetime.now(),
+                user_id="system",
             )
+            action = WorkflowAction(ActionType.OPEN_APP, app_name)
+            result = await launcher.execute(action, ctx)
 
-            metadata = result.get("metadata", {})
-            success = metadata.get("success", False)
-
-            if success:
+            status = result.get("status", "")
+            if status in ("launched", "activated"):
                 return True, f"Opening {app_name}, Sir"
             else:
-                # Try alternative method through shell pipeline
-                return await self.execute_shell_pipeline(f"open -a '{app_name}'")
+                return True, result.get("message", f"Opened {app_name}")
 
         except Exception as e:
             logger.error(f"Failed to open {app_name}: {e}")
             return False, f"I'm unable to open {app_name}, Sir"
 
     def open_application(self, app_name: str) -> Tuple[bool, str]:
-        """Open an application directly without pipeline (for system commands)"""
+        """Open an application directly without pipeline (for system commands).
+
+        For synchronous callers — resolves aliases, tries native launch,
+        then falls back to opening as a URL for web services.
+        """
+        import subprocess as _sp
+
         # Resolve aliases
-        app_name = self.app_aliases.get(app_name.lower(), app_name)
+        resolved = self.app_aliases.get(app_name.lower(), app_name)
 
         # Check if blocked
-        if app_name in self.blocked_apps:
-            return False, f"Opening {app_name} is blocked for safety"
+        if resolved in self.blocked_apps:
+            return False, f"Opening {resolved} is blocked for safety"
 
-        # Direct AppleScript to open application
-        script = f'tell application "{app_name}" to activate'
+        # Try native AppleScript launch first
+        script = f'tell application "{resolved}" to activate'
         success, message = self.execute_applescript(script)
-
         if success:
-            return True, f"Opening {app_name}, Sir"
-        else:
-            # Fallback: try with 'open' command
-            import subprocess
+            return True, f"Opening {resolved}, Sir"
 
-            try:
-                result = subprocess.run(
-                    ["open", "-a", app_name], capture_output=True, text=True, timeout=5
-                )
-                if result.returncode == 0:
-                    return True, f"Opening {app_name}, Sir"
-                else:
-                    return False, f"Couldn't find application: {app_name}"
-            except Exception as e:
-                return False, f"Error opening {app_name}: {str(e)}"
+        # Try open -a
+        try:
+            result = _sp.run(
+                ["open", "-a", resolved], capture_output=True, text=True, timeout=5
+            )
+            if result.returncode == 0:
+                return True, f"Opening {resolved}, Sir"
+        except Exception:
+            pass
+
+        # Native launch failed — check if it's a web service via the shared config
+        try:
+            from backend.api.action_executors import ApplicationLauncherExecutor
+            launcher = ApplicationLauncherExecutor()
+            _, web_svc = launcher.resolve_from_cache(app_name)
+            if web_svc and web_svc.get("type") == "web_service":
+                url = web_svc.get("url", f"https://www.{app_name.lower()}.com")
+                browser = os.environ.get("JARVIS_DEFAULT_BROWSER", "Google Chrome")
+                _sp.run(["open", "-a", browser, url], timeout=5)
+                return True, f"Opening {app_name} in browser, Sir"
+
+            # Check web_services in seed cache
+            svc = launcher.get_web_service(app_name)
+            if svc:
+                url = svc.get("url", f"https://www.{app_name.lower()}.com")
+                browser = os.environ.get("JARVIS_DEFAULT_BROWSER", "Google Chrome")
+                _sp.run(["open", "-a", browser, url], timeout=5)
+                return True, f"Opening {app_name} in browser, Sir"
+        except Exception:
+            pass
+
+        return False, f"Couldn't find application: {app_name}"
 
     def close_application(self, app_name: str) -> Tuple[bool, str]:
         """Close an application gracefully"""

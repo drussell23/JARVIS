@@ -345,47 +345,70 @@ class MacOSController:
     # Application Control Methods
     
     def open_application(self, app_name: str) -> Tuple[bool, str]:
-        """Open an application with event publishing"""
+        """Open an application with event publishing.
+
+        Resolves native apps via aliases, then falls back to web service
+        detection via the shared ApplicationLauncherExecutor config.
+        """
         # Resolve aliases
-        app_name = self.app_aliases.get(app_name.lower(), app_name)
-        
+        resolved = self.app_aliases.get(app_name.lower(), app_name)
+
         # Check if blocked
-        if app_name in self.blocked_apps:
+        if resolved in self.blocked_apps:
             SystemEvents.warning(
                 source="macos_controller",
                 warning="Blocked application",
-                details={"app": app_name, "reason": "safety"}
+                details={"app": resolved, "reason": "safety"}
             )
-            return False, f"Opening {app_name} is blocked for safety"
-            
-        script = f'tell application "{app_name}" to activate'
+            return False, f"Opening {resolved} is blocked for safety"
+
+        # Try native AppleScript launch
+        script = f'tell application "{resolved}" to activate'
         success, message = self.execute_applescript(script)
-        
+
         if success:
-            # Publish app launched event
             ControlEvents.app_launched(
                 source="macos_controller",
-                app_name=app_name,
+                app_name=resolved,
                 success=True
             )
-            return True, f"Opened {app_name}"
-        else:
-            # Try alternative method
-            success, message = self.execute_shell(f"open -a '{app_name}'")
-            if success:
+            return True, f"Opened {resolved}"
+
+        # Try open -a
+        success, message = self.execute_shell(f"open -a '{resolved}'")
+        if success:
+            ControlEvents.app_launched(
+                source="macos_controller",
+                app_name=resolved,
+                success=True
+            )
+            return True, f"Opened {resolved}"
+
+        # Native launch failed — check if it's a web service
+        try:
+            from backend.api.action_executors import ApplicationLauncherExecutor
+            launcher = ApplicationLauncherExecutor()
+            svc = launcher.get_web_service(app_name)
+            if svc:
+                import subprocess as _sp
+                url = svc.get("url", f"https://www.{app_name.lower()}.com")
+                browser = os.environ.get("JARVIS_DEFAULT_BROWSER", "Google Chrome")
+                _sp.run(["open", "-a", browser, url], timeout=5)
                 ControlEvents.app_launched(
                     source="macos_controller",
                     app_name=app_name,
                     success=True
                 )
-                return True, f"Opened {app_name}"
-                
-            ControlEvents.app_launched(
-                source="macos_controller",
-                app_name=app_name,
-                success=False
-            )
-            return False, f"Failed to open {app_name}: {message}"
+                return True, f"Opened {app_name} in browser"
+        except Exception:
+            pass
+
+        ControlEvents.app_launched(
+            source="macos_controller",
+            app_name=app_name,
+            success=False
+        )
+        return False, f"Failed to open {app_name}: {message}"
             
     def close_application(self, app_name: str) -> Tuple[bool, str]:
         """Close an application gracefully with event publishing"""

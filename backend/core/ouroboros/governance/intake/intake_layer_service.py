@@ -445,6 +445,23 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] ScheduledTriggerSensor skipped: %s", exc)
 
+        # ---- CapabilityGapSensor (Pillar 6: Neuroplasticity) ----
+        # Consumes CapabilityGapEvents from the GapSignalBus (emitted by
+        # ApplicationLauncherExecutor, AgentRegistry, etc.) and routes them
+        # through the full Ouroboros pipeline for graduation tracking.
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.capability_gap_sensor import (
+                CapabilityGapSensor,
+            )
+            _gap_sensor = CapabilityGapSensor(
+                intake_router=self._router,
+                repo="jarvis",
+            )
+            self._sensors.append(_gap_sensor)
+            logger.info("[IntakeLayer] CapabilityGapSensor added (neuroplasticity active)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] CapabilityGapSensor skipped: %s", exc)
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:
