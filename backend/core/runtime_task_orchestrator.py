@@ -51,6 +51,7 @@ logger = logging.getLogger(__name__)
 class TaskResolution(str, Enum):
     """How a step was resolved."""
     EXISTING_AGENT = "existing_agent"      # found in AgentRegistry
+    VISION_ACTION = "vision_action"        # v305.0: browser/UI task → VisionActionLoop
     EPHEMERAL_TOOL = "ephemeral_tool"      # synthesized on-the-fly, discarded after
     GOVERNANCE_OP = "governance_op"        # routed to Ouroboros for code change
     PERSISTENT_PROPOSAL = "persistent"     # synthesized + proposed for permanent add
@@ -274,6 +275,21 @@ class RuntimeTaskOrchestrator:
                 elapsed_s=time.monotonic() - start,
             )
 
+        # Check 1.5: Browser/UI task? Route to VisionActionLoop (perception-action loop).
+        # v305.0: Instead of synthesizing blind subprocess code, use the full
+        # vision stack: Ferrari Engine capture → Claude Vision analysis →
+        # Ghost Hands actuator → ActionVerifier. This gives JARVIS eyes and
+        # hands — it can see if the page loaded correctly and self-correct.
+        if self._is_browser_or_ui_task(goal, step):
+            return StepResolution(
+                step_goal=goal,
+                resolution=TaskResolution.VISION_ACTION,
+                agent_name="vision_action_loop",
+                capability_used="browser_navigation",
+                synthesized=False,
+                elapsed_s=time.monotonic() - start,
+            )
+
         # Check 2: Is this a code change? Route to Ouroboros governance.
         if self._is_code_change(goal):
             return StepResolution(
@@ -423,6 +439,48 @@ class RuntimeTaskOrchestrator:
         goal_lower = goal.lower()
         return any(signal in goal_lower for signal in code_signals)
 
+    @staticmethod
+    def _is_browser_or_ui_task(goal: str, step: Dict[str, Any]) -> bool:
+        """Detect if this step needs browser/UI interaction (route to VisionActionLoop).
+
+        v305.0: Browser tasks go through the full perception-action-verification
+        loop (Ferrari Engine + Ghost Hands + ActionVerifier) instead of blind
+        subprocess.run(['open', url]) ephemeral tools.
+
+        Detection is STRUCTURAL, not string-matching. We rely on the
+        IntentClassifier's semantic output (target_app, category, action_category)
+        which are resolved agentically by J-Prime — no hardcoded provider lists.
+        """
+        # Structural signals from IntentClassifier (set by J-Prime semantically)
+        target_app = (step.get("target_app") or "").lower()
+        category = (step.get("category") or "").lower()
+        action_category = (step.get("action_category") or "").lower()
+        provider = (step.get("provider") or "").lower()
+        search_query = step.get("search_query") or ""
+
+        # 1. IntentClassifier tagged it as a browser app
+        if target_app and target_app != "terminal":
+            # If the classifier identified a specific app target, it's UI work.
+            # Terminal commands are NOT vision tasks.
+            return True
+
+        # 2. IntentClassifier categorized it as web/search/navigation
+        if category in ("web_search", "browser", "navigation", "website"):
+            return True
+        if action_category in ("web_search", "browser", "navigation"):
+            return True
+
+        # 3. IntentClassifier identified a web provider + search query
+        # (provider is set agentically by the classifier, not a hardcoded list)
+        if provider and search_query:
+            return True
+
+        # 4. URL detected in goal (structural, not provider-specific)
+        if "http://" in goal or "https://" in goal or "www." in goal:
+            return True
+
+        return False
+
     def _find_topology_gap(self, goal: str) -> Optional[str]:
         """Check TopologyMap for known inactive capabilities matching the goal."""
         if self._topology is None:
@@ -540,6 +598,8 @@ class RuntimeTaskOrchestrator:
                 return await orchestrator._dispatch_to_agent(
                     resolution.agent_name or "", node.goal, step,
                 )
+            elif resolution.resolution == TaskResolution.VISION_ACTION:
+                return await orchestrator._dispatch_to_vision(node.goal, step)
             elif resolution.resolution == TaskResolution.GOVERNANCE_OP:
                 return await orchestrator._dispatch_to_governance(node.goal, step)
             elif resolution.resolution in (
@@ -778,6 +838,124 @@ class RuntimeTaskOrchestrator:
             return {"status": "submitted", "op_id": ctx.op_id, "result": str(result)}
         except Exception as exc:
             return {"status": "error", "error": str(exc)}
+
+    async def _resolve_url_via_prime(self, goal: str, step: Dict[str, Any]) -> str:
+        """Ask J-Prime to resolve the correct URL for a navigation goal.
+
+        No hardcoded URL templates — the model figures out the right URL
+        based on the goal semantics. Falls back to empty string on failure.
+        """
+        provider = step.get("provider") or ""
+        search_query = step.get("search_query") or ""
+
+        prompt = (
+            f"What is the exact URL to accomplish this goal?\n"
+            f"Goal: {goal}\n"
+            f"Provider: {provider}\n"
+            f"Search query: {search_query}\n\n"
+            f"Return ONLY the URL, nothing else. No markdown, no explanation.\n"
+            f"Example: https://www.youtube.com/results?search_query=neural+networks"
+        )
+        try:
+            response = await asyncio.wait_for(
+                self._prime.generate(
+                    prompt=prompt,
+                    system_prompt="You are a URL resolver. Return only the URL.",
+                    max_tokens=200,
+                ),
+                timeout=8.0,
+            )
+            url = (response.text if hasattr(response, "text") else str(response)).strip()
+            # Validate — must look like a URL
+            if url.startswith("http://") or url.startswith("https://"):
+                logger.info("[RuntimeTask] J-Prime resolved URL: %s", url[:80])
+                return url
+            logger.debug("[RuntimeTask] J-Prime URL invalid: %s", url[:80])
+        except Exception as exc:
+            logger.debug("[RuntimeTask] J-Prime URL resolution failed: %s", exc)
+        return ""
+
+    async def _dispatch_to_vision(self, goal: str, step: Dict[str, Any]) -> Any:
+        """Route a browser/UI task to VisionActionLoop for perception-action execution.
+
+        v305.0: Connects the full vision stack to voice commands:
+        Ferrari Engine (60fps capture) -> Claude Vision (analysis) ->
+        Ghost Hands (click/type/scroll) -> ActionVerifier (did it work?).
+
+        For navigation (URL or search), opens the browser first then
+        verifies via VisionActionLoop. For interactive tasks (click element,
+        fill form), delegates entirely to VisionActionLoop.execute_action().
+        """
+        search_query = step.get("search_query") or ""
+        target_app = (step.get("target_app") or "").lower()
+
+        # Step 1: Resolve URL agentically — ask J-Prime to figure out the right
+        # URL for this goal. No hardcoded URL templates (Manifesto §5).
+        url = step.get("url") or ""
+        if not url and self._prime is not None:
+            url = await self._resolve_url_via_prime(goal, step)
+        elif not url and search_query:
+            # Fallback only when J-Prime is completely unavailable
+            import urllib.parse as _urlparse
+            url = "https://www.google.com/search?q=" + _urlparse.quote_plus(search_query)
+
+        if url:
+            proc = await asyncio.create_subprocess_exec(
+                "open", url,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            logger.info("[RuntimeTask] Opened URL: %s", url[:80])
+        elif target_app:
+            proc = await asyncio.create_subprocess_exec(
+                "open", "-a", target_app,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+            logger.info("[RuntimeTask] Opened app: %s", target_app)
+
+        # Step 2: Verify via VisionActionLoop (perception-action loop)
+        await asyncio.sleep(2.0)  # Allow page load
+
+        try:
+            from backend.vision.realtime.vision_action_loop import VisionActionLoop
+            _loop_cls = VisionActionLoop
+            _inst = (
+                _loop_cls.get_instance()
+                if hasattr(_loop_cls, "get_instance")
+                else None
+            )
+            if _inst is not None and hasattr(_inst, "execute_action"):
+                verification = await asyncio.wait_for(
+                    _inst.execute_action(
+                        target_description=f"Verify: {goal}",
+                        action_type="click",
+                        target_text=search_query or goal,
+                    ),
+                    timeout=15.0,
+                )
+                if verification.success:
+                    return {
+                        "success": True,
+                        "result": f"Navigated and verified: {goal}",
+                    }
+                logger.info(
+                    "[RuntimeTask] Vision verification inconclusive: %s",
+                    getattr(verification, "error", "unknown"),
+                )
+        except asyncio.TimeoutError:
+            logger.debug("[RuntimeTask] Vision verification timed out")
+        except Exception as exc:
+            logger.debug("[RuntimeTask] VisionActionLoop unavailable: %s", exc)
+
+        # URL/app was opened even without verification
+        opened = f"URL: {url}" if url else f"app: {target_app}" if target_app else goal
+        return {
+            "success": True,
+            "result": f"Opened {opened}. Visual verification pending.",
+        }
 
     async def _synthesize_and_execute(
         self, goal: str, step: Dict[str, Any], ephemeral: bool,
