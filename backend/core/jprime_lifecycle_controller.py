@@ -200,13 +200,20 @@ class HealthResult:
 
 
 class HealthProbe:
-    """HTTP health probe for J-Prime /v1/reason/health endpoint."""
+    """HTTP health probe for J-Prime server.
+
+    Uses /v1/models (OpenAI-compatible) as the health probe since
+    llama-cpp-python doesn't serve /v1/reason/health. Falls back to
+    env override via JARVIS_PRIME_HEALTH_ENDPOINT.
+    """
 
     def __init__(self, host: str, port: int, timeout_s: float = 5.0):
         self._host = host
         self._port = port
         self._timeout_s = timeout_s
-        self._url = f"http://{host}:{port}/v1/reason/health"
+        import os
+        _endpoint = os.environ.get("JARVIS_PRIME_HEALTH_ENDPOINT", "/v1/models")
+        self._url = f"http://{host}:{port}{_endpoint}"
 
     async def _http_get(self, url: str, timeout: float) -> Dict[str, Any]:
         """HTTP GET returning parsed JSON. Raises on failure."""

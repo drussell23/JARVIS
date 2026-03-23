@@ -618,10 +618,13 @@ class PrimeClient:
 
             await self._pool.initialize()
 
-            # Initial health check
-            await self._check_health()
+            # Pillar 2 (Progressive Awakening): Do NOT block boot on health check.
+            # Start as DEGRADED and let the background monitor promote to AVAILABLE
+            # once J-Prime responds. This prevents event loop starvation during
+            # heavy parallel boot when GCP clients, Docker, etc. compete for I/O.
+            self._status = PrimeStatus.DEGRADED
 
-            # Start background health monitor
+            # Start background health monitor — will promote to AVAILABLE on first success
             self._health_check_task = asyncio.create_task(
                 self._health_monitor_loop(),
                 name="prime_health_monitor"
@@ -920,10 +923,15 @@ class PrimeClient:
             return True
 
     async def _health_monitor_loop(self) -> None:
-        """Background health monitoring loop with timeout protection."""
+        """Background health monitoring loop with timeout protection.
+
+        Pillar 2: First check runs immediately (no sleep-first) so J-Prime
+        becomes available ASAP after boot. Subsequent checks use backoff.
+        """
         shutdown_event = get_shutdown_event()
         max_iterations = int(os.getenv("PRIME_HEALTH_MAX_ITERATIONS", "0")) or None
         iteration = 0
+        first_check = True
 
         while True:
             # Check for shutdown
@@ -939,8 +947,12 @@ class PrimeClient:
             iteration += 1
 
             try:
-                # v258.0: Use backoff interval instead of fixed interval
-                await asyncio.sleep(self._health_backoff_interval)
+                # First check runs immediately, subsequent checks use backoff
+                if first_check:
+                    first_check = False
+                    await asyncio.sleep(1.0)  # Brief yield to let event loop breathe
+                else:
+                    await asyncio.sleep(self._health_backoff_interval)
                 # Add timeout protection for health check
                 await asyncio.wait_for(
                     self._check_health(),
@@ -1105,7 +1117,7 @@ class PrimeClient:
             return self._status
 
         except Exception as e:
-            logger.debug(f"[PrimeClient] Health check failed: {e}")
+            logger.warning(f"[PrimeClient] Health check failed: {type(e).__name__}: {e}")
             self._status = PrimeStatus.UNAVAILABLE
             self._last_health_check = time.time()
             # v276.0 Phase 12: Record forward failure

@@ -1053,7 +1053,9 @@ class JarvisPrimeClient:
         if client is None:
             return HealthStatus(available=False, error="HTTP client not available")
 
-        url = f"http://{self.config.local_host}:{self.config.local_port}/health"
+        import os as _os
+        _endpoint = _os.environ.get("JARVIS_PRIME_HEALTH_ENDPOINT", "/v1/models")
+        url = f"http://{self.config.local_host}:{self.config.local_port}{_endpoint}"
         start = time.time()
 
         try:

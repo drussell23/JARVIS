@@ -1880,21 +1880,21 @@ MODELS = {{
         "filename": "mistral-7b-instruct-v0.2.Q4_K_M.gguf",
         "size_gb": 4.4,
         "routable": True,
-        "config_overrides": {{"n_ctx": 8192, "chat_template": "mistral", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 8192, "chat_template": "mistral", "n_gpu_layers": -1, "flash_attn": True}},
     }},
     "qwen-2.5-7b": {{
         "repo": "Qwen/Qwen2.5-7B-Instruct-GGUF",
         "filename": "qwen2.5-7b-instruct-q4_k_m.gguf",
         "size_gb": 4.4,
         "routable": True,
-        "config_overrides": {{"n_ctx": 32768, "chat_template": "chatml", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 32768, "chat_template": "chatml", "n_gpu_layers": -1, "flash_attn": True}},
     }},
     "qwen-2.5-coder-7b": {{
         "repo": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
         "filename": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
         "size_gb": 4.4,
         "routable": True,
-        "config_overrides": {{"n_ctx": 32768, "chat_template": "chatml", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 32768, "chat_template": "chatml", "n_gpu_layers": -1, "flash_attn": True}},
     }},
     "llava-v1.6-mistral-7b": {{
         "repo": "cjpais/llava-1.6-mistral-7b-gguf",
@@ -1909,14 +1909,14 @@ MODELS = {{
         "filename": "Phi-3.5-mini-instruct-Q4_K_M.gguf",
         "size_gb": 2.2,
         "routable": True,
-        "config_overrides": {{"n_ctx": 4096, "chat_template": "phi3", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 4096, "chat_template": "phi3", "n_gpu_layers": -1, "flash_attn": True}},
     }},
     "llama-3.1-8b": {{
         "repo": "bartowski/Meta-Llama-3.1-8B-Instruct-GGUF",
         "filename": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
         "size_gb": 4.9,
         "routable": True,
-        "config_overrides": {{"n_ctx": 8192, "chat_template": "llama3", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 8192, "chat_template": "llama3", "n_gpu_layers": -1, "flash_attn": True}},
     }},
     "tinyllama-1.1b": {{
         "repo": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
@@ -1936,21 +1936,40 @@ MODELS = {{
         "filename": "DeepSeek-R1-Distill-Qwen-7B-Q4_K_M.gguf",
         "size_gb": 4.4,
         "routable": True,
-        "config_overrides": {{"n_ctx": 32768, "chat_template": "chatml", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 32768, "chat_template": "chatml", "n_gpu_layers": -1, "flash_attn": True}},
     }},
     "gemma-2-9b": {{
         "repo": "bartowski/gemma-2-9b-it-GGUF",
         "filename": "gemma-2-9b-it-Q4_K_M.gguf",
         "size_gb": 5.5,
         "routable": True,
-        "config_overrides": {{"n_ctx": 8192, "chat_template": "gemma", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 8192, "chat_template": "gemma", "n_gpu_layers": -1, "flash_attn": True}},
     }},
     "qwen-2.5-math-7b": {{
         "repo": "Qwen/Qwen2.5-Math-7B-Instruct-GGUF",
         "filename": "qwen2.5-math-7b-instruct-q4_k_m.gguf",
         "size_gb": 4.4,
         "routable": True,
-        "config_overrides": {{"n_ctx": 4096, "chat_template": "chatml", "n_gpu_layers": 0, "flash_attn": False}},
+        "config_overrides": {{"n_ctx": 4096, "chat_template": "chatml", "n_gpu_layers": -1, "flash_attn": True}},
+    }},
+    # v302.0: Tier-2/3 brains — L4 GPU (24GB VRAM) required
+    # BrainSelector routes HEAVY_CODE/COMPLEX tasks here.
+    # These are the organism's deep cognition models.
+    "qwen-2.5-coder-14b": {{
+        "repo": "Qwen/Qwen2.5-Coder-14B-Instruct-GGUF",
+        "filename": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+        "size_gb": 8.5,
+        "routable": True,
+        "compute_class": "gpu_l4",
+        "config_overrides": {{"n_ctx": 16384, "chat_template": "chatml", "n_gpu_layers": -1, "flash_attn": True}},
+    }},
+    "qwen-2.5-coder-32b": {{
+        "repo": "Qwen/Qwen2.5-Coder-32B-Instruct-GGUF",
+        "filename": "Qwen2.5-Coder-32B-Instruct-Q4_K_M.gguf",
+        "size_gb": 18.5,
+        "routable": True,
+        "compute_class": "gpu_l4",
+        "config_overrides": {{"n_ctx": 8192, "chat_template": "chatml", "n_gpu_layers": -1, "flash_attn": True}},
     }},
 }}
 
@@ -1959,12 +1978,17 @@ os.makedirs(models_dir, exist_ok=True)
 
 from huggingface_hub import hf_hub_download
 
-manifest = {{"models": {{}}, "build_timestamp": datetime.utcnow().isoformat(), "version": "v241.1"}}
-total = len(MODELS)
+manifest = {{"models": {{}}, "build_timestamp": datetime.utcnow().isoformat(), "version": "v302.0"}}
+
+# Pillar 2 (Progressive Awakening): Download models by size ascending.
+# Lighter models come online first so the organism has reflex-arc cognition
+# while heavier deep-thought models download in the background.
+sorted_models = sorted(MODELS.items(), key=lambda kv: kv[1].get("size_gb", 0))
+total = len(sorted_models)
 success_count = 0
 fail_count = 0
 
-for i, (model_id, spec) in enumerate(MODELS.items()):
+for i, (model_id, spec) in enumerate(sorted_models):
     target_path = os.path.join(models_dir, spec["filename"])
     pct = int(((i + 1) / total) * 100)
     print(f"[{{i+1}}/{{total}}] Downloading {{model_id}} ({{spec['size_gb']}} GB)...")
