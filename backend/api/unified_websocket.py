@@ -2470,7 +2470,8 @@ class UnifiedWebSocketManager:
                 from backend.core.runtime_task_orchestrator import get_runtime_task_orchestrator
 
                 _classifier = get_intent_classifier()
-                _classification = _classifier.classify(command_text)
+                # Pillar 5: Agentic classification via J-Prime (falls back to reflex arc)
+                _classification = await _classifier.classify_async(command_text)
 
                 if _classification.intent == CommandIntent.ACTION:
                     # Directive 2: Check Progressive Readiness before dispatching ACTION

@@ -1,18 +1,19 @@
-"""IntentClassifier — deterministic voice command routing for the E1 bridge.
+"""IntentClassifier — agentic voice command routing for the E1 bridge.
 
-Rules-based, zero LLM dependency, sub-millisecond classification.
-Determines if a voice command should route to:
-    ACTION → RuntimeTaskOrchestrator (Neural Mesh agents, browser, apps, tools)
-    QUERY  → HybridOrchestrator (J-Prime text Q&A, conversation, explanation)
+Pillar 2 (Progressive Awakening):
+    classify()       — reflex-arc, sub-millisecond, zero LLM dependency
+    classify_async() — agentic semantic classification via PrimeRouter/J-Prime
 
-Design constraints:
-    - Deterministic: same input → same output, every time
-    - Fast: pure string matching, no model inference
-    - Extensible: add patterns without modifying logic
-    - Safe default: unknown commands route to QUERY (non-destructive)
+Pillar 5 (Intelligence-Driven Routing):
+    classify_async() uses J-Prime to semantically evaluate intent, extract
+    structured fields (provider, search_query, target_app), and determine
+    routing — no regex, no pattern tables, no hardcoded keyword lists.
+
+    The sync classify() exists ONLY as a reflex arc for when the Mind is
+    unavailable. The async path is the primary intelligence.
 
 Architecture:
-    Voice input → IntentClassifier.classify(text) → CommandIntent
+    Voice input → IntentClassifier.classify_async(text) → ClassificationResult
         │
         ├─ ACTION → RuntimeTaskOrchestrator.execute(query)
         │              ↓
@@ -24,10 +25,15 @@ Architecture:
 """
 from __future__ import annotations
 
+import asyncio
+import json
+import logging
 import re
 from dataclasses import dataclass
 from enum import Enum
 from typing import List, Tuple
+
+logger = logging.getLogger(__name__)
 
 
 class CommandIntent(str, Enum):
@@ -411,6 +417,77 @@ class IntentClassifier:
             ' ', without_provider,
         )
         return re.sub(r'\s+', ' ', cleaned).strip()
+
+    # ------------------------------------------------------------------
+    # Agentic classification (Pillar 5)
+    # ------------------------------------------------------------------
+
+    _CLASSIFY_SYSTEM_PROMPT = (
+        "You are an intent classifier for a macOS desktop AI assistant. "
+        "Given a voice command, classify it and extract structured fields.\n\n"
+        "Respond ONLY with valid JSON, no markdown:\n"
+        "{\n"
+        '  "intent": "action" or "query",\n'
+        '  "confidence": 0.0-1.0,\n'
+        '  "action_category": "browser"|"app_control"|"system"|"communication"|"media"|"file"|"",\n'
+        '  "provider": "youtube"|"google"|"spotify"|etc or "",\n'
+        '  "search_query": "extracted search term" or "",\n'
+        '  "target_app": "native macOS app name" or "",\n'
+        '  "reasoning": "one-line explanation"\n'
+        "}\n\n"
+        "Rules:\n"
+        '- "action" = the user wants to DO something (open, search, play, create, send, etc.)\n'
+        '- "query" = the user wants to KNOW something (question, explanation, conversation)\n'
+        "- Extract provider if a specific service is mentioned (youtube, google, spotify, etc.)\n"
+        "- Extract search_query if the user is searching for something\n"
+        "- Extract target_app if a native macOS app is mentioned\n"
+        "- If uncertain, prefer query (safe — non-destructive)"
+    )
+
+    async def classify_async(self, command: str) -> ClassificationResult:
+        """Agentic intent classification via J-Prime (Pillar 5).
+
+        Falls back to reflex-arc classify() if the Mind is unavailable.
+        """
+        if not command or not command.strip():
+            return self.classify(command)
+
+        try:
+            from backend.core.prime_router import get_prime_router
+            router = await get_prime_router()
+
+            response = await router.generate(
+                prompt=f'Classify this voice command: "{command}"',
+                system_prompt=self._CLASSIFY_SYSTEM_PROMPT,
+                max_tokens=256,
+                temperature=0.0,
+                deadline=asyncio.get_event_loop().time() + 3.0,
+            )
+
+            result = json.loads(response.content)
+            intent = CommandIntent.ACTION if result.get("intent") == "action" else CommandIntent.QUERY
+
+            logger.info(
+                "IntentClassifier.classify_async: '%s' → %s (confidence=%.2f, source=%s, latency=%.0fms)",
+                command, intent.value, result.get("confidence", 0),
+                response.source, response.latency_ms,
+            )
+
+            return ClassificationResult(
+                intent=intent,
+                confidence=float(result.get("confidence", 0.85)),
+                matched_signal=f"ai:{response.source}",
+                action_category=result.get("action_category", ""),
+                provider=result.get("provider", ""),
+                search_query=result.get("search_query", ""),
+                target_app=result.get("target_app", ""),
+            )
+
+        except Exception as e:
+            logger.warning(
+                "IntentClassifier.classify_async failed, falling back to reflex: %s", e
+            )
+            return self.classify(command)
 
 
 # ---------------------------------------------------------------------------

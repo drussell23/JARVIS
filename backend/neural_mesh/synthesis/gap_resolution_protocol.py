@@ -102,7 +102,7 @@ def _load_policy(domain_id: str) -> GapResolutionPolicy:
 
 
 class GapResolutionProtocol:
-    def __init__(self) -> None:
+    def __init__(self, trust_ledger=None) -> None:
         self._in_flight: Dict[str, asyncio.Event] = {}
         self._synth_timeout_s: float = float(
             os.environ.get("DAS_SYNTH_TIMEOUT_S", "120")
@@ -123,6 +123,17 @@ class GapResolutionProtocol:
         self._flip_history: Dict[str, List[float]] = {}
         # domain_id -> freeze-until monotonic time
         self._frozen_until: Dict[str, float] = {}
+        # Pillar 6: DomainTrustLedger — records synthesis outcomes
+        # for trust-based tier graduation (tier_1 → tier_2 → tier_3).
+        # Auto-instantiates if not injected.
+        if trust_ledger is None:
+            try:
+                from backend.neural_mesh.synthesis.domain_trust_ledger import DomainTrustLedger
+                self._trust_ledger = DomainTrustLedger()
+            except ImportError:
+                self._trust_ledger = None
+        else:
+            self._trust_ledger = trust_ledger
 
     def classify_mode(self, event: CapabilityGapEvent) -> ResolutionMode:
         if event.source == "dream_advisory":
@@ -218,14 +229,24 @@ class GapResolutionProtocol:
             self.classify_mode(event).value,
             retry_count,
         )
-        # Trinity observer hooks — fire-and-forget, observer-only.
-        # HealthCortex and MemoryEngine require full dependency injection at
-        # construction time; direct instantiation here would always raise
-        # TypeError.  Full wiring is deferred to the Trinity integration
-        # follow-up spec.  The TRINITY_DREAM_DAS_ENABLED env var is defined
-        # but is a no-op in this implementation iteration.
-        log.debug(
-            "GapResolutionProtocol: synthesis complete for domain_id=%s "
-            "(Trinity observer hooks: deferred pending full Trinity wiring)",
-            event.domain_id,
-        )
+        # Pillar 6: Record synthesis outcome in DomainTrustLedger.
+        # Trust-based tier gates (tier_1 → tier_2 → tier_3) control whether
+        # future syntheses require human approval or can proceed autonomously.
+        if self._trust_ledger is not None:
+            try:
+                if retry_count == 0:
+                    self._trust_ledger.record_success(event.domain_id)
+                    log.info(
+                        "DomainTrustLedger: recorded success for %s (tier=%d)",
+                        event.domain_id,
+                        self._trust_ledger.record(event.domain_id).tier,
+                    )
+                else:
+                    self._trust_ledger.record_rollback(event.domain_id)
+                    log.info(
+                        "DomainTrustLedger: recorded rollback for %s (retry=%d, tier=%d)",
+                        event.domain_id, retry_count,
+                        self._trust_ledger.record(event.domain_id).tier,
+                    )
+            except Exception:
+                log.debug("DomainTrustLedger recording failed for %s", event.domain_id)

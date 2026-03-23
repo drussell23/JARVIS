@@ -212,6 +212,7 @@ class GraduationOrchestrator:
         agent_registry: Any = None,
         repo_registry: Any = None,
         comm_protocol: Any = None,
+        trust_ledger: Any = None,
         max_concurrent: int = _MAX_CONCURRENT,
         approval_timeout_s: float = _APPROVAL_TIMEOUT_S,
         persistence_dir: Optional[Path] = None,
@@ -230,6 +231,16 @@ class GraduationOrchestrator:
         self._total_graduated: int = 0
         self._total_failed: int = 0
         self._total_rejected: int = 0
+        # Pillar 6: DomainTrustLedger — records graduation outcomes for
+        # trust-based tier gates. Auto-instantiates if not injected.
+        if trust_ledger is None:
+            try:
+                from backend.neural_mesh.synthesis.domain_trust_ledger import DomainTrustLedger
+                self._trust_ledger = DomainTrustLedger()
+            except ImportError:
+                self._trust_ledger = None
+        else:
+            self._trust_ledger = trust_ledger
 
     async def evaluate_graduation(
         self, goal_class_id: str, usage_records: List[EphemeralUsageRecord],
@@ -314,6 +325,12 @@ class GraduationOrchestrator:
                 record.phase = GraduationPhase.FAILED
                 record.error = str(exc)[:500]
                 self._total_failed += 1
+                # Pillar 6: Record failure in DomainTrustLedger
+                if self._trust_ledger is not None:
+                    try:
+                        self._trust_ledger.record_incident(goal_class_id)
+                    except Exception:
+                        pass
                 await self._narrate(f"Graduation failed: {exc}")
                 return record
 
@@ -955,9 +972,16 @@ class GraduationOrchestrator:
             except Exception as exc:
                 logger.warning("[Graduation] TopologyMap update failed: %s", exc)
 
-        # Step 6: Terminal state + narration
+        # Step 6: Terminal state + narration + trust recording
         record.phase = GraduationPhase.GRADUATED
         self._total_graduated += 1
+        # Pillar 6: Record successful graduation in DomainTrustLedger
+        if self._trust_ledger is not None:
+            try:
+                domain = record.decision.capability_domain if record.decision else record.goal_class_id
+                self._trust_ledger.record_success(domain)
+            except Exception:
+                pass
         self._emit(record, f"Graduated: {record.decision.capability_name}")
         await self._narrate(
             f"Agent {record.decision.agent_class_name} is now live. "
