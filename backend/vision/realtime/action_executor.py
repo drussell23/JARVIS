@@ -177,42 +177,104 @@ class ActionExecutor:
             )
 
     # ------------------------------------------------------------------
-    # Internal dispatch helpers — one per ActionType
+    # Internal dispatch — prefer Ghost Hands, fallback to pyautogui
     # ------------------------------------------------------------------
 
     async def _dispatch(self, request: ActionRequest) -> None:
-        """Route *request* to the correct pyautogui call off the event loop."""
+        """Route *request* to Ghost Hands BackgroundActuator (preferred) or pyautogui.
+
+        v305.0: Ghost Hands provides focus-preserving execution via
+        Playwright (browsers), AppleScript (native apps), and CGEvent
+        (low-level). Falls back to pyautogui only if Ghost Hands is
+        unavailable. Zero hardcoding — backend selection is automatic.
+        """
+        # Try Ghost Hands first (focus-preserving, multi-backend)
+        actuator = await self._get_ghost_hands_actuator()
+        if actuator is not None:
+            await self._dispatch_via_ghost_hands(actuator, request)
+            return
+
+        # Fallback to pyautogui (steals focus, single backend)
+        logger.debug(
+            "Ghost Hands unavailable for %s, falling back to pyautogui",
+            request.action_id,
+        )
+        await self._dispatch_via_pyautogui(request)
+
+    async def _get_ghost_hands_actuator(self):
+        """Get Ghost Hands BackgroundActuator singleton (cached)."""
+        if not hasattr(self, '_actuator_cache'):
+            self._actuator_cache = None
+            self._actuator_checked = False
+
+        if self._actuator_checked:
+            return self._actuator_cache
+
+        self._actuator_checked = True
+        try:
+            from backend.ghost_hands.background_actuator import get_background_actuator
+            self._actuator_cache = await asyncio.wait_for(
+                get_background_actuator(), timeout=2.0,
+            )
+            logger.info("[ActionExecutor] Ghost Hands BackgroundActuator connected")
+        except Exception as exc:
+            logger.debug("[ActionExecutor] Ghost Hands not available: %s", exc)
+            self._actuator_cache = None
+
+        return self._actuator_cache
+
+    async def _dispatch_via_ghost_hands(self, actuator, request: ActionRequest) -> None:
+        """Execute action via Ghost Hands BackgroundActuator."""
         action_type = request.action_type
 
         if action_type == ActionType.CLICK:
             if request.coords is None:
-                raise ValueError(
-                    f"CLICK action {request.action_id!r} requires coords"
-                )
+                raise ValueError(f"CLICK action {request.action_id!r} requires coords")
+            report = await actuator.click(coordinates=request.coords)
+            if hasattr(report, 'result') and str(report.result) == 'FAILED':
+                raise RuntimeError(f"Ghost Hands click failed: {getattr(report, 'error', 'unknown')}")
+
+        elif action_type == ActionType.TYPE:
+            if request.text is None:
+                raise ValueError(f"TYPE action {request.action_id!r} requires text")
+            report = await actuator.type_text(request.text)
+            if hasattr(report, 'result') and str(report.result) == 'FAILED':
+                raise RuntimeError(f"Ghost Hands type failed: {getattr(report, 'error', 'unknown')}")
+
+        elif action_type == ActionType.SCROLL:
+            if request.scroll_amount is None:
+                raise ValueError(f"SCROLL action {request.action_id!r} requires scroll_amount")
+            # Ghost Hands may not have a direct scroll — fall back to pyautogui
+            await asyncio.to_thread(self._do_scroll, request.scroll_amount)
+
+        else:
+            raise ValueError(f"Unsupported action_type {action_type!r}")
+
+    async def _dispatch_via_pyautogui(self, request: ActionRequest) -> None:
+        """Fallback: execute action via pyautogui (steals focus)."""
+        action_type = request.action_type
+
+        if action_type == ActionType.CLICK:
+            if request.coords is None:
+                raise ValueError(f"CLICK action {request.action_id!r} requires coords")
             x, y = request.coords
             await asyncio.to_thread(self._do_click, x, y)
 
         elif action_type == ActionType.TYPE:
             if request.text is None:
-                raise ValueError(
-                    f"TYPE action {request.action_id!r} requires text"
-                )
+                raise ValueError(f"TYPE action {request.action_id!r} requires text")
             await asyncio.to_thread(self._do_type, request.text)
 
         elif action_type == ActionType.SCROLL:
             if request.scroll_amount is None:
-                raise ValueError(
-                    f"SCROLL action {request.action_id!r} requires scroll_amount"
-                )
+                raise ValueError(f"SCROLL action {request.action_id!r} requires scroll_amount")
             await asyncio.to_thread(self._do_scroll, request.scroll_amount)
 
         else:
-            raise ValueError(
-                f"Unsupported action_type {action_type!r} for action {request.action_id!r}"
-            )
+            raise ValueError(f"Unsupported action_type {action_type!r}")
 
     # ------------------------------------------------------------------
-    # Synchronous pyautogui wrappers — run inside to_thread
+    # Synchronous pyautogui wrappers — run inside to_thread (fallback)
     # ------------------------------------------------------------------
 
     @staticmethod

@@ -916,46 +916,161 @@ class RuntimeTaskOrchestrator:
             await proc.wait()
             logger.info("[RuntimeTask] Opened app: %s", target_app)
 
-        # Step 2: Verify via VisionActionLoop (perception-action loop)
+        # Step 2: Verify + correct via VisionActionLoop (Ferrari → LLaVA → Ghost Hands)
+        # Wait for page load, then run the perception-action-verification loop.
+        # VisionActionLoop internally: captures frame (Ferrari SCK) → routes to
+        # LLaVA/32B on GCP (L2) or Claude Vision (L3) → ActionExecutor (now backed
+        # by Ghost Hands) → ActionVerifier → retry if needed (MAX_RETRIES=2).
         await asyncio.sleep(2.0)  # Allow page load
 
-        try:
-            from backend.vision.realtime.vision_action_loop import VisionActionLoop
-            _loop_cls = VisionActionLoop
-            _inst = (
-                _loop_cls.get_instance()
-                if hasattr(_loop_cls, "get_instance")
-                else None
-            )
-            if _inst is not None and hasattr(_inst, "execute_action"):
+        _val = await self._get_vision_action_loop()
+        if _val is not None:
+            try:
                 verification = await asyncio.wait_for(
-                    _inst.execute_action(
+                    _val.execute_action(
                         target_description=f"Verify: {goal}",
                         action_type="click",
                         target_text=search_query or goal,
                     ),
-                    timeout=15.0,
+                    timeout=20.0,
+                )
+                logger.info(
+                    "[RuntimeTask] Vision verification: success=%s tier=%s",
+                    verification.success,
+                    getattr(verification, "tier_used", "unknown"),
                 )
                 if verification.success:
                     return {
                         "success": True,
                         "result": f"Navigated and verified: {goal}",
                     }
-                logger.info(
-                    "[RuntimeTask] Vision verification inconclusive: %s",
-                    getattr(verification, "error", "unknown"),
-                )
-        except asyncio.TimeoutError:
-            logger.debug("[RuntimeTask] Vision verification timed out")
-        except Exception as exc:
-            logger.debug("[RuntimeTask] VisionActionLoop unavailable: %s", exc)
 
-        # URL/app was opened even without verification
+                # Verification failed — attempt Ghost Hands correction
+                correction = await self._attempt_ghost_hands_correction(
+                    goal, step, verification,
+                )
+                if correction:
+                    return correction
+
+            except asyncio.TimeoutError:
+                logger.info("[RuntimeTask] Vision verification timed out (20s)")
+            except Exception as exc:
+                logger.info("[RuntimeTask] VisionActionLoop error: %s", exc)
+
+        # URL/app was opened even without full verification
         opened = f"URL: {url}" if url else f"app: {target_app}" if target_app else goal
         return {
             "success": True,
-            "result": f"Opened {opened}. Visual verification pending.",
+            "result": f"Opened {opened}. Visual verification not available.",
         }
+
+    async def _get_vision_action_loop(self) -> Any:
+        """Get the kernel's VisionActionLoop instance if running."""
+        try:
+            from backend.vision.realtime.vision_action_loop import VisionActionLoop
+            _cls = VisionActionLoop
+            if hasattr(_cls, "get_instance"):
+                return _cls.get_instance()
+            # Fallback: check if supervisor stored it
+            return None
+        except ImportError:
+            return None
+
+    async def _attempt_ghost_hands_correction(
+        self,
+        goal: str,
+        step: Dict[str, Any],
+        failed_verification: Any,
+    ) -> Optional[Dict[str, Any]]:
+        """Use Ghost Hands + LLaVA to correct a failed navigation.
+
+        v305.0: When VisionActionLoop verification fails (e.g., wrong page),
+        ask LLaVA what's on screen and what to click to reach the goal.
+        Ghost Hands executes the correction without stealing focus.
+        """
+        if self._prime is None:
+            return None
+
+        try:
+            # Ask J-Prime/LLaVA what went wrong and what to do
+            error_desc = getattr(failed_verification, "error", "page did not match goal")
+            prompt = (
+                f"A browser navigation failed. The goal was: {goal}\n"
+                f"The verification found: {error_desc}\n\n"
+                f"What should I do to correct this? Options:\n"
+                f"- Click a specific UI element (describe it)\n"
+                f"- Navigate to a different URL (provide it)\n"
+                f"- Type in a search box (provide the text)\n\n"
+                f"Return a JSON object: "
+                f'{{"action": "click"|"navigate"|"type", '
+                f'"target": "description or URL or text"}}'
+            )
+
+            response = await asyncio.wait_for(
+                self._prime.generate(
+                    prompt=prompt,
+                    system_prompt="You are a UI navigation assistant. Return only JSON.",
+                    max_tokens=200,
+                ),
+                timeout=8.0,
+            )
+
+            import json as _json
+            raw = (response.text if hasattr(response, "text") else str(response)).strip()
+            # Extract JSON from response (may have markdown fences)
+            if "```" in raw:
+                raw = raw.split("```")[1].strip()
+                if raw.startswith("json"):
+                    raw = raw[4:].strip()
+            correction = _json.loads(raw)
+
+            action = correction.get("action", "")
+            target = correction.get("target", "")
+
+            if action == "navigate" and target.startswith("http"):
+                proc = await asyncio.create_subprocess_exec(
+                    "open", target,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await proc.wait()
+                logger.info("[RuntimeTask] Ghost Hands correction: navigate to %s", target[:60])
+                return {"success": True, "result": f"Corrected navigation to: {target}"}
+
+            elif action == "click" and target:
+                # Use VisionActionLoop to find and click the described element
+                _val = await self._get_vision_action_loop()
+                if _val is not None:
+                    click_result = await asyncio.wait_for(
+                        _val.execute_action(
+                            target_description=target,
+                            action_type="click",
+                        ),
+                        timeout=15.0,
+                    )
+                    if click_result.success:
+                        logger.info("[RuntimeTask] Ghost Hands correction: clicked '%s'", target[:40])
+                        return {"success": True, "result": f"Corrected by clicking: {target}"}
+
+            elif action == "type" and target:
+                _val = await self._get_vision_action_loop()
+                if _val is not None:
+                    type_result = await asyncio.wait_for(
+                        _val.execute_action(
+                            target_description="search or input field",
+                            action_type="type",
+                            target_text=target,
+                        ),
+                        timeout=15.0,
+                    )
+                    if type_result.success:
+                        logger.info("[RuntimeTask] Ghost Hands correction: typed '%s'", target[:40])
+                        return {"success": True, "result": f"Corrected by typing: {target}"}
+
+        except Exception as exc:
+            logger.debug("[RuntimeTask] Ghost Hands correction failed: %s", exc)
+
+        return None
 
     async def _synthesize_and_execute(
         self, goal: str, step: Dict[str, Any], ephemeral: bool,
