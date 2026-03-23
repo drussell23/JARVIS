@@ -2343,7 +2343,7 @@ class JARVISLoadingManager {
             }
 
             // v210.0: Connect to discovered/configured loading server
-            const wsUrl = `${this.config.wsProtocol}//${this.config.hostname}:${this.config.loadingServerPort}/ws/progress`;
+            const wsUrl = `${this.config.wsProtocol}//${this.config.hostname}:${this.config.loadingServerPort}/ws/startup-progress`;
             console.log(`[WebSocket] Connecting to ${wsUrl}...`);
 
             this.state.ws = new WebSocket(wsUrl);
