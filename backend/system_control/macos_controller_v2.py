@@ -384,25 +384,8 @@ class MacOSController:
             )
             return True, f"Opened {resolved}"
 
-        # Native launch failed — check if it's a web service
-        try:
-            from backend.api.action_executors import ApplicationLauncherExecutor
-            launcher = ApplicationLauncherExecutor()
-            svc = launcher.get_web_service(app_name)
-            if svc:
-                import subprocess as _sp
-                url = svc.get("url", f"https://www.{app_name.lower()}.com")
-                browser = os.environ.get("JARVIS_DEFAULT_BROWSER", "Google Chrome")
-                _sp.run(["open", "-a", browser, url], timeout=5)
-                ControlEvents.app_launched(
-                    source="macos_controller",
-                    app_name=app_name,
-                    success=True
-                )
-                return True, f"Opened {app_name} in browser"
-        except Exception:
-            pass
-
+        # Sync path cannot do agentic AI resolution (requires async).
+        # The async open_application_pipeline() handles full AI resolution.
         ControlEvents.app_launched(
             source="macos_controller",
             app_name=app_name,

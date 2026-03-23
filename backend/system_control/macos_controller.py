@@ -679,27 +679,9 @@ class MacOSController:
         except Exception:
             pass
 
-        # Native launch failed — check if it's a web service via the shared config
-        try:
-            from backend.api.action_executors import ApplicationLauncherExecutor
-            launcher = ApplicationLauncherExecutor()
-            _, web_svc = launcher.resolve_from_cache(app_name)
-            if web_svc and web_svc.get("type") == "web_service":
-                url = web_svc.get("url", f"https://www.{app_name.lower()}.com")
-                browser = os.environ.get("JARVIS_DEFAULT_BROWSER", "Google Chrome")
-                _sp.run(["open", "-a", browser, url], timeout=5)
-                return True, f"Opening {app_name} in browser, Sir"
-
-            # Check web_services in seed cache
-            svc = launcher.get_web_service(app_name)
-            if svc:
-                url = svc.get("url", f"https://www.{app_name.lower()}.com")
-                browser = os.environ.get("JARVIS_DEFAULT_BROWSER", "Google Chrome")
-                _sp.run(["open", "-a", browser, url], timeout=5)
-                return True, f"Opening {app_name} in browser, Sir"
-        except Exception:
-            pass
-
+        # Sync path cannot do agentic AI resolution (requires async).
+        # The async open_application_pipeline() handles full AI resolution
+        # via ApplicationLauncherExecutor → PrimeRouter.
         return False, f"Couldn't find application: {app_name}"
 
     def close_application(self, app_name: str) -> Tuple[bool, str]:
