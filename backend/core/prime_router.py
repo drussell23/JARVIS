@@ -1006,7 +1006,12 @@ class PrimeRouter:
 
         except Exception as e:
             self._metrics.errors += 1
-            logger.error(f"[PrimeRouter] Generation failed: {e}")
+            logger.error(
+                f"[PrimeRouter] Generation failed: {type(e).__name__}: {e} "
+                f"(route={routing.value if routing else 'unknown'}, "
+                f"prime_available={self._prime_client.is_available if self._prime_client else None}, "
+                f"gcp_promoted={self._gcp_promoted})"
+            )
 
             # Return degraded response on error
             return self._build_degraded_response(
