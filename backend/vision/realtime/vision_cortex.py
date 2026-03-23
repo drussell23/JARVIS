@@ -161,11 +161,170 @@ class VisionCortex:
             self._activity_level = ActivityLevel.IDLE
 
     # ------------------------------------------------------------------
-    # Lifecycle -- stubs for Task 5
+    # Lifecycle
     # ------------------------------------------------------------------
 
     async def awaken(self) -> None:
-        raise NotImplementedError("Implemented in Task 5")
+        """Start all subsystems and the perception loop. Non-blocking."""
+        if self._running:
+            return
+        await self._discover_subsystems()
+        self._screen_dispatch = self._build_screen_dispatch()
+        self._running = True
+        self._start_perception_loop()
+        await self._start_monitor()
+        logger.info(
+            "[VisionCortex] Awake (pipeline=%s, analyzer=%s, monitor=%s)",
+            self._frame_pipeline is not None,
+            self._analyzer is not None,
+            self._monitor is not None,
+        )
 
     async def shutdown(self) -> None:
-        raise NotImplementedError("Implemented in Task 5")
+        """Stop all subsystems. Idempotent."""
+        if not self._running:
+            return
+        self._running = False
+        if self._perception_task and not self._perception_task.done():
+            self._perception_task.cancel()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._perception_task), timeout=2.0
+                )
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._perception_task = None
+        if self._monitor:
+            try:
+                await self._monitor.stop_monitoring()
+            except Exception as exc:
+                logger.debug("[VisionCortex] Monitor stop error: %s", exc)
+        if VisionCortex._instance is self:
+            VisionCortex._instance = None
+        logger.info("[VisionCortex] Shutdown complete")
+
+    # ------------------------------------------------------------------
+    # Subsystem discovery & wiring
+    # ------------------------------------------------------------------
+
+    async def _discover_subsystems(self) -> None:
+        """Discover existing organs via singleton lookups. No hard imports."""
+        try:
+            from backend.vision.realtime.vision_action_loop import VisionActionLoop
+            val = VisionActionLoop.get_instance()
+            if val is not None:
+                self._frame_pipeline = val.frame_pipeline
+                self._knowledge_fabric = val.knowledge_fabric
+        except ImportError:
+            pass
+
+        # Create analyzer -- works with or without Ferrari Engine
+        try:
+            from backend.vision.continuous_screen_analyzer import (
+                MemoryAwareScreenAnalyzer,
+            )
+            handler = _NullVisionHandler()
+            self._analyzer = MemoryAwareScreenAnalyzer(handler)
+            self._wire_analyzer_callbacks()
+        except ImportError as exc:
+            logger.debug("[VisionCortex] Analyzer not available: %s", exc)
+
+        # Fallback: if no Ferrari Engine, start analyzer's own monitoring loop
+        if self._frame_pipeline is None and self._analyzer is not None:
+            logger.info("[VisionCortex] No Ferrari Engine -- using screencapture fallback")
+            await self._analyzer.start_monitoring()
+
+    def _wire_analyzer_callbacks(self) -> None:
+        """Register VisionCortex as consumer of analyzer events.
+        Stores strong refs to prevent _CallbackSet weakref GC.
+        """
+        if self._analyzer is None:
+            return
+        self._analyzer_callback_refs = []
+        for event_type in ('content_changed', 'app_changed', 'error_detected',
+                           'notification_detected', 'meeting_detected',
+                           'security_concern', 'screen_captured'):
+            handler = self._make_screen_handler(event_type)
+            self._analyzer_callback_refs.append(handler)  # prevent GC
+            self._analyzer.event_callbacks[event_type].add(handler)
+
+    def _make_screen_handler(self, event_type: str):
+        """Create a callback for a specific screen event type."""
+        async def _handler(data):
+            await self._on_screen_event(event_type, data)
+        return _handler
+
+    # ------------------------------------------------------------------
+    # Perception loop
+    # ------------------------------------------------------------------
+
+    def _start_perception_loop(self) -> None:
+        # Only start if we have Ferrari Engine
+        if self._frame_pipeline is None:
+            return
+        self._perception_task = asyncio.ensure_future(
+            self._perception_loop(),
+        )
+
+    async def _perception_loop(self) -> None:
+        """Background loop: read latest frame, inject into analyzer, adapt."""
+        while self._running:
+            try:
+                interval = self.perception_interval
+                await asyncio.sleep(interval)
+                await self._run_one_perception_cycle()
+            except asyncio.CancelledError:
+                break
+            except Exception as exc:
+                logger.warning("[VisionCortex] Perception cycle error: %s", exc)
+
+    async def _run_one_perception_cycle(self) -> None:
+        """Single perception cycle: read frame, inject, update throttle.
+        Does NOT append to _change_history -- callbacks do that to avoid double-counting.
+        """
+        if self._frame_pipeline is None or self._analyzer is None:
+            return
+        frame = self._frame_pipeline.latest_frame
+        if frame is None:
+            return
+
+        from PIL import Image
+        pil_image = Image.fromarray(frame.data)
+        await self._analyzer.inject_frame(pil_image, frame.timestamp)
+
+    # ------------------------------------------------------------------
+    # Monitor wiring
+    # ------------------------------------------------------------------
+
+    async def _start_monitor(self) -> None:
+        try:
+            from backend.vision.multi_space_monitor import (
+                MultiSpaceMonitor, MonitorEventType,
+            )
+            self._monitor = MultiSpaceMonitor()
+            for evt_type in (MonitorEventType.SPACE_SWITCHED,
+                             MonitorEventType.APP_LAUNCHED,
+                             MonitorEventType.APP_CLOSED,
+                             MonitorEventType.APP_MOVED,
+                             MonitorEventType.WORKFLOW_DETECTED):
+                self._monitor.register_event_handler(
+                    evt_type, self._on_workspace_event,
+                )
+            await self._monitor.start_monitoring()
+        except ImportError as exc:
+            logger.debug("[VisionCortex] MultiSpaceMonitor not available: %s", exc)
+        except Exception as exc:
+            logger.warning("[VisionCortex] Monitor start failed: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Event dispatch stubs (Task 6 will implement)
+    # ------------------------------------------------------------------
+
+    def _build_screen_dispatch(self) -> dict:
+        return {}
+
+    async def _on_screen_event(self, event_type: str, data: dict) -> None:
+        pass
+
+    async def _on_workspace_event(self, event) -> None:
+        pass

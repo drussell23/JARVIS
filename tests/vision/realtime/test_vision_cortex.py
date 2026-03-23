@@ -64,3 +64,52 @@ def test_update_activity_level_from_rate():
     cortex._change_history.clear()
     cortex._update_activity_level()
     assert cortex._activity_level == ActivityLevel.IDLE
+
+
+@pytest.mark.asyncio
+async def test_awaken_and_shutdown():
+    cortex = VisionCortex()
+    with patch.object(cortex, '_discover_subsystems', new_callable=AsyncMock):
+        with patch.object(cortex, '_start_perception_loop'):
+            with patch.object(cortex, '_start_monitor', new_callable=AsyncMock):
+                await cortex.awaken()
+                assert cortex.is_awake
+                await cortex.shutdown()
+                assert not cortex.is_awake
+
+
+@pytest.mark.asyncio
+async def test_awaken_clears_singleton_on_shutdown():
+    cortex = VisionCortex()
+    assert VisionCortex.get_instance() is cortex
+    with patch.object(cortex, '_discover_subsystems', new_callable=AsyncMock):
+        with patch.object(cortex, '_start_perception_loop'):
+            with patch.object(cortex, '_start_monitor', new_callable=AsyncMock):
+                await cortex.awaken()
+    await cortex.shutdown()
+    assert VisionCortex.get_instance() is None
+
+
+@pytest.mark.asyncio
+async def test_perception_loop_reads_latest_frame():
+    """Verify perception loop uses latest_frame (non-destructive) not get_frame."""
+    from backend.vision.realtime.frame_pipeline import FrameData
+    cortex = VisionCortex()
+
+    mock_frame = FrameData(
+        data=np.zeros((100, 100, 3), dtype=np.uint8),
+        width=100, height=100, timestamp=1.0, frame_number=1,
+    )
+    mock_pipeline = MagicMock()
+    mock_pipeline.latest_frame = mock_frame
+    cortex._frame_pipeline = mock_pipeline
+
+    mock_analyzer = MagicMock()
+    mock_analyzer.inject_frame = AsyncMock()
+    cortex._analyzer = mock_analyzer
+    cortex._running = True
+
+    await cortex._run_one_perception_cycle()
+
+    mock_analyzer.inject_frame.assert_called_once()
+    mock_pipeline.get_frame.assert_not_called()
