@@ -1996,6 +1996,12 @@ class UnifiedCommandProcessor:
         """Inner pipeline extracted from process_command for dedupe wrapping.
         v277.0: All original process_command logic lives here."""
         _start_time = time.time()
+        # BREADCRUMB: write to file so we can see it even if TUI swallows logs
+        try:
+            with open("/tmp/jarvis_pillar5_trace.log", "a") as _p5f:
+                _p5f.write(f"[{time.strftime('%H:%M:%S')}] PIPELINE ENTERED: {command_text[:60]}\n")
+        except Exception:
+            pass
 
         source_context = source_context or {}
         allow_during_tts_interrupt = bool(
@@ -2327,72 +2333,100 @@ class UnifiedCommandProcessor:
                 logger.warning("[v295] Remote reasoning failed: %s — using local fallback", exc)
 
         # Pillar 5 + Pillar 2: Reflex-arc pre-route.
-        # Use instant reflex classification (<1ms) to detect ACTION commands.
-        # If RTO is available, dispatch there. Otherwise, execute directly
-        # via ApplicationLauncherExecutor (browser actions) or system controller.
+        # File-traced for debugging (TUI swallows logger output).
+        _p5_trace = "/tmp/jarvis_pillar5_trace.log"
+        def _p5log(msg):
+            try:
+                with open(_p5_trace, "a") as _f:
+                    _f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            except Exception:
+                pass
+
         try:
             from backend.core.intent_classifier import get_intent_classifier, CommandIntent
 
             _ic = get_intent_classifier()
-            _classification = _ic.classify(command_text)  # Reflex: <1ms
+            _classification = _ic.classify(command_text)
+            _p5log(f"classify: intent={_classification.intent.value} conf={_classification.confidence} "
+                   f"cat={_classification.action_category} provider={_classification.provider} "
+                   f"query={_classification.search_query}")
 
             if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
-                logger.info(
-                    "[Pillar5] Reflex → ACTION (conf=%.2f, category=%s, provider=%s, "
-                    "search_query=%s, target_app=%s)",
-                    _classification.confidence, _classification.action_category,
-                    _classification.provider, _classification.search_query,
-                    _classification.target_app,
-                )
+                _p5log("ACTION detected — entering pre-route")
 
-                # Try RTO (full Ouroboros path). Lazy-create if Zone 6.12 didn't fire.
+                # Try RTO
                 try:
                     from backend.core.runtime_task_orchestrator import (
                         get_runtime_task_orchestrator, set_runtime_task_orchestrator,
                         RuntimeTaskOrchestrator,
                     )
                     _rto = get_runtime_task_orchestrator()
+                    _p5log(f"RTO singleton: {_rto is not None}")
 
-                    # Lazy RTO creation — Zone 6.12 may not have fired (OOM, timing)
-                    # but we still need the RTO for action dispatch.
                     if _rto is None:
                         try:
                             from backend.core.prime_client import get_prime_client
                             _lazy_pc = await get_prime_client()
                             _rto = RuntimeTaskOrchestrator(prime_client=_lazy_pc)
                             set_runtime_task_orchestrator(_rto)
-                            logger.info("[Pillar5] Lazy-created minimal RTO (Zone 6.12 bypass)")
+                            _p5log("Lazy-created minimal RTO")
                         except Exception as _lazy_exc:
-                            logger.debug("[Pillar5] Lazy RTO creation failed: %s", _lazy_exc)
+                            _p5log(f"Lazy RTO FAILED: {_lazy_exc}")
 
                     if _rto is not None:
-                        logger.info("[Pillar5] Dispatching to RTO")
-                        _rto_result = await asyncio.wait_for(
-                            _rto.execute(
-                                query=command_text,
-                                context={
-                                    "intent": "action",
-                                    "action_category": _classification.action_category,
-                                    "provider": _classification.provider,
-                                    "search_query": _classification.search_query,
-                                    "target_app": _classification.target_app,
-                                    "source": "pillar5_preroute",
-                                },
-                            ),
-                            timeout=60.0,
-                        )
-                        if _rto_result is not None:
-                            _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
-                            return {
-                                "success": True,
-                                "response": _summary,
-                                "command_type": "ACTION",
-                                "source": "rto_pillar5",
-                            }
+                        _p5log("Dispatching to RTO.execute()")
+                        try:
+                            _rto_result = await asyncio.wait_for(
+                                _rto.execute(
+                                    query=command_text,
+                                    context={
+                                        "intent": "action",
+                                        "action_category": _classification.action_category,
+                                        "provider": _classification.provider,
+                                        "search_query": _classification.search_query,
+                                        "target_app": _classification.target_app,
+                                        "source": "pillar5_preroute",
+                                    },
+                                ),
+                                timeout=60.0,
+                            )
+                            _p5log(f"RTO result: {_rto_result}")
+                            if _rto_result is not None:
+                                # Check if the ephemeral tool actually succeeded
+                                _has_error = False
+                                if hasattr(_rto_result, 'steps'):
+                                    for _step in _rto_result.steps:
+                                        _step_result = getattr(_step, 'result', {}) or {}
+                                        if isinstance(_step_result, dict) and _step_result.get('error'):
+                                            _has_error = True
+                                            _p5log(f"RTO step error: {_step_result['error']}")
+
+                                if not _has_error:
+                                    _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
+                                    _p5log(f"RTO SUCCESS: {_summary[:100]}")
+                                    return {
+                                        "success": True,
+                                        "response": _summary,
+                                        "command_type": "ACTION",
+                                        "source": "rto_pillar5",
+                                    }
+                                else:
+                                    _p5log("RTO tool had runtime error — falling through to direct execution")
+                            _p5log("RTO returned None or failed — falling through")
+                        except asyncio.TimeoutError:
+                            _p5log("RTO TIMEOUT after 60s")
+                        except Exception as _rto_exec_exc:
+                            _p5log(f"RTO execute FAILED: {type(_rto_exec_exc).__name__}: {_rto_exec_exc}")
                 except Exception as _rto_exc:
-                    logger.info("[Pillar5] RTO unavailable (%s), using direct execution", _rto_exc)
+                    _p5log(f"RTO unavailable: {_rto_exc}")
 
                 # Direct execution fallback — browser search actions
+                _p5log(f"Direct execution check: cat={_classification.action_category} "
+                       f"query={_classification.search_query} provider={_classification.provider}")
+                logger.info(
+                    "[Pillar5] Direct execution check: category=%s search_query=%s provider=%s",
+                    _classification.action_category, _classification.search_query, _classification.provider,
+                )
                 if _classification.action_category == "browser" and _classification.search_query:
                     try:
                         from backend.api.action_executors import ApplicationLauncherExecutor

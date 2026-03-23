@@ -111,12 +111,44 @@ def _hash_code(code: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _build_safe_namespace(goal: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
-    """Build an isolated namespace with only safe builtins.
+    """Build an isolated namespace with governed import capability.
 
-    The synthesized code cannot access os, subprocess, shutil, or any
-    dangerous module. Only pure computation + asyncio + json + aiohttp.
+    The organism must ACT on the physical world (open browsers, run commands,
+    make HTTP requests) while being protected from destructive operations.
+
+    Pillar 6: Synthesized tools need imports to function. Blocking __import__
+    entirely produces dead code that can never graduate into permanent agents.
+
+    Security: governed __import__ allows whitelisted modules only.
     """
+
+    _ALLOWED_MODULES = frozenset({
+        "json", "re", "time", "datetime", "math", "hashlib", "base64",
+        "urllib", "urllib.parse", "urllib.request",
+        "collections", "itertools", "functools", "typing",
+        "io", "string", "textwrap",
+        "subprocess", "webbrowser", "os", "os.path", "pathlib",
+        "http", "http.client", "socket",
+        "asyncio", "aiohttp",
+    })
+
+    _BLOCKED_MODULES = frozenset({
+        "shutil", "ctypes", "importlib", "code", "codeop",
+        "dbm", "sqlite3", "multiprocessing", "threading",
+    })
+
+    _real_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+
+    def _governed_import(name, globals=None, locals=None, fromlist=(), level=0):
+        base_module = name.split(".")[0]
+        if base_module in _BLOCKED_MODULES:
+            raise ImportError(f"Module '{name}' blocked by sandbox policy")
+        if base_module not in _ALLOWED_MODULES and name not in _ALLOWED_MODULES:
+            raise ImportError(f"Module '{name}' not in sandbox allowlist")
+        return _real_import(name, globals, locals, fromlist, level)
+
     safe_builtins = {
+        "__import__": _governed_import,
         "print": print,
         "len": len,
         "range": range,
@@ -150,6 +182,7 @@ def _build_safe_namespace(goal: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
         "TypeError": TypeError,
         "KeyError": KeyError,
         "IndexError": IndexError,
+        "ImportError": ImportError,
         "RuntimeError": RuntimeError,
         "True": True,
         "False": False,
@@ -162,11 +195,16 @@ def _build_safe_namespace(goal: str, ctx: Dict[str, Any]) -> Dict[str, Any]:
     namespace["__goal__"] = goal
     namespace["__context__"] = ctx
 
-    # Allow aiohttp for web requests in synthesized tools
+    # Pre-inject commonly needed modules
     try:
         namespace["aiohttp"] = __import__("aiohttp")
     except ImportError:
         pass
+    namespace["subprocess"] = __import__("subprocess")
+    namespace["webbrowser"] = __import__("webbrowser")
+    namespace["os"] = __import__("os")
+    namespace["re"] = __import__("re")
+    namespace["urllib"] = __import__("urllib")
 
     return namespace
 
