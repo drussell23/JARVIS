@@ -1438,26 +1438,58 @@ async def safe_say(
             )
             os.close(_temp_fd)
 
-            proc = await asyncio.create_subprocess_exec(
-                "say",
-                "-v", resolved_voice,
-                "-r", str(rate),
-                "-o", _temp_path,
-                "--data-format", f"LEI16@{_say_sr}",
-                text,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                start_new_session=True,
-            )
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                logger.warning("[safe_say:%s] say subprocess timed out (%ss)", source, timeout)
-                return False
+            # v305.0: Try with --data-format first (matches device sample rate),
+            # retry WITHOUT it if say exits 1 (some voices/macOS versions reject
+            # the LEI16 format specifier). Capture stderr on failure for diagnostics.
+            _say_succeeded = False
+            for _attempt_idx in range(2):
+                _use_data_format = (_attempt_idx == 0)
+                _cmd = [
+                    "say", "-v", resolved_voice,
+                    "-r", str(rate), "-o", _temp_path,
+                ]
+                if _use_data_format:
+                    _cmd.extend(["--data-format", f"LEI16@{_say_sr}"])
+                _cmd.append(text)
 
-            if proc.returncode != 0:
-                logger.warning("[safe_say:%s] say exited %d", source, proc.returncode)
+                proc = await asyncio.create_subprocess_exec(
+                    *_cmd,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+                try:
+                    _, _stderr = await asyncio.wait_for(
+                        proc.communicate(), timeout=timeout,
+                    )
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    logger.warning(
+                        "[safe_say:%s] say subprocess timed out (%ss)",
+                        source, timeout,
+                    )
+                    return False
+
+                if proc.returncode == 0:
+                    _say_succeeded = True
+                    break
+
+                _err_msg = (_stderr or b"").decode(
+                    "utf-8", errors="replace"
+                ).strip()
+                if _attempt_idx == 0:
+                    logger.debug(
+                        "[safe_say:%s] say exited %d with --data-format "
+                        "(retrying without): %s",
+                        source, proc.returncode, _err_msg[:200],
+                    )
+                else:
+                    logger.warning(
+                        "[safe_say:%s] say exited %d (both attempts failed): %s",
+                        source, proc.returncode, _err_msg[:200],
+                    )
+
+            if not _say_succeeded:
                 return False
 
             # 3. Route playback via afplay (native macOS, no GIL dependency).

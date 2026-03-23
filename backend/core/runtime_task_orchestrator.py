@@ -791,16 +791,25 @@ class RuntimeTaskOrchestrator:
             return {"status": "error", "error": "PrimeClient not available for synthesis"}
 
         # Ask J-Prime to generate a one-shot tool
+        # v305.0: Strengthened prompt to prefer browser/app automation over HTTP fetch.
+        # J-Prime was generating aiohttp.get() for "search X on youtube/wikipedia"
+        # instead of opening the browser — the user expects to SEE the page, not
+        # receive raw HTML in a dict.
         prompt = (
             f"Generate a Python async function that accomplishes this goal:\n"
             f"Goal: {goal}\n\n"
-            f"Requirements:\n"
+            f"CRITICAL RULES:\n"
             f"- Single async function: async def execute(context: dict) -> dict\n"
             f"- The function MUST accept exactly one argument: context (a dict)\n"
             f"- Returns a dict with 'success' (bool) and 'result' (str) keys\n"
-            f"- This runs on macOS — use subprocess.run(['open', url]) to open URLs\n"
-            f"- Use subprocess.run(['open', '-a', app_name]) to open native apps\n"
-            f"- Available imports: subprocess, webbrowser, os, json, re, urllib, asyncio, aiohttp\n"
+            f"- This runs on macOS for a DESKTOP AI assistant with a screen\n"
+            f"- For ANY task involving websites, search, or browsing:\n"
+            f"  USE subprocess.run(['open', url]) to open the URL in Chrome/Safari\n"
+            f"  The user wants to SEE the page, NOT receive raw HTML\n"
+            f"  NEVER use aiohttp/requests/urllib to fetch web pages — open them in the browser\n"
+            f"- For app tasks: subprocess.run(['open', '-a', 'AppName'])\n"
+            f"- For web search: build the URL (e.g. youtube.com/results?search_query=X) and open it\n"
+            f"- Available imports: subprocess, webbrowser, os, json, re, urllib, asyncio\n"
             f"- Output ONLY the function code, no markdown, no explanation\n"
         )
 
