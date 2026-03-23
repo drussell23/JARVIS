@@ -31,7 +31,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("Ouroboros.GraduationOrchestrator")
 
-_GRADUATION_THRESHOLD = int(os.environ.get("JARVIS_GRADUATION_THRESHOLD", "3"))
+# Pillar 6: Graduation threshold — count=3 defends against code bloat.
+# DEBUG_MUTATION_MODE=true overrides to count=1 for development testing.
+# NEVER enable DEBUG_MUTATION_MODE in production.
+_DEBUG_MUTATION = os.environ.get("DEBUG_MUTATION_MODE", "false").lower() in ("true", "1", "yes")
+_GRADUATION_THRESHOLD = 1 if _DEBUG_MUTATION else int(os.environ.get("JARVIS_GRADUATION_THRESHOLD", "3"))
 _APPROVAL_TIMEOUT_S = float(os.environ.get("JARVIS_GRADUATION_APPROVAL_TIMEOUT_S", "1800"))
 _APPROVAL_POLL_S = 5.0
 _MAX_CONCURRENT = 1

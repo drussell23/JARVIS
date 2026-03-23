@@ -2091,13 +2091,101 @@ class UnifiedCommandProcessor:
             logger.info("[UNIFIED] No audio data provided for this command")
 
         # =========================================================================
-        # v242 SPINAL REFLEX ARC: Reflex check -> J-Prime call -> Action executor
+        # PILLAR 5: AGENTIC PRE-ROUTE — MUST BE FIRST
+        # No hardcoded URLs. No static dictionaries. The AI resolves everything.
+        # Classify → RTO → J-Prime synthesizes → SandboxedExecutor runs → dissolves.
         # =========================================================================
-        # Replaces 5,000 lines of keyword classification with ~200 lines.
-        # 1. Check reflex manifest (local, sub-ms)
-        # 2. Call J-Prime for classification + generation
-        # 3. Execute action based on J-Prime's routing metadata
-        # 4. Brain vacuum fallback if J-Prime is unreachable
+        _p5_trace = "/tmp/jarvis_pillar5_trace.log"
+        def _p5log(msg):
+            try:
+                with open(_p5_trace, "a") as _f:
+                    _f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+            except Exception:
+                pass
+
+        try:
+            from backend.core.intent_classifier import get_intent_classifier, CommandIntent
+            _ic = get_intent_classifier()
+            _classification = _ic.classify(command_text)
+            _p5log(f"classify: {_classification.intent.value} conf={_classification.confidence} "
+                   f"cat={_classification.action_category} provider={_classification.provider} "
+                   f"query={_classification.search_query}")
+
+            if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
+                _p5log("ACTION detected — dispatching to RTO (agentic resolution)")
+
+                # Directive 3: Transparent latency — narrate synthesis to user
+                try:
+                    from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                    asyncio.create_task(safe_say(
+                        f"On it, Sir. Synthesizing a solution now.",
+                        wait=False, source="pillar5_preroute",
+                    ))
+                except Exception:
+                    pass  # Voice narration is best-effort
+
+                try:
+                    from backend.core.runtime_task_orchestrator import (
+                        get_runtime_task_orchestrator, set_runtime_task_orchestrator,
+                        RuntimeTaskOrchestrator,
+                    )
+                    _rto = get_runtime_task_orchestrator()
+
+                    if _rto is None:
+                        from backend.core.prime_client import get_prime_client
+                        _lazy_pc = await get_prime_client()
+                        _rto = RuntimeTaskOrchestrator(prime_client=_lazy_pc)
+                        set_runtime_task_orchestrator(_rto)
+                        _p5log("Lazy-created minimal RTO")
+
+                    _p5log("Dispatching to RTO.execute()")
+                    _rto_result = await asyncio.wait_for(
+                        _rto.execute(
+                            query=command_text,
+                            context={
+                                "intent": "action",
+                                "action_category": _classification.action_category,
+                                "provider": _classification.provider,
+                                "search_query": _classification.search_query,
+                                "target_app": _classification.target_app,
+                                "source": "pillar5_preroute",
+                            },
+                        ),
+                        timeout=60.0,
+                    )
+                    _p5log(f"RTO result: {_rto_result}")
+
+                    if _rto_result is not None:
+                        _has_error = False
+                        if hasattr(_rto_result, 'steps'):
+                            for _step in _rto_result.steps:
+                                _sr = getattr(_step, 'result', {}) or {}
+                                if isinstance(_sr, dict) and _sr.get('error'):
+                                    _has_error = True
+                                    _p5log(f"Step error: {_sr['error']}")
+
+                        if not _has_error:
+                            _summary = _rto_result.summary if hasattr(_rto_result, 'summary') else str(_rto_result)
+                            _p5log(f"SUCCESS: {_summary[:100]}")
+                            return {
+                                "success": True,
+                                "response": _summary,
+                                "command_type": "ACTION",
+                                "source": "rto_pillar5",
+                            }
+                        else:
+                            _p5log("RTO tool had error — falling through to legacy")
+
+                except asyncio.TimeoutError:
+                    _p5log("RTO timeout 60s — falling through")
+                except Exception as _rto_exc:
+                    _p5log(f"RTO error: {_rto_exc}")
+
+        except Exception as _p5_exc:
+            _p5log(f"Pre-route error: {_p5_exc}")
+
+        # =========================================================================
+        # v242 SPINAL REFLEX ARC (legacy — fallback for non-ACTION commands)
         # =========================================================================
 
         # Track command frequency

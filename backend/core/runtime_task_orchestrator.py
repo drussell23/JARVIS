@@ -35,11 +35,14 @@ it figures out how to do it.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
@@ -773,17 +776,23 @@ class RuntimeTaskOrchestrator:
             f"Generate a Python async function that accomplishes this goal:\n"
             f"Goal: {goal}\n\n"
             f"Requirements:\n"
-            f"- Single async function named 'execute'\n"
-            f"- Takes no arguments (or a dict context)\n"
-            f"- Returns a dict with 'success' bool and 'result' string\n"
-            f"- Uses only standard library + aiohttp if needed\n"
-            f"- Must be safe to run in a sandbox\n"
+            f"- Single async function: async def execute(context: dict) -> dict\n"
+            f"- The function MUST accept exactly one argument: context (a dict)\n"
+            f"- Returns a dict with 'success' (bool) and 'result' (str) keys\n"
+            f"- This runs on macOS — use subprocess.run(['open', url]) to open URLs\n"
+            f"- Use subprocess.run(['open', '-a', app_name]) to open native apps\n"
+            f"- Available imports: subprocess, webbrowser, os, json, re, urllib, asyncio, aiohttp\n"
+            f"- Output ONLY the function code, no markdown, no explanation\n"
         )
 
         try:
             response = await self._prime.generate(
                 prompt=prompt,
-                system_prompt="Generate a single Python async function. Output only the code, no explanation.",
+                system_prompt=(
+                    "You are a code generator for a macOS desktop AI assistant. "
+                    "Generate ONLY a single Python async function. No markdown fences. "
+                    "No explanation. Just the raw Python code starting with 'async def execute(context: dict) -> dict:'"
+                ),
                 max_tokens=2048,
                 temperature=0.3,
                 model_name=None,
@@ -795,6 +804,39 @@ class RuntimeTaskOrchestrator:
                 goal[:50],
                 response.tokens_used,
             )
+
+            # Pillar 7: Full observability — persist and display synthesized code
+            _code = response.content
+            _code_hash = hashlib.sha256(_code.encode()).hexdigest()[:16]
+            try:
+                # Persist to disk so the developer can inspect what the AI wrote
+                _synth_dir = Path(os.path.expanduser("~/.jarvis/ouroboros/synthesized_tools"))
+                _synth_dir.mkdir(parents=True, exist_ok=True)
+                _synth_file = _synth_dir / f"{_code_hash}_{goal.replace(' ', '_')[:30]}.py"
+                _synth_file.write_text(
+                    f"# Synthesized by J-Prime for: {goal}\n"
+                    f"# Hash: {_code_hash}\n"
+                    f"# Ephemeral: {ephemeral}\n"
+                    f"# Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"{_code}\n"
+                )
+                logger.warning(
+                    "\n"
+                    "╔══════════════════════════════════════════════════════╗\n"
+                    "║  🧬 EPHEMERAL TOOL SYNTHESIZED                     ║\n"
+                    "╠══════════════════════════════════════════════════════╣\n"
+                    "║  Goal: %-45s ║\n"
+                    "║  Hash: %-45s ║\n"
+                    "║  File: %-45s ║\n"
+                    "╠══════════════════════════════════════════════════════╣\n"
+                    "%s\n"
+                    "╚══════════════════════════════════════════════════════╝",
+                    goal[:45], _code_hash,
+                    str(_synth_file.name)[:45],
+                    _code[:500],
+                )
+            except Exception as _persist_exc:
+                logger.debug("[RuntimeTask] Failed to persist synthesized code: %s", _persist_exc)
 
             # Execute the synthesized code in the SandboxedExecutor blast chamber
             from backend.core.topology.sandboxed_executor import SandboxedExecutor
