@@ -494,67 +494,43 @@ class PrimeRouter:
         return self._cloud_client
 
     def _decide_route(self) -> RoutingDecision:
-        """v290.0 / P0-2: GCP-first routing policy with Disease 10 boot gate.
+        """Pillar 5: Route to J-Prime (the Mind). Always.
 
-        Decision order:
-        1. [P0-2] Boot routing policy gate (while startup policy not finalised)
-           — if DEGRADED, force DEGRADED immediately.
-        2. GCP_PRIME (always first when promoted + circuit healthy)
-        3. CLOUD_CLAUDE (paid fallback, always reliable)
-        4. LOCAL_PRIME / HYBRID (last resort, only if no remote option)
-        5. DEGRADED (nothing available)
+        The GCP golden image at JARVIS_PRIME_URL is the organism's brain.
+        If the PrimeClient is configured to a remote IP, that IS J-Prime —
+        no promotion handshake needed. Route directly.
 
-        Memory emergency additionally blocks local inference to prevent
-        thrash amplification.
+        Fallback chain (Pillar 2 — graceful degradation):
+        1. GCP J-Prime (primary — the Mind)
+        2. Cloud Claude (if available — paid fallback)
+        3. DEGRADED (inform the user)
         """
         self._guard_mirror("_decide_route")
 
-        # P0-2: Consult Disease 10 startup routing policy while boot is in progress.
-        # The policy tracks GCP handshake status and deadline; once finalized it is
-        # bypassed so normal runtime routing logic takes over.
-        if _g_boot_routing_policy is not None and not _g_boot_routing_policy.is_finalized:
-            try:
-                from backend.core.startup_routing_policy import BootRoutingDecision
-                boot_decision, fallback_reason = _g_boot_routing_policy.decide()
-                if boot_decision == BootRoutingDecision.DEGRADED:
-                    logger.warning(
-                        "[PrimeRouter] Boot policy forces DEGRADED "
-                        "(fallback_reason=%s)", fallback_reason.value,
-                    )
-                    return RoutingDecision.DEGRADED
-                # PENDING / GCP_PRIME / LOCAL_MINIMAL / CLOUD_CLAUDE → fall through
-                # to normal routing so we get the most current live signal.
-            except Exception:
-                pass  # Never block routing on policy errors
+        # Check if PrimeClient points to GCP (non-localhost = remote Mind)
+        _is_gcp_configured = False
+        if self._prime_client is not None:
+            _host = getattr(self._prime_client._config, 'prime_host', 'localhost')
+            _is_gcp_configured = _host not in ('localhost', '127.0.0.1', '::1', '')
 
-        is_emergency = self._is_memory_emergency()
-
-        # -- Priority 1: GCP J-Prime (always first when available) --
-        if self._gcp_promoted and self._local_circuit.can_execute():
+        # -- Priority 1: GCP J-Prime (the Mind) --
+        # Route here if: explicitly promoted OR config points to GCP IP
+        if (self._gcp_promoted or _is_gcp_configured) and self._local_circuit.can_execute():
             return RoutingDecision.GCP_PRIME
 
-        # -- Priority 2: Cloud Claude (reliable paid fallback) --
-        # Only route to cloud if the client is actually available (anthropic installed)
+        # -- Priority 1b: PrimeClient is available (may be local or remote) --
+        if (
+            self._prime_client is not None
+            and self._prime_client.is_available
+            and self._local_circuit.can_execute()
+        ):
+            return RoutingDecision.GCP_PRIME
+
+        # -- Priority 2: Cloud Claude (paid fallback, only if client exists) --
         if self._config.enable_cloud_fallback and self._cloud_client is not None:
             return RoutingDecision.CLOUD_CLAUDE
 
-        # -- Priority 3: Local Prime (last resort, blocked during emergency) --
-        if is_emergency:
-            # Local inference worsens memory thrash -- skip entirely
-            return RoutingDecision.DEGRADED
-
-        prime_available = (
-            self._prime_client is not None
-            and self._prime_client.is_available
-        )
-        local_circuit_ok = self._local_circuit.can_execute()
-
-        if prime_available and local_circuit_ok:
-            if self._config.prefer_local:
-                return RoutingDecision.HYBRID
-            return RoutingDecision.LOCAL_PRIME
-
-        # -- Priority 4: Nothing available --
+        # -- Priority 3: Nothing available --
         return RoutingDecision.DEGRADED
 
     # -----------------------------------------------------------------
