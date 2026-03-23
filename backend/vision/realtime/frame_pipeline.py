@@ -241,6 +241,7 @@ class FramePipeline:
         self._capture_task: Optional[asyncio.Task] = None
         self._running: bool = False
         self._frame_counter: int = 0
+        self._latest_frame: Optional[FrameData] = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -289,6 +290,11 @@ class FramePipeline:
     def is_running(self) -> bool:
         return self._running
 
+    @property
+    def latest_frame(self) -> Optional["FrameData"]:
+        """Most recent frame — non-destructive read. Does not consume from queue."""
+        return self._latest_frame
+
     # ------------------------------------------------------------------
     # Frame access
     # ------------------------------------------------------------------
@@ -326,6 +332,7 @@ class FramePipeline:
         room for the incoming one — ensuring consumers always see the most
         recent content.
         """
+        self._latest_frame = frame
         if self._frame_queue.full():
             try:
                 dropped = self._frame_queue.get_nowait()
