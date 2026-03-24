@@ -631,6 +631,190 @@ class MindClient:
             return None
 
     # ------------------------------------------------------------------
+    # Vision loop reasoning (agentic turn-by-turn)
+    # ------------------------------------------------------------------
+
+    def _compress_frame_jpeg(
+        self,
+        pil_image,
+        quality: int = 85,
+        max_bytes: int = 500000,
+    ) -> dict:
+        """Compress PIL Image to JPEG, downscaling if over max_bytes.
+
+        Returns a dict with keys: data (base64), content_type, sha256,
+        width, height.  Tries up to 3 downscale passes (each halving
+        width+height) before giving up and returning whatever fits.
+        """
+        import io as _io
+        import base64 as _b64
+        import hashlib as _hashlib
+        from PIL import Image as _Image
+
+        img = pil_image
+        buf = _io.BytesIO()
+        for _ in range(3):
+            buf = _io.BytesIO()
+            img.save(buf, format="JPEG", quality=quality)
+            raw = buf.getvalue()
+            if len(raw) <= max_bytes:
+                break
+            w, h = img.size
+            img = img.resize((w // 2, h // 2), _Image.LANCZOS)
+        else:
+            raw = buf.getvalue()
+
+        w, h = img.size
+        return {
+            "data": _b64.b64encode(raw).decode("ascii"),
+            "content_type": "image/jpeg",
+            "sha256": _hashlib.sha256(raw).hexdigest(),
+            "width": w,
+            "height": h,
+        }
+
+    def _validate_vision_loop_response(self, result) -> dict:
+        """Validate vision.loop.v1 response.
+
+        Returns the result dict if valid, or None if the response is
+        structurally malformed.  A response with ``goal_achieved=False``
+        and no ``next_action`` is only valid when ``stop_reason`` is
+        ``"model_refusal"`` (the model declined to act).
+        """
+        if not isinstance(result, dict):
+            return None
+        if "goal_achieved" not in result:
+            return None
+        if not result.get("goal_achieved") and not result.get("next_action"):
+            if result.get("stop_reason") != "model_refusal":
+                logger.warning(
+                    "[MindClient] Malformed v1: no goal_achieved and no next_action"
+                )
+                return None
+        return result
+
+    async def _claude_vision_fallback(self, v1_payload: dict) -> dict:
+        """L3 Claude Vision fallback.
+
+        Stub implementation — returns an error-shaped response so the
+        caller's fallback chain degrades gracefully.  Will be wired to
+        the actual Claude Vision API in a follow-up task.
+        """
+        logger.info("[MindClient] Claude vision fallback not yet implemented")
+        return {
+            "schema": "vision.loop.v1",
+            "goal_achieved": False,
+            "stop_reason": "error",
+            "next_action": None,
+            "reasoning": "Claude Vision L3 fallback not yet implemented",
+            "confidence": 0.0,
+            "scene_summary": "",
+        }
+
+    async def reason_vision_turn(
+        self,
+        request_id: str,
+        session_id: str,
+        goal: str,
+        action_log: list,
+        frame_jpeg_b64: str,
+        frame_dims: dict,
+        allowed_action_types: list,
+        strategy_hints=None,
+    ) -> dict:
+        """POST /v1/vision/reason_turn — ask J-Prime what to do next.
+
+        Sends the current screen frame plus the full action history and
+        receives a vision.loop.v1 decision: the next UI action to take,
+        or a signal that the goal has been satisfied (or an error).
+
+        Falls back to ``_claude_vision_fallback`` (L3) on any J-Prime
+        failure, and returns a hard-error dict if both tiers are down.
+
+        ``asyncio.shield`` wraps the inner coroutine so that the
+        aiohttp session is not cancelled mid-request when the outer
+        ``wait_for`` timeout fires.
+
+        Parameters
+        ----------
+        request_id:
+            Caller-supplied trace identifier.
+        session_id:
+            Vision-loop session UUID (may differ from ``_session_id``).
+        goal:
+            Natural-language description of the end state to reach.
+        action_log:
+            List of previously executed actions in this session.
+        frame_jpeg_b64:
+            Base-64-encoded JPEG of the current screen frame.
+        frame_dims:
+            Dict with keys ``width``, ``height``, ``scale`` (and any
+            additional metadata the caller wants to forward).
+        allowed_action_types:
+            Constraint list forwarded to J-Prime (e.g. ``["click",
+            "type", "scroll"]``).
+        strategy_hints:
+            Optional free-form hints to guide J-Prime's reasoning.
+        """
+        payload = {
+            "schema": "vision.loop.v1",
+            "request_id": request_id,
+            "session_id": session_id,
+            "goal": goal,
+            "turn_number": len(action_log) + 1,
+            "max_turns": int(os.getenv("VISION_LOOP_MAX_TURNS", "10")),
+            "allowed_action_types": allowed_action_types,
+            "strategy_hints": strategy_hints,
+            "action_log": action_log,
+            "frame": {"data": frame_jpeg_b64, **frame_dims},
+        }
+
+        timeout = float(os.getenv("VISION_LOOP_THINK_TIMEOUT_S", "12"))
+
+        try:
+            result = await asyncio.wait_for(
+                asyncio.shield(
+                    self._http_post(
+                        "/v1/vision/reason_turn",
+                        data=payload,
+                        timeout=timeout,
+                    )
+                ),
+                timeout=timeout,
+            )
+            validated = self._validate_vision_loop_response(result)
+            if validated:
+                self._circuit.record_success()
+                self._record_success()
+                return validated
+        except asyncio.TimeoutError:
+            logger.info(
+                "[MindClient] reason_vision_turn timed out (%.1fs)", timeout
+            )
+        except Exception as exc:
+            logger.info(
+                "[MindClient] reason_vision_turn L2 failed: %s", exc
+            )
+            self._circuit.record_failure()
+            self._record_failure()
+
+        # L3 fallback — Claude Vision API (stub for now)
+        try:
+            return await self._claude_vision_fallback(payload)
+        except Exception as exc:
+            logger.warning("[MindClient] Claude fallback failed: %s", exc)
+
+        return {
+            "schema": "vision.loop.v1",
+            "goal_achieved": False,
+            "stop_reason": "error",
+            "next_action": None,
+            "reasoning": "Both J-Prime and Claude unavailable",
+            "confidence": 0.0,
+            "scene_summary": "",
+        }
+
+    # ------------------------------------------------------------------
     # Background health monitor
     # ------------------------------------------------------------------
 
