@@ -220,17 +220,78 @@ class LeanVisionLoop:
     async def _capture_screen(
         self,
     ) -> Tuple[Optional[str], int, int]:
-        """Capture screenshot via async subprocess (no fork crash).
+        """Capture screenshot — tries FramePipeline first, falls back to screencapture.
 
         Returns (base64_jpeg, width, height) or (None, 0, 0) on failure.
-        The image is downscaled to logical screen resolution so that
-        pixel coordinates in the image map directly to pyautogui coords.
+        Image is downscaled to logical screen resolution so Claude coords
+        map directly to the actuator's coordinate space.
         """
+        # --- Primary: FramePipeline.latest_frame (sub-10ms if running) ---
+        frame_data = self._try_frame_pipeline()
+        if frame_data is not None:
+            return self._process_frame(frame_data)
+
+        # --- Fallback: screencapture subprocess ---
+        return await self._capture_via_subprocess()
+
+    def _try_frame_pipeline(self):
+        """Try to get latest frame from the existing FramePipeline/VisionCortex."""
+        for import_path in (
+            "backend.vision.realtime.frame_pipeline",
+            "vision.realtime.frame_pipeline",
+        ):
+            try:
+                import importlib
+                mod = importlib.import_module(import_path)
+                # Check if VisionActionLoop has an instance with a frame_pipeline
+                try:
+                    from backend.vision.realtime.vision_action_loop import VisionActionLoop
+                    val = VisionActionLoop.get_instance() if hasattr(VisionActionLoop, "get_instance") else None
+                    if val and hasattr(val, "frame_pipeline") and val.frame_pipeline:
+                        frame = val.frame_pipeline.latest_frame
+                        if frame is not None:
+                            logger.info("[LeanVision] Frame from FramePipeline (sub-10ms)")
+                            return frame
+                except Exception:
+                    pass
+
+                # Try VisionCortex singleton
+                try:
+                    cortex_mod = importlib.import_module(import_path.replace("frame_pipeline", "vision_cortex"))
+                    cortex_cls = getattr(cortex_mod, "VisionCortex", None)
+                    if cortex_cls and hasattr(cortex_cls, "get_instance"):
+                        cortex = cortex_cls.get_instance()
+                        if cortex and hasattr(cortex, "_pipeline") and cortex._pipeline:
+                            frame = cortex._pipeline.latest_frame
+                            if frame is not None:
+                                logger.info("[LeanVision] Frame from VisionCortex (sub-10ms)")
+                                return frame
+                except Exception:
+                    pass
+
+                break  # Import succeeded but no frame available
+            except ImportError:
+                continue
+        return None
+
+    def _process_frame(self, frame_data) -> Tuple[Optional[str], int, int]:
+        """Convert a FrameData (numpy RGB array) to base64 JPEG."""
+        try:
+            from PIL import Image
+            img = Image.fromarray(frame_data.data)
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
+            return self._downscale_and_encode(img)
+        except Exception as exc:
+            logger.warning("[LeanVision] FramePipeline frame processing failed: %s", exc)
+            return None, 0, 0
+
+    async def _capture_via_subprocess(self) -> Tuple[Optional[str], int, int]:
+        """Fallback: capture via screencapture subprocess."""
         os.makedirs(_TMP_DIR, exist_ok=True)
         tmp_path = os.path.join(_TMP_DIR, f"lean_{uuid.uuid4().hex[:8]}.png")
 
         try:
-            # Async subprocess -- safe alongside loaded C extensions
             proc = await asyncio.create_subprocess_exec(
                 "screencapture", "-x", "-C", tmp_path,
                 stdout=asyncio.subprocess.DEVNULL,
@@ -244,37 +305,10 @@ class LeanVisionLoop:
                 return None, 0, 0
 
             from PIL import Image
-
             img = Image.open(tmp_path)
             if img.mode == "RGBA":
                 img = img.convert("RGB")
-
-            capture_w, capture_h = img.size
-
-            # Downscale to logical screen resolution so Claude coords
-            # map directly to pyautogui's coordinate space.
-            logical_w, logical_h = self._get_logical_screen_size()
-            if logical_w > 0 and logical_h > 0 and (capture_w, capture_h) != (logical_w, logical_h):
-                img = img.resize((logical_w, logical_h), Image.LANCZOS)
-
-            # If still over max dimension, downscale further
-            cur_w, cur_h = img.size
-            if max(cur_w, cur_h) > _MAX_IMAGE_DIM:
-                ratio = _MAX_IMAGE_DIM / max(cur_w, cur_h)
-                new_w = int(cur_w * ratio)
-                new_h = int(cur_h * ratio)
-                img = img.resize((new_w, new_h), Image.LANCZOS)
-                self._last_coord_scale = 1.0 / ratio
-            else:
-                self._last_coord_scale = 1.0
-
-            # JPEG compress
-            buf = io.BytesIO()
-            img.save(buf, format="JPEG", quality=_JPEG_QUALITY)
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-            final_w, final_h = img.size
-            return b64, final_w, final_h
+            return self._downscale_and_encode(img)
 
         except asyncio.TimeoutError:
             logger.error("[LeanVision] screencapture timed out (%.1fs)", _CAPTURE_TIMEOUT_S)
@@ -287,6 +321,31 @@ class LeanVisionLoop:
                 os.unlink(tmp_path)
             except OSError:
                 pass
+
+    def _downscale_and_encode(self, img) -> Tuple[Optional[str], int, int]:
+        """Downscale PIL image to logical screen coords and encode as base64 JPEG."""
+        from PIL import Image as _Image
+        capture_w, capture_h = img.size
+
+        # Downscale to logical screen resolution so Claude coords = actuator coords
+        logical_w, logical_h = self._get_logical_screen_size()
+        if logical_w > 0 and logical_h > 0 and (capture_w, capture_h) != (logical_w, logical_h):
+            img = img.resize((logical_w, logical_h), _Image.LANCZOS)
+
+        # If still over max dimension, downscale further
+        cur_w, cur_h = img.size
+        if max(cur_w, cur_h) > _MAX_IMAGE_DIM:
+            ratio = _MAX_IMAGE_DIM / max(cur_w, cur_h)
+            img = img.resize((int(cur_w * ratio), int(cur_h * ratio)), _Image.LANCZOS)
+            self._last_coord_scale = 1.0 / ratio
+        else:
+            self._last_coord_scale = 1.0
+
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=_JPEG_QUALITY)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        final_w, final_h = img.size
+        return b64, final_w, final_h
 
     def _get_logical_screen_size(self) -> Tuple[int, int]:
         """Get the logical (non-Retina) screen dimensions.
@@ -468,18 +527,25 @@ class LeanVisionLoop:
     # ------------------------------------------------------------------
 
     async def _execute_action(self, action: Dict[str, Any]) -> bool:
-        """Dispatch action to the appropriate handler."""
+        """Dispatch action via BackgroundActuator (Ghost Hands) with pyautogui fallback."""
         action_type = action.get("action_type", "click")
 
         try:
+            # Try Ghost Hands (CGEvent + FocusGuard) first
+            gh_result = await self._try_ghost_hands(action)
+            if gh_result is not None:
+                return gh_result
+
+            # Fallback: pyautogui
+            logger.info("[LeanVision] Ghost Hands unavailable, falling back to pyautogui")
             if action_type == "click":
-                return await self._do_click(action)
+                return await self._pyautogui_click(action)
             elif action_type == "type":
-                return await self._do_type(action)
+                return await self._pyautogui_type(action)
             elif action_type == "key":
-                return await self._do_key(action)
+                return await self._pyautogui_key(action)
             elif action_type == "scroll":
-                return await self._do_scroll(action)
+                return await self._pyautogui_scroll(action)
             else:
                 logger.warning("[LeanVision] Unknown action_type: %s", action_type)
                 return False
@@ -489,91 +555,161 @@ class LeanVisionLoop:
             logger.error("[LeanVision] Action '%s' error: %s", action_type, exc)
             return False
 
-    async def _do_click(self, action: Dict[str, Any]) -> bool:
-        """Click at coordinates, scaling from image space to screen space."""
+    # ------------------------------------------------------------------
+    # Ghost Hands integration (primary actuator)
+    # ------------------------------------------------------------------
+
+    async def _try_ghost_hands(self, action: Dict[str, Any]) -> Optional[bool]:
+        """Try executing via BackgroundActuator. Returns None if unavailable."""
+        try:
+            from backend.ghost_hands.background_actuator import (
+                BackgroundActuator, Action, ActionType, ActionResult,
+            )
+        except ImportError:
+            try:
+                from ghost_hands.background_actuator import (
+                    BackgroundActuator, Action, ActionType, ActionResult,
+                )
+            except ImportError:
+                return None  # Not available
+
+        # Get or create actuator
+        if not hasattr(self, "_ghost_hands") or self._ghost_hands is None:
+            try:
+                self._ghost_hands = BackgroundActuator()
+                started = await self._ghost_hands.start()
+                if not started:
+                    self._ghost_hands = None
+                    return None
+                logger.info("[LeanVision] Ghost Hands actuator started")
+            except Exception as exc:
+                logger.warning("[LeanVision] Ghost Hands init failed: %s", exc)
+                self._ghost_hands = None
+                return None
+
+        action_type = action.get("action_type", "click")
+        coords = action.get("coords")
+        screen_coords = None
+        if coords and len(coords) >= 2:
+            screen_coords = (
+                int(float(coords[0]) * self._last_coord_scale),
+                int(float(coords[1]) * self._last_coord_scale),
+            )
+
+        target = action.get("target", "")
+
+        try:
+            if action_type == "click":
+                if not screen_coords:
+                    return None
+                gh_action = Action(
+                    action_type=ActionType.CLICK,
+                    coordinates=screen_coords,
+                )
+                logger.info("[LeanVision] CLICK via Ghost Hands (%d, %d) on '%s'",
+                           screen_coords[0], screen_coords[1], target[:50])
+
+            elif action_type == "type":
+                text = action.get("text", "")
+                if not text:
+                    return False
+                # Click target first if coords provided
+                if screen_coords:
+                    click_action = Action(action_type=ActionType.CLICK, coordinates=screen_coords)
+                    await self._ghost_hands.execute(click_action)
+                    await asyncio.sleep(0.15)
+                gh_action = Action(action_type=ActionType.TYPE, text=text)
+                logger.info("[LeanVision] TYPE via Ghost Hands '%s'", text[:50])
+
+            elif action_type == "key":
+                key_name = action.get("text", "").lower().strip()
+                if not key_name:
+                    return False
+                gh_action = Action(action_type=ActionType.KEY, key=key_name)
+                logger.info("[LeanVision] KEY via Ghost Hands '%s'", key_name)
+
+            elif action_type == "scroll":
+                amount = action.get("scroll_amount") or action.get("amount") or -3
+                gh_action = Action(
+                    action_type=ActionType.SCROLL,
+                    coordinates=screen_coords,
+                    text=str(amount),
+                )
+                logger.info("[LeanVision] SCROLL via Ghost Hands %s", amount)
+
+            else:
+                return None
+
+            report = await asyncio.wait_for(
+                self._ghost_hands.execute(gh_action),
+                timeout=5.0,
+            )
+            success = report.result == ActionResult.SUCCESS
+            if not success:
+                logger.warning("[LeanVision] Ghost Hands returned: %s (%s)",
+                             report.result.name, getattr(report, "error", ""))
+            return success
+
+        except asyncio.TimeoutError:
+            logger.warning("[LeanVision] Ghost Hands timed out")
+            return None  # Fall back to pyautogui
+        except Exception as exc:
+            logger.warning("[LeanVision] Ghost Hands error: %s", exc)
+            return None  # Fall back to pyautogui
+
+    # ------------------------------------------------------------------
+    # pyautogui fallback actions
+    # ------------------------------------------------------------------
+
+    async def _pyautogui_click(self, action: Dict[str, Any]) -> bool:
+        """Fallback click via pyautogui."""
         coords = action.get("coords")
         if not coords or len(coords) < 2:
-            logger.error("[LeanVision] Click missing coords: %s", action)
             return False
-
-        img_x, img_y = float(coords[0]), float(coords[1])
-
-        # Scale from image coords to logical screen coords
-        # If we downscaled beyond logical size, _last_coord_scale > 1.0
-        screen_x = int(img_x * self._last_coord_scale)
-        screen_y = int(img_y * self._last_coord_scale)
-
-        target = action.get("target", "unknown element")
-        logger.info(
-            "[LeanVision] CLICK (%d, %d) -> screen (%d, %d) on '%s'",
-            int(img_x), int(img_y), screen_x, screen_y, target[:50],
-        )
-
+        screen_x = int(float(coords[0]) * self._last_coord_scale)
+        screen_y = int(float(coords[1]) * self._last_coord_scale)
+        logger.info("[LeanVision] CLICK via pyautogui (%d, %d)", screen_x, screen_y)
         import pyautogui
         await asyncio.to_thread(pyautogui.click, screen_x, screen_y)
         return True
 
-    async def _do_type(self, action: Dict[str, Any]) -> bool:
-        """Type text using clipboard paste (handles Unicode reliably)."""
+    async def _pyautogui_type(self, action: Dict[str, Any]) -> bool:
+        """Fallback type via clipboard paste."""
         text = action.get("text", "")
         if not text:
-            logger.error("[LeanVision] Type action has no text")
             return False
-
-        # If coords provided, click the target field first
         coords = action.get("coords")
         if coords and len(coords) >= 2:
-            await self._do_click({"coords": coords, "target": action.get("target", "text field")})
-            await asyncio.sleep(0.2)  # Let field focus
-
-        logger.info("[LeanVision] TYPE '%s'", text[:50])
-
-        # Use clipboard paste for reliability (handles Unicode, special chars)
+            await self._pyautogui_click({"coords": coords, "target": "text field"})
+            await asyncio.sleep(0.2)
+        logger.info("[LeanVision] TYPE via pyautogui '%s'", text[:50])
         proc = await asyncio.create_subprocess_exec(
-            "pbcopy",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            "pbcopy", stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await proc.communicate(text.encode("utf-8"))
-
-        # Paste via osascript to avoid pyautogui hotkey "v" leak
-        paste_proc = await asyncio.create_subprocess_exec(
+        paste = await asyncio.create_subprocess_exec(
             "osascript", "-e",
             'tell application "System Events" to keystroke "v" using command down',
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
-        await paste_proc.wait()
+        await paste.wait()
         return True
 
-    async def _do_key(self, action: Dict[str, Any]) -> bool:
-        """Press a single key (return, tab, escape, etc.)."""
+    async def _pyautogui_key(self, action: Dict[str, Any]) -> bool:
+        """Fallback key press via pyautogui."""
         key_name = action.get("text", "").lower().strip()
         if not key_name:
-            logger.error("[LeanVision] Key action missing key name in 'text'")
             return False
-
-        logger.info("[LeanVision] KEY '%s'", key_name)
-
+        logger.info("[LeanVision] KEY via pyautogui '%s'", key_name)
         import pyautogui
         await asyncio.to_thread(pyautogui.press, key_name)
         return True
 
-    async def _do_scroll(self, action: Dict[str, Any]) -> bool:
-        """Scroll at current position or specified coords."""
+    async def _pyautogui_scroll(self, action: Dict[str, Any]) -> bool:
+        """Fallback scroll via pyautogui."""
         amount = action.get("scroll_amount") or action.get("amount") or -3
-
-        # If coords provided, move mouse there first
-        coords = action.get("coords")
-        if coords and len(coords) >= 2:
-            import pyautogui
-            screen_x = int(float(coords[0]) * self._last_coord_scale)
-            screen_y = int(float(coords[1]) * self._last_coord_scale)
-            await asyncio.to_thread(pyautogui.moveTo, screen_x, screen_y)
-
-        logger.info("[LeanVision] SCROLL amount=%s", amount)
-
+        logger.info("[LeanVision] SCROLL via pyautogui %s", amount)
         import pyautogui
         await asyncio.to_thread(pyautogui.scroll, int(amount))
         return True
