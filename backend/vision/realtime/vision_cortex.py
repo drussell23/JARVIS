@@ -225,37 +225,54 @@ class VisionCortex:
         except ImportError:
             pass
 
-        # 2. Discover real VisionCommandHandler for Phase 2 analysis
-        # This is the SAME handler the old _activate_screen_observation used.
-        # VisionCortex unifies both paths into one (no duplicate analyzer).
-        vision_handler = None
-        try:
-            from backend.api.vision_command_handler import get_vision_command_handler
-            vision_handler = get_vision_command_handler()
-            logger.info("[VisionCortex] Real VisionCommandHandler discovered for Phase 2")
-        except ImportError:
-            pass
-        except Exception as exc:
-            logger.debug("[VisionCortex] VisionCommandHandler not available: %s", exc)
-
-        if vision_handler is None:
-            vision_handler = _NullVisionHandler()
-            logger.info("[VisionCortex] Using NullVisionHandler (Phase 2 disabled)")
-
-        # 3. Create analyzer with the discovered handler
+        # 2. Create analyzer with NullVisionHandler IMMEDIATELY (non-blocking).
+        # The real VisionCommandHandler is heavy to construct (ML models, API
+        # connections). Discovering it during boot would block the startup
+        # sequence — violating §2 (Progressive Awakening).
+        # Phase 2 starts with NullHandler; the real handler is discovered in
+        # the background and hot-swapped when ready.
         try:
             from backend.vision.continuous_screen_analyzer import (
                 MemoryAwareScreenAnalyzer,
             )
-            self._analyzer = MemoryAwareScreenAnalyzer(vision_handler)
+            self._analyzer = MemoryAwareScreenAnalyzer(_NullVisionHandler())
             self._wire_analyzer_callbacks()
+            logger.info("[VisionCortex] Analyzer created (Phase 2 handler upgrading in background)")
         except ImportError as exc:
             logger.debug("[VisionCortex] Analyzer not available: %s", exc)
+
+        # 3. Upgrade to real VisionCommandHandler in background (non-blocking)
+        if self._analyzer is not None:
+            asyncio.ensure_future(self._upgrade_vision_handler())
 
         # Fallback: if no Ferrari Engine, start analyzer's own monitoring loop
         if self._frame_pipeline is None and self._analyzer is not None:
             logger.info("[VisionCortex] No Ferrari Engine -- using screencapture fallback")
             await self._analyzer.start_monitoring()
+
+    async def _upgrade_vision_handler(self) -> None:
+        """Background task: discover and hot-swap the real VisionCommandHandler.
+
+        Runs AFTER awaken() returns so boot is never blocked. When the real
+        handler is ready, it replaces the NullVisionHandler on the analyzer,
+        enabling Phase 2 analysis (Claude Vision / LLaVA).
+        """
+        try:
+            # Run the heavy import/init in a thread to avoid blocking event loop
+            def _get_handler():
+                from backend.api.vision_command_handler import get_vision_command_handler
+                return get_vision_command_handler()
+
+            handler = await asyncio.to_thread(_get_handler)
+            if handler is not None and self._analyzer is not None:
+                self._analyzer.vision_handler = handler
+                logger.info("[VisionCortex] Phase 2 handler upgraded to real VisionCommandHandler")
+            else:
+                logger.info("[VisionCortex] VisionCommandHandler not available — Phase 2 stays disabled")
+        except ImportError:
+            logger.debug("[VisionCortex] VisionCommandHandler not importable")
+        except Exception as exc:
+            logger.debug("[VisionCortex] Handler upgrade failed (non-fatal): %s", exc)
 
     def _wire_analyzer_callbacks(self) -> None:
         """Register VisionCortex as consumer of analyzer events.
