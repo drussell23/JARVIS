@@ -208,7 +208,14 @@ class VisionCortex:
     # ------------------------------------------------------------------
 
     async def _discover_subsystems(self) -> None:
-        """Discover existing organs via singleton lookups. No hard imports."""
+        """Discover existing organs via singleton lookups. No hard imports.
+
+        Subsystem discovery order:
+        1. VisionActionLoop → frame pipeline + knowledge fabric
+        2. VisionCommandHandler → real Phase 2 analysis (Claude Vision / LLaVA)
+        3. MemoryAwareScreenAnalyzer → continuous screen monitoring
+        """
+        # 1. Frame pipeline from VisionActionLoop
         try:
             from backend.vision.realtime.vision_action_loop import VisionActionLoop
             val = VisionActionLoop.get_instance()
@@ -218,13 +225,29 @@ class VisionCortex:
         except ImportError:
             pass
 
-        # Create analyzer -- works with or without Ferrari Engine
+        # 2. Discover real VisionCommandHandler for Phase 2 analysis
+        # This is the SAME handler the old _activate_screen_observation used.
+        # VisionCortex unifies both paths into one (no duplicate analyzer).
+        vision_handler = None
+        try:
+            from backend.api.vision_command_handler import get_vision_command_handler
+            vision_handler = get_vision_command_handler()
+            logger.info("[VisionCortex] Real VisionCommandHandler discovered for Phase 2")
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.debug("[VisionCortex] VisionCommandHandler not available: %s", exc)
+
+        if vision_handler is None:
+            vision_handler = _NullVisionHandler()
+            logger.info("[VisionCortex] Using NullVisionHandler (Phase 2 disabled)")
+
+        # 3. Create analyzer with the discovered handler
         try:
             from backend.vision.continuous_screen_analyzer import (
                 MemoryAwareScreenAnalyzer,
             )
-            handler = _NullVisionHandler()
-            self._analyzer = MemoryAwareScreenAnalyzer(handler)
+            self._analyzer = MemoryAwareScreenAnalyzer(vision_handler)
             self._wire_analyzer_callbacks()
         except ImportError as exc:
             logger.debug("[VisionCortex] Analyzer not available: %s", exc)
