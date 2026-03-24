@@ -471,71 +471,77 @@ class FramePipeline:
                 pass
 
     async def _coregraphics_capture_loop(self) -> None:
-        """CoreGraphics polling fallback — synchronous one-shot capture per interval.
+        """Subprocess-based screen capture via macOS screencapture command.
 
-        Uses fast_capture (CGWindowListCreateImage-based) which is synchronous
-        and does NOT need GCD callbacks or a CFRunLoop. Works reliably from any
-        thread in any process context.
+        Native capture APIs (both SCK and CoreGraphics C++ extensions) hang
+        when called from thread pool threads in the asyncio process — they
+        need framework initialization that thread pool threads lack.
 
-        Captures at the configured FPS via asyncio.sleep intervals. Each capture
-        runs in a thread executor to avoid blocking the event loop.
+        The screencapture command is a SEPARATE PROCESS with its own framework
+        context. It is the structurally correct capture method for an asyncio
+        host. Not a fallback — the primary reliable path.
+
+        Captures at ~2-3 FPS (subprocess overhead). Sufficient for VisionCortex
+        continuous awareness and the agentic vision loop.
         """
-        try:
-            from backend.native_extensions.fast_capture_wrapper import (
-                FastCaptureEngine,
-                CaptureConfig,
-            )
-        except ImportError as exc:
-            logger.error(
-                "[FramePipeline] CoreGraphics fast_capture not available: %s — "
-                "vision is BLIND (vision_capture_mode=unavailable)", exc
-            )
-            self._running = False
-            return
+        import tempfile as _tf
+        from PIL import Image as _Image
 
-        engine = FastCaptureEngine()
-        cg_config = CaptureConfig(output_format="raw")
-        target_fps = int(os.environ.get("VISION_CAPTURE_FPS", "30"))
-        # CoreGraphics is slower than SCK — cap at 10fps to avoid CPU burn
-        effective_fps = min(target_fps, 10)
-        interval = 1.0 / effective_fps
+        target_fps = min(int(os.environ.get("VISION_CAPTURE_FPS", "3")), 3)
+        interval = 1.0 / target_fps
+        tmp_path = os.path.join(_tf.gettempdir(), f"jarvis_capture_{os.getpid()}.png")
 
         logger.info(
-            "[FramePipeline] CoreGraphics capture running at %dfps "
-            "(vision_capture_mode=coregraphics)",
-            effective_fps,
+            "[FramePipeline] Subprocess capture running at %dfps "
+            "(vision_capture_mode=subprocess)",
+            target_fps,
         )
 
         try:
             while self._running:
                 try:
-                    # Synchronous capture in thread executor (non-blocking)
-                    result = await asyncio.to_thread(
-                        engine.capture_frontmost_window, cg_config
+                    proc = await asyncio.create_subprocess_exec(
+                        "screencapture", "-x", "-C", tmp_path,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
                     )
+                    await asyncio.wait_for(proc.wait(), timeout=5.0)
 
-                    if result and result.get("success") and "image" in result:
-                        self._frame_counter += 1
-                        img_data = result["image"]
-                        frame = FrameData(
-                            data=img_data,
-                            width=result.get("width", img_data.shape[1] if hasattr(img_data, 'shape') else 0),
-                            height=result.get("height", img_data.shape[0] if hasattr(img_data, 'shape') else 0),
-                            timestamp=time.time(),
-                            frame_number=self._frame_counter,
-                            scale_factor=result.get("scale_factor", 1.0),
-                        )
+                    if proc.returncode == 0:
+                        try:
+                            img = _Image.open(tmp_path)
+                            img_rgb = img.convert("RGB")
+                            img_array = np.array(img_rgb)
 
-                        if self._should_process(frame):
-                            self._enqueue_frame(frame)
+                            self._frame_counter += 1
+                            frame = FrameData(
+                                data=img_array,
+                                width=img_array.shape[1],
+                                height=img_array.shape[0],
+                                timestamp=time.time(),
+                                frame_number=self._frame_counter,
+                                scale_factor=2.0,
+                            )
 
+                            if self._should_process(frame):
+                                self._enqueue_frame(frame)
+                        except Exception as exc:
+                            logger.debug("[FramePipeline] Frame read error: %s", exc)
+
+                except asyncio.TimeoutError:
+                    logger.debug("[FramePipeline] screencapture timed out (5s)")
                 except Exception as exc:
-                    logger.debug("[FramePipeline] CG capture error: %s", exc)
+                    logger.debug("[FramePipeline] Capture error: %s", exc)
 
                 await asyncio.sleep(interval)
 
         except asyncio.CancelledError:
-            logger.debug("CoreGraphics capture loop cancelled")
+            logger.debug("Subprocess capture loop cancelled")
             raise
         except Exception as exc:
-            logger.exception("CoreGraphics capture loop error: %s", exc)
+            logger.exception("Subprocess capture loop error: %s", exc)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
