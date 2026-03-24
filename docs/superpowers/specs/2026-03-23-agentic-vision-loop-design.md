@@ -1,7 +1,7 @@
 # Agentic Vision Loop: Multi-Turn See-Think-Act-Verify Chain
 
 **Date:** 2026-03-23
-**Status:** Approved
+**Status:** Draft (approved design, pre-implementation)
 **Manifesto alignment:** §1 Unified Organism, §3 Async Tendrils, §5 Intelligence-Driven Routing, §6 Neuroplasticity, §7 Absolute Observability
 **Depends on:** VisionCortex (2026-03-23-vision-cortex-design.md)
 
@@ -122,6 +122,7 @@ Versioned schema (`vision.loop.v1`) for communication between the loop and J-Pri
 {
     "schema": "vision.loop.v1",
     "goal_achieved": false,
+    "stop_reason": null,
     "next_action": {
         "action_id": "act-uuid",
         "action_type": "type",
@@ -206,6 +207,61 @@ class StopReason(str, Enum):
     ERROR = "error"
 ```
 
+## Edge Cases & Policies
+
+### 1. Ambiguous model output (`next_action` is null but `goal_achieved` is false)
+
+**Invariant**: J-Prime MUST return either `goal_achieved: true` or a valid `next_action`. If response validation finds `goal_achieved: false` AND `next_action` is null AND `stop_reason` is NOT `model_refusal`, this is a malformed response. The loop treats it as `StopReason.ERROR` with `error_code: "MALFORMED_RESPONSE"` and returns a partial result with the action log. No improvised retries.
+
+### 2. Tier 3 verify API shape
+
+Tier 3 (surgical C) uses the **same** `/v1/vision/reason_turn` endpoint with a `mode` field:
+- Normal reasoning: `"mode": "reason"` (default, can be omitted)
+- Verify request: `"mode": "verify"`, with `verify_context.before_frame` and `verify_context.after_frame` (two base64 JPEG images) and `verify_context.action_taken` (the action being verified)
+
+This avoids a separate endpoint/schema while keeping the contract versionable. The L3 Claude adapter handles both modes.
+
+### 3. Tier 2 verify: delegates to ActionVerifier
+
+Tier 2 **delegates** to the existing `ActionVerifier` from VisionActionLoop (not a separate hash-delta implementation). The ActionVerifier already does per-action-type frame diff analysis (`verify_click`, `verify_type`, `verify_scroll`). The loop calls it directly with pre-action and post-action frames. No duplicate logic, no dead code.
+
+### 4. `confidence` provenance on action_log entries
+
+The `confidence` field on each action_log entry is the **model confidence from the THINK step that proposed the action** (i.e., from J-Prime's response). It is NOT post-verify confidence or executor confidence. If the action was proposed by a graduated strategy (no model call), confidence is `null`. This keeps the field's meaning unambiguous for graduation analytics.
+
+### 5. Degraded mode (no VisionActionLoop / no frame pipeline)
+
+If `VisionActionLoop.get_instance()` returns `None` (not running, not enabled):
+- The agentic loop does NOT run
+- `_dispatch_to_vision()` falls back to the **pre-agentic behavior**: open URL/app, return `{"success": True, "result": "Opened {url}. Visual verification not available."}`
+- Telemetry emits `vision.loop.completed@1.0.0` with `stop_reason: "error"`, `error_code: "NO_VISION_PIPELINE"`, `total_turns: 0`
+- This is a **graceful degradation**, not a hard error
+- Controlled by `JARVIS_VISION_LOOP_ENABLED` (existing env var)
+
+### 6. HTTP error retry policy
+
+| HTTP Status | Action | Rationale |
+|-------------|--------|-----------|
+| 200 | Parse response, validate v1 schema | Normal path |
+| 400 | `StopReason.ERROR`, no retry | Client-side schema error, retrying won't help |
+| 502/504 | **One** idempotent retry with 2s backoff | Transient upstream failure |
+| 502/504 after retry | Trigger L3 fallback (Claude Vision) | J-Prime definitively down for this turn |
+| Timeout (>12s) | Trigger L3 fallback immediately | Shield protects session, loop moves on |
+| Connection refused | Trigger L3 fallback immediately | J-Prime VM not running |
+
+L3 fallback is triggered per-turn, not per-loop. If J-Prime recovers on the next turn, the loop uses it again (circuit breaker recovery via VisionRouter's existing health tracking).
+
+### 7. Strategy matching is semantic, not regex
+
+`app_pattern` on `NavigationStrategy` is a **registry key** used for `AgentRegistry.find_strategy(goal, app_key)` lookup — NOT a regex pattern matched against goal text. The registry uses semantic matching (same as `AgentRegistry.find_agent()`). This preserves Manifesto §5: no string-matching or regex-based decision making.
+
+### 8. Privacy & logging
+
+Goals and `reasoning` fields may contain PII. Policies:
+- **Telemetry**: Uses `goal_hash` (sha256[:12]) and `reasoning_truncated` (max 80 chars). Full goal text is NEVER emitted to TelemetryBus.
+- **Debug logs**: Full JSON (including goal, reasoning) logged at DEBUG level only. Production log level is INFO.
+- **Episodic memory** (future hook): Sanitized `action_log` (goal_hash, action types, outcomes — no reasoning text) may be persisted to ConsciousnessBridge for graduation. Out of scope for v1.
+
 ## Verify Step (3-Tier)
 
 After each ACT, the loop verifies the action succeeded:
@@ -213,10 +269,10 @@ After each ACT, the loop verifies the action succeeded:
 | Tier | Trigger | Method | Cost |
 |------|---------|--------|------|
 | 1: Executor | Always | `result.success` + `result.verification_status` from VisionActionLoop | Free |
-| 2: Frame delta | Tier 1 INCONCLUSIVE | Wait `settle_ms`, grab new frame, compute hash delta vs pre-action frame | Free (local) |
-| 3: Surgical C | Failure OR confidence < `VISION_LOOP_VERIFY_CONFIDENCE_TAU` | Send before+after frames to J-Prime: "did this action succeed?" | 1 extra J-Prime call |
+| 2: Frame delta | Tier 1 INCONCLUSIVE | Delegate to `ActionVerifier.verify_click/type/scroll()` with pre/post frames | Free (local) |
+| 3: Surgical C | Failure OR confidence < `VISION_LOOP_VERIFY_CONFIDENCE_TAU` | POST `/v1/vision/reason_turn` with `mode: "verify"` + before/after frames | 1 extra J-Prime call |
 
-Tier 3 sends exactly **two** images (before/after), not the full action log with all frames. This is the "surgical C" escape hatch — targeted vision memory on ambiguity, not full conversation threading.
+Tier 3 sends exactly **two** images (before/after) via the verify mode, not the full action log with all frames. This is the "surgical C" escape hatch — targeted vision memory on ambiguity, not full conversation threading.
 
 ## Stagnation Detection
 
