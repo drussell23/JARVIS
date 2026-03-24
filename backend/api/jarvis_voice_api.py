@@ -2105,7 +2105,38 @@ class JARVISVoiceAPI:
         except Exception as e:
             logger.debug(f"[DYNAMIC] Component loading skipped: {e}")
 
-        # Check if this is a multi-command workflow
+        # v306.0: Agentic routing via UCP Pillar 5 (Manifesto §5)
+        # UCP.classify_async → J-Prime → RTO → agentic vision loop
+        # This is the PRIMARY command routing brain. workflow_command_processor
+        # is the FALLBACK for when UCP/Pillar 5 is unavailable.
+        try:
+            from .unified_command_processor import get_unified_processor
+            _ucp = get_unified_processor(self.api_key if hasattr(self, 'api_key') else None)
+            if _ucp is not None:
+                _ucp_result = await asyncio.wait_for(
+                    _ucp.process_command(
+                        command.text,
+                        audio_data=getattr(command, 'audio_data', None),
+                        speaker_name=getattr(command, 'speaker_name', None),
+                    ),
+                    timeout=60.0,
+                )
+                if _ucp_result and _ucp_result.get("success") is not False:
+                    logger.info(
+                        "[JARVIS API] UCP Pillar 5 handled command: %s",
+                        _ucp_result.get("response", "")[:80],
+                    )
+                    return _ucp_result
+                # UCP returned failure — fall through to workflow processor
+                logger.info("[JARVIS API] UCP returned failure, trying workflow processor")
+        except asyncio.TimeoutError:
+            logger.warning("[JARVIS API] UCP Pillar 5 timed out (60s), trying workflow processor")
+        except ImportError:
+            logger.debug("[JARVIS API] UCP not available, using workflow processor")
+        except Exception as e:
+            logger.info(f"[JARVIS API] UCP Pillar 5 error: {e}, trying workflow processor")
+
+        # Fallback: workflow_command_processor (old path)
         try:
             from .workflow_command_processor import handle_workflow_command
 
