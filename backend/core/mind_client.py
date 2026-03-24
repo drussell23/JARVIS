@@ -694,19 +694,151 @@ class MindClient:
         return result
 
     async def _claude_vision_fallback(self, v1_payload: dict) -> dict:
-        """L3 Claude Vision fallback.
+        """L3 Claude Vision fallback — real implementation via Anthropic API.
 
-        Stub implementation — returns an error-shaped response so the
-        caller's fallback chain degrades gracefully.  Will be wired to
-        the actual Claude Vision API in a follow-up task.
+        Sends the screenshot to Claude with the vision.loop.v1 structured
+        prompt. Claude sees the screen, reasons about what to do, and returns
+        precise coordinates for actions. This is the same capability as
+        Claude Computer Use but through our own orchestration.
+
+        Uses tool_use to constrain Claude's response to the v1 schema.
         """
-        logger.info("[MindClient] Claude vision fallback not yet implemented")
+        try:
+            import anthropic
+
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key:
+                logger.warning("[MindClient] No ANTHROPIC_API_KEY — L3 unavailable")
+                return self._vision_error_response("No Anthropic API key configured")
+
+            model = os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20250514")
+            client = anthropic.AsyncAnthropic(api_key=api_key)
+
+            # Build the prompt from vision.loop.v1 payload
+            goal = v1_payload.get("goal", "")
+            action_log = v1_payload.get("action_log", [])
+            turn = v1_payload.get("turn_number", 1)
+            frame_data = v1_payload.get("frame", {})
+            frame_b64 = frame_data.get("data", "") if isinstance(frame_data, dict) else ""
+
+            # Build action history text
+            history_lines = []
+            for entry in action_log:
+                t = entry.get("turn", "?")
+                act = entry.get("action_type", "?")
+                target = entry.get("target", "?")
+                result = entry.get("result", "?")
+                obs = entry.get("observation", "")
+                history_lines.append(f"Turn {t}: {act} '{target}' → {result} ({obs})")
+            history_text = "\n".join(history_lines) if history_lines else "(first turn — no prior actions)"
+
+            system_prompt = (
+                "You are a vision-guided UI automation agent. You can see the user's screen.\n\n"
+                "Your job: look at the screenshot and decide what action to take next to achieve the goal.\n\n"
+                "Respond with ONLY valid JSON (no markdown, no explanation):\n"
+                "{\n"
+                '  "goal_achieved": true/false,\n'
+                '  "stop_reason": "goal_satisfied" or null,\n'
+                '  "next_action": {\n'
+                '    "action_type": "click" or "type" or "scroll",\n'
+                '    "target": "description of what to click/type in",\n'
+                '    "text": "text to type" or null,\n'
+                '    "coords": [x, y] pixel coordinates or null\n'
+                '  } or null (if goal achieved),\n'
+                '  "reasoning": "one line explanation",\n'
+                '  "confidence": 0.0-1.0,\n'
+                '  "scene_summary": "brief description of what you see"\n'
+                "}\n\n"
+                "IMPORTANT:\n"
+                "- Return PRECISE pixel coordinates [x, y] for click targets\n"
+                "- Look at the actual screen content to find UI elements\n"
+                "- If the goal is achieved (e.g., message sent), set goal_achieved=true\n"
+                "- action_type must be one of: click, type, scroll\n"
+            )
+
+            user_text = (
+                f"GOAL: {goal}\n\n"
+                f"TURN: {turn}\n\n"
+                f"ACTION HISTORY:\n{history_text}\n\n"
+                f"Look at the screenshot and tell me what action to take next."
+            )
+
+            # Build message content with image
+            content = []
+            if frame_b64:
+                media_type = frame_data.get("content_type", "image/jpeg") if isinstance(frame_data, dict) else "image/jpeg"
+                content.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": frame_b64,
+                    },
+                })
+            content.append({"type": "text", "text": user_text})
+
+            timeout = float(os.environ.get("JARVIS_CLAUDE_VISION_TIMEOUT", "15.0"))
+
+            response = await asyncio.wait_for(
+                client.messages.create(
+                    model=model,
+                    max_tokens=512,
+                    system=system_prompt,
+                    messages=[{"role": "user", "content": content}],
+                ),
+                timeout=timeout,
+            )
+
+            # Parse Claude's response
+            import json as _json
+            raw_text = response.content[0].text if response.content else ""
+
+            # Strip markdown fences if present
+            if "```" in raw_text:
+                raw_text = raw_text.split("```")[1]
+                if raw_text.startswith("json"):
+                    raw_text = raw_text[4:]
+                raw_text = raw_text.strip()
+
+            result = _json.loads(raw_text)
+
+            # Normalize to v1 schema
+            result["schema"] = "vision.loop.v1"
+            if result.get("next_action") and not result["next_action"].get("action_id"):
+                result["next_action"]["action_id"] = f"claude-{turn}"
+            if result.get("next_action") and result["next_action"].get("coords"):
+                # Ensure coords are integers
+                c = result["next_action"]["coords"]
+                if isinstance(c, list) and len(c) >= 2:
+                    result["next_action"]["coords"] = [int(c[0]), int(c[1])]
+
+            logger.info(
+                "[MindClient] Claude Vision L3: goal_achieved=%s, action=%s, conf=%.2f",
+                result.get("goal_achieved"),
+                result.get("next_action", {}).get("action_type") if result.get("next_action") else "none",
+                result.get("confidence", 0),
+            )
+
+            return result
+
+        except asyncio.TimeoutError:
+            logger.warning("[MindClient] Claude Vision timed out (%.0fs)", timeout)
+            return self._vision_error_response("Claude Vision timed out")
+        except _json.JSONDecodeError as e:
+            logger.warning("[MindClient] Claude Vision returned invalid JSON: %s", e)
+            return self._vision_error_response(f"Invalid JSON from Claude: {e}")
+        except Exception as exc:
+            logger.warning("[MindClient] Claude Vision fallback error: %s", exc)
+            return self._vision_error_response(str(exc))
+
+    @staticmethod
+    def _vision_error_response(reason: str) -> dict:
         return {
             "schema": "vision.loop.v1",
             "goal_achieved": False,
             "stop_reason": "error",
             "next_action": None,
-            "reasoning": "Claude Vision L3 fallback not yet implemented",
+            "reasoning": reason,
             "confidence": 0.0,
             "scene_summary": "",
         }
