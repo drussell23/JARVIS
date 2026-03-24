@@ -770,6 +770,23 @@ class RuntimeTaskOrchestrator:
                     elapsed_s=time.monotonic() - start,
                 )
 
+            elif resolution.resolution == TaskResolution.VISION_ACTION:
+                result = await self._dispatch_to_vision(goal, step)
+                # Check the success field — vision returns {success: bool, ...}
+                vision_error = None
+                if isinstance(result, dict) and not result.get("success", True):
+                    vision_error = result.get("result", "Vision action failed")
+                return StepResolution(
+                    step_goal=goal,
+                    resolution=resolution.resolution,
+                    agent_name="vision_action_loop",
+                    capability_used="browser_navigation",
+                    synthesized=False,
+                    result=result,
+                    error=vision_error,
+                    elapsed_s=time.monotonic() - start,
+                )
+
             else:
                 return resolution  # UNRESOLVABLE — return as-is
 
@@ -1457,7 +1474,7 @@ class RuntimeTaskOrchestrator:
             await safe_say(
                 msg,
                 source="runtime_task_completion",
-                skip_dedup=True,  # Always speak task results
+                skip_dedup=False,  # v307: dedup enabled — prevents "Done" repeating 3-4x
             )
         except Exception as exc:
             logger.debug("[RuntimeTask] Voice completion failed (non-fatal): %s", exc)
