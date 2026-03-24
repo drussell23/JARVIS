@@ -353,36 +353,65 @@ class FramePipeline:
             )
 
     # ------------------------------------------------------------------
-    # Capture loop — tries SCK streaming, falls back to CoreGraphics
+    # Capture backend selection — Capability Gate (zero dead time)
     # ------------------------------------------------------------------
+    #
+    # SCK (ScreenCaptureKit) requires a pumped CFRunLoop for its GCD
+    # completion handlers. The asyncio event loop does NOT pump a
+    # CFRunLoop, so SCK will hang indefinitely when started from
+    # asyncio.to_thread() in the supervisor process.
+    #
+    # CoreGraphics (CGWindowListCreateImage via fast_capture) is
+    # synchronous — no GCD callbacks, no run loop needed. Works
+    # reliably from any thread in any process context.
+    #
+    # Capability Gate: detect the execution environment and choose the
+    # correct backend IMMEDIATELY. Never attempt a known-doomed path.
+    #
+    # VISION_CAPTURE_BACKEND env var:
+    #   "auto" (default) — CG in asyncio contexts, SCK only with dedicated thread
+    #   "coregraphics"   — force CG (always safe)
+    #   "sck"            — force SCK (only for dedicated CFRunLoop thread — future)
 
     async def _sck_capture_loop(self) -> None:
-        """
-        Background capture task with progressive degradation:
-        1. Try SCK streaming (60fps, GPU-accelerated) — with 5s start timeout
-        2. Fall back to CoreGraphics one-shot capture (fast_capture) — synchronous,
-           no GCD callbacks, works from any thread
+        """Capability-gated capture backend selection. Zero dead time."""
+        backend = os.environ.get("VISION_CAPTURE_BACKEND", "auto").lower()
 
-        SCK can hang in asyncio contexts because ScreenCaptureKit's completion
-        handlers need a CFRunLoop that asyncio doesn't pump. CoreGraphics
-        capture is synchronous and avoids this entirely.
+        if backend == "sck":
+            # Explicit SCK override — caller asserts CFRunLoop is available
+            logger.info("[FramePipeline] Backend forced to SCK via VISION_CAPTURE_BACKEND")
+            await self._sck_stream_loop()
+            return
 
-        Reports capture mode via logger for observability (Manifesto §7).
-        """
-        # --- Attempt 1: SCK streaming ---
-        sck_started = await self._try_sck_stream()
-        if sck_started:
-            return  # SCK loop is running
+        if backend == "coregraphics":
+            # Explicit CG override
+            logger.info(
+                "[FramePipeline] Backend forced to CoreGraphics via VISION_CAPTURE_BACKEND "
+                "(vision_capture_mode=coregraphics)"
+            )
+            await self._coregraphics_capture_loop()
+            return
 
-        # --- Attempt 2: CoreGraphics polling (fast_capture) ---
-        logger.info(
-            "[FramePipeline] SCK unavailable — falling back to CoreGraphics capture "
-            "(vision_capture_mode=coregraphics)"
-        )
-        await self._coregraphics_capture_loop()
+        # --- Auto mode: detect environment ---
+        # In asyncio context (which the supervisor always is), SCK will hang.
+        # Go straight to CoreGraphics. Zero seconds of dead time.
+        try:
+            asyncio.get_running_loop()
+            # We're in asyncio — SCK is structurally unsound here
+            logger.info(
+                "[FramePipeline] Asyncio context detected — bypassing SCK "
+                "(CFRunLoop not available). Using CoreGraphics "
+                "(vision_capture_mode=coregraphics, sck_outcome=skipped)"
+            )
+            await self._coregraphics_capture_loop()
+            return
+        except RuntimeError:
+            # No running loop — we might be in a dedicated thread (future)
+            logger.info("[FramePipeline] No asyncio loop — attempting SCK")
+            await self._sck_stream_loop()
 
-    async def _try_sck_stream(self) -> bool:
-        """Try starting SCK streaming. Returns True if successful."""
+    async def _sck_stream_loop(self) -> None:
+        """SCK streaming loop — only called when CFRunLoop is available."""
         try:
             from backend.native_extensions.macos_sck_stream import (
                 AsyncCaptureStream,
@@ -390,7 +419,7 @@ class FramePipeline:
             )
         except ImportError as exc:
             logger.info("[FramePipeline] SCK extension not available: %s", exc)
-            return False
+            return
 
         config = StreamingConfig(
             target_fps=int(os.environ.get("VISION_CAPTURE_FPS", "30")),
@@ -399,31 +428,18 @@ class FramePipeline:
         )
 
         stream = AsyncCaptureStream(self._window_id, config)
-        sck_timeout = float(os.environ.get("VISION_SCK_START_TIMEOUT_S", "5.0"))
 
         try:
-            started = await asyncio.wait_for(stream.start(), timeout=sck_timeout)
+            started = await stream.start()
             if not started:
-                logger.warning("[FramePipeline] SCK stream start returned False")
-                return False
-        except asyncio.TimeoutError:
-            logger.warning(
-                "[FramePipeline] SCK stream start timed out (%.1fs) — likely CFRunLoop "
-                "not pumped in asyncio context. Falling back to CoreGraphics.",
-                sck_timeout,
+                logger.error("[FramePipeline] SCK stream start returned False")
+                return
+
+            logger.info(
+                "[FramePipeline] SCK capture running (vision_capture_mode=sck, window=%d)",
+                self._window_id,
             )
-            return False
-        except Exception as exc:
-            logger.warning("[FramePipeline] SCK stream start failed: %s", exc)
-            return False
 
-        logger.info(
-            "[FramePipeline] SCK capture running (vision_capture_mode=sck, window=%d)",
-            self._window_id,
-        )
-
-        # SCK streaming loop — runs until cancelled or error
-        try:
             while self._running:
                 raw = await stream.get_frame(timeout_ms=50)
                 if raw is None:
@@ -453,7 +469,6 @@ class FramePipeline:
                 await stream.stop()
             except Exception:
                 pass
-        return True  # SCK loop ran (even if it errored) — don't fall through to CG
 
     async def _coregraphics_capture_loop(self) -> None:
         """CoreGraphics polling fallback — synchronous one-shot capture per interval.
