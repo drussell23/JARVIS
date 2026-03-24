@@ -317,14 +317,100 @@ class VisionCortex:
             logger.warning("[VisionCortex] Monitor start failed: %s", exc)
 
     # ------------------------------------------------------------------
-    # Event dispatch stubs (Task 6 will implement)
+    # Callback dispatchers -- registry-based, no if/elif chains (Manifesto ss5)
     # ------------------------------------------------------------------
 
     def _build_screen_dispatch(self) -> dict:
-        return {}
+        """Build dispatch table for screen events. Called once in awaken()."""
+        return {
+            'content_changed': self._handle_content_changed,
+            'screen_captured': self._handle_screen_captured,
+            'error_detected': self._handle_narration,
+            'security_concern': self._handle_narration,
+            'app_changed': self._handle_narration,
+            'notification_detected': self._handle_narration,
+            'meeting_detected': self._handle_narration,
+        }
 
     async def _on_screen_event(self, event_type: str, data: dict) -> None:
-        pass
+        """Dispatch screen events via registry. No if/elif chains."""
+        handler = self._screen_dispatch.get(event_type)
+        if handler:
+            await handler(event_type, data)
+        await self._emit_telemetry(f"screen.{event_type}@1.0.0", data)
+
+    async def _handle_content_changed(self, event_type: str, data: dict) -> None:
+        self._change_history.append((time.monotonic(), True))
+        self._update_activity_level()
+        await self._update_scene_graph(data)
+
+    async def _handle_screen_captured(self, event_type: str, data: dict) -> None:
+        self._change_history.append((time.monotonic(), False))
+        self._update_activity_level()
+
+    async def _handle_narration(self, event_type: str, data: dict) -> None:
+        await self._narrate_event(event_type, data)
 
     async def _on_workspace_event(self, event) -> None:
+        """Dispatch workspace events from MultiSpaceMonitor."""
+        from backend.vision.multi_space_monitor import MonitorEventType
+        if event.event_type == MonitorEventType.SPACE_SWITCHED:
+            self._force_immediate_capture()
+        await self._emit_telemetry(
+            f"workspace.{event.event_type.value}@1.0.0",
+            event.details,
+        )
+
+    def _force_immediate_capture(self) -> None:
+        """Schedule an immediate perception cycle (space switched = new content)."""
+        if self._running and self._perception_task is not None:
+            asyncio.ensure_future(self._run_one_perception_cycle())
+
+    async def _update_scene_graph(self, data: dict) -> None:
+        """Feed analysis results into KnowledgeFabric L1 cache."""
+        if self._knowledge_fabric is None:
+            return
+        try:
+            self._knowledge_fabric.update_scene(data)
+        except Exception as exc:
+            logger.debug("[VisionCortex] Scene graph update error: %s", exc)
+
+    async def _narrate_event(self, event_type: str, data: dict) -> None:
+        if not _NARRATION_ENABLED:
+            return
+        await _safe_say(event_type, data)
+
+    async def _emit_telemetry(self, schema: str, payload: dict) -> None:
+        try:
+            from backend.core.telemetry_bus import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            if bus:
+                envelope = TelemetryEnvelope.create(
+                    event_schema=schema,
+                    source="vision_cortex",
+                    payload=payload or {},
+                )
+                bus.emit(envelope)
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.debug("[VisionCortex] Telemetry emit error: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+async def _safe_say(event_type: str, data: dict) -> None:
+    """Voice narration for vision events. Dynamically builds message from event data."""
+    try:
+        from backend.core.supervisor.unified_voice_orchestrator import safe_say
+        app = data.get('app_name') or data.get('app') or ''
+        detail = data.get('error_text') or data.get('description') or event_type.replace('_', ' ')
+        msg = f"{detail} — {app}".strip(' —') if app else detail
+        if msg:
+            await safe_say(msg, source="vision_cortex", skip_dedup=False)
+    except ImportError:
+        pass
+    except Exception:
         pass

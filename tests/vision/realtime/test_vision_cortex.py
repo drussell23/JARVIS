@@ -113,3 +113,39 @@ async def test_perception_loop_reads_latest_frame():
 
     mock_analyzer.inject_frame.assert_called_once()
     mock_pipeline.get_frame.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_on_screen_event_content_changed_updates_throttle():
+    cortex = VisionCortex()
+    cortex._screen_dispatch = cortex._build_screen_dispatch()
+    cortex._change_history.clear()
+    await cortex._on_screen_event('content_changed', {'app': 'Terminal'})
+    assert any(changed for _, changed in cortex._change_history)
+
+
+@pytest.mark.asyncio
+async def test_on_screen_event_error_detected_narrates():
+    cortex = VisionCortex()
+    cortex._screen_dispatch = cortex._build_screen_dispatch()
+    with patch('backend.vision.realtime.vision_cortex._NARRATION_ENABLED', True):
+        with patch('backend.vision.realtime.vision_cortex._safe_say', new_callable=AsyncMock) as mock_say:
+            await cortex._on_screen_event('error_detected', {
+                'app': 'Terminal', 'error_text': 'segfault'
+            })
+            mock_say.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_on_workspace_event_space_switched():
+    from backend.vision.multi_space_monitor import MonitorEvent, MonitorEventType
+    from datetime import datetime
+    cortex = VisionCortex()
+    cortex._force_immediate_capture = MagicMock()
+    event = MonitorEvent(
+        event_type=MonitorEventType.SPACE_SWITCHED,
+        timestamp=datetime.now(),
+        space_id=2,
+    )
+    await cortex._on_workspace_event(event)
+    cortex._force_immediate_capture.assert_called_once()
