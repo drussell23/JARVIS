@@ -39,12 +39,17 @@ logger = logging.getLogger(__name__)
 _MAX_TURNS = int(os.environ.get("VISION_LEAN_MAX_TURNS", "10"))
 _SETTLE_S = float(os.environ.get("VISION_LEAN_SETTLE_S", "0.3"))
 _OVERALL_TIMEOUT_S = float(os.environ.get("VISION_LEAN_TIMEOUT_S", "180"))
-_CLAUDE_TIMEOUT_S = float(os.environ.get("VISION_LEAN_CLAUDE_TIMEOUT_S", "30"))
+_VISION_TIMEOUT_S = float(os.environ.get("VISION_LEAN_TIMEOUT_S", "30"))
 _CAPTURE_TIMEOUT_S = float(os.environ.get("VISION_LEAN_CAPTURE_TIMEOUT_S", "5"))
 _MAX_IMAGE_DIM = int(os.environ.get("VISION_LEAN_MAX_IMAGE_DIM", "1024"))
 _JPEG_QUALITY = int(os.environ.get("VISION_LEAN_JPEG_QUALITY", "70"))
-# Sonnet for accurate pixel coordinates; set JARVIS_CLAUDE_VISION_MODEL=claude-haiku-4-5-20251001 for speed
+
+# --- Vision model routing (Doubleword PRIMARY, Claude SECONDARY) ---
+_DOUBLEWORD_API_KEY = os.environ.get("DOUBLEWORD_API_KEY", "")
+_DOUBLEWORD_BASE_URL = os.environ.get("DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1")
+_DOUBLEWORD_VISION_MODEL = os.environ.get("DOUBLEWORD_VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8")
 _CLAUDE_MODEL = os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20250514")
+
 _STAGNATION_WINDOW = int(os.environ.get("VISION_LEAN_STAGNATION_WINDOW", "3"))
 _TMP_DIR = os.environ.get("VISION_LEAN_TMP_DIR", "/tmp/claude")
 
@@ -378,12 +383,32 @@ class LeanVisionLoop:
         action_log: List[Dict[str, Any]],
         turn: int,
     ) -> Dict[str, Any]:
-        """Send screenshot to Claude Vision and get structured action."""
-        client = self._get_client()
-        if client is None:
-            return {"goal_achieved": False, "reasoning": "No Anthropic API key"}
+        """Send screenshot to vision model — Doubleword PRIMARY, Claude SECONDARY."""
 
-        # Build action history
+        # Build shared prompt components
+        system_prompt, user_text = self._build_vision_prompt(
+            goal, img_w, img_h, action_log, turn,
+        )
+
+        # Tier 0: Doubleword VL-235B (primary — 30x cheaper)
+        if _DOUBLEWORD_API_KEY:
+            result = await self._ask_doubleword_vision(
+                system_prompt, user_text, screenshot_b64,
+            )
+            if result.get("reasoning", "").lower().find("error") == -1:
+                return result
+            logger.warning("[LeanVision] Doubleword failed, falling back to Claude")
+
+        # Tier 1: Claude Vision (secondary fallback)
+        return await self._ask_claude_vision(
+            system_prompt, user_text, screenshot_b64,
+        )
+
+    def _build_vision_prompt(
+        self, goal: str, img_w: int, img_h: int,
+        action_log: List[Dict[str, Any]], turn: int,
+    ) -> tuple:
+        """Build the system prompt and user text (shared by both providers)."""
         history_lines = []
         for entry in action_log:
             t = entry.get("turn", "?")
@@ -437,6 +462,81 @@ class LeanVisionLoop:
             "Look at the screenshot and return the next action as JSON."
         )
 
+        return system_prompt, user_text
+
+    # ------------------------------------------------------------------
+    # Tier 0: Doubleword Vision (PRIMARY — Qwen3-VL-235B)
+    # ------------------------------------------------------------------
+
+    async def _ask_doubleword_vision(
+        self, system_prompt: str, user_text: str, screenshot_b64: str,
+    ) -> Dict[str, Any]:
+        """Send screenshot to Doubleword's VL-235B model (OpenAI-compatible)."""
+        if not hasattr(self, "_dw_session") or self._dw_session is None:
+            try:
+                import aiohttp
+                self._dw_session = aiohttp.ClientSession()
+            except ImportError:
+                logger.warning("[LeanVision] aiohttp not installed for Doubleword")
+                return {"goal_achieved": False, "reasoning": "Doubleword error: aiohttp not installed"}
+
+        payload = {
+            "model": _DOUBLEWORD_VISION_MODEL,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
+                    },
+                    {"type": "text", "text": user_text},
+                ]},
+            ],
+            "max_tokens": 512,
+            "temperature": 0.1,
+        }
+
+        try:
+            async with self._dw_session.post(
+                f"{_DOUBLEWORD_BASE_URL}/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {_DOUBLEWORD_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                timeout=__import__("aiohttp").ClientTimeout(total=_VISION_TIMEOUT_S),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("[LeanVision] Doubleword HTTP %d: %s", resp.status, body[:200])
+                    return {"goal_achieved": False, "reasoning": f"Doubleword error: HTTP {resp.status}"}
+
+                data = await resp.json()
+                content = data["choices"][0]["message"].get("content", "")
+                logger.info("[LeanVision] THINK via Doubleword VL-235B")
+                return self._parse_response(content)
+
+        except asyncio.TimeoutError:
+            logger.warning("[LeanVision] Doubleword timed out after %.0fs", _VISION_TIMEOUT_S)
+            return {"goal_achieved": False, "reasoning": "Doubleword error: timed out"}
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[LeanVision] Doubleword error: %s", exc)
+            return {"goal_achieved": False, "reasoning": f"Doubleword error: {exc}"}
+
+    # ------------------------------------------------------------------
+    # Tier 1: Claude Vision (SECONDARY fallback)
+    # ------------------------------------------------------------------
+
+    async def _ask_claude_vision(
+        self, system_prompt: str, user_text: str, screenshot_b64: str,
+    ) -> Dict[str, Any]:
+        """Send screenshot to Claude Vision (Anthropic API)."""
+        client = self._get_client()
+        if client is None:
+            return {"goal_achieved": False, "reasoning": "No Anthropic API key"}
+
         content: list = [
             {
                 "type": "image",
@@ -457,16 +557,14 @@ class LeanVisionLoop:
                     system=system_prompt,
                     messages=[{"role": "user", "content": content}],
                 ),
-                timeout=_CLAUDE_TIMEOUT_S,
+                timeout=_VISION_TIMEOUT_S,
             )
-
             raw = response.content[0].text if response.content else ""
+            logger.info("[LeanVision] THINK via Claude %s", _CLAUDE_MODEL)
             return self._parse_response(raw)
 
         except asyncio.TimeoutError:
-            logger.error(
-                "[LeanVision] Claude timed out after %.0fs", _CLAUDE_TIMEOUT_S,
-            )
+            logger.error("[LeanVision] Claude timed out after %.0fs", _VISION_TIMEOUT_S)
             return {"goal_achieved": False, "reasoning": "Claude API timed out"}
         except asyncio.CancelledError:
             raise
