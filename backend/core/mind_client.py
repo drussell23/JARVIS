@@ -651,7 +651,7 @@ class MindClient:
         import hashlib as _hashlib
         from PIL import Image as _Image
 
-        img = pil_image
+        img = pil_image.convert("RGB") if pil_image.mode != "RGB" else pil_image
         buf = _io.BytesIO()
         for _ in range(3):
             buf = _io.BytesIO()

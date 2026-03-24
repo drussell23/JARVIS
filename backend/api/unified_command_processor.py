@@ -2165,7 +2165,7 @@ class UnifiedCommandProcessor:
                                 "source": "pillar5_preroute",
                             },
                         ),
-                        timeout=60.0,
+                        timeout=float(os.environ.get("JARVIS_RTO_TIMEOUT", "120.0")),
                     )
                     _p5log(f"RTO result: {_rto_result}")
 
