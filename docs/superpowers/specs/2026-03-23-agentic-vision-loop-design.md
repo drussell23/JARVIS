@@ -31,6 +31,8 @@ _dispatch_to_vision(goal, step)
             │   If not → fall through to J-Prime
             │
             ├── SEE: frame = frame_pipeline.latest_frame
+            │   (non-destructive read; frame safety: FramePipeline allocates
+            │    new FrameData per capture — no in-place numpy mutation)
             │   JPEG compress, enforce max_bytes, compute sha256
             │
             ├── THINK: await mind_client.reason_vision_turn(
@@ -123,7 +125,7 @@ Versioned schema (`vision.loop.v1`) for communication between the loop and J-Pri
     "next_action": {
         "action_id": "act-uuid",
         "action_type": "type",
-        "target_description": "search field",
+        "target": "search field",
         "text": "Zach",
         "coords": null,
         "settle_ms": 300,
@@ -173,12 +175,16 @@ Model refusal returns HTTP 200 with:
 
 ### Field naming convention
 
-`target_description` is the canonical field name in both `next_action` (response) and `action_log` entries (request). Stored as `target` in log entries for brevity; the MindClient adapter normalizes on read.
+`target` is the canonical field name everywhere — both `next_action` (response) and `action_log` entries (request). No aliases, no adapter normalization. When calling `VisionActionLoop.execute_action()`, the loop maps `target` to the `target_description` parameter.
 
 ## Enums
 
 ```python
-class VisionActionResult(str, Enum):
+class ActionOutcome(str, Enum):
+    """Outcome of a single action within the agentic loop.
+    Named ActionOutcome (not VisionActionResult) to avoid collision with
+    the existing VisionActionResult dataclass in vision_action_loop.py.
+    """
     SUCCESS = "success"
     FAILURE = "failure"
     UNKNOWN = "unknown"
@@ -216,13 +222,15 @@ Tier 3 sends exactly **two** images (before/after), not the full action log with
 
 ```python
 def _is_stagnant(action_log: list, proposed_action) -> bool:
-    # Check 1: identical action proposed N times (VISION_LOOP_STAGNATION_WINDOW, default 2)
+    # Check 1: identical SUCCESSFUL action proposed N times (VISION_LOOP_STAGNATION_WINDOW, default 3)
+    # Only count entries where result == "success" — repeating a failed action is valid retry.
     window = _STAGNATION_WINDOW
     recent = action_log[-window:] if len(action_log) >= window else action_log
     matches = sum(1 for e in recent
                   if e["action_type"] == proposed_action.action_type
-                  and e.get("target") == proposed_action.target_description
-                  and e.get("text") == getattr(proposed_action, "text", None))
+                  and e.get("target") == proposed_action.target
+                  and e.get("text") == getattr(proposed_action, "text", None)
+                  and e.get("result") == "success")
     if matches >= window:
         return True
 
@@ -269,7 +277,7 @@ async def reason_vision_turn(
 - Validates and normalizes response before returning to the loop
 - The loop never knows which backend answered — Manifesto §5
 
-**Timeout**: `VISION_LOOP_THINK_TIMEOUT_S` (default 12s) via `asyncio.wait_for`
+**Timeout**: `VISION_LOOP_THINK_TIMEOUT_S` (default 12s). Uses `asyncio.wait_for(asyncio.shield(http_call), timeout)` — shield prevents cancellation of the underlying HTTP request on timeout, allowing the aiohttp session to close gracefully. The loop moves on; the connection pool stays clean.
 
 ## Strategy Plugin Interface (Ouroboros Graduation)
 
@@ -312,11 +320,16 @@ class NavigationStrategy:
 - Add enums: `VisionActionResult`, `VerifyTier`, `StopReason`
 - Remove `_attempt_ghost_hands_correction()` — subsumed by the loop (Ghost Hands correction IS a loop turn: J-Prime proposes correction, loop executes via Ghost Hands)
 
-**`backend/core/mind_client.py`** (~80 lines added)
-- Add `reason_vision_turn()` method
-- JPEG compression + max_bytes enforcement + downscale
-- L3 fallback adapter (Claude multimodal → v1 schema → validate)
-- Response validation against vision.loop.v1 contract
+**`backend/core/mind_client.py`** (~140 lines added)
+- Add `reason_vision_turn()` method (~60 lines: payload build, POST, validate)
+- Add `_compress_frame_jpeg()` helper (~25 lines: JPEG quality, max_bytes, downscale, sha256)
+- Add `_claude_vision_fallback()` helper (~55 lines: convert v1 request to Claude multimodal message, tool_use constraint for v1 schema output, validate and normalize response)
+
+**Frame access path**: The loop obtains the FramePipeline via `VisionActionLoop.get_instance().frame_pipeline` (the `frame_pipeline` property was added in the VisionCortex implementation — Task 2). If VisionActionLoop is not running, the loop falls back to the existing single-shot behavior (open URL, return without vision verification).
+
+**CancelledError handling**: The main `for turn in range(MAX_VISION_TURNS)` loop must catch `asyncio.CancelledError` separately and re-raise it. `CancelledError` is `BaseException` in Python 3.9+ and will NOT be caught by `except Exception`. The loop must not swallow it — task cancellation must propagate cleanly.
+
+**Backend telemetry constants**: `"jprime_l2"`, `"claude_l3"`, `"strategy_cache"` (future). These are the only valid values for the `backend` field in telemetry payloads.
 
 ### Not modified
 
@@ -334,9 +347,11 @@ class NavigationStrategy:
 | `VISION_LOOP_THINK_TIMEOUT_S` | `12.0` | J-Prime reasoning timeout per turn |
 | `VISION_LOOP_JPEG_QUALITY` | `85` | Frame compression quality |
 | `VISION_LOOP_MAX_FRAME_BYTES` | `500000` | Max frame payload, downscale if over |
-| `VISION_LOOP_STAGNATION_WINDOW` | `2` | Identical actions before early exit |
+| `VISION_LOOP_STAGNATION_WINDOW` | `3` | Identical successful actions before early exit |
 | `VISION_LOOP_FRAME_STAGNATION` | `3` | Unchanged frames before early exit |
 | `VISION_LOOP_VERIFY_CONFIDENCE_TAU` | `0.7` | Below this → Tier 3 surgical verify |
+| `VISION_LOOP_DEFAULT_SETTLE_MS` | `200` | Default settle time when J-Prime omits it |
+| `VISION_LOOP_MAX_SETTLE_MS` | `2000` | Cap on settle_ms to prevent stalling |
 
 ## Telemetry
 
