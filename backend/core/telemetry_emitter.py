@@ -415,6 +415,9 @@ class TelemetryEmitter:
 
     def __init__(self, config: Optional[TelemetryConfig] = None):
         self._config = config or TelemetryConfig()
+        # v307: Skip telemetry emission when Reactor Core isn't running.
+        # Set JARVIS_TELEMETRY_ENABLED=false to suppress connection warnings.
+        self._enabled = os.getenv("JARVIS_TELEMETRY_ENABLED", "true").lower() in ("true", "1", "yes")
         self._circuit = TelemetryCircuitBreaker(self._config)
         self._disk_queue: Optional[DiskBackedQueue] = None
         self._memory_queue: List[TelemetryEvent] = []
@@ -428,6 +431,10 @@ class TelemetryEmitter:
     async def initialize(self) -> None:
         """Initialize the emitter."""
         if self._initialized:
+            return
+        if not self._enabled:
+            logger.info("[Telemetry] Disabled via JARVIS_TELEMETRY_ENABLED=false — events written to disk only")
+            self._initialized = True
             return
 
         # Initialize disk queue
