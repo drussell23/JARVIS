@@ -442,6 +442,15 @@ public:
     }
 #endif
 
+    SCDisplay* find_main_display() {
+        if (!shareable_content) return nil;
+        // Return first display (main display) from shareable content
+        if (shareable_content.displays.count > 0) {
+            return shareable_content.displays[0];
+        }
+        return nil;
+    }
+
     bool start_stream() {
         if (active.load()) {
             return true;  // Already active
@@ -449,28 +458,56 @@ public:
 
 #ifdef __APPLE__
         @autoreleasepool {
-            SCWindow *target_window = find_window();
-            if (!target_window) {
+            SCContentFilter *filter = nil;
+
+            if (window_id == 0) {
+                // Display capture mode: window_id=0 means "capture entire main display"
                 refresh_content();
-                target_window = find_window();
-            }
-
-            if (!target_window) {
-                if (error_callback) {
-                    error_callback("Window not found: " + std::to_string(window_id));
+                SCDisplay *main_display = find_main_display();
+                if (!main_display) {
+                    if (error_callback) {
+                        error_callback("No display found for screen capture");
+                    }
+                    return false;
                 }
-                return false;
-            }
+                // Capture entire display, excluding no windows
+                filter = [[SCContentFilter alloc] initWithDisplay:main_display excludingWindows:@[]];
+            } else {
+                // Window capture mode: capture a specific window by ID
+                SCWindow *target_window = find_window();
+                if (!target_window) {
+                    refresh_content();
+                    target_window = find_window();
+                }
 
-            // Create content filter
-            SCContentFilter *filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:target_window];
+                if (!target_window) {
+                    if (error_callback) {
+                        error_callback("Window not found: " + std::to_string(window_id));
+                    }
+                    return false;
+                }
+
+                filter = [[SCContentFilter alloc] initWithDesktopIndependentWindow:target_window];
+            }
 
             // Configure stream
             SCStreamConfiguration *streamConfig = [[SCStreamConfiguration alloc] init];
 
-            // Apply resolution scaling
-            int scaled_width = (int)(target_window.frame.size.width * config.resolution_scale);
-            int scaled_height = (int)(target_window.frame.size.height * config.resolution_scale);
+            // Apply resolution scaling — source dimensions depend on capture mode
+            int source_width, source_height;
+            if (window_id == 0) {
+                // Display mode: use main screen dimensions
+                NSScreen *mainScreen = [NSScreen mainScreen];
+                source_width = (int)mainScreen.frame.size.width;
+                source_height = (int)mainScreen.frame.size.height;
+            } else {
+                // Window mode: use window frame
+                SCWindow *target_window = find_window();
+                source_width = (int)(target_window ? target_window.frame.size.width : 1920);
+                source_height = (int)(target_window ? target_window.frame.size.height : 1080);
+            }
+            int scaled_width = (int)(source_width * config.resolution_scale);
+            int scaled_height = (int)(source_height * config.resolution_scale);
 
             streamConfig.width = scaled_width;
             streamConfig.height = scaled_height;
