@@ -11,14 +11,24 @@
       "avg_duration": 9.774395000000002
     },
     "open_app_unknown": {
-      "success": 4,
+      "success": 5,
       "failure": 0,
-      "avg_duration": 14.4772205
+      "avg_duration": 16.6771558
     },
     "unknown_unknown": {
       "success": 1,
       "failure": 0,
       "avg_duration": 6.857729
+    },
+    "open_app_write_send": {
+      "success": 1,
+      "failure": 0,
+      "avg_duration": 15.9239
+    },
+    "open_app_write": {
+      "success": 1,
+      "failure": 0,
+      "avg_duration": 6.324106
     }
   },
   "preferences": {},
@@ -32,13 +42,21 @@
       "total": 6
     },
     "open_app": {
-      "success": 9,
-      "total": 9
+      "success": 12,
+      "total": 12
     },
     "unknown": {
-      "success": 6,
-      "total": 6
+      "success": 7,
+      "total": 7
+    },
+    "write": {
+      "success": 2,
+      "total": 2
+    },
+    "send": {
+      "success": 1,
+      "total": 1
     }
   },
-  "last_updated": "2026-03-23T23:11:37.933970"
+  "last_updated": "2026-03-24T12:10:30.556787"
 }
