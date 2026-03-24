@@ -348,9 +348,9 @@ class LeanVisionLoop:
             "{\n"
             '  "goal_achieved": boolean,\n'
             '  "next_action": {                    // null if goal_achieved is true\n'
-            '    "action_type": "click"|"type"|"scroll",\n'
+            '    "action_type": "click"|"type"|"scroll"|"key",\n'
             '    "target": "human description of the element",\n'
-            '    "text": "text to type",           // required for type, omit for click/scroll\n'
+            '    "text": "text to type or key name", // required for type and key\n'
             '    "coords": [x, y]                  // required for click, optional for type/scroll\n'
             "  },\n"
             '  "reasoning": "one-line explanation of your decision",\n'
@@ -360,10 +360,12 @@ class LeanVisionLoop:
             "RULES:\n"
             "- For CLICK: return precise [x, y] pixel coordinates of the element center\n"
             "- For TYPE: if the target text field is already focused (from a prior click), omit coords\n"
+            "- For KEY: press a key like 'return', 'tab', 'escape', 'space', etc. Put the key name in 'text'\n"
             "- For SCROLL: coords optional, scrolls at current mouse position\n"
             "- If previous action failed, try a different approach (different coords, different element)\n"
             "- Be precise with coordinates -- look carefully at the actual element position\n"
             "- If the goal is fully achieved (e.g., message sent, page loaded), set goal_achieved=true\n"
+            "- IMPORTANT: After typing a message in a chat app, press 'return' (key action) to SEND it\n"
         )
 
         user_text = (
@@ -471,6 +473,8 @@ class LeanVisionLoop:
                 return await self._do_click(action)
             elif action_type == "type":
                 return await self._do_type(action)
+            elif action_type == "key":
+                return await self._do_key(action)
             elif action_type == "scroll":
                 return await self._do_scroll(action)
             else:
@@ -530,8 +534,27 @@ class LeanVisionLoop:
         )
         await proc.communicate(text.encode("utf-8"))
 
+        # Paste via osascript to avoid pyautogui hotkey "v" leak
+        paste_proc = await asyncio.create_subprocess_exec(
+            "osascript", "-e",
+            'tell application "System Events" to keystroke "v" using command down',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await paste_proc.wait()
+        return True
+
+    async def _do_key(self, action: Dict[str, Any]) -> bool:
+        """Press a single key (return, tab, escape, etc.)."""
+        key_name = action.get("text", "").lower().strip()
+        if not key_name:
+            logger.error("[LeanVision] Key action missing key name in 'text'")
+            return False
+
+        logger.info("[LeanVision] KEY '%s'", key_name)
+
         import pyautogui
-        await asyncio.to_thread(pyautogui.hotkey, "command", "v")
+        await asyncio.to_thread(pyautogui.press, key_name)
         return True
 
     async def _do_scroll(self, action: Dict[str, Any]) -> bool:
