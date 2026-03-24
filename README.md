@@ -6,6 +6,103 @@ JARVIS is the control plane and execution layer of a three-repository AGI ecosys
 
 ---
 
+## Symbiotic AI-Native Manifesto: Trinity Ecosystem Unification
+
+This initiative is **not a software refactor**. It is the genesis of an autonomous, self-evolving **Artificial Intelligence Operating System**. The project explicitly rejects the rigid paradigms of traditional software engineering in favor of a symbiotic design: **the models and agents carry intelligence; the codebase is the nervous system** that connects senses, cognition, and safe execution.
+
+### What we abandon
+
+- Hardcoded business logic expressed as long `if` / `elif` routing trees
+- Static heuristics that break the first time a user goal does not match a pre-enumerated case
+- “Agent sprawl” — dozens or hundreds of narrow specialist classes that duplicate similar behaviors with slightly different code paths
+- Shortcuts: retry spam, brute-force patches, and symptom-level fixes that leave structural disease in place
+
+### What we build instead
+
+- **Deep asynchrony** — true parallelism across senses, cognition, and UI; no accidental blocking of the organism
+- **Mathematical and semantic governance** — thresholds, entropy-aware signals, and model-driven planning instead of string-matching routers
+- **Cross-repo contract integrity** — JARVIS (Body), J-Prime (Mind), and Reactor Core (Immune System) behave as one organism, not three glued scripts
+
+### The tri-partite organism
+
+| Layer | Repository | Role | Analogy |
+|---|---|---|---|
+| **Senses / Body** | **JARVIS** (this repo) | Screen, audio, input automation, APIs, supervisor | Peripheral and motor nervous system |
+| **Mind / Cognition** | **J-Prime** | Model serving, reasoning, brain policy, LangGraph | Executive and associative cortex |
+| **Immune system / Sandbox** | **Reactor Core** | Isolated validation of generated code, training lineage, probation | Adaptive immunity — test before merge |
+
+The Mind is not “imported” into the Body as a Python library. The Body talks to the Mind over **HTTP and WebSocket** with explicit contracts (`MindClient`, `PrimeRouter`), so each subsystem can evolve, scale, and fail independently without corrupting the whole.
+
+### The seven principles
+
+**1. The unified organism (tri-partite microkernel)**  
+The ecosystem awakens through a **single authoritative entry point**: `python3 unified_supervisor.py`. The supervisor is not a dumb process launcher; it is the **kernel** that coordinates local edge (senses), cloud cognition (J-Prime), and sandboxed execution (Reactor / Docker) with consistent lifecycle and health semantics.
+
+**2. Progressive awakening (adaptive lifecycle)**  
+Boot is **not** a single long blocking chain. Local senses (UI, voice, capture) should reach **ACTIVE_LOCAL** quickly so the host can interact while heavy resources (e.g. GCP J-Prime) spin up **asynchronously**. UI readiness must track **real async resolution** — never a cosmetic “ready” that lies about backend state.
+
+**3. Asynchronous tendrils (disciplined concurrency)**  
+Foreground work, background exploration, and telemetry must use **structured concurrency** (`asyncio` task groups, gathering, cancellation discipline). Background **tendrils** must not starve the event loop, leak context, or corrupt shared memory assumptions.
+
+**4. The synthetic soul (Trinity consciousness)**  
+The system maintains **episodic awareness** of what worked and what failed. Components such as the **ConsciousnessBridge** (and related memory / telemetry paths) observe outcomes so the organism can detect **gaps in its own competence**. When statistical signals (e.g. entropy / uncertainty) show persistent ignorance, that drives **exploration and evolution** — not silent failure.
+
+**5. Intelligence-driven routing (the cognitive forge)**  
+Routing, planning, and decomposition are **agentic and semantic**, not regex catalogs. **Intent classification** and **brain selection** evaluate requests against policy and capability, then route to the right **model tier** and tools. Complex work is expressed as **DAG-shaped plans** (directed acyclic graphs) rather than linear scripts.
+
+**6. Threshold-triggered neuroplasticity (Ouroboros)**  
+When the organism hits a **capability gap**, it must synthesize a **just-in-time** response:
+
+- **Ephemeral tools** — one-off generated code or scripts run in the **sandbox** (Reactor Core), then discarded.
+- **Persistent assimilation** — if the same ephemeral capability is exercised successfully and **repeated** (e.g. graduation threshold such as **count ≥ 3**), **GraduationOrchestrator** proposes **permanent** integration: tests, validation, and a **secure Git PR** into the OS DNA.
+
+**7. Absolute observability (systemic transparency)**  
+Autonomous decisions must be **visible**. A **TelemetryBus** (and related emitters) broadcasts decisions, state transitions, and errors into **live dashboards** and, where appropriate, **voice narration** — the circulatory and reporting layer of the symbiote.
+
+### The zero-shortcut mandate
+
+**No shortcuts whatsoever.** No brute-force retries without diagnosis. No hardcoded routing tables that encode product policy. No sequential bottlenecks that exist only because “it was easier.” If a subsystem fails or hangs, the response is **structural repair** — dismantle the flawed assumption and rebuild — not a bypass that hides the bug. We do not attempt to code every future task explicitly; we code **the entity that can survive novelty**.
+
+### Five core execution contexts (why not sixty agents)
+
+Large reasoning models collapse many narrow “specialist agents” into **one mind** that adapts to the task. The codebase should expose **a small number of execution contexts** differentiated by **tools and sandbox boundaries**, not by dozens of parallel `if` branches.
+
+| Context | Responsibility | Typical model tier (policy-driven) |
+|---|---|---|
+| **Executor** | Sees the screen, clicks, types, navigates apps — **motor loop** | Vision-capable / multimodal tier |
+| **Architect** | Decomposes goals into **DAGs**, assigns steps, reconciles failures | Highest reasoning tier |
+| **Developer** | Reads and writes code across repos, tests, PR flow | Same reasoning / coding tier as policy allows |
+| **Communicator** | Email, calendar, messaging — protocol-heavy I/O | Fast tier by default; heavy tier when ambiguity is high |
+| **Observer** | Monitors screen / logs, anomaly detection, briefings | Vision or fast tier depending on sensitivity |
+
+**Intelligence lives in the model and the plan**, not in the number of Python classes. Agent code supplies: **tools** (filesystem, browser, screen, APIs), **execution locale** (live vs sandbox), and **safety gates** (human approval for destructive actions).
+
+### Example: one goal, multiple contexts (Ouroboros-aligned)
+
+**User:** “Refactor authentication to OAuth2.”
+
+1. **Architect** (reasoning tier) emits a DAG: analyze current auth → research constraints → implement → test in sandbox → open PR.  
+2. **Developer** executes code-reading and editing steps with repo tools.  
+3. **Reactor Core** runs tests in **isolation** and returns pass/fail.  
+4. **Architect** replans with failure context if needed; otherwise approves merge / PR narrative.  
+
+The **same** model stack can serve Architect and Developer roles; the **separation is operational** (what tools and gates are attached), not a requirement for dozens of named agent files.
+
+### Mapping manifesto → this repository
+
+| Principle | Primary anchors in JARVIS |
+|---|---|
+| Unified kernel | `unified_supervisor.py` |
+| Body–Mind bridge | `backend/core/mind_client.py`, `backend/core/prime_router.py` |
+| Semantic routing | `backend/core/interactive_brain_router.py`, `backend/core/ouroboros/governance/brain_selection_policy.yaml` |
+| Motor / vision loop | `backend/vision/lean_loop.py`, `backend/ghost_hands/` |
+| Neuroplasticity | `backend/core/ouroboros/` (`governed_loop_service.py`, `orchestrator.py`, `saga/`, `intake/`) |
+| Observability | `backend/core/telemetry_emitter.py`, governance narration, env-driven telemetry flags |
+
+Contributors should align new work with these principles: **extend tools and policy**, do not add brittle routing ladders or duplicate “mini-agents” that differ only by prompt wording.
+
+---
+
 ## Trinity Architecture
 
 The system is split across three repositories that map to **Body**, **Mind**, and **Soul**.
@@ -190,10 +287,14 @@ JARVIS-AI-Agent/
 
 ## Documentation
 
-Detailed documentation lives in the `docs/` directory.
+The **Symbiotic AI-Native Manifesto** (Trinity unification, seven principles, five execution contexts, zero-shortcut mandate) is the authoritative philosophical and architectural preamble in **this file**, under [Symbiotic AI-Native Manifesto: Trinity Ecosystem Unification](#symbiotic-ai-native-manifesto-trinity-ecosystem-unification).
+
+Detailed documentation also lives in the `docs/` directory.
 
 | Document | Path | Covers |
 |---|---|---|
+| Symbiotic manifesto (Trinity OS) | `README.md` | Genesis thesis, progressive awakening, Ouroboros neuroplasticity, observability, five contexts vs agent sprawl |
+| Ouroboros architecture | `docs/architecture/OUROBOROS.md` | Governance pipeline, graduation, sandbox vs assimilation |
 | Async Architecture | `docs/architecture/async-architecture.md` | Event loop design, cooperative cancellation, async-first patterns |
 | WebSocket Architecture | `docs/architecture/websocket-architecture.md` | Real-time communication protocol between frontend and backend |
 | Voice Sidecar Control Plane | `docs/architecture/VOICE_SIDECAR_CONTROL_PLANE.md` | Voice pipeline orchestration and audio bus design |
