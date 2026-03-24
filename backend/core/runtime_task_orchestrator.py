@@ -942,26 +942,51 @@ class RuntimeTaskOrchestrator:
         await asyncio.sleep(2.0)  # Allow page load
 
         # Phase 1: Lean Vision Loop (Path A)
+        # Try BOTH import paths — unified_supervisor may use either root
         lean_enabled = os.getenv("VISION_LEAN_ENABLED", "true").lower() in ("true", "1", "yes")
         if lean_enabled:
-            try:
-                from backend.vision.lean_loop import LeanVisionLoop
-                lean = LeanVisionLoop.get_instance()
-                logger.info("[RuntimeTask] Using Lean Vision Loop for: %s", goal[:80])
-                return await lean.run(goal)
-            except ImportError:
-                logger.warning("[RuntimeTask] LeanVisionLoop not available, falling back to legacy")
-            except Exception as lean_exc:
-                logger.warning("[RuntimeTask] Lean vision failed: %s, falling back to legacy", lean_exc)
+            _LeanVisionLoop = None
+            for _import_path in ("backend.vision.lean_loop", "vision.lean_loop"):
+                try:
+                    import importlib
+                    _mod = importlib.import_module(_import_path)
+                    _LeanVisionLoop = _mod.LeanVisionLoop
+                    logger.info("[RuntimeTask] Lean loop imported from: %s", _import_path)
+                    break
+                except ImportError:
+                    continue
 
-        # Legacy fallback: complex pipeline (VISION_LEAN_ENABLED=false)
+            if _LeanVisionLoop is not None:
+                try:
+                    lean = _LeanVisionLoop.get_instance()
+                    logger.info("[RuntimeTask] === LEAN VISION LOOP START === goal: %s", goal[:80])
+                    result = await lean.run(goal)
+                    logger.info("[RuntimeTask] === LEAN VISION LOOP END === success=%s turns=%s",
+                               result.get("success"), result.get("turns"))
+                    return result
+                except Exception as lean_exc:
+                    logger.error("[RuntimeTask] LEAN VISION LOOP CRASHED: %s", lean_exc, exc_info=True)
+            else:
+                logger.error(
+                    "[RuntimeTask] LEAN VISION LOOP IMPORT FAILED — tried both "
+                    "'backend.vision.lean_loop' and 'vision.lean_loop'. "
+                    "File missing or dependency error."
+                )
+
+        # Legacy fallback — but NO false success.
+        # If we get here, vision is broken. Say so.
         import hashlib as _hashlib
         _val = await self._get_vision_action_loop()
         if _val is None:
             opened = f"URL: {url}" if url else f"app: {target_app}" if target_app else goal
+            logger.error(
+                "[RuntimeTask] VISION UNAVAILABLE — opened %s but cannot "
+                "perform screen actions. Both lean loop and legacy pipeline failed.",
+                opened,
+            )
             return {
-                "success": True,
-                "result": f"Opened {opened}. Visual verification not available.",
+                "success": False,
+                "result": f"I opened {opened} but my vision system isn't working — I can't see or interact with the screen right now.",
                 "stop_reason": StopReason.ERROR.value,
             }
 
