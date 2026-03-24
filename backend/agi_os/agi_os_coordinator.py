@@ -205,9 +205,14 @@ class AGIOSCoordinator:
         self._phase_status: Dict[str, ComponentStatus] = {}
 
         # Configuration
+        # v307.0: proactive monitoring disabled by default — the Lean Vision
+        # Loop (Path A) handles vision tasks on-demand.  The old continuous
+        # screen analyzer competes for Claude API calls and wastes RAM.
+        # Set JARVIS_PROACTIVE_MONITORING=true to re-enable.
+        _proactive = os.getenv("JARVIS_PROACTIVE_MONITORING", "false").lower() in ("true", "1", "yes")
         self._config = {
             'enable_voice': True,
-            'enable_proactive_monitoring': True,
+            'enable_proactive_monitoring': _proactive,
             'enable_autonomous_actions': True,
             'voice_greeting': True,
             'health_check_interval': 30,
