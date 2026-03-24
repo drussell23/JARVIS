@@ -44,10 +44,12 @@ _CAPTURE_TIMEOUT_S = float(os.environ.get("VISION_LEAN_CAPTURE_TIMEOUT_S", "5"))
 _MAX_IMAGE_DIM = int(os.environ.get("VISION_LEAN_MAX_IMAGE_DIM", "1024"))
 _JPEG_QUALITY = int(os.environ.get("VISION_LEAN_JPEG_QUALITY", "70"))
 
-# --- Vision model routing (Doubleword PRIMARY, Claude SECONDARY) ---
-_DOUBLEWORD_API_KEY = os.environ.get("DOUBLEWORD_API_KEY", "")
-_DOUBLEWORD_BASE_URL = os.environ.get("DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1")
-_DOUBLEWORD_VISION_MODEL = os.environ.get("DOUBLEWORD_VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8")
+# --- Vision model routing ---
+# PRIMARY: J-Prime (routes to Doubleword/local models via brain selector)
+# FALLBACK: Claude API direct (when J-Prime unavailable)
+_JPRIME_HOST = os.environ.get("JARVIS_PRIME_HOST", "136.113.252.164")
+_JPRIME_PORT = os.environ.get("JARVIS_PRIME_PORT", "8002")
+_JPRIME_VISION_TIMEOUT_S = float(os.environ.get("VISION_JPRIME_TIMEOUT_S", "15"))
 _CLAUDE_MODEL = os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20250514")
 
 _STAGNATION_WINDOW = int(os.environ.get("VISION_LEAN_STAGNATION_WINDOW", "3"))
@@ -383,23 +385,22 @@ class LeanVisionLoop:
         action_log: List[Dict[str, Any]],
         turn: int,
     ) -> Dict[str, Any]:
-        """Send screenshot to vision model — Doubleword PRIMARY, Claude SECONDARY."""
+        """Send screenshot to vision — J-Prime PRIMARY (routes via brain selector),
+        Claude SECONDARY (direct fallback when J-Prime unavailable)."""
 
         # Build shared prompt components
         system_prompt, user_text = self._build_vision_prompt(
             goal, img_w, img_h, action_log, turn,
         )
 
-        # Tier 0: Doubleword VL-235B (primary — 30x cheaper)
-        if _DOUBLEWORD_API_KEY:
-            result = await self._ask_doubleword_vision(
-                system_prompt, user_text, screenshot_b64,
-            )
-            if result.get("reasoning", "").lower().find("error") == -1:
-                return result
-            logger.warning("[LeanVision] Doubleword failed, falling back to Claude")
+        # Tier 0: J-Prime (brain selector routes to Doubleword/local model)
+        result = await self._ask_jprime_vision(
+            system_prompt, user_text, screenshot_b64,
+        )
+        if result is not None:
+            return result
 
-        # Tier 1: Claude Vision (secondary fallback)
+        # Tier 1: Claude Vision (direct fallback)
         return await self._ask_claude_vision(
             system_prompt, user_text, screenshot_b64,
         )
@@ -465,65 +466,65 @@ class LeanVisionLoop:
         return system_prompt, user_text
 
     # ------------------------------------------------------------------
-    # Tier 0: Doubleword Vision (PRIMARY — Qwen3-VL-235B)
+    # Tier 0: J-Prime (routes to Doubleword/local via brain selector)
     # ------------------------------------------------------------------
 
-    async def _ask_doubleword_vision(
+    async def _ask_jprime_vision(
         self, system_prompt: str, user_text: str, screenshot_b64: str,
-    ) -> Dict[str, Any]:
-        """Send screenshot to Doubleword's VL-235B model (OpenAI-compatible)."""
-        if not hasattr(self, "_dw_session") or self._dw_session is None:
-            try:
-                import aiohttp
-                self._dw_session = aiohttp.ClientSession()
-            except ImportError:
-                logger.warning("[LeanVision] aiohttp not installed for Doubleword")
-                return {"goal_achieved": False, "reasoning": "Doubleword error: aiohttp not installed"}
+    ) -> Optional[Dict[str, Any]]:
+        """Send screenshot to J-Prime's vision endpoint.
 
-        payload = {
-            "model": _DOUBLEWORD_VISION_MODEL,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{screenshot_b64}"},
-                    },
-                    {"type": "text", "text": user_text},
-                ]},
-            ],
-            "max_tokens": 512,
-            "temperature": 0.1,
-        }
-
+        J-Prime's brain selector decides which model to use (Doubleword VL-235B,
+        local LLaVA, etc.) — no model name hardcoded here.
+        Returns None if J-Prime is unavailable (triggers Claude fallback).
+        """
         try:
-            async with self._dw_session.post(
-                f"{_DOUBLEWORD_BASE_URL}/chat/completions",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {_DOUBLEWORD_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                timeout=__import__("aiohttp").ClientTimeout(total=_VISION_TIMEOUT_S),
-            ) as resp:
-                if resp.status != 200:
-                    body = await resp.text()
-                    logger.warning("[LeanVision] Doubleword HTTP %d: %s", resp.status, body[:200])
-                    return {"goal_achieved": False, "reasoning": f"Doubleword error: HTTP {resp.status}"}
+            for import_path in ("backend.core.mind_client", "core.mind_client"):
+                try:
+                    import importlib
+                    mod = importlib.import_module(import_path)
+                    get_fn = getattr(mod, "get_mind_client", None)
+                    if get_fn:
+                        mind = get_fn()
+                        if mind is not None:
+                            break
+                except ImportError:
+                    continue
+            else:
+                return None  # MindClient not available
 
-                data = await resp.json()
-                content = data["choices"][0]["message"].get("content", "")
-                logger.info("[LeanVision] THINK via Doubleword VL-235B")
-                return self._parse_response(content)
+            # Use MindClient's reason_vision_turn which routes through J-Prime
+            response = await asyncio.wait_for(
+                mind.reason_vision_turn(
+                    request_id=str(uuid.uuid4())[:12],
+                    session_id=getattr(self, "_session_id", "lean"),
+                    goal=f"{system_prompt}\n\n{user_text}",
+                    action_log=[],
+                    frame_jpeg_b64=screenshot_b64,
+                    frame_dims={"width": 0, "height": 0, "scale": 1.0},
+                ),
+                timeout=_JPRIME_VISION_TIMEOUT_S,
+            )
+
+            if response and response.get("next_action") is not None:
+                logger.info("[LeanVision] THINK via J-Prime (brain selector routed)")
+                return response
+            elif response and response.get("goal_achieved"):
+                logger.info("[LeanVision] THINK via J-Prime — goal achieved")
+                return response
+
+            # J-Prime returned empty/error — fall through to Claude
+            logger.info("[LeanVision] J-Prime returned no action, falling back to Claude")
+            return None
 
         except asyncio.TimeoutError:
-            logger.warning("[LeanVision] Doubleword timed out after %.0fs", _VISION_TIMEOUT_S)
-            return {"goal_achieved": False, "reasoning": "Doubleword error: timed out"}
+            logger.info("[LeanVision] J-Prime timed out (%.0fs), falling back to Claude", _JPRIME_VISION_TIMEOUT_S)
+            return None
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            logger.warning("[LeanVision] Doubleword error: %s", exc)
-            return {"goal_achieved": False, "reasoning": f"Doubleword error: {exc}"}
+            logger.info("[LeanVision] J-Prime unavailable (%s), falling back to Claude", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Tier 1: Claude Vision (SECONDARY fallback)
