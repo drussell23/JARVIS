@@ -901,40 +901,21 @@ class MindClient:
             "frame": {"data": frame_jpeg_b64, **frame_dims},
         }
 
-        timeout = float(os.getenv("VISION_LOOP_THINK_TIMEOUT_S", "12"))
-
-        try:
-            result = await asyncio.wait_for(
-                asyncio.shield(
-                    self._http_post(
-                        "/v1/vision/reason_turn",
-                        data=payload,
-                        timeout=timeout,
-                    )
-                ),
-                timeout=timeout,
-            )
-            validated = self._validate_vision_loop_response(result)
-            if validated:
-                self._circuit.record_success()
-                self._record_success()
-                return validated
-        except asyncio.TimeoutError:
-            logger.info(
-                "[MindClient] reason_vision_turn timed out (%.1fs)", timeout
-            )
-        except Exception as exc:
-            logger.info(
-                "[MindClient] reason_vision_turn L2 failed: %s", exc
-            )
-            self._circuit.record_failure()
-            self._record_failure()
-
-        # L3 fallback — Claude Vision API (stub for now)
+        # Vision reasoning goes DIRECTLY to Claude (L3).
+        # J-Prime (Qwen2.5-32B) is text-only — it cannot see screenshots.
+        # Sending images to a blind model wastes 8-12s per turn before
+        # inevitably falling back to Claude anyway. This is not a fallback
+        # — Claude IS the vision brain until a multimodal on-premise model
+        # is deployed (see roadmap: LLaVA-34B+ upgrade).
+        #
+        # Future: when a multimodal J-Prime is available on GCP (Path 3),
+        # re-enable the L2 path here. The L2→L3 cascade is architecturally
+        # correct but currently pointless for vision tasks.
+        logger.info("[MindClient] Vision reasoning → Claude L3 (J-Prime is text-only)")
         try:
             return await self._claude_vision_fallback(payload)
         except Exception as exc:
-            logger.warning("[MindClient] Claude fallback failed: %s", exc)
+            logger.warning("[MindClient] Claude vision failed: %s", exc)
 
         return {
             "schema": "vision.loop.v1",
