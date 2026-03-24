@@ -317,7 +317,7 @@ class NavigationStrategy:
 - Add `_verify_action()` — 3-tier verify dispatch
 - Add `_build_action_log_entry()` — structured entry builder
 - Add `_find_strategy()` — stub returning None (future: Ouroboros)
-- Add enums: `VisionActionResult`, `VerifyTier`, `StopReason`
+- Add enums: `ActionOutcome`, `VerifyTier`, `StopReason`
 - Remove `_attempt_ghost_hands_correction()` — subsumed by the loop (Ghost Hands correction IS a loop turn: J-Prime proposes correction, loop executes via Ghost Hands)
 
 **`backend/core/mind_client.py`** (~140 lines added)
