@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout Code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Create Monitoring Script
         run: |
@@ -509,7 +509,7 @@ jobs:
 
       - name: Create Alert Issue
         if: steps.monitor.outputs.critical_alerts > 0
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           script: |
             const stuckCommands = ${{ steps.monitor.outputs.stuck_commands }};
