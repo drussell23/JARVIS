@@ -36,13 +36,13 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Environment-driven tunables
 # ---------------------------------------------------------------------------
-_MAX_TURNS = int(os.environ.get("VISION_LEAN_MAX_TURNS", "15"))
+_MAX_TURNS = int(os.environ.get("VISION_LEAN_MAX_TURNS", "10"))
 _SETTLE_S = float(os.environ.get("VISION_LEAN_SETTLE_S", "0.5"))
-_OVERALL_TIMEOUT_S = float(os.environ.get("VISION_LEAN_TIMEOUT_S", "120"))
-_CLAUDE_TIMEOUT_S = float(os.environ.get("VISION_LEAN_CLAUDE_TIMEOUT_S", "30"))
+_OVERALL_TIMEOUT_S = float(os.environ.get("VISION_LEAN_TIMEOUT_S", "180"))
+_CLAUDE_TIMEOUT_S = float(os.environ.get("VISION_LEAN_CLAUDE_TIMEOUT_S", "60"))
 _CAPTURE_TIMEOUT_S = float(os.environ.get("VISION_LEAN_CAPTURE_TIMEOUT_S", "5"))
-_MAX_IMAGE_DIM = int(os.environ.get("VISION_LEAN_MAX_IMAGE_DIM", "1536"))
-_JPEG_QUALITY = int(os.environ.get("VISION_LEAN_JPEG_QUALITY", "80"))
+_MAX_IMAGE_DIM = int(os.environ.get("VISION_LEAN_MAX_IMAGE_DIM", "1024"))
+_JPEG_QUALITY = int(os.environ.get("VISION_LEAN_JPEG_QUALITY", "70"))
 _CLAUDE_MODEL = os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20250514")
 _STAGNATION_WINDOW = int(os.environ.get("VISION_LEAN_STAGNATION_WINDOW", "3"))
 _TMP_DIR = os.environ.get("VISION_LEAN_TMP_DIR", "/tmp/claude")

@@ -1101,7 +1101,7 @@ class UnifiedWebSocketManager:
         self.pipeline.register_stage(
             "command_execution",
             self._execute_command_async,
-            timeout=90.0,  # Increased from 45s for complex vision processing
+            timeout=180.0,  # v307.0: Lean Vision Loop needs ~10s/turn × 10 turns
             retry_count=2,
             required=True,
         )
@@ -1815,10 +1815,10 @@ class UnifiedWebSocketManager:
                                 base_timeout = float(os.getenv("WS_SURVEILLANCE_TIMEOUT", "90.0"))
                                 logger.info(f"[WS] 👁️ Surveillance command detected - using {base_timeout}s timeout")
                             else:
-                                # v306.0: Dynamic timeout — vision tasks need multi-turn budget
-                                # Agentic vision loop: ~8s per turn × 5-6 turns = 40-48s + overhead
+                                # v307.0: Lean Vision Loop needs multi-turn budget
+                                # ~10s per turn (Claude Vision) × up to 10 turns = ~100s + overhead
                                 _gcp_active = bool(os.environ.get("JARVIS_INVINCIBLE_NODE_IP"))
-                                _default_timeout = "120.0" if _gcp_active else "90.0"
+                                _default_timeout = "180.0" if _gcp_active else "180.0"
                                 base_timeout = float(os.getenv("WS_COMMAND_TIMEOUT", _default_timeout))
 
                             # v242.0: Deduct headroom ONCE at deadline creation.
