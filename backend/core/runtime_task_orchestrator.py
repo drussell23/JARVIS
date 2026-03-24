@@ -58,6 +58,33 @@ class TaskResolution(str, Enum):
     UNRESOLVABLE = "unresolvable"          # no agent, no synthesis possible
 
 
+class ActionOutcome(str, Enum):
+    """Outcome of a single action within the agentic vision loop."""
+    SUCCESS = "success"
+    FAILURE = "failure"
+    UNKNOWN = "unknown"
+    SKIPPED = "skipped"
+
+
+class VerifyTier(str, Enum):
+    """Which verification tier was used."""
+    NONE = "none"
+    EXECUTOR = "executor"
+    FRAME_DELTA = "frame_delta"
+    MODEL_VERIFY = "model_verify"
+
+
+class StopReason(str, Enum):
+    """Why the agentic vision loop terminated."""
+    GOAL_SATISFIED = "goal_satisfied"
+    USER_CONFIRMATION = "user_visible_confirmation"
+    BEST_EFFORT = "best_effort"
+    STAGNATION = "stagnation"
+    MAX_TURNS = "max_turns"
+    MODEL_REFUSAL = "model_refusal"
+    ERROR = "error"
+
+
 @dataclass(frozen=True)
 class StepResolution:
     """How a single step in a task plan was resolved."""
@@ -1430,6 +1457,34 @@ class RuntimeTaskOrchestrator:
     # -----------------------------------------------------------------------
     # Step 5: Telemetry — Trinity-wide observability
     # -----------------------------------------------------------------------
+
+    @staticmethod
+    def _is_stagnant_static(
+        action_log: list,
+        proposed_action,
+        stagnation_window: int = 3,
+        frame_stagnation: int = 3,
+    ) -> bool:
+        """Detect stuck vision loops: same successful action repeated, or frozen frames."""
+        # Check 1: identical SUCCESSFUL action proposed N times
+        recent = action_log[-stagnation_window:] if len(action_log) >= stagnation_window else action_log
+        matches = sum(
+            1 for e in recent
+            if e.get("action_type") == proposed_action.action_type
+            and e.get("target") == proposed_action.target
+            and e.get("text") == getattr(proposed_action, "text", None)
+            and e.get("result") == "success"
+        )
+        if matches >= stagnation_window:
+            return True
+
+        # Check 2: frame unchanged for N turns
+        if len(action_log) >= frame_stagnation:
+            recent_hashes = [e.get("frame_hash") for e in action_log[-frame_stagnation:]]
+            if len(set(h for h in recent_hashes if h)) == 1:
+                return True
+
+        return False
 
     def _emit_task_telemetry(self, result: TaskResult) -> None:
         """Emit a TelemetryEnvelope so all Trinity systems see action outcomes.
