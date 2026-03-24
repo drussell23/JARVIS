@@ -905,18 +905,16 @@ class RuntimeTaskOrchestrator:
         return ""
 
     async def _dispatch_to_vision(self, goal: str, step: Dict[str, Any]) -> Any:
-        """Route a browser/UI task through the agentic vision loop.
+        """Route a browser/UI task through the vision loop.
 
-        v306.0: Multi-turn see-think-act-verify chain driven by J-Prime.
-        Each turn: read frame -> ask J-Prime "what next?" -> execute action ->
-        verify -> record. Replaces single-shot verify + ghost hands correction.
+        v307.0: Lean Vision Loop (Path A) -- stripped-down 3-step loop
+        that replaces the 12-hop pipeline.  CAPTURE -> THINK -> ACT.
+        Set VISION_LEAN_ENABLED=false to fall back to legacy pipeline.
         """
-        import hashlib as _hashlib
-
         search_query = step.get("search_query") or ""
         target_app = (step.get("target_app") or "").lower()
 
-        # Phase 0: Open app/URL (same as before)
+        # Phase 0: Open app/URL
         url = step.get("url") or ""
         if not url and self._prime is not None:
             url = await self._resolve_url_via_prime(goal, step)
@@ -943,7 +941,21 @@ class RuntimeTaskOrchestrator:
 
         await asyncio.sleep(2.0)  # Allow page load
 
-        # Phase 1: Agentic vision loop
+        # Phase 1: Lean Vision Loop (Path A)
+        lean_enabled = os.getenv("VISION_LEAN_ENABLED", "true").lower() in ("true", "1", "yes")
+        if lean_enabled:
+            try:
+                from backend.vision.lean_loop import LeanVisionLoop
+                lean = LeanVisionLoop.get_instance()
+                logger.info("[RuntimeTask] Using Lean Vision Loop for: %s", goal[:80])
+                return await lean.run(goal)
+            except ImportError:
+                logger.warning("[RuntimeTask] LeanVisionLoop not available, falling back to legacy")
+            except Exception as lean_exc:
+                logger.warning("[RuntimeTask] Lean vision failed: %s, falling back to legacy", lean_exc)
+
+        # Legacy fallback: complex pipeline (VISION_LEAN_ENABLED=false)
+        import hashlib as _hashlib
         _val = await self._get_vision_action_loop()
         if _val is None:
             opened = f"URL: {url}" if url else f"app: {target_app}" if target_app else goal

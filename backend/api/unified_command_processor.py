@@ -9711,14 +9711,16 @@ class UnifiedCommandProcessor:
             if deadline is not None:
                 _timeout_cap = max(2.0, deadline - time.monotonic() - 5.0)
 
+            # v307: async subprocess avoids fork crash (SIGABRT) when
+            # native C extensions (sounddevice, numpy) are loaded.
+            _cap_proc = await asyncio.create_subprocess_exec(
+                "screencapture", "-x", "-t", "png", tmp_path,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
             await asyncio.wait_for(
-                asyncio.to_thread(
-                    subprocess.run,
-                    ["screencapture", "-x", "-t", "png", tmp_path],
-                    capture_output=True,
-                    timeout=int(_timeout_cap),
-                ),
-                timeout=_timeout_cap + 1,
+                _cap_proc.wait(),
+                timeout=_timeout_cap,
             )
 
             with open(tmp_path, "rb") as f:

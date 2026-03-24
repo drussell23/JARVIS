@@ -20,6 +20,7 @@ Example:
     >>> print(f"Generated {len(actions)} autonomous actions")
 """
 
+import asyncio
 import re
 import os
 import logging
@@ -233,7 +234,12 @@ class MessageHandler:
                         with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                             tmp_path = tmp.name
                         
-                        subprocess.run(['screencapture', '-x', tmp_path], check=True, capture_output=True)
+                        _cap = await asyncio.create_subprocess_exec(
+                            'screencapture', '-x', tmp_path,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(_cap.wait(), timeout=5.0)
                         image = Image.open(tmp_path)
                         screenshot = np.array(image)
                         os.unlink(tmp_path)
