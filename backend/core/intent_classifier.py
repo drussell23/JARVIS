@@ -404,10 +404,35 @@ class IntentClassifier:
 
         # --- target_app ---
         if category == "app_control":
+            # First: try known app keywords
             for keyword, app_name in self._APP_KEYWORDS:
                 if keyword in cmd:
                     result["target_app"] = app_name
                     break
+
+            # Degraded fallback (§2): generic app tokenizer.
+            # Extract the word after "open" as target_app when the known
+            # list misses it. This is NOT routing logic — it's entity
+            # extraction so RTO can open the right app. The async J-Prime
+            # path (§5-aligned) does this agentically when available.
+            if "target_app" not in result:
+                m = re.search(r'\bopen\s+(\w+)', cmd)
+                if m:
+                    result["target_app"] = m.group(1)
+
+            # Compound command detection: "open X and [verb]" = requires_vision.
+            # If the user says "open whatsapp AND message/send/click/type/search",
+            # the follow-on action needs screen interaction. This is a STRUCTURAL
+            # pattern (not keyword routing) — it detects that there's a second
+            # action after the app open that requires UI automation.
+            _compound_verbs = {"message", "send", "type", "click", "search",
+                               "navigate", "find", "write", "reply", "fill",
+                               "scroll", "select", "drag", "check", "play"}
+            if " and " in cmd:
+                after_and = cmd.split(" and ", 1)[1].strip()
+                first_word_after = after_and.split()[0] if after_and.split() else ""
+                if first_word_after in _compound_verbs:
+                    result["requires_vision"] = True
 
         return result
 
