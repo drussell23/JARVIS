@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from enum import Enum
@@ -470,7 +471,9 @@ class IntentClassifier:
                 system_prompt=self._CLASSIFY_SYSTEM_PROMPT,
                 max_tokens=256,
                 temperature=0.0,
-                deadline=asyncio.get_event_loop().time() + 3.0,
+                deadline=asyncio.get_event_loop().time() + float(
+                    os.environ.get("JARVIS_CLASSIFY_DEADLINE_S", "8.0")
+                ),
             )
 
             result = json.loads(response.content)
