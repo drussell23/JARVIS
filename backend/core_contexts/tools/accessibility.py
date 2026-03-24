@@ -2,7 +2,7 @@
 Atomic accessibility tools -- find UI elements by description, not coordinates.
 
 These tools provide the Executor context with macOS Accessibility API
-(AXUIElement) integration.  Instead of guessing pixel coordinates from
+(AXUIElement) integration. Instead of guessing pixel coordinates from
 a screenshot, these tools query the OS-level accessibility tree to find
 the exact position of named UI elements.
 
