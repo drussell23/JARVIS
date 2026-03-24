@@ -366,6 +366,8 @@ class LeanVisionLoop:
             "- Be precise with coordinates -- look carefully at the actual element position\n"
             "- If the goal is fully achieved (e.g., message sent, page loaded), set goal_achieved=true\n"
             "- IMPORTANT: After typing a message in a chat app, press 'return' (key action) to SEND it\n"
+            "- After pressing return to send, the message appears in the chat. Set goal_achieved=true — do NOT type or send again\n"
+            "- If you see your message already in the conversation (as a sent bubble), the goal IS achieved\n"
         )
 
         user_text = (
