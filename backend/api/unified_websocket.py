@@ -1815,9 +1815,10 @@ class UnifiedWebSocketManager:
                                 base_timeout = float(os.getenv("WS_SURVEILLANCE_TIMEOUT", "90.0"))
                                 logger.info(f"[WS] 👁️ Surveillance command detected - using {base_timeout}s timeout")
                             else:
-                                # v242.0: Dynamic timeout — GCP inference needs more budget
+                                # v306.0: Dynamic timeout — vision tasks need multi-turn budget
+                                # Agentic vision loop: ~8s per turn × 5-6 turns = 40-48s + overhead
                                 _gcp_active = bool(os.environ.get("JARVIS_INVINCIBLE_NODE_IP"))
-                                _default_timeout = "60.0" if _gcp_active else "45.0"
+                                _default_timeout = "120.0" if _gcp_active else "90.0"
                                 base_timeout = float(os.getenv("WS_COMMAND_TIMEOUT", _default_timeout))
 
                             # v242.0: Deduct headroom ONCE at deadline creation.

@@ -2119,7 +2119,7 @@ class JARVISVoiceAPI:
                         audio_data=getattr(command, 'audio_data', None),
                         speaker_name=getattr(command, 'speaker_name', None),
                     ),
-                    timeout=60.0,
+                    timeout=float(os.environ.get("JARVIS_UCP_TIMEOUT", "120.0")),
                 )
                 if _ucp_result and _ucp_result.get("success") is not False:
                     logger.info(

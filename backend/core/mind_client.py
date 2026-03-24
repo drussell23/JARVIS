@@ -777,7 +777,7 @@ class MindClient:
                 })
             content.append({"type": "text", "text": user_text})
 
-            timeout = float(os.environ.get("JARVIS_CLAUDE_VISION_TIMEOUT", "15.0"))
+            timeout = float(os.environ.get("JARVIS_CLAUDE_VISION_TIMEOUT", "30.0"))
 
             response = await asyncio.wait_for(
                 client.messages.create(
