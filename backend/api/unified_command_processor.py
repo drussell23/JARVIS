@@ -2106,9 +2106,21 @@ class UnifiedCommandProcessor:
         try:
             from backend.core.intent_classifier import get_intent_classifier, CommandIntent
             _ic = get_intent_classifier()
-            _classification = _ic.classify(command_text)
+            # Primary: agentic classification via J-Prime (Manifesto §5)
+            # Fallback: sync heuristic (degraded mode, §2 Progressive Awakening)
+            try:
+                _classification = await asyncio.wait_for(
+                    _ic.classify_async(command_text),
+                    timeout=5.0,
+                )
+            except (asyncio.TimeoutError, Exception) as _ce:
+                _p5log(f"classify_async failed ({_ce}), degraded to sync heuristic")
+                _classification = _ic.classify(command_text)
             _p5log(f"classify: {_classification.intent.value} conf={_classification.confidence} "
                    f"cat={_classification.action_category} provider={_classification.provider} "
+                   f"target_app={_classification.target_app} "
+                   f"requires_vision={_classification.requires_vision} "
+                   f"source={_classification.classification_source} "
                    f"query={_classification.search_query}")
 
             if _classification.intent == CommandIntent.ACTION and _classification.confidence >= 0.7:
@@ -2148,6 +2160,8 @@ class UnifiedCommandProcessor:
                                 "provider": _classification.provider,
                                 "search_query": _classification.search_query,
                                 "target_app": _classification.target_app,
+                                "requires_vision": _classification.requires_vision,
+                                "classification_source": _classification.classification_source,
                                 "source": "pillar5_preroute",
                             },
                         ),

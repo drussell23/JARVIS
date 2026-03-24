@@ -57,6 +57,8 @@ class ClassificationResult:
     search_query: str = ""  # extracted search term (e.g. "nba" from "search youtube for nba")
     url: str = ""           # pre-resolved URL if deterministic
     target_app: str = ""    # native app name (e.g. "apple music")
+    requires_vision: bool = False  # True when subsequent steps need screen/UI automation
+    classification_source: str = "sync_heuristic"  # "sync_heuristic" or "jprime" — telemetry
 
 
 # ---------------------------------------------------------------------------
@@ -432,15 +434,22 @@ class IntentClassifier:
         '  "action_category": "browser"|"app_control"|"system"|"communication"|"media"|"file"|"",\n'
         '  "provider": "youtube"|"google"|"spotify"|etc or "",\n'
         '  "search_query": "extracted search term" or "",\n'
-        '  "target_app": "native macOS app name" or "",\n'
+        '  "target_app": "app name mentioned" or "",\n'
+        '  "requires_vision": true or false,\n'
         '  "reasoning": "one-line explanation"\n'
         "}\n\n"
         "Rules:\n"
         '- "action" = the user wants to DO something (open, search, play, create, send, etc.)\n'
         '- "query" = the user wants to KNOW something (question, explanation, conversation)\n'
-        "- Extract provider if a specific service is mentioned (youtube, google, spotify, etc.)\n"
+        "- Extract provider if a specific service is mentioned\n"
         "- Extract search_query if the user is searching for something\n"
-        "- Extract target_app if a native macOS app is mentioned\n"
+        "- Extract target_app if ANY app is mentioned (WhatsApp, Slack, Chrome, etc.) — "
+        "do NOT limit to a fixed list, extract whatever app the user names\n"
+        '- Set requires_vision=true when the command needs screen/UI interaction BEYOND '
+        "just opening an app — e.g. 'message Zach on WhatsApp' (needs to find and click "
+        "a contact), 'search YouTube for NBA' (needs to interact with search), "
+        "'fill out the form' (needs to see and click fields). "
+        "Pure 'open X' with no follow-on interaction = false\n"
         "- If uncertain, prefer query (safe — non-destructive)"
     )
 
@@ -481,11 +490,13 @@ class IntentClassifier:
                 provider=result.get("provider", ""),
                 search_query=result.get("search_query", ""),
                 target_app=result.get("target_app", ""),
+                requires_vision=bool(result.get("requires_vision", False)),
+                classification_source="jprime",
             )
 
         except Exception as e:
             logger.warning(
-                "IntentClassifier.classify_async failed, falling back to reflex: %s", e
+                "IntentClassifier.classify_async failed, falling back to sync heuristic: %s", e
             )
             return self.classify(command)
 

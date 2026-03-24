@@ -470,25 +470,28 @@ class RuntimeTaskOrchestrator:
     def _is_browser_or_ui_task(goal: str, step: Dict[str, Any]) -> bool:
         """Detect if this step needs browser/UI interaction (route to VisionActionLoop).
 
-        v305.0: Browser tasks go through the full perception-action-verification
-        loop (Ferrari Engine + Ghost Hands + ActionVerifier) instead of blind
-        subprocess.run(['open', url]) ephemeral tools.
+        v306.0: Primary signal is `requires_vision` from the IntentClassifier's
+        agentic output (J-Prime decides, not keywords). Structural fallback
+        signals apply only when `requires_vision` was not set (sync heuristic
+        degraded mode — Progressive Awakening §2).
 
         Detection is STRUCTURAL, not string-matching. We rely on the
-        IntentClassifier's semantic output (target_app, category, action_category)
-        which are resolved agentically by J-Prime — no hardcoded provider lists.
+        IntentClassifier's semantic output which are resolved agentically
+        by J-Prime — no hardcoded provider lists.
         """
-        # Structural signals from IntentClassifier (set by J-Prime semantically)
+        # 0. PRIMARY: J-Prime explicitly said this needs vision (§5-aligned)
+        if step.get("requires_vision"):
+            return True
+
+        # --- Below: structural fallback for degraded/sync classification ---
         target_app = (step.get("target_app") or "").lower()
         category = (step.get("category") or "").lower()
         action_category = (step.get("action_category") or "").lower()
         provider = (step.get("provider") or "").lower()
         search_query = step.get("search_query") or ""
 
-        # 1. IntentClassifier tagged it as a browser app
+        # 1. IntentClassifier tagged a specific app target (not terminal)
         if target_app and target_app != "terminal":
-            # If the classifier identified a specific app target, it's UI work.
-            # Terminal commands are NOT vision tasks.
             return True
 
         # 2. IntentClassifier categorized it as web/search/navigation
@@ -498,7 +501,6 @@ class RuntimeTaskOrchestrator:
             return True
 
         # 3. IntentClassifier identified a web provider + search query
-        # (provider is set agentically by the classifier, not a hardcoded list)
         if provider and search_query:
             return True
 
