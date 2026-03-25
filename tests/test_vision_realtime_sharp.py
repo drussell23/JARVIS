@@ -164,13 +164,14 @@ def _parse_ocr_lines(lines: list) -> Dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Main loop — VLA Pipeline (Vision + Language + Action)
 # ---------------------------------------------------------------------------
 
-async def main(duration_s: int = 45):
-    print("\n" + "=" * 60)
-    print("  JARVIS Real-Time Vision -- Read What's On Screen")
-    print("=" * 60)
+async def main(duration_s: int = 60):
+    print("\n" + "=" * 70)
+    print("  JARVIS VLA Pipeline — Dual-Model Parallel Perception")
+    print("  OCR (local) + 235B (structural) + Claude (semantic)")
+    print("=" * 70)
 
     # Open bouncing ball and bring it to front
     html = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vision_smoke_test_bounce.html")
@@ -178,25 +179,10 @@ async def main(duration_s: int = 45):
         subprocess.Popen(["open", html], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         await asyncio.sleep(2.0)
 
-    # Bring the bouncing ball tab to front in Chrome
     try:
         proc = await asyncio.create_subprocess_exec(
-            "osascript", "-e", """
-tell application "Google Chrome"
-    activate
-    repeat with w in windows
-        set tabIndex to 0
-        repeat with t in tabs of w
-            set tabIndex to tabIndex + 1
-            if title of t contains "Bouncing Ball" then
-                set active tab index of w to tabIndex
-                set index of w to 1
-                return
-            end if
-        end repeat
-    end repeat
-end tell
-""",
+            "osascript", "-e",
+            'tell application "Google Chrome" to activate',
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -205,9 +191,12 @@ end tell
     except Exception:
         pass
 
-    await jarvis_say("JARVIS vision online. I will read exactly what I see on your screen.")
+    await jarvis_say(
+        "JARVIS Vision Language Action pipeline online. "
+        "Dual model perception activated."
+    )
 
-    # Re-focus Chrome after speech (terminal may have stolen focus)
+    # Re-focus Chrome
     try:
         refocus = await asyncio.create_subprocess_exec(
             "osascript", "-e",
@@ -223,250 +212,154 @@ end tell
     # Start capture
     from backend.vision.lean_loop import LeanVisionLoop
     loop = LeanVisionLoop.get_instance()
+    # Force fresh frame_server for main-display-only capture
+    loop._frame_server_proc = None
+    loop._frame_server_ready = False
     await loop._ensure_frame_server()
     if loop._frame_server_ready:
         await asyncio.sleep(2.0)
-    print("  Capture: ONLINE\n")
+    print("  Capture: ONLINE")
 
-    # Cloud model for spatial context (async, non-blocking)
+    # Initialize cloud clients
     claude_client = None
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if api_key:
         try:
             import anthropic
             claude_client = anthropic.AsyncAnthropic(api_key=api_key)
+            print("  Claude Vision: ONLINE")
         except ImportError:
-            pass
+            print("  Claude Vision: OFFLINE (no anthropic)")
 
-    # --- Ouroboros: VisionReflexCompiler ---
-    from backend.vision.vision_reflex import VisionReflexCompiler
-    reflex_compiler = VisionReflexCompiler.get_instance()
-    TASK_KEY = "ocr_hud"
-
-    print(f"  Running {duration_s}s...")
-    print()
-    print("  " + "=" * 56)
-    print("   PHASE 1: THE SQUINT — Naive Agentic Baseline")
-    print("  " + "=" * 56)
-
-    t_start = time.monotonic()
-    prev_vals: Dict[str, str] = {}
-    last_narr_time = 0.0
-    last_cloud_time = 0.0
-    n_reads = 0
-    n_reflex_reads = 0
-    n_speaks = 0
-    ocr_latencies: list = []
-    reflex_latencies: list = []
-    cloud_task: Optional[asyncio.Task] = None
+    dw_key = os.environ.get("DOUBLEWORD_API_KEY", "")
+    print(f"  Doubleword 235B: {'ONLINE' if dw_key else 'OFFLINE (no key)'}")
 
     _tel_dir = os.environ.get(
         "VISION_TELEMETRY_DIR", "/tmp/claude/vision_telemetry",
     )
     _latest = os.path.join(_tel_dir, "vision_last_perception.png")
 
+    print(f"\n  Running {duration_s}s...\n  " + "-" * 60)
+
+    t_start = time.monotonic()
+    n_cycles = 0
+    last_ocr_vals: Dict[str, str] = {}
+    # Background tasks for cloud models (non-blocking)
+    claude_task: Optional[asyncio.Task] = None
+    dw_task: Optional[asyncio.Task] = None
+    last_vla_time = 0.0
+
     while (time.monotonic() - t_start) < duration_s:
-        # Capture
+        t_cycle = time.monotonic()
+
+        # ---- CAPTURE ----
         b64 = await loop._capture_cu_screenshot()
         if b64 is None:
             await asyncio.sleep(0.5)
             continue
 
-        # --- Ouroboros routing: reflex or OCR? ---
-        t_read = time.monotonic()
-        reflex = reflex_compiler.get_reflex(TASK_KEY)
+        n_cycles += 1
 
-        if reflex is not None:
-            # FAST PATH: compiled reflex (may be sync or async)
-            if asyncio.iscoroutinefunction(reflex):
-                vals = await reflex(b64)
-            else:
-                vals = reflex(b64)
-            read_ms = (time.monotonic() - t_read) * 1000
-            n_reflex_reads += 1
-            reflex_latencies.append(read_ms)
-            label = "REFLEX"
-            tier = reflex_compiler.get_active_tier(TASK_KEY)
-        else:
-            # SLOW PATH: full Apple Vision OCR
-            vals = await ocr_read_screen(b64)
-            read_ms = (time.monotonic() - t_read) * 1000
-            n_reads += 1
-            ocr_latencies.append(read_ms)
-            label = "OCR"
+        # ---- LAYER 1: Local OCR (deterministic skeleton, every cycle) ----
+        t_ocr = time.monotonic()
+        ocr_vals = await ocr_read_screen(b64)
+        ocr_ms = (time.monotonic() - t_ocr) * 1000
 
-            # Track call and check for graduation
-            event = reflex_compiler.record_call(TASK_KEY, read_ms)
-            if event == "graduate" and vals:
-                avg_ocr = (
-                    sum(ocr_latencies) / len(ocr_latencies)
-                    if ocr_latencies else read_ms
-                )
+        if ocr_vals and ocr_vals != last_ocr_vals:
+            h = ocr_vals.get("horizontal", "?")
+            v = ocr_vals.get("vertical", "?")
+            t = ocr_vals.get("total", "?")
+            _verify = f" | verify: {_latest}" if os.path.exists(_latest) else ""
+            print(f"  [OCR] ({ocr_ms:.0f}ms) H:{h} V:{v} T:{t}{_verify}")
+            jarvis_say_background(f"{t} total bounces. {h} horizontal, {v} vertical.")
+            last_ocr_vals = ocr_vals.copy()
 
-                # ============ PHASE 2: THE SURGERY ============
-                print()
-                print("  " + "=" * 56)
-                print("   PHASE 2: THE SURGERY — Ouroboros Triggered")
-                print("  " + "=" * 56)
-                print(
-                    f"  [Ouroboros] CognitiveInefficiencyEvent: "
-                    f"{reflex_compiler.get_call_count(TASK_KEY)} repeated "
-                    f"reads at avg {avg_ocr:.0f}ms"
-                )
-                print(
-                    f"  [Ouroboros] Latency threshold breached. "
-                    f"The Naive Agentic Way is burning {avg_ocr:.0f}ms/read."
-                )
-
-                jarvis_say_background(
-                    "Cognitive inefficiency detected. Initiating neuro compilation.",
-                )
-
-                def _print_status(msg: str) -> None:
-                    print(f"  [Ouroboros] {msg}")
-                    # Narrate key surgical moments live
-                    lower = msg.lower()
-                    if any(kw in lower for kw in [
-                        "235b", "397b", "tier 4", "validated",
-                        "synthesis", "sandbox", "generated",
-                    ]):
-                        jarvis_say_background(msg[:120])
-
-                t_compile = time.monotonic()
-                ok = await reflex_compiler.compile_reflexes(
-                    TASK_KEY, b64, vals, on_status=_print_status,
-                )
-                compile_ms = (time.monotonic() - t_compile) * 1000
-
-                if ok:
-                    tier = reflex_compiler.get_active_tier(TASK_KEY)
-                    print()
-                    print("  " + "=" * 56)
-                    print("   PHASE 3: 20/20 VISION — Reflex Assimilated")
-                    print("  " + "=" * 56)
-                    print(
-                        f"  [Retina] Tier {tier} reflex GRADUATED "
-                        f"in {compile_ms:.0f}ms"
-                    )
-                    print(
-                        f"  [Retina] Deterministic fast-path active. "
-                        f"Baseline {avg_ocr:.0f}ms -> reflex target <200ms"
-                    )
-                    print()
-                    jarvis_say_background(
-                        f"Reflex assimilated. Switching from {int(avg_ocr)} "
-                        f"millisecond reads to tier {tier} reflex.",
-                    )
-                else:
-                    print(f"  [Ouroboros] All tiers FAILED — staying on baseline OCR")
-
-        # Only speak if we actually read something AND values changed
-        if vals:
-            changed = vals != prev_vals
-            enough_time = (time.monotonic() - last_narr_time) > 2.5
-
-            if changed or enough_time:
-                parts = []
-                h = vals.get("horizontal")
-                v = vals.get("vertical")
-                t = vals.get("total")
-                prev_h = prev_vals.get("horizontal")
-                prev_t = prev_vals.get("total")
-
-                if h and v and t:
-                    if prev_t and prev_h and changed:
-                        try:
-                            delta_t = int(t) - int(prev_t)
-                            if delta_t > 0:
-                                parts.append(f"{t} total bounces, up {delta_t}")
-                            else:
-                                parts.append(f"{t} total bounces")
-                        except ValueError:
-                            parts.append(f"{t} total bounces")
-                        parts.append(f"{h} horizontal, {v} vertical")
-                    else:
-                        parts.append(f"{h} horizontal, {v} vertical, {t} total bounces")
-
-                narr = ". ".join(parts)
-                if narr:
-                    n_speaks += 1
-                    prev_vals = vals.copy()
-                    last_narr_time = time.monotonic()
-
-                    _artifact_hint = (
-                        f" | verify: {_latest}" if os.path.exists(_latest) else ""
-                    )
-                    print(
-                        f"  [{label} #{n_reads + n_reflex_reads}] ({read_ms:.0f}ms) "
-                        f"H:{h} V:{v} T:{t}{_artifact_hint}"
-                    )
-                    jarvis_say_background(narr)
-
-        # Cloud spatial context every ~10s (async background)
+        # ---- LAYER 2+3: Cloud VLA (parallel, every ~8s) ----
         elapsed = time.monotonic() - t_start
-        if cloud_task and cloud_task.done():
+        should_vla = (elapsed - last_vla_time) >= 8.0 and n_cycles >= 2
+
+        # Collect finished cloud results
+        if claude_task and claude_task.done():
             try:
-                cloud_result = cloud_task.result()
-                if cloud_result:
-                    print(f"  [CLOUD] {cloud_result}")
-                    await jarvis_say(cloud_result)
+                claude_result = claude_task.result()
+                if claude_result:
+                    print(f"  [CLAUDE] {claude_result}")
+                    jarvis_say_background(claude_result)
             except Exception:
                 pass
-            cloud_task = None
+            claude_task = None
 
-        if (elapsed - last_cloud_time) >= 10.0 and cloud_task is None and claude_client and n_speaks >= 2:
-            last_cloud_time = elapsed
-            cloud_task = asyncio.create_task(
-                _cloud_spatial(claude_client, b64)
-            )
+        if dw_task and dw_task.done():
+            try:
+                dw_result = dw_task.result()
+                if dw_result:
+                    # Truncate for display
+                    short = dw_result.replace("\n", " ").strip()[:200]
+                    print(f"  [235B]   {short}")
+                    jarvis_say_background(
+                        f"235B structural analysis: {short[:120]}"
+                    )
+            except Exception:
+                pass
+            dw_task = None
+
+        # Fire new parallel perception if enough time passed
+        if should_vla and claude_task is None and dw_task is None:
+            last_vla_time = elapsed
+            print(f"  [VLA] Firing dual-model perception (T+{elapsed:.0f}s)...")
+            if claude_client:
+                claude_task = asyncio.create_task(
+                    _claude_vision(claude_client, b64)
+                )
+            if dw_key:
+                dw_task = asyncio.create_task(
+                    _doubleword_vision(b64)
+                )
 
         await asyncio.sleep(0.3)
 
     # Cleanup
-    if cloud_task and not cloud_task.done():
-        cloud_task.cancel()
+    for task in [claude_task, dw_task]:
+        if task and not task.done():
+            task.cancel()
 
     total = time.monotonic() - t_start
-    print(f"\n  " + "-" * 50)
-    print(f"  OCR reads: {n_reads} | Reflex reads: {n_reflex_reads} | Duration: {total:.1f}s")
-    if ocr_latencies:
-        print(f"  OCR avg: {sum(ocr_latencies)/len(ocr_latencies):.0f}ms")
-    if reflex_latencies:
-        avg_reflex = sum(reflex_latencies) / len(reflex_latencies)
-        print(f"  Reflex avg: {avg_reflex:.0f}ms")
-        if ocr_latencies:
-            speedup = (sum(ocr_latencies) / len(ocr_latencies)) / avg_reflex
-            print(f"  Ouroboros speedup: {speedup:.0f}x")
+    print(f"\n  " + "-" * 60)
+    print(f"  Cycles: {n_cycles} | Duration: {total:.1f}s")
 
-    summary = f"Done. {n_reads} O.C.R. reads, {n_reflex_reads} reflex reads in {int(total)} seconds."
-    if reflex_latencies and ocr_latencies:
-        speedup = (sum(ocr_latencies) / len(ocr_latencies)) / (sum(reflex_latencies) / len(reflex_latencies))
-        summary += f" Ouroboros achieved {int(speedup)}x speedup."
-    await jarvis_say(summary)
+    await jarvis_say(
+        f"VLA pipeline complete. {n_cycles} perception cycles in "
+        f"{int(total)} seconds."
+    )
 
-    print("=" * 60 + "\n")
+    print("=" * 70 + "\n")
     if loop._frame_server_proc and loop._frame_server_proc.returncode is None:
         loop._frame_server_proc.terminate()
 
 
-async def _cloud_spatial(client, b64: str) -> Optional[str]:
-    """Ask Claude for spatial context -- where is the ball?"""
+# ---------------------------------------------------------------------------
+# VLA Perception Engines (run in parallel on the same frame)
+# ---------------------------------------------------------------------------
+
+async def _claude_vision(client, b64: str) -> Optional[str]:
+    """Claude Vision: deep semantic scene understanding."""
     try:
         resp = await asyncio.wait_for(
             client.messages.create(
                 model=os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20250514"),
-                max_tokens=40,
+                max_tokens=80,
                 system=(
-                    "ONE sentence, under 12 words. "
-                    "Where is the green ball on screen and what direction is its trail pointing? "
-                    "Address Derek."
+                    "You are JARVIS reporting to Derek. "
+                    "Describe what you see in 1-2 sentences: the scene, "
+                    "where the ball is, its direction, and any notable details. "
+                    "Be specific about position (quadrant, edge proximity) and motion."
                 ),
                 messages=[{"role": "user", "content": [
                     {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
-                    {"type": "text", "text": "Ball position and trail direction."},
+                    {"type": "text", "text": "Describe this screen."},
                 ]}],
             ),
-            timeout=8,
+            timeout=10,
         )
         for block in resp.content:
             if hasattr(block, "text"):
@@ -474,6 +367,114 @@ async def _cloud_spatial(client, b64: str) -> Optional[str]:
     except Exception:
         pass
     return None
+
+
+async def _doubleword_vision(b64: str) -> Optional[str]:
+    """Doubleword 235B VL: fast structural read — text, numbers, layout."""
+    dw_key = os.environ.get("DOUBLEWORD_API_KEY", "")
+    dw_base = os.environ.get("DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1")
+    dw_model = os.environ.get(
+        "DOUBLEWORD_VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+    )
+    if not dw_key:
+        return None
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{dw_base}/chat/completions",
+                json={
+                    "model": dw_model,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{b64}",
+                                },
+                            },
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Read ALL text on screen precisely. "
+                                    "Then describe: where is the green ball, "
+                                    "what quadrant, what direction is the trail, "
+                                    "and is it near any edge? Be concise."
+                                ),
+                            },
+                        ],
+                    }],
+                    "max_tokens": 200,
+                    "temperature": 0.0,
+                },
+                headers={
+                    "Authorization": f"Bearer {dw_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                return data["choices"][0]["message"].get("content", "")
+    except Exception:
+        return None
+
+
+async def _fused_perception(
+    claude_client, b64: str, ocr_vals: Dict[str, str],
+) -> str:
+    """Fire 235B + Claude in parallel, fuse results into one narration."""
+    # Launch both in parallel
+    tasks = []
+    if claude_client:
+        tasks.append(asyncio.create_task(_claude_vision(claude_client, b64)))
+    else:
+        tasks.append(asyncio.create_task(asyncio.sleep(0)))  # placeholder
+
+    tasks.append(asyncio.create_task(_doubleword_vision(b64)))
+
+    # Wait for both (with timeout so we don't block forever)
+    done, pending = await asyncio.wait(tasks, timeout=12)
+    for p in pending:
+        p.cancel()
+
+    claude_result = None
+    dw_result = None
+    for t in done:
+        try:
+            r = t.result()
+            if r is None:
+                continue
+            # Claude results tend to be longer/more narrative
+            # 235B results tend to start with the text data
+            if claude_client and t == tasks[0]:
+                claude_result = r
+            else:
+                dw_result = r
+        except Exception:
+            pass
+
+    # Fuse: OCR numbers + 235B detail + Claude spatial reasoning
+    parts = []
+
+    # Structured data from OCR
+    h = ocr_vals.get("horizontal", "?")
+    v = ocr_vals.get("vertical", "?")
+    t = ocr_vals.get("total", "?")
+    if h != "?" and v != "?":
+        parts.append(f"{t} total bounces. {h} horizontal, {v} vertical.")
+
+    # 235B structural detail (if it adds something beyond OCR)
+    if dw_result:
+        parts.append(f"235B sees: {dw_result[:150]}")
+
+    # Claude semantic understanding
+    if claude_result:
+        parts.append(f"Claude sees: {claude_result[:150]}")
+
+    return " ".join(parts) if parts else ""
 
 
 if __name__ == "__main__":

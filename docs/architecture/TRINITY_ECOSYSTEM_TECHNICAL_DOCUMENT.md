@@ -1282,13 +1282,15 @@ Architectural documents tend toward aspiration. This section aims for accuracy. 
 
 | Metric | Value | Context |
 |--------|-------|---------|
-| Python files | 12,452 | Across JARVIS-AI-Agent repo (excluding worktrees/venv) |
-| Lines of Python | ~5.1 million | Including generated code, tests, experiments, and utilities |
+| **Total lines across Trinity** | **~2.13 million** | All three repos, excluding venvs, worktrees, and __pycache__ |
+| JARVIS (Body) lines | ~1.89M (3,433 files) | Includes ~302K test lines, ~50K deprecated |
+| J-Prime (Mind) lines | ~139K (193 files) | Model serving, reasoning sidecar, brain selector |
+| Reactor Core (Soul) lines | ~102K (152 files) | Governance pipeline, graduation, experience |
 | Total commits | 5,664 | Since August 13, 2025 (project inception) |
 | Commit velocity | 230 → 632 → 2,368 / period | Month 1 → Month 5 → Last 6 weeks — accelerating |
 | Microkernel (`unified_supervisor.py`) | 101,984 lines | Single file, hand-written orchestration logic |
-| GCP VM Manager | 7,400+ lines | Single file, on-demand lifecycle management |
-| Model Serving | 2,200+ lines | 3-tier routing: PRIME_API → PRIME_LOCAL → CLAUDE |
+| GCP VM Manager | 11,688 lines | Single file, on-demand lifecycle management |
+| Model Serving | 4,761 lines | 3-tier routing: PRIME_API → PRIME_LOCAL → CLAUDE |
 | Test suite | 1,361+ tests | Across 3 repos (JARVIS, J-Prime, Reactor Core) |
 | Development duration | 7 months | Solo developer (Derek J. Russell) |
 | Voice samples enrolled | 59 | ECAPA-TDNN 192-dim embeddings in Cloud SQL |
