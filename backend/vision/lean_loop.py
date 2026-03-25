@@ -602,32 +602,79 @@ class LeanVisionLoop:
 
     @staticmethod
     def _parse_response(raw: str) -> Dict[str, Any]:
-        """Extract JSON from Claude's response text."""
-        # Try direct parse first
-        try:
-            return json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            pass
+        """Extract JSON from vision model response, repairing common errors."""
 
-        # Strip markdown fences if present
+        def _try_parse(text: str) -> Optional[Dict[str, Any]]:
+            try:
+                return json.loads(text)
+            except (json.JSONDecodeError, TypeError):
+                return None
+
+        # Try direct parse
+        result = _try_parse(raw)
+        if result:
+            return result
+
+        # Strip markdown fences
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```\w*\n?", "", cleaned)
             cleaned = re.sub(r"\n?```$", "", cleaned)
-            try:
-                return json.loads(cleaned)
-            except (json.JSONDecodeError, TypeError):
-                pass
+            result = _try_parse(cleaned)
+            if result:
+                return result
 
-        # Regex fallback: find first JSON object
+        # Extract first JSON object
         match = re.search(r"\{[\s\S]*\}", raw)
         if match:
-            try:
-                return json.loads(match.group())
-            except (json.JSONDecodeError, TypeError):
-                pass
+            json_text = match.group()
 
-        logger.warning("[LeanVision] Could not parse Claude response: %s", raw[:300])
+            result = _try_parse(json_text)
+            if result:
+                return result
+
+            # --- Repair common model JSON errors ---
+
+            # Fix missing closing quotes: "click,  → "click",
+            repaired = re.sub(r'"(\w+),\s*\n', r'"\1",\n', json_text)
+            result = _try_parse(repaired)
+            if result:
+                logger.info("[LeanVision] Repaired missing quote in JSON")
+                return result
+
+            # Fix truncated response: add missing closing braces
+            open_braces = json_text.count("{") - json_text.count("}")
+            open_brackets = json_text.count("[") - json_text.count("]")
+            if open_braces > 0 or open_brackets > 0:
+                # Truncate to last complete value
+                # Find last complete key-value pair
+                last_comma = json_text.rfind(",")
+                last_colon = json_text.rfind(":")
+                if last_comma > last_colon:
+                    truncated = json_text[:last_comma]
+                else:
+                    truncated = json_text
+
+                # Close open structures
+                truncated += "]" * max(0, open_brackets)
+                truncated += "}" * max(0, open_braces)
+                result = _try_parse(truncated)
+                if result:
+                    logger.info("[LeanVision] Repaired truncated JSON")
+                    return result
+
+            # Fix unquoted values: click → "click"
+            repaired2 = re.sub(
+                r':\s*([a-zA-Z_]\w*)\s*([,}\]])',
+                lambda m: f': "{m.group(1)}"{m.group(2)}' if m.group(1) not in ("true", "false", "null") else m.group(0),
+                json_text,
+            )
+            result = _try_parse(repaired2)
+            if result:
+                logger.info("[LeanVision] Repaired unquoted values in JSON")
+                return result
+
+        logger.warning("[LeanVision] Could not parse response: %s", raw[:300])
         return {"goal_achieved": False, "reasoning": f"Unparseable response: {raw[:100]}"}
 
     # ------------------------------------------------------------------
