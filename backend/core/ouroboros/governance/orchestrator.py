@@ -440,11 +440,20 @@ class GovernedOrchestrator:
                 )
                 from backend.core.ouroboros.governance.skill_registry import SkillRegistry as _SkillRegistry
                 _skill_registry = _SkillRegistry(self._config.project_root)
+                # DocFetcher: bounded external doc retrieval (P3 — Boundary Principle)
+                _doc_fetcher = None
+                try:
+                    from backend.core.ouroboros.governance.doc_fetcher import DocFetcher
+                    _doc_fetcher = DocFetcher()
+                except ImportError:
+                    pass
+
                 expander = ContextExpander(
                     generator=self._generator,
                     repo_root=self._config.project_root,
                     oracle=getattr(self._stack, "oracle", None),
                     skill_registry=_skill_registry,
+                    doc_fetcher=_doc_fetcher,
                 )
                 ctx = await asyncio.wait_for(
                     expander.expand(ctx, expansion_deadline),

@@ -51,11 +51,13 @@ class ContextExpander:
         repo_root: Path,
         oracle: Optional[Any] = None,
         skill_registry: Optional[Any] = None,   # Optional[SkillRegistry]
+        doc_fetcher: Optional[Any] = None,       # Optional[DocFetcher]
     ) -> None:
         self._generator = generator
         self._repo_root = repo_root
         self._oracle = oracle
         self._skill_registry = skill_registry
+        self._doc_fetcher = doc_fetcher
 
     async def expand(
         self,
@@ -146,7 +148,39 @@ class ContextExpander:
                 break
 
             confirmed = self._resolve_files(new_paths)
-            if not confirmed:
+
+            # External doc fetch: if the model requested package docs, fetch them
+            # Deterministic: URL construction + HTTP GET. Agentic: which packages to fetch.
+            external_docs = self._parse_doc_requests(raw)
+            if external_docs and self._doc_fetcher is not None:
+                try:
+                    doc_results = await self._doc_fetcher.fetch_package_docs(external_docs)
+                    _doc_texts = []
+                    for dr in doc_results:
+                        if dr.success and dr.text:
+                            _doc_texts.append(dr.text)
+                            logger.info(
+                                "[ContextExpander] op=%s round=%d: fetched external doc from %s (%d chars)",
+                                ctx.op_id, round_num + 1, dr.url, len(dr.text),
+                            )
+                    # Inject fetched docs into strategic_memory_prompt
+                    # (already wired into the GENERATE prompt by providers.py)
+                    if _doc_texts:
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        _doc_block = "\n\n--- EXTERNAL DOCUMENTATION ---\n" + "\n\n---\n".join(_doc_texts)
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=_existing + _doc_block,
+                            strategic_memory_digest=ctx.strategic_memory_digest,
+                        )
+                except Exception as doc_exc:
+                    logger.debug(
+                        "[ContextExpander] op=%s doc fetch failed: %s",
+                        ctx.op_id, doc_exc,
+                    )
+
+            if not confirmed and not external_docs:
                 logger.debug(
                     "[ContextExpander] op=%s round=%d: none of %d requested files found on disk",
                     ctx.op_id, round_num + 1, len(new_paths),
@@ -208,10 +242,12 @@ class ContextExpander:
             f"Context files already fetched:\n{fetched_list}\n\n"
             f"{available_section}"
             f"Which additional files (if any) would help understand the context for this task?\n"
-            f"List only files that exist in the codebase. Do NOT request the target files themselves.\n\n"
+            f"List only files that exist in the codebase. Do NOT request the target files themselves.\n"
+            f"If you need documentation for an external Python package, list its PyPI name in external_package_docs.\n\n"
             f"Return ONLY this JSON:\n"
             f'{{"schema_version": "expansion.1", '
             f'"additional_files_needed": ["path/relative/to/repo.py", ...], '
+            f'"external_package_docs": ["package-name", ...], '
             f'"reasoning": "<one sentence max 200 chars>"}}'
         )
 
@@ -313,6 +349,37 @@ class ContextExpander:
             valid = valid[:MAX_FILES_PER_ROUND]
 
         return valid
+
+    def _parse_doc_requests(self, raw: str) -> List[str]:
+        """Extract external_package_docs from expansion response.
+
+        Returns list of package names (strings). Empty on any error.
+        Bounded to MAX_FILES_PER_ROUND entries (reuses the same governor).
+        """
+        try:
+            stripped = raw.strip()
+            if stripped.startswith("```"):
+                lines = stripped.split("\n")
+                stripped = "\n".join(
+                    line for line in lines if not line.startswith("```")
+                ).strip()
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+        if not isinstance(data, dict):
+            return []
+
+        docs = data.get("external_package_docs", [])
+        if not isinstance(docs, list):
+            return []
+
+        # Sanitize: only valid package name strings, bounded
+        valid = [
+            d.strip() for d in docs
+            if isinstance(d, str) and d.strip() and len(d.strip()) < 100
+        ]
+        return valid[:MAX_FILES_PER_ROUND]
 
     def _inject_skill_instructions(self, ctx: "OperationContext") -> "OperationContext":
         """Append matched skill instructions to ctx.human_instructions (GAP 4).
