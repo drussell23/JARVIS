@@ -847,9 +847,8 @@ class LeanVisionLoop:
     # Agentic — L1 Scene Graph write-back
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _write_scene_cache(
-        action: str, params: dict, next_action: dict,
+        self, action: str, params: dict, next_action: dict,
     ) -> None:
         """Write successful element + coords to KnowledgeFabric scene graph."""
         target = next_action.get("target", "")
@@ -858,8 +857,19 @@ class LeanVisionLoop:
             return
 
         try:
-            from backend.knowledge.fabric import KnowledgeFabric
-            fabric = KnowledgeFabric()
+            # Reuse VAL's fabric if available, else create/cache our own
+            if not hasattr(self, "_knowledge_fabric") or self._knowledge_fabric is None:
+                try:
+                    from backend.vision.realtime.vision_action_loop import VisionActionLoop
+                    val = VisionActionLoop.get_instance()
+                    if val:
+                        self._knowledge_fabric = val.knowledge_fabric
+                except Exception:
+                    pass
+                if not hasattr(self, "_knowledge_fabric") or self._knowledge_fabric is None:
+                    from backend.knowledge.fabric import KnowledgeFabric
+                    self._knowledge_fabric = KnowledgeFabric()
+            fabric = self._knowledge_fabric
             entity_id = f"kg://scene/element/{target.lower().replace(' ', '_')[:50]}"
             fabric.write(
                 entity_id,
@@ -1026,7 +1036,7 @@ class LeanVisionLoop:
 
         action_id = f"ag-{turn}-{action_name}-{id(params)}"
         result = self._precheck_gate.check(
-            frame_age_ms=(_CU_SETTLE_S * 1000) + 100,  # frame was just captured
+            frame_age_ms=50.0,  # frame was just captured this turn (~50-200ms ago)
             fused_confidence=0.8,  # agentic loop uses model confidence
             action_id=action_id,
             action_type=action_name,
