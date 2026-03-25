@@ -501,7 +501,11 @@ class LeanVisionLoop:
                     {"type": "text", "text": user_text},
                 ]},
             ],
-            "max_tokens": 512,
+            # Qwen3.5 is a reasoning model — it uses ~400-800 tokens for
+            # chain-of-thought BEFORE producing the JSON output. At 512,
+            # the JSON gets truncated. 2048 gives plenty of room for both
+            # reasoning and a complete JSON response.
+            "max_tokens": 2048,
             "temperature": 0.1,
         }
 
