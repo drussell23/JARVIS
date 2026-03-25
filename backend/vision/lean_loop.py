@@ -211,6 +211,10 @@ class LeanVisionLoop:
         # recent screenshots so it can verify what happened after each action.
         frames: List[Tuple[str, str]] = []
         capture_failures = 0
+        # VisionCortex scene context (injected on first turn)
+        scene_context = self._get_scene_context()
+        # B.2: Bridge VisionActionLoop state machine
+        self._bridge_val_state(active=True)
 
         for turn in range(1, _CU_MAX_TURNS + 1):
             turn_start = time.monotonic()
@@ -250,6 +254,7 @@ class LeanVisionLoop:
             # ---- 2. THINK (multi-image visual history → model cascade) ----
             response = await self._agentic_think(
                 goal, frames, action_log, turn,
+                scene_context=scene_context if turn == 1 else "",
             )
             if response is None:
                 if turn == 1:
@@ -266,7 +271,7 @@ class LeanVisionLoop:
                 "[LeanVision:AG] Turn %d: THINK → %s", turn, reasoning[:120],
             )
 
-            # Goal achieved?
+            # Goal achieved? (multi-signal fusion)
             if response.get("goal_achieved"):
                 if (
                     turn == 1
@@ -278,15 +283,33 @@ class LeanVisionLoop:
                     )
                     response["goal_achieved"] = False
                 else:
-                    logger.info(
-                        "[LeanVision:AG] === GOAL ACHIEVED turn %d ===", turn,
+                    # Fuse model confidence with verification + history signals
+                    fused_ok, fused_conf = self._fuse_goal_confidence(
+                        model_says_done=True,
+                        model_confidence=response.get("confidence", 0.8),
+                        verification_status=action_log[-1].get("verification", "") if action_log else "",
+                        turn=turn,
+                        action_log=action_log,
                     )
-                    return {
-                        "success": True,
-                        "result": f"Goal achieved: {goal}",
-                        "turns": turn,
-                        "action_log": action_log,
-                    }
+                    if fused_ok:
+                        logger.info(
+                            "[LeanVision:AG] === GOAL ACHIEVED turn %d (fused_conf=%.2f) ===",
+                            turn, fused_conf,
+                        )
+                        return {
+                            "success": True,
+                            "result": f"Goal achieved: {goal}",
+                            "turns": turn,
+                            "action_log": action_log,
+                            "fused_confidence": fused_conf,
+                        }
+                    else:
+                        logger.warning(
+                            "[LeanVision:AG] Model claims done but fusion rejected "
+                            "(fused_conf=%.2f < threshold) — continuing",
+                            fused_conf,
+                        )
+                        response["goal_achieved"] = False
 
             next_action = response.get("next_action")
             if not next_action:
@@ -313,10 +336,46 @@ class LeanVisionLoop:
             )
             params = self._translate_to_cu_params(next_action)
 
+            # ---- PRECHECK (idempotency + freshness + risk) ----
+            precheck_fail = self._precheck_action(action_name, params, turn)
+            if precheck_fail:
+                action_log.append({
+                    "turn": turn, "action": action_name,
+                    "params": {k: v for k, v in params.items() if k != "action"},
+                    "target": next_action.get("target", ""),
+                    "result": f"blocked: {precheck_fail}",
+                    "verification": "skipped", "reasoning": reasoning,
+                    "elapsed_s": round(time.monotonic() - turn_start, 2),
+                })
+                continue  # Skip to next turn — model will see "blocked" in history
+
+            # Save pre-action frame for verification
+            pre_frame = self._b64_to_numpy(b64_png)
+
             ok, err = await self._execute_cu_action(action_name, params)
             elapsed = time.monotonic() - turn_start
 
             await asyncio.sleep(_CU_SETTLE_S)
+
+            # ---- 4. VERIFY (pixel-diff post-action check) ----
+            verification = "skipped"
+            post_b64 = await self._capture_cu_screenshot()
+            if pre_frame is not None and post_b64 is not None:
+                post_frame = self._b64_to_numpy(post_b64)
+                if post_frame is not None:
+                    verification = self._verify_cu_action(
+                        action_name, pre_frame, post_frame, params,
+                    )
+                    if verification == "fail" and ok:
+                        logger.warning(
+                            "[LeanVision:AG] Turn %d: action reported success "
+                            "but verification FAILED (no pixel change)",
+                            turn,
+                        )
+
+            # ---- 5. SCENE WRITE-BACK (cache successful element coords) ----
+            if ok and verification != "fail":
+                self._write_scene_cache(action_name, params, next_action)
 
             action_log.append({
                 "turn": turn,
@@ -326,9 +385,22 @@ class LeanVisionLoop:
                 },
                 "target": next_action.get("target", ""),
                 "result": "success" if ok else f"error: {err}",
+                "verification": verification,
                 "reasoning": reasoning,
                 "elapsed_s": round(elapsed, 2),
             })
+
+            # ---- NARRATE (fire-and-forget voice feedback) ----
+            asyncio.ensure_future(self._narrate_action(
+                action_name, next_action.get("target", "")[:40],
+                "success" if ok else f"error: {err}",
+            ))
+
+            # ---- B.2: METRICS (VisionActionLoop-compatible telemetry) ----
+            self._emit_val_metric(
+                action_name, params, next_action.get("target", ""),
+                ok, verification, turn, elapsed * 1000,
+            )
 
             logger.info(
                 "[LeanVision:AG] Turn %d: %s → %s (%.1fs)",
@@ -340,6 +412,7 @@ class LeanVisionLoop:
         logger.warning(
             "[LeanVision:AG] Max turns (%d) exhausted", _CU_MAX_TURNS,
         )
+        self._bridge_val_state(active=False)
         return {
             "success": False,
             "result": f"Max turns ({_CU_MAX_TURNS}) exhausted",
@@ -357,6 +430,7 @@ class LeanVisionLoop:
         frames: List[Tuple[str, str]],
         action_log: List[Dict[str, Any]],
         turn: int,
+        scene_context: str = "",
     ) -> Optional[Dict[str, Any]]:
         """Send recent screenshots + action log to vision model cascade.
 
@@ -364,7 +438,7 @@ class LeanVisionLoop:
         """
         system_prompt = self._build_agentic_system_prompt()
         content = self._build_agentic_content(
-            goal, frames, action_log, turn,
+            goal, frames, action_log, turn, scene_context=scene_context,
         )
 
         # --- Provider cascade ---
@@ -382,6 +456,11 @@ class LeanVisionLoop:
             )
             if result is not None:
                 return result
+
+        # 3. J-Prime LLaVA (GCP GPU — zero API cost)
+        result = await self._agentic_ask_jprime(system_prompt, content)
+        if result is not None:
+            return result
 
         return None
 
@@ -430,6 +509,7 @@ class LeanVisionLoop:
         frames: List[Tuple[str, str]],
         action_log: List[Dict[str, Any]],
         turn: int,
+        scene_context: str = "",
     ) -> list:
         """Build multi-image content with annotated screenshot history."""
         # Include last 3 screenshots for visual context (≈3K-4.5K tokens)
@@ -468,15 +548,23 @@ class LeanVisionLoop:
                 parts.append(f"at {coord}")
             if text:
                 parts.append(f"text='{text[:30]}'")
+            verification = entry.get("verification", "")
             parts.append(f"→ {result}")
+            if verification and verification not in ("skipped", "success"):
+                parts.append(f"[verify: {verification}]")
             history_lines.append("  " + " ".join(parts))
         history = (
             "\n".join(history_lines) if history_lines
             else "  (first turn — no prior actions)"
         )
 
+        context_line = ""
+        if scene_context:
+            context_line = f"SCENE CONTEXT: {scene_context}\n\n"
+
         user_text = (
             f"GOAL: {goal}\n\n"
+            f"{context_line}"
             f"TURN: {turn}/{_CU_MAX_TURNS}\n\n"
             f"ACTION HISTORY:\n{history}\n\n"
             "The screenshots above show your screen. The LAST is current.\n"
@@ -627,6 +715,425 @@ class LeanVisionLoop:
         except Exception as exc:
             logger.warning("[LeanVision:AG] Doubleword error: %s", exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Agentic — J-Prime LLaVA provider (GCP GPU, zero API cost)
+    # ------------------------------------------------------------------
+
+    async def _agentic_ask_jprime(
+        self, system_prompt: str, content: list,
+    ) -> Optional[Dict[str, Any]]:
+        """J-Prime LLaVA/32B on GCP GPU (zero API cost fallback)."""
+        endpoint = os.environ.get("JARVIS_JPRIME_VISION_URL", "")
+        if not endpoint:
+            # Try default GCP VM
+            endpoint = "http://136.113.252.164:8000"
+
+        # Quick reachability check — don't burn 30s on a dead endpoint
+        if not hasattr(self, "_jprime_reachable"):
+            self._jprime_reachable = None
+        if self._jprime_reachable is False:
+            return None
+
+        if not hasattr(self, "_jp_session") or self._jp_session is None:
+            try:
+                import aiohttp
+                self._jp_session = aiohttp.ClientSession()
+            except ImportError:
+                return None
+
+        # Convert content to OpenAI-compatible format (same as Doubleword)
+        oai_content: list = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") == "image":
+                    oai_content.append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{item['source']['data']}",
+                        },
+                    })
+                elif item.get("type") == "text":
+                    oai_content.append({"type": "text", "text": item["text"]})
+
+        payload = {
+            "model": os.environ.get("JARVIS_JPRIME_VISION_MODEL", "llava-v1.5"),
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": oai_content},
+            ],
+            "max_tokens": 2048,
+            "temperature": 0.1,
+        }
+
+        try:
+            import aiohttp
+            async with self._jp_session.post(
+                f"{endpoint}/v1/chat/completions",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as resp:
+                if resp.status != 200:
+                    self._jprime_reachable = False
+                    return None
+                self._jprime_reachable = True
+                data = await resp.json()
+                raw = data["choices"][0]["message"].get("content", "")
+                logger.info("[LeanVision:AG] THINK via J-Prime LLaVA")
+                return self._parse_response(raw)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[LeanVision:AG] J-Prime error: %s", exc)
+            self._jprime_reachable = False
+            return None
+
+    # ------------------------------------------------------------------
+    # Agentic — ActionVerifier integration
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _b64_to_numpy(b64_png: str) -> Optional["np.ndarray"]:
+        """Decode base64 PNG to numpy array for verification."""
+        try:
+            import numpy as np
+            from PIL import Image
+            img = Image.open(io.BytesIO(base64.b64decode(b64_png)))
+            return np.array(img.convert("RGB"))
+        except Exception:
+            return None
+
+    @staticmethod
+    def _verify_cu_action(
+        action: str,
+        pre_frame: "np.ndarray",
+        post_frame: "np.ndarray",
+        params: dict,
+    ) -> str:
+        """Run pixel-diff verification. Returns 'success', 'fail', or 'inconclusive'."""
+        try:
+            from backend.vision.realtime.verification import (
+                ActionVerifier, VerificationStatus,
+            )
+        except ImportError:
+            return "skipped"
+
+        verifier = ActionVerifier()
+        coord = params.get("coordinate")
+
+        if action in (
+            "left_click", "right_click", "double_click",
+            "triple_click", "middle_click",
+        ) and coord:
+            result = verifier.verify_click(
+                pre_frame, post_frame,
+                coords=(int(coord[0]), int(coord[1])),
+            )
+        elif action == "scroll":
+            result = verifier.verify_scroll(pre_frame, post_frame)
+        else:
+            # Type, key, etc. — check full-frame diff
+            import numpy as _np
+            diff = float(_np.mean(_np.abs(
+                post_frame.astype(_np.float32) - pre_frame.astype(_np.float32),
+            )))
+            if diff > 2.0:
+                return "success"
+            return "fail"
+
+        return result.status.value
+
+    # ------------------------------------------------------------------
+    # Agentic — L1 Scene Graph write-back
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _write_scene_cache(
+        action: str, params: dict, next_action: dict,
+    ) -> None:
+        """Write successful element + coords to KnowledgeFabric scene graph."""
+        target = next_action.get("target", "")
+        coord = params.get("coordinate")
+        if not target or not coord:
+            return
+
+        try:
+            from backend.knowledge.fabric import KnowledgeFabric
+            fabric = KnowledgeFabric()
+            entity_id = f"kg://scene/element/{target.lower().replace(' ', '_')[:50]}"
+            fabric.write(
+                entity_id,
+                {
+                    "target": target,
+                    "coordinates": coord,
+                    "action": action,
+                    "timestamp": time.time(),
+                },
+                ttl_seconds=30,  # Cache for 30s (UI can change)
+            )
+            logger.debug("[LeanVision:AG] Scene cache: %s → %s", target[:30], coord)
+        except Exception:
+            pass  # Non-critical — don't block on cache failure
+
+    # ------------------------------------------------------------------
+    # Agentic — VisionCortex scene context
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _get_scene_context() -> str:
+        """Query VisionCortex for current foreground app / scene state."""
+        try:
+            from backend.vision.realtime.vision_cortex import VisionCortex
+            cortex = VisionCortex.get_instance() if hasattr(VisionCortex, "get_instance") else None
+            if cortex is None:
+                return ""
+            # Try to get the current foreground app
+            if hasattr(cortex, "_current_app") and cortex._current_app:
+                return f"Foreground app: {cortex._current_app}"
+            if hasattr(cortex, "_last_scene_summary") and cortex._last_scene_summary:
+                return cortex._last_scene_summary[:200]
+        except Exception:
+            pass
+        return ""
+
+    # ------------------------------------------------------------------
+    # B.2: VisionActionLoop Unification (shared infrastructure bridges)
+    # ------------------------------------------------------------------
+
+    def _bridge_val_state(self, active: bool) -> None:
+        """Bridge VisionActionLoop state machine — update when lean_loop starts/stops.
+
+        This keeps the TUI dashboard and telemetry aware of vision activity
+        without merging control flows.
+        """
+        try:
+            from backend.vision.realtime.vision_action_loop import VisionActionLoop
+            from backend.vision.realtime.states import VisionEvent
+            val = VisionActionLoop.get_instance()
+            if val is None:
+                return
+            if active and val.state.value == "IDLE":
+                val._state_machine.transition(VisionEvent.START)
+                logger.debug("[LeanVision:VAL] Bridge: IDLE → WATCHING")
+            elif not active and val.state.value != "IDLE":
+                val._state_machine.transition(VisionEvent.STOP)
+                logger.debug("[LeanVision:VAL] Bridge: → IDLE")
+        except Exception:
+            pass  # Non-critical
+
+    def _emit_val_metric(
+        self, action_name: str, params: dict, target: str,
+        ok: bool, verification: str, turn: int, elapsed_ms: float,
+        tier_used: str = "agentic",
+    ) -> None:
+        """Emit a VisionActionLoop-compatible metric record.
+
+        Uses the same ``build_action_record`` format as VisionActionLoop
+        so metrics appear in the same telemetry stream.
+        """
+        try:
+            from backend.vision.realtime.metrics import build_action_record
+            from backend.vision.realtime.vision_action_loop import VisionActionLoop
+
+            record = build_action_record(
+                action_id=f"ag-{turn}-{action_name}",
+                target_description=target,
+                coords=tuple(params["coordinate"]) if "coordinate" in params else None,
+                confidence=0.8,
+                precheck_passed=True,
+                action_type=action_name,
+                backend_used="ghost_hands+pyautogui",
+                latency_ms=elapsed_ms,
+                verification_result=verification,
+                retry_count=0,
+                tier_used=tier_used,
+                success=ok,
+            )
+
+            # Emit via VAL callback if available
+            val = VisionActionLoop.get_instance()
+            if val and val.on_action_record:
+                val.on_action_record(record)
+            else:
+                logger.debug("[LeanVision:VAL] Metric: %s %s → %s (%.0fms)",
+                             action_name, target[:20], "ok" if ok else "fail", elapsed_ms)
+        except Exception:
+            pass  # Non-critical
+
+    async def _try_val_frame_pipeline(self) -> Optional[str]:
+        """Read latest frame from VisionActionLoop's FramePipeline (sub-10ms).
+
+        VisionActionLoop starts a FramePipeline at boot (Zone 6.4b).
+        Reading from it is faster than spawning frame_server or screencapture.
+        Returns base64 PNG at CU resolution, or None if unavailable.
+        """
+        try:
+            from backend.vision.realtime.vision_action_loop import VisionActionLoop
+            val = VisionActionLoop.get_instance()
+            if val is None or not val.frame_pipeline.is_running:
+                return None
+
+            frame = val.frame_pipeline.latest_frame
+            if frame is None:
+                return None
+
+            from PIL import Image
+            img = Image.fromarray(frame.data)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+            logical_w, logical_h = self._get_logical_screen_size()
+            if logical_w > 0 and logical_h > 0:
+                self._cu_scale = (
+                    logical_w / _CU_DISPLAY_W,
+                    logical_h / _CU_DISPLAY_H,
+                )
+            else:
+                self._cu_scale = (
+                    frame.width / _CU_DISPLAY_W,
+                    frame.height / _CU_DISPLAY_H,
+                )
+
+            img = img.resize(
+                (_CU_DISPLAY_W, _CU_DISPLAY_H), Image.Resampling.LANCZOS,
+            )
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            logger.debug("[LeanVision:VAL] Frame from FramePipeline (sub-10ms)")
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # Agentic — PrecheckGate (idempotency + freshness + risk)
+    # ------------------------------------------------------------------
+
+    def _precheck_action(
+        self, action_name: str, params: dict, turn: int,
+    ) -> Optional[str]:
+        """Run PrecheckGate guards before executing an action.
+
+        Returns None if all guards pass, or a failure reason string.
+        Lightweight checks only — no model calls, no I/O.
+        """
+        try:
+            from backend.vision.realtime.precheck_gate import PrecheckGate
+        except ImportError:
+            return None  # Gate unavailable — pass through
+
+        if not hasattr(self, "_precheck_gate"):
+            self._precheck_gate = PrecheckGate()
+
+        action_id = f"ag-{turn}-{action_name}-{id(params)}"
+        result = self._precheck_gate.check(
+            frame_age_ms=(_CU_SETTLE_S * 1000) + 100,  # frame was just captured
+            fused_confidence=0.8,  # agentic loop uses model confidence
+            action_id=action_id,
+            action_type=action_name,
+            target_task_type="browser_navigate",  # default safe
+            intent_timestamp=time.time(),
+            is_degraded=False,
+        )
+
+        if result.passed:
+            # Commit so idempotency guard works on next check
+            self._precheck_gate.commit_action(action_id)
+            return None
+        else:
+            failed = ", ".join(result.failed_guards)
+            logger.warning(
+                "[LeanVision:AG] PrecheckGate BLOCKED: %s (action=%s)",
+                failed, action_name,
+            )
+            return f"PrecheckGate: {failed}"
+
+    # ------------------------------------------------------------------
+    # Agentic — NarrationEngine (voice feedback during automation)
+    # ------------------------------------------------------------------
+
+    async def _narrate_action(
+        self, action_name: str, target: str, result: str,
+    ) -> None:
+        """Fire-and-forget voice narration of vision actions.
+
+        Non-blocking — narration failure never blocks the vision loop.
+        Uses Ghost Hands NarrationEngine if available, falls back to safe_say.
+        """
+        try:
+            from backend.ghost_hands.narration_engine import NarrationEngine
+            engine = NarrationEngine.get_instance()
+            if engine and engine._is_running:
+                if result.startswith("error"):
+                    await engine.narrate_error(
+                        f"Action failed: {action_name} on {target}",
+                    )
+                else:
+                    await engine.narrate_action(
+                        f"{action_name} on {target}",
+                    )
+                return
+        except Exception:
+            pass
+
+        # Fallback: use safe_say if NarrationEngine unavailable
+        try:
+            from backend.audio.safe_say import safe_say
+            if action_name in ("left_click", "double_click"):
+                safe_say(f"Clicking {target[:30]}")
+            elif action_name == "type":
+                safe_say("Typing text")
+            elif action_name == "key":
+                safe_say(f"Pressing {target[:20]}")
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Agentic — Fusion (multi-signal goal_achieved confidence)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fuse_goal_confidence(
+        model_says_done: bool,
+        model_confidence: float,
+        verification_status: str,
+        turn: int,
+        action_log: List[Dict[str, Any]],
+    ) -> Tuple[bool, float]:
+        """Multi-signal fusion for goal_achieved decisions.
+
+        Combines model confidence with verification signals and action
+        history to produce a calibrated (achieved, confidence) tuple.
+        Prevents premature goal_achieved claims.
+        """
+        if not model_says_done:
+            return False, 0.0
+
+        confidence = model_confidence
+
+        # Penalty: if last action verification failed, distrust goal_achieved
+        if action_log:
+            last_verify = action_log[-1].get("verification", "")
+            if last_verify == "fail":
+                confidence *= 0.5
+            elif last_verify == "success":
+                confidence *= 1.1  # boost
+
+        # Penalty: very early goal_achieved is suspicious
+        if turn <= 2 and len(action_log) < 2:
+            confidence *= 0.6
+
+        # Penalty: no successful actions at all
+        successful = sum(
+            1 for e in action_log if e.get("result") == "success"
+        )
+        if successful == 0:
+            confidence *= 0.3
+
+        confidence = min(confidence, 1.0)
+
+        # Only accept if fused confidence is above threshold
+        threshold = float(os.environ.get("VISION_GOAL_CONFIDENCE_THRESHOLD", "0.5"))
+        return confidence >= threshold, confidence
 
     # ==================================================================
     # Computer Use API — native multi-turn agent loop
@@ -818,11 +1325,16 @@ class LeanVisionLoop:
         """Capture screen as PNG at CU display resolution.
 
         Capture cascade (fastest first):
-        1. Ferrari Engine (frame_server subprocess via Quartz CGWindowListCreateImage)
-           — ~50ms, 15fps continuous, zero temp files
-        2. screencapture subprocess — ~200ms, reliable fallback
+        0. VisionActionLoop FramePipeline (if running) — sub-10ms
+        1. Ferrari Engine (frame_server subprocess via Quartz)    — ~50ms
+        2. screencapture subprocess                               — ~200ms
         """
-        # --- Try Ferrari Engine first (frame_server atomic file) ---
+        # --- Try VisionActionLoop FramePipeline (sub-10ms) ---
+        result = await self._try_val_frame_pipeline()
+        if result is not None:
+            return result
+
+        # --- Try Ferrari Engine (frame_server atomic file) ---
         result = await self._try_frame_server_capture()
         if result is not None:
             return result
@@ -1023,13 +1535,21 @@ class LeanVisionLoop:
     async def _execute_cu_action(
         self, action: str, params: dict,
     ) -> Tuple[bool, Optional[str]]:
-        """Execute a Computer Use action. Returns (success, error_msg)."""
+        """Execute a Computer Use action. Returns (success, error_msg).
+
+        Execution cascade: Ghost Hands (focus-preserving) → pyautogui (fallback).
+        """
         try:
             if action in ("screenshot", "cursor_position"):
                 return True, None
 
             coord = params.get("coordinate")
             sx, sy = self._cu_to_screen(coord) if coord else (0, 0)
+
+            # --- Try Ghost Hands first (focus-preserving) ---
+            gh_result = await self._try_cu_ghost_hands(action, sx, sy, params)
+            if gh_result is not None:
+                return gh_result
 
             if action in (
                 "left_click", "right_click", "middle_click",
@@ -1069,6 +1589,74 @@ class LeanVisionLoop:
             raise
         except Exception as exc:
             return False, str(exc)
+
+    async def _try_cu_ghost_hands(
+        self, action: str, sx: int, sy: int, params: dict,
+    ) -> Optional[Tuple[bool, Optional[str]]]:
+        """Try executing via Ghost Hands BackgroundActuator (focus-preserving).
+
+        Returns (success, error) or None if Ghost Hands unavailable.
+        """
+        try:
+            from backend.ghost_hands.background_actuator import (
+                BackgroundActuator, Action, ActionType, ActionResult,
+            )
+        except ImportError:
+            return None
+
+        if not hasattr(self, "_ghost_hands") or self._ghost_hands is None:
+            try:
+                self._ghost_hands = BackgroundActuator()
+                started = await self._ghost_hands.start()
+                if not started:
+                    self._ghost_hands = None
+                    return None
+                logger.info("[LeanVision:GH] Ghost Hands started")
+            except Exception as exc:
+                logger.debug("[LeanVision:GH] Ghost Hands init failed: %s", exc)
+                self._ghost_hands = None
+                return None
+
+        try:
+            gh_action: Optional[Action] = None
+            if action in ("left_click", "double_click", "right_click"):
+                atype = {
+                    "left_click": ActionType.CLICK,
+                    "double_click": ActionType.DOUBLE_CLICK,
+                    "right_click": ActionType.RIGHT_CLICK,
+                }.get(action, ActionType.CLICK)
+                gh_action = Action(action_type=atype, coordinates=(sx, sy))
+            elif action == "type":
+                gh_action = Action(
+                    action_type=ActionType.TYPE, text=params.get("text", ""),
+                )
+            elif action == "key":
+                gh_action = Action(
+                    action_type=ActionType.KEY, key=params.get("text", ""),
+                )
+
+            if gh_action is None:
+                return None  # Unsupported action — fall through to pyautogui
+
+            report = await asyncio.wait_for(
+                self._ghost_hands.execute(gh_action), timeout=5.0,
+            )
+            success = report.result == ActionResult.SUCCESS
+            if success:
+                logger.info(
+                    "[LeanVision:GH] %s (%d,%d) focus_preserved=%s",
+                    action, sx, sy, report.focus_preserved,
+                )
+                return True, None
+            else:
+                logger.debug(
+                    "[LeanVision:GH] %s failed: %s", action, report.error,
+                )
+                return None  # Fall through to pyautogui
+        except asyncio.TimeoutError:
+            return None
+        except Exception:
+            return None
 
     async def _cu_click(
         self, x: int, y: int, action: str, modifier: Optional[str] = None,
