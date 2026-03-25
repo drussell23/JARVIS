@@ -829,6 +829,123 @@ class GovernedOrchestrator:
                     len(_violations),
                 )
 
+        # ── Entropy measurement (Pillar 4: Synthetic Soul) ──────────────────
+        # Compute CompositeEntropySignal from acute (this generation) +
+        # chronic (historical domain) signals. Pure deterministic math.
+        try:
+            from backend.core.ouroboros.governance.entropy_calculator import (
+                compute_acute_signal,
+                compute_chronic_signal,
+                compute_systemic_entropy,
+                build_cognitive_inefficiency_event,
+                extract_domain_key,
+                EntropyQuadrant,
+            )
+
+            # Acute signal: from validation + shadow + retry data
+            _shadow_conf = 1.0
+            if ctx.shadow is not None:
+                _shadow_conf = getattr(ctx.shadow, "confidence", 1.0)
+
+            _critique_errors = 0
+            _critique_warnings = 0
+            _critique_infos = 0
+            if _episodic_memory is not None:
+                try:
+                    for ep in getattr(_episodic_memory, "_episodes", []):
+                        _critique_errors += getattr(ep, "error_count", 0)
+                        _critique_warnings += getattr(ep, "warning_count", 0)
+                        _critique_infos += getattr(ep, "info_count", 0)
+                except Exception:
+                    pass
+
+            _acute = compute_acute_signal(
+                validation_passed=best_validation.passed,
+                critique_errors=_critique_errors,
+                critique_warnings=_critique_warnings,
+                critique_infos=_critique_infos,
+                shadow_confidence=_shadow_conf,
+                retries_used=(self._config.max_generate_retries - generate_retries_remaining),
+                max_retries=self._config.max_generate_retries,
+            )
+
+            # Chronic signal: from LearningBridge history
+            _domain_key = extract_domain_key(ctx.target_files, ctx.description)
+            _chronic_outcomes: list = []
+            if hasattr(self._stack, "learning_bridge") and self._stack.learning_bridge is not None:
+                try:
+                    _history = await self._stack.learning_bridge.get_domain_history(
+                        _domain_key
+                    )
+                    _chronic_outcomes = _history if _history else []
+                except Exception:
+                    pass  # No history available — chronic signal stays neutral
+
+            _chronic = compute_chronic_signal(_domain_key, _chronic_outcomes)
+
+            # Fuse into systemic entropy
+            _composite = compute_systemic_entropy(_acute, _chronic)
+
+            # Log for observability (Pillar 7)
+            logger.info(
+                "[Orchestrator] Entropy: acute=%.3f chronic=%.3f systemic=%.3f "
+                "quadrant=%s trigger=%s domain=%s (op=%s)",
+                _acute.normalized_score, _chronic.normalized_score,
+                _composite.systemic_score, _composite.quadrant.value,
+                _composite.should_trigger, _domain_key, ctx.op_id,
+            )
+
+            # Record in ledger
+            await self._record_ledger(ctx, OperationState.GATING, {
+                "event": "entropy_measured",
+                "acute_score": round(_acute.normalized_score, 4),
+                "chronic_score": round(_chronic.normalized_score, 4),
+                "systemic_score": round(_composite.systemic_score, 4),
+                "quadrant": _composite.quadrant.value,
+                "domain_key": _domain_key,
+                "should_trigger": _composite.should_trigger,
+            })
+
+            # Act on quadrant
+            if _composite.quadrant == EntropyQuadrant.IMMEDIATE_TRIGGER:
+                # Emit CognitiveInefficiencyEvent to GapSignalBus
+                _event = build_cognitive_inefficiency_event(ctx.op_id, _composite)
+                try:
+                    from backend.neural_mesh.synthesis.gap_signal_bus import (
+                        GapSignalBus, CapabilityGapEvent,
+                    )
+                    _bus = GapSignalBus.get_instance()
+                    if _bus is not None:
+                        _gap_event = CapabilityGapEvent(
+                            goal=ctx.description or "capability gap detected via entropy",
+                            task_type=_domain_key,
+                            target_app="ouroboros",
+                            source="entropy_calculator",
+                            resolution_mode="synthesis",
+                        )
+                        _bus.emit(_gap_event)
+                        logger.warning(
+                            "[Orchestrator] IMMEDIATE_TRIGGER: CognitiveInefficiencyEvent "
+                            "emitted for domain=%s systemic=%.3f (op=%s)",
+                            _domain_key, _composite.systemic_score, ctx.op_id,
+                        )
+                except Exception:
+                    logger.debug("[Orchestrator] GapSignalBus emit failed", exc_info=True)
+
+            elif _composite.quadrant == EntropyQuadrant.FALSE_CONFIDENCE:
+                # Force sandbox validation even though validation passed
+                logger.warning(
+                    "[Orchestrator] FALSE_CONFIDENCE: domain=%s has high chronic "
+                    "failure rate (%.3f) despite passing validation. "
+                    "Recommend sandbox re-verification. (op=%s)",
+                    _domain_key, _chronic.failure_rate, ctx.op_id,
+                )
+
+        except ImportError:
+            pass  # entropy_calculator not available — degrade gracefully
+        except Exception:
+            logger.debug("[Orchestrator] Entropy computation failed", exc_info=True)
+
         # Store compact validation result in context; full output is in ledger
         ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
 
