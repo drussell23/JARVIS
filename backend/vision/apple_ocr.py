@@ -68,11 +68,16 @@ async def apple_ocr_read_async(
     min_confidence: float = 0.5,
     timeout_s: float = 5.0,
 ) -> List[Dict]:
-    """Run Apple Vision OCR on an image. Returns [{text, confidence}, ...]."""
-    script = _ensure_script()
+    """Run Apple Vision OCR on an image. Returns [{text, confidence}, ...].
+
+    Ouroboros fast-path: if VisionReflexCompiler has a pre-compiled
+    Swift binary, uses that (~50ms) instead of interpreting (~2000ms).
+    """
+    binary = _get_compiled_binary()
+    cmd = [binary, image_path] if binary else ["swift", _ensure_script(), image_path]
     try:
         proc = await asyncio.create_subprocess_exec(
-            "swift", script, image_path,
+            *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -87,3 +92,16 @@ async def apple_ocr_read_async(
     except (asyncio.TimeoutError, Exception) as exc:
         logger.debug("[AppleOCR] %s", exc)
         return []
+
+
+def _get_compiled_binary() -> Optional[str]:
+    """Check if VisionReflexCompiler has a pre-compiled binary available."""
+    try:
+        from backend.vision.vision_reflex import VisionReflexCompiler
+        compiler = VisionReflexCompiler.get_instance()
+        binary = compiler._compiled_binary
+        if binary and os.path.exists(binary):
+            return binary
+    except Exception:
+        pass
+    return None

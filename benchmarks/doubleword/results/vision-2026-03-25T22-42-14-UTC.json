@@ -1,0 +1,278 @@
+{
+  "run_at": "2026-03-25T22:42:14.400719+00:00",
+  "iterations_per_prompt": 2,
+  "screenshot_kb": 950,
+  "models": {
+    "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8": {
+      "model_id": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+      "label": "Qwen3-VL-235B (deep vision)",
+      "type": "vision",
+      "params": "235B",
+      "active": "~22B",
+      "prompts": {
+        "describe": {
+          "iterations": [
+            {
+              "status": 200,
+              "latency_s": 6.95,
+              "content": "The screen displays a dark, geometric background with a repeating pattern of interlocking diamond shapes outlined in faint green lines.\n\nIn the upper left corner, there is bright green text showing real-time statistics:\n- Horizontal Bounces: 101\n- Vertical Bounces: 118\n- Total Bounces: 219\n- Speed: 331 px/s\n\nIn the upper center-right area, a glowing green sphere with a trailing comet-like streak is visible, moving diagonally downward to the right.\n\nAt the bottom left corner, in small white text, it reads:\n\u201cJARVIS Vision Smoke Test \u2014 Ask JARVIS: \"What do you see on screen?\"\u201d\n\nThe overall aesthetic is dark and futuristic, with glowing green elements providing contrast.",
+              "input_tokens": 2623,
+              "output_tokens": 159,
+              "finish_reason": "stop"
+            },
+            {
+              "status": 200,
+              "latency_s": 4.4,
+              "content": "The screen displays a dark, geometric background with a repeating pattern of interlocking diamond shapes outlined in faint green lines.\n\nIn the upper left corner, there is bright green text showing real-time statistics:\n- Horizontal Bounces: 101\n- Vertical Bounces: 118\n- Total Bounces: 219\n- Speed: 331 px/s\n\nIn the center-right area of the screen, there is a glowing green sphere with a trailing comet-like streak, suggesting motion from right to left.\n\nAt the bottom left corner, in small white text, it reads:\n\u201cJARVIS Vision Smoke Test \u2014 Ask JARVIS: \"What do you see on screen?\"\u201d\n\nThere is also a small blue dot in the top right corner of the screen.",
+              "input_tokens": 2623,
+              "output_tokens": 161,
+              "finish_reason": "stop"
+            }
+          ],
+          "success_rate": 1.0,
+          "avg_latency_s": 5.68,
+          "min_latency_s": 4.4,
+          "max_latency_s": 6.95,
+          "best_content": "The screen displays a dark, geometric background with a repeating pattern of interlocking diamond shapes outlined in faint green lines.\n\nIn the upper left corner, there is bright green text showing real-time statistics:\n- Horizontal Bounces: 101\n- Vertical Bounces: 118\n- Total Bounces: 219\n- Speed: 331 px/s\n\nIn the upper center-right area, a glowing green sphere with a trailing comet-like streak is visible, moving diagonally downward to the right.\n\nAt the bottom left corner, in small white text, it reads:\n\u201cJARVIS Vision Smoke Test \u2014 Ask JARVIS: \"What do you see on screen?\"\u201d\n\nThe overall aesthetic is dark and futuristic, with glowing green elements providing contrast."
+        },
+        "coordinates": {
+          "iterations": [
+            {
+              "status": 200,
+              "latency_s": 7.78,
+              "content": "```json\n[\n\t{\"label\": \"green glowing ball with trail\", \"x\": [538, 174], \"y\": [209]}\n]\n```",
+              "input_tokens": 2640,
+              "output_tokens": 39,
+              "finish_reason": "stop"
+            },
+            {
+              "status": 200,
+              "latency_s": 2.32,
+              "content": "```json\n[\n\t{\"label\": \"green glowing ball with motion trail\", \"x\": [539, 174], \"y\": [174]}\n]\n```",
+              "input_tokens": 2640,
+              "output_tokens": 40,
+              "finish_reason": "stop"
+            }
+          ],
+          "success_rate": 1.0,
+          "avg_latency_s": 5.05,
+          "min_latency_s": 2.32,
+          "max_latency_s": 7.78,
+          "best_content": "```json\n[\n\t{\"label\": \"green glowing ball with trail\", \"x\": [538, 174], \"y\": [209]}\n]\n```"
+        }
+      }
+    },
+    "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8": {
+      "model_id": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "label": "Qwen3-VL-30B (fast vision)",
+      "type": "vision",
+      "params": "30B",
+      "active": "~3B",
+      "prompts": {
+        "describe": {
+          "iterations": [
+            {
+              "status": 200,
+              "latency_s": 6.8,
+              "content": "This is a screenshot of a computer screen displaying a simulation or game with a dark, geometric background.\n\nThe screen has the following elements:\n\n- **Background:** A dark, almost black, background with a repeating pattern of dark green, interlocking diamond shapes.\n- **Main Object:** A bright, glowing green sphere with a long, tapered tail, resembling a meteor or a laser beam. It is positioned in the upper right quadrant of the screen and appears to be moving diagonally upwards and to the right.\n- **Text (Top Left):** In bright green, monospaced font, the following statistics are displayed:\n    - `Horizontal Bounces: 101`\n    - `Vertical Bounces: 118`\n    - `Total Bounces: 219`\n    - `Speed: 331 px/s`\n- **Text (Bottom Left):** In a smaller, white, monospaced font, the following text is visible:\n    - `JARVIS Vision Smoke Test - Ask JARVIS: \"What do you see on screen?\"`\n- **Other:** A small, solid blue dot is visible in the top right corner of the screen.",
+              "input_tokens": 2623,
+              "output_tokens": 243,
+              "finish_reason": "stop"
+            },
+            {
+              "status": 200,
+              "latency_s": 8.14,
+              "content": "This is a screenshot of a computer screen displaying a simulation or game with a dark, geometric background.\n\nThe screen has the following elements:\n\n- **Background:** A dark, almost black, background with a repeating pattern of dark green, interlocking diamond shapes.\n- **Main Object:** A bright, glowing green sphere with a long, tapered tail, resembling a meteor or a laser beam. It is positioned in the upper right quadrant of the screen and appears to be moving diagonally upwards and to the right.\n- **Text (Top Left):** In bright green, monospaced font, the following statistics are displayed:\n    - `Horizontal Bounces: 101`\n    - `Vertical Bounces: 118`\n    - `Total Bounces: 219`\n    - `Speed: 331 px/s`\n- **Text (Bottom Left):** In a smaller, white, monospaced font, the following text is visible:\n    - `JARVIS Vision Smoke Test - Ask JARVIS: \"What do you see on screen?\"`\n- **Other:** A small, solid blue dot is visible in the top right corner of the screen.",
+              "input_tokens": 2623,
+              "output_tokens": 243,
+              "finish_reason": "stop"
+            }
+          ],
+          "success_rate": 1.0,
+          "avg_latency_s": 7.47,
+          "min_latency_s": 6.8,
+          "max_latency_s": 8.14,
+          "best_content": "This is a screenshot of a computer screen displaying a simulation or game with a dark, geometric background.\n\nThe screen has the following elements:\n\n- **Background:** A dark, almost black, background with a repeating pattern of dark green, interlocking diamond shapes.\n- **Main Object:** A bright, glowing green sphere with a long, tapered tail, resembling a meteor or a laser beam. It is positioned in the upper right quadrant of the screen and appears to be moving diagonally upwards and to the right.\n- **Text (Top Left):** In bright green, monospaced font, the following statistics are displayed:\n    - `Horizontal Bounces: 101`\n    - `Vertical Bounces: 118`\n    - `Total Bounces: 219`\n    - `Speed: 331 px/s`\n- **Text (Bottom Left):** In a smaller, white, monospaced font, the following text is visible:\n    - `JARVIS Vision Smoke Test - Ask JARVIS: \"What do you see on screen?\"`\n- **Other:** A small, solid blue dot is visible in the top right corner of the screen."
+        },
+        "coordinates": {
+          "iterations": [
+            {
+              "status": 200,
+              "latency_s": 4.25,
+              "content": "```json\n[\n\t{\"label\": \"text display showing game statistics\", \"x\": [145, 117], \"y\": 117}\n]\n```",
+              "input_tokens": 2640,
+              "output_tokens": 39,
+              "finish_reason": "stop"
+            },
+            {
+              "status": 200,
+              "latency_s": 4.25,
+              "content": "```json\n[\n\t{\"label\": \"text display\", \"x\": [145, 104], \"y\": 104}\n]\n```",
+              "input_tokens": 2640,
+              "output_tokens": 36,
+              "finish_reason": "stop"
+            }
+          ],
+          "success_rate": 1.0,
+          "avg_latency_s": 4.25,
+          "min_latency_s": 4.25,
+          "max_latency_s": 4.25,
+          "best_content": "```json\n[\n\t{\"label\": \"text display showing game statistics\", \"x\": [145, 117], \"y\": 117}\n]\n```"
+        }
+      }
+    },
+    "deepseek-ai/DeepSeek-OCR-2": {
+      "model_id": "deepseek-ai/DeepSeek-OCR-2",
+      "label": "DeepSeek-OCR-2",
+      "type": "ocr",
+      "params": "unknown",
+      "active": "unknown",
+      "prompts": {
+        "describe": {
+          "iterations": [
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.59,
+              "content": ""
+            },
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.58,
+              "content": ""
+            }
+          ],
+          "success_rate": 0.0,
+          "avg_latency_s": null,
+          "min_latency_s": null,
+          "max_latency_s": null,
+          "best_content": ""
+        },
+        "coordinates": {
+          "iterations": [
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.82,
+              "content": ""
+            },
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.72,
+              "content": ""
+            }
+          ],
+          "success_rate": 0.0,
+          "avg_latency_s": null,
+          "min_latency_s": null,
+          "max_latency_s": null,
+          "best_content": ""
+        }
+      }
+    },
+    "allenai/olmOCR-2-7B-1025-FP8": {
+      "model_id": "allenai/olmOCR-2-7B-1025-FP8",
+      "label": "olmOCR-2-7B (document OCR)",
+      "type": "ocr",
+      "params": "7B",
+      "active": "7B",
+      "prompts": {
+        "describe": {
+          "iterations": [
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.56,
+              "content": ""
+            },
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.58,
+              "content": ""
+            }
+          ],
+          "success_rate": 0.0,
+          "avg_latency_s": null,
+          "min_latency_s": null,
+          "max_latency_s": null,
+          "best_content": ""
+        },
+        "coordinates": {
+          "iterations": [
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.59,
+              "content": ""
+            },
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.59,
+              "content": ""
+            }
+          ],
+          "success_rate": 0.0,
+          "avg_latency_s": null,
+          "min_latency_s": null,
+          "max_latency_s": null,
+          "best_content": ""
+        }
+      }
+    },
+    "lightonai/LightOnOCR-2-1B-bbox-soup": {
+      "model_id": "lightonai/LightOnOCR-2-1B-bbox-soup",
+      "label": "LightOnOCR-1B (bbox coords)",
+      "type": "ocr",
+      "params": "1B",
+      "active": "1B",
+      "prompts": {
+        "describe": {
+          "iterations": [
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.58,
+              "content": ""
+            },
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.58,
+              "content": ""
+            }
+          ],
+          "success_rate": 0.0,
+          "avg_latency_s": null,
+          "min_latency_s": null,
+          "max_latency_s": null,
+          "best_content": ""
+        },
+        "coordinates": {
+          "iterations": [
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.6,
+              "content": ""
+            },
+            {
+              "status": 403,
+              "error": "{\"error\":{\"message\":\"Forbidden\",\"type\":\"invalid_request_error\",\"param\":null,\"code\":\"forbidden\"}}",
+              "latency_s": 0.57,
+              "content": ""
+            }
+          ],
+          "success_rate": 0.0,
+          "avg_latency_s": null,
+          "min_latency_s": null,
+          "max_latency_s": null,
+          "best_content": ""
+        }
+      }
+    }
+  }
+}

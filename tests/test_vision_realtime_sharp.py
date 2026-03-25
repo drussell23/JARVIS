@@ -207,6 +207,11 @@ end tell
         except ImportError:
             pass
 
+    # --- Ouroboros: VisionReflexCompiler ---
+    from backend.vision.vision_reflex import VisionReflexCompiler
+    reflex_compiler = VisionReflexCompiler.get_instance()
+    TASK_KEY = "ocr_hud"
+
     print(f"  Running {duration_s}s...\n  " + "-" * 50)
 
     t_start = time.monotonic()
@@ -214,8 +219,16 @@ end tell
     last_narr_time = 0.0
     last_cloud_time = 0.0
     n_reads = 0
+    n_reflex_reads = 0
     n_speaks = 0
+    ocr_latencies: list = []
+    reflex_latencies: list = []
     cloud_task: Optional[asyncio.Task] = None
+
+    _tel_dir = os.environ.get(
+        "VISION_TELEMETRY_DIR", "/tmp/claude/vision_telemetry",
+    )
+    _latest = os.path.join(_tel_dir, "vision_last_perception.png")
 
     while (time.monotonic() - t_start) < duration_s:
         # Capture
@@ -224,11 +237,64 @@ end tell
             await asyncio.sleep(0.5)
             continue
 
-        # OCR -- read exactly what's on screen (Apple Vision or Tesseract)
-        t_ocr = time.monotonic()
-        vals = await ocr_read_screen(b64)
-        ocr_ms = (time.monotonic() - t_ocr) * 1000
-        n_reads += 1
+        # --- Ouroboros routing: reflex or OCR? ---
+        t_read = time.monotonic()
+        reflex = reflex_compiler.get_reflex(TASK_KEY)
+
+        if reflex is not None:
+            # FAST PATH: compiled reflex (may be sync or async)
+            if asyncio.iscoroutinefunction(reflex):
+                vals = await reflex(b64)
+            else:
+                vals = reflex(b64)
+            read_ms = (time.monotonic() - t_read) * 1000
+            n_reflex_reads += 1
+            reflex_latencies.append(read_ms)
+            label = "REFLEX"
+            tier = reflex_compiler.get_active_tier(TASK_KEY)
+        else:
+            # SLOW PATH: full Apple Vision OCR
+            vals = await ocr_read_screen(b64)
+            read_ms = (time.monotonic() - t_read) * 1000
+            n_reads += 1
+            ocr_latencies.append(read_ms)
+            label = "OCR"
+
+            # Track call and check for graduation
+            event = reflex_compiler.record_call(TASK_KEY, read_ms)
+            if event == "graduate" and vals:
+                print(
+                    f"\n  [Ouroboros] CognitiveInefficiencyEvent: "
+                    f"{reflex_compiler.get_call_count(TASK_KEY)} repeated "
+                    f"OCR calls detected"
+                )
+                print(
+                    f"  [Ouroboros] Compiling vision reflexes "
+                    f"(validating against last OCR)..."
+                )
+                asyncio.ensure_future(jarvis_say(
+                    "Cognitive inefficiency detected. Compiling reflex.",
+                ))
+                t_compile = time.monotonic()
+                ok = await reflex_compiler.compile_reflexes(TASK_KEY, b64, vals)
+                compile_ms = (time.monotonic() - t_compile) * 1000
+                if ok:
+                    tier = reflex_compiler.get_active_tier(TASK_KEY)
+                    avg_ocr = (
+                        sum(ocr_latencies) / len(ocr_latencies)
+                        if ocr_latencies else read_ms
+                    )
+                    print(
+                        f"  [Ouroboros] Reflex GRADUATED (Tier {tier}) "
+                        f"in {compile_ms:.0f}ms — "
+                        f"OCR avg {avg_ocr:.0f}ms -> reflex ~5ms"
+                    )
+                    asyncio.ensure_future(jarvis_say(
+                        f"Reflex compiled. Switching from {int(avg_ocr)} "
+                        f"millisecond O C R to tier {tier} reflex.",
+                    ))
+                else:
+                    print(f"  [Ouroboros] Reflex compilation FAILED — staying on OCR")
 
         # Only speak if we actually read something AND values changed
         if vals:
@@ -236,14 +302,10 @@ end tell
             enough_time = (time.monotonic() - last_narr_time) > 2.5
 
             if changed or enough_time:
-                # Build narration from ONLY what we read
                 parts = []
-
                 h = vals.get("horizontal")
                 v = vals.get("vertical")
                 t = vals.get("total")
-
-                # Delta from last read
                 prev_h = prev_vals.get("horizontal")
                 prev_t = prev_vals.get("total")
 
@@ -267,19 +329,17 @@ end tell
                     prev_vals = vals.copy()
                     last_narr_time = time.monotonic()
 
-                    # Visual Telemetry: show the exact artifact the OCR read
-                    _tel_dir = os.environ.get(
-                        "VISION_TELEMETRY_DIR", "/tmp/claude/vision_telemetry",
-                    )
-                    _latest = os.path.join(_tel_dir, "vision_last_perception.png")
                     _artifact_hint = (
                         f" | verify: {_latest}" if os.path.exists(_latest) else ""
                     )
                     print(
-                        f"  [OCR #{n_speaks}] ({ocr_ms:.0f}ms) "
+                        f"  [{label} #{n_reads + n_reflex_reads}] ({read_ms:.0f}ms) "
                         f"H:{h} V:{v} T:{t}{_artifact_hint}"
                     )
-                    await jarvis_say(narr)
+                    # Fire-and-forget: speech runs in background so the
+                    # vision loop iterates at full speed. jarvis_say
+                    # auto-cancels stale speech when new speech starts.
+                    asyncio.ensure_future(jarvis_say(narr))
 
         # Cloud spatial context every ~10s (async background)
         elapsed = time.monotonic() - t_start
@@ -307,12 +367,21 @@ end tell
 
     total = time.monotonic() - t_start
     print(f"\n  " + "-" * 50)
-    print(f"  OCR reads: {n_reads} | Spoke: {n_speaks} | Duration: {total:.1f}s")
+    print(f"  OCR reads: {n_reads} | Reflex reads: {n_reflex_reads} | Duration: {total:.1f}s")
+    if ocr_latencies:
+        print(f"  OCR avg: {sum(ocr_latencies)/len(ocr_latencies):.0f}ms")
+    if reflex_latencies:
+        avg_reflex = sum(reflex_latencies) / len(reflex_latencies)
+        print(f"  Reflex avg: {avg_reflex:.0f}ms")
+        if ocr_latencies:
+            speedup = (sum(ocr_latencies) / len(ocr_latencies)) / avg_reflex
+            print(f"  Ouroboros speedup: {speedup:.0f}x")
 
-    await jarvis_say(
-        f"Done. I read the screen {n_reads} times and spoke {n_speaks} updates "
-        f"in {int(total)} seconds."
-    )
+    summary = f"Done. {n_reads} O.C.R. reads, {n_reflex_reads} reflex reads in {int(total)} seconds."
+    if reflex_latencies and ocr_latencies:
+        speedup = (sum(ocr_latencies) / len(ocr_latencies)) / (sum(reflex_latencies) / len(reflex_latencies))
+        summary += f" Ouroboros achieved {int(speedup)}x speedup."
+    await jarvis_say(summary)
 
     print("=" * 60 + "\n")
     if loop._frame_server_proc and loop._frame_server_proc.returncode is None:

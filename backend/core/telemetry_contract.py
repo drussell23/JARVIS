@@ -41,6 +41,8 @@ V1_EVENT_SCHEMAS: List[str] = [
     "host.environment_change@1.0.0",
     "exploration.tendril@1.0.0",
     "vision.perception@1.0.0",
+    "ouroboros.cognitive_inefficiency@1.0.0",
+    "ouroboros.reflex_graduation@1.0.0",
 ]
 
 
