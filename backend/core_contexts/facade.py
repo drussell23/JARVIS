@@ -130,28 +130,40 @@ async def _execute_context(
     """Execute a task in the specified Core Context."""
 
     if context_name == "executor":
-        from backend.core_contexts.executor import Executor
-        from backend.core_contexts.tools import screen, input as input_tools, apps
+        from backend.core_contexts.tools import apps
 
-        # For vision tasks, use the lean loop (already battle-tested)
-        if task_type in ("vision_action", "browser_navigation"):
-            from backend.vision.lean_loop import LeanVisionLoop
-            loop = LeanVisionLoop.get_instance()
+        # Executor = vision loop. If a goal reaches the executor,
+        # it involves screen interaction. Run the lean loop.
+        for lean_path in ("backend.vision.lean_loop", "vision.lean_loop"):
+            try:
+                import importlib
+                mod = importlib.import_module(lean_path)
+                LeanVisionLoop = mod.LeanVisionLoop
+                break
+            except ImportError:
+                continue
+        else:
+            return {"success": False, "result": "LeanVisionLoop not available"}
 
-            # Open app first if specified
-            target_app = (step or {}).get("target_app", "")
-            if target_app:
-                await apps.open_app(target_app)
-                await asyncio.sleep(2.0)
+        loop = LeanVisionLoop.get_instance()
 
-            result = await loop.run(goal)
-            return result
+        # Extract app name from goal for pre-launch
+        target_app = (step or {}).get("target_app", "")
+        if not target_app:
+            # Try to extract app name from the goal text
+            goal_lower = goal.lower()
+            for app in ("whatsapp", "safari", "chrome", "terminal", "mail",
+                        "slack", "spotify", "notes", "finder", "messages"):
+                if app in goal_lower:
+                    target_app = app
+                    break
 
-        # For screen observation, capture and describe
-        frame = await screen.capture_and_compress()
-        if frame:
-            return {"success": True, "result": f"Screen captured ({frame.width}x{frame.height})"}
-        return {"success": False, "result": "Screen capture failed"}
+        if target_app:
+            await apps.open_app(target_app)
+            await asyncio.sleep(2.0)
+
+        result = await loop.run(goal)
+        return result
 
     elif context_name == "communicator":
         from backend.core_contexts.communicator import Communicator
