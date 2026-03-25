@@ -46,6 +46,16 @@ logger = logging.getLogger(__name__)
 _GRADUATION_THRESHOLD = int(os.environ.get("OUROBOROS_GRADUATION_THRESHOLD", "3"))
 _TMP_DIR = os.environ.get("VISION_LEAN_TMP_DIR", "/tmp/claude")
 
+# Doubleword 397B Architect — generates reflex code via agentic synthesis
+_DW_API_KEY = os.environ.get("DOUBLEWORD_API_KEY", "")
+_DW_BASE_URL = os.environ.get("DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1")
+_DW_ARCHITECT_MODEL = os.environ.get(
+    "DOUBLEWORD_ARCHITECT_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8",
+)
+_DW_VISION_MODEL = os.environ.get(
+    "DOUBLEWORD_VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+)
+
 # Persistent Apple Vision OCR server — keeps Vision Framework warm.
 # Accepts image paths on stdin, returns JSON OCR results on stdout.
 # Eliminates the ~800ms Framework initialization per subprocess call.
@@ -145,43 +155,80 @@ class VisionReflexCompiler:
         task_key: str,
         last_b64: str,
         last_ocr_result: Dict[str, str],
+        on_status: Optional[Callable] = None,
     ) -> bool:
         """Compile and validate reflexes for a graduated task.
 
         Tier cascade (highest first):
-          Tier 3: Persistent OCR server (~50ms, keeps Vision Framework warm)
+          Tier 4: 397B Architect synthesis (~5ms reflex, agentic code generation)
+          Tier 3: Persistent OCR server (~150ms, keeps Vision Framework warm)
           Tier 1: Pre-compiled Swift binary (~900ms, no Swift compilation)
           Tier 0: Interpreted Swift subprocess (~2000ms, baseline)
 
         Validates against last_ocr_result before activating.
         Returns True if at least one reflex was activated.
         """
+        def _status(msg: str) -> None:
+            if on_status:
+                on_status(msg)
+
         activated = False
 
+        # --- Tier 4: 397B Architect JIT synthesis ---
+        if _DW_API_KEY:
+            try:
+                _status("Initiating JIT Synthesis via Doubleword 397B Architect...")
+                tier4_fn, generated_code = await self._tier4_architect_synthesis(
+                    task_key, last_b64, last_ocr_result, _status,
+                )
+                if tier4_fn is not None:
+                    tier4_result = tier4_fn(last_b64)
+                    if tier4_result and _validate_reflex(tier4_result, last_ocr_result):
+                        self._reflexes[task_key] = tier4_fn
+                        self._tier_active[task_key] = 4
+                        self._log_graduation(task_key, 4, "architect_397b_synthesis")
+                        _status(
+                            f"Tier 4 reflex VALIDATED — 397B-generated code "
+                            f"matches ground truth"
+                        )
+                        logger.info(
+                            "[Ouroboros] Tier 4 reflex VALIDATED for '%s' — "
+                            "397B Architect synthesis (~5ms)",
+                            task_key,
+                        )
+                        activated = True
+                    else:
+                        _status("Tier 4 validation failed — reflex output doesn't match ground truth")
+                        logger.debug("[Ouroboros] Tier 4 validation failed")
+            except Exception as exc:
+                _status(f"Tier 4 synthesis error: {exc}")
+                logger.debug("[Ouroboros] Tier 4 failed: %s", exc)
+
         # --- Tier 3: Persistent Apple Vision OCR server ---
-        try:
-            await self._ensure_ocr_server()
-            if self._ocr_server_ready:
-                tier3_result = await self._reflex_ocr_server(last_b64)
-                if tier3_result and _validate_reflex(tier3_result, last_ocr_result):
-                    # Capture self reference for the closure
-                    async_reflex = self._reflex_ocr_server
-                    self._reflexes[task_key] = async_reflex
-                    self._tier_active[task_key] = 3
-                    self._log_graduation(task_key, 3, "persistent_ocr_server")
-                    logger.info(
-                        "[Ouroboros] Tier 3 reflex VALIDATED for '%s' — "
-                        "persistent OCR server (~50ms)",
-                        task_key,
-                    )
-                    activated = True
-                else:
-                    logger.debug(
-                        "[Ouroboros] Tier 3 validation failed for '%s'",
-                        task_key,
-                    )
-        except Exception as exc:
-            logger.debug("[Ouroboros] Tier 3 compilation failed: %s", exc)
+        if not activated:
+            try:
+                _status("Falling back to Tier 3 persistent OCR server...")
+                await self._ensure_ocr_server()
+                if self._ocr_server_ready:
+                    tier3_result = await self._reflex_ocr_server(last_b64)
+                    if tier3_result and _validate_reflex(tier3_result, last_ocr_result):
+                        async_reflex = self._reflex_ocr_server
+                        self._reflexes[task_key] = async_reflex
+                        self._tier_active[task_key] = 3
+                        self._log_graduation(task_key, 3, "persistent_ocr_server")
+                        logger.info(
+                            "[Ouroboros] Tier 3 reflex VALIDATED for '%s' — "
+                            "persistent OCR server (~150ms)",
+                            task_key,
+                        )
+                        activated = True
+                    else:
+                        logger.debug(
+                            "[Ouroboros] Tier 3 validation failed for '%s'",
+                            task_key,
+                        )
+            except Exception as exc:
+                logger.debug("[Ouroboros] Tier 3 compilation failed: %s", exc)
 
         # --- Tier 1: Pre-compiled Swift binary (fallback) ---
         if not activated:
@@ -220,6 +267,189 @@ class VisionReflexCompiler:
     def get_active_tier(self, task_key: str) -> int:
         """Return the active tier for a task (0=baseline, 1=compiled, 2=numpy)."""
         return self._tier_active.get(task_key, 0)
+
+    # ------------------------------------------------------------------
+    # Tier 4: 397B Architect JIT synthesis
+    # ------------------------------------------------------------------
+    # The 397B reasoning model examines a sample frame + the 235B's
+    # analysis, then writes a deterministic Python function that
+    # replicates the extraction locally. The generated code is
+    # exec'd in a sandbox, validated, and hot-swapped into the Retina.
+
+    async def _tier4_architect_synthesis(
+        self,
+        task_key: str,
+        last_b64: str,
+        last_ocr_result: Dict[str, str],
+        status: Callable,
+    ) -> Tuple[Optional[Callable], Optional[str]]:
+        """Ask the 397B Architect to generate a fast-path reflex function.
+
+        Returns (reflex_fn, generated_code) or (None, None) on failure.
+        """
+        import aiohttp
+
+        # Step 1: Ask the 235B vision model what it sees (the "conscious read")
+        status("Querying Doubleword 235B vision model for frame analysis...")
+        vision_analysis = await self._call_doubleword_vision(last_b64)
+        if not vision_analysis:
+            status("235B vision call failed — cannot proceed with synthesis")
+            return None, None
+        status(f"235B analysis: {vision_analysis[:120]}")
+
+        # Step 2: Ask the 397B to write a reflex function
+        status("Handing frame + 235B output to 397B Architect for code synthesis...")
+
+        architect_prompt = (
+            "You are a code generation engine for an AI vision system. "
+            "Your job: write a FAST Python function that extracts the SAME "
+            "data that a slow VLM extracted, but using only numpy/PIL.\n\n"
+            "The VLM analyzed a screenshot and found these values:\n"
+            f"  {json.dumps(last_ocr_result)}\n\n"
+            f"The VLM's natural language analysis:\n  {vision_analysis}\n\n"
+            "The screenshot shows green monospace text on a dark background "
+            "in the top-left corner (HUD overlay). The text contains lines like "
+            "'Horizontal Bounces: 123', 'Vertical Bounces: 456', etc.\n\n"
+            "Write a Python function with this EXACT signature:\n\n"
+            "def reflex_extract(b64_png: str) -> dict:\n"
+            "    '''Extract HUD values from a base64 PNG. Returns dict with "
+            "keys: horizontal, vertical, total, speed (all str values).'''\n\n"
+            "Requirements:\n"
+            "- Import only: base64, io, re, numpy, PIL.Image\n"
+            "- Decode the base64 PNG to a numpy array\n"
+            "- Crop the top-left ~40% x ~25% (the HUD region)\n"
+            "- Isolate green text pixels (green channel > 120, red < 130, "
+            "blue < 130)\n"
+            "- Create a clean binary image, scale up 3x\n"
+            "- Save to a temp file and use subprocess to run the Apple Vision "
+            "OCR binary at this path: '/tmp/claude/jarvis_ocr_server' with "
+            "the image path as an argument. Parse JSON output.\n"
+            "- If the binary doesn't exist, fall back to returning an empty dict\n"
+            "- Parse the text with regex for 'Horizontal Bounces: N', etc.\n"
+            "- Return a dict like: {'horizontal': '123', 'vertical': '456', "
+            "'total': '579', 'speed': '331'}\n\n"
+            "Return ONLY the Python function. No markdown, no explanation, "
+            "no backticks. Just the raw Python code starting with 'def'."
+        )
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_DW_BASE_URL}/chat/completions",
+                    json={
+                        "model": _DW_ARCHITECT_MODEL,
+                        "messages": [
+                            {"role": "system", "content": "You are a code generator. Output ONLY Python code. No markdown fences."},
+                            {"role": "user", "content": architect_prompt},
+                        ],
+                        "max_tokens": 8192,
+                        "temperature": 0.1,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {_DW_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        status(f"397B API error: HTTP {resp.status}")
+                        logger.warning("[Ouroboros:T4] 397B HTTP %d: %s", resp.status, body[:200])
+                        return None, None
+                    data = await resp.json()
+                    msg = data["choices"][0]["message"]
+                    # 397B is a reasoning model: code may be in
+                    # 'content' (final answer) or 'reasoning' (CoT).
+                    generated_code = msg.get("content", "") or ""
+                    if not generated_code.strip():
+                        # Fallback: extract code from reasoning field
+                        generated_code = msg.get("reasoning", "") or ""
+        except Exception as exc:
+            status(f"397B API call failed: {exc}")
+            logger.debug("[Ouroboros:T4] 397B error: %s", exc, exc_info=True)
+            return None, None
+
+        # Clean up markdown fences if the model wrapped them
+        generated_code = generated_code.strip()
+        if generated_code.startswith("```"):
+            lines = generated_code.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            generated_code = "\n".join(lines).strip()
+
+        if not generated_code.startswith("def "):
+            # Try to find the function definition in the output
+            idx = generated_code.find("def reflex_extract")
+            if idx >= 0:
+                generated_code = generated_code[idx:]
+            else:
+                status("397B output doesn't contain a valid function definition")
+                return None, None
+
+        status("397B generated reflex code:")
+        # Print the generated code to terminal so the human sees it
+        for line in generated_code.split("\n"):
+            status(f"  | {line}")
+
+        # Step 3: Sandbox exec — compile the generated code
+        try:
+            sandbox: Dict[str, Any] = {}
+            exec(compile(generated_code, "<ouroboros-tier4>", "exec"), sandbox)
+            reflex_fn = sandbox.get("reflex_extract")
+            if reflex_fn is None or not callable(reflex_fn):
+                status("Generated code doesn't define callable 'reflex_extract'")
+                return None, None
+        except Exception as exc:
+            status(f"Sandbox compilation failed: {exc}")
+            return None, None
+
+        status("Sandbox compilation passed — validating against ground truth...")
+        return reflex_fn, generated_code
+
+    async def _call_doubleword_vision(self, b64_png: str) -> Optional[str]:
+        """Call the 235B VLM to analyze a frame. Returns natural language description."""
+        import aiohttp
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{_DW_BASE_URL}/chat/completions",
+                    json={
+                        "model": _DW_VISION_MODEL,
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/png;base64,{b64_png}",
+                                        },
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": (
+                                            "Read the exact text displayed in the top-left HUD overlay. "
+                                            "List each line with its value. Be precise with numbers."
+                                        ),
+                                    },
+                                ],
+                            },
+                        ],
+                        "max_tokens": 256,
+                        "temperature": 0.0,
+                    },
+                    headers={
+                        "Authorization": f"Bearer {_DW_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+                    return data["choices"][0]["message"].get("content", "")
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # Tier 3: Persistent Apple Vision OCR server

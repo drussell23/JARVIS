@@ -1,18 +1,17 @@
 #!/usr/bin/env python3
 """
-JARVIS Real-Time Vision -- Read What's On Screen, Nothing More
+JARVIS Vision-Language-Action (VLA) Pipeline
 
-Simple and accurate:
-  1. Capture screen
-  2. OCR reads the exact numbers displayed
-  3. JARVIS speaks ONLY what OCR actually reads
-  4. Cloud models add spatial context (where is the ball?)
-  5. If OCR can't read it, stay silent -- silence > wrong
+Dual-model parallel perception:
+  - Doubleword 235B VL: fast structural read (text, numbers, elements)
+  - Claude Vision: deep semantic understanding (scene, spatial, context)
+  - Apple Vision OCR: local deterministic text extraction (fallback)
 
-No prediction. No physics simulation. Just read the screen.
+Both cloud models fire in parallel on the same frame. Results are fused
+into a rich perception that JARVIS narrates with voice.
 
 Usage:
-    python3 tests/test_vision_realtime_sharp.py [--duration 45]
+    python3 tests/test_vision_realtime_sharp.py [--duration 60]
 """
 from __future__ import annotations
 
@@ -42,29 +41,48 @@ from PIL import Image
 
 
 # ---------------------------------------------------------------------------
-# Voice -- one speaker at a time
+# Voice -- serial queue, ONE speaker at a time, never overlapping
 # ---------------------------------------------------------------------------
 
-_active_say: Optional[asyncio.subprocess.Process] = None
+_speech_queue: asyncio.Queue = None  # type: ignore[assignment]
+_speech_task: Optional[asyncio.Task] = None
+
+
+async def _speech_worker() -> None:
+    """Drain the speech queue serially. One utterance at a time."""
+    while True:
+        text, voice = await _speech_queue.get()
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "say", "-v", voice, "-r", "220", text,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await proc.wait()
+        except Exception:
+            pass
+        _speech_queue.task_done()
+
+
+def _ensure_speech_worker() -> None:
+    global _speech_queue, _speech_task
+    if _speech_queue is None:
+        _speech_queue = asyncio.Queue()
+    if _speech_task is None or _speech_task.done():
+        _speech_task = asyncio.ensure_future(_speech_worker())
 
 
 async def jarvis_say(text: str, voice: str = "Daniel") -> None:
-    global _active_say
-    if _active_say is not None and _active_say.returncode is None:
-        try:
-            _active_say.terminate()
-            await asyncio.wait_for(_active_say.wait(), timeout=0.3)
-        except (asyncio.TimeoutError, ProcessLookupError):
-            try:
-                _active_say.kill()
-            except ProcessLookupError:
-                pass
-    _active_say = await asyncio.create_subprocess_exec(
-        "say", "-v", voice, "-r", "220", text,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.DEVNULL,
-    )
-    await _active_say.wait()
+    """Queue speech and wait for it to finish. Never overlaps."""
+    _ensure_speech_worker()
+    await _speech_queue.put((text, voice))
+    await _speech_queue.join()
+
+
+def jarvis_say_background(text: str, voice: str = "Daniel") -> None:
+    """Queue speech without waiting. Still serial — no overlap."""
+    _ensure_speech_worker()
+    _speech_queue.put_nowait((text, voice))
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +207,19 @@ end tell
 
     await jarvis_say("JARVIS vision online. I will read exactly what I see on your screen.")
 
+    # Re-focus Chrome after speech (terminal may have stolen focus)
+    try:
+        refocus = await asyncio.create_subprocess_exec(
+            "osascript", "-e",
+            'tell application "Google Chrome" to activate',
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await refocus.wait()
+        await asyncio.sleep(0.5)
+    except Exception:
+        pass
+
     # Start capture
     from backend.vision.lean_loop import LeanVisionLoop
     loop = LeanVisionLoop.get_instance()
@@ -212,7 +243,11 @@ end tell
     reflex_compiler = VisionReflexCompiler.get_instance()
     TASK_KEY = "ocr_hud"
 
-    print(f"  Running {duration_s}s...\n  " + "-" * 50)
+    print(f"  Running {duration_s}s...")
+    print()
+    print("  " + "=" * 56)
+    print("   PHASE 1: THE SQUINT — Naive Agentic Baseline")
+    print("  " + "=" * 56)
 
     t_start = time.monotonic()
     prev_vals: Dict[str, str] = {}
@@ -263,38 +298,67 @@ end tell
             # Track call and check for graduation
             event = reflex_compiler.record_call(TASK_KEY, read_ms)
             if event == "graduate" and vals:
+                avg_ocr = (
+                    sum(ocr_latencies) / len(ocr_latencies)
+                    if ocr_latencies else read_ms
+                )
+
+                # ============ PHASE 2: THE SURGERY ============
+                print()
+                print("  " + "=" * 56)
+                print("   PHASE 2: THE SURGERY — Ouroboros Triggered")
+                print("  " + "=" * 56)
                 print(
-                    f"\n  [Ouroboros] CognitiveInefficiencyEvent: "
+                    f"  [Ouroboros] CognitiveInefficiencyEvent: "
                     f"{reflex_compiler.get_call_count(TASK_KEY)} repeated "
-                    f"OCR calls detected"
+                    f"reads at avg {avg_ocr:.0f}ms"
                 )
                 print(
-                    f"  [Ouroboros] Compiling vision reflexes "
-                    f"(validating against last OCR)..."
+                    f"  [Ouroboros] Latency threshold breached. "
+                    f"The Naive Agentic Way is burning {avg_ocr:.0f}ms/read."
                 )
-                asyncio.ensure_future(jarvis_say(
-                    "Cognitive inefficiency detected. Compiling reflex.",
-                ))
+
+                jarvis_say_background(
+                    "Cognitive inefficiency detected. Initiating neuro compilation.",
+                )
+
+                def _print_status(msg: str) -> None:
+                    print(f"  [Ouroboros] {msg}")
+                    # Narrate key surgical moments live
+                    lower = msg.lower()
+                    if any(kw in lower for kw in [
+                        "235b", "397b", "tier 4", "validated",
+                        "synthesis", "sandbox", "generated",
+                    ]):
+                        jarvis_say_background(msg[:120])
+
                 t_compile = time.monotonic()
-                ok = await reflex_compiler.compile_reflexes(TASK_KEY, b64, vals)
+                ok = await reflex_compiler.compile_reflexes(
+                    TASK_KEY, b64, vals, on_status=_print_status,
+                )
                 compile_ms = (time.monotonic() - t_compile) * 1000
+
                 if ok:
                     tier = reflex_compiler.get_active_tier(TASK_KEY)
-                    avg_ocr = (
-                        sum(ocr_latencies) / len(ocr_latencies)
-                        if ocr_latencies else read_ms
+                    print()
+                    print("  " + "=" * 56)
+                    print("   PHASE 3: 20/20 VISION — Reflex Assimilated")
+                    print("  " + "=" * 56)
+                    print(
+                        f"  [Retina] Tier {tier} reflex GRADUATED "
+                        f"in {compile_ms:.0f}ms"
                     )
                     print(
-                        f"  [Ouroboros] Reflex GRADUATED (Tier {tier}) "
-                        f"in {compile_ms:.0f}ms — "
-                        f"OCR avg {avg_ocr:.0f}ms -> reflex ~5ms"
+                        f"  [Retina] Deterministic fast-path active. "
+                        f"Baseline {avg_ocr:.0f}ms -> reflex target <200ms"
                     )
-                    asyncio.ensure_future(jarvis_say(
-                        f"Reflex compiled. Switching from {int(avg_ocr)} "
-                        f"millisecond O C R to tier {tier} reflex.",
-                    ))
+                    print()
+                    jarvis_say_background(
+                        f"Reflex assimilated. Switching from {int(avg_ocr)} "
+                        f"millisecond reads to tier {tier} reflex.",
+                    )
                 else:
-                    print(f"  [Ouroboros] Reflex compilation FAILED — staying on OCR")
+                    print(f"  [Ouroboros] All tiers FAILED — staying on baseline OCR")
 
         # Only speak if we actually read something AND values changed
         if vals:
@@ -336,10 +400,7 @@ end tell
                         f"  [{label} #{n_reads + n_reflex_reads}] ({read_ms:.0f}ms) "
                         f"H:{h} V:{v} T:{t}{_artifact_hint}"
                     )
-                    # Fire-and-forget: speech runs in background so the
-                    # vision loop iterates at full speed. jarvis_say
-                    # auto-cancels stale speech when new speech starts.
-                    asyncio.ensure_future(jarvis_say(narr))
+                    jarvis_say_background(narr)
 
         # Cloud spatial context every ~10s (async background)
         elapsed = time.monotonic() - t_start

@@ -100,6 +100,8 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1024) -> No
             CGImageDestinationCreateWithURL,
             CGImageDestinationAddImage,
             CGImageDestinationFinalize,
+            CGMainDisplayID,
+            CGDisplayBounds,
         )
         from CoreFoundation import (
             CFURLCreateWithFileSystemPath,
@@ -110,7 +112,20 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1024) -> No
         sys.exit(1)
 
     os.makedirs(_TMP_DIR, exist_ok=True)
-    _respond({"ok": True, "status": "ready", "pid": os.getpid()})
+
+    # Capture ONLY the main display, not the union of all displays.
+    # CGRectInfinite spans all monitors (including virtual ghost displays),
+    # which composites them into one image and shrinks the primary content.
+    main_display_rect = CGDisplayBounds(CGMainDisplayID())
+    _respond({
+        "ok": True, "status": "ready", "pid": os.getpid(),
+        "main_display": {
+            "x": main_display_rect.origin.x,
+            "y": main_display_rect.origin.y,
+            "w": main_display_rect.size.width,
+            "h": main_display_rect.size.height,
+        },
+    })
 
     frame_number = 0
     interval = 1.0 / fps
@@ -120,9 +135,9 @@ def capture_loop(fps: int = 15, quality: float = 0.7, max_dim: int = 1024) -> No
         t0 = time.monotonic()
 
         try:
-            # Capture screen
+            # Capture MAIN display only (not ghost/virtual displays)
             image_ref = CGWindowListCreateImage(
-                CGRectInfinite,
+                main_display_rect,
                 kCGWindowListOptionOnScreenOnly,
                 kCGNullWindowID,
                 kCGWindowImageDefault,
