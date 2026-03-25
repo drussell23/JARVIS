@@ -40,6 +40,7 @@ V1_EVENT_SCHEMAS: List[str] = [
     "fault.resolved@1.0.0",
     "host.environment_change@1.0.0",
     "exploration.tendril@1.0.0",
+    "vision.perception@1.0.0",
 ]
 
 

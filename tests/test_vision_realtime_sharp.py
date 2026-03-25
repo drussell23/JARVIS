@@ -267,7 +267,18 @@ end tell
                     prev_vals = vals.copy()
                     last_narr_time = time.monotonic()
 
-                    print(f"  [OCR #{n_speaks}] ({ocr_ms:.0f}ms) H:{h} V:{v} T:{t}")
+                    # Visual Telemetry: show the exact artifact the OCR read
+                    _tel_dir = os.environ.get(
+                        "VISION_TELEMETRY_DIR", "/tmp/claude/vision_telemetry",
+                    )
+                    _latest = os.path.join(_tel_dir, "vision_last_perception.png")
+                    _artifact_hint = (
+                        f" | verify: {_latest}" if os.path.exists(_latest) else ""
+                    )
+                    print(
+                        f"  [OCR #{n_speaks}] ({ocr_ms:.0f}ms) "
+                        f"H:{h} V:{v} T:{t}{_artifact_hint}"
+                    )
                     await jarvis_say(narr)
 
         # Cloud spatial context every ~10s (async background)

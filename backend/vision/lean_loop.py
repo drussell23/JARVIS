@@ -57,6 +57,15 @@ _CLAUDE_MODEL = os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20
 _STAGNATION_WINDOW = int(os.environ.get("VISION_LEAN_STAGNATION_WINDOW", "3"))
 _TMP_DIR = os.environ.get("VISION_LEAN_TMP_DIR", "/tmp/claude")
 
+# --- Visual Telemetry (Principle 7: Absolute Observability) ---
+# Every perception carries its frame artifact so the operator can verify
+# what the agent saw without altering the host environment.
+_TELEMETRY_DIR = os.environ.get(
+    "VISION_TELEMETRY_DIR",
+    os.path.join(_TMP_DIR, "vision_telemetry"),
+)
+_TELEMETRY_MAX_ARTIFACTS = int(os.environ.get("VISION_TELEMETRY_MAX_ARTIFACTS", "50"))
+
 # --- Computer Use API (native, best accuracy for UI automation) ---
 _CU_ENABLED = os.environ.get("VISION_CU_ENABLED", "true").lower() in ("true", "1", "yes")
 _CU_DISPLAY_W = int(os.environ.get("VISION_CU_DISPLAY_W", "1280"))
@@ -103,6 +112,8 @@ class LeanVisionLoop:
         # Ferrari Engine: frame_server subprocess for real-time capture
         self._frame_server_proc: Any = None  # asyncio.subprocess.Process
         self._frame_server_ready: bool = False
+        # Visual Telemetry: monotonic perception counter
+        self._perception_seq: int = 0
 
     # ------------------------------------------------------------------
     # Singleton access (matches codebase convention)
@@ -1328,6 +1339,106 @@ class LeanVisionLoop:
         }
 
     # ------------------------------------------------------------------
+    # Visual Telemetry (Principle 7: Absolute Observability)
+    # ------------------------------------------------------------------
+    # Every perception saves the exact frame the agent reasoned over.
+    # The operator verifies OCR/model output against that artifact —
+    # no host freezing, no temporal guessing.
+
+    def _emit_perception_artifact(
+        self, b64_png: str, source: str,
+    ) -> Optional[str]:
+        """Save the exact frame the agent perceived. Returns artifact path.
+
+        Args:
+            b64_png: The base64-encoded PNG the agent will reason over.
+            source: Capture source identifier (val_pipeline, frame_server, screencapture).
+
+        Returns:
+            Absolute path to the saved artifact, or None on failure.
+        """
+        try:
+            os.makedirs(_TELEMETRY_DIR, exist_ok=True)
+            self._perception_seq += 1
+            epoch_ms = int(time.time() * 1000)
+            filename = f"{epoch_ms}_p{self._perception_seq:04d}.png"
+            artifact_path = os.path.join(_TELEMETRY_DIR, filename)
+            latest_path = os.path.join(_TELEMETRY_DIR, "vision_last_perception.png")
+
+            raw = base64.b64decode(b64_png)
+
+            # Atomic write: tmp → rename
+            tmp_artifact = artifact_path + ".tmp"
+            with open(tmp_artifact, "wb") as f:
+                f.write(raw)
+            os.replace(tmp_artifact, artifact_path)
+
+            # Update latest pointer (atomic)
+            tmp_latest = latest_path + ".tmp"
+            with open(tmp_latest, "wb") as f:
+                f.write(raw)
+            os.replace(tmp_latest, latest_path)
+
+            # Prune old artifacts beyond the rolling window
+            self._prune_perception_artifacts()
+
+            # Emit to TelemetryBus (non-blocking, optional)
+            self._emit_perception_envelope(artifact_path, source)
+
+            logger.info(
+                "[VisionTelemetry] #%d | source=%s | %s",
+                self._perception_seq, source, artifact_path,
+            )
+            return artifact_path
+
+        except Exception as exc:
+            logger.debug("[VisionTelemetry] artifact save failed: %s", exc)
+            return None
+
+    def _prune_perception_artifacts(self) -> None:
+        """Keep only the last N timestamped perception PNGs."""
+        try:
+            entries = sorted(
+                f for f in os.listdir(_TELEMETRY_DIR)
+                if f.endswith(".png")
+                and not f.startswith("vision_last_perception")
+                and not f.endswith(".tmp")
+            )
+            for stale in entries[:-_TELEMETRY_MAX_ARTIFACTS]:
+                try:
+                    os.unlink(os.path.join(_TELEMETRY_DIR, stale))
+                except OSError:
+                    pass
+        except OSError:
+            pass
+
+    def _emit_perception_envelope(
+        self, artifact_path: str, source: str,
+    ) -> None:
+        """Emit a vision.perception@1.0.0 envelope to the TelemetryBus."""
+        try:
+            from backend.core.telemetry_contract import (
+                TelemetryEnvelope,
+                get_telemetry_bus,
+            )
+            envelope = TelemetryEnvelope.create(
+                event_schema="vision.perception@1.0.0",
+                source="lean_vision_loop",
+                trace_id=str(uuid.uuid4()),
+                span_id=f"perception-{self._perception_seq}",
+                partition_key="vision",
+                payload={
+                    "perception_seq": self._perception_seq,
+                    "artifact_path": artifact_path,
+                    "capture_source": source,
+                    "capture_epoch_ms": int(time.time() * 1000),
+                },
+            )
+            get_telemetry_bus().emit(envelope)
+        except Exception:
+            pass  # TelemetryBus unavailable — observability degrades, agent continues
+
+    # ------------------------------------------------------------------
     # Computer Use — screenshot capture (PNG at CU display resolution)
     # ------------------------------------------------------------------
 
@@ -1342,15 +1453,20 @@ class LeanVisionLoop:
         # --- Try VisionActionLoop FramePipeline (sub-10ms) ---
         result = await self._try_val_frame_pipeline()
         if result is not None:
+            self._emit_perception_artifact(result, "val_pipeline")
             return result
 
         # --- Try Ferrari Engine (frame_server atomic file) ---
         result = await self._try_frame_server_capture()
         if result is not None:
+            self._emit_perception_artifact(result, "frame_server")
             return result
 
         # --- Fallback: screencapture subprocess ---
-        return await self._screencapture_fallback()
+        result = await self._screencapture_fallback()
+        if result is not None:
+            self._emit_perception_artifact(result, "screencapture")
+        return result
 
     async def _try_frame_server_capture(self) -> Optional[str]:
         """Read latest frame from frame_server subprocess (~50ms, Quartz CGWindowListCreateImage).
