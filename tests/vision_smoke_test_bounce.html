@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>JARVIS Vision Smoke Test — Bouncing Ball</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; color: #0f0; font-family: 'Courier New', monospace; overflow: hidden; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 20px; left: 20px;
+    font-size: 28px; line-height: 1.6;
+    text-shadow: 0 0 10px #0f0;
+    z-index: 10;
+  }
+  #instructions {
+    position: fixed; bottom: 20px; left: 20px;
+    font-size: 16px; color: #666;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  <div>Horizontal Bounces: <span id="h-count">0</span></div>
+  <div>Vertical Bounces: <span id="v-count">0</span></div>
+  <div>Total Bounces: <span id="total">0</span></div>
+  <div>Speed: <span id="speed">0</span> px/s</div>
+</div>
+<div id="instructions">
+  JARVIS Vision Smoke Test — Ask JARVIS: "What do you see on screen?"
+</div>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+canvas.width = window.innerWidth;
+canvas.height = window.innerHeight;
+
+let x = canvas.width / 2, y = canvas.height / 2;
+let vx = 4.5, vy = 3.2;
+const radius = 25;
+let hBounces = 0, vBounces = 0;
+const trail = [];
+
+function update() {
+  x += vx; y += vy;
+
+  if (x + radius >= canvas.width || x - radius <= 0) {
+    vx = -vx;
+    hBounces++;
+    document.getElementById('h-count').textContent = hBounces;
+  }
+  if (y + radius >= canvas.height || y - radius <= 0) {
+    vy = -vy;
+    vBounces++;
+    document.getElementById('v-count').textContent = vBounces;
+  }
+
+  document.getElementById('total').textContent = hBounces + vBounces;
+  document.getElementById('speed').textContent = Math.round(Math.sqrt(vx*vx + vy*vy) * 60);
+
+  trail.push({x, y, age: 0});
+  if (trail.length > 40) trail.shift();
+}
+
+function draw() {
+  ctx.fillStyle = 'rgba(17, 17, 17, 0.15)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  // Trail
+  for (let i = 0; i < trail.length; i++) {
+    const t = trail[i];
+    const alpha = (i / trail.length) * 0.4;
+    ctx.beginPath();
+    ctx.arc(t.x, t.y, radius * (i / trail.length), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(0, 255, 100, ${alpha})`;
+    ctx.fill();
+  }
+
+  // Ball
+  const gradient = ctx.createRadialGradient(x - 5, y - 5, 2, x, y, radius);
+  gradient.addColorStop(0, '#fff');
+  gradient.addColorStop(0.4, '#0f0');
+  gradient.addColorStop(1, '#060');
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fillStyle = gradient;
+  ctx.fill();
+  ctx.strokeStyle = '#0f0';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+function loop() {
+  update();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+window.addEventListener('resize', () => {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+});
+
+loop();
+</script>
+</body>
+</html>
