@@ -290,7 +290,32 @@ class RuntimeTaskOrchestrator:
         goal = step["goal"]
         start = time.monotonic()
 
-        # Check 1: AgentRegistry — does an existing agent handle this?
+        # Check 0: Core Context facade — new architecture (per-vertical flags)
+        try:
+            from backend.core_contexts.facade import dispatch as ctx_dispatch
+            ctx_result = await ctx_dispatch(
+                goal=goal,
+                task_type=step.get("task_type", ""),
+                command=goal,
+                step=step,
+            )
+            if ctx_result is not None:
+                return StepResolution(
+                    step_goal=goal,
+                    resolution=TaskResolution.VISION_ACTION,
+                    agent_name=f"core_context",
+                    capability_used="core_contexts_facade",
+                    synthesized=False,
+                    result=ctx_result,
+                    error=None if ctx_result.get("success") else ctx_result.get("result"),
+                    elapsed_s=time.monotonic() - start,
+                )
+        except ImportError:
+            pass  # Facade not available — fall through to legacy
+        except Exception as _ctx_exc:
+            logger.debug("[RuntimeTask] Core Context facade error: %s", _ctx_exc)
+
+        # Check 1: AgentRegistry — does an existing agent handle this? (LEGACY)
         agent_name, capability = await self._find_agent(goal, step)
         if agent_name:
             return StepResolution(
