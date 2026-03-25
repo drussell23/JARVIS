@@ -66,6 +66,10 @@ class OperationState(Enum):
     PRE_APPLY_CHECKSUM = "pre_apply_checksum"
     ITERATION_OUTCOME = "iteration_outcome"
 
+    # Tier 0 (Doubleword async batch) lifecycle
+    PENDING_TIER0 = "pending_tier0"
+    TIER0_COMPLETE = "tier0_complete"
+
 
 # ---------------------------------------------------------------------------
 # Data classes

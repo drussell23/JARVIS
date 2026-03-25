@@ -2222,6 +2222,7 @@ class GovernedLoopService:
                 primary=effective_primary,
                 fallback=effective_fallback,
                 tier0=tier0,
+                ledger=self._ledger,
             )
 
             # Sync FSM to reflect actual startup probe result.

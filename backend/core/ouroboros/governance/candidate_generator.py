@@ -347,10 +347,12 @@ class CandidateGenerator:
         primary_concurrency: int = 4,
         fallback_concurrency: int = 2,
         tier0: Optional[Any] = None,  # DoublewordProvider (batch, async)
+        ledger: Optional[Any] = None,  # OperationLedger for batch traceability
     ) -> None:
         self._primary = primary
         self._fallback = fallback
         self._tier0 = tier0
+        self._ledger = ledger
         self._primary_sem = asyncio.Semaphore(primary_concurrency)
         self._fallback_sem = asyncio.Semaphore(fallback_concurrency)
         self.fsm = FailbackStateMachine()
@@ -431,6 +433,16 @@ class CandidateGenerator:
                             "(complexity=%s, cross_repo=%s) — falling through to Tier 1",
                             pending.batch_id, _complexity, _is_cross_repo,
                         )
+                        # Record PENDING_TIER0 in ledger for audit trail
+                        await self._record_tier0_ledger(
+                            _op_id, "pending_tier0", {
+                                "batch_id": pending.batch_id,
+                                "file_id": pending.file_id,
+                                "model": getattr(self._tier0, "_model", "unknown"),
+                                "complexity": _complexity,
+                                "cross_repo": _is_cross_repo,
+                            },
+                        )
                         # Fire background poll — result stored when ready
                         task = asyncio.create_task(
                             self._background_poll_tier0(pending, context),
@@ -481,6 +493,15 @@ class CandidateGenerator:
                     result=result,
                     completed_at=time.monotonic(),
                 )
+                # Record TIER0_COMPLETE in ledger
+                await self._record_tier0_ledger(
+                    _op_id, "tier0_complete", {
+                        "batch_id": pending.batch_id,
+                        "candidates": len(result.candidates),
+                        "provider": result.provider_name,
+                        "duration_s": round(result.generation_duration_s, 1),
+                    },
+                )
                 logger.info(
                     "[CandidateGenerator] Tier 0 background poll complete: "
                     "batch %s → %d candidates stored for op %s",
@@ -513,6 +534,35 @@ class CandidateGenerator:
     def pop_completed_batch(self, op_id: str) -> Optional[Any]:
         """Retrieve and remove a completed Tier 0 result for the given op_id."""
         return self._completed_batches.pop(op_id, None)
+
+    async def _record_tier0_ledger(
+        self, op_id: str, state_name: str, data: dict[str, Any],
+    ) -> None:
+        """Record a Tier 0 batch event in the governance ledger.
+
+        Fails silently — ledger writes must never crash the pipeline.
+        """
+        if self._ledger is None:
+            return
+        try:
+            from backend.core.ouroboros.governance.ledger import (
+                LedgerEntry,
+                OperationState,
+            )
+            entry = LedgerEntry(
+                op_id=op_id,
+                state=OperationState(state_name),
+                data=data,
+                entry_id=data.get("batch_id"),
+            )
+            await self._ledger.append(entry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "[CandidateGenerator] Ledger write failed for %s:%s",
+                op_id, state_name, exc_info=True,
+            )
 
     async def run_health_probe(self) -> bool:
         """Probe the primary provider and update the FSM.
