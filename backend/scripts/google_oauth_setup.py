@@ -22,6 +22,20 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings("ignore")
 
+# Patch importlib.metadata.packages_distributions for Python 3.9
+# Must run BEFORE any google.* imports (google-api-core uses it at import time)
+from importlib import metadata as _metadata
+if not hasattr(_metadata, 'packages_distributions'):
+    def _packages_distributions_fallback():
+        try:
+            import importlib_metadata as _backport
+            if hasattr(_backport, 'packages_distributions'):
+                return _backport.packages_distributions()
+        except ImportError:
+            pass
+        return {}
+    _metadata.packages_distributions = _packages_distributions_fallback
+
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError

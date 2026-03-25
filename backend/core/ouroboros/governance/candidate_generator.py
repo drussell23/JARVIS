@@ -55,7 +55,7 @@ import logging
 import time
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Optional, Protocol, runtime_checkable
+from typing import Any, Optional, Protocol, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -346,9 +346,11 @@ class CandidateGenerator:
         fallback: CandidateProvider,
         primary_concurrency: int = 4,
         fallback_concurrency: int = 2,
+        tier0: Optional[Any] = None,  # DoublewordProvider (batch, async)
     ) -> None:
         self._primary = primary
         self._fallback = fallback
+        self._tier0 = tier0
         self._primary_sem = asyncio.Semaphore(primary_concurrency)
         self._fallback_sem = asyncio.Semaphore(fallback_concurrency)
         self.fsm = FailbackStateMachine()
@@ -379,6 +381,34 @@ class CandidateGenerator:
         asyncio.TimeoutError
             If the deadline is already past and no provider can be tried.
         """
+        # Tier 0 (Doubleword batch) — try first when available.
+        # Async batch provider for ultra-complex tasks. Falls through
+        # silently on failure or unavailability.
+        if self._tier0 is not None and getattr(self._tier0, "is_available", False):
+            try:
+                result = await self._tier0.generate(context)
+                if result is not None and len(result.candidates) > 0:
+                    logger.info(
+                        "[CandidateGenerator] Tier 0 (Doubleword) succeeded: "
+                        "%d candidates in %.1fs",
+                        len(result.candidates),
+                        result.generation_duration_s,
+                    )
+                    return result
+                logger.info(
+                    "[CandidateGenerator] Tier 0 returned no candidates, "
+                    "falling through to Tier 1"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as t0_exc:
+                logger.warning(
+                    "[CandidateGenerator] Tier 0 failed (%s), "
+                    "falling through to Tier 1",
+                    t0_exc,
+                )
+
+        # Tier 1 + Tier 2: Primary (J-Prime) → Fallback (Claude)
         state = self.fsm.state
 
         if state is FailbackState.QUEUE_ONLY:

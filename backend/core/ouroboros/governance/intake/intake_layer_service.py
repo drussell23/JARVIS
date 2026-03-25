@@ -462,6 +462,36 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] CapabilityGapSensor skipped: %s", exc)
 
+        # ---- RuntimeHealthSensor (P6 + Boundary Principle) ----
+        # Autonomously monitors Python runtime EOL, dependency staleness,
+        # security advisories, and legacy compat shims. Deterministic detection,
+        # agentic remediation via Ouroboros pipeline.
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.runtime_health_sensor import (
+                RuntimeHealthSensor,
+            )
+            _health_poll_s = float(
+                os.environ.get("JARVIS_RUNTIME_HEALTH_INTERVAL_S", "86400")
+            )
+            if enabled_repos:
+                for rc in enabled_repos:
+                    _health_sensor = RuntimeHealthSensor(
+                        repo=rc.name,
+                        router=self._router,
+                        poll_interval_s=_health_poll_s,
+                    )
+                    self._sensors.append(_health_sensor)
+            else:
+                _health_sensor = RuntimeHealthSensor(
+                    repo="jarvis",
+                    router=self._router,
+                    poll_interval_s=_health_poll_s,
+                )
+                self._sensors.append(_health_sensor)
+            logger.info("[IntakeLayer] RuntimeHealthSensor added (autonomous dependency monitoring)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] RuntimeHealthSensor skipped: %s", exc)
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:

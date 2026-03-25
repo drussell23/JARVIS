@@ -2188,6 +2188,28 @@ class GovernedLoopService:
                 )
                 fallback = None
 
+        # Build DoublewordProvider (Tier 0 — batch 397B MoE) if API key set
+        tier0 = None
+        _dw_api_key = os.environ.get("DOUBLEWORD_API_KEY", "")
+        if _dw_api_key:
+            try:
+                from backend.core.ouroboros.governance.doubleword_provider import (
+                    DoublewordProvider,
+                )
+                tier0 = DoublewordProvider(
+                    api_key=_dw_api_key,
+                    repo_root=self._config.project_root,
+                    repo_roots=repo_roots_map,
+                )
+                logger.info(
+                    "[GovernedLoop] DoublewordProvider: configured (model=%s)",
+                    tier0._model,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[GovernedLoop] DoublewordProvider build failed: %s", exc
+                )
+
         # Build CandidateGenerator (needs at least one provider)
         if primary is not None or fallback is not None:
             # If only one provider, use it as both (FSM still works)
@@ -2199,6 +2221,7 @@ class GovernedLoopService:
             self._generator = CandidateGenerator(
                 primary=effective_primary,
                 fallback=effective_fallback,
+                tier0=tier0,
             )
 
             # Sync FSM to reflect actual startup probe result.
