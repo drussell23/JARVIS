@@ -474,8 +474,18 @@ class PrimeRouter:
                 except Exception as e:
                     logger.debug(f"[PrimeRouter] Graceful degradation not available: {e}")
 
-            # Initialize cloud client (lazy - only if needed)
+            # v307.0: Eagerly initialize cloud client so _decide_route()
+            # can fall back to Claude when J-Prime is unavailable.
+            # Without this, _cloud_client is None and routing goes to DEGRADED.
             self._cloud_client = None
+            try:
+                from anthropic import AsyncAnthropic
+                _api_key = os.getenv("ANTHROPIC_API_KEY")
+                if _api_key:
+                    self._cloud_client = AsyncAnthropic(api_key=_api_key)
+                    logger.info("[PrimeRouter] Cloud Claude client initialized (eager)")
+            except ImportError:
+                logger.warning("[PrimeRouter] anthropic package not available for fallback")
 
             self._initialized = True
             logger.info("[PrimeRouter] Initialization complete")
