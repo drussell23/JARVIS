@@ -1,0 +1,102 @@
+{
+  "run_at": "2026-03-25T20:08:33.479319+00:00",
+  "batch_id": "d36e8837-326b-424d-9a4e-68a5b1e091b8",
+  "input_file_id": "a4f920da-3c82-4a3c-85be-bc663c00e73b",
+  "output_file_id": "e52c677b-fbd7-4f9a-889e-9280d0bef80b",
+  "doubleword_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "jprime_model": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+  "jprime_compute": "NVIDIA L4 (g2-standard-4, 24GB VRAM)",
+  "wall_elapsed_s": 55.4,
+  "pricing": {
+    "input_cost_per_m": 0.1,
+    "output_cost_per_m": 0.4
+  },
+  "tasks": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "input_tokens": 78,
+      "output_tokens": 4323,
+      "finish_reason": "stop",
+      "input_cost_usd": 7.8e-06,
+      "output_cost_usd": 0.0017292,
+      "total_cost_usd": 0.001737,
+      "content": "\n\n```python\nimport ipaddress\nimport logging\nfrom typing import List, Dict, Any, Optional\nfrom dataclasses import dataclass, asdict\n\n# Configure logging for audit trails required by FedRAMP (AU-2, AU-3)\nlogging.basicConfig(\n    level=logging.INFO,\n    format='%(asctime)s - %(levelname)s - %(message)s'\n)\nlogger = logging.getLogger(__name__)\n\n@dataclass\nclass FirewallRule:\n    rule_id: str\n    direction: str  # 'inbound' or 'outbound'\n    protocol: str   # 'tcp', 'udp', 'icmp', etc.\n    port_range: str # e.g., '443', '80-90', 'all'\n    cidr_block: str # e.g., '10.0.0.0/8', '0.0.0.0/0'\n    action: str     # 'allow', 'deny'\n\n@dataclass\nclass ComplianceViolation:\n    rule_id: str\n    control_id: str\n    severity: str\n    description: str\n    finding: str\n\nclass NIST80053FirewallValidator:\n    \"\"\"\n    Validates firewall rules against NIST 800-53 Rev 5 controls.\n    Primary Focus: SC-7 (Boundary Protection), AC-17 (Remote Access)\n    \"\"\"\n\n    UNRESTRICTED_IPV4 = ipaddress.ip_network('0.0.0.0/0')\n    UNRESTRICTED_IPV6 = ipaddress.ip_network('::/0')\n    VALID_PROTOCOLS = {'tcp', 'udp', 'icmp', 'icmpv6', 'all'}\n    VALID_DIRECTIONS = {'inbound', 'outbound'}\n    VALID_ACTIONS = {'allow', 'deny'}\n\n    def __init__(self, strict_mode: bool = True):\n        self.strict_mode = strict_mode\n        self.violations: List[ComplianceViolation] = []\n\n    def _validate_cidr(self, cidr: str) -> Optional[ipaddress.IPv4Network | ipaddress.IPv6Network]:\n        try:\n            return ipaddress.ip_network(cidr, strict=False)\n        except ValueError:\n            return None\n\n    def _validate_port_range(self, port_range: str) -> bool:\n        if port_range.lower() == 'all':\n            return True\n        try:\n            if '-' in port_range:\n                start, end = map(int, port_range.split('-'))\n                return 0 <= start <= 65535 and 0 <= end <= 65535 and start <= end\n            else:\n                port = int(port_range)\n                return 0 <= port <= 65535\n        except ValueError:\n            return False\n\n    def _check_unrestricted_access(self, rule: FirewallRule, network: Any) -> Optional[ComplianceViolation]:\n        \"\"\"\n        Checks for NIST SC-7 Violation: Unrestricted Inbound Access.\n        FedRAMP High/Moderate baselines generally prohibit 0.0.0.0/0 on inbound allow rules.\n        \"\"\"\n        if rule.direction.lower() == 'inbound' and rule.action.lower() == 'allow':\n            if network == self.UNRESTRICTED_IPV4 or network == self.UNRESTRICTED_IPV6:\n                return ComplianceViolation(\n                    rule_id=rule.rule_id,\n                    control_id=\"NIST-800-53 SC-7\",\n                    severity=\"HIGH\",\n                    description=\"Unrestricted inbound access detected (0.0.0.0/0 or ::/0)\",\n                    finding=f\"Rule {rule.rule_id} allows inbound traffic from any source on {rule.port_range}\"\n                )\n        return None\n\n    def _check_port_compliance(self, rule: FirewallRule) -> Optional[ComplianceViolation]:\n        \"\"\"\n        Checks for NIST CM-7 Violation: Least Functionality.\n        Flags non-standard ports if strict mode is enabled.\n        \"\"\"\n        if not self._validate_port_range(rule.port_range):\n            return ComplianceViolation(\n                rule_id=rule.rule_id,\n                control_id=\"NIST-800-53 CM-7\",\n                severity=\"MEDIUM\",\n                description=\"Invalid or non-compliant port range\",\n                finding=f\"Rule {rule.rule_id} has invalid port range: {rule.port_range}\"\n            )\n        return None\n\n    def _check_cidr_format(self, rule: FirewallRule) -> Optional[ComplianceViolation]:\n        \"\"\"\n        Checks for valid CIDR notation to prevent configuration errors.\n        \"\"\"\n        if self._validate_cidr(rule.cidr_block) is None:\n            return ComplianceViolation(\n                rule_id=rule.rule_id,\n                control_id=\"NIST-800-53 SC-7\",\n                severity=\"MEDIUM\",\n                description=\"Invalid CIDR block format\",\n                finding=f\"Rule {rule.rule_id} has invalid CIDR: {rule.cidr_block}\"\n            )\n        return None\n\n    def validate_rule(self, rule: FirewallRule) -> List[ComplianceViolation]:\n        findings = []\n        \n        # Validate Enumerations\n        if rule.protocol.lower() not in self.VALID_PROTOCOLS:\n            findings.append(ComplianceViolation(\n                rule_id=rule.rule_id, control_id=\"NIST-800-53 CM-6\",\n                severity=\"LOW\", description=\"Invalid protocol\",\n                finding=f\"Rule {rule.rule_id} uses unsupported protocol: {rule.protocol}\"\n            ))\n            \n        if rule.direction.lower() not in self.VALID_DIRECTIONS:\n            findings.append(ComplianceViolation(\n                rule_id=rule.rule_id, control_id=\"NIST-800-53 CM-6\",\n                severity=\"LOW\", description=\"Invalid direction\",\n                finding=f\"Rule {rule.rule_id} has invalid direction: {rule.direction}\"\n            ))\n\n        # Validate CIDR\n        cidr_violation = self._check_cidr_format(rule)\n        if cidr_violation:\n            findings.append(cidr_violation)\n        else:\n            network = self._validate_cidr(rule.cidr_block)\n            # Validate Unrestricted Access (Critical SC-7 Check)\n            unrestricted_violation = self._check_unrestricted_access(rule, network)\n            if unrestricted_violation:\n                findings.append(unrestricted_violation)\n\n        # Validate Ports\n        port_violation = self._check_port_compliance(rule)\n        if port_violation:\n            findings.append(port_violation)\n\n        return findings\n\n    def validate_ruleset(self, rules: List[Dict[str, Any]]) -> Dict[str, Any]:\n        \"\"\"\n        Main entry point for validating a list of firewall rules.\n        Returns a summary compliant with audit requirements.\n        \"\"\"\n        self.violations = []\n        compliant_count = 0\n        \n        for raw_rule in rules:\n            try:\n                rule = FirewallRule(**raw_rule)\n                findings = self.validate_rule(rule)\n                if findings:\n                    self.violations.extend(findings)\n                    logger.warning(f\"Rule {rule.rule_id} failed compliance check with {len(findings)} findings.\")\n                else:\n                    compliant_count += 1\n                    logger.info(f\"Rule {rule.rule_id} passed compliance check.\")\n            except TypeError as e:\n                logger.error(f\"Invalid rule structure: {e}\")\n                self.violations.append(ComplianceViolation(\n                    rule_id=\"UNKNOWN\", control_id=\"NIST-800-53 CM-6\",\n                    severity=\"HIGH\", description=\"Malformed Rule Definition\",\n                    finding=str(e)\n                ))\n\n        return {\n            \"status\": \"FAIL\" if self.violations else \"PASS\",\n            \"total_rules\": len(rules),\n            \"compliant_rules\": compliant_count,\n            \"violations_found\": len(self.violations),\n            \"details\": [asdict(v) for v in self.violations]\n        }\n\n# Example Usage\nif __name__ == \"__main__\":\n    sample_rules = [\n        {\n            \"rule_id\": \"R001\",\n            \"direction\": \"inbound\",\n            \"protocol\": \"tcp\",\n            \"port_range\": \"443\",\n            \"cidr_block\": \"10.0.0.0/8\",\n            \"action\": \"allow\"\n        },\n        {\n            \"rule_id\": \"R002\",\n            \"direction\": \"inbound\",\n            \"protocol\": \"tcp\",\n            \"port_range\": \"22\",\n            \"cidr_block\": \"0.0.0.0/0\",\n            \"action\": \"allow\"\n        },\n        {\n            \"rule_id\": \"R003\",\n            \"direction\": \"inbound\",\n            \"protocol\": \"tcp\",\n            \"port_range\": \"99999\",\n            \"cidr_block\": \"192.168.1.0/24\",\n            \"action\": \"allow\"\n        }\n    ]\n\n    validator = NIST80053FirewallValidator(strict_mode=True)\n    results = validator.validate_ruleset(sample_rules)\n    \n    # Output results for CI/CD pipeline integration\n    import json\n    print(json.dumps(results, indent=2))\n```",
+      "reasoning_preview": ""
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "input_tokens": 78,
+      "output_tokens": 2640,
+      "finish_reason": "stop",
+      "input_cost_usd": 7.8e-06,
+      "output_cost_usd": 0.001056,
+      "total_cost_usd": 0.0010638,
+      "content": "\n\n*   **Threat Level: CRITICAL** \u2013 Successful brute-force followed by immediate sudo escalation on a classified network confirms active compromise, lateral movement, or insider threat.\n*   **Containment & Forensics:** Isolate the target host and the three source IPs immediately to halt movement, then capture volatile memory and disk images before remediation.\n*   **Credential Hygiene:** Invalidate the compromised account credentials, revoke all active sessions, and mandate a reset for all privileged users within the network segment.",
+      "reasoning_preview": ""
+    }
+  },
+  "jprime_baseline": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "latency_ms": 27630,
+      "tok_s": 24.6,
+      "tokens": 680
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "latency_ms": 5334,
+      "tok_s": 24.4,
+      "tokens": 130
+    }
+  },
+  "model_catalog": [
+    {
+      "id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    },
+    {
+      "id": "Qwen/Qwen3.5-397B-A17B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3.5-9B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-35B-A3B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-14B-FP8"
+    },
+    {
+      "id": "allenai/olmOCR-2-7B-1025-FP8"
+    },
+    {
+      "id": "openai/gpt-oss-20b"
+    },
+    {
+      "id": "lightonai/LightOnOCR-2-1B-bbox-soup"
+    },
+    {
+      "id": "Qwen/Qwen3-Embedding-8B"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-OCR-2"
+    },
+    {
+      "id": "Qwen/Qwen3.5-4B"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"
+    }
+  ],
+  "summary": {
+    "total_dw_cost_usd": 0.0028008,
+    "total_jp_cost_usd": 0.010988,
+    "cost_ratio": 3.92,
+    "cost_savings_pct": 74.5,
+    "total_dw_tokens": 6963,
+    "total_jp_tokens": 810,
+    "batch_wall_time_s": 55.4
+  }
+}

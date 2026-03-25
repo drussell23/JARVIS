@@ -354,6 +354,10 @@ class CandidateGenerator:
         self._primary_sem = asyncio.Semaphore(primary_concurrency)
         self._fallback_sem = asyncio.Semaphore(fallback_concurrency)
         self.fsm = FailbackStateMachine()
+        # Async Tier 0 tracking: op_id → CompletedBatch
+        self._completed_batches: dict[str, Any] = {}
+        # Background polling tasks (kept to prevent GC)
+        self._background_polls: dict[str, asyncio.Task[Any]] = {}
 
     async def generate(
         self,
@@ -381,32 +385,71 @@ class CandidateGenerator:
         asyncio.TimeoutError
             If the deadline is already past and no provider can be tried.
         """
-        # Tier 0 (Doubleword batch) — try first when available.
-        # Async batch provider for ultra-complex tasks. Falls through
-        # silently on failure or unavailability.
+        # Tier 0 (Doubleword batch) — async, non-blocking.
+        # Complexity gate: only invoke the batch API for tasks that justify
+        # the async latency cost. Simple tasks skip straight to Tier 1.
+        #
+        # Flow: submit batch (fast, <2s) → fire background poll task →
+        #       fall through to Tier 1. If a previous Tier 0 result already
+        #       completed for this op, use it directly.
+        _TIER0_COMPLEXITY_CLASSES = frozenset({"heavy_code", "complex"})
+        _op_id = getattr(context, "operation_id", "")
         if self._tier0 is not None and getattr(self._tier0, "is_available", False):
-            try:
-                result = await self._tier0.generate(context)
-                if result is not None and len(result.candidates) > 0:
+            # Check if a previous async batch already completed for this op
+            _completed = self._completed_batches.pop(_op_id, None)
+            if _completed is not None:
+                _result = _completed.result
+                if _result is not None and len(_result.candidates) > 0:
                     logger.info(
-                        "[CandidateGenerator] Tier 0 (Doubleword) succeeded: "
-                        "%d candidates in %.1fs",
-                        len(result.candidates),
-                        result.generation_duration_s,
+                        "[CandidateGenerator] Tier 0 async result available: "
+                        "%d candidates (batch completed %.1fs ago)",
+                        len(_result.candidates),
+                        time.monotonic() - _completed.completed_at,
                     )
-                    return result
-                logger.info(
-                    "[CandidateGenerator] Tier 0 returned no candidates, "
-                    "falling through to Tier 1"
+                    return _result
+
+            # Determine if this operation qualifies for Tier 0 routing
+            _complexity = ""
+            if context.routing is not None:
+                _complexity = getattr(context.routing, "task_complexity", "")
+            _is_cross_repo = getattr(context, "cross_repo", False)
+            _qualifies = _complexity in _TIER0_COMPLEXITY_CLASSES or _is_cross_repo
+
+            if not _qualifies:
+                logger.debug(
+                    "[CandidateGenerator] Tier 0 skipped: complexity=%r, "
+                    "cross_repo=%s — routing to Tier 1",
+                    _complexity, _is_cross_repo,
                 )
-            except asyncio.CancelledError:
-                raise
-            except Exception as t0_exc:
-                logger.warning(
-                    "[CandidateGenerator] Tier 0 failed (%s), "
-                    "falling through to Tier 1",
-                    t0_exc,
-                )
+            else:
+                # Async submit: fast path (<2s), then background poll
+                try:
+                    pending = await self._tier0.submit_batch(context)
+                    if pending is not None:
+                        logger.info(
+                            "[CandidateGenerator] Tier 0 batch %s submitted async "
+                            "(complexity=%s, cross_repo=%s) — falling through to Tier 1",
+                            pending.batch_id, _complexity, _is_cross_repo,
+                        )
+                        # Fire background poll — result stored when ready
+                        task = asyncio.create_task(
+                            self._background_poll_tier0(pending, context),
+                            name=f"dw-poll-{pending.batch_id[:12]}",
+                        )
+                        self._background_polls[_op_id] = task
+                    else:
+                        logger.info(
+                            "[CandidateGenerator] Tier 0 batch submission failed, "
+                            "falling through to Tier 1"
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as t0_exc:
+                    logger.warning(
+                        "[CandidateGenerator] Tier 0 submit failed (%s), "
+                        "falling through to Tier 1",
+                        t0_exc,
+                    )
 
         # Tier 1 + Tier 2: Primary (J-Prime) → Fallback (Claude)
         state = self.fsm.state
@@ -419,6 +462,56 @@ class CandidateGenerator:
 
         # FALLBACK_ACTIVE or PRIMARY_DEGRADED: use fallback directly
         return await self._call_fallback(context, deadline)
+
+    async def _background_poll_tier0(
+        self, pending: Any, context: OperationContext,
+    ) -> None:
+        """Background task: poll Doubleword batch and store result when ready."""
+        _op_id = pending.op_id
+        try:
+            result = await self._tier0.poll_and_retrieve(pending, context)
+            if result is not None and len(result.candidates) > 0:
+                from backend.core.ouroboros.governance.doubleword_provider import (
+                    CompletedBatch,
+                )
+                self._completed_batches[_op_id] = CompletedBatch(
+                    op_id=_op_id,
+                    batch_id=pending.batch_id,
+                    result=result,
+                    completed_at=time.monotonic(),
+                )
+                logger.info(
+                    "[CandidateGenerator] Tier 0 background poll complete: "
+                    "batch %s → %d candidates stored for op %s",
+                    pending.batch_id, len(result.candidates), _op_id,
+                )
+            else:
+                logger.info(
+                    "[CandidateGenerator] Tier 0 background poll: "
+                    "batch %s returned no usable candidates",
+                    pending.batch_id,
+                )
+        except asyncio.CancelledError:
+            logger.debug(
+                "[CandidateGenerator] Tier 0 background poll cancelled: %s",
+                pending.batch_id,
+            )
+        except Exception:
+            logger.warning(
+                "[CandidateGenerator] Tier 0 background poll failed: %s",
+                pending.batch_id,
+                exc_info=True,
+            )
+        finally:
+            self._background_polls.pop(_op_id, None)
+
+    def get_completed_batch(self, op_id: str) -> Optional[Any]:
+        """Check if a Tier 0 async result is available for the given op_id."""
+        return self._completed_batches.get(op_id)
+
+    def pop_completed_batch(self, op_id: str) -> Optional[Any]:
+        """Retrieve and remove a completed Tier 0 result for the given op_id."""
+        return self._completed_batches.pop(op_id, None)
 
     async def run_health_probe(self) -> bool:
         """Probe the primary provider and update the FSM.

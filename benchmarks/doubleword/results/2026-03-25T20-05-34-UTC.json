@@ -1,0 +1,102 @@
+{
+  "run_at": "2026-03-25T20:05:34.790959+00:00",
+  "batch_id": "9ad43d52-119e-423b-b904-d0c865279ad6",
+  "input_file_id": "9267d7a1-f46c-4047-a2fc-e29693bf47ae",
+  "output_file_id": "dd57aa0e-5846-4953-9c63-3439fe5d2503",
+  "doubleword_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "jprime_model": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+  "jprime_compute": "NVIDIA L4 (g2-standard-4, 24GB VRAM)",
+  "wall_elapsed_s": 129.6,
+  "pricing": {
+    "input_cost_per_m": 0.1,
+    "output_cost_per_m": 0.4
+  },
+  "tasks": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "input_tokens": 78,
+      "output_tokens": 10000,
+      "finish_reason": "length",
+      "input_cost_usd": 7.8e-06,
+      "output_cost_usd": 0.004,
+      "total_cost_usd": 0.0040078,
+      "content": "",
+      "reasoning_preview": ""
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "input_tokens": 78,
+      "output_tokens": 1818,
+      "finish_reason": "stop",
+      "input_cost_usd": 7.8e-06,
+      "output_cost_usd": 0.0007272,
+      "total_cost_usd": 0.000735,
+      "content": "\n\n**Threat Level: CRITICAL** (Active compromise with privilege escalation on a high-side network)\n\n*   **Contain:** Immediately isolate the target host and the three source IPs from the network to halt lateral movement and prevent further access.\n*   **Revoke:** Disable the compromised user account and force a reset of all associated SSH keys and passwords across the enclave.\n*   **Investigate:** Preserve memory and audit logs on the target system to analyze commands executed post-escalation for data exfiltration or persistence mechanisms.",
+      "reasoning_preview": ""
+    }
+  },
+  "jprime_baseline": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "latency_ms": 27630,
+      "tok_s": 24.6,
+      "tokens": 680
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "latency_ms": 5334,
+      "tok_s": 24.4,
+      "tokens": 130
+    }
+  },
+  "model_catalog": [
+    {
+      "id": "Qwen/Qwen3.5-397B-A17B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3.5-4B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-9B"
+    },
+    {
+      "id": "openai/gpt-oss-20b"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-OCR-2"
+    },
+    {
+      "id": "allenai/olmOCR-2-7B-1025-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3.5-35B-A3B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-14B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-Embedding-8B"
+    },
+    {
+      "id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    },
+    {
+      "id": "lightonai/LightOnOCR-2-1B-bbox-soup"
+    }
+  ],
+  "summary": {
+    "total_dw_cost_usd": 0.0047428,
+    "total_jp_cost_usd": 0.010988,
+    "cost_ratio": 2.32,
+    "cost_savings_pct": 56.8,
+    "total_dw_tokens": 11818,
+    "total_jp_tokens": 810,
+    "batch_wall_time_s": 129.6
+  }
+}

@@ -1,0 +1,102 @@
+{
+  "run_at": "2026-03-25T19:56:18.627955+00:00",
+  "batch_id": "9e626100-369b-4c37-81d7-bac0e10affcf",
+  "input_file_id": "63138fae-a724-4cf4-ae53-bcd31c441428",
+  "output_file_id": "23ecb960-e13d-4f45-b8d4-e92a95d834e4",
+  "doubleword_model": "Qwen/Qwen3.5-397B-A17B-FP8",
+  "jprime_model": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+  "jprime_compute": "NVIDIA L4 (g2-standard-4, 24GB VRAM)",
+  "wall_elapsed_s": 270.2,
+  "pricing": {
+    "input_cost_per_m": 0.1,
+    "output_cost_per_m": 0.4
+  },
+  "tasks": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "input_tokens": 78,
+      "output_tokens": 5000,
+      "finish_reason": "length",
+      "input_cost_usd": 7.8e-06,
+      "output_cost_usd": 0.002,
+      "total_cost_usd": 0.0020078,
+      "content": "\n\n#!/usr/bin/env python3\n\"\"\"\nFirewall Rule Validator for NIST 800-53 Compliance (FedRAMP Context)\n\nThis module validates firewall rules against specific security controls\nderived from NIST 800-53 Rev. 5, focusing on Boundary Protection (SC-7)\nand Information Flow Enforcement (AC-4).\n\"\"\"\n\nimport ipaddress\nfrom dataclasses import dataclass, field, asdict\nfrom typing import List, Dict, Any, Optional\nfrom enum import Enum\n\n\nclass Severity(Enum):\n    CRITICAL = \"CRITICAL\"\n    HIGH = \"HIGH\"\n    MEDIUM = \"MEDIUM\"\n    LOW = \"LOW\"\n\n\nclass NISTControl(Enum):\n    SC_7 = \"SC-7 (Boundary Protection)\"\n    AC_4 = \"AC-4 (Information Flow Enforcement)\"\n    CM_7 = \"CM-7 (Least Functionality)\"\n\n\n@dataclass\nclass FirewallRule:\n    rule_id: str\n    direction: str  # 'ingress' or 'egress'\n    protocol: str   # 'tcp', 'udp', 'icmp', '-1' (all)\n    cidr_block: str\n    port_start: int\n    port_end: int\n    description: Optional[str] = None\n\n\n# Constants defining unrestricted access patterns\nUNRESTRICTED_IPV4 = ipaddress.ip_network(\"0.0.0.0/0\")\nUNRESTRICTED_IPV6 = ipaddress.ip_network(\"::/0\")\n\n# Sensitive ports that should never be open to the public internet in FedRAMP environments\nSENSITIVE_PORTS = {\n    22: \"SSH\",\n    23: \"Telnet\",\n    3389: \"RDP\",\n    3306: \"MySQL\",\n    5432:",
+      "reasoning_preview": ""
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "input_tokens": 78,
+      "output_tokens": 2000,
+      "finish_reason": "length",
+      "input_cost_usd": 7.8e-06,
+      "output_cost_usd": 0.0008,
+      "total_cost_usd": 0.0008078,
+      "content": "",
+      "reasoning_preview": ""
+    }
+  },
+  "jprime_baseline": {
+    "infra": {
+      "label": "Secure Infrastructure Code",
+      "latency_ms": 27630,
+      "tok_s": 24.6,
+      "tokens": 680
+    },
+    "threat": {
+      "label": "Defense Threat Analysis",
+      "latency_ms": 5334,
+      "tok_s": 24.4,
+      "tokens": 130
+    }
+  },
+  "model_catalog": [
+    {
+      "id": "Qwen/Qwen3.5-397B-A17B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3.5-4B"
+    },
+    {
+      "id": "Qwen/Qwen3.5-9B"
+    },
+    {
+      "id": "openai/gpt-oss-20b"
+    },
+    {
+      "id": "deepseek-ai/DeepSeek-OCR-2"
+    },
+    {
+      "id": "allenai/olmOCR-2-7B-1025-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3.5-35B-A3B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-14B-FP8"
+    },
+    {
+      "id": "Qwen/Qwen3-Embedding-8B"
+    },
+    {
+      "id": "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    },
+    {
+      "id": "lightonai/LightOnOCR-2-1B-bbox-soup"
+    }
+  ],
+  "summary": {
+    "total_dw_cost_usd": 0.0028156,
+    "total_jp_cost_usd": 0.010988,
+    "cost_ratio": 3.9,
+    "cost_savings_pct": 74.4,
+    "total_dw_tokens": 7000,
+    "total_jp_tokens": 810,
+    "batch_wall_time_s": 270.2
+  }
+}

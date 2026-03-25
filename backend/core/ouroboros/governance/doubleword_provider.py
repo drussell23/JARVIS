@@ -40,7 +40,7 @@ _DW_MODEL = os.environ.get(
     "DOUBLEWORD_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8"
 )
 _DW_COMPLETION_WINDOW = os.environ.get("DOUBLEWORD_WINDOW", "1h")
-_DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "5000"))
+_DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "10000"))
 _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "15"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
@@ -60,6 +60,27 @@ class DoublewordStats:
     total_latency_s: float = 0.0
     failed_batches: int = 0
     empty_content_retries: int = 0
+
+
+@dataclass
+class PendingBatch:
+    """Tracks an in-flight Doubleword batch for async retrieval."""
+    op_id: str
+    batch_id: str
+    file_id: str
+    prompt: str
+    submitted_at: float  # time.monotonic()
+    wall_submitted_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class CompletedBatch:
+    """Stores a completed Doubleword batch result for deferred application."""
+    op_id: str
+    batch_id: str
+    result: "GenerationResult"
+    completed_at: float  # time.monotonic()
+    wall_completed_at: float = field(default_factory=time.time)
 
 
 class DoublewordProvider:
@@ -112,70 +133,98 @@ class DoublewordProvider:
             )
         return self._session
 
-    async def generate(
+    # ------------------------------------------------------------------
+    # Async decoupled API: submit_batch() + poll_and_retrieve()
+    # ------------------------------------------------------------------
+
+    async def submit_batch(
         self,
         ctx: OperationContext,
         *,
         prompt_override: Optional[str] = None,
-    ) -> GenerationResult:
-        """Generate code via Doubleword batch API.
+    ) -> Optional[PendingBatch]:
+        """Stage 1+2: Upload JSONL and create batch. Returns immediately.
 
-        Returns GenerationResult with provider_used="doubleword".
-        Falls through to empty result on failure (caller handles fallback).
+        This is the fast path — typically completes in <2s. The caller
+        should fire a background task to poll_and_retrieve() later.
+        Returns None on failure (caller falls through to Tier 1).
         """
         if not self.is_available:
-            return GenerationResult(
-                candidates=(),
-                provider_name="doubleword",
-                generation_duration_s=0.0,
-            )
+            return None
 
-        t0 = time.monotonic()
-
-        # Build the prompt (reuse the same prompt builder as other providers)
         from backend.core.ouroboros.governance.providers import _build_codegen_prompt
         prompt = prompt_override or _build_codegen_prompt(ctx)
+        operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
+
+        jsonl_line = json.dumps({
+            "custom_id": operation_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": {
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": "You are a code generation assistant for the Trinity AI ecosystem. Return valid JSON matching the requested schema."},
+                    {"role": "user", "content": prompt},
+                ],
+                "max_tokens": self._max_tokens,
+                "temperature": _DW_TEMPERATURE,
+            },
+        })
 
         try:
-            # Stage 1: Upload JSONL
-            operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
-            jsonl_line = json.dumps({
-                "custom_id": operation_id,
-                "method": "POST",
-                "url": "/v1/chat/completions",
-                "body": {
-                    "model": self._model,
-                    "messages": [
-                        {"role": "system", "content": "You are a code generation assistant for the Trinity AI ecosystem. Return valid JSON matching the requested schema."},
-                        {"role": "user", "content": prompt},
-                    ],
-                    "max_tokens": self._max_tokens,
-                    "temperature": _DW_TEMPERATURE,
-                },
-            })
-
             file_id = await self._upload_file(jsonl_line)
             if not file_id:
-                return self._empty_result(t0, "File upload failed")
+                logger.warning("[DoublewordProvider] submit_batch: file upload failed")
+                return None
 
-            # Stage 2: Create batch
             batch_id = await self._create_batch(file_id)
             if not batch_id:
-                return self._empty_result(t0, "Batch creation failed")
+                logger.warning("[DoublewordProvider] submit_batch: batch creation failed")
+                return None
 
             logger.info(
-                "[DoublewordProvider] Batch %s submitted (model=%s, window=%s)",
-                batch_id, self._model, _DW_COMPLETION_WINDOW,
+                "[DoublewordProvider] Batch %s submitted async (model=%s, op=%s)",
+                batch_id, self._model, operation_id,
+            )
+            return PendingBatch(
+                op_id=operation_id,
+                batch_id=batch_id,
+                file_id=file_id,
+                prompt=prompt,
+                submitted_at=time.monotonic(),
             )
 
-            # Stage 3: Poll until completion
-            output_file_id = await self._poll_batch(batch_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("[DoublewordProvider] submit_batch failed")
+            return None
+
+    async def poll_and_retrieve(
+        self,
+        pending: PendingBatch,
+        ctx: OperationContext,
+    ) -> Optional[GenerationResult]:
+        """Stage 3+4: Poll batch to completion and parse results.
+
+        This is the slow path — may take minutes. Designed to run as a
+        background task via asyncio.create_task(). Returns None on failure.
+        """
+        t0 = pending.submitted_at
+
+        try:
+            output_file_id = await self._poll_batch(pending.batch_id)
             if not output_file_id:
                 self._stats.failed_batches += 1
-                return self._empty_result(t0, f"Batch {batch_id} failed or timed out")
+                logger.warning(
+                    "[DoublewordProvider] Batch %s failed or timed out",
+                    pending.batch_id,
+                )
+                return None
 
-            # Stage 4: Retrieve results
-            content, usage = await self._retrieve_result(output_file_id, operation_id)
+            content, usage = await self._retrieve_result(
+                output_file_id, pending.op_id,
+            )
 
             elapsed = time.monotonic() - t0
             self._stats.total_batches += 1
@@ -193,23 +242,19 @@ class DoublewordProvider:
                 self._stats.total_cost_usd += cost
 
             if not content:
-                # Empty content — reasoning model used all tokens on thinking
                 self._stats.empty_content_retries += 1
                 logger.warning(
                     "[DoublewordProvider] Batch %s returned empty content "
-                    "(reasoning model exhausted token budget). "
-                    "Consider raising DOUBLEWORD_MAX_TOKENS.",
-                    batch_id,
+                    "(reasoning model exhausted token budget).",
+                    pending.batch_id,
                 )
-                return self._empty_result(t0, "Empty content (reasoning budget exhausted)")
+                return None
 
-            # Parse the response using the shared parser
             from backend.core.ouroboros.governance.providers import (
                 _parse_generation_response,
             )
-            # Compute source hash for parser
             import hashlib as _hl
-            _src = prompt[:500] if prompt else ""
+            _src = pending.prompt[:500] if pending.prompt else ""
             _src_hash = _hl.sha256(_src.encode()).hexdigest()[:16]
 
             return _parse_generation_response(
@@ -223,15 +268,50 @@ class DoublewordProvider:
                 repo_root=self._repo_root,
             )
 
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            elapsed = time.monotonic() - t0
             self._stats.failed_batches += 1
-            logger.exception("[DoublewordProvider] Generation failed")
+            logger.exception(
+                "[DoublewordProvider] poll_and_retrieve failed for batch %s",
+                pending.batch_id,
+            )
+            return None
+
+    # ------------------------------------------------------------------
+    # Synchronous generate() — kept for backwards compatibility.
+    # Combines submit_batch + poll_and_retrieve in a single blocking call.
+    # ------------------------------------------------------------------
+
+    async def generate(
+        self,
+        ctx: OperationContext,
+        *,
+        prompt_override: Optional[str] = None,
+    ) -> GenerationResult:
+        """Generate code via Doubleword batch API (blocking).
+
+        Returns GenerationResult with provider_used="doubleword".
+        Falls through to empty result on failure (caller handles fallback).
+
+        For non-blocking usage, prefer submit_batch() + poll_and_retrieve().
+        """
+        if not self.is_available:
             return GenerationResult(
                 candidates=(),
                 provider_name="doubleword",
-                generation_duration_s=elapsed,
+                generation_duration_s=0.0,
             )
+
+        t0 = time.monotonic()
+        pending = await self.submit_batch(ctx, prompt_override=prompt_override)
+        if pending is None:
+            return self._empty_result(t0, "Batch submission failed")
+
+        result = await self.poll_and_retrieve(pending, ctx)
+        if result is None:
+            return self._empty_result(t0, "Batch retrieval failed")
+        return result
 
     # ------------------------------------------------------------------
     # Batch API stages (all deterministic — Tier 0 protocol)

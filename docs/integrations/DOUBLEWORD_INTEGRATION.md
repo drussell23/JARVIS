@@ -1,9 +1,9 @@
 # Doubleword × Trinity AI — Integration Guide
 
-**Last updated:** 2026-03-18
-**Status:** Benchmarked · Ready for implementation
-**Benchmark results:** `benchmarks/doubleword/results/2026-03-18T00-56-02-UTC.json`
-**Batch ID:** `ca6b7b1f-da63-4c44-ac8e-e9e8b796eae4`
+**Last updated:** 2026-03-25
+**Status:** Benchmarked (35B + 397B) · Provider integrated · Routing in progress
+**Benchmark results:** `benchmarks/doubleword/results/2026-03-25T20-08-33-UTC.json` (latest 397B)
+**Latest Batch ID:** `d36e8837-326b-424d-9a4e-68a5b1e091b8`
 
 ---
 
@@ -81,13 +81,52 @@ This is not a model deficiency. It reflects a calibration mismatch: the token bu
 
 **Recommended token budgets for Qwen3.5 reasoning models:**
 
-| Task type | Recommended `max_tokens` | Reasoning overhead estimate |
-|-----------|--------------------------|----------------------------|
-| Code generation (complex) | 3000–5000 | ~800–1500 reasoning tokens |
-| Code generation (simple) | 1500–2000 | ~400–800 reasoning tokens |
-| Threat analysis / classification | 500–1000 | ~200–400 reasoning tokens |
-| Architecture review | 4000–8000 | ~1000–2000 reasoning tokens |
-| DPO preference scoring | 1000–2000 | ~300–600 reasoning tokens |
+> **Updated 2026-03-25** based on 397B benchmarking. The 397B reasons more deeply than the 35B —
+> budget estimates below are calibrated from live batch results, not projections.
+
+| Task type | Recommended `max_tokens` | Actual reasoning overhead (397B) |
+|-----------|--------------------------|----------------------------------|
+| Code generation (complex) | **20000** | ~15,000 reasoning → ~4,300 output |
+| Code generation (simple) | 8000–10000 | ~5,000–7,000 reasoning tokens |
+| Threat analysis / classification | **5000** | ~2,400 reasoning → ~2,600 output |
+| Architecture review | 15000–20000 | ~10,000–15,000 reasoning tokens |
+| DPO preference scoring | 5000–8000 | ~3,000–5,000 reasoning tokens |
+
+**Rule of thumb for 397B:** Set `max_tokens` to **4–5× expected output** for code generation, and **2–2.5× expected output** for analysis tasks. The provider default is 10000.
+
+---
+
+## 397B Benchmark Results (2026-03-25)
+
+> **Live production run** — 4 iterative runs calibrating token budgets. Final run: batch `d36e8837` submitted to `Qwen/Qwen3.5-397B-A17B-FP8`, both tasks completed with `finish_reason: stop`.
+
+### Final Run (Corrected Budgets)
+
+| Task | Budget | Used | finish_reason | Content | Cost |
+|------|--------|------|---------------|---------|------|
+| Secure Infrastructure Code | 20,000 | 4,323 | **stop** ✅ | Full NIST 800-53 Python validator with FedRAMP audit logging | $0.00174 |
+| Defense Threat Analysis | 5,000 | 2,640 | **stop** ✅ | CRITICAL classification + 3 actionable response bullets | $0.00106 |
+| **Total** | — | **6,963** | — | — | **$0.00280** |
+
+### Cost Comparison: 397B vs J-Prime (14B L4)
+
+| Metric | J-Prime (14B) | Doubleword (397B) | Delta |
+|--------|---------------|-------------------|-------|
+| Total cost (both tasks) | $0.01099 | $0.00280 | **4x cheaper** |
+| Output tokens | 810 | 6,963 | **8.6x more output** |
+| Wall time | ~33s (streaming) | 55s (batch) | 1.7x slower |
+| Monthly @ 100 ops/day | $216.00/mo | **$8.40/mo** | **25.7x cheaper** |
+
+### Calibration History
+
+| Run | Model | Infra `max_tokens` | Threat `max_tokens` | Infra Output | Threat Output | Wall Time |
+|-----|-------|--------------------|---------------------|-------------|---------------|-----------|
+| 1 (Mar 18) | 35B | 700 | 200 | None (reasoning exhausted) | None | 257s |
+| 2 (Mar 25) | 397B | 5,000 | 2,000 | Partial code (truncated) | None | 270s |
+| 3 (Mar 25) | 397B | 10,000 | 5,000 | None (deeper reasoning) | **Complete** ✅ | 130s |
+| **4 (Mar 25)** | **397B** | **20,000** | **5,000** | **Complete** ✅ | **Complete** ✅ | **55s** |
+
+**Key insight:** The 397B's reasoning depth scales with available budget. At 5K tokens, reasoning was shallow enough to produce partial code output. At 10K, it reasoned deeper and consumed the entire budget. At 20K, it had room to reason fully AND produce complete output. This non-linear behavior means budgets must be set generously — the model self-regulates quality rather than truncating.
 
 ---
 
@@ -135,7 +174,7 @@ The `Qwen3.5` series differs architecturally from standard instruction-tuned mod
 
 **Quality advantage:** For complex multi-step tasks — the exact workloads Trinity routes to Tier 0 — the reasoning layer is a significant quality multiplier. A 35B reasoning model outperforms a 35B non-reasoning model on architecture analysis and code review tasks because it self-checks its work before outputting. For DPO scoring specifically, reasoning models produce more reliable preference scores because they articulate *why* one candidate is better than another before assigning a score.
 
-**The token budget rule of thumb:** Set `max_tokens` = (expected output tokens) + (2× reasoning overhead). For a 500-token code function, budget 500 + 2×400 = 1300 minimum. For a thorough architecture review, budget 3000 output + 2×1000 = 5000 minimum.
+**The token budget rule of thumb (updated for 397B):** Set `max_tokens` = **4–5× expected output** for code generation, **2–2.5× expected output** for analysis. The 397B reasons much more deeply than the 35B — a 4.3K-token code output required a 20K budget. For a thorough architecture review, budget 15K–20K minimum. The provider default (`DOUBLEWORD_MAX_TOKENS`) is 10000.
 
 ---
 
