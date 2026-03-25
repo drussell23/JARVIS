@@ -94,10 +94,16 @@ class LeanVisionLoop:
         """
         logger.info("[LeanVision] === START === goal: %s", goal[:100])
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._loop(goal),
                 timeout=_OVERALL_TIMEOUT_S,
             )
+            logger.info(
+                "[LeanVision] === END === success=%s turns=%s result=%s",
+                result.get("success"), result.get("turns"),
+                str(result.get("result", ""))[:120],
+            )
+            return result
         except asyncio.TimeoutError:
             logger.error(
                 "[LeanVision] Overall timeout (%.0fs) exceeded for: %s",
@@ -126,6 +132,7 @@ class LeanVisionLoop:
 
     async def _loop(self, goal: str) -> Dict[str, Any]:
         action_log: List[Dict[str, Any]] = []
+        capture_failures = 0
 
         for turn in range(1, _MAX_TURNS + 1):
             turn_start = time.monotonic()
@@ -137,9 +144,19 @@ class LeanVisionLoop:
             # ---- 1. CAPTURE ----
             screenshot_b64, img_w, img_h = await self._capture_screen()
             if screenshot_b64 is None:
-                logger.error("[LeanVision] Turn %d: CAPTURE failed, retrying...", turn)
+                capture_failures += 1
+                logger.error("[LeanVision] Turn %d: CAPTURE failed (%d consecutive)", turn, capture_failures)
+                if capture_failures >= 3:
+                    logger.error("[LeanVision] Screen capture broken after %d failures — aborting", capture_failures)
+                    return {
+                        "success": False,
+                        "result": "Cannot capture screen — screencapture failed 3 times. Check screen recording permissions in System Settings > Privacy & Security.",
+                        "turns": turn,
+                        "action_log": action_log,
+                    }
                 await asyncio.sleep(1.0)
                 continue
+            capture_failures = 0  # reset on success
             logger.info("[LeanVision] Turn %d: CAPTURE OK (%dx%d)", turn, img_w, img_h)
 
             # ---- 2. THINK ----
@@ -151,16 +168,28 @@ class LeanVisionLoop:
 
             # Goal achieved?
             if response.get("goal_achieved"):
-                logger.info(
-                    "[LeanVision] === GOAL ACHIEVED on turn %d ===", turn,
-                )
-                return {
-                    "success": True,
-                    "result": f"Goal achieved: {goal}",
-                    "turns": turn,
-                    "action_log": action_log,
-                    "scene_summary": response.get("scene_summary", ""),
-                }
+                # Safety: reject premature goal_achieved on turn 1 with no actions
+                # if the goal clearly involves multi-step interaction (messaging, typing, etc.)
+                if turn == 1 and len(action_log) == 0 and self._goal_requires_interaction(goal):
+                    logger.warning(
+                        "[LeanVision] Turn 1: model claims goal_achieved but no actions taken "
+                        "and goal requires interaction — overriding to continue. "
+                        "Reasoning: %s", response.get("reasoning", "")[:120],
+                    )
+                    # Force the model to propose an action by treating as not achieved
+                    response["goal_achieved"] = False
+                    # Fall through to next_action check below
+                else:
+                    logger.info(
+                        "[LeanVision] === GOAL ACHIEVED on turn %d ===", turn,
+                    )
+                    return {
+                        "success": True,
+                        "result": f"Goal achieved: {goal}",
+                        "turns": turn,
+                        "action_log": action_log,
+                        "scene_summary": response.get("scene_summary", ""),
+                    }
 
             next_action = response.get("next_action")
             if not next_action:
@@ -402,6 +431,9 @@ class LeanVisionLoop:
         if result is not None and "error" not in result.get("reasoning", "").lower():
             return result
 
+        claude_reason = result.get("reasoning", "unknown") if result else "no response"
+        logger.warning("[LeanVision] Claude Vision failed/errored: %s", claude_reason[:120])
+
         # FALLBACK: Doubleword VL-235B (if Claude fails/unavailable)
         if _DOUBLEWORD_API_KEY:
             logger.info("[LeanVision] Claude failed, trying Doubleword VL-235B")
@@ -435,7 +467,7 @@ class LeanVisionLoop:
 
         system_prompt = (
             "You are a precise UI automation agent. You can see the user's screen.\n\n"
-            "TASK: Look at the screenshot and decide the single next action to achieve the goal.\n\n"
+            "TASK: Look at the screenshot and decide the single next action to achieve the COMPLETE goal.\n\n"
             f"The image is {img_w}x{img_h} pixels and maps directly to screen coordinates.\n"
             "Return coordinates as [x, y] in this image's pixel space.\n\n"
             "Respond with ONLY a JSON object (no markdown fences, no explanation outside JSON):\n"
@@ -451,17 +483,26 @@ class LeanVisionLoop:
             '  "confidence": 0.0 to 1.0,\n'
             '  "scene_summary": "brief description of what you see on screen"\n'
             "}\n\n"
-            "RULES:\n"
+            "CRITICAL — GOAL COMPLETION RULES:\n"
+            "- Read the ENTIRE goal carefully. Multi-part goals (e.g., 'open X AND message Y saying Z') are NOT done until ALL parts are complete.\n"
+            "- Opening an app is NEVER the final step if the goal includes sending a message, clicking something, or any further interaction.\n"
+            "- goal_achieved=true ONLY when the ENTIRE goal is satisfied — e.g., message was SENT (visible in chat as sent), search results are showing, etc.\n"
+            "- If you are on turn 1 and the goal involves messaging/typing/clicking, goal_achieved MUST be false — you haven't done anything yet.\n\n"
+            "ACTION RULES:\n"
             "- For CLICK: return precise [x, y] pixel coordinates of the element center\n"
             "- For TYPE: if the target text field is already focused (from a prior click), omit coords\n"
             "- For KEY: press a key like 'return', 'tab', 'escape', 'space', etc. Put the key name in 'text'\n"
             "- For SCROLL: coords optional, scrolls at current mouse position\n"
             "- If previous action failed, try a different approach (different coords, different element)\n"
-            "- Be precise with coordinates -- look carefully at the actual element position\n"
-            "- If the goal is fully achieved (e.g., message sent, page loaded), set goal_achieved=true\n"
-            "- IMPORTANT: After typing a message in a chat app, press 'return' (key action) to SEND it\n"
-            "- After pressing return to send, the message appears in the chat. Set goal_achieved=true — do NOT type or send again\n"
+            "- Be precise with coordinates — look carefully at the actual element position\n\n"
+            "CHAT APP RULES (WhatsApp, Messages, Slack, etc.):\n"
+            "- To message someone: first find and click their name/chat in the sidebar or search for them\n"
+            "- Then click the message input field at the bottom of the conversation\n"
+            "- Then type the message text\n"
+            "- Then press 'return' (key action) to SEND it\n"
+            "- After pressing return, the message appears as a sent bubble. ONLY THEN set goal_achieved=true\n"
             "- If you see your message already in the conversation (as a sent bubble), the goal IS achieved\n"
+            "- Do NOT type or send again after the message is visible as sent\n"
         )
 
         user_text = (
@@ -907,3 +948,22 @@ class LeanVisionLoop:
                 return False
 
         return True
+
+    # ------------------------------------------------------------------
+    # Multi-step goal detection
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _goal_requires_interaction(goal: str) -> bool:
+        """Detect if a goal involves interaction beyond just opening an app.
+
+        Used to prevent premature goal_achieved on turn 1 when the model
+        sees the app already open but hasn't performed the actual task.
+        """
+        goal_lower = goal.lower()
+        interaction_signals = (
+            "message", "send", "type", "write", "reply", "text",
+            "search", "click", "navigate", "play", "post",
+            "saying", "tell", "ask",
+        )
+        return any(signal in goal_lower for signal in interaction_signals)

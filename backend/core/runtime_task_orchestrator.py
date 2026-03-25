@@ -245,7 +245,25 @@ class RuntimeTaskOrchestrator:
 
         Uses PredictivePlanningAgent if available, falls back to
         single-step execution for simple commands.
+
+        IMPORTANT: Vision/UI tasks are NEVER decomposed. The lean vision
+        loop handles multi-step goals internally via its see-think-act
+        cycle. Decomposition breaks it by splitting the goal into sub-tasks
+        that each claim success independently without full context.
+
+        Detection is agentic (Manifesto §5): we ask the same classifier
+        the facade uses to determine if this is an executor/vision task.
+        No hardcoded app lists.
         """
+        # Agentic check: ask the facade classifier if this is a vision/UI task.
+        # If so, skip decomposition — the lean loop handles multi-step goals.
+        if await self._is_vision_goal_agentic(query, ctx):
+            logger.info(
+                "[RuntimeTask] Vision/UI goal detected (agentic) — single-step: %s",
+                query[:80],
+            )
+            return self._single_step(query, ctx), "single-step (vision goal)"
+
         if self._planner is not None:
             try:
                 prediction = await self._planner.expand_intent(query)
@@ -263,9 +281,11 @@ class RuntimeTaskOrchestrator:
             except Exception as exc:
                 logger.warning("[RuntimeTask] PredictivePlanner failed: %s — using single step", exc)
 
-        # Fallback: treat entire query as one step.
-        # Propagate structured fields from context so _dispatch_to_agent
-        # receives provider/url/search_query without scraping goal text.
+        return self._single_step(query, ctx), "single-step fallback"
+
+    @staticmethod
+    def _single_step(query: str, ctx: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Build a single-step plan from the query and context."""
         step: Dict[str, Any] = {
             "goal": query,
             "priority": 1,
@@ -276,8 +296,34 @@ class RuntimeTaskOrchestrator:
             val = ctx.get(field_name)
             if val:
                 step[field_name] = val
+        return [step]
 
-        return [step], "single-step fallback"
+    @staticmethod
+    async def _is_vision_goal_agentic(query: str, ctx: Dict[str, Any]) -> bool:
+        """Agentically determine if a goal is a vision/UI task.
+
+        Uses the same classification pipeline as the Core Context facade
+        (Manifesto §5: intelligence-driven routing, no hardcoded lists).
+        Falls back to structural signals from the IntentClassifier output.
+        """
+        # 1. Structural signals from IntentClassifier (already agentic)
+        if ctx.get("requires_vision"):
+            return True
+        if ctx.get("target_app"):
+            return True
+
+        # 2. Ask the facade's classifier (uses Claude or keyword fallback)
+        try:
+            from backend.core_contexts.facade import _classify_to_context
+            context_name = await _classify_to_context(query)
+            if context_name == "executor":
+                return True
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        return False
 
     # -----------------------------------------------------------------------
     # Step 2: Capability Resolution
@@ -588,6 +634,15 @@ class RuntimeTaskOrchestrator:
             for i, (resolution, step) in enumerate(zip(resolutions, plan_steps)):
                 node = dag_result.nodes.get(f"node-{i}")
                 if node and node.state == NodeState.COMPLETED:
+                    # Check if the result dict signals a logical failure
+                    # (e.g. vision loop returned success=False without raising)
+                    _node_error = None
+                    if isinstance(node.result, dict) and not node.result.get("success", True):
+                        _node_error = node.result.get("result", "Action failed")
+                        logger.warning(
+                            "[RuntimeTask] DAG node %d completed but result.success=False: %s",
+                            i, _node_error[:120] if _node_error else "unknown",
+                        )
                     executed.append(StepResolution(
                         step_goal=step["goal"],
                         resolution=resolution.resolution,
@@ -595,6 +650,7 @@ class RuntimeTaskOrchestrator:
                         capability_used=resolution.capability_used,
                         synthesized=resolution.synthesized,
                         result=node.result,
+                        error=_node_error,
                         elapsed_s=node.elapsed_s,
                     ))
                 elif node and node.state in (NodeState.FAILED, NodeState.BLOCKED):
@@ -713,6 +769,9 @@ class RuntimeTaskOrchestrator:
         for i, (resolution, step) in enumerate(zip(resolutions, plan_steps)):
             task = task_map.get(f"step-{i}")
             if task and task.status == "completed":
+                _task_error = None
+                if isinstance(task.result, dict) and not task.result.get("success", True):
+                    _task_error = task.result.get("result", "Action failed")
                 executed.append(StepResolution(
                     step_goal=step["goal"],
                     resolution=resolution.resolution,
@@ -720,6 +779,7 @@ class RuntimeTaskOrchestrator:
                     capability_used=resolution.capability_used,
                     synthesized=resolution.synthesized,
                     result=task.result,
+                    error=_task_error,
                     elapsed_s=(task.completed_at - task.started_at).total_seconds() if task.completed_at and task.started_at else 0,
                 ))
             elif task and task.error:
@@ -1465,12 +1525,19 @@ class RuntimeTaskOrchestrator:
             if synthesized > 0:
                 summary += f" {synthesized} tool{'s' if synthesized > 1 else ''} synthesized on the fly."
         else:
-            # Partial failure
+            # Partial or complete failure — surface the actual error
+            errors = [s.error for s in steps if s.error]
             if succeeded > 0:
                 summary = f"Partially done. {succeeded} of {total} steps succeeded."
+                if errors:
+                    summary += f" Issue: {errors[0]}"
             else:
-                errors = [s.error for s in steps if s.error]
-                summary = f"That didn't work. {errors[0]}" if errors else "That didn't work."
+                if errors:
+                    # Make it conversational — trim long error messages
+                    err_msg = errors[0][:150] if errors[0] else "Unknown error"
+                    summary = f"That didn't work. {err_msg}"
+                else:
+                    summary = "That didn't work."
 
         return summary
 
