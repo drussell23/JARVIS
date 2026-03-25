@@ -2415,6 +2415,20 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] ReasoningChainBridge skipped: %s", exc)
 
+        # ---- Wire InfrastructureApplicator (Boundary Principle: deterministic post-APPLY) ----
+        try:
+            from backend.core.ouroboros.governance.infrastructure_applicator import (
+                InfrastructureApplicator,
+            )
+            _infra = InfrastructureApplicator(project_root=self._config.project_root)
+            if _infra.is_enabled:
+                self._orchestrator.set_infra_applicator(_infra)
+                logger.info("[GLS] InfrastructureApplicator wired (deterministic post-APPLY)")
+            else:
+                logger.debug("[GLS] InfrastructureApplicator: disabled via env")
+        except Exception as exc:
+            logger.debug("[GLS] InfrastructureApplicator skipped: %s", exc)
+
         # ---- Wire GovernanceMCPClient (P5) ----
         self._mcp_client = None
         try:

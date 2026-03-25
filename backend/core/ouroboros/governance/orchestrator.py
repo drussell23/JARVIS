@@ -217,10 +217,15 @@ class GovernedOrchestrator:
         self._validation_runner = validation_runner
         self._oracle_update_lock: asyncio.Lock = asyncio.Lock()
         self._reasoning_bridge: Optional[Any] = None  # set via set_reasoning_bridge()
+        self._infra_applicator: Optional[Any] = None  # set via set_infra_applicator()
 
     def set_reasoning_bridge(self, bridge: Any) -> None:
         """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning."""
         self._reasoning_bridge = bridge
+
+    def set_infra_applicator(self, applicator: Any) -> None:
+        """Attach an InfrastructureApplicator for deterministic post-APPLY hooks."""
+        self._infra_applicator = applicator
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
@@ -1043,6 +1048,55 @@ class GovernedOrchestrator:
             )
             await self._publish_outcome(ctx, OperationState.FAILED, "change_engine_failed")
             return ctx
+
+        # ---- Phase 7.5: INFRASTRUCTURE (deterministic post-APPLY hook) ----
+        # Boundary Principle: the agentic layer wrote the file (e.g., requirements.txt).
+        # This hook executes the KNOWN consequence (pip install). No inference.
+        if self._infra_applicator is not None and self._infra_applicator.is_enabled:
+            infra_results = await self._infra_applicator.execute_post_apply(
+                modified_files=ctx.target_files,
+                op_id=ctx.op_id,
+            )
+            if infra_results and not self._infra_applicator.all_succeeded(infra_results):
+                # Infrastructure operation failed — the file change is correct
+                # but the environment didn't accept it. Roll back the file change
+                # and mark FAILED so Ouroboros can retry with corrected deps.
+                _failed = [r for r in infra_results if not r.success]
+                logger.error(
+                    "[Orchestrator] Infrastructure hook failed for %s: %s",
+                    ctx.op_id,
+                    "; ".join(f"{r.file_trigger}: exit={r.exit_code}" for r in _failed),
+                )
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="infrastructure_failed",
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {
+                        "reason": "infrastructure_failed",
+                        "infra_results": [
+                            {
+                                "file": r.file_trigger,
+                                "command": r.command,
+                                "exit_code": r.exit_code,
+                                "stderr": r.stderr_tail[:500],
+                            }
+                            for r in _failed
+                        ],
+                    },
+                )
+                self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
+                await self._publish_outcome(ctx, OperationState.FAILED, "infrastructure_failed")
+                return ctx
+
+            # Log successful infra operations for observability
+            for r in infra_results:
+                logger.info(
+                    "[Orchestrator] Infrastructure: %s completed in %.1fs (op=%s)",
+                    r.file_trigger, r.duration_s, ctx.op_id,
+                )
 
         # ---- Phase 8: VERIFY ----
         ctx = ctx.advance(OperationPhase.VERIFY)

@@ -153,7 +153,11 @@ class RuntimeHealthSensor:
         security = await self._check_security_audit()
         findings.extend(security)
 
-        # 4. Compat shim detection (deterministic — grep for legacy patterns)
+        # 4. Import error detection (deterministic — catch ModuleNotFoundError)
+        import_errors = self._check_import_errors()
+        findings.extend(import_errors)
+
+        # 5. Compat shim detection (deterministic — grep for legacy patterns)
         shims = self._check_legacy_shims()
         findings.extend(shims)
 
@@ -390,6 +394,73 @@ class RuntimeHealthSensor:
             pass
         except Exception:
             logger.debug("[RuntimeHealthSensor] pip audit error", exc_info=True)
+
+        return findings
+
+    def _check_import_errors(self) -> List[HealthFinding]:
+        """Detect missing Python packages by attempting tracked imports.
+
+        Distinguishes dependency errors (ModuleNotFoundError, ImportError) from
+        syntax errors or runtime errors. Only dependency errors route to the
+        dependency-resolution prompt path in the Ouroboros pipeline.
+        """
+        findings = []
+
+        # PyPI name -> importable module name (deterministic mapping)
+        _MODULE_MAP: Dict[str, str] = {
+            "google-api-core": "google.api_core",
+            "llama-cpp-python": "llama_cpp",
+            "scikit-learn": "sklearn",
+        }
+
+        for pkg_name in _TRACKED_PACKAGES:
+            module_name = _MODULE_MAP.get(
+                pkg_name, pkg_name.replace("-", "_")
+            )
+            try:
+                __import__(module_name)
+            except ModuleNotFoundError:
+                findings.append(HealthFinding(
+                    category="missing_dependency",
+                    severity="high",
+                    summary=(
+                        f"ModuleNotFoundError: '{module_name}' "
+                        f"(PyPI: {pkg_name}) is not installed. "
+                        f"Add to requirements.txt and run pip install."
+                    ),
+                    details={
+                        "package": pkg_name,
+                        "module": module_name,
+                        "error_type": "ModuleNotFoundError",
+                        "resolution": "dependency_install",
+                    },
+                    target_files=("requirements.txt",),
+                ))
+            except ImportError as exc:
+                # ImportError with a message (e.g., missing C extension,
+                # incompatible version). Different from ModuleNotFoundError —
+                # the package exists but can't load.
+                findings.append(HealthFinding(
+                    category="broken_dependency",
+                    severity="high",
+                    summary=(
+                        f"ImportError for '{module_name}' "
+                        f"(PyPI: {pkg_name}): {exc}. "
+                        f"May need reinstall or version change."
+                    ),
+                    details={
+                        "package": pkg_name,
+                        "module": module_name,
+                        "error_type": "ImportError",
+                        "error_message": str(exc),
+                        "resolution": "dependency_reinstall",
+                    },
+                    target_files=("requirements.txt",),
+                ))
+            except Exception:
+                # SyntaxError, RuntimeError, etc. — not a dependency issue.
+                # Don't emit a finding; this is a code problem, not a pip problem.
+                pass
 
         return findings
 
