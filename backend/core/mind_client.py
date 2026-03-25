@@ -73,7 +73,7 @@ def _env_float(key: str, default: float) -> float:
 FAILURE_THRESHOLD: int = _env_int("MIND_CLIENT_FAILURE_THRESHOLD", 3)
 RECOVERY_THRESHOLD: int = _env_int("MIND_CLIENT_RECOVERY_THRESHOLD", 3)
 
-_DEFAULT_HOST = "136.113.252.164"
+_DEFAULT_HOST = "localhost"
 _DEFAULT_PORT = 8000
 
 

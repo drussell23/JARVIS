@@ -321,7 +321,7 @@ class InteractiveBrainRouter:
         import urllib.request
         import json
 
-        host = os.getenv("JARVIS_PRIME_HOST", "136.113.252.164")
+        host = os.getenv("JARVIS_PRIME_HOST", "localhost")
         port = os.getenv("JARVIS_PRIME_VISION_PORT", "8001")
         url = f"http://{host}:{port}/v1/models"
 
