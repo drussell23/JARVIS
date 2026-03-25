@@ -469,6 +469,7 @@ class CandidateGenerator:
         """Background task: poll Doubleword batch and store result when ready."""
         _op_id = pending.op_id
         try:
+            assert self._tier0 is not None  # guaranteed by caller
             result = await self._tier0.poll_and_retrieve(pending, context)
             if result is not None and len(result.candidates) > 0:
                 from backend.core.ouroboros.governance.doubleword_provider import (
