@@ -26,6 +26,16 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
 5. **Audit Trail** -- Every Doubleword batch now records `PENDING_TIER0` and `TIER0_COMPLETE` entries in the governance ledger with full traceability: `operation_id -> batch_id -> output_file_id`.
 
+6. **VL-235B Vision Integration** -- I also ran a dual-model real-time vision test using your `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` as the "fast eye" alongside Claude Vision as the "deep brain." Both models observe the screen simultaneously -- VL-235B reads every ~4 seconds, Claude analyzes patterns every ~12 seconds.
+
+   Results:
+   - Cold start: 11.9s (first call)
+   - Warm calls: **3.6s** (fast enough for real-time screen observation)
+   - Accurately reads on-screen counters, tracks object position and direction
+   - Already wired as Tier 0 in my Lean Vision Loop (provider cascade: Doubleword VL-235B -> Claude Vision -> J-Prime GCP)
+
+   This means Doubleword now powers **two independent subsystems** in Trinity: the Ouroboros governance pipeline (397B batch) AND the real-time vision loop (VL-235B direct). Two different models, two different use patterns, both through the same API.
+
 ---
 
 **Technical Next Steps (Proposed Timeline)**
@@ -59,9 +69,15 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
 **What this means for the partnership**
 
-The 397B model fundamentally changes what Trinity can do. My L4 GPU caps me at 32B models -- the 397B gives me 12x the reasoning capacity at the same per-token cost. The DPO scoring pipeline means the 397B is now the judge that makes J-Prime smarter over time. It's not just a fallback tier -- it's the intelligence multiplier for the entire ecosystem.
+Doubleword now powers two independent subsystems in Trinity:
 
-I'm committed to making this integration a reference case for how batch inference powers autonomous governance systems. Happy to share benchmarks, architecture docs, or a live demo anytime.
+1. **Ouroboros governance** (397B batch) -- The 397B gives me 12x the reasoning capacity my L4 can provide, at the same per-token cost. The DPO scoring pipeline means the 397B is the judge that makes J-Prime smarter over time. It's the intelligence multiplier for the entire ecosystem.
+
+2. **Real-time vision** (VL-235B direct) -- The VL-235B serves as the fast eye in my dual-model vision loop at 3.6s warm latency. This is a completely different use pattern from batch -- real-time, image-in/text-out, sub-5-second response cycle. Same API, different model, different tier.
+
+Two models, two use patterns, both through the same Doubleword API. I don't think many of your customers are using your platform for both batch governance AND real-time vision simultaneously. This could be a compelling reference case.
+
+Happy to share benchmarks, architecture docs, or a live demo anytime.
 
 Looking forward to continuing to build together.
 

@@ -130,6 +130,49 @@ This is not a model deficiency. It reflects a calibration mismatch: the token bu
 
 ---
 
+## VL-235B Vision Benchmark (2026-03-25)
+
+> **Live dual-model vision test** — Doubleword's `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` as the "fast eye" alongside Claude Vision as the "deep brain", both observing a bouncing ball animation with on-screen counters.
+
+### Test: `tests/test_vision_dual_model_realtime.py`
+
+The VL-235B acts as Tier 0 for the Lean Vision Loop — a real-time OpenAI-compatible `/chat/completions` endpoint (not batch) with base64 image input.
+
+### Results
+
+| Metric | Doubleword VL-235B | Claude Vision |
+|--------|-------------------|---------------|
+| **Role** | Fast eye (every ~4s) | Deep brain (every ~12s) |
+| **Cold start latency** | 11.9s (first call) | N/A (API always warm) |
+| **Warm call latency** | **3.6s** | ~4-6s |
+| **Output quality** | Reads counters accurately, tracks ball position + direction | Pattern analysis, trend detection across observations |
+| **Model** | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` (235B total, ~22B active) | `claude-sonnet-4-20250514` |
+
+### Sample Output
+
+```
+Doubleword VL-235B (fast eye):
+  Read #1: "Derek, bounces show 3 horizontal, 3 vertical, 6 total at 331 px/s
+            - green ball positioned upper-left moving diagonally." (11.9s, cold)
+  Read #2: "Derek, ball moves left-down; counters: H7, V9, Total16,
+            Speed331 px/s." (3.6s, warm)
+```
+
+### Integration in Lean Vision Loop
+
+The VL-235B is already wired as Tier 0 in `backend/vision/lean_loop.py`:
+
+```
+Vision Provider Cascade:
+  Tier 0: Doubleword VL-235B  (real-time, 3.6s warm, ~22B active params)
+  Tier 1: Claude Vision        (fallback, 4-6s)
+  Tier 2: J-Prime GCP          (last resort, only when VM running)
+```
+
+**Key advantage:** The VL-235B provides near-Claude-quality vision at MoE economics — 235B total params but only ~22B active per forward pass. For the fast-eye role (frequent, low-latency screen reads), this is ideal: fast enough for 4-second observation cycles, accurate enough to read counters and track motion.
+
+---
+
 ## Understanding the MoE Cost Structure
 
 This is the single most important concept for modeling Doubleword's economics at scale.
