@@ -492,6 +492,25 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] RuntimeHealthSensor skipped: %s", exc)
 
+        # ---- WebIntelligenceSensor (P1: proactive CVE/advisory monitoring) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.web_intelligence_sensor import (
+                WebIntelligenceSensor,
+            )
+            _web_intel_poll_s = float(
+                os.environ.get("JARVIS_WEB_INTEL_INTERVAL_S", "86400")
+            )
+            _web_sensor = WebIntelligenceSensor(
+                repo="jarvis",
+                router=self._router,
+                poll_interval_s=_web_intel_poll_s,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_web_sensor)
+            logger.info("[IntakeLayer] WebIntelligenceSensor added (proactive CVE monitoring)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] WebIntelligenceSensor skipped: %s", exc)
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:

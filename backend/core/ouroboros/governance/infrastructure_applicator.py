@@ -49,6 +49,16 @@ _INFRA_MAPPINGS: Tuple[Tuple[str, str, str], ...] = (
         "npm_install",
         "Node.js dependency installation",
     ),
+    (
+        ".env",
+        "env_reload",
+        "Environment variable reload",
+    ),
+    (
+        "backend/.env",
+        "env_reload",
+        "Backend environment variable reload",
+    ),
 )
 
 # Environment-driven configuration
@@ -82,9 +92,16 @@ def _build_npm_argv(project_root: Path, file_path: str) -> List[str]:
     return ["npm", "install", "--prefix", str(project_root / Path(file_path).parent)]
 
 
+_ENV_RELOAD_TIMEOUT_S = 5.0  # env reload is instant, but cap it
+
 _COMMAND_BUILDERS: Dict[str, Tuple[Any, float]] = {
     "pip_install": (_build_pip_argv, _PIP_TIMEOUT_S),
     "npm_install": (_build_npm_argv, _NPM_TIMEOUT_S),
+}
+
+# In-process operations (no subprocess — deterministic reload)
+_INPROCESS_OPS: Dict[str, str] = {
+    "env_reload": "env_reload",
 }
 
 
@@ -179,13 +196,17 @@ class InfrastructureApplicator:
         self,
         file_path: str,
         cmd_key: str,
-        description: str,
+        _description: str,
     ) -> InfraResult:
-        """Execute a single infrastructure operation via subprocess.
+        """Execute a single infrastructure operation.
 
-        Uses asyncio.create_subprocess_exec — argv-based, no shell
-        interpolation, no injection surface.
+        Routes to subprocess execution (pip, npm) or in-process
+        operation (env reload) based on command key.
         """
+        # In-process operations — no subprocess needed
+        if cmd_key in _INPROCESS_OPS:
+            return await self._execute_env_reload(file_path)
+
         builder, timeout_s = _COMMAND_BUILDERS[cmd_key]
         argv = builder(self._project_root, file_path)
         cmd_str = " ".join(argv)
@@ -245,6 +266,77 @@ class InfrastructureApplicator:
             return InfraResult(
                 success=False,
                 command=cmd_str,
+                exit_code=-2,
+                duration_s=elapsed,
+                stdout_tail="",
+                stderr_tail=f"Exception: {exc}",
+                file_trigger=file_path,
+            )
+
+    async def _execute_env_reload(self, file_path: str) -> InfraResult:
+        """Reload environment variables from a .env file.
+
+        Deterministic in-process operation — reads the file, updates
+        os.environ for changed/new keys. Does NOT remove existing keys
+        (additive merge only — safe for running system).
+
+        Uses python-dotenv if available, falls back to manual parsing.
+        """
+        t0 = time.monotonic()
+        env_path = self._project_root / file_path
+        loaded_count = 0
+
+        try:
+            if not env_path.exists():
+                return InfraResult(
+                    success=False, command=f"env_reload({file_path})",
+                    exit_code=1, duration_s=time.monotonic() - t0,
+                    stdout_tail="", stderr_tail=f"File not found: {env_path}",
+                    file_trigger=file_path,
+                )
+
+            # Try python-dotenv first (handles quoting, comments, exports)
+            try:
+                from dotenv import dotenv_values
+                new_vars = dotenv_values(env_path)
+                for key, value in new_vars.items():
+                    if value is not None:
+                        os.environ[key] = value
+                        loaded_count += 1
+            except ImportError:
+                # Manual parsing fallback
+                for line in env_path.read_text().splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, _, value = line.partition("=")
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key:
+                            os.environ[key] = value
+                            loaded_count += 1
+
+            elapsed = time.monotonic() - t0
+            logger.info(
+                "[InfraApplicator] Env reload: %d vars loaded from %s in %.3fs",
+                loaded_count, file_path, elapsed,
+            )
+            return InfraResult(
+                success=True,
+                command=f"env_reload({file_path})",
+                exit_code=0,
+                duration_s=elapsed,
+                stdout_tail=f"Loaded {loaded_count} environment variables",
+                stderr_tail="",
+                file_trigger=file_path,
+            )
+
+        except Exception as exc:
+            elapsed = time.monotonic() - t0
+            return InfraResult(
+                success=False,
+                command=f"env_reload({file_path})",
                 exit_code=-2,
                 duration_s=elapsed,
                 stdout_tail="",
