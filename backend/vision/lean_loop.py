@@ -49,7 +49,7 @@ _JPEG_QUALITY = int(os.environ.get("VISION_LEAN_JPEG_QUALITY", "70"))
 # FALLBACK: Claude API direct (when J-Prime unavailable)
 _JPRIME_HOST = os.environ.get("JARVIS_PRIME_HOST", "136.113.252.164")
 _JPRIME_PORT = os.environ.get("JARVIS_PRIME_PORT", "8002")
-_JPRIME_VISION_TIMEOUT_S = float(os.environ.get("VISION_JPRIME_TIMEOUT_S", "15"))
+_JPRIME_VISION_TIMEOUT_S = float(os.environ.get("VISION_JPRIME_TIMEOUT_S", "3"))
 _CLAUDE_MODEL = os.environ.get("JARVIS_CLAUDE_VISION_MODEL", "claude-sonnet-4-20250514")
 
 _STAGNATION_WINDOW = int(os.environ.get("VISION_LEAN_STAGNATION_WINDOW", "3"))
@@ -479,6 +479,7 @@ class LeanVisionLoop:
         Returns None if J-Prime is unavailable (triggers Claude fallback).
         """
         try:
+            mind = None
             for import_path in ("backend.core.mind_client", "core.mind_client"):
                 try:
                     import importlib
@@ -490,8 +491,18 @@ class LeanVisionLoop:
                             break
                 except ImportError:
                     continue
-            else:
+
+            if mind is None:
                 return None  # MindClient not available
+
+            # Skip J-Prime if circuit breaker is OPEN (GCP VM is down)
+            if hasattr(mind, "_circuit") and hasattr(mind._circuit, "can_execute"):
+                can_exec = mind._circuit.can_execute()
+                if isinstance(can_exec, tuple):
+                    can_exec = can_exec[0]
+                if not can_exec:
+                    logger.info("[LeanVision] J-Prime circuit OPEN, skipping to Claude")
+                    return None
 
             # Use MindClient's reason_vision_turn which routes through J-Prime
             response = await asyncio.wait_for(
