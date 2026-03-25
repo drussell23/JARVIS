@@ -387,26 +387,31 @@ class LeanVisionLoop:
         action_log: List[Dict[str, Any]],
         turn: int,
     ) -> Dict[str, Any]:
-        """Send screenshot to vision model — Doubleword PRIMARY, Claude SECONDARY."""
+        """Send screenshot to vision model — Claude PRIMARY for vision (best
+        coordinate precision), Doubleword available as fallback."""
 
         # Build shared prompt components
         system_prompt, user_text = self._build_vision_prompt(
             goal, img_w, img_h, action_log, turn,
         )
 
-        # Tier 0: Doubleword VL-235B (direct API call, always available)
+        # PRIMARY: Claude Vision (best at UI automation, trained for computer use)
+        result = await self._ask_claude_vision(
+            system_prompt, user_text, screenshot_b64,
+        )
+        if result is not None and "error" not in result.get("reasoning", "").lower():
+            return result
+
+        # FALLBACK: Doubleword VL-235B (if Claude fails/unavailable)
         if _DOUBLEWORD_API_KEY:
+            logger.info("[LeanVision] Claude failed, trying Doubleword VL-235B")
             result = await self._ask_doubleword_vision(
                 system_prompt, user_text, screenshot_b64,
             )
-            if result is not None and "error" not in result.get("reasoning", "").lower():
+            if result is not None:
                 return result
-            logger.info("[LeanVision] Doubleword unavailable, falling back to Claude")
 
-        # Tier 1: Claude Vision (fallback)
-        return await self._ask_claude_vision(
-            system_prompt, user_text, screenshot_b64,
-        )
+        return {"goal_achieved": False, "reasoning": "All vision providers failed"}
 
     def _build_vision_prompt(
         self, goal: str, img_w: int, img_h: int,
