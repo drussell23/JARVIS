@@ -796,6 +796,10 @@ class RuntimeTaskOrchestrator:
                 )
 
             elif resolution.resolution == TaskResolution.VISION_ACTION:
+                # If the facade already executed (result is set), skip re-execution
+                if resolution.result is not None:
+                    return resolution
+
                 result = await self._dispatch_to_vision(goal, step)
                 # Check the success field — vision returns {success: bool, ...}
                 vision_error = None
