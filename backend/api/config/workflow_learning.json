@@ -11,9 +11,9 @@
       "avg_duration": 9.774395000000002
     },
     "open_app_unknown": {
-      "success": 12,
+      "success": 14,
       "failure": 0,
-      "avg_duration": 14.913700333333336
+      "avg_duration": 14.674499428571432
     },
     "unknown_unknown": {
       "success": 1,
@@ -47,12 +47,12 @@
       "total": 6
     },
     "open_app": {
-      "success": 20,
-      "total": 20
+      "success": 22,
+      "total": 22
     },
     "unknown": {
-      "success": 16,
-      "total": 16
+      "success": 18,
+      "total": 18
     },
     "write": {
       "success": 2,
@@ -63,5 +63,5 @@
       "total": 1
     }
   },
-  "last_updated": "2026-03-25T00:56:05.052579"
+  "last_updated": "2026-03-25T01:20:03.290068"
 }
