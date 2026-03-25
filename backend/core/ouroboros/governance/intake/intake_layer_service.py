@@ -511,6 +511,43 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] WebIntelligenceSensor skipped: %s", exc)
 
+        # ---- PerformanceRegressionSensor (P2: continuous benchmarking) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.performance_regression_sensor import (
+                PerformanceRegressionSensor,
+            )
+            _perf_poll_s = float(
+                os.environ.get("JARVIS_PERF_REGRESSION_INTERVAL_S", "3600")
+            )
+            _perf_sensor = PerformanceRegressionSensor(
+                repo="jarvis",
+                router=self._router,
+                poll_interval_s=_perf_poll_s,
+            )
+            self._sensors.append(_perf_sensor)
+            logger.info("[IntakeLayer] PerformanceRegressionSensor added (continuous benchmarking)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] PerformanceRegressionSensor skipped: %s", exc)
+
+        # ---- DocStalenessSensor (P2: automatic documentation gaps) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.doc_staleness_sensor import (
+                DocStalenessSensor,
+            )
+            _doc_poll_s = float(
+                os.environ.get("JARVIS_DOC_STALENESS_INTERVAL_S", "86400")
+            )
+            _doc_sensor = DocStalenessSensor(
+                repo="jarvis",
+                router=self._router,
+                poll_interval_s=_doc_poll_s,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_doc_sensor)
+            logger.info("[IntakeLayer] DocStalenessSensor added (documentation gap detection)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:
