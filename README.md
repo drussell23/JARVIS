@@ -145,6 +145,12 @@ The supervisor in this repo starts all three. J-Prime runs on a GCP `g2-standard
 
 **`backend/vision/lean_loop.py` + `backend/vision/vision_reflex.py` + `backend/vision/apple_ocr.py`**
 
+**The Biological Analogy: Screenshots = Blinking. Video Streaming = Eyes Open.**
+
+Traditional AI assistants (Claude Desktop, Cursor) take periodic screenshots to "see" the screen. This is like a human who blinks every 2 seconds and is blind between blinks -- they miss everything that moves. JARVIS keeps its eyes open. A continuous video stream (macOS ScreenCaptureKit, indicated by the purple recording icon) feeds raw numpy frames at 10-15fps. The BallTracker processes every frame in ~9ms -- JARVIS sees motion, predicts trajectories, and tracks objects between cloud API calls. The cloud models (235B + Claude) provide deep reasoning, like the visual cortex processing a scene. But the eyes never close.
+
+Ouroboros is the neuroplasticity -- the brain learning to see better over time. A newborn has open eyes but cannot track a moving object. Over weeks, the visual cortex rewires itself: neurons that fire together wire together. Ouroboros does the same: the 397B reasoning model observes what the cloud models extract, then writes local numpy code that replicates that extraction in 2ms. Each graduation makes the brain faster. The eyes stay the same; the brain improves. The longer JARVIS runs, the more scenes it encounters, the more reflexes Ouroboros compiles, and the less it needs the cloud.
+
 JARVIS sees through a three-layer parallel perception pipeline. Deterministic code handles the fast path; agentic intelligence handles novel scene understanding.
 
 **Layer 1 -- Local OCR (deterministic skeleton, every cycle, ~2s)**

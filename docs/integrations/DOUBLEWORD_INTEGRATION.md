@@ -644,6 +644,24 @@ cd benchmarks/doubleword
 
 > **Live production integration** -- all results below are from real API calls against live Doubleword endpoints, captured during JARVIS VLA smoke tests.
 
+### The Biological Model: Doubleword as Compiler for Local Intelligence
+
+**Screenshots = Blinking. Video Streaming = Eyes Open. Doubleword = The Brain Learning to See.**
+
+Traditional AI assistants take periodic screenshots to perceive the screen -- the equivalent of a human who blinks every 2 seconds and is blind between blinks. JARVIS keeps its eyes open via continuous video streaming (macOS ScreenCaptureKit, ~10-15fps raw numpy frames). The Doubleword models do not serve as JARVIS's eyes -- they serve as its **visual cortex during development**.
+
+The biological analogy maps precisely to the Doubleword integration:
+
+| Biological role | Doubleword model | What it does | When it runs |
+|---|---|---|---|
+| **Visual cortex** (conscious scene analysis) | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | Structural analysis: reads text, identifies UI elements, locates objects, classifies quadrants | Every ~8s, parallel with Claude Vision |
+| **Prefrontal cortex** (learning to automate perception) | `Qwen/Qwen3.5-397B-A17B-FP8` | Code synthesis: examines the 235B's analysis and writes local Python that replicates it in ~2ms | Once per scene type (background, ~60-120s) |
+| **Crystallized reflex** (subconscious, instant) | Generated numpy code | Ball tracking, centroid detection, quadrant classification -- zero API calls | Every frame, ~2ms |
+
+The Doubleword models are **compilers for local intelligence**, not runtime perception engines. The 235B provides the training signal (what to extract from the screen). The 397B writes the extraction code (how to extract it locally in numpy). After Ouroboros graduation, neither model runs for that scene type -- their intelligence has been crystallized into deterministic local code. The longer JARVIS runs, the more scene types it encounters, the more reflexes Ouroboros compiles, and the less it calls the Doubleword API.
+
+This is economically optimal: Doubleword charges per token, and after graduation, token consumption drops to zero for learned patterns. The expensive cloud models pay for themselves by eliminating future cloud calls.
+
 ### Architecture: Dual-Model Parallel Perception
 
 JARVIS's Vision-Language-Action pipeline uses Doubleword models in two distinct roles:

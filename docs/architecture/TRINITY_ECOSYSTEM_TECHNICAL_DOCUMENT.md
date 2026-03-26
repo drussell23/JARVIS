@@ -105,13 +105,29 @@ This principle draws from Stafford Beer's **Viable System Model** (1972), which 
 
 The Trinity is not a metaphor for marketing — it is a structural design constraint:
 
-- **Body (JARVIS)** perceives and acts. It has eyes (Ferrari Engine, 60fps screen capture), ears (ECAPA-TDNN voice biometrics, continuous audio), hands (Ghost Hands focus-preserving actuation), and a voice (CoreAudio TTS). It does not reason about what it perceives — it routes perception to the Mind.
+- **Body (JARVIS)** perceives and acts. It has eyes (continuous video stream via ScreenCaptureKit at 10-15fps, plus the Ferrari Engine for 60fps when available), ears (ECAPA-TDNN voice biometrics, continuous audio), hands (Ghost Hands focus-preserving actuation), and a voice (CoreAudio TTS). It does not reason about what it perceives — it routes perception to the Mind.
 
-- **Mind (J-Prime)** reasons and decides. It receives sensory input from the Body, runs it through reasoning graphs (LangGraph), selects appropriate cognitive strategies (UnifiedBrainSelector), and returns action plans. It does not act — it tells the Body what to do.
+- **Mind (J-Prime / Doubleword 235B / Claude Vision)** reasons and decides. It receives sensory input from the Body, runs it through reasoning graphs (LangGraph), vision-language models (Doubleword 235B VL for structural analysis, Claude Vision for semantic reasoning), selects appropriate cognitive strategies (UnifiedBrainSelector), and returns action plans. It does not act — it tells the Body what to do.
 
-- **Soul (Reactor Core)** learns and protects. It observes outcomes of Body+Mind collaboration, tracks success/failure patterns via Shannon entropy, synthesizes new capabilities when gaps are detected, and governs self-modification through a trust-graduated pipeline. It does not perceive or decide — it evolves the organism.
+- **Soul (Reactor Core / Ouroboros)** learns and protects. It observes outcomes of Body+Mind collaboration, tracks success/failure patterns via Shannon entropy, synthesizes new capabilities when gaps are detected, and governs self-modification through a trust-graduated pipeline. It does not perceive or decide — it evolves the organism.
 
-This separation is not arbitrary. It maps to Rodney Brooks' **Subsumption Architecture** (1986), where lower layers (perception/actuation) operate independently and higher layers (reasoning/planning) modulate but cannot block lower-layer function. See [Section 9.2](#92-cognitive-architectures).
+**Screenshots = Blinking. Video Streaming = Eyes Open. Ouroboros = The Brain Learning to See.**
+
+Traditional AI assistants take periodic screenshots to "see" the screen. This is analogous to a human who blinks every 2 seconds and is blind between blinks — they miss everything that moves. JARVIS keeps its eyes open: a continuous video stream feeds raw numpy frames to the Deterministic Retina (a BallTracker that computes position, velocity, heading, and wall predictions in ~9ms per frame). Between cloud API calls, JARVIS is still watching. It sees motion, predicts trajectories, and tracks objects in real-time.
+
+The cloud models (Doubleword 235B VL + Claude Vision) function as the visual cortex — deep, slow, semantic processing that runs in parallel every ~8 seconds. The local tracker is the retina and optic nerve — fast, deterministic, continuous. When a human watches a bouncing ball, they don't consciously process every pixel — their eyes track continuously while their brain interprets periodically. JARVIS does the same: continuous local tracking + periodic cloud reasoning.
+
+Ouroboros is the neuroplasticity — the mechanism by which the brain learns to see better over time. A newborn has open eyes but cannot track a moving object. Over weeks, the visual cortex rewires itself. Ouroboros does the same: the Doubleword 397B reasoning model observes what the cloud VLMs extract from a scene, then generates local Python code (a "reflex") that replicates the extraction in milliseconds. Each graduation crystallizes cloud intelligence into local code. The eyes stay the same; the brain improves. After enough scene encounters, JARVIS can perceive most of its environment without any cloud calls — like an adult who sees and reacts without conscious thought.
+
+| Human visual development | JARVIS visual development |
+|---|---|
+| Eyes open, raw photons hit retina | Continuous video stream, raw pixels hit numpy |
+| Visual cortex slowly learns edge detection | Cloud models (235B + Claude) analyze scene semantics |
+| Repeated exposure strengthens neural pathways | Repeated API calls trigger CognitiveInefficiencyEvent |
+| Pathways crystallize into instant reflexes | 397B writes local numpy code, Ouroboros graduates it |
+| Adult sees and reacts without thinking | Tier 4 reflex processes frames in ~2ms, zero API calls |
+
+This separation maps to Rodney Brooks' **Subsumption Architecture** (1986), where lower layers (perception/actuation) operate independently and higher layers (reasoning/planning) modulate but cannot block lower-layer function. The continuous video stream is the lowest layer — it never stops, regardless of what the cloud models are doing. See [Section 9.2](#92-cognitive-architectures).
 
 ---
 
@@ -144,32 +160,53 @@ The voice pipeline provides continuous, always-on audio perception with speaker 
 
 ### 3.2 Vision Subsystem
 
-Two vision architectures coexist, feature-flagged:
+Three vision layers operate in parallel, following the Boundary Mandate:
 
-**Lean Vision Loop (Path A — Active)**
+**Layer 1 — Deterministic Retina (continuous, ~2ms/frame)**
+
+The BallTracker (`tests/test_vision_realtime_sharp.py:BallTracker`) processes raw numpy frames from the continuous video stream. It finds objects via green pixel centroid detection, computes velocity from position history, classifies quadrant, determines heading direction, and predicts time-to-wall via linear extrapolation. It does NOT count events or interpret semantics — it provides spatial awareness and trajectory prediction. The HUD/scoreboard values are read by OCR (the "glancing at the scoreboard" operation).
+
+- Capture: `CGWindowListCreateImage` via `asyncio.to_thread()` for targeted window capture even when terminal has focus. Raw BGRA → numpy → RGB in ~15ms. Zero b64 encoding on the fast path.
+- Frame source: `CGDisplayBounds(CGMainDisplayID())` — captures only the primary display, not virtual ghost displays.
+- Tracking: bright green core pixels (g > 225) for ball centroid, softer threshold (g > 180) as fallback. Position history for smoothed velocity. Heading computed as human-readable direction strings.
+- Prediction: linear extrapolation to each wall → nearest wall = predicted next bounce.
+
+**Layer 2 — Doubleword 235B VL (structural analysis, parallel, ~8s)**
+
+`Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` performs fast structural reads: text extraction, UI element detection, object position, quadrant classification. Fires in parallel with Layer 3 via `asyncio.create_task()`.
+
+**Layer 3 — Claude Vision (semantic reasoning, parallel, ~8s)**
+
+Claude Sonnet provides deep contextual understanding: spatial relationships, motion direction, scene description. Both cloud models analyze the same frame; their outputs are cross-validated (numbers, position consensus, motion consensus). Disagreements caused by temporal lag are the signal that triggers Ouroboros Neuro-Compilation.
+
+**Layer 0 — OCR Scoreboard (periodic validation, background, ~2s)**
+
+Apple Vision Framework reads HUD text every ~8 seconds as a background task. The OCR values are the **ground truth** for numeric data (bounce counts, speed) — JARVIS reads the scoreboard rather than re-deriving physics from pixel trajectories. This follows the Boundary Mandate: the simplest correct solution is the best solution.
+
+**VLA Narration Synthesis:**
+
+JARVIS narrates by fusing the HUD scoreboard (what the numbers say) with the spatial tracker (where the ball is and where it is heading): "17 bounces. 8 horizontal, 9 vertical. Ball in top-right, heading down-left." This mirrors how a human commentator works — they read the score AND watch the field.
+
+**Lean Vision Loop (UI Automation)**
 ```
-CAPTURE (async screencapture, logical resolution)
-  → THINK (Claude Vision API, direct)
-    → ACT (pyautogui + clipboard paste)
-      → VERIFY (re-capture, compare)
+CAPTURE (targeted window or full screen, CU resolution 1280x800)
+  → THINK (Doubleword 235B VL → Claude Vision → J-Prime LLaVA, cascade)
+    → ACT (pyautogui + clipboard paste, Retina coordinate scaling)
+      → VERIFY (pixel-diff post-action check)
         → repeat or terminate
 ```
 - File: `backend/vision/lean_loop.py`
 - Stagnation guard: stops after 3 identical actions
-- Env: `VISION_LEAN_MAX_TURNS=15`, `VISION_LEAN_TIMEOUT_S=120`
-- Downscales to logical screen size so Claude coordinates = pyautogui coordinates (no Retina conversion needed)
+- Provider cascade: Doubleword 235B VL → Claude Computer Use → J-Prime LLaVA
+- Visual Telemetry: every perception frame saved to `/tmp/claude/vision_telemetry/`
 
-**Legacy Full Pipeline (Path B — Fallback)**
-```
-Ferrari Engine (native C++ ScreenCaptureKit, 60fps)
-  → VisionRouter (L1 scene_graph → L2 LLaVA/32B on GCP → L3 Claude → DEGRADED)
-    → Ghost Hands (BackgroundActuator, focus-preserving)
-      → ActionVerifier (re-capture + LLaVA re-check)
-        → correction loop or graduation
-```
-- Ferrari Engine: `backend/native_extensions/fast_capture_stream.mm` + `macos_sck_stream.py`
-- Ghost Hands: Playwright (browsers) → AppleScript (native) → CGEvent (low-level)
-- Never steals user focus during actuation
+**Ouroboros Vision Reflex System:**
+- File: `backend/vision/vision_reflex.py`
+- CognitiveInefficiencyEvent fires after 3 repeated VLA calls
+- Doubleword 397B reasoning model generates local Python reflexes
+- Sandbox compilation + validation against ground truth
+- Hot-swap into live loop — cloud calls replaced by local numpy (~2ms)
+- See [Doubleword Integration](../integrations/DOUBLEWORD_INTEGRATION.md) for model details
 
 **Design Decision — Vision Tasks Are Atomic:**
 Vision/UI tasks are never decomposed by the DAG planner. The lean vision loop's see-think-act cycle handles multi-step screen interactions as a single atomic unit. Decomposing them strips context and causes each sub-task to claim success independently without completing the actual goal. This was learned through failure — see [Section 9.8](#98-embodied-and-situated-cognition).
@@ -321,6 +358,29 @@ When the system encounters a capability gap (a task it cannot perform), the Ouro
 - After `JARVIS_GRADUATION_THRESHOLD` uses (default: 3), the `GraduationOrchestrator` triggers
 - Pipeline: test → validate → propose Git PR
 - The organism physically grows — new capability becomes permanent code
+
+**Neuro-Compilation (Vision-Specific Neuroplasticity):**
+
+The VLA pipeline's Ouroboros integration demonstrates neuroplasticity in action. When the cross-validation layer detects that cloud models (Doubleword 235B + Claude Vision) are being called repeatedly for the same type of visual analysis, the `VisionReflexCompiler` triggers Neuro-Compilation:
+
+1. `CognitiveInefficiencyEvent` fires (3 repeated VLA calls detected)
+2. The Doubleword 235B VL analyzes the current frame (the "conscious read")
+3. The Doubleword 397B reasoning model receives the 235B's analysis + cross-validation consensus and generates a local Python function
+4. The generated code is compiled in a sandboxed namespace, validated against the last known-good result, and hot-swapped into the live loop
+
+This is biologically equivalent to the visual cortex rewiring after repeated exposure:
+
+| Human visual development | JARVIS Neuro-Compilation |
+|---|---|
+| Eyes open, raw photons hit retina | Continuous video stream, raw pixels hit numpy array |
+| Visual cortex slowly learns to detect edges, motion | Cloud models (235B + Claude) analyze scene structure |
+| Repeated exposure strengthens specific neural pathways | Repeated API calls trigger CognitiveInefficiencyEvent |
+| Strengthened pathways crystallize into instant reflexes | 397B generates local numpy code, Ouroboros graduates it |
+| Adult recognizes faces in milliseconds without effort | Tier 4 reflex processes frames in ~2ms, zero API calls |
+
+The key insight: the eyes (continuous video stream) never change. The brain (local reflex code) gets smarter. Each graduated reflex permanently expands the deterministic fast-path, reducing cloud dependency. After enough scene encounters, JARVIS can perceive most of its visual environment without any cloud calls — like an adult who sees and reacts without conscious deliberation.
+
+The Doubleword models serve as **compilers for local intelligence**: the 235B provides the training signal (what to extract), the 397B writes the extraction code (how to extract it locally). Neither model runs after graduation — their intelligence is crystallized into deterministic numpy operations.
 
 **Shannon Entropy for Capability Gap Detection:**
 The ConsciousnessBridge measures the system's uncertainty about its own capabilities using Shannon entropy:

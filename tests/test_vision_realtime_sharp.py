@@ -775,15 +775,12 @@ async def main(duration_s: int = 60):
     print(f"\n  " + "-" * 60)
     print(f"  Frames: {tracker.frames_processed} ({avg_fps:.1f}fps) | Duration: {total:.1f}s")
     print(
-        f"  Tracker bounces: H:{tracker.h_bounces} V:{tracker.v_bounces} "
-        f"T:{tracker.total_bounces}"
+        f"  HUD (ground truth): H:{tracker.hud_h} V:{tracker.hud_v} T:{tracker.hud_t}"
     )
-    if last_ocr_vals:
-        print(
-            f"  HUD (last OCR): H:{last_ocr_vals.get('horizontal','?')} "
-            f"V:{last_ocr_vals.get('vertical','?')} "
-            f"T:{last_ocr_vals.get('total','?')}"
-        )
+    print(
+        f"  Last position: ({tracker.ball_x},{tracker.ball_y}) "
+        f"{tracker.quadrant} heading {tracker.heading}"
+    )
     print(f"  VLA perceptions: {n_vla_cycles}")
     if n_agreements or n_disagreements:
         pct = n_agreements / max(n_agreements + n_disagreements, 1) * 100
@@ -794,7 +791,7 @@ async def main(duration_s: int = 60):
 
     summary = (
         f"VLA pipeline complete. Tracked {tracker.frames_processed} frames "
-        f"at {avg_fps:.0f} F P S. Detected {tracker.total_bounces} bounces. "
+        f"at {avg_fps:.0f} F P S. {tracker.hud_t} bounces on the scoreboard. "
         f"{n_vla_cycles} cloud analyses in {int(total)} seconds."
     )
     await jarvis_say(summary)
