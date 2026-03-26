@@ -548,6 +548,37 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
 
+        # ---- ProactiveExplorationSensor (P3: curiosity-driven domain exploration) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor import (
+                ProactiveExplorationSensor,
+            )
+            _explore_sensor = ProactiveExplorationSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_explore_sensor)
+            logger.info("[IntakeLayer] ProactiveExplorationSensor added (curiosity-driven)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] ProactiveExplorationSensor skipped: %s", exc)
+
+        # ---- CrossRepoDriftSensor (P3: Trinity contract integrity) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
+                CrossRepoDriftSensor,
+            )
+            _drift_sensor = CrossRepoDriftSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+                repo_registry=self._config.repo_registry,
+            )
+            self._sensors.append(_drift_sensor)
+            logger.info("[IntakeLayer] CrossRepoDriftSensor added (Trinity contract integrity)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] CrossRepoDriftSensor skipped: %s", exc)
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:
