@@ -41,7 +41,7 @@ logger = logging.getLogger(__name__)
 
 
 class TrinityConsciousness:
-    """Zone 6.11: Self-awareness layer composing 4 engines.
+    """Zone 6.11: Self-awareness layer composing 7 engines.
 
     Parameters
     ----------
@@ -74,11 +74,18 @@ class TrinityConsciousness:
         config: Any,
         comm: Any = None,
         say_fn: Any = None,
+        # CAI/SAI/UAE awareness engines (optional — graceful no-op when None)
+        contextual_awareness: Any = None,
+        situational_awareness: Any = None,
+        unified_awareness: Any = None,
     ) -> None:
         self._cortex = health_cortex
         self._memory = memory_engine
         self._dream = dream_engine
         self._prophecy = prophecy_engine
+        self._cai = contextual_awareness
+        self._sai = situational_awareness
+        self._uae = unified_awareness
         self._config = config
         self._comm = comm
         self._say_fn = say_fn
@@ -112,6 +119,18 @@ class TrinityConsciousness:
             self._prophecy.start(),
         )
 
+        # Phase 2b: Awareness engines (CAI/SAI depend on Phase 1+2 engines)
+        _awareness_starts = []
+        if self._cai is not None:
+            _awareness_starts.append(self._cai.start())
+        if self._sai is not None:
+            _awareness_starts.append(self._sai.start())
+        if _awareness_starts:
+            await asyncio.gather(*_awareness_starts)
+        # UAE starts last — it fuses CAI + SAI outputs
+        if self._uae is not None:
+            await self._uae.start()
+
         self._running = True
 
         # Phase 3: morning briefing (best-effort)
@@ -130,7 +149,18 @@ class TrinityConsciousness:
         """
         self._running = False
 
-        # Phase 2 engines first (GPU-optional)
+        # Phase 2b engines first: awareness (UAE before CAI/SAI)
+        for engine in (self._uae, self._sai, self._cai):
+            if engine is not None:
+                try:
+                    await engine.stop()
+                except Exception as exc:
+                    logger.warning(
+                        "Engine %s stop failed: %s",
+                        type(engine).__name__, exc,
+                    )
+
+        # Phase 2 engines: GPU-optional
         for engine in (self._dream, self._prophecy):
             try:
                 await engine.stop()
@@ -178,6 +208,9 @@ class TrinityConsciousness:
             "memory": "active",
             "dream": "active" if self._config.dream_enabled else "disabled",
             "prophecy": "active" if self._config.prophecy_enabled else "disabled",
+            "cai": "active" if self._cai is not None else "disabled",
+            "sai": "active" if self._sai is not None else "disabled",
+            "uae": "active" if self._uae is not None else "disabled",
         }
 
     # ------------------------------------------------------------------
@@ -227,6 +260,38 @@ class TrinityConsciousness:
             )
 
         return " ".join(parts)
+
+    # ------------------------------------------------------------------
+    # Cross-engine integration: UAE awareness (CAI/SAI fusion)
+    # ------------------------------------------------------------------
+
+    def get_unified_awareness(self) -> Optional[Any]:
+        """Get the current unified awareness state from UAE.
+
+        Returns None if UAE is not wired or not running.
+        Safe to call at any time — never raises.
+        """
+        if self._uae is None:
+            return None
+        try:
+            return self._uae.get_unified_state()
+        except Exception:
+            return None
+
+    async def assess_operation_awareness(
+        self, target_files: Tuple[str, ...], goal: str,
+    ) -> Optional[Any]:
+        """Get operation-specific awareness from UAE (fuses CAI+SAI).
+
+        Returns OperationAwareness or None if UAE is not available.
+        """
+        if self._uae is None:
+            return None
+        try:
+            return await self._uae.assess_for_operation(target_files, goal)
+        except Exception as exc:
+            logger.debug("UAE assess_for_operation failed: %s", exc)
+            return None
 
     # ------------------------------------------------------------------
     # Cross-engine integration: Memory -> Planner (TC19)

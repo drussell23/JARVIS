@@ -156,3 +156,38 @@ class ConsciousnessBridge:
             )
         except Exception as exc:
             logger.debug("[ConsciousnessBridge] record_operation_outcome error: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Integration 5: UAE — Unified Awareness for pipeline decisions
+    # ------------------------------------------------------------------
+
+    def get_unified_awareness(self) -> Optional[Any]:
+        """Get the current unified awareness state (fuses CAI+SAI+all engines).
+
+        Returns UnifiedAwarenessState or None if consciousness/UAE unavailable.
+        """
+        if self._consciousness is None:
+            return None
+        try:
+            return self._consciousness.get_unified_awareness()
+        except Exception:
+            return None
+
+    async def assess_operation_awareness(
+        self, target_files: Tuple[str, ...], goal: str,
+    ) -> Optional[Any]:
+        """Get operation-specific awareness from UAE.
+
+        Returns OperationAwareness with unified risk, confidence,
+        suggested provider tier, thinking budget, and prompt injection text.
+        Returns None if consciousness/UAE unavailable.
+        """
+        if self._consciousness is None:
+            return None
+        try:
+            return await self._consciousness.assess_operation_awareness(
+                target_files, goal,
+            )
+        except Exception as exc:
+            logger.debug("[ConsciousnessBridge] assess_operation_awareness error: %s", exc)
+            return None
