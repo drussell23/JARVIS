@@ -1,0 +1,331 @@
+{
+  "timestamp": "2026-03-26T21:52:26.121716+00:00",
+  "platform": "darwin (arm64)",
+  "python_version": "3.9.6",
+  "numpy_version": "2.0.2",
+  "results": [
+    {
+      "name": "shm_read_speed",
+      "description": "SHM ring buffer read throughput (synthetic writer, no SCK)",
+      "duration_s": 5.000399375,
+      "total_operations": 9888,
+      "fps": 1977.4420518161112,
+      "throughput_mb_s": 9776.172253241273,
+      "latency": {
+        "mean_us": 3.752415655337384,
+        "median_us": 3.0830000001813573,
+        "p95_us": 4.70800000007543,
+        "p99_us": 22.880460000382875,
+        "max_us": 888.2080000001124,
+        "min_us": 1.5409999999937973,
+        "stddev_us": 9.662004372432648
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "channels": 4,
+        "duration_s": 5.0,
+        "ring_size": 5
+      },
+      "metadata": {},
+      "error": null
+    },
+    {
+      "name": "shm_write_speed",
+      "description": "SHM ring buffer write throughput (1440x900x4)",
+      "duration_s": 5.000185042,
+      "total_operations": 6953,
+      "fps": 1390.5485380234854,
+      "throughput_mb_s": 6874.6601306092725,
+      "latency": {
+        "mean_us": 716.0115213576986,
+        "median_us": 607.584000000827,
+        "p95_us": 1317.9921999999067,
+        "p99_us": 3039.3303200001833,
+        "max_us": 15509.666999999894,
+        "min_us": 337.6250000002301,
+        "stddev_us": 603.6446489562818
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "channels": 4
+      },
+      "metadata": {},
+      "error": null
+    },
+    {
+      "name": "sck_to_shm_delivery",
+      "description": "Full SCK capture -> SHM write -> Python read pipeline",
+      "duration_s": 5.000102875000001,
+      "total_operations": 92,
+      "fps": 18.399621427789118,
+      "throughput_mb_s": 90.96492527166251,
+      "latency": {
+        "mean_us": 25.940630434643758,
+        "median_us": 24.33299999893279,
+        "p95_us": 39.68589999931993,
+        "p99_us": 41.13052999963785,
+        "max_us": 42.8750000001088,
+        "min_us": 13.33300000005977,
+        "stddev_us": 5.649255541017639
+      },
+      "parameters": {
+        "target_fps": 60,
+        "duration_s": 5.0,
+        "window_id": 0,
+        "width": 1440,
+        "height": 900,
+        "channels": 4,
+        "frame_size": 5184000
+      },
+      "metadata": {
+        "empty_polls": 41283,
+        "poll_efficiency_pct": 0.22,
+        "inter_frame_us": {
+          "mean": 54855.93223076925,
+          "median": 50393.16700000107,
+          "p95": 80270.50000000013,
+          "max": 148534.20800000094
+        }
+      },
+      "error": null
+    },
+    {
+      "name": "bgra_to_rgb_fancy_1440x900",
+      "description": "BGRA->RGB via numpy fancy indexing at 1440x900",
+      "duration_s": 5.000557542000003,
+      "total_operations": 1308,
+      "fps": 261.57083265496385,
+      "throughput_mb_s": 969.8747609734529,
+      "latency": {
+        "mean_us": 3819.511172782898,
+        "median_us": 3858.083500000831,
+        "p95_us": 4975.731450000964,
+        "p99_us": 5136.148619999155,
+        "max_us": 7613.833000000624,
+        "min_us": 2031.833000000205,
+        "stddev_us": 797.5431657751035
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "method": "fancy_index"
+      },
+      "metadata": {},
+      "error": null
+    },
+    {
+      "name": "bgra_to_rgb_slice_1440x900",
+      "description": "BGRA->RGB via numpy slice+stack at 1440x900",
+      "duration_s": 5.001707500000002,
+      "total_operations": 1544,
+      "fps": 308.69458080065647,
+      "throughput_mb_s": 1144.6042348413011,
+      "latency": {
+        "mean_us": 3237.295419689074,
+        "median_us": 3106.5415000011144,
+        "p95_us": 4660.4749999994865,
+        "p99_us": 5164.611999998029,
+        "max_us": 9858.749999999362,
+        "min_us": 2642.9999999990628,
+        "stddev_us": 652.9399782426874
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "method": "slice_stack"
+      },
+      "metadata": {},
+      "error": null
+    },
+    {
+      "name": "bgra_to_rgb_contig_1440x900",
+      "description": "BGRA->RGB via fancy index + ascontiguousarray at 1440x900",
+      "duration_s": 5.010485790999997,
+      "total_operations": 417,
+      "fps": 83.22546303774165,
+      "throughput_mb_s": 308.59050778459505,
+      "latency": {
+        "mean_us": 12014.112829736288,
+        "median_us": 11352.457999997512,
+        "p95_us": 16139.716600002173,
+        "p99_us": 20423.03443999997,
+        "max_us": 21002.208000002298,
+        "min_us": 9817.667000000085,
+        "stddev_us": 1974.9195751761254
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "method": "contig_copy"
+      },
+      "metadata": {},
+      "error": null
+    },
+    {
+      "name": "dhash_motion_detection",
+      "description": "dhash computation per frame (1440x900, hash_size=8)",
+      "duration_s": 5.003071540999997,
+      "total_operations": 155,
+      "fps": 30.98096813722938,
+      "throughput_mb_s": 114.87389003519804,
+      "latency": {
+        "mean_us": 32276.3317225808,
+        "median_us": 30017.08299999706,
+        "p95_us": 42917.92940000148,
+        "p99_us": 54004.4945000014,
+        "max_us": 98051.5840000038,
+        "min_us": 23954.041999999732,
+        "stddev_us": 7514.629838383696
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "hash_size": 8,
+        "duration_s": 5.0
+      },
+      "metadata": {
+        "detect_change": {
+          "ops": 155,
+          "fps": 30.820004240733162,
+          "changes_detected": 93,
+          "change_rate_pct": 60.0,
+          "latency": {
+            "mean_us": 32445.176070967496,
+            "median_us": 31573.83399999958,
+            "p95_us": 39250.16609999615,
+            "p99_us": 44970.30782000067,
+            "max_us": 46199.74999999954,
+            "min_us": 27232.00000000503,
+            "stddev_us": 3706.3829007239765
+          }
+        }
+      },
+      "error": null
+    },
+    {
+      "name": "frame_pipeline_e2e",
+      "description": "End-to-end FramePipeline (1440x900, queue=10, motion=on)",
+      "duration_s": 5.023834208000004,
+      "total_operations": 151,
+      "fps": 30.05672435598016,
+      "throughput_mb_s": 111.44689969639859,
+      "latency": {
+        "mean_us": 33264.22047682093,
+        "median_us": 31688.12500000229,
+        "p95_us": 48263.833500001856,
+        "p99_us": 57957.1879999996,
+        "max_us": 58958.58399999554,
+        "min_us": 27187.00000000496,
+        "stddev_us": 6625.169790735562
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "max_queue_size": 10,
+        "motion_detect": true,
+        "motion_threshold": 0.05,
+        "duration_s": 5.0
+      },
+      "metadata": {
+        "enqueued": 92,
+        "consumed": 30,
+        "dropped_overflow": 52,
+        "filtered_by_motion": 59,
+        "filter_rate_pct": 39.07,
+        "consume_latency": {
+          "mean_us": 2.6333000000988704,
+          "median_us": 1.9374999986609964,
+          "p95_us": 4.523100000852764,
+          "p99_us": 4.689679996303653,
+          "max_us": 4.74999999511283,
+          "min_us": 1.124999997159648,
+          "stddev_us": 1.3078465798981005
+        }
+      },
+      "error": null
+    },
+    {
+      "name": "frame_pipeline_e2e",
+      "description": "End-to-end FramePipeline (1440x900, queue=10, motion=off)",
+      "duration_s": 5.000007666000002,
+      "total_operations": 840748,
+      "fps": 168149.34219342849,
+      "throughput_mb_s": 623478.5484772205,
+      "latency": {
+        "mean_us": 4.177633689285588,
+        "median_us": 4.332999999689946,
+        "p95_us": 5.333999993695215,
+        "p99_us": 6.083999998907075,
+        "max_us": 184.6250000028249,
+        "min_us": 2.4999999936881068,
+        "stddev_us": 0.9502693355368299
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "max_queue_size": 10,
+        "motion_detect": false,
+        "motion_threshold": 0.05,
+        "duration_s": 5.0
+      },
+      "metadata": {
+        "enqueued": 840748,
+        "consumed": 168149,
+        "dropped_overflow": 672589,
+        "filtered_by_motion": 0,
+        "filter_rate_pct": 0.0,
+        "consume_latency": {
+          "mean_us": 1.0126944852490798,
+          "median_us": 0.9999999974752427,
+          "p95_us": 1.2919999932137216,
+          "p99_us": 1.4170000000035543,
+          "max_us": 85.62499999698048,
+          "min_us": 0.7080000017367638,
+          "stddev_us": 0.2624579251751854
+        }
+      },
+      "error": null
+    },
+    {
+      "name": "numpy_frombuffer_reshape",
+      "description": "np.frombuffer + reshape (1440x900x4)",
+      "duration_s": 5.000000542000002,
+      "total_operations": 3396855,
+      "fps": 679370.9263561913,
+      "throughput_mb_s": 3358706.3619904476,
+      "latency": {
+        "mean_us": 1.0861349006648497,
+        "median_us": 1.0830000007899798,
+        "p95_us": 1.4589999963732225,
+        "p99_us": 1.7919999990567703,
+        "max_us": 730.9579999983384,
+        "min_us": 0.6659999982616682,
+        "stddev_us": 0.5926550313947732
+      },
+      "parameters": {
+        "width": 1440,
+        "height": 900,
+        "channels": 4
+      },
+      "metadata": {},
+      "error": null
+    }
+  ],
+  "config": {
+    "duration_s": 5.0,
+    "skip_sck": false,
+    "width": 1440,
+    "height": 900,
+    "benchmarks_requested": [
+      "bgra",
+      "dhash",
+      "frombuffer",
+      "pipeline",
+      "sck_to_shm",
+      "shm_read",
+      "shm_write"
+    ]
+  }
+}
