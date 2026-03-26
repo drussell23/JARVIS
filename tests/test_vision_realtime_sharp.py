@@ -714,20 +714,26 @@ async def main(duration_s: int = 60):
     last_vla_time = 0.0
 
     while (time.monotonic() - t_start) < duration_s:
-        # ---- CAPTURE: SHM bridge (20fps) → Quartz (9fps) → frame_server ----
+        # ---- CAPTURE: SHM primary (no Quartz fallback — eliminates 47ms tax) ----
         raw_frame: Optional[np.ndarray] = None
         b64: Optional[str] = None
 
         if _shm_reader is not None:
-            # Zero-copy: numpy view over shared memory, no GIL
-            raw_frame, _ = _shm_reader.read_frame()
-        if raw_frame is None and _chrome_wid:
-            raw_frame = await _capture_window_raw_async(_chrome_wid)
-        if raw_frame is None:
-            b64 = await loop._capture_cu_screenshot()
-            if b64 is None:
-                await asyncio.sleep(0.008)  # ~120fps yield
+            raw_frame, _ = _shm_reader.read_latest()
+            if raw_frame is None:
+                # No new SHM frame — yield and retry next cycle.
+                # DO NOT fall through to Quartz (47ms) — it caps fps at 21.
+                await asyncio.sleep(0)
                 continue
+        else:
+            # No SHM — Quartz fallback only when SHM unavailable
+            if _chrome_wid:
+                raw_frame = await _capture_window_raw_async(_chrome_wid)
+            if raw_frame is None:
+                b64 = await loop._capture_cu_screenshot()
+                if b64 is None:
+                    await asyncio.sleep(0.008)
+                    continue
         # b64 lazily encoded only when OCR or cloud needs it
 
         n_cycles += 1
