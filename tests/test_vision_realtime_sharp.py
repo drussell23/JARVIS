@@ -591,14 +591,16 @@ async def main(duration_s: int = 60):
     # Find Chrome window first
     _chrome_wid = _find_chrome_ball_window()
 
-    # Quartz per-frame capture at native resolution (~19fps ceiling)
-    # SCK native 60fps requires CFRunLoop modification in the C++ extension.
-    # Quartz CGWindowListCreateImage is the reliable path for asyncio.
+    # Try SCK native 60fps (with CFRunLoop pump fix)
     _sck_active = False
     from backend.vision.lean_loop import LeanVisionLoop
     loop = LeanVisionLoop.get_instance()
     if _chrome_wid:
-        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — {19}fps ceiling")
+        _sck_active = await _start_sck_stream(_chrome_wid)
+    if _sck_active:
+        print(f"  Capture: SCK 60fps NATIVE (wid={_chrome_wid}) — eyes fully open")
+    elif _chrome_wid:
+        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — 19fps fallback")
     else:
         loop._frame_server_proc = None
         loop._frame_server_ready = False
@@ -663,16 +665,18 @@ async def main(duration_s: int = 60):
     last_vla_time = 0.0
 
     while (time.monotonic() - t_start) < duration_s:
-        # ---- CAPTURE: Quartz targeted window → frame_server fallback ----
+        # ---- CAPTURE: SCK 60fps → Quartz fallback → frame_server fallback ----
         raw_frame: Optional[np.ndarray] = None
         b64: Optional[str] = None
 
-        if _chrome_wid:
+        if _sck_active:
+            raw_frame = await _get_sck_frame()
+        if raw_frame is None and _chrome_wid:
             raw_frame = await _capture_window_raw_async(_chrome_wid)
         if raw_frame is None:
             b64 = await loop._capture_cu_screenshot()
             if b64 is None:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.01)
                 continue
         # b64 lazily encoded only when OCR or cloud needs it
 

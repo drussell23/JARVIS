@@ -369,6 +369,10 @@ public:
     std::function<void(const StreamFrame&)> frame_callback;
     std::function<void(const std::string&)> error_callback;
 
+    // RunLoop pump thread — keeps CFRunLoop alive so SCK can deliver frames
+    std::thread runloop_thread;
+    std::atomic<bool> runloop_active{false};
+
     Impl(uint32_t wid, const StreamConfig& cfg)
         : window_id(wid), config(cfg), frame_callback(cfg.frame_callback),
           error_callback(cfg.error_callback),
@@ -392,8 +396,44 @@ public:
 #endif
     }
 
+    void start_runloop_pump() {
+#ifdef __APPLE__
+        if (runloop_active.load()) return;
+        runloop_active.store(true);
+
+        runloop_thread = std::thread([this]() {
+            @autoreleasepool {
+                // Attach a timer source so CFRunLoop doesn't exit immediately
+                NSTimer *keepAlive = [NSTimer timerWithTimeInterval:0.001
+                    repeats:YES
+                    block:^(NSTimer * _Nonnull timer) {
+                        // No-op — just keeps the RunLoop alive
+                    }];
+                [[NSRunLoop currentRunLoop] addTimer:keepAlive forMode:NSDefaultRunLoopMode];
+
+                // Pump the RunLoop until told to stop
+                while (runloop_active.load()) {
+                    @autoreleasepool {
+                        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, true);
+                    }
+                }
+
+                [keepAlive invalidate];
+            }
+        });
+#endif
+    }
+
+    void stop_runloop_pump() {
+        runloop_active.store(false);
+        if (runloop_thread.joinable()) {
+            runloop_thread.join();
+        }
+    }
+
     ~Impl() {
         stop_stream();
+        stop_runloop_pump();
 #ifdef __APPLE__
         // v29.0: Ensure capture queue is fully drained before releasing
         if (capture_queue) {
@@ -588,6 +628,12 @@ public:
             if (started) {
                 active.store(true);
                 stream_start_time = std::chrono::steady_clock::now();
+
+                // Start RunLoop pump thread — SCK's GCD callbacks need a
+                // running CFRunLoop to deliver frames. Without this, the
+                // delegate's didOutputSampleBuffer: never fires from Python.
+                start_runloop_pump();
+
                 return true;
             }
 
@@ -619,6 +665,9 @@ public:
         if (!active.load()) {
             return;
         }
+
+        // Stop RunLoop pump first (before signaling shutdown to delegates)
+        stop_runloop_pump();
 
         // v29.0: PHASE 1 - Signal shutdown to delegate callbacks FIRST
         // This ensures any in-flight or pending callbacks will early-exit
