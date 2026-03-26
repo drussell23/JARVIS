@@ -597,16 +597,15 @@ async def main(duration_s: int = 60):
     # Find Chrome window first
     _chrome_wid = _find_chrome_ball_window()
 
-    # SCK full-screen capture at 60fps (proven 23fps)
-    # Window-specific capture has delegate issues — full screen works.
-    # The tracker filters by green channel so non-ball content is ignored.
-    _sck_active = await _start_sck_stream(0)  # 0 = full screen
+    # Quartz targeted window capture — 12.5fps proven, zero GIL contention.
+    # SCK delivers 8fps at the C++ level but pybind11 GIL handoff drops to 1.2fps.
+    # Quartz via asyncio.run_in_executor properly manages GIL → 12.5fps sustained.
+    # TODO: Ouroboros target — fix SCK GIL contention via shared memory buffer.
+    _sck_active = False
     from backend.vision.lean_loop import LeanVisionLoop
     loop = LeanVisionLoop.get_instance()
-    if _sck_active:
-        print(f"  Capture: SCK FULL SCREEN 60fps — eyes open")
-    elif _chrome_wid:
-        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — fallback")
+    if _chrome_wid:
+        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — 12.5fps")
     else:
         loop._frame_server_proc = None
         loop._frame_server_ready = False
@@ -692,18 +691,17 @@ async def main(duration_s: int = 60):
     last_vla_time = 0.0
 
     while (time.monotonic() - t_start) < duration_s:
-        # ---- CAPTURE: SCK 60fps → Quartz fallback ----
+        # ---- CAPTURE: Quartz targeted window (12.5fps proven) ----
         raw_frame: Optional[np.ndarray] = None
         b64: Optional[str] = None
 
-        if _sck_active:
-            raw_frame = await _get_sck_frame()
-        # Always fall back to Quartz if SCK didn't deliver
-        if raw_frame is None and _chrome_wid:
+        if _chrome_wid:
             raw_frame = await _capture_window_raw_async(_chrome_wid)
         if raw_frame is None:
-            await asyncio.sleep(0.016)  # ~60fps yield when no frame
-            continue
+            b64 = await loop._capture_cu_screenshot()
+            if b64 is None:
+                await asyncio.sleep(0.016)
+                continue
         # b64 lazily encoded only when OCR or cloud needs it
 
         n_cycles += 1
