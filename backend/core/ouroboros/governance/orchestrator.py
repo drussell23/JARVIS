@@ -630,6 +630,55 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
 
+        # ── Advanced Repair: hierarchical localization + slow/fast thinking + doc-augmented ──
+        try:
+            from backend.core.ouroboros.governance.advanced_repair import (
+                HierarchicalFaultLocalizer, SlowFastThinkingRouter, DocAugmentedRepair,
+            )
+            _apr_blocks: list = []
+
+            # 1. Hierarchical fault localization (file → function → line)
+            _localizer = HierarchicalFaultLocalizer(self._config.project_root)
+            _error_msg = getattr(ctx, "error_pattern", "") or ctx.description
+            _locations = _localizer.localize(ctx.target_files, _error_msg)
+            _loc_prompt = _localizer.format_for_prompt(_locations)
+            if _loc_prompt:
+                _apr_blocks.append(_loc_prompt)
+
+            # 2. Slow/fast thinking router
+            _thinking = SlowFastThinkingRouter.route(
+                ctx.description, ctx.target_files,
+            )
+            _think_prompt = SlowFastThinkingRouter.format_for_prompt(_thinking)
+            if _think_prompt:
+                _apr_blocks.append(_think_prompt)
+
+            # 3. Documentation-augmented repair context
+            _doc_repair = DocAugmentedRepair(self._config.project_root)
+            _doc_context = _doc_repair.generate_docs_for_repair(ctx.target_files)
+            if _doc_context:
+                _apr_blocks.append(_doc_context)
+
+            if _apr_blocks:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                _apr_combined = "\n\n".join(_apr_blocks)
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=_existing + "\n\n" + _apr_combined,
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[Orchestrator] Advanced repair: %d blocks (localization=%d locs, "
+                    "thinking=%s, docs=%d chars) for op=%s",
+                    len(_apr_blocks), len(_locations), _thinking.depth,
+                    len(_doc_context), ctx.op_id,
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[Orchestrator] Advanced repair injection failed", exc_info=True)
+
         # ── Self-Evolution P0: Inject runtime prompt adaptations + negative constraints + code metrics ──
         try:
             from backend.core.ouroboros.governance.self_evolution import (
