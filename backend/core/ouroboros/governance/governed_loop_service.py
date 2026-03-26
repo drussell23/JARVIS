@@ -2657,6 +2657,36 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] BrowserBridge skipped: %s", exc)
 
+        # ---- Wire PromptCache (token cost reduction via prefix caching) ----
+        self._prompt_cache = None
+        try:
+            from backend.core.ouroboros.governance.prompt_cache import get_prompt_cache
+            self._prompt_cache = get_prompt_cache()
+            logger.info("[GLS] PromptCache wired (system prompt prefix caching)")
+        except Exception as exc:
+            logger.debug("[GLS] PromptCache skipped: %s", exc)
+
+        # ---- Wire SessionManager (multi-turn operation resume) ----
+        self._session_mgr = None
+        try:
+            from backend.core.ouroboros.governance.session_manager import get_session_manager
+            self._session_mgr = get_session_manager()
+            logger.info("[GLS] SessionManager wired (multi-turn session resume/fork)")
+        except Exception as exc:
+            logger.debug("[GLS] SessionManager skipped: %s", exc)
+
+        # ---- Wire PermissionClassifier (ML-based auto-approve) ----
+        self._permission_clf = None
+        try:
+            from backend.core.ouroboros.governance.permission_classifier import get_permission_classifier
+            self._permission_clf = get_permission_classifier()
+            logger.info(
+                "[GLS] PermissionClassifier wired (%d rules, weighted voting)",
+                len(self._permission_clf._rules),
+            )
+        except Exception as exc:
+            logger.debug("[GLS] PermissionClassifier skipped: %s", exc)
+
         # ---- JARVIS Tier 3: Predictive Regression Engine (background task) ----
         self._predictive_engine = None
         try:
