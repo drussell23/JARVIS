@@ -221,6 +221,8 @@ class GovernedOrchestrator:
         self._infra_applicator: Optional[Any] = None  # set via set_infra_applicator()
         self._reasoning_narrator: Optional[Any] = None  # set via set_reasoning_narrator()
         self._dialogue_store: Optional[Any] = None  # set via set_dialogue_store()
+        self._pre_action_narrator: Optional[Any] = None  # set via set_pre_action_narrator()
+        self._exploration_fleet: Optional[Any] = None  # set via set_exploration_fleet()
 
     def set_reasoning_bridge(self, bridge: Any) -> None:
         """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning."""
@@ -237,6 +239,14 @@ class GovernedOrchestrator:
     def set_dialogue_store(self, store: Any) -> None:
         """Attach an OperationDialogueStore for reasoning journal recording."""
         self._dialogue_store = store
+
+    def set_pre_action_narrator(self, narrator: Any) -> None:
+        """Attach a PreActionNarrator for real-time WHAT-is-about-to-happen voice."""
+        self._pre_action_narrator = narrator
+
+    def set_exploration_fleet(self, fleet: Any) -> None:
+        """Attach an ExplorationFleet for parallel codebase exploration."""
+        self._exploration_fleet = fleet
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
@@ -563,6 +573,15 @@ class GovernedOrchestrator:
                 logger.debug("[Orchestrator] TelemetryContextualizer not available", exc_info=True)
 
         if self._config.context_expansion_enabled:
+            # ── PreActionNarrator: voice WHAT before CONTEXT_EXPANSION ──
+            if self._pre_action_narrator is not None:
+                try:
+                    await self._pre_action_narrator.narrate_phase(
+                        "CONTEXT_EXPANSION",
+                        {"target_file": list(ctx.target_files)[0] if ctx.target_files else "unknown"},
+                    )
+                except Exception:
+                    pass
             ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
 
             # ---- Phase 2b: CONTEXT_EXPANSION ----
@@ -629,6 +648,30 @@ class GovernedOrchestrator:
                     expander.expand(ctx, expansion_deadline),
                     timeout=self._config.context_expansion_timeout_s,
                 )
+
+                # ExplorationFleet: parallel codebase exploration across Trinity repos
+                if self._exploration_fleet is not None:
+                    try:
+                        _fleet_report = await asyncio.wait_for(
+                            self._exploration_fleet.deploy(
+                                goal=ctx.description,
+                                max_agents=8,
+                            ),
+                            timeout=min(30.0, self._config.context_expansion_timeout_s / 2),
+                        )
+                        if _fleet_report.total_findings > 0:
+                            _fleet_text = self._exploration_fleet.format_for_prompt(_fleet_report)
+                            ctx = ctx.with_expanded_files(
+                                ctx.expanded_files + (f"[Fleet:{_fleet_report.total_findings}]",)
+                            )
+                            logger.info(
+                                "[Orchestrator] ExplorationFleet: %d agents, %d findings in %.1fs",
+                                _fleet_report.agents_completed,
+                                _fleet_report.total_findings,
+                                _fleet_report.duration_s,
+                            )
+                    except Exception as _fleet_exc:
+                        logger.debug("[Orchestrator] ExplorationFleet skipped: %s", _fleet_exc)
             except Exception as exc:
                 logger.warning(
                     "[Orchestrator] Context expansion failed for op=%s: %s; "
@@ -640,6 +683,17 @@ class GovernedOrchestrator:
         else:
             # Expansion disabled: skip directly from ROUTE to GENERATE
             ctx = ctx.advance(OperationPhase.GENERATE)
+
+        # ── PreActionNarrator: voice WHAT before GENERATE ──
+        if self._pre_action_narrator is not None:
+            try:
+                _provider_name = getattr(ctx, "routing_actual", None) or "unknown"
+                await self._pre_action_narrator.narrate_phase(
+                    "GENERATE",
+                    {"provider": str(_provider_name), "thinking_mode": "standard"},
+                )
+            except Exception:
+                pass
 
         # ── P2: Adaptive Learning — inject consolidated rules + success patterns ──
         try:
@@ -1023,6 +1077,15 @@ class GovernedOrchestrator:
 
         # Store generation result in context
         ctx = ctx.advance(OperationPhase.VALIDATE, generation=generation)
+
+        # ── PreActionNarrator: voice WHAT before VALIDATE ──
+        if self._pre_action_narrator is not None:
+            try:
+                await self._pre_action_narrator.narrate_phase(
+                    "VALIDATE", {"test_count": str(len(ctx.target_files))},
+                )
+            except Exception:
+                pass
 
         # ---- Phase 4: VALIDATE ----
         best_candidate: Optional[Dict[str, Any]] = None
@@ -1517,6 +1580,14 @@ class GovernedOrchestrator:
                 return ctx
 
             # APPROVED -- continue to APPLY
+
+        # ── PreActionNarrator: voice WHAT before APPLY ──
+        if self._pre_action_narrator is not None:
+            try:
+                _tf = list(ctx.target_files)[0] if ctx.target_files else "unknown"
+                await self._pre_action_narrator.narrate_phase("APPLY", {"target_file": _tf})
+            except Exception:
+                pass
 
         # ---- Phase 7: APPLY ----
         ctx = ctx.advance(OperationPhase.APPLY)

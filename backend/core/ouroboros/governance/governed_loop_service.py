@@ -2461,6 +2461,36 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] OperationDialogueStore skipped: %s", exc)
 
+        # ---- Wire PreActionNarrator (real-time WHAT-before-action voice) ----
+        try:
+            from backend.core.ouroboros.governance.pre_action_narrator import PreActionNarrator
+            _say = getattr(self, "_say_fn", None)
+            _pan = PreActionNarrator(say_fn=_say)
+            self._orchestrator.set_pre_action_narrator(_pan)
+            logger.info("[GLS] PreActionNarrator wired (real-time WHAT before each phase)")
+        except Exception as exc:
+            logger.debug("[GLS] PreActionNarrator skipped: %s", exc)
+
+        # ---- Wire ExplorationFleet (parallel codebase exploration) ----
+        try:
+            from backend.core.ouroboros.governance.exploration_fleet import ExplorationFleet
+            _fleet = ExplorationFleet(jarvis_root=self._config.project_root)
+            self._orchestrator.set_exploration_fleet(_fleet)
+            logger.info("[GLS] ExplorationFleet wired (parallel Trinity repo exploration)")
+        except Exception as exc:
+            logger.debug("[GLS] ExplorationFleet skipped: %s", exc)
+
+        # ---- Wire UnlimitedFleetOrchestrator (recursive agent spawning) ----
+        self._unlimited_fleet = None
+        try:
+            from backend.core.ouroboros.governance.unlimited_agents import UnlimitedFleetOrchestrator
+            self._unlimited_fleet = UnlimitedFleetOrchestrator(
+                jarvis_root=self._config.project_root,
+            )
+            logger.info("[GLS] UnlimitedFleetOrchestrator wired (recursive agent spawning)")
+        except Exception as exc:
+            logger.debug("[GLS] UnlimitedFleetOrchestrator skipped: %s", exc)
+
         # ---- JARVIS Tier 3: Predictive Regression Engine (background task) ----
         self._predictive_engine = None
         try:

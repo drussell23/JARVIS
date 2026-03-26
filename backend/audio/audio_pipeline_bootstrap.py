@@ -208,6 +208,17 @@ async def wire_conversation_pipeline(
     except Exception as e:
         logger.warning(f"[Bootstrap] ModeDispatcher init skipped: {e}")
 
+    # 5b. JarvisVoiceBridge — glue between ConversationManager and Ouroboros
+    try:
+        from backend.voice.jarvis_voice_bridge import create_voice_bridge
+        handle.voice_bridge = await create_voice_bridge(
+            mode_dispatcher=handle.mode_dispatcher,
+            audio_bus=audio_bus,
+        )
+        logger.info("[Bootstrap] JarvisVoiceBridge wired")
+    except Exception as e:
+        logger.debug(f"[Bootstrap] JarvisVoiceBridge skipped: {e}")
+
     # 6. Register ModeDispatcher transcript hook on voice communicator
     try:
         from backend.agi_os.realtime_voice_communicator import (

@@ -597,6 +597,21 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] CrossRepoDriftSensor skipped: %s", exc)
 
+        # ---- TodoScannerSensor (P3: unfinished work detection) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.todo_scanner_sensor import (
+                TodoScannerSensor,
+            )
+            _todo_sensor = TodoScannerSensor(
+                repo="jarvis",
+                router=self._router,
+                project_root=self._config.project_root,
+            )
+            self._sensors.append(_todo_sensor)
+            logger.info("[IntakeLayer] TodoScannerSensor added (TODO/FIXME/HACK detection)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] TodoScannerSensor skipped: %s", exc)
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:
