@@ -349,7 +349,7 @@ class VisionReflexCompiler:
                         "Authorization": f"Bearer {_DW_API_KEY}",
                         "Content-Type": "application/json",
                     },
-                    timeout=aiohttp.ClientTimeout(total=90),
+                    timeout=aiohttp.ClientTimeout(total=150),
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()

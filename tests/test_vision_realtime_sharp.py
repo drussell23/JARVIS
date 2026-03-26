@@ -338,6 +338,29 @@ async def main(duration_s: int = 60):
 
         n_cycles += 1
 
+        # ---- CHECK OUROBOROS BACKGROUND TASK ----
+        if ouroboros_task and ouroboros_task.done():
+            try:
+                ok = ouroboros_task.result()
+                compile_s = time.monotonic() - ouroboros_t0
+                if ok:
+                    tier = reflex_compiler.get_active_tier(TASK_KEY)
+                    print()
+                    print("  " + "=" * 60)
+                    print(f"   REFLEX ASSIMILATED — Tier {tier} active ({compile_s:.0f}s)")
+                    print("   397B code is now executing on live frames")
+                    print("  " + "=" * 60)
+                    jarvis_say_background(
+                        f"Ouroboros complete. Tier {tier} reflex assimilated "
+                        f"after {int(compile_s)} seconds of synthesis. "
+                        f"Local perception now active."
+                    )
+                else:
+                    print(f"  [Ouroboros] Background synthesis failed ({compile_s:.0f}s) — VLA continues")
+            except Exception as exc:
+                print(f"  [Ouroboros] Background task error: {type(exc).__name__}: {exc}")
+            ouroboros_task = None
+
         # ---- LAYER 1: Local OCR (deterministic skeleton, every cycle) ----
         t_ocr = time.monotonic()
         ocr_vals = await ocr_read_screen(b64)
@@ -470,7 +493,7 @@ async def main(duration_s: int = 60):
         await asyncio.sleep(0.3)
 
     # Cleanup
-    for task in [claude_task, dw_task]:
+    for task in [claude_task, dw_task, ouroboros_task]:
         if task and not task.done():
             task.cancel()
 
