@@ -621,6 +621,55 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
 
+        # ── Self-Evolution P0: Inject runtime prompt adaptations + negative constraints + code metrics ──
+        try:
+            from backend.core.ouroboros.governance.self_evolution import (
+                RuntimePromptAdapter, NegativeConstraintStore,
+                CodeMetricsAnalyzer, MultiVersionEvolutionTracker,
+            )
+            from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key as _edk
+
+            _se_domain = _edk(ctx.target_files, ctx.description)
+            _se_blocks: List[str] = []
+
+            # P0: Runtime prompt adaptation — learned instructions from outcomes
+            _prompt_adapter = RuntimePromptAdapter()
+            _adapted = _prompt_adapter.get_adapted_instructions(_se_domain)
+            if _adapted:
+                _se_blocks.append(_adapted)
+
+            # P0: Negative constraints — "never do X" rules
+            _neg_store = NegativeConstraintStore()
+            _neg_prompt = _neg_store.format_for_prompt(_se_domain)
+            if _neg_prompt:
+                _se_blocks.append(_neg_prompt)
+
+            # P1: Code metrics feedback — objective quality signals
+            for _tf in ctx.target_files[:3]:
+                _metrics = CodeMetricsAnalyzer.analyze(self._config.project_root / _tf)
+                if _metrics:
+                    _mf = CodeMetricsAnalyzer.format_for_prompt(_metrics)
+                    if _mf:
+                        _se_blocks.append(_mf)
+
+            if _se_blocks:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                _se_combined = "\n\n".join(_se_blocks)
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=_existing + "\n\n" + _se_combined,
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[Orchestrator] Self-evolution: injected %d blocks for domain=%s",
+                    len(_se_blocks), _se_domain,
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[Orchestrator] Self-evolution injection failed", exc_info=True)
+
         # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
         generation: Optional[GenerationResult] = None
         generate_retries_remaining = self._config.max_generate_retries
@@ -694,8 +743,30 @@ class GovernedOrchestrator:
                         {"reason": "generation_failed", "error": str(exc)},
                     )
                     return ctx
+                # P2: Dynamic Re-Planning — suggest alternative strategy on failure
+                try:
+                    from backend.core.ouroboros.governance.self_evolution import DynamicRePlanner
+                    _attempt_num = self._config.max_generate_retries - generate_retries_remaining + 1
+                    _fc = validation.failure_class or "" if 'validation' in dir() else ""
+                    _em = validation.short_summary or "" if 'validation' in dir() else ""
+                    _replan = DynamicRePlanner.suggest_replan(_fc, _em, _attempt_num)
+                    if _replan:
+                        _replan_text = DynamicRePlanner.format_for_prompt(_replan)
+                        logger.info(
+                            "[Orchestrator] Dynamic re-plan: %s (attempt %d)",
+                            _replan.trigger[:50], _attempt_num,
+                        )
+                except Exception:
+                    _replan_text = ""
+                    pass
+
                 # Retry: advance to GENERATE_RETRY with episodic memory context
                 _retry_ctx_kwargs = {}
+
+                # Inject re-plan if available
+                if _replan_text:
+                    _retry_ctx_kwargs["strategic_memory_prompt"] = _replan_text
+
                 if _episodic_memory is not None and _episodic_memory.has_failures():
                     _failure_context = _episodic_memory.format_for_prompt()
                     if _failure_context:
@@ -1502,6 +1573,44 @@ class GovernedOrchestrator:
                 )
             except Exception:
                 pass  # Positive feedback is best-effort — never block
+
+        # Self-evolution feedback: record outcome for prompt adaptation +
+        # negative constraints + evolution tracking
+        try:
+            from backend.core.ouroboros.governance.self_evolution import (
+                RuntimePromptAdapter, NegativeConstraintStore,
+                MultiVersionEvolutionTracker,
+            )
+            from backend.core.ouroboros.governance.entropy_calculator import (
+                extract_domain_key as _se_edk,
+            )
+            _se_domain = _se_edk(ctx.target_files, ctx.description)
+            _is_success = final_state in (OperationState.APPLIED,)
+
+            # P0: Record for runtime prompt adaptation
+            _pa = RuntimePromptAdapter()
+            _pa.record_outcome(
+                _se_domain, ctx.op_id, _is_success,
+                failure_class=error_pattern or "",
+            )
+
+            # P0: Add negative constraint on failure
+            if not _is_success and error_pattern:
+                _ns = NegativeConstraintStore()
+                _ns.add_constraint(
+                    _se_domain,
+                    f'Avoid pattern that caused "{error_pattern}"',
+                    f"Operation {ctx.op_id} failed: {error_pattern}",
+                    source_op_id=ctx.op_id,
+                    severity="soft",
+                )
+
+            # P2: Multi-version evolution tracking
+            _evt = MultiVersionEvolutionTracker()
+            _evt.record_operation(_is_success, len(ctx.target_files))
+
+        except Exception:
+            pass  # Self-evolution feedback is best-effort
 
     async def _run_benchmark(
         self,
