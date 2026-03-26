@@ -107,21 +107,164 @@ def _find_chrome_ball_window() -> Optional[int]:
     return None
 
 
+# ---------------------------------------------------------------------------
+# SCK Native Stream — 30fps ScreenCaptureKit (the REAL eyes-open path)
+# ---------------------------------------------------------------------------
+
+_sck_stream = None  # AsyncCaptureStream singleton
+
+
+async def _start_sck_stream(wid: int) -> bool:
+    """Start SCK in a dedicated thread with its own CFRunLoop.
+
+    SCK's GCD completion handlers need a pumped CFRunLoop. The asyncio
+    event loop does NOT pump one. Solution: run SCK in a background
+    thread that pumps CFRunLoop, and share frames via a thread-safe queue.
+    """
+    global _sck_stream, _sck_frame_queue
+    import threading
+    import queue
+
+    sck_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "backend", "native_extensions",
+    )
+    if sck_path not in sys.path:
+        sys.path.insert(0, sck_path)
+
+    _sck_frame_queue = queue.Queue(maxsize=3)
+    _sck_ready = threading.Event()
+
+    def _sck_thread():
+        """Dedicated thread: start SCK, pump CFRunLoop, push frames to queue."""
+        try:
+            import fast_capture_stream
+            config = fast_capture_stream.StreamConfig()
+            config.target_fps = 60
+            config.max_buffer_size = 3
+            config.output_format = "raw"
+            config.use_gpu_acceleration = True
+            config.drop_frames_on_overflow = True
+
+            stream = fast_capture_stream.CaptureStream(wid, config)
+            if not stream.start():
+                return
+
+            _sck_ready.set()
+
+            # Pump frames into the shared queue
+            while _sck_ready.is_set():
+                frame = stream.get_frame(50)  # 50ms timeout
+                if frame and frame.get("image") is not None:
+                    try:
+                        _sck_frame_queue.put_nowait(frame)
+                    except queue.Full:
+                        # Drop oldest, put newest
+                        try:
+                            _sck_frame_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            _sck_frame_queue.put_nowait(frame)
+                        except queue.Full:
+                            pass
+
+            stream.stop()
+        except Exception as exc:
+            print(f"  SCK thread error: {exc}")
+
+    try:
+        t = threading.Thread(target=_sck_thread, daemon=True, name="sck-capture")
+        t.start()
+
+        # Wait for SCK to be ready (up to 3s)
+        if _sck_ready.wait(timeout=3.0):
+            _sck_stream = _sck_ready  # Use as signal object
+            await asyncio.sleep(0.5)  # Let a few frames buffer
+            return True
+        return False
+    except Exception as exc:
+        print(f"  SCK stream failed: {exc}")
+        return False
+
+
+_sck_logical_size: Optional[tuple] = None
+_sck_frame_queue = None  # thread-safe queue.Queue
+
+
+async def _get_sck_frame() -> Optional[np.ndarray]:
+    """Get the latest frame from the SCK thread's queue. Zero async overhead.
+
+    The SCK thread pumps CFRunLoop and pushes frames into a queue.Queue.
+    We just pop the latest — no asyncio.to_thread, no GCD callback issues.
+    """
+    global _sck_logical_size
+    if _sck_frame_queue is None:
+        return None
+    try:
+        import queue
+        # Drain to get the LATEST frame (skip stale ones)
+        frame = None
+        while True:
+            try:
+                frame = _sck_frame_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        if frame is None:
+            return None
+        img = frame.get("image")
+        if img is None:
+            return None
+
+        # Ensure RGB
+        if img.ndim == 3 and img.shape[2] == 4:
+            img = img[:, :, [2, 1, 0]]
+        elif img.ndim != 3 or img.shape[2] != 3:
+            return None
+
+        h, w = img.shape[:2]
+
+        # Retina normalization
+        if _sck_logical_size is None:
+            _sck_logical_size = (w // 2, h // 2) if w > 1600 else (w, h)
+
+        lw, _ = _sck_logical_size
+        if w > lw * 1.5:
+            scale = w // lw
+            img = img[::scale, ::scale, :]
+
+        return img
+    except Exception:
+        return None
+
+
+async def _stop_sck_stream() -> None:
+    global _sck_stream, _sck_frame_queue
+    if _sck_stream is not None:
+        # Signal the SCK thread to stop
+        _sck_stream.clear()  # threading.Event.clear() stops the loop
+        _sck_stream = None
+    _sck_frame_queue = None
+
+
 def _capture_window_raw_numpy(wid: int) -> Optional[np.ndarray]:
     """Raw Memory Bypass: Quartz CGImage → numpy array. Zero b64. Zero PNG.
 
-    Returns RGB numpy array at CU resolution (1280x800), or None.
-    This is the fast path for the Deterministic Retina — ~15ms total.
+    Returns RGB numpy array at NATIVE resolution. Zero resize.
+    The tracker works at any resolution — np.where doesn't care about size.
     """
     try:
         import Quartz
-        from PIL import Image as _Img
 
         image_ref = Quartz.CGWindowListCreateImage(
             Quartz.CGRectNull,
-            Quartz.kCGWindowListOptionIncludingWindow,
+            Quartz.kCGWindowListOptionIncludingWindow
+            | Quartz.kCGWindowListOptionOnScreenAboveWindow,
             wid,
-            Quartz.kCGWindowImageBoundsIgnoreFraming,
+            Quartz.kCGWindowImageDefault
+            | Quartz.kCGWindowImageBoundsIgnoreFraming
+            | Quartz.kCGWindowImageNominalResolution,
         )
         if image_ref is None:
             return None
@@ -131,14 +274,9 @@ def _capture_window_raw_numpy(wid: int) -> Optional[np.ndarray]:
         provider = Quartz.CGImageGetDataProvider(image_ref)
         data = Quartz.CGDataProviderCopyData(provider)
 
-        # BGRA raw pixels → numpy (zero copy where possible)
+        # BGRA raw pixels → numpy → RGB (zero resize)
         arr = np.frombuffer(bytes(data), dtype=np.uint8).reshape((h, w, 4))
-        # BGRA → RGB (drop alpha, swap channels)
-        rgb = arr[:, :, [2, 1, 0]]
-
-        # Resize to CU resolution via PIL (LANCZOS for quality)
-        img = _Img.fromarray(rgb).resize((1280, 800), _Img.Resampling.LANCZOS)
-        return np.array(img)
+        return arr[:, :, [2, 1, 0]]
     except Exception:
         return None
 
@@ -155,9 +293,15 @@ async def _capture_window_raw_async(wid: int) -> Optional[np.ndarray]:
 
 
 def _numpy_to_b64(frame: np.ndarray) -> str:
-    """Slow path: encode numpy → b64 PNG. Only for cloud model API calls."""
+    """Slow path: encode numpy → b64 PNG. Only for cloud model API calls.
+
+    Resizes to 1280x800 HERE (not in the capture path) because cloud APIs
+    have token limits on image size. This runs every ~8s, not every frame.
+    """
     from PIL import Image as _Img
     img = _Img.fromarray(frame)
+    if img.width != 1280 or img.height != 800:
+        img = img.resize((1280, 800), _Img.Resampling.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
@@ -181,7 +325,7 @@ class BallTracker:
     Bounce counts come from OCR reading the HUD — the scoreboard, not physics.
     """
 
-    EDGE_MARGIN = 40
+    EDGE_MARGIN_PCT = 0.04   # 4% of frame dimension = edge zone
     HISTORY_SIZE = 6
 
     def __init__(self) -> None:
@@ -264,7 +408,7 @@ class BallTracker:
 
     def _predict_wall(self, w: int, h: int) -> None:
         candidates = []
-        m = self.EDGE_MARGIN
+        m = int(max(w, h) * self.EDGE_MARGIN_PCT)
         if self.vel_x > 0.5:
             f = (w - m - self.ball_x) / self.vel_x
             if f > 0:
@@ -444,22 +588,24 @@ async def main(duration_s: int = 60):
     except Exception:
         pass
 
-    # Start capture
+    # Find Chrome window first
+    _chrome_wid = _find_chrome_ball_window()
+
+    # Quartz per-frame capture at native resolution (~19fps ceiling)
+    # SCK native 60fps requires CFRunLoop modification in the C++ extension.
+    # Quartz CGWindowListCreateImage is the reliable path for asyncio.
+    _sck_active = False
     from backend.vision.lean_loop import LeanVisionLoop
     loop = LeanVisionLoop.get_instance()
-    # Force fresh frame_server for main-display-only capture
-    loop._frame_server_proc = None
-    loop._frame_server_ready = False
-    await loop._ensure_frame_server()
-    if loop._frame_server_ready:
-        await asyncio.sleep(2.0)
-
-    # Find Chrome bouncing ball window ID for targeted capture
-    _chrome_wid = _find_chrome_ball_window()
     if _chrome_wid:
-        print(f"  Capture: ONLINE (Chrome window wid={_chrome_wid})")
+        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — {19}fps ceiling")
     else:
-        print("  Capture: ONLINE (full main display — Chrome window not found)")
+        loop._frame_server_proc = None
+        loop._frame_server_ready = False
+        await loop._ensure_frame_server()
+        if loop._frame_server_ready:
+            await asyncio.sleep(2.0)
+        print("  Capture: frame_server (full main display)")
 
     # Initialize cloud clients
     claude_client = None
@@ -517,20 +663,18 @@ async def main(duration_s: int = 60):
     last_vla_time = 0.0
 
     while (time.monotonic() - t_start) < duration_s:
-        # ---- CAPTURE: Dual-Output Router ----
-        # Raw numpy for Deterministic Retina (reflex), b64 only when needed.
+        # ---- CAPTURE: Quartz targeted window → frame_server fallback ----
         raw_frame: Optional[np.ndarray] = None
         b64: Optional[str] = None
 
         if _chrome_wid:
             raw_frame = await _capture_window_raw_async(_chrome_wid)
         if raw_frame is None:
-            # Fallback: frame_server → b64
             b64 = await loop._capture_cu_screenshot()
             if b64 is None:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.05)
                 continue
-        # b64 is lazily encoded from raw_frame ONLY when OCR or cloud needs it
+        # b64 lazily encoded only when OCR or cloud needs it
 
         n_cycles += 1
 
@@ -669,6 +813,8 @@ async def main(duration_s: int = 60):
         )
         if both_done:
             n_vla_cycles += 1
+            cl_quad = []
+            dw_quad = []
             _cross_validate(
                 pending_claude, pending_dw, pending_ocr_snapshot,
                 n_vla_cycles,
@@ -762,8 +908,9 @@ async def main(duration_s: int = 60):
                         _doubleword_vision(b64)
                     )
 
-        # Continuous tracking: ~15fps. Throttle slightly to share CPU.
-        await asyncio.sleep(0.06)
+        # Minimal sleep: let asyncio process other tasks (OCR, cloud, speech)
+        # The capture itself takes ~47ms so total cycle is ~57ms = ~17fps
+        await asyncio.sleep(0.01)
 
     # Cleanup
     for task in [claude_task, dw_task, ouroboros_task, ocr_bg_task]:
@@ -797,8 +944,12 @@ async def main(duration_s: int = 60):
     await jarvis_say(summary)
 
     print("=" * 70 + "\n")
-    if loop._frame_server_proc and loop._frame_server_proc.returncode is None:
-        loop._frame_server_proc.terminate()
+    await _stop_sck_stream()
+    try:
+        if not _sck_active and loop._frame_server_proc and loop._frame_server_proc.returncode is None:
+            loop._frame_server_proc.terminate()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
