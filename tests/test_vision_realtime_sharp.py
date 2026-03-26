@@ -641,7 +641,28 @@ async def main(duration_s: int = 60):
 
     # --- Ball Tracker: primary perception (deterministic, ~2ms/frame) ---
     tracker = BallTracker()
-    print(f"  Ball Tracker: ONLINE (deterministic numpy, ~2ms/frame)")
+    # Get Chrome window bounds for cropping full-screen captures
+    _crop_region = None  # (x, y, w, h) or None for no crop
+    if _chrome_wid:
+        try:
+            import Quartz as _Q
+            _wins = _Q.CGWindowListCopyWindowInfo(
+                _Q.kCGWindowListOptionOnScreenOnly, _Q.kCGNullWindowID,
+            )
+            for _w in _wins:
+                if _w.get("kCGWindowNumber", 0) == _chrome_wid:
+                    _b = _w.get("kCGWindowBounds", {})
+                    _crop_region = (
+                        int(_b.get("X", 0)), int(_b.get("Y", 0)),
+                        int(_b.get("Width", 0)), int(_b.get("Height", 0)),
+                    )
+                    break
+        except Exception:
+            pass
+    if _crop_region:
+        print(f"  Ball Tracker: ONLINE + crop to Chrome region {_crop_region}")
+    else:
+        print(f"  Ball Tracker: ONLINE (full screen, no crop)")
 
     print(f"\n  Running {duration_s}s...\n  " + "-" * 60)
 
@@ -715,6 +736,18 @@ async def main(duration_s: int = 60):
 
         # ---- PRIMARY: Ball Tracker (spatial) + OCR (scoreboard) ----
         if raw_frame is not None:
+            # Crop to Chrome window region (removes dock, menu bar, other green)
+            if _crop_region:
+                cx, cy, cw, ch = _crop_region
+                h_f, w_f = raw_frame.shape[:2]
+                # Clamp to frame bounds
+                y1 = max(0, min(cy, h_f))
+                y2 = max(0, min(cy + ch, h_f))
+                x1 = max(0, min(cx, w_f))
+                x2 = max(0, min(cx + cw, w_f))
+                if y2 > y1 and x2 > x1:
+                    raw_frame = raw_frame[y1:y2, x1:x2]
+
             t_track = time.monotonic()
             tracker_state = tracker.process_frame(raw_frame)
             track_ms = (time.monotonic() - t_track) * 1000
