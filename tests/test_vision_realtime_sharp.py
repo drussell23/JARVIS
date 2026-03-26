@@ -90,18 +90,27 @@ def jarvis_say_background(text: str, voice: str = "Daniel") -> None:
 # ---------------------------------------------------------------------------
 
 def _find_chrome_ball_window() -> Optional[int]:
-    """Find the Chrome window ID showing the bouncing ball."""
+    """Find the Chrome window ID showing the bouncing ball.
+
+    Uses kCGWindowListOptionAll (not OnScreenOnly) so it finds the window
+    even when the terminal has stolen focus or Chrome is behind other windows.
+    """
     try:
         import Quartz
-        windows = Quartz.CGWindowListCopyWindowInfo(
+        # Search ALL windows, not just on-screen — fixes the crop bug
+        # where the window wasn't found after terminal stole focus
+        for option in [
             Quartz.kCGWindowListOptionOnScreenOnly,
-            Quartz.kCGNullWindowID,
-        )
-        for w in windows:
-            owner = w.get("kCGWindowOwnerName", "")
-            title = w.get("kCGWindowName", "")
-            if "Chrome" in owner and "Bouncing Ball" in str(title):
-                return w.get("kCGWindowNumber", 0)
+            0x0,  # kCGWindowListOptionAll (includes off-screen)
+        ]:
+            windows = Quartz.CGWindowListCopyWindowInfo(
+                option, Quartz.kCGNullWindowID,
+            )
+            for w in windows:
+                owner = w.get("kCGWindowOwnerName", "")
+                title = w.get("kCGWindowName", "")
+                if "Chrome" in owner and "Bouncing Ball" in str(title):
+                    return w.get("kCGWindowNumber", 0)
     except Exception:
         pass
     return None

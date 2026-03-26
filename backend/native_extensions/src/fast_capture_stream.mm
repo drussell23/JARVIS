@@ -286,11 +286,27 @@ struct CallbackGuard {
             frame.height = (int)dst_h;
             frame.memory_used = dst_size;
         } else {
-            // Non-retina: direct copy (already small enough)
-            size_t dataSize = bytesPerRow * height;
-            frame.data.resize(dataSize);
-            std::memcpy(frame.data.data(), baseAddress, dataSize);
-            frame.memory_used = dataSize;
+            // Non-retina: copy with stride correction.
+            // bytesPerRow may include padding (e.g., 5792 for 1440*4=5760).
+            // Python reshapes as (height, width, 4) so we must strip padding.
+            size_t tight_row = width * 4;
+            if (bytesPerRow == tight_row) {
+                // No padding — fast single memcpy
+                size_t dataSize = tight_row * height;
+                frame.data.resize(dataSize);
+                std::memcpy(frame.data.data(), baseAddress, dataSize);
+                frame.memory_used = dataSize;
+            } else {
+                // Strip row padding — copy row by row
+                size_t dataSize = tight_row * height;
+                frame.data.resize(dataSize);
+                const uint8_t* src = static_cast<const uint8_t*>(baseAddress);
+                uint8_t* dst = frame.data.data();
+                for (size_t y = 0; y < height; y++) {
+                    std::memcpy(dst + y * tight_row, src + y * bytesPerRow, tight_row);
+                }
+                frame.memory_used = dataSize;
+            }
         }
     } else {
         // Compression path: Convert to JPEG/PNG
