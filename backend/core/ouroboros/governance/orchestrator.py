@@ -449,12 +449,27 @@ class GovernedOrchestrator:
                 except ImportError:
                     pass
 
+                # WebSearchCapability: structured search with epistemic allowlist
+                _web_search = None
+                try:
+                    from backend.core.ouroboros.governance.web_search import WebSearchCapability
+                    _ws = WebSearchCapability()
+                    if _ws.is_available:
+                        _web_search = _ws
+                        logger.debug(
+                            "[Orchestrator] WebSearchCapability available (backend=%s)",
+                            _ws.backend_name,
+                        )
+                except ImportError:
+                    pass
+
                 expander = ContextExpander(
                     generator=self._generator,
                     repo_root=self._config.project_root,
                     oracle=getattr(self._stack, "oracle", None),
                     skill_registry=_skill_registry,
                     doc_fetcher=_doc_fetcher,
+                    web_search=_web_search,
                 )
                 ctx = await asyncio.wait_for(
                     expander.expand(ctx, expansion_deadline),

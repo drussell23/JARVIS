@@ -52,12 +52,14 @@ class ContextExpander:
         oracle: Optional[Any] = None,
         skill_registry: Optional[Any] = None,   # Optional[SkillRegistry]
         doc_fetcher: Optional[Any] = None,       # Optional[DocFetcher]
+        web_search: Optional[Any] = None,        # Optional[WebSearchCapability]
     ) -> None:
         self._generator = generator
         self._repo_root = repo_root
         self._oracle = oracle
         self._skill_registry = skill_registry
         self._doc_fetcher = doc_fetcher
+        self._web_search = web_search
 
     async def expand(
         self,
@@ -180,7 +182,36 @@ class ContextExpander:
                         ctx.op_id, doc_exc,
                     )
 
-            if not confirmed and not external_docs:
+            # Web search: if the model requested search queries, execute them
+            # Deterministic: API call + domain filter. Agentic: query content.
+            search_queries = self._parse_search_queries(raw)
+            if search_queries and self._web_search is not None:
+                try:
+                    for query in search_queries[:2]:  # Max 2 searches per round
+                        search_response = await self._web_search.search_and_fetch(query)
+                        if search_response.results:
+                            _search_text = self._web_search.format_for_prompt(search_response)
+                            _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                            ctx = ctx.with_strategic_memory_context(
+                                strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                                strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                                strategic_memory_prompt=_existing + "\n\n" + _search_text,
+                                strategic_memory_digest=ctx.strategic_memory_digest,
+                            )
+                            logger.info(
+                                "[ContextExpander] op=%s round=%d: web search for %r "
+                                "returned %d results (%d filtered)",
+                                ctx.op_id, round_num + 1, query[:40],
+                                len(search_response.results),
+                                search_response.filtered_count,
+                            )
+                except Exception as search_exc:
+                    logger.debug(
+                        "[ContextExpander] op=%s web search failed: %s",
+                        ctx.op_id, search_exc,
+                    )
+
+            if not confirmed and not external_docs and not search_queries:
                 logger.debug(
                     "[ContextExpander] op=%s round=%d: none of %d requested files found on disk",
                     ctx.op_id, round_num + 1, len(new_paths),
@@ -243,11 +274,13 @@ class ContextExpander:
             f"{available_section}"
             f"Which additional files (if any) would help understand the context for this task?\n"
             f"List only files that exist in the codebase. Do NOT request the target files themselves.\n"
-            f"If you need documentation for an external Python package, list its PyPI name in external_package_docs.\n\n"
+            f"If you need documentation for an external Python package, list its PyPI name in external_package_docs.\n"
+            f"If you need to search for a solution to a specific technical problem, provide a search query in search_queries.\n\n"
             f"Return ONLY this JSON:\n"
             f'{{"schema_version": "expansion.1", '
             f'"additional_files_needed": ["path/relative/to/repo.py", ...], '
             f'"external_package_docs": ["package-name", ...], '
+            f'"search_queries": ["how to handle aiohttp session timeout python", ...], '
             f'"reasoning": "<one sentence max 200 chars>"}}'
         )
 
@@ -380,6 +413,37 @@ class ContextExpander:
             if isinstance(d, str) and d.strip() and len(d.strip()) < 100
         ]
         return valid[:MAX_FILES_PER_ROUND]
+
+    def _parse_search_queries(self, raw: str) -> List[str]:
+        """Extract search_queries from expansion response.
+
+        Returns list of search query strings. Empty on any error.
+        Bounded to 2 queries per round (governor limit).
+        """
+        try:
+            stripped = raw.strip()
+            if stripped.startswith("```"):
+                lines = stripped.split("\n")
+                stripped = "\n".join(
+                    line for line in lines if not line.startswith("```")
+                ).strip()
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+        if not isinstance(data, dict):
+            return []
+
+        queries = data.get("search_queries", [])
+        if not isinstance(queries, list):
+            return []
+
+        # Sanitize: valid strings, bounded length, max 2
+        valid = [
+            q.strip() for q in queries
+            if isinstance(q, str) and 5 < len(q.strip()) < 200
+        ]
+        return valid[:2]
 
     def _inject_skill_instructions(self, ctx: "OperationContext") -> "OperationContext":
         """Append matched skill instructions to ctx.human_instructions (GAP 4).
