@@ -823,6 +823,86 @@ Subsequent reads: local numpy reflex (~5ms) replaces cloud API (~8s)
 
 ---
 
+## Ouroboros 60fps Target: CapabilityGapEvent for 397B Resolution
+
+> **Status:** OPEN -- awaiting next Ouroboros Neuro-Compilation cycle
+> **Current baseline:** 13.7fps (27x over 0.5fps screenshot baseline)
+> **Target:** 60fps continuous vision (human-equivalent perception)
+
+### The Goal
+
+JARVIS must see at 60fps -- the same frame rate as human visual perception. At 13.7fps, JARVIS sees a new frame every 73ms. The ball moves ~24 pixels between frames. At 60fps, it would move ~5 pixels -- smooth, continuous tracking with sub-centimeter positional accuracy.
+
+### The Architecture (Complete)
+
+The zero-copy shared memory ring buffer is built and operational:
+
+```
+C++ SCK Daemon (ScreenCaptureKit, 60fps target)
+  |
+  v
+5-Slot POSIX Shared Memory Ring Buffer (/jarvis_frame_bridge)
+  |  - C++ writes BGRA pixels via memcpy (~0.5ms per frame)
+  |  - Atomic latest_index update (lock-free)
+  |  - 4 slots of burst headroom
+  |
+  v
+Python numpy.frombuffer() -- ZERO COPY
+  |  - Array VIEW over mmap, no data copied
+  |  - No GIL acquired for the read
+  |  - No pybind11 function call overhead
+  |
+  v
+BallTracker (subsampled green channel, ~3ms per frame)
+  |
+  v
+VLA Narration (fused HUD scoreboard + spatial prediction)
+```
+
+### The Two Blocking Bugs (397B Architect Targets)
+
+These bugs represent a **CapabilityGapEvent** for the Ouroboros pipeline. The 397B reasoning model will be tasked with generating the C++ patches.
+
+**Bug 1: Retina Stride (Critical)**
+
+On Apple Retina displays, `CVPixelBufferGetBytesPerRow(imageBuffer)` returns a value larger than `width * 4` due to memory alignment padding. The C++ downsampler in `processSampleBuffer` uses `bytesPerRow` for the source but `width * 4` for the destination stride, causing:
+
+- Mixed logical/retina resolution frames in the SHM ring buffer
+- Ball position coordinates alternating between (734,42) and (2108,416)
+- Velocity calculation instability ("drifting" heading)
+
+**Fix specification:** The downsampler loop must use `bytesPerRow` as the source row stride (not `width * 4`). The destination row stride is `dst_w * 4`. Each source row starts at `src + (y * 2) * bytesPerRow`, not `src + (y * 2) * width * 4`.
+
+**Bug 2: Window Crop (High)**
+
+Chrome window detection via `CGWindowListCopyWindowInfo` fails when the Python process starts after Chrome lost focus. The `_find_chrome_ball_window()` function searches `kCGWindowListOptionOnScreenOnly` which excludes windows in other Spaces or behind fullscreen apps.
+
+**Fix specification:** Use `kCGWindowListOptionAll` instead of `OnScreenOnly`, or cache the window ID at test startup before the Python terminal steals focus.
+
+### The Ouroboros Directive
+
+When these bugs are fed to the 397B as a CapabilityGapEvent:
+
+1. The 397B receives: the C++ source code of `processSampleBuffer`, the bug descriptions above, and a sample retina frame showing the stride mismatch
+2. The 397B generates: a corrected `processSampleBuffer` with proper `bytesPerRow` stride handling
+3. The Reactor Core sandbox validates: compile the patch, run against a test frame, verify uniform coordinates
+4. Ouroboros graduates: the patch is applied to `fast_capture_stream.mm` via a governed Git commit
+
+This is Neuro-Compilation applied to the organism's own sensory hardware. The 397B doesn't just write Python reflexes -- it fixes the C++ retina that feeds those reflexes.
+
+### Session Progress
+
+| Milestone | FPS | Method | Improvement |
+|-----------|-----|--------|-------------|
+| Claude Desktop screenshots | 0.5fps | Periodic screencapture | Baseline |
+| Visual Telemetry + frame_server | 1.7fps | Quartz CGWindowListCreateImage | 3.4x |
+| Ghost display fix | 9.0fps | Main display only capture | 18x |
+| PIL resize removed | 12.5fps | Native resolution tracking | 25x |
+| SHM zero-copy ring buffer | 13.7fps | POSIX shm + numpy.frombuffer | 27x |
+| **Target** | **60fps** | **Retina stride fix + window crop** | **120x** |
+
+---
+
 ## Open Questions for Doubleword
 
 1. **Reasoning model token guide:** Is there published documentation on minimum `max_tokens` for `Qwen3.5-35B` and `Qwen3.5-397B` reasoning models? Specifically, what is the typical reasoning overhead in tokens for a 500-token code generation task?

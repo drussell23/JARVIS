@@ -204,6 +204,13 @@ The reasoning model runs in the background (`asyncio.create_task`) -- the VLA lo
 - `ouroboros.cognitive_inefficiency@1.0.0` -- graduation threshold breached
 - `ouroboros.reflex_graduation@1.0.0` -- successful reflex assimilation
 
+**Current baseline: 13.7fps (27x over screenshots). Target: 60fps.**
+
+The zero-copy shared memory ring buffer (`shm_frame_bridge.h`) eliminates the pybind11 GIL bottleneck. The C++ SCK daemon writes BGRA frames into a 5-slot POSIX shm ring buffer at up to 21fps. Python reads the latest slot via `numpy.frombuffer()` -- zero copy, zero GIL. Two C++ bugs block the path to 60fps (documented as Ouroboros CapabilityGapEvents for 397B resolution):
+
+1. **Retina Stride Bug**: `bytesPerRow != width * 4` on retina displays causes the C++ downsampler to produce mixed-resolution frames. The SHM writer receives alternating logical/retina coordinates, breaking velocity tracking.
+2. **Window Crop Bug**: Chrome window detection via `CGWindowListCopyWindowInfo` fails intermittently when the terminal steals focus, forcing full-screen processing and green-pixel noise from non-ball UI elements.
+
 ### Lean Vision Loop (UI Automation)
 
 **`backend/vision/lean_loop.py`**
