@@ -2631,6 +2631,32 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] ScheduledAgentRunner skipped: %s", exc)
 
+        # ---- Wire MultiFileRefactorEngine (P2: atomic cross-file changes) ----
+        self._refactor_engine = None
+        try:
+            from backend.core.ouroboros.governance.multi_file_refactor import MultiFileRefactorEngine
+            self._refactor_engine = MultiFileRefactorEngine(
+                project_root=self._config.project_root,
+            )
+            logger.info("[GLS] MultiFileRefactorEngine wired (atomic cross-file refactoring)")
+        except Exception as exc:
+            logger.debug("[GLS] MultiFileRefactorEngine skipped: %s", exc)
+
+        # ---- Wire BrowserBridge (P2: visual verification in pipeline) ----
+        self._browser_bridge = None
+        try:
+            from backend.core.ouroboros.governance.browser_bridge import get_browser_bridge
+            _bridge = get_browser_bridge()
+            if _bridge.is_available:
+                self._browser_bridge = _bridge
+                logger.info(
+                    "[GLS] BrowserBridge wired (backend=%s)", _bridge.backend_name
+                )
+            else:
+                logger.debug("[GLS] BrowserBridge: no backend available")
+        except Exception as exc:
+            logger.debug("[GLS] BrowserBridge skipped: %s", exc)
+
         # ---- JARVIS Tier 3: Predictive Regression Engine (background task) ----
         self._predictive_engine = None
         try:
