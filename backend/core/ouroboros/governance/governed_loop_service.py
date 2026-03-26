@@ -1030,6 +1030,40 @@ class GovernedLoopService:
     # Submit
     # ------------------------------------------------------------------
 
+    async def submit_background(
+        self,
+        ctx: OperationContext,
+        trigger_source: str = "unknown",
+    ) -> str:
+        """Submit an operation for non-blocking background execution.
+
+        Returns the op_id immediately. Use get_background_result(op_id)
+        to poll for completion.
+
+        Falls back to synchronous submit() if BackgroundAgentPool is not available.
+        """
+        if self._bg_pool is not None:
+            try:
+                op_id = await self._bg_pool.submit(ctx)
+                logger.info(
+                    "[GovernedLoop] Background op submitted: %s (trigger=%s)",
+                    op_id, trigger_source,
+                )
+                return op_id
+            except Exception as exc:
+                logger.warning(
+                    "[GovernedLoop] Background submit failed, falling back to sync: %s", exc
+                )
+        # Fallback: run synchronously
+        result = await self.submit(ctx, trigger_source)
+        return result.op_id
+
+    def get_background_result(self, op_id: str) -> Any:
+        """Poll for a background operation result. Returns None if not ready."""
+        if self._bg_pool is not None:
+            return self._bg_pool.get_result(op_id)
+        return None
+
     async def submit(
         self,
         ctx: OperationContext,
