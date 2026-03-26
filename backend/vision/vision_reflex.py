@@ -121,7 +121,8 @@ class VisionReflexCompiler:
         self._ocr_server_proc: Optional[Any] = None
         self._ocr_server_ready: bool = False
         self._graduation_log: List[Dict[str, Any]] = []
-        self._tier_active: Dict[str, int] = {}  # task_key -> active tier (0, 1, 2, 3)
+        self._tier_active: Dict[str, int] = {}  # task_key -> active tier (0, 1, 2, 3, 4)
+        self._last_cross_validation: Optional[Dict[str, Any]] = None
 
     @classmethod
     def get_instance(cls) -> VisionReflexCompiler:
@@ -145,6 +146,24 @@ class VisionReflexCompiler:
 
     def get_call_count(self, task_key: str) -> int:
         return self._call_counts.get(task_key, 0)
+
+    def feed_cross_validation(
+        self,
+        claude_result: Optional[str],
+        dw_result: Optional[str],
+        ocr_vals: Dict[str, str],
+        position_consensus: str,
+        motion_consensus: str,
+    ) -> None:
+        """Feed cross-validation consensus data as Ouroboros learning signal."""
+        self._last_cross_validation = {
+            "claude": claude_result or "",
+            "dw": dw_result or "",
+            "ocr": ocr_vals,
+            "position_consensus": position_consensus,
+            "motion_consensus": motion_consensus,
+            "timestamp": time.time(),
+        }
 
     # ------------------------------------------------------------------
     # Reflex compilation
@@ -301,35 +320,16 @@ class VisionReflexCompiler:
         status("Handing frame + 235B output to 397B Architect for code synthesis...")
 
         architect_prompt = (
-            "You are a code generation engine for an AI vision system. "
-            "Your job: write a FAST Python function that extracts the SAME "
-            "data that a slow VLM extracted, but using only numpy/PIL.\n\n"
-            "The VLM analyzed a screenshot and found these values:\n"
-            f"  {json.dumps(last_ocr_result)}\n\n"
-            f"The VLM's natural language analysis:\n  {vision_analysis}\n\n"
-            "The screenshot shows green monospace text on a dark background "
-            "in the top-left corner (HUD overlay). The text contains lines like "
-            "'Horizontal Bounces: 123', 'Vertical Bounces: 456', etc.\n\n"
-            "Write a Python function with this EXACT signature:\n\n"
-            "def reflex_extract(b64_png: str) -> dict:\n"
-            "    '''Extract HUD values from a base64 PNG. Returns dict with "
-            "keys: horizontal, vertical, total, speed (all str values).'''\n\n"
-            "Requirements:\n"
-            "- Import only: base64, io, re, numpy, PIL.Image\n"
-            "- Decode the base64 PNG to a numpy array\n"
-            "- Crop the top-left ~40% x ~25% (the HUD region)\n"
-            "- Isolate green text pixels (green channel > 120, red < 130, "
-            "blue < 130)\n"
-            "- Create a clean binary image, scale up 3x\n"
-            "- Save to a temp file and use subprocess to run the Apple Vision "
-            "OCR binary at this path: '/tmp/claude/jarvis_ocr_server' with "
-            "the image path as an argument. Parse JSON output.\n"
-            "- If the binary doesn't exist, fall back to returning an empty dict\n"
-            "- Parse the text with regex for 'Horizontal Bounces: N', etc.\n"
-            "- Return a dict like: {'horizontal': '123', 'vertical': '456', "
-            "'total': '579', 'speed': '331'}\n\n"
-            "Return ONLY the Python function. No markdown, no explanation, "
-            "no backticks. Just the raw Python code starting with 'def'."
+            "Write def reflex_extract(b64_png: str) -> dict.\n"
+            "Decode PNG with PIL+numpy. Green ball on dark background.\n"
+            "1. ball centroid: pixels where green>200, np.mean of coords → ball_x,ball_y\n"
+            "2. quadrant: top-left/top-right/bottom-left/bottom-right from ball vs midpoint\n"
+            "3. trail: compare bright core (g>240) centroid vs all-green centroid → direction\n"
+            "4. HUD: crop(0,0,w*0.4,h*0.25), threshold g>120, save tmp png, "
+            "subprocess.run(['/tmp/claude/jarvis_ocr_server',path]) → JSON, "
+            "regex r'Horizontal.*?(\\d+)' etc\n"
+            "Return: horizontal,vertical,total,speed(str), ball_x,ball_y(int), "
+            "quadrant,trail_direction(str). try/except. No markdown."
         )
 
         try:
@@ -349,7 +349,7 @@ class VisionReflexCompiler:
                         "Authorization": f"Bearer {_DW_API_KEY}",
                         "Content-Type": "application/json",
                     },
-                    timeout=aiohttp.ClientTimeout(total=60),
+                    timeout=aiohttp.ClientTimeout(total=90),
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
@@ -358,14 +358,18 @@ class VisionReflexCompiler:
                         return None, None
                     data = await resp.json()
                     msg = data["choices"][0]["message"]
-                    # 397B is a reasoning model: code may be in
-                    # 'content' (final answer) or 'reasoning' (CoT).
+                    # 397B is a reasoning model: code is in 'content',
+                    # chain-of-thought is in 'reasoning'.
                     generated_code = msg.get("content", "") or ""
                     if not generated_code.strip():
-                        # Fallback: extract code from reasoning field
-                        generated_code = msg.get("reasoning", "") or ""
+                        # Extract code block from reasoning if content empty
+                        reasoning = msg.get("reasoning", "") or ""
+                        # Find the last def statement in reasoning
+                        idx = reasoning.rfind("def reflex_extract")
+                        if idx >= 0:
+                            generated_code = reasoning[idx:]
         except Exception as exc:
-            status(f"397B API call failed: {exc}")
+            status(f"397B API call failed: {type(exc).__name__}: {exc}")
             logger.debug("[Ouroboros:T4] 397B error: %s", exc, exc_info=True)
             return None, None
 
@@ -391,8 +395,25 @@ class VisionReflexCompiler:
             status(f"  | {line}")
 
         # Step 3: Sandbox exec — compile the generated code
+        # The 397B's code uses imports (base64, numpy, PIL, etc.)
+        # We must provide these in the sandbox globals so they're
+        # available when the function executes, not just at compile time.
         try:
-            sandbox: Dict[str, Any] = {}
+            import numpy as _np
+            from PIL import Image as _PILImage
+            sandbox: Dict[str, Any] = {
+                "__builtins__": __builtins__,
+                "base64": base64,
+                "io": io,
+                "os": os,
+                "re": re,
+                "json": json,
+                "subprocess": subprocess,
+                "np": _np,
+                "numpy": _np,
+                "Image": _PILImage,
+                "tempfile": __import__("tempfile"),
+            }
             exec(compile(generated_code, "<ouroboros-tier4>", "exec"), sandbox)
             reflex_fn = sandbox.get("reflex_extract")
             if reflex_fn is None or not callable(reflex_fn):
@@ -899,14 +920,34 @@ def _validate_reflex(
     reflex_result: Dict[str, str],
     known_good: Dict[str, str],
 ) -> bool:
-    """Validate reflex output against the last known-good OCR result.
+    """Validate reflex output against the last known-good result.
 
-    The reflex must extract at least H and V with plausible numeric values.
-    Values may differ slightly (ball keeps bouncing) but structure must match.
+    For VLA reflexes (Tier 4), the reflex may return ball position + quadrant
+    even if OCR text extraction partially failed. We validate what it CAN do:
+      - If it has numeric H/V/T: validate those
+      - If it has ball_x/ball_y/quadrant: that alone is valid (spatial perception)
+      - Must have SOMETHING useful — empty dict fails
     """
     if not reflex_result:
         return False
 
+    # VLA reflex: ball position is valid even without text
+    has_ball = (
+        "ball_x" in reflex_result
+        and "ball_y" in reflex_result
+        and "quadrant" in reflex_result
+    )
+    if has_ball:
+        try:
+            bx = int(reflex_result["ball_x"])
+            by = int(reflex_result["ball_y"])
+            q = reflex_result["quadrant"]
+            if bx >= 0 and by >= 0 and q and q != "unknown":
+                return True
+        except (ValueError, TypeError):
+            pass
+
+    # Text extraction: need at least H and V as digits
     required = {"horizontal", "vertical"}
     if not required.issubset(reflex_result.keys()):
         return False

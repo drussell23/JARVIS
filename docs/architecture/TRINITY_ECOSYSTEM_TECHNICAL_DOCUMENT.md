@@ -1282,10 +1282,11 @@ Architectural documents tend toward aspiration. This section aims for accuracy. 
 
 | Metric | Value | Context |
 |--------|-------|---------|
-| **Total lines across Trinity** | **~2.13 million** | All three repos, excluding venvs, worktrees, and __pycache__ |
-| JARVIS (Body) lines | ~1.89M (3,433 files) | Includes ~302K test lines, ~50K deprecated |
-| J-Prime (Mind) lines | ~139K (193 files) | Model serving, reasoning sidecar, brain selector |
-| Reactor Core (Soul) lines | ~102K (152 files) | Governance pipeline, graduation, experience |
+| **Total lines across Trinity** | **~2.86 million** | All three repos, all file types, excluding venvs/worktrees/__pycache__ |
+| JARVIS (Body) | ~2.59M | Python 1.89M + JS/TS 48K + C/C++/ObjC 34K + Shell 14K + Config 67K + Docs 537K |
+| J-Prime (Mind) | ~146K | Python 139K + config/docs 7K |
+| Reactor Core (Soul) | ~121K | Python 102K + config/docs 19K |
+| Python code only (all repos) | ~2.13M | 3,778 files across three repos |
 | Total commits | 5,664 | Since August 13, 2025 (project inception) |
 | Commit velocity | 230 → 632 → 2,368 / period | Month 1 → Month 5 → Last 6 weeks — accelerating |
 | Microkernel (`unified_supervisor.py`) | 101,984 lines | Single file, hand-written orchestration logic |
