@@ -1,16 +1,36 @@
 """
-BrowserBridge — Connect the governance pipeline to browser automation.
+Browser Automation Bridge -- Governance-to-Browser Visual Verification
+=======================================================================
 
-Enables visual verification during VALIDATE phase: navigate to a URL,
-take screenshots, read page text, verify expected UI elements exist.
+Connects the Ouroboros governance pipeline to browser automation tools
+for visual UI verification, page text extraction, and screenshot capture.
 
-Supports two backends (auto-detected):
-  1. Playwright (via subprocess — never imported directly)
-  2. MCP browser server (placeholder for claude-in-chrome integration)
+Supports two backends:
+  - **playwright**: Runs a lightweight Playwright script via subprocess
+    (argv-based, no shell).  Does NOT import playwright directly so the
+    module loads cleanly even when playwright is not installed.
+  - **mcp**: Placeholder for MCP browser server integration (future).
 
-Boundary Principle:
-  Deterministic: Backend detection, subprocess invocation, result parsing.
-  Agentic: What to verify and how to interpret screenshots (via Vision).
+If neither backend is available, all operations return graceful
+``BrowserResult(success=False)`` with an explanatory error — the bridge
+never raises or blocks the governance pipeline.
+
+Boundary Principle
+------------------
+Deterministic: subprocess management, result parsing, singleton lifecycle.
+Agentic: actual page content / visual state comes from external browser.
+
+Environment Variables
+---------------------
+``JARVIS_BROWSER_BRIDGE_MODE``
+    Backend selection: ``"playwright"``, ``"mcp"``, ``"disabled"``, or
+    ``"auto"`` (default).  Auto probes playwright first, then mcp.
+``JARVIS_BROWSER_BRIDGE_TIMEOUT_S``
+    Default per-action timeout in seconds (default: 15).
+``JARVIS_BROWSER_SCREENSHOT_DIR``
+    Directory for saved screenshots (default: /tmp/jarvis_screenshots).
+``JARVIS_BROWSER_HEADLESS``
+    Set to ``"0"`` or ``"false"`` for headed browser (default: headless).
 """
 from __future__ import annotations
 
@@ -18,289 +38,511 @@ import asyncio
 import json
 import logging
 import os
-import shutil
-import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("Ouroboros.BrowserBridge")
 
-_BROWSER_MODE = os.environ.get("JARVIS_BROWSER_MODE", "auto")
-_BROWSER_TIMEOUT_S = float(os.environ.get("JARVIS_BROWSER_TIMEOUT_S", "15"))
+_MODE = os.environ.get("JARVIS_BROWSER_BRIDGE_MODE", "auto").lower()
+_DEFAULT_TIMEOUT_S = float(os.environ.get("JARVIS_BROWSER_BRIDGE_TIMEOUT_S", "15"))
 _SCREENSHOT_DIR = Path(
-    os.environ.get("JARVIS_SCREENSHOT_DIR", tempfile.gettempdir())
+    os.environ.get("JARVIS_BROWSER_SCREENSHOT_DIR", "/tmp/jarvis_screenshots")
+)
+_HEADLESS = os.environ.get("JARVIS_BROWSER_HEADLESS", "1").lower() not in (
+    "0", "false", "no",
 )
 
 
-@dataclass(frozen=True)
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
+
+@dataclass
 class BrowserAction:
-    """One browser action to perform."""
-    action_type: str  # "navigate", "click", "screenshot", "read_text", "fill_form"
-    target: str       # URL, CSS selector, or XPath
-    value: Optional[str] = None  # for fill_form
-    timeout_s: float = _BROWSER_TIMEOUT_S
+    """Describes a single browser automation action.
+
+    Attributes
+    ----------
+    action_type:
+        One of ``"navigate"``, ``"click"``, ``"screenshot"``,
+        ``"read_text"``, ``"fill_form"``.
+    target:
+        URL (for navigate/read_text), CSS selector or XPath (for click/
+        screenshot/fill_form).
+    value:
+        Text value for ``"fill_form"`` actions.
+    timeout_s:
+        Per-action timeout in seconds.
+    """
+
+    action_type: str  # "navigate" | "click" | "screenshot" | "read_text" | "fill_form"
+    target: str
+    value: Optional[str] = None
+    timeout_s: float = _DEFAULT_TIMEOUT_S
+
+    _VALID_TYPES = frozenset({
+        "navigate", "click", "screenshot", "read_text", "fill_form",
+    })
+
+    def __post_init__(self) -> None:
+        if self.action_type not in self._VALID_TYPES:
+            raise ValueError(
+                f"Invalid action_type {self.action_type!r}; "
+                f"must be one of {sorted(self._VALID_TYPES)}"
+            )
 
 
 @dataclass
 class BrowserResult:
-    """Result from a browser action."""
+    """Outcome of a single browser action.
+
+    Attributes
+    ----------
+    success:
+        True if the action completed without error.
+    action_type:
+        The action that was attempted.
+    screenshot_path:
+        Filesystem path to a saved screenshot (if applicable).
+    page_text:
+        Extracted text content from the page (if applicable).
+    error:
+        Error message if the action failed.
+    duration_s:
+        Wall-clock seconds the action took.
+    page_url:
+        The current page URL after the action (if available).
+    elements_found:
+        Number of elements matching the selector (for verify_ui).
+    """
+
     success: bool
     action_type: str
     screenshot_path: Optional[str] = None
     page_text: Optional[str] = None
     error: Optional[str] = None
     duration_s: float = 0.0
+    page_url: Optional[str] = None
+    elements_found: Optional[int] = None
+
+
+# ---------------------------------------------------------------------------
+# Backend detection
+# ---------------------------------------------------------------------------
+
+
+async def _check_playwright_async() -> bool:
+    """Async check for playwright availability via subprocess (argv, no shell)."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "python3", "-c", "import playwright; print('ok')",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5.0)
+        return proc.returncode == 0 and b"ok" in stdout
+    except (OSError, asyncio.TimeoutError):
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Playwright runner script (passed to subprocess via argv, no shell)
+# ---------------------------------------------------------------------------
+
+# This script is passed as a constant string to ``python3 -c`` via
+# ``asyncio.create_subprocess_exec`` (argv-based, safe — no shell
+# interpretation).  The action payload is passed as a separate argv
+# element (sys.argv[1]), NOT interpolated into the script string.
+
+_PLAYWRIGHT_SCRIPT = '''
+import asyncio
+import json
+import sys
+
+async def main():
+    action = json.loads(sys.argv[1])
+    action_type = action["action_type"]
+    target = action["target"]
+    value = action.get("value")
+    timeout_ms = int(action.get("timeout_s", 15) * 1000)
+    headless = action.get("headless", True)
+    screenshot_path = action.get("screenshot_path")
+
+    from playwright.async_api import async_playwright
+    result = {"success": False, "action_type": action_type}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        page = await browser.new_page()
+        page.set_default_timeout(timeout_ms)
+
+        try:
+            if action_type == "navigate":
+                await page.goto(target, wait_until="domcontentloaded")
+                result["success"] = True
+                result["page_url"] = page.url
+
+            elif action_type == "click":
+                await page.click(target)
+                result["success"] = True
+                result["page_url"] = page.url
+
+            elif action_type == "screenshot":
+                selector = target if target != "body" else None
+                path = screenshot_path or "/tmp/jarvis_screenshot.png"
+                if selector:
+                    elem = await page.query_selector(selector)
+                    if elem:
+                        await elem.screenshot(path=path)
+                    else:
+                        await page.screenshot(path=path, full_page=True)
+                else:
+                    await page.screenshot(path=path, full_page=True)
+                result["success"] = True
+                result["screenshot_path"] = path
+                result["page_url"] = page.url
+
+            elif action_type == "read_text":
+                await page.goto(target, wait_until="domcontentloaded")
+                text = await page.inner_text("body")
+                result["success"] = True
+                result["page_text"] = text[:50000]
+                result["page_url"] = page.url
+
+            elif action_type == "fill_form":
+                await page.fill(target, value or "")
+                result["success"] = True
+                result["page_url"] = page.url
+
+        except Exception as e:
+            result["error"] = str(e)
+        finally:
+            await browser.close()
+
+    print(json.dumps(result))
+
+asyncio.run(main())
+'''
+
+
+# ---------------------------------------------------------------------------
+# BrowserBridge
+# ---------------------------------------------------------------------------
 
 
 class BrowserBridge:
-    """Bridge between governance pipeline and browser automation.
+    """Browser automation bridge for governance visual verification.
 
-    Auto-detects available backend (playwright > mcp > disabled).
-    All browser interaction is via subprocess — never imports playwright
-    directly into the main process.
+    Provides a high-level async API for common browser operations.
+    Delegates to playwright subprocess or MCP server depending on
+    detected availability and configuration.
 
-    Usage:
-        bridge = BrowserBridge()
-        if bridge.is_available:
-            result = await bridge.navigate("http://localhost:3000")
-            result = await bridge.screenshot()
-            result = await bridge.verify_ui(
-                "http://localhost:3000/login",
-                expected_elements=["Sign In", "Email", "Password"],
-            )
+    Parameters
+    ----------
+    mode:
+        Backend selection: ``"playwright"``, ``"mcp"``, ``"disabled"``,
+        or ``"auto"`` (default).
     """
 
-    def __init__(self, mode: str = _BROWSER_MODE) -> None:
-        self._mode = mode
-        self._backend: Optional[str] = None
-        self._detected = False
+    def __init__(self, mode: str = "auto") -> None:
+        self._mode = mode.lower() if mode else _MODE
+        self._playwright_available: Optional[bool] = None
+        self._mcp_available: Optional[bool] = None
+        self._action_count = 0
+        self._error_count = 0
+
+    # ------------------------------------------------------------------
+    # Availability
+    # ------------------------------------------------------------------
 
     @property
     def is_available(self) -> bool:
-        if not self._detected:
-            self._detect_backend()
-        return self._backend is not None
-
-    @property
-    def backend_name(self) -> str:
-        if not self._detected:
-            self._detect_backend()
-        return self._backend or "none"
-
-    def _detect_backend(self) -> None:
-        self._detected = True
+        """True if at least one browser backend is detected."""
         if self._mode == "disabled":
-            self._backend = None
-            return
+            return False
+        if self._mode == "playwright":
+            return self._check_playwright_cached()
+        if self._mode == "mcp":
+            return self._check_mcp_cached()
+        # auto: try playwright, then mcp
+        return self._check_playwright_cached() or self._check_mcp_cached()
 
-        if self._mode in ("auto", "playwright"):
-            if shutil.which("playwright") is not None or shutil.which("npx") is not None:
-                self._backend = "playwright"
-                return
+    def _check_playwright_cached(self) -> bool:
+        """Cached playwright availability check (import probe only)."""
+        if self._playwright_available is None:
+            try:
+                import importlib.util
+                spec = importlib.util.find_spec("playwright")
+                self._playwright_available = spec is not None
+            except (ImportError, ModuleNotFoundError, ValueError):
+                self._playwright_available = False
+        return self._playwright_available
 
-        if self._mode in ("auto", "mcp"):
-            # MCP browser server — placeholder detection
-            if os.environ.get("JARVIS_MCP_BROWSER_URL"):
-                self._backend = "mcp"
-                return
+    def _check_mcp_cached(self) -> bool:
+        """Cached MCP browser server availability check."""
+        if self._mcp_available is None:
+            # MCP browser integration is a future capability;
+            # detect via env var for forward compatibility.
+            self._mcp_available = bool(
+                os.environ.get("JARVIS_MCP_BROWSER_URL")
+            )
+        return self._mcp_available
 
-        self._backend = None
+    # ------------------------------------------------------------------
+    # High-level API
+    # ------------------------------------------------------------------
 
-    async def navigate(self, url: str) -> BrowserResult:
-        """Navigate to a URL."""
-        action = BrowserAction(action_type="navigate", target=url)
-        return await self._execute(action)
+    async def navigate(self, url: str, timeout_s: float = _DEFAULT_TIMEOUT_S) -> BrowserResult:
+        """Navigate to a URL and return the result."""
+        action = BrowserAction(
+            action_type="navigate",
+            target=url,
+            timeout_s=timeout_s,
+        )
+        return await self._dispatch(action)
 
-    async def screenshot(self, selector: str = "body") -> BrowserResult:
-        """Take a screenshot, optionally of a specific element."""
-        action = BrowserAction(action_type="screenshot", target=selector)
-        return await self._execute(action)
+    async def screenshot(
+        self,
+        selector: str = "body",
+        timeout_s: float = _DEFAULT_TIMEOUT_S,
+    ) -> BrowserResult:
+        """Take a screenshot, optionally scoped to a CSS selector.
 
-    async def read_page_text(self, url: str) -> BrowserResult:
-        """Navigate to URL and extract all visible text."""
-        action = BrowserAction(action_type="read_text", target=url)
-        return await self._execute(action)
+        Saves the screenshot to a temporary file and returns the path
+        in ``BrowserResult.screenshot_path``.
+        """
+        _SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        screenshot_path = str(
+            _SCREENSHOT_DIR / f"screenshot_{uuid.uuid4().hex[:8]}.png"
+        )
+        action = BrowserAction(
+            action_type="screenshot",
+            target=selector,
+            timeout_s=timeout_s,
+        )
+        return await self._dispatch(action, screenshot_path=screenshot_path)
+
+    async def read_page_text(
+        self, url: str, timeout_s: float = _DEFAULT_TIMEOUT_S,
+    ) -> BrowserResult:
+        """Navigate to a URL and extract the visible text content."""
+        action = BrowserAction(
+            action_type="read_text",
+            target=url,
+            timeout_s=timeout_s,
+        )
+        return await self._dispatch(action)
 
     async def verify_ui(
         self,
         url: str,
-        expected_elements: Optional[List[str]] = None,
+        expected_elements: List[str],
+        timeout_s: float = _DEFAULT_TIMEOUT_S,
     ) -> BrowserResult:
-        """Navigate to URL and verify expected elements are present."""
-        t0 = time.monotonic()
-        expected_elements = expected_elements or []
+        """Verify that a page contains expected text elements.
+
+        Navigates to ``url``, takes a screenshot, reads page text, and
+        checks if each item in ``expected_elements`` appears in the text.
+
+        Returns ``BrowserResult.success = True`` only if ALL expected
+        elements are found.
+        """
+        start = time.monotonic()
 
         # Step 1: Read page text
-        text_result = await self.read_page_text(url)
+        text_result = await self.read_page_text(url, timeout_s=timeout_s)
         if not text_result.success:
             return BrowserResult(
                 success=False,
                 action_type="verify_ui",
                 error=f"Failed to read page: {text_result.error}",
-                duration_s=time.monotonic() - t0,
+                duration_s=time.monotonic() - start,
             )
 
-        page_text = (text_result.page_text or "").lower()
+        page_text = text_result.page_text or ""
 
-        # Step 2: Check expected elements
-        missing = [
-            elem for elem in expected_elements
-            if elem.lower() not in page_text
-        ]
+        # Step 2: Take screenshot for evidence
+        screenshot_result = await self.screenshot(timeout_s=timeout_s)
 
-        # Step 3: Screenshot for evidence
-        screenshot_result = await self.screenshot()
+        # Step 3: Check for expected elements
+        found = 0
+        missing: List[str] = []
+        for elem in expected_elements:
+            if elem.lower() in page_text.lower():
+                found += 1
+            else:
+                missing.append(elem)
 
-        success = len(missing) == 0
-        error = None
+        all_found = len(missing) == 0
+        error_msg = None
         if missing:
-            error = f"Missing UI elements: {', '.join(missing)}"
+            error_msg = f"Missing elements: {missing}"
 
         return BrowserResult(
-            success=success,
+            success=all_found,
             action_type="verify_ui",
             screenshot_path=screenshot_result.screenshot_path,
-            page_text=text_result.page_text,
-            error=error,
-            duration_s=time.monotonic() - t0,
+            page_text=page_text[:10000],
+            error=error_msg,
+            duration_s=time.monotonic() - start,
+            page_url=text_result.page_url,
+            elements_found=found,
         )
 
-    async def _execute(self, action: BrowserAction) -> BrowserResult:
-        """Route action to the detected backend."""
-        if not self.is_available:
+    # ------------------------------------------------------------------
+    # Dispatch
+    # ------------------------------------------------------------------
+
+    async def _dispatch(
+        self,
+        action: BrowserAction,
+        screenshot_path: Optional[str] = None,
+    ) -> BrowserResult:
+        """Route an action to the appropriate backend."""
+        self._action_count += 1
+
+        if self._mode == "disabled":
             return BrowserResult(
                 success=False,
                 action_type=action.action_type,
-                error="No browser backend available",
+                error="Browser bridge is disabled",
             )
 
-        if self._backend == "playwright":
-            return await self._run_playwright(action)
-        if self._backend == "mcp":
-            return await self._run_mcp(action)
+        # Try playwright first (or exclusively if mode=playwright)
+        if self._mode in ("auto", "playwright"):
+            if self._check_playwright_cached():
+                return await self._run_playwright(action, screenshot_path)
 
+        # Try MCP
+        if self._mode in ("auto", "mcp"):
+            if self._check_mcp_cached():
+                return await self._run_mcp(action)
+
+        self._error_count += 1
         return BrowserResult(
             success=False,
             action_type=action.action_type,
-            error=f"Unknown backend: {self._backend}",
+            error="No browser backend available (install playwright or configure MCP)",
         )
 
-    async def _run_playwright(self, action: BrowserAction) -> BrowserResult:
-        """Execute action via Playwright subprocess."""
-        t0 = time.monotonic()
+    # ------------------------------------------------------------------
+    # Playwright backend
+    # ------------------------------------------------------------------
 
-        # Build a small inline script for playwright
-        screenshot_path = str(
-            _SCREENSHOT_DIR / f"ouroboros_{int(time.time())}.png"
-        )
+    async def _run_playwright(
+        self,
+        action: BrowserAction,
+        screenshot_path: Optional[str] = None,
+    ) -> BrowserResult:
+        """Run a browser action via Playwright subprocess (argv-based, no shell).
 
-        if action.action_type == "navigate":
-            script = (
-                f"const {{ chromium }} = require('playwright');\n"
-                f"(async () => {{\n"
-                f"  const browser = await chromium.launch({{ headless: true }});\n"
-                f"  const page = await browser.newPage();\n"
-                f"  await page.goto({json.dumps(action.target)}, {{ timeout: {int(action.timeout_s * 1000)} }});\n"
-                f"  console.log(JSON.stringify({{ success: true, title: await page.title() }}));\n"
-                f"  await browser.close();\n"
-                f"}})();\n"
-            )
-        elif action.action_type == "screenshot":
-            script = (
-                f"const {{ chromium }} = require('playwright');\n"
-                f"(async () => {{\n"
-                f"  const browser = await chromium.launch({{ headless: true }});\n"
-                f"  const page = await browser.newPage();\n"
-                f"  await page.goto('about:blank');\n"
-                f"  await page.screenshot({{ path: {json.dumps(screenshot_path)} }});\n"
-                f"  console.log(JSON.stringify({{ success: true, path: {json.dumps(screenshot_path)} }}));\n"
-                f"  await browser.close();\n"
-                f"}})();\n"
-            )
-        elif action.action_type == "read_text":
-            script = (
-                f"const {{ chromium }} = require('playwright');\n"
-                f"(async () => {{\n"
-                f"  const browser = await chromium.launch({{ headless: true }});\n"
-                f"  const page = await browser.newPage();\n"
-                f"  await page.goto({json.dumps(action.target)}, {{ timeout: {int(action.timeout_s * 1000)} }});\n"
-                f"  const text = await page.innerText('body');\n"
-                f"  console.log(JSON.stringify({{ success: true, text: text.substring(0, 10000) }}));\n"
-                f"  await browser.close();\n"
-                f"}})();\n"
-            )
-        else:
-            return BrowserResult(
-                success=False,
-                action_type=action.action_type,
-                error=f"Unsupported action: {action.action_type}",
-                duration_s=time.monotonic() - t0,
-            )
+        A self-contained Python script is passed as a child process using
+        ``asyncio.create_subprocess_exec`` with explicit argv.  The action
+        payload is passed as ``sys.argv[1]`` (JSON), never interpolated
+        into the script string.
+        """
+        start = time.monotonic()
+
+        action_payload = {
+            "action_type": action.action_type,
+            "target": action.target,
+            "value": action.value,
+            "timeout_s": action.timeout_s,
+            "headless": _HEADLESS,
+            "screenshot_path": screenshot_path,
+        }
 
         try:
+            # Argv-based invocation — safe, no shell injection vector.
+            # The script is a constant; the payload is a separate argv element.
             proc = await asyncio.create_subprocess_exec(
-                "node", "-e", script,
+                "python3", "-c", _PLAYWRIGHT_SCRIPT,
+                json.dumps(action_payload),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
             stdout, stderr = await asyncio.wait_for(
                 proc.communicate(),
-                timeout=action.timeout_s + 5,
+                timeout=action.timeout_s + 10.0,
             )
-
-            if proc.returncode != 0:
-                return BrowserResult(
-                    success=False,
-                    action_type=action.action_type,
-                    error=stderr.decode()[:500] if stderr else "playwright failed",
-                    duration_s=time.monotonic() - t0,
-                )
-
-            try:
-                data = json.loads(stdout.decode())
-                return BrowserResult(
-                    success=data.get("success", False),
-                    action_type=action.action_type,
-                    screenshot_path=data.get("path"),
-                    page_text=data.get("text"),
-                    duration_s=time.monotonic() - t0,
-                )
-            except json.JSONDecodeError:
-                return BrowserResult(
-                    success=False,
-                    action_type=action.action_type,
-                    error="Invalid JSON from playwright",
-                    duration_s=time.monotonic() - t0,
-                )
-
         except asyncio.TimeoutError:
+            self._error_count += 1
             return BrowserResult(
                 success=False,
                 action_type=action.action_type,
-                error=f"Playwright timed out after {action.timeout_s}s",
-                duration_s=time.monotonic() - t0,
+                error=f"Playwright subprocess timed out after {action.timeout_s + 10.0}s",
+                duration_s=time.monotonic() - start,
             )
-        except FileNotFoundError:
+        except OSError as exc:
+            self._error_count += 1
             return BrowserResult(
                 success=False,
                 action_type=action.action_type,
-                error="node not found — playwright requires Node.js",
-                duration_s=time.monotonic() - t0,
+                error=f"Failed to launch Playwright subprocess: {exc}",
+                duration_s=time.monotonic() - start,
             )
-        except Exception as exc:
+
+        duration = time.monotonic() - start
+
+        if proc.returncode != 0:
+            stderr_text = stderr.decode("utf-8", errors="replace")[:2000]
+            self._error_count += 1
             return BrowserResult(
                 success=False,
                 action_type=action.action_type,
-                error=str(exc),
-                duration_s=time.monotonic() - t0,
+                error=f"Playwright exited with code {proc.returncode}: {stderr_text}",
+                duration_s=duration,
             )
+
+        # Parse JSON result from stdout
+        try:
+            stdout_text = stdout.decode("utf-8", errors="replace").strip()
+            # Find the last line that looks like JSON (script may emit logs)
+            json_line = ""
+            for line in reversed(stdout_text.splitlines()):
+                stripped = line.strip()
+                if stripped.startswith("{"):
+                    json_line = stripped
+                    break
+            if not json_line:
+                json_line = stdout_text
+
+            result_data = json.loads(json_line)
+        except (json.JSONDecodeError, ValueError) as exc:
+            self._error_count += 1
+            return BrowserResult(
+                success=False,
+                action_type=action.action_type,
+                error=f"Failed to parse Playwright output: {exc}",
+                duration_s=duration,
+            )
+
+        return BrowserResult(
+            success=result_data.get("success", False),
+            action_type=action.action_type,
+            screenshot_path=result_data.get("screenshot_path"),
+            page_text=result_data.get("page_text"),
+            error=result_data.get("error"),
+            duration_s=duration,
+            page_url=result_data.get("page_url"),
+        )
+
+    # ------------------------------------------------------------------
+    # MCP backend (placeholder)
+    # ------------------------------------------------------------------
 
     async def _run_mcp(self, action: BrowserAction) -> BrowserResult:
-        """Execute action via MCP browser server (placeholder)."""
+        """Run a browser action via MCP browser server.
+
+        This is a placeholder for future MCP integration.  Currently
+        returns a not-available result.
+        """
         logger.debug(
-            "[BrowserBridge] MCP backend not yet implemented for action=%s",
+            "[BrowserBridge] MCP backend not yet implemented for action %s",
             action.action_type,
         )
         return BrowserResult(
@@ -309,14 +551,43 @@ class BrowserBridge:
             error="MCP browser backend not yet implemented",
         )
 
+    # ------------------------------------------------------------------
+    # Health / stats
+    # ------------------------------------------------------------------
 
-# Singleton
-_bridge: Optional[BrowserBridge] = None
+    def health(self) -> Dict[str, Any]:
+        """Return health status for observability."""
+        return {
+            "mode": self._mode,
+            "is_available": self.is_available,
+            "playwright_detected": self._check_playwright_cached(),
+            "mcp_detected": self._check_mcp_cached(),
+            "headless": _HEADLESS,
+            "action_count": self._action_count,
+            "error_count": self._error_count,
+            "screenshot_dir": str(_SCREENSHOT_DIR),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Singleton factory
+# ---------------------------------------------------------------------------
+
+_browser_bridge_instance: Optional[BrowserBridge] = None
 
 
 def get_browser_bridge() -> BrowserBridge:
-    """Get or create the singleton BrowserBridge."""
-    global _bridge
-    if _bridge is None:
-        _bridge = BrowserBridge()
-    return _bridge
+    """Return the singleton BrowserBridge instance.
+
+    Thread-safe for first-call races (the worst case is two instances
+    are created and one is discarded — no state is shared).
+    """
+    global _browser_bridge_instance
+    if _browser_bridge_instance is None:
+        _browser_bridge_instance = BrowserBridge(mode=_MODE)
+        logger.info(
+            "[BrowserBridge] Initialized (mode=%s, available=%s)",
+            _browser_bridge_instance._mode,
+            _browser_bridge_instance.is_available,
+        )
+    return _browser_bridge_instance
