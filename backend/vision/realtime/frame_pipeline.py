@@ -274,6 +274,10 @@ class FramePipeline:
 
         self._running = False
 
+        # Signal SCK background thread to stop (if SHM mode was used)
+        if hasattr(self, "_sck_thread_stop"):
+            self._sck_thread_stop.set()
+
         if self._capture_task is not None and not self._capture_task.done():
             self._capture_task.cancel()
             try:
@@ -369,9 +373,11 @@ class FramePipeline:
     # correct backend IMMEDIATELY. Never attempt a known-doomed path.
     #
     # VISION_CAPTURE_BACKEND env var:
-    #   "auto" (default) — CG in asyncio contexts, SCK only with dedicated thread
-    #   "coregraphics"   — force CG (always safe)
-    #   "sck"            — force SCK (only for dedicated CFRunLoop thread — future)
+    #   "auto" (default) — SHM bridge (SCK thread → SHM → asyncio poll) in asyncio,
+    #                       falls back to CoreGraphics subprocess if SHM fails
+    #   "shm"            — force SHM bridge (SCK in thread, poll from asyncio)
+    #   "coregraphics"   — force CG subprocess (always safe, ~3fps)
+    #   "sck"            — force SCK direct (only for dedicated CFRunLoop thread)
 
     async def _sck_capture_loop(self) -> None:
         """Capability-gated capture backend selection. Zero dead time."""
@@ -392,23 +398,30 @@ class FramePipeline:
             await self._coregraphics_capture_loop()
             return
 
-        # --- Auto mode: detect environment ---
-        # In asyncio context (which the supervisor always is), SCK will hang.
-        # Go straight to CoreGraphics. Zero seconds of dead time.
+        if backend == "shm":
+            # Explicit SHM override
+            logger.info("[FramePipeline] Backend forced to SHM via VISION_CAPTURE_BACKEND")
+            await self._shm_capture_loop()
+            return
+
+        # --- Auto mode: SHM bridge is the primary path ---
+        # SCK runs in a dedicated thread with its own CFRunLoop pump.
+        # Frames land in SHM ring buffer. Python polls SHM from asyncio.
+        # This completely bypasses the "asyncio can't pump CFRunLoop" problem.
+        # Falls back to CoreGraphics subprocess ONLY if SHM fails to start.
+        logger.info(
+            "[FramePipeline] Auto mode — attempting SHM bridge "
+            "(SCK thread → SHM → asyncio poll)"
+        )
         try:
-            asyncio.get_running_loop()
-            # We're in asyncio — SCK is structurally unsound here
-            logger.info(
-                "[FramePipeline] Asyncio context detected — bypassing SCK "
-                "(CFRunLoop not available). Using CoreGraphics "
-                "(vision_capture_mode=coregraphics, sck_outcome=skipped)"
+            await self._shm_capture_loop()
+        except Exception as exc:
+            logger.warning(
+                "[FramePipeline] SHM bridge failed (%s), falling back to "
+                "CoreGraphics subprocess",
+                exc,
             )
             await self._coregraphics_capture_loop()
-            return
-        except RuntimeError:
-            # No running loop — we might be in a dedicated thread (future)
-            logger.info("[FramePipeline] No asyncio loop — attempting SCK")
-            await self._sck_stream_loop()
 
     async def _sck_stream_loop(self) -> None:
         """SCK streaming loop — only called when CFRunLoop is available."""
@@ -469,6 +482,178 @@ class FramePipeline:
                 await stream.stop()
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # SHM Bridge: SCK thread → SHM ring buffer → asyncio poll
+    # ------------------------------------------------------------------
+    # This is the 60fps path. SCK runs in a dedicated daemon thread with
+    # its own CFRunLoop pump. The delegate writes frames to a 5-slot SHM
+    # ring buffer. Python polls the ring buffer from asyncio using
+    # zero-copy numpy.frombuffer over mmap.
+    #
+    # Architecture:
+    #   [SCK thread] → didOutputSampleBuffer → ShmFrameWriter → /jarvis_frame_bridge
+    #   [asyncio]    → ShmFrameReader.read_latest() → numpy view → FrameData
+    #
+    # Why this works in asyncio:
+    #   - SCK's GCD callbacks fire on the SCK thread's CFRunLoop (not asyncio)
+    #   - SHM is a shared memory segment — no GCD, no RunLoop, no GIL needed
+    #   - Python's mmap.mmap with ACCESS_WRITE gives coherent reads
+    #   - numpy.frombuffer is zero-copy — no memcpy, no allocation
+
+    def _start_sck_background_thread(self) -> bool:
+        """Start SCK capture in a dedicated daemon thread.
+
+        Returns True if the thread started successfully and SCK is writing
+        to SHM. The thread runs until self._running becomes False.
+        """
+        import threading
+
+        target_fps = int(os.environ.get("VISION_CAPTURE_FPS", "60"))
+        ready_event = threading.Event()
+        self._sck_thread_stop = threading.Event()
+
+        def _sck_thread():
+            try:
+                import sys as _sys
+                _ext = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.dirname(
+                        os.path.abspath(__file__)))),
+                    "native_extensions",
+                )
+                if _ext not in _sys.path:
+                    _sys.path.insert(0, _ext)
+
+                import fast_capture_stream
+
+                config = fast_capture_stream.StreamConfig()
+                config.target_fps = target_fps
+                config.max_buffer_size = 3
+                config.output_format = "raw"
+                config.use_gpu_acceleration = True
+                config.drop_frames_on_overflow = True
+
+                stream = fast_capture_stream.CaptureStream(self._window_id, config)
+                if not stream.start():
+                    logger.error(
+                        "[FramePipeline] SCK thread: stream.start() FAILED "
+                        "(window=%d, fps=%d)",
+                        self._window_id, target_fps,
+                    )
+                    return
+
+                logger.info(
+                    "[FramePipeline] SCK thread running — target %dfps, "
+                    "window=%d, SHM writes active",
+                    target_fps, self._window_id,
+                )
+                ready_event.set()
+
+                # Keep thread alive — SCK delivers frames via delegate → SHM.
+                # No get_frame() needed — SHM write happens in the delegate.
+                while not self._sck_thread_stop.is_set() and self._running:
+                    self._sck_thread_stop.wait(timeout=0.1)
+
+                stream.stop()
+                logger.info("[FramePipeline] SCK thread stopped")
+
+            except Exception as exc:
+                logger.error("[FramePipeline] SCK thread error: %s", exc)
+
+        t = threading.Thread(target=_sck_thread, daemon=True, name="fp-sck-shm")
+        t.start()
+
+        # Wait for SCK to start and write initial frames
+        if not ready_event.wait(timeout=5.0):
+            logger.warning("[FramePipeline] SCK thread did not start within 5s")
+            self._sck_thread_stop.set()
+            return False
+
+        return True
+
+    async def _shm_capture_loop(self) -> None:
+        """SHM bridge capture loop — polls SHM ring buffer from asyncio.
+
+        1. Start SCK in a background thread (with CFRunLoop pump)
+        2. Wait for SHM to have data
+        3. Poll SHM at maximum rate, yielding to asyncio between reads
+        """
+        from backend.vision.shm_frame_reader import ShmFrameReader
+
+        # Phase 1: Start SCK background thread
+        if not self._start_sck_background_thread():
+            raise RuntimeError("SCK background thread failed to start")
+
+        # Phase 2: Open SHM reader
+        await asyncio.sleep(1.0)  # Let SCK warm up and write initial frames
+
+        reader = ShmFrameReader()
+        if not reader.open():
+            self._sck_thread_stop.set()
+            raise RuntimeError("SHM reader failed to open — SCK not writing?")
+
+        target_fps = int(os.environ.get("VISION_CAPTURE_FPS", "60"))
+        # Adaptive sleep: when no new frame, sleep briefly to avoid busy-spin.
+        # At 60fps, frames arrive every ~16.7ms. Sleep 1ms between polls gives
+        # ~16 polls per frame interval — responsive without burning CPU.
+        poll_sleep_s = float(os.environ.get("VISION_SHM_POLL_SLEEP_S", "0.001"))
+
+        logger.info(
+            "[FramePipeline] SHM capture running "
+            "(vision_capture_mode=shm, window=%d, target=%dfps, "
+            "poll_sleep=%.1fms, frame=%dx%dx%d)",
+            self._window_id, target_fps, poll_sleep_s * 1000,
+            reader.width, reader.height, reader.channels,
+        )
+
+        try:
+            consecutive_empty = 0
+            while self._running:
+                frame_arr, _counter = reader.read_latest()
+
+                if frame_arr is None:
+                    consecutive_empty += 1
+                    # Adaptive backoff: sleep longer if we keep getting empty reads
+                    if consecutive_empty > 100:
+                        await asyncio.sleep(poll_sleep_s * 10)  # 10ms
+                    elif consecutive_empty > 10:
+                        await asyncio.sleep(poll_sleep_s)  # 1ms
+                    else:
+                        await asyncio.sleep(0)  # yield
+                    continue
+
+                consecutive_empty = 0
+                self._frame_counter += 1
+
+                # SHM frame is BGRA — convert channel order for consumers
+                # expecting RGB. numpy view, no copy.
+                if frame_arr.shape[2] == 4:
+                    # BGRA → RGB: drop alpha, swap B/R
+                    rgb = frame_arr[:, :, [2, 1, 0]]
+                else:
+                    rgb = frame_arr
+
+                frame = FrameData(
+                    data=rgb,
+                    width=reader.width,
+                    height=reader.height,
+                    timestamp=time.time(),
+                    frame_number=self._frame_counter,
+                    scale_factor=1.0,
+                )
+
+                if self._should_process(frame):
+                    self._enqueue_frame(frame)
+
+        except asyncio.CancelledError:
+            logger.debug("SHM capture loop cancelled")
+            raise
+        except Exception as exc:
+            logger.exception("SHM capture loop error: %s", exc)
+        finally:
+            reader.close()
+            if hasattr(self, "_sck_thread_stop"):
+                self._sck_thread_stop.set()
 
     async def _coregraphics_capture_loop(self) -> None:
         """Subprocess-based screen capture via macOS screencapture command.

@@ -38,6 +38,151 @@ class LSPTypeChecker:
     def __init__(self, project_root: Path) -> None:
         self._project_root = project_root
         self._checker: Optional[str] = None
+        self._checker_detected: bool = False
+
+    @property
+    def is_available(self) -> bool:
+        """True if a type checker (pyright or mypy) was detected.
+
+        Note: this only returns a meaningful result AFTER at least one call
+        to ``check_files`` or ``check_incremental`` (which run ``_detect_checker``).
+        For a synchronous pre-check, call ``detect_checker_sync()`` first.
+        """
+        return self._checker not in (None, "none")
+
+    def detect_checker_sync(self) -> bool:
+        """Synchronous helper — detects checker availability without asyncio.
+
+        Safe to call from ``run_in_executor``.  Caches result so subsequent
+        async calls to ``_detect_checker`` are free.
+        """
+        if self._checker_detected:
+            return self.is_available
+        import subprocess, shutil
+        for name in ("pyright", "mypy"):
+            if shutil.which(name) is not None:
+                try:
+                    result = subprocess.run(
+                        [name, "--version"],
+                        capture_output=True, timeout=5.0,
+                    )
+                    if result.returncode == 0:
+                        self._checker = name
+                        self._checker_detected = True
+                        return True
+                except (FileNotFoundError, subprocess.TimeoutExpired):
+                    pass
+        self._checker = "none"
+        self._checker_detected = True
+        return False
+
+    def check_incremental(
+        self,
+        changed_files: List[str],
+        timeout_s: float = 15.0,
+    ) -> TypeCheckResult:
+        """Synchronous incremental type check — only the given files.
+
+        Designed for ``run_in_executor`` from the orchestrator.  Falls back
+        gracefully (passed=True, 0 errors) if no checker is available.
+
+        Parameters
+        ----------
+        changed_files:
+            Absolute paths to the modified files.
+        timeout_s:
+            Per-invocation timeout (default 15 s — shorter than full-project).
+        """
+        import time, subprocess
+        t0 = time.monotonic()
+
+        # Ensure checker is detected (sync path)
+        if not self._checker_detected:
+            self.detect_checker_sync()
+
+        if not self.is_available:
+            return TypeCheckResult(True, 0, 0, [], "none", time.monotonic() - t0)
+
+        py_files = [f for f in changed_files if f.endswith(".py") and os.path.isfile(f)]
+        if not py_files:
+            return TypeCheckResult(True, 0, 0, [], self._checker or "none", time.monotonic() - t0)
+
+        checker = self._checker
+        try:
+            if checker == "pyright":
+                result = self._run_pyright_sync(py_files, timeout_s)
+            else:
+                result = self._run_mypy_sync(py_files, timeout_s)
+            result.duration_s = time.monotonic() - t0
+            return result
+        except Exception as exc:
+            logger.debug("[LSPTypeChecker] incremental check failed: %s", exc)
+            return TypeCheckResult(True, 0, 0, [], f"{checker}_error", time.monotonic() - t0)
+
+    def _run_pyright_sync(self, files: List[str], timeout_s: float) -> TypeCheckResult:
+        """Run pyright synchronously on specific files."""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["pyright", "--outputjson", *files],
+                capture_output=True, timeout=timeout_s,
+                cwd=str(self._project_root),
+            )
+            try:
+                data = json.loads(proc.stdout.decode())
+                errors: List[Dict[str, Any]] = []
+                ec, wc = 0, 0
+                for d in data.get("generalDiagnostics", []):
+                    sev = d.get("severity", "information")
+                    entry = {
+                        "file": d.get("file", ""),
+                        "line": d.get("range", {}).get("start", {}).get("line", 0),
+                        "message": d.get("message", ""),
+                        "severity": sev,
+                        "rule": d.get("rule", ""),
+                    }
+                    if sev == "error":
+                        ec += 1; errors.append(entry)
+                    elif sev == "warning":
+                        wc += 1; errors.append(entry)
+                return TypeCheckResult(ec == 0, ec, wc, errors[:20], "pyright")
+            except json.JSONDecodeError:
+                return TypeCheckResult(
+                    proc.returncode == 0,
+                    0 if proc.returncode == 0 else 1,
+                    0, [], "pyright",
+                )
+        except subprocess.TimeoutExpired:
+            return TypeCheckResult(True, 0, 0, [], "pyright_timeout")
+
+    def _run_mypy_sync(self, files: List[str], timeout_s: float) -> TypeCheckResult:
+        """Run mypy synchronously on specific files."""
+        import subprocess
+        try:
+            proc = subprocess.run(
+                ["mypy", "--no-color-output", "--show-error-codes", "--no-error-summary", *files],
+                capture_output=True, timeout=timeout_s,
+                cwd=str(self._project_root),
+            )
+            errors: List[Dict[str, Any]] = []
+            ec, wc = 0, 0
+            for line in proc.stdout.decode().strip().split("\n"):
+                match = re.match(r"(.+?):(\d+):\s*(error|warning|note):\s*(.+)", line)
+                if match:
+                    sev = match.group(3)
+                    entry = {
+                        "file": match.group(1),
+                        "line": int(match.group(2)),
+                        "message": match.group(4),
+                        "severity": sev,
+                    }
+                    if sev == "error":
+                        ec += 1; errors.append(entry)
+                    elif sev == "warning":
+                        wc += 1; errors.append(entry)
+            return TypeCheckResult(ec == 0, ec, wc, errors[:20], "mypy")
+        except subprocess.TimeoutExpired:
+            return TypeCheckResult(True, 0, 0, [], "mypy_timeout")
 
     async def check_files(self, files: List[str], timeout_s: float = _TIMEOUT_S) -> TypeCheckResult:
         import time; t0 = time.monotonic()

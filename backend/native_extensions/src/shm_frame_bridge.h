@@ -140,6 +140,52 @@ public:
     }
 
     /**
+     * Downsample a retina frame 2x and write directly into the SHM ring slot.
+     * Zero intermediate allocation — pixels go straight from CVPixelBuffer
+     * into the ring buffer with 2x downsampling (nearest neighbor).
+     *
+     * This eliminates the 10MB/frame double-copy that killed 60fps on retina:
+     *   Old: pixel_buffer → frame.data (5MB) → SHM (5MB) = 600MB/s at 60fps
+     *   New: pixel_buffer → SHM directly (5MB) = 300MB/s at 60fps
+     */
+    void write_frame_downsampled(const uint8_t* pixels,
+                                  uint32_t src_width, uint32_t src_height,
+                                  uint32_t src_stride,
+                                  uint64_t timestamp_ns) {
+        if (!shm_ptr_) return;
+
+        auto* h = reinterpret_cast<RingHeader*>(shm_ptr_);
+        uint32_t dst_w = src_width / 2;
+        uint32_t dst_h = src_height / 2;
+        uint32_t dst_row = dst_w * h->channels;
+        uint32_t expected_fs = dst_w * dst_h * h->channels;
+
+        // SHM must be sized for the downsampled resolution
+        if (expected_fs > h->frame_size) return;
+
+        uint32_t wi = h->write_index.load(std::memory_order_relaxed);
+        uint8_t* dst = static_cast<uint8_t*>(shm_ptr_)
+                       + sizeof(RingHeader) + (wi * h->frame_size);
+
+        // Downsample 2x: take every 2nd pixel from every 2nd row
+        // Direct into ring slot — zero allocation
+        for (uint32_t y = 0; y < dst_h; y++) {
+            const uint8_t* src_row = pixels + (y * 2) * src_stride;
+            uint8_t* dst_row_ptr = dst + y * dst_row;
+            for (uint32_t x = 0; x < dst_w; x++) {
+                // Copy 4 bytes (BGRA) per pixel via uint32 load/store
+                *reinterpret_cast<uint32_t*>(dst_row_ptr + x * 4) =
+                    *reinterpret_cast<const uint32_t*>(src_row + x * 2 * 4);
+            }
+        }
+
+        h->timestamps[wi] = timestamp_ns;
+        h->latest_index.store(wi, std::memory_order_release);
+        h->frame_counter.fetch_add(1, std::memory_order_relaxed);
+        h->write_index.store((wi + 1) % RING_SIZE, std::memory_order_relaxed);
+    }
+
+    /**
      * Write a stride-corrected frame directly from a padded pixel buffer.
      * Strips row padding in a single pass — no intermediate buffer.
      * Used when bytesPerRow > width * 4 (retina display padding).

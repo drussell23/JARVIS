@@ -38,6 +38,19 @@ _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _root)
 
 
+def _check_screen_recording_permission() -> bool:
+    """Check if screen recording permission is granted."""
+    try:
+        import Quartz
+        windows = Quartz.CGWindowListCopyWindowInfo(
+            Quartz.kCGWindowListOptionOnScreenOnly,
+            Quartz.kCGNullWindowID,
+        )
+        return windows is not None and len(windows) > 0
+    except Exception:
+        return False
+
+
 def _start_sck_thread(
     target_fps: int = 60,
     window_id: int = 0,  # 0 = full display
@@ -47,34 +60,40 @@ def _start_sck_thread(
 
     ready = threading.Event()
     stop = threading.Event()
+    error_msg = [None]  # mutable for thread closure
 
     def _thread():
-        config = fast_capture_stream.StreamConfig()
-        config.target_fps = target_fps
-        config.max_buffer_size = 3
-        config.output_format = "raw"
-        config.use_gpu_acceleration = True
-        config.drop_frames_on_overflow = True
+        try:
+            config = fast_capture_stream.StreamConfig()
+            config.target_fps = target_fps
+            config.max_buffer_size = 3
+            config.output_format = "raw"
+            config.use_gpu_acceleration = True
+            config.drop_frames_on_overflow = True
 
-        stream = fast_capture_stream.CaptureStream(window_id, config)
-        if not stream.start():
-            print("[SCK] stream.start() FAILED")
-            return
+            stream = fast_capture_stream.CaptureStream(window_id, config)
+            if not stream.start():
+                error_msg[0] = "stream.start() returned False"
+                print(f"[SCK] {error_msg[0]}")
+                return
 
-        print(f"[SCK] Stream started — target {target_fps}fps, window_id={window_id}")
-        ready.set()
+            print(f"[SCK] Stream started — target {target_fps}fps, window_id={window_id}")
+            ready.set()
 
-        # Keep thread alive — SCK delivers frames via delegate → SHM
-        # No need to call get_frame() — SHM write happens in the delegate
-        while not stop.is_set():
-            stop.wait(timeout=0.1)
+            # Keep thread alive — SCK delivers frames via delegate → SHM
+            # No need to call get_frame() — SHM write happens in the delegate
+            while not stop.is_set():
+                stop.wait(timeout=0.1)
 
-        stream.stop()
-        print("[SCK] Stream stopped")
+            stream.stop()
+            print("[SCK] Stream stopped")
+        except Exception as exc:
+            error_msg[0] = str(exc)
+            print(f"[SCK] Thread error: {exc}")
 
     t = threading.Thread(target=_thread, daemon=True, name="sck-bench")
     t.start()
-    return ready, stop
+    return ready, stop, error_msg
 
 
 def run_benchmark(
@@ -92,12 +111,26 @@ def run_benchmark(
     print(f"  Capture: {'display' if display_mode else f'window {window_id}'}")
     print("=" * 70)
 
+    # --- Pre-check: Screen recording permission ---
+    print("\n[0] Checking screen recording permission...")
+    if not _check_screen_recording_permission():
+        print(
+            "FATAL: Screen recording permission NOT granted.\n\n"
+            "  Fix: System Settings > Privacy & Security > Screen Recording\n"
+            "        Enable your terminal app (Terminal, iTerm2, Cursor, VS Code)\n"
+            "        Then restart the terminal.\n"
+        )
+        return
+
+    print("    Screen recording: OK")
+
     # --- Phase 1: Start SCK ---
     print("\n[1] Starting SCK stream...")
-    ready, stop = _start_sck_thread(target_fps=target_fps, window_id=window_id)
+    ready, stop, error_msg = _start_sck_thread(target_fps=target_fps, window_id=window_id)
 
     if not ready.wait(timeout=5.0):
-        print("FATAL: SCK failed to start within 5s")
+        msg = error_msg[0] or "unknown reason"
+        print(f"FATAL: SCK failed to start within 5s ({msg})")
         return
 
     # Let SCK warm up and write initial frames to SHM

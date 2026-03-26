@@ -254,10 +254,47 @@ struct CallbackGuard {
     frame.format = _outputFormat;
     frame.gpu_accelerated = (_metalDevice != nil);
 
-    if (_outputFormat == "raw") {
-        // Downsample retina frames in C++ BEFORE the copy.
-        // A 2880x1800x4 frame = 20MB. At 60fps that's 1.2GB/s of memcpy.
-        // Downsampling 2x here reduces it to 5MB = 300MB/s — 4x faster.
+    // ---- SHM-FIRST PATH ----
+    // When SHM is active and format is raw, write directly to SHM ring
+    // slot. Retina frames are downsampled directly into SHM — zero
+    // intermediate allocation. This halves memory bandwidth on retina:
+    //   Old: pixel_buffer -> frame.data (5MB) -> SHM (5MB) = 600MB/s @60fps
+    //   New: pixel_buffer -> SHM directly (5MB) = 300MB/s @60fps
+    // frame.data stays empty — only populated for legacy get_frame() path.
+    bool shm_active = _shmWriter && _shmWriter->is_open();
+
+    if (shm_active && _outputFormat == "raw") {
+        auto ts = std::chrono::steady_clock::now().time_since_epoch();
+        uint64_t ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ts).count();
+
+        bool is_retina = (width > 1600);
+        if (is_retina) {
+            _shmWriter->write_frame_downsampled(
+                static_cast<const uint8_t*>(baseAddress),
+                (uint32_t)width, (uint32_t)height, (uint32_t)bytesPerRow,
+                ts_ns
+            );
+            frame.width = (int)(width / 2);
+            frame.height = (int)(height / 2);
+        } else {
+            size_t tight_row = width * 4;
+            if (bytesPerRow == tight_row) {
+                _shmWriter->write_frame(
+                    static_cast<const uint8_t*>(baseAddress),
+                    (uint32_t)(tight_row * height), ts_ns
+                );
+            } else {
+                _shmWriter->write_frame_strided(
+                    static_cast<const uint8_t*>(baseAddress),
+                    (uint32_t)width, (uint32_t)height, (uint32_t)bytesPerRow,
+                    ts_ns
+                );
+            }
+        }
+        frame.memory_used = 0;
+        // Skip frame.data — SHM is the only output
+    } else if (_outputFormat == "raw") {
+        // Legacy path: populate frame.data for pybind11 get_frame()
         bool is_retina = (width > 1600);
         if (is_retina) {
             size_t dst_w = width / 2;
@@ -351,56 +388,9 @@ struct CallbackGuard {
         CGColorSpaceRelease(colorSpace);
     }
 
-    // Write to shared memory. When SHM is active, this is the PRIMARY output.
-    // Python reads shm directly — the frame.data buffer is only needed for
-    // pybind11 get_frame() calls (legacy path). With SHM, we can skip the
-    // frame.data copy entirely and write directly from the pixel buffer.
-    if (_shmWriter && _shmWriter->is_open()) {
-        auto ts = std::chrono::steady_clock::now().time_since_epoch();
-        uint64_t ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ts).count();
-
-        if (frame.data.size() > 0) {
-            // Retina path: write the already-downsampled frame.data
-            _shmWriter->write_frame(frame.data.data(), (uint32_t)frame.data.size(), ts_ns);
-        } else {
-            // Non-retina: write stride-corrected pixels directly to SHM
-            // Skip the frame.data copy entirely — write ONLY to SHM
-            size_t tight_row = width * 4;
-            size_t tight_size = tight_row * height;
-            if (bytesPerRow == tight_row) {
-                // No padding — direct write from pixel buffer
-                _shmWriter->write_frame(
-                    static_cast<const uint8_t*>(baseAddress),
-                    (uint32_t)tight_size, ts_ns
-                );
-            } else if (width <= 1600) {
-                // Non-retina with padding: stride-corrected write to SHM
-                _shmWriter->write_frame_strided(
-                    static_cast<const uint8_t*>(baseAddress),
-                    (uint32_t)width, (uint32_t)height, (uint32_t)bytesPerRow,
-                    ts_ns
-                );
-            } else {
-                // Retina without prior downsample — downsample + write to SHM
-                // SHM is sized at logical resolution, not retina
-                size_t dst_w = width / 2;
-                size_t dst_h = height / 2;
-                size_t dst_row = dst_w * 4;
-                size_t dst_size = dst_row * dst_h;
-                // Temporary buffer for downsampled frame
-                std::vector<uint8_t> tmp(dst_size);
-                const uint8_t* src = static_cast<const uint8_t*>(baseAddress);
-                for (size_t y = 0; y < dst_h; y++) {
-                    const uint8_t* sr = src + (y * 2) * bytesPerRow;
-                    uint8_t* dr = tmp.data() + y * dst_row;
-                    for (size_t x = 0; x < dst_w; x++) {
-                        memcpy(dr + x * 4, sr + x * 2 * 4, 4);
-                    }
-                }
-                _shmWriter->write_frame(tmp.data(), (uint32_t)dst_size, ts_ns);
-            }
-        }
-    }
+    // SHM write is handled in the SHM-FIRST path at the top.
+    // If shm_active was true, we already wrote directly to SHM.
+    // If shm_active was false, SHM isn't available — nothing to do.
 
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
 
