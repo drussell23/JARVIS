@@ -54,6 +54,8 @@ class ContextExpander:
         doc_fetcher: Optional[Any] = None,       # Optional[DocFetcher]
         web_search: Optional[Any] = None,        # Optional[WebSearchCapability]
         visual_comprehension: Optional[Any] = None,  # Optional[VisualCodeComprehension]
+        code_explorer: Optional[Any] = None,          # Optional[CodeExplorationTool]
+        dialogue_store: Optional[Any] = None,          # Optional[OperationDialogueStore]
     ) -> None:
         self._generator = generator
         self._repo_root = repo_root
@@ -62,6 +64,8 @@ class ContextExpander:
         self._doc_fetcher = doc_fetcher
         self._web_search = web_search
         self._visual_comprehension = visual_comprehension
+        self._code_explorer = code_explorer
+        self._dialogue_store = dialogue_store
 
     async def expand(
         self,
@@ -87,9 +91,31 @@ class ContextExpander:
         Returns ctx.with_expanded_files(tuple) otherwise.
         Never raises — all errors produce the unmodified ctx.
         """
+        # ── P3: Cross-session dialogue injection ──────────────────────────
+        # Inject past reasoning dialogues for the same domain so the model
+        # has context from previous operations on similar tasks.
+        if self._dialogue_store is not None:
+            try:
+                from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key
+                _dk = extract_domain_key(ctx.target_files, ctx.description)
+                _past_dialogue = self._dialogue_store.format_for_prompt(_dk)
+                if _past_dialogue:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _past_dialogue,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+                    logger.info(
+                        "[ContextExpander] Injected %d past dialogues for domain=%s",
+                        len(self._dialogue_store.get_past_dialogues(_dk)), _dk,
+                    )
+            except Exception:
+                pass
+
         if self._oracle is None or not self._oracle.is_ready():
             logger.info("[ContextExpander] Oracle not ready \u2014 using blind baseline")
-            # Still apply skill_registry.match() even without oracle expansion
             return self._inject_skill_instructions(ctx)
 
         # Freshness check: warn if index is stale (> 5 minutes old)
@@ -239,7 +265,31 @@ class ContextExpander:
                         ctx.op_id, vis_exc,
                     )
 
-            if not confirmed and not external_docs and not search_queries and not visual_type:
+            # Code exploration: run Python snippets to test hypotheses
+            explore_snippets = self._parse_explore_snippets(raw)
+            if explore_snippets and self._code_explorer is not None:
+                try:
+                    explore_results = await self._code_explorer.explore_batch(explore_snippets)
+                    _explore_text = self._code_explorer.format_for_prompt(explore_results)
+                    if _explore_text:
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=_existing + "\n\n" + _explore_text,
+                            strategic_memory_digest=ctx.strategic_memory_digest,
+                        )
+                        logger.info(
+                            "[ContextExpander] op=%s round=%d: explored %d snippets",
+                            ctx.op_id, round_num + 1, len(explore_results),
+                        )
+                except Exception as exp_exc:
+                    logger.debug(
+                        "[ContextExpander] op=%s code exploration failed: %s",
+                        ctx.op_id, exp_exc,
+                    )
+
+            if not confirmed and not external_docs and not search_queries and not visual_type and not explore_snippets:
                 logger.debug(
                     "[ContextExpander] op=%s round=%d: none of %d requested files found on disk",
                     ctx.op_id, round_num + 1, len(new_paths),
@@ -304,13 +354,15 @@ class ContextExpander:
             f"List only files that exist in the codebase. Do NOT request the target files themselves.\n"
             f"If you need documentation for an external Python package, list its PyPI name in external_package_docs.\n"
             f"If you need to search for a solution to a specific technical problem, provide a search query in search_queries.\n"
-            f"If you need to see the current screen state (UI, terminal, IDE), set visual_analysis to a type: code_structure, error_analysis, ui_state, or terminal_output.\n\n"
+            f"If you need to see the current screen state (UI, terminal, IDE), set visual_analysis to a type: code_structure, error_analysis, ui_state, or terminal_output.\n"
+            f"If you need to test a hypothesis by running a Python snippet, provide it in explore_snippets.\n\n"
             f"Return ONLY this JSON:\n"
             f'{{"schema_version": "expansion.1", '
             f'"additional_files_needed": ["path/relative/to/repo.py", ...], '
             f'"external_package_docs": ["package-name", ...], '
             f'"search_queries": ["how to handle aiohttp session timeout python", ...], '
             f'"visual_analysis": null, '
+            f'"explore_snippets": ["import foo; print(dir(foo))", ...], '
             f'"reasoning": "<one sentence max 200 chars>"}}'
         )
 
@@ -443,6 +495,31 @@ class ContextExpander:
             if isinstance(d, str) and d.strip() and len(d.strip()) < 100
         ]
         return valid[:MAX_FILES_PER_ROUND]
+
+    def _parse_explore_snippets(self, raw: str) -> List[str]:
+        """Extract explore_snippets from expansion response."""
+        try:
+            stripped = raw.strip()
+            if stripped.startswith("```"):
+                lines = stripped.split("\n")
+                stripped = "\n".join(
+                    line for line in lines if not line.startswith("```")
+                ).strip()
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return []
+
+        if not isinstance(data, dict):
+            return []
+
+        snippets = data.get("explore_snippets", [])
+        if not isinstance(snippets, list):
+            return []
+
+        return [
+            s.strip() for s in snippets
+            if isinstance(s, str) and 5 < len(s.strip()) < 500
+        ][:2]  # Max 2 per round
 
     def _parse_visual_request(self, raw: str) -> Optional[str]:
         """Extract visual_analysis type from expansion response.

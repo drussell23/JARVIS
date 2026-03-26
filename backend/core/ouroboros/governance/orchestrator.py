@@ -517,6 +517,14 @@ class GovernedOrchestrator:
                 except ImportError:
                     pass
 
+                # CodeExplorationTool: sandboxed hypothesis testing
+                _explorer = None
+                try:
+                    from backend.core.ouroboros.governance.code_exploration import CodeExplorationTool
+                    _explorer = CodeExplorationTool(str(self._config.project_root))
+                except ImportError:
+                    pass
+
                 expander = ContextExpander(
                     generator=self._generator,
                     repo_root=self._config.project_root,
@@ -525,6 +533,8 @@ class GovernedOrchestrator:
                     doc_fetcher=_doc_fetcher,
                     web_search=_web_search,
                     visual_comprehension=_visual,
+                    code_explorer=_explorer,
+                    dialogue_store=self._dialogue_store,
                 )
                 ctx = await asyncio.wait_for(
                     expander.expand(ctx, expansion_deadline),
