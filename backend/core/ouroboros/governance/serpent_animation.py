@@ -90,28 +90,28 @@ _SERPENT_FRAMES = [
 
 # Compact single-line spinner for non-TTY environments
 _SPINNER_FRAMES = [
-    "[ OUROBOROS ] ~~~~~~~~~~~~>  ",
-    "[ OUROBOROS ] ~~~~~~~~~~~~~> ",
-    "[ OUROBOROS ] ~~~~~~~~~~~~~~>",
-    "[ OUROBOROS ] >~~~~~~~~~~~~~~",
-    "[ OUROBOROS ] ~>~~~~~~~~~~~~~",
-    "[ OUROBOROS ] ~~>~~~~~~~~~~~~",
-    "[ OUROBOROS ] ~~~>~~~~~~~~~~~",
-    "[ OUROBOROS ] ~~~~>~~~~~~~~~~",
+    "\U0001F40D [ OUROBOROS ] ~~~~~~~~~~~~>  ",
+    "\U0001F40D [ OUROBOROS ] ~~~~~~~~~~~~~> ",
+    "\U0001F40D [ OUROBOROS ] ~~~~~~~~~~~~~~>",
+    "\U0001F40D [ OUROBOROS ] >~~~~~~~~~~~~~~",
+    "\U0001F40D [ OUROBOROS ] ~>~~~~~~~~~~~~~",
+    "\U0001F40D [ OUROBOROS ] ~~>~~~~~~~~~~~~",
+    "\U0001F40D [ OUROBOROS ] ~~~>~~~~~~~~~~~",
+    "\U0001F40D [ OUROBOROS ] ~~~~>~~~~~~~~~~",
 ]
 
-# Minimal phase indicators
+# Minimal phase indicators with snake emoji
 _PHASE_ICONS = {
-    "CLASSIFY":          "[ OUROBOROS ] CLASSIFY  >>>>>>>>>>>>>>>",
-    "ROUTE":             "[ OUROBOROS ] ROUTE     >>>>>>>>>>>>>  ",
-    "CONTEXT_EXPANSION": "[ OUROBOROS ] EXPAND    >>>>>>>>>>>    ",
-    "GENERATE":          "[ OUROBOROS ] GENERATE  >>>>>>>>>      ",
-    "VALIDATE":          "[ OUROBOROS ] VALIDATE  >>>>>>>        ",
-    "GATE":              "[ OUROBOROS ] GATE      >>>>>          ",
-    "APPROVE":           "[ OUROBOROS ] APPROVE   >>>            ",
-    "APPLY":             "[ OUROBOROS ] APPLY     >              ",
-    "VERIFY":            "[ OUROBOROS ] VERIFY    >>             ",
-    "COMPLETE":          "[ OUROBOROS ] COMPLETE  >>>>           ",
+    "CLASSIFY":          "\U0001F40D [ OUROBOROS ] CLASSIFY  >>>>>>>>>>>>>>>",
+    "ROUTE":             "\U0001F40D [ OUROBOROS ] ROUTE     >>>>>>>>>>>>>  ",
+    "CONTEXT_EXPANSION": "\U0001F40D [ OUROBOROS ] EXPAND    >>>>>>>>>>>    ",
+    "GENERATE":          "\U0001F40D [ OUROBOROS ] GENERATE  >>>>>>>>>      ",
+    "VALIDATE":          "\U0001F40D [ OUROBOROS ] VALIDATE  >>>>>>>        ",
+    "GATE":              "\U0001F40D [ OUROBOROS ] GATE      >>>>>          ",
+    "APPROVE":           "\U0001F40D [ OUROBOROS ] APPROVE   >>>            ",
+    "APPLY":             "\U0001F40D [ OUROBOROS ] APPLY     >              ",
+    "VERIFY":            "\U0001F40D [ OUROBOROS ] VERIFY    >>             ",
+    "COMPLETE":          "\U0001F40D [ OUROBOROS ] COMPLETE  >>>>           ",
 }
 
 
@@ -163,10 +163,10 @@ class OuroborosSerpent:
             return
 
         elapsed = time.monotonic() - self._start_time
-        icon = "COMPLETE" if success else "FAILED"
+        icon = "\U0001F40D COMPLETE \u2705" if success else "\U0001F40D FAILED \u274C"
         _clear_line()
         sys.stderr.write(
-            f"\r[ OUROBOROS ] {icon} in {elapsed:.1f}s\n"
+            f"\r{icon} [ OUROBOROS ] in {elapsed:.1f}s\n"
         )
         sys.stderr.flush()
 
