@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <memory>  // v29.0: For std::shared_ptr in DelegateSharedState
 #include <cstdlib>  // v29.0: For getenv() in configurable shutdown timeout
+#include "shm_frame_bridge.h"  // Zero-copy shared memory bridge
 
 #ifdef __APPLE__
 #import <Foundation/Foundation.h>
@@ -91,6 +92,8 @@ struct DelegateSharedState {
 @property (nonatomic, assign) int jpegQuality;
 @property (nonatomic, assign) bool useGPU;
 @property (nonatomic, assign) id<MTLDevice> metalDevice;
+// Zero-copy shared memory writer (optional, nil if not enabled)
+@property (nonatomic, assign) jarvis::vision::shm::ShmFrameWriter* shmWriter;
 @end
 
 @implementation JARVISStreamingDelegate
@@ -332,6 +335,26 @@ struct CallbackGuard {
         CGColorSpaceRelease(colorSpace);
     }
 
+    // Write to shared memory BEFORE unlocking the pixel buffer.
+    // This is the zero-copy bridge: Python reads shm directly via numpy.frombuffer.
+    // Cost: ~0.5ms for 1440x900x4 = 5.2MB memcpy. Runs on the GCD capture queue.
+    if (_shmWriter && _shmWriter->is_open()) {
+        auto ts = std::chrono::steady_clock::now().time_since_epoch();
+        uint64_t ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ts).count();
+
+        // Write the downsampled frame if retina, otherwise the raw frame
+        if (frame.data.size() > 0) {
+            _shmWriter->write_frame(frame.data.data(), (uint32_t)frame.data.size(), ts_ns);
+        } else {
+            // Fallback: write raw pixels directly (non-retina path)
+            _shmWriter->write_frame(
+                static_cast<const uint8_t*>(baseAddress),
+                (uint32_t)(bytesPerRow * height),
+                ts_ns
+            );
+        }
+    }
+
     CVPixelBufferUnlockBaseAddress(imageBuffer, kCVPixelBufferLock_ReadOnly);
 
     // Calculate latency
@@ -404,6 +427,9 @@ public:
     // RunLoop pump thread — keeps CFRunLoop alive so SCK can deliver frames
     std::thread runloop_thread;
     std::atomic<bool> runloop_active{false};
+
+    // Zero-copy shared memory bridge — Python reads without GIL
+    jarvis::vision::shm::ShmFrameWriter shm_writer;
 
     Impl(uint32_t wid, const StreamConfig& cfg)
         : window_id(wid), config(cfg), frame_callback(cfg.frame_callback),
@@ -615,6 +641,13 @@ public:
             delegate.jpegQuality = config.jpeg_quality;
             delegate.useGPU = config.use_gpu_acceleration;
             delegate.metalDevice = metal_device;
+
+            // Open shared memory bridge for zero-copy Python access
+            if (shm_writer.open(scaled_width, scaled_height, 4)) {
+                delegate.shmWriter = &shm_writer;
+            } else {
+                delegate.shmWriter = nullptr;
+            }
 
             // Create stream
             NSError *error = nil;

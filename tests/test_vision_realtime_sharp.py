@@ -597,16 +597,30 @@ async def main(duration_s: int = 60):
     # Find Chrome window first
     _chrome_wid = _find_chrome_ball_window()
 
-    # Quartz targeted window capture — 12.5fps proven, zero GIL contention.
-    # SCK delivers 8fps at the C++ level but pybind11 GIL handoff drops to 1.2fps.
-    # Quartz via asyncio.run_in_executor properly manages GIL → 12.5fps sustained.
-    # TODO: Ouroboros target — fix SCK GIL contention via shared memory buffer.
+    # Capture cascade: SHM bridge (20fps) → Quartz per-frame (9fps) → frame_server
+    _shm_reader = None
     _sck_active = False
     from backend.vision.lean_loop import LeanVisionLoop
     loop = LeanVisionLoop.get_instance()
-    if _chrome_wid:
-        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — 12.5fps")
-    else:
+
+    # Try SHM bridge first — start SCK daemon, read via zero-copy mmap
+    try:
+        _sck_active = await _start_sck_stream(0)  # Start SCK full-screen
+        if _sck_active:
+            await asyncio.sleep(2)  # Let SCK warm up and write to shm
+            from backend.vision.shm_frame_reader import ShmFrameReader
+            _shm_reader = ShmFrameReader()
+            if _shm_reader.open():
+                print(f"  Capture: SHM BRIDGE (zero-copy mmap) — 20fps target")
+            else:
+                _shm_reader = None
+                print(f"  Capture: SHM failed to open — falling back")
+    except Exception as exc:
+        print(f"  SHM bridge error: {exc}")
+
+    if not _shm_reader and _chrome_wid:
+        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — 9fps")
+    elif not _shm_reader:
         loop._frame_server_proc = None
         loop._frame_server_ready = False
         await loop._ensure_frame_server()
@@ -691,16 +705,19 @@ async def main(duration_s: int = 60):
     last_vla_time = 0.0
 
     while (time.monotonic() - t_start) < duration_s:
-        # ---- CAPTURE: Quartz targeted window (12.5fps proven) ----
+        # ---- CAPTURE: SHM bridge (20fps) → Quartz (9fps) → frame_server ----
         raw_frame: Optional[np.ndarray] = None
         b64: Optional[str] = None
 
-        if _chrome_wid:
+        if _shm_reader is not None:
+            # Zero-copy: numpy view over shared memory, no GIL
+            raw_frame, _ = _shm_reader.read_frame()
+        if raw_frame is None and _chrome_wid:
             raw_frame = await _capture_window_raw_async(_chrome_wid)
         if raw_frame is None:
             b64 = await loop._capture_cu_screenshot()
             if b64 is None:
-                await asyncio.sleep(0.016)
+                await asyncio.sleep(0.008)  # ~120fps yield
                 continue
         # b64 lazily encoded only when OCR or cloud needs it
 
@@ -985,6 +1002,8 @@ async def main(duration_s: int = 60):
     await jarvis_say(summary)
 
     print("=" * 70 + "\n")
+    if _shm_reader:
+        _shm_reader.close()
     await _stop_sck_stream()
     try:
         if not _sck_active and loop._frame_server_proc and loop._frame_server_proc.returncode is None:
