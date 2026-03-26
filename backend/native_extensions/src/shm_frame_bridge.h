@@ -1,38 +1,43 @@
 /**
- * Zero-Copy Shared Memory Frame Bridge
+ * Zero-Copy Shared Memory Ring Buffer Frame Bridge
  *
- * Eliminates the pybind11 GIL contention bottleneck that caps SCK at 1.2fps
- * through Python. The C++ capture daemon writes raw BGRA pixels into a POSIX
- * shared memory segment. Python reads them via numpy.frombuffer() -- zero copy,
+ * 5-slot ring buffer absorbs SCK burst delivery. C++ writes at 60fps in
+ * bursts. Python reads the latest slot via numpy.frombuffer() -- zero copy,
  * zero GIL, zero function calls across the language boundary.
  *
- * Memory Layout (double-buffered):
- *   [Header: 64 bytes]
- *     uint64_t frame_counter    -- monotonic, incremented by writer on each frame
- *     uint32_t width            -- frame width in pixels
- *     uint32_t height           -- frame height in pixels
- *     uint32_t channels         -- always 4 (BGRA)
- *     uint32_t active_buffer    -- 0 or 1 (which buffer has the latest frame)
- *     uint64_t timestamp_ns     -- capture timestamp (steady_clock nanoseconds)
- *     uint32_t writer_pid       -- PID of the writing process
- *     uint8_t  padding[20]      -- alignment to 64 bytes
+ * Memory Layout:
+ *   [Header: 128 bytes]
+ *     uint64_t frame_counter      -- monotonic counter (total frames written)
+ *     uint32_t width              -- frame width in pixels
+ *     uint32_t height             -- frame height in pixels
+ *     uint32_t channels           -- 4 (BGRA)
+ *     uint32_t ring_size          -- number of slots (5)
+ *     uint32_t write_index        -- next slot C++ will write to (0..ring_size-1)
+ *     uint32_t latest_index       -- slot with the most recent complete frame
+ *     uint32_t frame_size         -- width * height * channels
+ *     uint32_t writer_pid         -- PID of the writer process
+ *     uint64_t timestamps[5]      -- per-slot capture timestamp (nanoseconds)
+ *     uint8_t  padding[...]       -- align to 128 bytes
  *
- *   [Buffer 0: width * height * channels bytes]
- *   [Buffer 1: width * height * channels bytes]
+ *   [Slot 0: frame_size bytes]
+ *   [Slot 1: frame_size bytes]
+ *   [Slot 2: frame_size bytes]
+ *   [Slot 3: frame_size bytes]
+ *   [Slot 4: frame_size bytes]
  *
- * Double-buffering: writer fills the INACTIVE buffer, then atomically flips
- * active_buffer. Reader always reads the ACTIVE buffer. No locks needed --
- * the atomic flip is the synchronization primitive.
- *
- * Boundary Mandate: this is pure deterministic infrastructure. No intelligence,
- * no decisions, no agentic behavior. Just memory physics.
+ * Protocol:
+ *   Writer: memcpy pixels into slot[write_index], set timestamps[write_index],
+ *           atomically update latest_index = write_index, increment frame_counter,
+ *           advance write_index = (write_index + 1) % ring_size.
+ *   Reader: read latest_index, read from slot[latest_index] via frombuffer.
+ *           Writer never overwrites latest_index until the NEXT write completes.
+ *           With 5 slots, the writer has 4 slots of headroom before wrapping.
  */
 
 #pragma once
 
 #include <cstdint>
 #include <cstring>
-#include <string>
 #include <atomic>
 
 #ifdef __APPLE__
@@ -44,79 +49,62 @@
 
 namespace jarvis { namespace vision { namespace shm {
 
-// Shared memory segment name
 static constexpr const char* SHM_NAME = "/jarvis_frame_bridge";
+static constexpr uint32_t RING_SIZE = 5;
 
-// Header layout -- exactly 64 bytes, naturally aligned
-struct FrameHeader {
-    std::atomic<uint64_t> frame_counter;   // 8 bytes
-    uint32_t width;                         // 4 bytes
-    uint32_t height;                        // 4 bytes
-    uint32_t channels;                      // 4 bytes
-    std::atomic<uint32_t> active_buffer;   // 4 bytes (0 or 1)
-    uint64_t timestamp_ns;                  // 8 bytes
-    uint32_t writer_pid;                    // 4 bytes
-    uint32_t frame_size;                    // 4 bytes (width * height * channels)
-    uint8_t  padding[24];                   // pad to 64 bytes
+// Header: 128 bytes
+struct RingHeader {
+    std::atomic<uint64_t> frame_counter;    // 8
+    uint32_t width;                          // 4
+    uint32_t height;                         // 4
+    uint32_t channels;                       // 4
+    uint32_t ring_size;                      // 4
+    std::atomic<uint32_t> write_index;      // 4
+    std::atomic<uint32_t> latest_index;     // 4
+    uint32_t frame_size;                     // 4
+    uint32_t writer_pid;                     // 4
+    uint64_t timestamps[RING_SIZE];          // 40 (5 * 8)
+    uint8_t  padding[48];                    // 48 to reach 128
 };
 
-static_assert(sizeof(FrameHeader) == 64, "Header must be exactly 64 bytes");
+static_assert(sizeof(RingHeader) == 128, "RingHeader must be 128 bytes");
 
-/**
- * Writer side: C++ SCK daemon writes frames here.
- * Called from the SCK delegate's didOutputSampleBuffer callback.
- */
 class ShmFrameWriter {
 public:
     ShmFrameWriter() : shm_fd_(-1), shm_ptr_(nullptr), shm_size_(0) {}
+    ~ShmFrameWriter() { close(); }
 
-    ~ShmFrameWriter() {
-        close();
-    }
-
-    /**
-     * Create and map the shared memory segment.
-     * Returns true on success. Idempotent -- safe to call multiple times.
-     */
     bool open(uint32_t width, uint32_t height, uint32_t channels = 4) {
-        if (shm_ptr_) return true;  // Already open
-
+        if (shm_ptr_) return true;
 #ifdef __APPLE__
         uint32_t frame_size = width * height * channels;
-        shm_size_ = sizeof(FrameHeader) + (frame_size * 2);  // double buffer
+        shm_size_ = sizeof(RingHeader) + (frame_size * RING_SIZE);
 
-        // Create shared memory
         shm_fd_ = shm_open(SHM_NAME, O_CREAT | O_RDWR, 0666);
         if (shm_fd_ < 0) return false;
 
-        // Size it
         if (ftruncate(shm_fd_, shm_size_) < 0) {
-            ::close(shm_fd_);
-            shm_fd_ = -1;
-            return false;
+            ::close(shm_fd_); shm_fd_ = -1; return false;
         }
 
-        // Map it
         shm_ptr_ = mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE,
                          MAP_SHARED, shm_fd_, 0);
         if (shm_ptr_ == MAP_FAILED) {
-            shm_ptr_ = nullptr;
-            ::close(shm_fd_);
-            shm_fd_ = -1;
-            return false;
+            shm_ptr_ = nullptr; ::close(shm_fd_); shm_fd_ = -1; return false;
         }
 
-        // Initialize header
-        auto* header = reinterpret_cast<FrameHeader*>(shm_ptr_);
-        header->frame_counter.store(0, std::memory_order_relaxed);
-        header->width = width;
-        header->height = height;
-        header->channels = channels;
-        header->active_buffer.store(0, std::memory_order_relaxed);
-        header->timestamp_ns = 0;
-        header->writer_pid = getpid();
-        header->frame_size = frame_size;
-        memset(header->padding, 0, sizeof(header->padding));
+        auto* h = reinterpret_cast<RingHeader*>(shm_ptr_);
+        h->frame_counter.store(0, std::memory_order_relaxed);
+        h->width = width;
+        h->height = height;
+        h->channels = channels;
+        h->ring_size = RING_SIZE;
+        h->write_index.store(0, std::memory_order_relaxed);
+        h->latest_index.store(0, std::memory_order_relaxed);
+        h->frame_size = frame_size;
+        h->writer_pid = getpid();
+        memset(h->timestamps, 0, sizeof(h->timestamps));
+        memset(h->padding, 0, sizeof(h->padding));
 
         return true;
 #else
@@ -125,46 +113,36 @@ public:
     }
 
     /**
-     * Write a frame to the INACTIVE buffer, then flip.
-     * Called from the SCK delegate on the capture_queue thread.
-     * ~0.5ms for a 1440x900x4 frame (5.2MB memcpy).
+     * Write a frame into the next ring slot and advance.
+     * Called from the SCK delegate on the GCD capture_queue.
      */
     void write_frame(const uint8_t* pixels, uint32_t size, uint64_t timestamp_ns) {
         if (!shm_ptr_) return;
 
-        auto* header = reinterpret_cast<FrameHeader*>(shm_ptr_);
-        uint32_t frame_size = header->frame_size;
-        if (size < frame_size) return;  // Frame too small
+        auto* h = reinterpret_cast<RingHeader*>(shm_ptr_);
+        uint32_t fs = h->frame_size;
+        if (size < fs) return;
 
-        // Write to INACTIVE buffer
-        uint32_t active = header->active_buffer.load(std::memory_order_acquire);
-        uint32_t write_buf = 1 - active;  // The other buffer
-
+        // Write into the current write_index slot
+        uint32_t wi = h->write_index.load(std::memory_order_relaxed);
         uint8_t* dst = static_cast<uint8_t*>(shm_ptr_)
-                       + sizeof(FrameHeader)
-                       + (write_buf * frame_size);
+                       + sizeof(RingHeader) + (wi * fs);
 
-        memcpy(dst, pixels, frame_size);
+        memcpy(dst, pixels, fs);
+        h->timestamps[wi] = timestamp_ns;
 
-        // Update metadata
-        header->timestamp_ns = timestamp_ns;
+        // Publish: this slot is now the latest complete frame
+        h->latest_index.store(wi, std::memory_order_release);
+        h->frame_counter.fetch_add(1, std::memory_order_relaxed);
 
-        // Atomic flip -- this is the ONLY synchronization point
-        header->active_buffer.store(write_buf, std::memory_order_release);
-        header->frame_counter.fetch_add(1, std::memory_order_relaxed);
+        // Advance write pointer (wrap around ring)
+        h->write_index.store((wi + 1) % RING_SIZE, std::memory_order_relaxed);
     }
 
     void close() {
 #ifdef __APPLE__
-        if (shm_ptr_) {
-            munmap(shm_ptr_, shm_size_);
-            shm_ptr_ = nullptr;
-        }
-        if (shm_fd_ >= 0) {
-            ::close(shm_fd_);
-            shm_unlink(SHM_NAME);
-            shm_fd_ = -1;
-        }
+        if (shm_ptr_) { munmap(shm_ptr_, shm_size_); shm_ptr_ = nullptr; }
+        if (shm_fd_ >= 0) { ::close(shm_fd_); shm_unlink(SHM_NAME); shm_fd_ = -1; }
 #endif
     }
 

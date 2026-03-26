@@ -1,21 +1,25 @@
 """
-Zero-Copy Shared Memory Frame Reader
+Zero-Copy Shared Memory Ring Buffer Frame Reader
 
-Reads raw BGRA frames from POSIX shared memory written by the C++ SCK daemon.
-Uses numpy.frombuffer() to create an array view directly over the mapped memory --
-zero copy, zero GIL, zero function calls across the language boundary.
+Reads raw BGRA frames from a 5-slot POSIX shared memory ring buffer
+written by the C++ SCK daemon. Uses numpy.frombuffer() to create an
+array VIEW directly over the mapped memory -- zero copy, zero GIL.
 
-The C++ writer (shm_frame_bridge.h) double-buffers: it writes to the inactive
-buffer, then atomically flips active_buffer. Python always reads the active
-buffer. No locks needed.
+The ring buffer absorbs SCK's bursty delivery. C++ writes at up to
+60fps in bursts. Python reads the latest complete frame at any time.
+With 5 slots, even if C++ bursts 4 frames while Python processes one,
+no frames are torn (the reader always gets a complete frame from the
+latest_index slot).
 
 Usage::
 
     reader = ShmFrameReader()
     if reader.open():
-        frame, counter = reader.read_frame()
-        # frame is a numpy array view over shared memory -- zero copy
-        # counter is the monotonic frame number (detect new frames)
+        while True:
+            frame, counter = reader.read_latest()
+            if frame is not None:
+                green = frame[::2, ::2, 1]  # Subsample green channel
+                ...
 """
 from __future__ import annotations
 
@@ -30,21 +34,20 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Must match shm_frame_bridge.h layout exactly
 SHM_NAME = "/jarvis_frame_bridge"
-HEADER_SIZE = 64
-HEADER_FMT = "<QIIIIQIIxxxxxxxxxxxxxxxxxxxxxxxx"
-# Q=frame_counter, I=width, I=height, I=channels, I=active_buffer,
-# Q=timestamp_ns, I=writer_pid, I=frame_size, 24 bytes padding
+HEADER_SIZE = 128
+RING_SIZE = 5
+
+# Header struct: must match RingHeader in shm_frame_bridge.h
+# Q=frame_counter, I=width, I=height, I=channels, I=ring_size,
+# I=write_index, I=latest_index, I=frame_size, I=writer_pid
+# Then 5 Q timestamps, then 48 bytes padding
+HEADER_FIXED = "<QIIIIIIII"
+HEADER_FIXED_SIZE = struct.calcsize(HEADER_FIXED)  # 40 bytes
 
 
 class ShmFrameReader:
-    """Zero-copy shared memory frame reader.
-
-    Opens the POSIX shared memory segment created by the C++ SCK daemon
-    and returns numpy array views directly over the mapped memory.
-    No data is copied. No GIL is acquired for the read.
-    """
+    """Zero-copy ring buffer reader. Python's eye into the C++ retina."""
 
     def __init__(self) -> None:
         self._mm: Optional[mmap.mmap] = None
@@ -56,116 +59,89 @@ class ShmFrameReader:
         self._frame_size: int = 0
 
     def open(self) -> bool:
-        """Open the shared memory segment. Returns True on success."""
+        """Open the shared memory ring buffer. Returns True on success."""
         if self._mm is not None:
             return True
-
         try:
-            # Open the POSIX shared memory file descriptor
-            shm_path = f"/dev/shm{SHM_NAME}"
-            # macOS uses /tmp for shm_open files
-            if os.path.exists(f"/tmp/com.apple.shm{SHM_NAME}"):
-                shm_path = f"/tmp/com.apple.shm{SHM_NAME}"
-
-            # Use ctypes to call shm_open directly
             libc = ctypes.CDLL("libc.dylib", use_errno=True)
-            shm_name_bytes = SHM_NAME.encode("utf-8")
-            self._fd = libc.shm_open(shm_name_bytes, os.O_RDONLY, 0o666)
-
+            self._fd = libc.shm_open(
+                SHM_NAME.encode("utf-8"), os.O_RDONLY, 0o666,
+            )
             if self._fd < 0:
-                errno = ctypes.get_errno()
-                logger.debug("[ShmReader] shm_open failed: errno=%d", errno)
                 return False
 
-            # Get the size
-            stat = os.fstat(self._fd)
-            total_size = stat.st_size
+            total_size = os.fstat(self._fd).st_size
             if total_size < HEADER_SIZE:
                 os.close(self._fd)
                 self._fd = -1
                 return False
 
-            # Map it read-only
             self._mm = mmap.mmap(self._fd, total_size, access=mmap.ACCESS_READ)
 
-            # Read header to get frame dimensions
-            header_bytes = self._mm[:HEADER_SIZE]
+            # Read static header fields
+            fixed = struct.unpack_from(HEADER_FIXED, self._mm, 0)
             (
-                counter, width, height, channels, active_buf,
-                ts_ns, writer_pid, frame_size,
-            ) = struct.unpack_from("<QIIIIQII", header_bytes, 0)
-
-            self._width = width
-            self._height = height
-            self._channels = channels
-            self._frame_size = frame_size
+                _counter, self._width, self._height, self._channels,
+                _ring, _wi, _li, self._frame_size, _pid,
+            ) = fixed
 
             logger.info(
-                "[ShmReader] Opened: %dx%dx%d (%d bytes/frame) writer_pid=%d",
-                width, height, channels, frame_size, writer_pid,
+                "[ShmRing] Opened: %dx%dx%d ring=%d frame_size=%d",
+                self._width, self._height, self._channels, RING_SIZE,
+                self._frame_size,
             )
             return True
-
         except Exception as exc:
-            logger.debug("[ShmReader] open failed: %s", exc)
+            logger.debug("[ShmRing] open failed: %s", exc)
             self.close()
             return False
 
-    def read_frame(self) -> Tuple[Optional[np.ndarray], int]:
-        """Read the latest frame from shared memory. Zero copy.
+    def read_latest(self) -> Tuple[Optional[np.ndarray], int]:
+        """Read the latest complete frame from the ring buffer. Zero copy.
 
-        Returns (frame, counter) where frame is a numpy array view
-        over the shared memory and counter is the monotonic frame number.
-        Returns (None, 0) if no new frame or not open.
+        Returns (frame_view, counter). frame_view is a numpy array VIEW
+        over the mmap -- no data is copied. Returns (None, 0) if no new frame.
 
-        The returned array is BGRA format (same as SCK output).
-        Green channel is index 1 in both BGRA and RGB.
+        The returned array is BGRA. Green channel is index 1.
         """
         if self._mm is None:
             return None, 0
-
         try:
-            # Read header atomically (struct unpack from mmap)
-            header_bytes = self._mm[:HEADER_SIZE]
-            (
-                counter, width, height, channels, active_buf,
-                ts_ns, writer_pid, frame_size,
-            ) = struct.unpack_from("<QIIIIQII", header_bytes, 0)
-
-            # No new frame?
+            # Read frame_counter (offset 0) and latest_index (offset 28)
+            counter = struct.unpack_from("<Q", self._mm, 0)[0]
             if counter == self._last_counter:
+                return None, counter  # No new frame
+
+            latest_idx = struct.unpack_from("<I", self._mm, 28)[0]
+
+            # Bounds check
+            if latest_idx >= RING_SIZE:
                 return None, counter
 
-            # Dimensions changed?
-            if width != self._width or height != self._height:
-                self._width = width
-                self._height = height
-                self._channels = channels
-                self._frame_size = frame_size
+            # Slot offset in the mmap
+            slot_offset = HEADER_SIZE + (latest_idx * self._frame_size)
+            slot_end = slot_offset + self._frame_size
 
-            # Calculate buffer offset
-            buf_offset = HEADER_SIZE + (active_buf * frame_size)
-            buf_end = buf_offset + frame_size
-
-            if buf_end > len(self._mm):
+            if slot_end > len(self._mm):
                 return None, counter
 
-            # Zero-copy: numpy array VIEW over the mmap buffer
-            # This does NOT copy the pixel data. It wraps the memory.
+            # Zero-copy: numpy view directly over the mmap buffer
             frame = np.frombuffer(
                 self._mm, dtype=np.uint8,
-                count=frame_size, offset=buf_offset,
-            ).reshape((height, width, channels))
+                count=self._frame_size, offset=slot_offset,
+            ).reshape((self._height, self._width, self._channels))
 
             self._last_counter = counter
             return frame, counter
 
-        except Exception as exc:
-            logger.debug("[ShmReader] read failed: %s", exc)
+        except Exception:
             return None, 0
 
+    # Legacy alias for compatibility
+    def read_frame(self) -> Tuple[Optional[np.ndarray], int]:
+        return self.read_latest()
+
     def has_new_frame(self) -> bool:
-        """Check if a new frame is available without reading it."""
         if self._mm is None:
             return False
         try:
@@ -174,19 +150,7 @@ class ShmFrameReader:
         except Exception:
             return False
 
-    @property
-    def fps_estimate(self) -> float:
-        """Read the current frame counter to estimate activity."""
-        if self._mm is None:
-            return 0.0
-        try:
-            counter = struct.unpack_from("<Q", self._mm, 0)[0]
-            return float(counter)  # Caller tracks delta/time
-        except Exception:
-            return 0.0
-
     def close(self) -> None:
-        """Close the shared memory mapping."""
         if self._mm is not None:
             try:
                 self._mm.close()
