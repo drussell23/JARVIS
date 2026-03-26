@@ -63,9 +63,9 @@ Autonomous decisions must be **visible**. A **TelemetryBus** (and related emitte
 
 **No shortcuts whatsoever.** No brute-force retries without diagnosis. No hardcoded routing tables that encode product policy. No sequential bottlenecks that exist only because “it was easier.” If a subsystem fails or hangs, the response is **structural repair** — dismantle the flawed assumption and rebuild — not a bypass that hides the bug. We do not attempt to code every future task explicitly; we code **the entity that can survive novelty**.
 
-### Five core execution contexts (why not sixty agents)
+### Five core execution contexts + Symbiotic Router
 
-Large reasoning models collapse many narrow “specialist agents” into **one mind** that adapts to the task. The codebase should expose **a small number of execution contexts** differentiated by **tools and sandbox boundaries**, not by dozens of parallel `if` branches.
+Large reasoning models collapse many narrow “specialist agents” into **one mind** that adapts to the task. The codebase exposes **five execution contexts** (Brain) differentiated by tools and sandbox boundaries, backed by **22 legacy Neural Mesh agents** (Peripheral Nervous System) as a Strangler Fig fallback.
 
 | Context | Responsibility | Typical model tier (policy-driven) |
 |---|---|---|
@@ -75,7 +75,29 @@ Large reasoning models collapse many narrow “specialist agents” into **one m
 | **Communicator** | Email, calendar, messaging — protocol-heavy I/O | Fast tier by default; heavy tier when ambiguity is high |
 | **Observer** | Monitors screen / logs, anomaly detection, briefings | Vision or fast tier depending on sensitivity |
 
-**Intelligence lives in the model and the plan**, not in the number of Python classes. Agent code supplies: **tools** (filesystem, browser, screen, APIs), **execution locale** (live vs sandbox), and **safety gates** (human approval for destructive actions).
+**Symbiotic Router (`backend/core_contexts/facade.py`) — 3-tier dispatch:**
+
+```
+Tier 1: Core Contexts (Brain)
+  │ Feature-flagged per vertical (JARVIS_CTX_EXECUTOR=true, etc.)
+  │ 397B Architect routes goals to the appropriate context
+  │ SUCCESS → return result
+  │ FAIL/DISABLED → fall through ↓
+  │
+Tier 2: Legacy Agents (Peripheral Nervous System)
+  │ 22 Neural Mesh agents (30K+ lines of production code)
+  │ GoogleWorkspaceAgent (6.7K lines), VisualMonitorAgent (11K lines), etc.
+  │ Keyword-based agent selection + lazy instantiation
+  │ SUCCESS → return result
+  │ FAIL → fall through ↓
+  │
+Tier 3: Ouroboros Neuroplasticity (Pillar 6)
+    CapabilityGapEvent emitted to GapSignalBus
+    GraduationOrchestrator JIT-synthesizes the missing capability
+    “I'm learning how to do this.”
+```
+
+The **Strangler Fig pattern** enables incremental migration: flip one vertical at a time, verify it works, then flip the next. Legacy agents stay alive as Tier 2 fallback until the Core Context fully absorbs their logic. No big bang. No deletion of working code.
 
 ### Example: one goal, multiple contexts (Ouroboros-aligned)
 
@@ -131,11 +153,70 @@ A stripped-down three-step see-think-act loop that replaced the original 12-hop 
 
 Focus-preserving UI automation. Ghost Hands executes actions on background windows without stealing keyboard focus from the user's active window. Three backends are available: Playwright for browser DOM manipulation, AppleScript/JXA for native macOS apps, and Quartz CGEvent injection for low-level input. A `FocusGuard` singleton saves and restores the frontmost application around every action.
 
-### Ouroboros Governance
+### Ouroboros Governance Engine
 
 **`backend/core/ouroboros/`**
 
-The self-developing code pipeline. Ouroboros detects improvement opportunities (test failures, mined patterns), generates multi-repo patches via J-Prime or Claude (schema 2c.1), validates them, applies them through branch-isolated sagas with two-tier locks and fast-forward-only promote gates, and narrates every decision via voice and TUI. Key modules: `governed_loop_service.py` (main loop), `orchestrator.py` (FSM pipeline), `providers.py` (code generation), `brain_selector.py` (model selection), `saga/` (branch isolation and rollback), `intake/` (sensors for test failures and opportunities).
+The self-developing code pipeline — the organism's immune system and neuroplasticity layer. Ouroboros runs a 10-phase governance pipeline (CLASSIFY → ROUTE → CONTEXT_EXPANSION → GENERATE → VALIDATE → GATE → APPROVE → APPLY → VERIFY → COMPLETE) that detects improvement opportunities, generates multi-repo patches, validates them in sandboxed worktrees, applies them through branch-isolated sagas, and narrates every decision via voice and TUI.
+
+**10-Phase Pipeline:**
+
+| Phase | Component | Function |
+|---|---|---|
+| CLASSIFY | RiskEngine + ComplexityClassifier | Deterministic risk tier assignment |
+| ROUTE | BrainSelector + RouteDecisionService | Policy-driven provider selection |
+| CONTEXT_EXPANSION | ContextExpander + TheOracle + DocFetcher | Semantic file neighborhood + bounded external doc retrieval |
+| GENERATE | DoublewordProvider → PrimeProvider → ClaudeProvider | 3-tier failback code generation (397B → 7B → Claude) |
+| VALIDATE | TestRunner (Python + C++ adapters) | Flake detection, structured critique, episodic memory |
+| GATE | PolicyEngine + ContractGate | Declarative YAML rules, FSM contract validation |
+| APPROVE | ApprovalProvider | Human-in-the-loop gate (idempotent, timeout → EXPIRED) |
+| APPLY | ChangeEngine + SagaApplyStrategy + InfrastructureApplicator | Transactional file writes + deterministic post-apply hooks (pip install, env reload) |
+| VERIFY | ShadowHarness + PatchBenchmarker + Shannon Entropy | Structural integrity + performance + composite ignorance measurement |
+| COMPLETE | Ledger + LearningBridge | Immutable audit trail + outcome feedback for future operations |
+
+**10 Autonomous Sensors (Intake Layer):**
+
+| Sensor | Detects | Poll Interval |
+|---|---|---|
+| TestFailureSensor | Real-time pytest failures (streak-based stability) | Event-driven |
+| VoiceCommandSensor | Voice intents with STT confidence gating | Event-driven |
+| OpportunityMinerSensor | Cyclomatic complexity violations via AST | Hourly |
+| CapabilityGapSensor | Neural mesh capability boundaries | Event-driven |
+| ScheduledTriggerSensor | Cron-based governance operations (YAML config) | Configurable |
+| BacklogSensor | `.jarvis/backlog.json` task queue | 30s |
+| RuntimeHealthSensor | Python EOL, package staleness, import errors, security audit, legacy shim detection | Daily |
+| WebIntelligenceSensor | PyPI CVE/advisory vulnerabilities against installed packages | Daily |
+| PerformanceRegressionSensor | P50 latency drift, success rate drops, code quality degradation | Hourly |
+| DocStalenessSensor | Undocumented Python modules via AST analysis | Daily |
+
+**Shannon Entropy Calculator (Pillar 4 — Synthetic Soul):**
+
+Computes a CompositeEntropySignal from two deterministic sources:
+- **Acute Ignorance** (per-generation): validation pass/fail, critique severity distribution, shadow harness confidence, retry exhaustion
+- **Chronic Ignorance** (historical domain): failure rate and outcome entropy from LearningBridge history
+
+Fused into a SystemicEntropyScore via `H(X) = -Σ p·log₂(p)` with a 4-quadrant decision matrix:
+
+| Acute | Chronic | Quadrant | Action |
+|---|---|---|---|
+| High | High | IMMEDIATE_TRIGGER | Emit CapabilityGapEvent → Ouroboros neuroplasticity |
+| High | Low | WARNING_RETRY | Bad prompt, not bad domain — retry with adjusted context |
+| Low | High | FALSE_CONFIDENCE | Force sandbox validation despite passing tests |
+| Low | Low | HEALTHY | No action needed |
+
+**Infrastructure Applicator (Boundary Principle):**
+
+Deterministic post-APPLY hook. When the agentic layer modifies `requirements.txt`, the deterministic skeleton automatically runs `pip install`. When `.env` is modified, it reloads environment variables in-process. The agentic layer decides WHAT to change; the skeleton executes the KNOWN consequence.
+
+| File Modified | Deterministic Action |
+|---|---|
+| `requirements.txt` | `venv/bin/pip install -r requirements.txt` |
+| `package.json` | `npm install` |
+| `.env`, `backend/.env` | In-process env var reload (additive merge) |
+
+**Graduation Orchestrator (Pillar 6):**
+
+Converts ephemeral tools into permanent agents: TRACKING → EVALUATING → WORKTREE_CREATING → GENERATING → VALIDATING → COMMITTING → AWAITING_APPROVAL → PUSHING → AWAITING_MERGE → REGISTERING → GRADUATED. After `JARVIS_GRADUATION_THRESHOLD` (default 3) successful uses, synthesizes production-ready agent code, runs contract tests, creates a Git PR, and hot-loads the new agent on merge.
 
 ### Voice Biometric Authentication
 
@@ -222,6 +303,17 @@ Core configuration. All values have sensible defaults; only `ANTHROPIC_API_KEY` 
 | `JARVIS_PROACTIVE_MONITORING` | `false` | Enable proactive screen analysis and suggestions |
 | `JARVIS_GOVERNANCE_MODE` | `sandbox` | Ouroboros governance mode: `sandbox`, `observe`, or `governed` |
 | `JARVIS_SAGA_BRANCH_ISOLATION` | `false` | Enable branch-isolated sagas for Ouroboros patches |
+| `JARVIS_INFRA_APPLICATOR_ENABLED` | `true` | Enable deterministic post-APPLY hooks (pip install, env reload) |
+| `JARVIS_ENTROPY_SYSTEMIC_THRESHOLD` | `0.7` | Shannon entropy threshold for CapabilityGapEvent emission |
+| `JARVIS_ENTROPY_ACUTE_WEIGHT` | `0.6` | Weight of per-generation signal in composite entropy |
+| `JARVIS_ENTROPY_CHRONIC_WEIGHT` | `0.4` | Weight of historical domain signal in composite entropy |
+| `JARVIS_WEB_INTEL_INTERVAL_S` | `86400` | WebIntelligenceSensor poll interval (seconds) |
+| `JARVIS_RUNTIME_HEALTH_INTERVAL_S` | `86400` | RuntimeHealthSensor poll interval (seconds) |
+| `JARVIS_PERF_REGRESSION_INTERVAL_S` | `3600` | PerformanceRegressionSensor poll interval (seconds) |
+| `JARVIS_CTX_EXECUTOR` | `false` | Enable Executor Core Context (Strangler Fig migration) |
+| `JARVIS_CTX_COMMUNICATOR` | `false` | Enable Communicator Core Context |
+| `JARVIS_CTX_DEVELOPER` | `false` | Enable Developer Core Context |
+| `JARVIS_CTX_OBSERVER` | `false` | Enable Observer Core Context |
 | `JARVIS_VOICE_ENABLED` | `true` | Enable voice input/output |
 | `JARVIS_AUDIO_BUS_ENABLED` | `false` | Enable real-time full-duplex audio bus |
 | `JARVIS_DEBUG` | `false` | Verbose debug logging |
@@ -248,14 +340,57 @@ JARVIS-AI-Agent/
 |   |   |-- telemetry_emitter.py   # Observability event pipeline
 |   |   `-- ouroboros/              # Self-developing governance engine
 |   |       |-- governance/
-|   |       |   |-- governed_loop_service.py  # Main autonomous loop
-|   |       |   |-- orchestrator.py           # FSM pipeline (classify-route-generate-validate-apply)
-|   |       |   |-- brain_selector.py         # Model selection for code generation
+|   |       |   |-- governed_loop_service.py  # Main autonomous loop (Zone 6.8)
+|   |       |   |-- orchestrator.py           # 10-phase FSM pipeline
+|   |       |   |-- brain_selector.py         # Model selection + boot handshake
 |   |       |   |-- brain_selection_policy.yaml  # Single source of truth for all model routing
-|   |       |   |-- providers.py              # J-Prime + Claude code generation backends
-|   |       |   |-- saga/                     # Branch-isolated patch application
-|   |       |   `-- intake/                   # Sensors (test failures, opportunities)
+|   |       |   |-- providers.py              # PrimeProvider + ClaudeProvider
+|   |       |   |-- doubleword_provider.py    # Tier 0: Doubleword 397B batch API
+|   |       |   |-- entropy_calculator.py     # Shannon entropy composite ignorance measurement
+|   |       |   |-- infrastructure_applicator.py  # Deterministic post-APPLY hooks (pip, npm, env)
+|   |       |   |-- doc_fetcher.py            # Bounded external doc retrieval for CONTEXT_EXPANSION
+|   |       |   |-- candidate_generator.py    # 3-tier failback: Doubleword -> J-Prime -> Claude
+|   |       |   |-- change_engine.py          # Transactional file writes with rollback
+|   |       |   |-- repair_engine.py          # Iterative self-repair on validation failures
+|   |       |   |-- test_runner.py            # Multi-adapter test validation (Python + C++)
+|   |       |   |-- graduation_orchestrator.py  # Ephemeral -> permanent agent via Git PR
+|   |       |   |-- saga/                     # Branch-isolated multi-repo patch application
+|   |       |   |-- autonomy/                 # L3 subagent scheduler + execution graphs
+|   |       |   |   |-- subagent_scheduler.py # Parallel work unit dispatch (DAG)
+|   |       |   |   |-- iteration_planner.py  # Goal -> ExecutionGraph decomposition
+|   |       |   |   `-- iteration_service.py  # 10-state autonomy FSM
+|   |       |   `-- intake/                   # 10 autonomous sensors
+|   |       |       |-- intake_layer_service.py  # Sensor lifecycle (Zone 6.9)
+|   |       |       |-- unified_intake_router.py # Priority queue + dedup + WAL
+|   |       |       `-- sensors/
+|   |       |           |-- test_failure_sensor.py
+|   |       |           |-- voice_command_sensor.py
+|   |       |           |-- opportunity_miner_sensor.py
+|   |       |           |-- capability_gap_sensor.py
+|   |       |           |-- scheduled_sensor.py
+|   |       |           |-- backlog_sensor.py
+|   |       |           |-- runtime_health_sensor.py
+|   |       |           |-- web_intelligence_sensor.py
+|   |       |           |-- performance_regression_sensor.py
+|   |       |           `-- doc_staleness_sensor.py
 |   |       `-- oracle.py                     # Codebase semantic index
+|   |-- core_contexts/                # 5 Core Execution Contexts (Brain)
+|   |   |-- facade.py                 # Symbiotic Router: 3-tier dispatch
+|   |   |-- executor.py              # Screen vision, clicks, typing, app navigation
+|   |   |-- architect.py             # DAG planning, goal decomposition, context selection
+|   |   |-- developer.py             # Code generation, review, testing, Ouroboros
+|   |   |-- communicator.py          # Email, calendar, messaging, web search
+|   |   |-- observer.py              # Monitoring, anomaly detection, pattern recognition
+|   |   `-- tools/                   # 11 atomic tool modules (screen, input, apps, etc.)
+|   |-- neural_mesh/                  # 22 Legacy Agents (Peripheral Nervous System)
+|   |   |-- agents/                   # Production agents (30K+ lines total)
+|   |   |   |-- google_workspace_agent.py   # 6.7K lines: Gmail, Calendar, Drive, Contacts
+|   |   |   |-- visual_monitor_agent.py     # 11K lines: background visual surveillance
+|   |   |   |-- native_app_control_agent.py # 1.3K lines: macOS app automation
+|   |   |   `-- ...                         # 19 more specialized agents
+|   |   `-- synthesis/                # Capability gap detection + JIT agent synthesis
+|   |       |-- gap_signal_bus.py     # Fire-and-forget CapabilityGapEvent bus
+|   |       `-- agent_synthesis_loader.py  # J-Prime-driven agent synthesis
 |   |-- vision/
 |   |   |-- lean_loop.py           # 3-step see-think-act vision loop (Path A)
 |   |   |-- realtime/              # Real-time frame pipeline
@@ -294,11 +429,13 @@ Detailed documentation also lives in the `docs/` directory.
 | Document | Path | Covers |
 |---|---|---|
 | Symbiotic manifesto (Trinity OS) | `README.md` | Genesis thesis, progressive awakening, Ouroboros neuroplasticity, observability, five contexts vs agent sprawl |
+| **Trinity Ecosystem Technical Document** | `docs/architecture/TRINITY_ECOSYSTEM_TECHNICAL_DOCUMENT.md` | Full architecture, 20+ academic references (SOAR, VSM, Shannon, Brooks, Kahneman), subsystem deep dives, comparative analysis vs Claude Desktop/Code |
 | Ouroboros architecture | `docs/architecture/OUROBOROS.md` | Governance pipeline, graduation, sandbox vs assimilation |
+| Brain routing | `docs/architecture/BRAIN_ROUTING.md` | 3-tier cascade, Doubleword Tier 0, brain selection policy |
+| Doubleword Integration | `docs/integrations/DOUBLEWORD_INTEGRATION.md` | Tier 0 batch inference, 397B MoE, cost benchmarks, async batch protocol |
 | Async Architecture | `docs/architecture/async-architecture.md` | Event loop design, cooperative cancellation, async-first patterns |
 | WebSocket Architecture | `docs/architecture/websocket-architecture.md` | Real-time communication protocol between frontend and backend |
 | Voice Sidecar Control Plane | `docs/architecture/VOICE_SIDECAR_CONTROL_PLANE.md` | Voice pipeline orchestration and audio bus design |
-| Doubleword Integration | `docs/integrations/DOUBLEWORD_INTEGRATION.md` | Tier 0 batch inference setup, cost benchmarks, routing policy |
 | Ouroboros Production Readiness | `docs/ouroboros_production_readiness.md` | Governance pipeline deployment checklist |
 | Vision System | `docs/vision/` | Vision pipeline architecture and configuration |
 | Voice Unlock | `docs/voice_unlock/` | Voice biometric authentication flow diagrams |
