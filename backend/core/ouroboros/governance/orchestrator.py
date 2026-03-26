@@ -219,6 +219,8 @@ class GovernedOrchestrator:
         self._oracle_update_lock: asyncio.Lock = asyncio.Lock()
         self._reasoning_bridge: Optional[Any] = None  # set via set_reasoning_bridge()
         self._infra_applicator: Optional[Any] = None  # set via set_infra_applicator()
+        self._reasoning_narrator: Optional[Any] = None  # set via set_reasoning_narrator()
+        self._dialogue_store: Optional[Any] = None  # set via set_dialogue_store()
 
     def set_reasoning_bridge(self, bridge: Any) -> None:
         """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning."""
@@ -227,6 +229,14 @@ class GovernedOrchestrator:
     def set_infra_applicator(self, applicator: Any) -> None:
         """Attach an InfrastructureApplicator for deterministic post-APPLY hooks."""
         self._infra_applicator = applicator
+
+    def set_reasoning_narrator(self, narrator: Any) -> None:
+        """Attach a ReasoningNarrator for WHY-not-WHAT explanations."""
+        self._reasoning_narrator = narrator
+
+    def set_dialogue_store(self, store: Any) -> None:
+        """Attach an OperationDialogueStore for reasoning journal recording."""
+        self._dialogue_store = store
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
@@ -406,6 +416,38 @@ class GovernedOrchestrator:
             risk_tier=risk_tier,
             reasoning_chain_result=reasoning_result,
         )
+
+        # ── P0 Wiring: Start ReasoningNarrator + OperationDialogue ──────
+        if self._reasoning_narrator is not None:
+            try:
+                self._reasoning_narrator.start_trace(ctx.op_id)
+                self._reasoning_narrator.record_classify(
+                    ctx.op_id,
+                    risk_tier.value if hasattr(risk_tier, "value") else str(risk_tier),
+                    f"files={list(ctx.target_files)[:3]}, "
+                    f"complexity={getattr(_complexity_result, 'complexity', 'unknown')}",
+                )
+            except Exception:
+                pass
+
+        if self._dialogue_store is not None:
+            try:
+                from backend.core.ouroboros.governance.entropy_calculator import extract_domain_key
+                _dk = extract_domain_key(ctx.target_files, ctx.description)
+                self._dialogue_store.start_dialogue(
+                    op_id=ctx.op_id,
+                    domain_key=_dk,
+                    description=ctx.description,
+                    target_files=ctx.target_files,
+                )
+                _dialogue = self._dialogue_store.get_active(ctx.op_id)
+                if _dialogue:
+                    _dialogue.add_entry(
+                        "CLASSIFY",
+                        f"Risk={risk_tier}, complexity={getattr(_complexity_result, 'complexity', 'unknown')}",
+                    )
+            except Exception:
+                pass
 
         # ---- Phase 2: ROUTE ----
 
@@ -596,6 +638,27 @@ class GovernedOrchestrator:
                 if generation is None or len(generation.candidates) == 0:
                     generation = None
                     raise RuntimeError("no_candidates_returned")
+
+                # Success -- record reasoning trace + dialogue
+                if self._reasoning_narrator is not None:
+                    try:
+                        self._reasoning_narrator.record_generate(
+                            ctx.op_id, generation.provider_name,
+                            len(generation.candidates), generation.generation_duration_s,
+                        )
+                    except Exception:
+                        pass
+                if self._dialogue_store is not None:
+                    try:
+                        _d = self._dialogue_store.get_active(ctx.op_id)
+                        if _d:
+                            _d.add_entry(
+                                "GENERATE",
+                                f"{generation.provider_name} produced {len(generation.candidates)} "
+                                f"candidates in {generation.generation_duration_s:.1f}s",
+                            )
+                    except Exception:
+                        pass
 
                 # Success -- break out of retry loop
                 break
@@ -1336,6 +1399,22 @@ class GovernedOrchestrator:
         await self._persist_performance_record(ctx)
         applied_files = [Path(p).resolve() for p in ctx.target_files]
         await self._oracle_incremental_update(applied_files)
+
+        # ── P0 Wiring: Complete ReasoningNarrator + OperationDialogue ────
+        if self._reasoning_narrator is not None:
+            try:
+                self._reasoning_narrator.record_outcome(ctx.op_id, True, "Applied successfully")
+                await self._reasoning_narrator.narrate_completion(ctx.op_id)
+            except Exception:
+                pass
+        if self._dialogue_store is not None:
+            try:
+                _d = self._dialogue_store.get_active(ctx.op_id)
+                if _d:
+                    _d.add_entry("COMPLETE", "Applied successfully")
+                self._dialogue_store.complete_dialogue(ctx.op_id, "success")
+            except Exception:
+                pass
         return ctx
 
     # ------------------------------------------------------------------

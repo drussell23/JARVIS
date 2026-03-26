@@ -103,6 +103,22 @@ _ADAPTER_RULES: Tuple[_AdapterRule, ...] = (
         adapters=("python",),
         reason="pure python layer",
     ),
+    # Multi-language adapters (P0 wiring)
+    _AdapterRule(
+        pattern=re.compile(r".*\.(js|jsx|ts|tsx|mjs|cjs)$"),
+        adapters=("javascript",),
+        reason="JavaScript/TypeScript file",
+    ),
+    _AdapterRule(
+        pattern=re.compile(r".*\.rs$"),
+        adapters=("rust",),
+        reason="Rust source file",
+    ),
+    _AdapterRule(
+        pattern=re.compile(r".*\.go$"),
+        adapters=("go",),
+        reason="Go source file",
+    ),
     _AdapterRule(
         pattern=re.compile(r".*"),  # catch-all
         adapters=("python",),

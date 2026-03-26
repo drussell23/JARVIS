@@ -2442,6 +2442,25 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] GovernanceMCPClient skipped: %s", exc)
 
+        # ---- Wire ReasoningNarrator (P0 Wiring: WHY-not-WHAT explanations) ----
+        try:
+            from backend.core.ouroboros.governance.reasoning_narrator import ReasoningNarrator
+            _say = getattr(self, "_say_fn", None)
+            _narrator = ReasoningNarrator(say_fn=_say)
+            self._orchestrator.set_reasoning_narrator(_narrator)
+            logger.info("[GLS] ReasoningNarrator wired (explains WHY decisions were made)")
+        except Exception as exc:
+            logger.debug("[GLS] ReasoningNarrator skipped: %s", exc)
+
+        # ---- Wire OperationDialogueStore (P0 Wiring: reasoning journal) ----
+        try:
+            from backend.core.ouroboros.governance.operation_dialogue import OperationDialogueStore
+            _dialogue_store = OperationDialogueStore()
+            self._orchestrator.set_dialogue_store(_dialogue_store)
+            logger.info("[GLS] OperationDialogueStore wired (per-op reasoning journal)")
+        except Exception as exc:
+            logger.debug("[GLS] OperationDialogueStore skipped: %s", exc)
+
         # NOTE: IntakeLayerService is started by the supervisor (Zone 6.9) which
         # injects say_fn and repo_registry.  GLS exposes _repo_registry so Zone 6.9
         # can reuse the already-resolved registry without a second from_env() call.
