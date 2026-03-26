@@ -168,137 +168,146 @@ def _numpy_to_b64(frame: np.ndarray) -> str:
 # ---------------------------------------------------------------------------
 
 class BallTracker:
-    """Tracks a green ball across frames and detects bounces by velocity reversal.
+    """Spatial awareness + prediction. No bounce counting (HUD is ground truth).
 
-    This is the Deterministic Retina — pure numpy, zero API calls, ~2ms/frame.
-    It WATCHES the ball and COUNTS bounces independently, then cross-validates
-    against the HUD text that OCR reads periodically.
+    Boundary Mandate: the HUD already has the correct bounce count. Trying to
+    re-derive it from pixel physics is complexity theater. The tracker's job:
 
-    Bounce detection: when ball_x was increasing (moving right) and suddenly
-    decreases (hit right wall and reversed), that's a horizontal bounce.
-    Same logic for ball_y and vertical bounces.
+    1. WHERE is the ball? (centroid from green pixels, ~2ms)
+    2. WHICH quadrant? (deterministic from position)
+    3. WHERE is it heading? (velocity from position history)
+    4. WHEN will it hit a wall? (linear extrapolation)
+
+    Bounce counts come from OCR reading the HUD — the scoreboard, not physics.
     """
+
+    EDGE_MARGIN = 40
+    HISTORY_SIZE = 6
 
     def __init__(self) -> None:
         self.ball_x: int = 0
         self.ball_y: int = 0
-        self.prev_x: int = 0
-        self.prev_y: int = 0
-        self.vel_x: float = 0.0  # positive = moving right
-        self.vel_y: float = 0.0  # positive = moving down
-        self.h_bounces: int = 0
-        self.v_bounces: int = 0
-        self.total_bounces: int = 0
+        self.vel_x: float = 0.0
+        self.vel_y: float = 0.0
         self.quadrant: str = "unknown"
-        self.trail_direction: str = "unknown"
+        self.heading: str = "unknown"
+        self.next_wall: str = "unknown"
+        self.frames_to_wall: int = -1
         self.frames_processed: int = 0
-        self._last_bounce_frame: int = 0  # debounce: ignore bounces within 3 frames
+        # HUD values (set externally by OCR)
+        self.hud_h: str = "?"
+        self.hud_v: str = "?"
+        self.hud_t: str = "?"
+        self.hud_speed: str = "?"
+        self._pos_history: list = []
         self._initialized: bool = False
 
     def process_frame(self, frame: np.ndarray) -> dict:
-        """Process a raw RGB numpy frame. Returns perception dict.
-
-        ~2ms on a 1280x800 frame. Zero allocations beyond the mask.
-        """
+        """Find ball, compute velocity, predict next wall. ~2ms."""
         h, w = frame.shape[:2]
-        green = frame[:, :, 1]  # green channel
+        green = frame[:, :, 1]
 
-        # Find bright green pixels (ball + trail)
-        mask = green > 180
-        ys, xs = np.where(mask)
-
-        if len(xs) < 10:
-            # No green pixels — ball not visible
-            return self._state_dict("no_ball")
-
-        # Ball centroid = mean of all bright green pixels
-        cx = int(np.mean(xs))
-        cy = int(np.mean(ys))
-
-        # Bright core (the ball itself, not the trail) for better centroid
-        core_mask = green > 230
+        # Bright core pixels = the ball itself (not the fading trail)
+        core_mask = green > 225
         core_ys, core_xs = np.where(core_mask)
-        if len(core_xs) > 5:
-            cx = int(np.mean(core_xs))
-            cy = int(np.mean(core_ys))
 
-        self.prev_x, self.prev_y = self.ball_x, self.ball_y
+        if len(core_xs) < 5:
+            soft = green > 180
+            ys, xs = np.where(soft)
+            if len(xs) < 10:
+                return self._state("no_ball")
+            cx, cy = int(np.mean(xs)), int(np.mean(ys))
+        else:
+            cx, cy = int(np.mean(core_xs)), int(np.mean(core_ys))
+
         self.ball_x, self.ball_y = cx, cy
         self.frames_processed += 1
 
-        # Need at least 2 frames for velocity
+        self._pos_history.append((cx, cy, time.monotonic()))
+        if len(self._pos_history) > self.HISTORY_SIZE:
+            self._pos_history.pop(0)
+
         if not self._initialized:
             self._initialized = True
             self._update_quadrant(w, h)
-            self._update_trail(xs, ys, cx, cy)
-            return self._state_dict("initializing")
+            return self._state("initializing")
 
-        # Velocity = position delta
-        new_vel_x = float(self.ball_x - self.prev_x)
-        new_vel_y = float(self.ball_y - self.prev_y)
+        # Smoothed velocity
+        if len(self._pos_history) >= 3:
+            n = len(self._pos_history)
+            self.vel_x = (self._pos_history[-1][0] - self._pos_history[0][0]) / max(n - 1, 1)
+            self.vel_y = (self._pos_history[-1][1] - self._pos_history[0][1]) / max(n - 1, 1)
 
-        # Bounce detection: velocity sign flip with debounce
-        frames_since_bounce = self.frames_processed - self._last_bounce_frame
-        if frames_since_bounce > 3:  # debounce: 3 frames minimum between bounces
-            # Horizontal bounce: vel_x sign flipped AND ball near left/right edge
-            if (self.vel_x * new_vel_x < 0) and abs(new_vel_x) > 2:
-                near_edge = cx < 50 or cx > (w - 50)
-                if near_edge:
-                    self.h_bounces += 1
-                    self.total_bounces += 1
-                    self._last_bounce_frame = self.frames_processed
+        # Heading direction (human-readable)
+        parts = []
+        if self.vel_y < -3:
+            parts.append("up")
+        elif self.vel_y > 3:
+            parts.append("down")
+        if self.vel_x < -3:
+            parts.append("left")
+        elif self.vel_x > 3:
+            parts.append("right")
+        self.heading = "-".join(parts) if parts else "drifting"
 
-            # Vertical bounce: vel_y sign flipped AND ball near top/bottom edge
-            if (self.vel_y * new_vel_y < 0) and abs(new_vel_y) > 2:
-                near_edge = cy < 50 or cy > (h - 50)
-                if near_edge:
-                    self.v_bounces += 1
-                    self.total_bounces += 1
-                    self._last_bounce_frame = self.frames_processed
-
-        self.vel_x = new_vel_x
-        self.vel_y = new_vel_y
-
+        # Predict next wall
+        self._predict_wall(w, h)
         self._update_quadrant(w, h)
-        self._update_trail(xs, ys, cx, cy)
+        return self._state("tracking")
 
-        return self._state_dict("tracking")
+    def update_hud(self, ocr_vals: dict) -> None:
+        """Set HUD values from OCR. The scoreboard is the ground truth."""
+        self.hud_h = ocr_vals.get("horizontal", self.hud_h)
+        self.hud_v = ocr_vals.get("vertical", self.hud_v)
+        self.hud_t = ocr_vals.get("total", self.hud_t)
+        self.hud_speed = ocr_vals.get("speed", self.hud_speed)
+
+    def _predict_wall(self, w: int, h: int) -> None:
+        candidates = []
+        m = self.EDGE_MARGIN
+        if self.vel_x > 0.5:
+            f = (w - m - self.ball_x) / self.vel_x
+            if f > 0:
+                candidates.append(("right", int(f)))
+        if self.vel_x < -0.5:
+            f = (m - self.ball_x) / self.vel_x
+            if f > 0:
+                candidates.append(("left", int(f)))
+        if self.vel_y > 0.5:
+            f = (h - m - self.ball_y) / self.vel_y
+            if f > 0:
+                candidates.append(("bottom", int(f)))
+        if self.vel_y < -0.5:
+            f = (m - self.ball_y) / self.vel_y
+            if f > 0:
+                candidates.append(("top", int(f)))
+        if candidates:
+            nearest = min(candidates, key=lambda c: c[1])
+            self.next_wall, self.frames_to_wall = nearest
+        else:
+            self.next_wall, self.frames_to_wall = "unknown", -1
 
     def _update_quadrant(self, w: int, h: int) -> None:
-        mid_x, mid_y = w // 2, h // 2
-        if self.ball_x < mid_x:
-            self.quadrant = "top-left" if self.ball_y < mid_y else "bottom-left"
+        mx, my = w // 2, h // 2
+        if self.ball_x < mx:
+            self.quadrant = "top-left" if self.ball_y < my else "bottom-left"
         else:
-            self.quadrant = "top-right" if self.ball_y < mid_y else "bottom-right"
+            self.quadrant = "top-right" if self.ball_y < my else "bottom-right"
 
-    def _update_trail(
-        self, xs: np.ndarray, ys: np.ndarray, cx: int, cy: int,
-    ) -> None:
-        """Trail direction = where the green mass is relative to the ball core."""
-        mass_x = float(np.mean(xs))
-        mass_y = float(np.mean(ys))
-        dx = mass_x - cx
-        dy = mass_y - cy
-
-        parts = []
-        if abs(dy) > 5:
-            parts.append("up" if dy < 0 else "down")
-        if abs(dx) > 5:
-            parts.append("left" if dx < 0 else "right")
-        self.trail_direction = "-".join(parts) if parts else "stationary"
-
-    def _state_dict(self, status: str) -> dict:
+    def _state(self, status: str) -> dict:
         return {
             "status": status,
             "ball_x": self.ball_x,
             "ball_y": self.ball_y,
             "vel_x": round(self.vel_x, 1),
             "vel_y": round(self.vel_y, 1),
-            "h_bounces": self.h_bounces,
-            "v_bounces": self.v_bounces,
-            "total_bounces": self.total_bounces,
             "quadrant": self.quadrant,
-            "trail_direction": self.trail_direction,
+            "heading": self.heading,
+            "next_wall": self.next_wall,
+            "frames_to_wall": self.frames_to_wall,
+            "hud_h": self.hud_h,
+            "hud_v": self.hud_v,
+            "hud_t": self.hud_t,
             "frames": self.frames_processed,
         }
 
@@ -489,6 +498,7 @@ async def main(duration_s: int = 60):
     n_disagreements = 0
     last_ocr_vals: Dict[str, str] = {}
     last_ocr_time = 0.0
+    ocr_bg_task: Optional[asyncio.Task] = None
     # Background tasks for cloud models (non-blocking)
     claude_task: Optional[asyncio.Task] = None
     dw_task: Optional[asyncio.Task] = None
@@ -499,6 +509,7 @@ async def main(duration_s: int = 60):
     last_tracker_print = 0.0
     last_spoken_quad = ""
     last_spoken_total = 0
+    last_spoken_total_time = 0.0
     # Pending results from the SAME VLA cycle — held until both return
     pending_claude: Optional[str] = None
     pending_dw: Optional[str] = None
@@ -549,7 +560,7 @@ async def main(duration_s: int = 60):
                 print(f"  [Ouroboros] Background task error: {type(exc).__name__}: {exc}")
             ouroboros_task = None
 
-        # ---- PRIMARY: Ball Tracker on raw numpy frame (~2ms) ----
+        # ---- PRIMARY: Ball Tracker (spatial) + OCR (scoreboard) ----
         if raw_frame is not None:
             t_track = time.monotonic()
             tracker_state = tracker.process_frame(raw_frame)
@@ -559,65 +570,78 @@ async def main(duration_s: int = 60):
             bx = tracker_state["ball_x"]
             by = tracker_state["ball_y"]
             quad = tracker_state["quadrant"]
-            trail = tracker_state["trail_direction"]
-            h_b = tracker_state["h_bounces"]
-            v_b = tracker_state["v_bounces"]
-            t_b = tracker_state["total_bounces"]
+            heading = tracker_state["heading"]
+            next_wall = tracker_state.get("next_wall", "unknown")
+            frames_to = tracker_state.get("frames_to_wall", -1)
             fps = tracker_state["frames"] / max(time.monotonic() - t_start, 0.1)
 
-            # Print every ~0.5s (not every frame)
+            # Print tracker state every ~0.5s
             if (time.monotonic() - last_tracker_print) > 0.5 and status == "tracking":
+                predict = ""
+                if next_wall != "unknown" and frames_to > 0:
+                    predict = f" → {next_wall} wall"
                 print(
                     f"  [TRACKER] ({track_ms:.1f}ms) "
-                    f"ball=({bx},{by}) quad={quad} trail={trail} "
-                    f"H:{h_b} V:{v_b} T:{t_b} | {fps:.1f}fps"
+                    f"ball=({bx},{by}) {quad} heading {heading}{predict} "
+                    f"| HUD: H:{tracker.hud_h} V:{tracker.hud_v} T:{tracker.hud_t} "
+                    f"| {fps:.1f}fps"
                 )
                 last_tracker_print = time.monotonic()
 
-            # Narrate bounces as they happen
-            if t_b > last_spoken_total:
-                delta = t_b - last_spoken_total
-                last_spoken_total = t_b
-                jarvis_say_background(
-                    f"Bounce detected. {t_b} total. "
-                    f"{h_b} horizontal, {v_b} vertical."
-                )
+            # === SYMBIOTIC NARRATION: HUD truth + spatial prediction ===
 
-            # Narrate quadrant changes
-            if quad != last_spoken_quad and quad != "unknown":
-                jarvis_say_background(f"Ball in {quad}.")
+            # 1. Quadrant changed — announce with heading
+            if quad != last_spoken_quad and quad != "unknown" and heading != "drifting":
+                jarvis_say_background(
+                    f"Ball in {quad}, heading {heading}."
+                )
                 last_spoken_quad = quad
 
-        # ---- VALIDATION: OCR reads HUD text every ~5s ----
+            # 2. Approaching a wall — predictive
+            elif (
+                next_wall != "unknown"
+                and 3 < frames_to < 10
+                and next_wall != getattr(tracker, '_last_announced_wall', '')
+            ):
+                jarvis_say_background(f"Approaching {next_wall} wall.")
+                tracker._last_announced_wall = next_wall
+
+            # 3. Periodic summary every ~4s — fuse HUD + spatial
+            elif (time.monotonic() - last_spoken_total_time) > 4.0 and tracker.hud_t != "?":
+                jarvis_say_background(
+                    f"{tracker.hud_t} bounces. {tracker.hud_h} horizontal, "
+                    f"{tracker.hud_v} vertical. Ball in {quad}, heading {heading}."
+                )
+                last_spoken_total_time = time.monotonic()
+
+        # ---- VALIDATION: OCR reads HUD text every ~8s (BACKGROUND, non-blocking) ----
         elapsed = time.monotonic() - t_start
-        if (elapsed - last_ocr_time) >= 5.0:
+        if ocr_bg_task and ocr_bg_task.done():
+            try:
+                ocr_result = ocr_bg_task.result()
+                if ocr_result and isinstance(ocr_result, dict) and ocr_result:
+                    # Feed HUD ground truth to the tracker
+                    tracker.update_hud(ocr_result)
+                    ocr_h = ocr_result.get("horizontal", "?")
+                    ocr_v = ocr_result.get("vertical", "?")
+                    ocr_t = ocr_result.get("total", "?")
+                    print(
+                        f"  [HUD] H:{ocr_h} V:{ocr_v} T:{ocr_t} | "
+                        f"ball=({tracker.ball_x},{tracker.ball_y}) "
+                        f"{tracker.quadrant} heading {tracker.heading}"
+                    )
+                    last_ocr_vals = ocr_result.copy()
+            except Exception:
+                pass
+            ocr_bg_task = None
+
+        if (elapsed - last_ocr_time) >= 8.0 and ocr_bg_task is None:
             last_ocr_time = elapsed
             if b64 is None and raw_frame is not None:
                 b64 = _numpy_to_b64(raw_frame)
             if b64:
-                t_ocr = time.monotonic()
-                ocr_vals = await ocr_read_screen(b64)
-                ocr_ms = (time.monotonic() - t_ocr) * 1000
-
-                if ocr_vals:
-                    ocr_h = ocr_vals.get("horizontal", "?")
-                    ocr_v = ocr_vals.get("vertical", "?")
-                    ocr_t = ocr_vals.get("total", "?")
-                    # Cross-validate tracker vs HUD
-                    tracker_t = tracker.total_bounces
-                    try:
-                        hud_t = int(ocr_t)
-                        drift = abs(tracker_t - hud_t)
-                        match = "MATCH" if drift <= 2 else f"DRIFT={drift}"
-                    except (ValueError, TypeError):
-                        match = "OCR_FAIL"
-                    print(
-                        f"  [VALIDATE] ({ocr_ms:.0f}ms) "
-                        f"HUD: H:{ocr_h} V:{ocr_v} T:{ocr_t} | "
-                        f"Tracker: H:{tracker.h_bounces} V:{tracker.v_bounces} T:{tracker_t} | "
-                        f"{match}"
-                    )
-                    last_ocr_vals = ocr_vals.copy()
+                _b64_for_ocr = b64
+                ocr_bg_task = asyncio.create_task(ocr_read_screen(_b64_for_ocr))
 
         # ---- LAYER 2+3: Cloud VLA (parallel, every ~8s) ----
         elapsed = time.monotonic() - t_start
@@ -742,7 +766,7 @@ async def main(duration_s: int = 60):
         await asyncio.sleep(0.06)
 
     # Cleanup
-    for task in [claude_task, dw_task, ouroboros_task]:
+    for task in [claude_task, dw_task, ouroboros_task, ocr_bg_task]:
         if task and not task.done():
             task.cancel()
 
