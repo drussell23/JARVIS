@@ -472,6 +472,47 @@ class GovernedOrchestrator:
             # Expansion disabled: skip directly from ROUTE to GENERATE
             ctx = ctx.advance(OperationPhase.GENERATE)
 
+        # ── P2: Adaptive Learning — inject consolidated rules + success patterns ──
+        try:
+            from backend.core.ouroboros.governance.adaptive_learning import (
+                LearningConsolidator, SuccessPatternStore,
+            )
+            from backend.core.ouroboros.governance.entropy_calculator import (
+                extract_domain_key as _extract_dk,
+            )
+            _domain = _extract_dk(ctx.target_files, ctx.description)
+
+            _consolidator = LearningConsolidator()
+            _rules_context = _consolidator.format_rules_for_prompt(_domain)
+
+            _success_store = SuccessPatternStore()
+            _success_context = _success_store.format_for_prompt(_domain, ctx.target_files)
+
+            if _rules_context or _success_context:
+                _existing_mem = getattr(ctx, "strategic_memory_prompt", "") or ""
+                _learning_block = ""
+                if _rules_context:
+                    _learning_block += f"\n\n{_rules_context}"
+                if _success_context:
+                    _learning_block += f"\n\n{_success_context}"
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=_existing_mem + _learning_block,
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[Orchestrator] Adaptive learning: injected %d rules + %d success "
+                    "patterns for domain=%s (op=%s)",
+                    len(_consolidator.get_rules_for_domain(_domain)),
+                    len(_success_store.get_similar_successes(_domain, ctx.target_files)),
+                    _domain, ctx.op_id,
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[Orchestrator] Adaptive learning injection failed", exc_info=True)
+
         # ── P0: Test Coverage Enforcer (pre-GENERATE) ─────────────────────
         # If target files lack test coverage, inject instruction into the
         # generation context so the provider generates tests alongside code.
@@ -1295,7 +1336,11 @@ class GovernedOrchestrator:
         final_state: OperationState,
         error_pattern: Optional[str] = None,
     ) -> None:
-        """Publish operation outcome to LearningBridge. Fault-isolated -- never raises."""
+        """Publish operation outcome to LearningBridge + SuccessPatternStore.
+
+        Fault-isolated — never raises. Records both failures (LearningBridge)
+        and successes (SuccessPatternStore) for the adaptive learning loop.
+        """
         if self._stack.learning_bridge is None:
             return
         try:
@@ -1312,6 +1357,34 @@ class GovernedOrchestrator:
                 "[Orchestrator] LearningBridge.publish failed for op %s; outcome not recorded",
                 ctx.op_id,
             )
+
+        # P2: Record success patterns for positive feedback loop
+        if final_state in (OperationState.APPLIED,):
+            try:
+                from backend.core.ouroboros.governance.adaptive_learning import (
+                    SuccessPatternStore,
+                )
+                from backend.core.ouroboros.governance.entropy_calculator import (
+                    extract_domain_key as _extract_dk,
+                )
+                _domain = _extract_dk(ctx.target_files, ctx.description)
+                _provider = ""
+                if ctx.generation is not None:
+                    _provider = ctx.generation.provider_name
+                _store = SuccessPatternStore()
+                _store.record_success(
+                    domain_key=_domain,
+                    description=ctx.description,
+                    target_files=ctx.target_files,
+                    provider=_provider,
+                    approach_summary=f"Succeeded via {_provider} on {len(ctx.target_files)} files",
+                )
+                logger.debug(
+                    "[Orchestrator] Success pattern recorded: domain=%s provider=%s (op=%s)",
+                    _domain, _provider, ctx.op_id,
+                )
+            except Exception:
+                pass  # Positive feedback is best-effort — never block
 
     async def _run_benchmark(
         self,
