@@ -2552,6 +2552,85 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] BackgroundAgentPool skipped: %s", exc)
 
+        # ---- Wire LifecycleHookEngine (P1: 15 lifecycle events) ----
+        self._hook_engine = None
+        try:
+            from backend.core.ouroboros.governance.lifecycle_hooks import get_hook_engine, HookEvent
+            self._hook_engine = get_hook_engine()
+            asyncio.get_event_loop().create_task(
+                self._hook_engine.fire(HookEvent.SESSION_START, {"service": "GLS"})
+            )
+            logger.info("[GLS] LifecycleHookEngine wired (15 event types)")
+        except Exception as exc:
+            logger.debug("[GLS] LifecycleHookEngine skipped: %s", exc)
+
+        # ---- Wire ContextCompactor (P1: auto-compact large dialogues) ----
+        self._compactor = None
+        try:
+            from backend.core.ouroboros.governance.context_compaction import ContextCompactor
+            self._compactor = ContextCompactor()
+            logger.info("[GLS] ContextCompactor wired (auto-compact at threshold)")
+        except Exception as exc:
+            logger.debug("[GLS] ContextCompactor skipped: %s", exc)
+
+        # ---- Wire AgentMemoryStore (P1: persistent per-agent memory) ----
+        self._agent_memory_factory = None
+        try:
+            from backend.core.ouroboros.governance.agent_memory import get_agent_memory, MemoryScope
+            self._agent_memory_factory = get_agent_memory
+            logger.info("[GLS] AgentMemoryStore factory wired (USER/PROJECT/LOCAL scopes)")
+        except Exception as exc:
+            logger.debug("[GLS] AgentMemoryStore skipped: %s", exc)
+
+        # ---- Wire PlanModeExecutor (P1: read-only dry-run) ----
+        self._plan_executor = None
+        try:
+            from backend.core.ouroboros.governance.plan_mode import PlanModeExecutor
+            self._plan_executor = PlanModeExecutor()
+            logger.info("[GLS] PlanModeExecutor wired (read-only plan mode)")
+        except Exception as exc:
+            logger.debug("[GLS] PlanModeExecutor skipped: %s", exc)
+
+        # ---- Wire ScopedToolGate (P1: per-agent tool restrictions) ----
+        self._scoped_tool_gate = None
+        try:
+            from backend.core.ouroboros.governance.scoped_tool_access import get_scope_for_role
+            self._scoped_tool_gate = get_scope_for_role
+            logger.info("[GLS] ScopedToolGate wired (role-based tool restrictions)")
+        except Exception as exc:
+            logger.debug("[GLS] ScopedToolGate skipped: %s", exc)
+
+        # ---- Wire DeferredToolRegistry (P2: lazy tool loading) ----
+        self._tool_registry = None
+        try:
+            from backend.core.ouroboros.governance.deferred_tool_registry import get_tool_registry
+            self._tool_registry = get_tool_registry()
+            logger.info(
+                "[GLS] DeferredToolRegistry wired (%d tools, lazy loading)",
+                len(self._tool_registry.list_available()),
+            )
+        except Exception as exc:
+            logger.debug("[GLS] DeferredToolRegistry skipped: %s", exc)
+
+        # ---- Wire CheckpointManager (P2: interactive rewind) ----
+        self._checkpoint_mgr = None
+        try:
+            from backend.core.ouroboros.governance.checkpoint_rewind import CheckpointManager
+            self._checkpoint_mgr = CheckpointManager(project_root=self._config.project_root)
+            logger.info("[GLS] CheckpointManager wired (git-based rewind)")
+        except Exception as exc:
+            logger.debug("[GLS] CheckpointManager skipped: %s", exc)
+
+        # ---- Wire ScheduledAgentRunner (P2: cron-based recurring agents) ----
+        self._scheduler = None
+        try:
+            from backend.core.ouroboros.governance.scheduled_agents import ScheduledAgentRunner
+            self._scheduler = ScheduledAgentRunner(gls=self)
+            asyncio.get_event_loop().create_task(self._scheduler.start())
+            logger.info("[GLS] ScheduledAgentRunner started (cron-based agent scheduling)")
+        except Exception as exc:
+            logger.debug("[GLS] ScheduledAgentRunner skipped: %s", exc)
+
         # ---- JARVIS Tier 3: Predictive Regression Engine (background task) ----
         self._predictive_engine = None
         try:
