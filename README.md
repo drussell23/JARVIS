@@ -321,6 +321,60 @@ The organism fixes its own bugs. GitHubIssueSensor polls open issues across all 
 
 Speaker verification using ECAPA-TDNN embeddings (192-dimensional vectors). Voiceprints are stored in Cloud SQL. The system captures audio continuously, extracts embeddings, and compares them against enrolled profiles with an 85% cosine similarity threshold. Supports contextual awareness (time-of-day, location, microphone type), continuous learning from successful unlocks, and anti-spoofing detection. The unlock flow is wired through `backend/api/voice_unlock_api.py`.
 
+### Voice-First Interactive Conversation
+
+**`backend/voice/conversation_manager.py` + `barge_in_detector.py` + `jarvis_voice_bridge.py`**
+
+The primary interface is voice. Derek talks to JARVIS and JARVIS talks back — no keyboard required.
+
+**ConversationManager** classifies 11 utterance types (greeting, status, code task, code question, confirmation, denial, emergency, positive/negative feedback, farewell, ambient) via deterministic keyword matching and routes each to the appropriate handler. Multi-turn context tracks the last 10 turns with topic continuity, pending questions, and active operation status.
+
+**BargeInDetector** monitors audio capture energy (RMS) every 50ms during TTS playback. If Derek speaks while JARVIS is talking, the afplay process is killed immediately (SIGTERM → SIGKILL) and audio capture resumes. Like Alexa/Siri — interrupt anytime.
+
+**JarvisVoiceBridge** is the integration glue: registered as a transcript hook on `RealTimeVoiceCommunicator`, all transcribed speech flows through the ConversationManager. Code tasks route to `VoiceCommandSensor` → Ouroboros pipeline. Proactive speech (predictions, emergencies, milestones) can be injected via `inject_proactive()`.
+
+**ProactiveSpeechEngine** allows JARVIS to speak first — predictions, emergency alerts, operation completions, milestones — with configurable debounce (30s default).
+
+### JARVIS-Level Intelligence (7 Tiers)
+
+**`backend/core/ouroboros/governance/` — 7 tiers of autonomous intelligence**
+
+| Tier | Module | What It Does |
+|---|---|---|
+| **1. Proactive Judgment** | `operation_advisor.py` | Evaluates blast radius, test coverage, chronic entropy, time, staleness. BLOCK / ADVISE_AGAINST / CAUTION / RECOMMEND. "I wouldn't recommend that, sir." |
+| **2. Emergency Protocols** | `emergency_protocols.py` | 5-level escalation: GREEN → YELLOW → ORANGE → RED → HOUSE PARTY. Alert accumulation with exponential decay. Named protocols: HOUSE_PARTY, CLEAN_SLATE, IRON_LEGION, VERONICA. |
+| **3. Predictive Intelligence** | `predictive_engine.py` | Anticipates regressions: code velocity (22 changes/7d → 100% risk), dependency fragility, test decay, resource trajectory. Background task every 4h. |
+| **4. Self-Preservation** | `distributed_resilience.py` | Heartbeat to GCP (60s), state sync (5m), automatic failover if primary offline for 5 min. Survives crashes. |
+| **5. Cross-Domain Reasoning** | `jarvis_intelligence.py` | Fuses code + infrastructure + user behavior + security + business into unified insights. |
+| **6. Personality** | `jarvis_intelligence.py` | 5 states: CONFIDENT / CAUTIOUS / CONCERNED / PROUD / URGENT. Deterministic from metrics. Voice templates per state. |
+| **7. Autonomous Judgment** | `jarvis_intelligence.py` | Daily self-review, strategic planning, value alignment (7 explicit principles). The organism governs its own evolution. |
+
+### Self-Evolution Engine
+
+**`backend/core/ouroboros/governance/self_evolution.py`**
+
+9 research-grade self-programming techniques from 5 academic papers:
+
+1. **Runtime Prompt Adaptation** (Live-SWE-Agent) — prompts evolve based on execution outcomes
+2. **Module-Level Mutation** (CSE) — surgical function-level code evolution via AST
+3. **Negative Constraints** (CSE) — explicit "never do X" rules from failed attempts
+4. **Code Metrics Feedback** (SPA) — complexity, docstring coverage, line count drive generation
+5. **Dynamic Re-Planning** (Devin v3.0) — pattern-matched failure → alternative strategy
+6. **Multi-Version Evolution** (SWE-EVO) — epoch-based tracking: improving / stable / degrading
+7. Generate-Verify-Refine cycle (strengthened)
+8. Hierarchical Memory with positive/negative distinction (strengthened)
+9. Repository auto-documentation via CodeMetricsAnalyzer
+
+### Advanced Repair Techniques
+
+**`backend/core/ouroboros/governance/advanced_repair.py`**
+
+3 state-of-the-art APR techniques from 2026 research:
+
+1. **Hierarchical Fault Localization** (Agentless + RepoRepair) — 3-stage narrowing: file → function → line. Reduces prompt size ~10x.
+2. **Slow/Fast Thinking Router** (SIADAFIX) — simple fixes get 0.5x tokens, complex get 2x + force Tier 0.
+3. **Documentation-Augmented Repair** (RepoRepair) — auto-generate docs via AST FIRST, use as repair context.
+
 ### Unified Supervisor
 
 **`unified_supervisor.py`** (102K lines)
@@ -542,7 +596,9 @@ Detailed documentation also lives in the `docs/` directory.
 | **Trinity Ecosystem Technical Document** | `docs/architecture/TRINITY_ECOSYSTEM_TECHNICAL_DOCUMENT.md` | Full architecture, 20+ academic references (SOAR, VSM, Shannon, Brooks, Kahneman), subsystem deep dives, comparative analysis vs Claude Desktop/Code |
 | Ouroboros architecture | `docs/architecture/OUROBOROS.md` | Governance pipeline, graduation, sandbox vs assimilation |
 | Brain routing | `docs/architecture/BRAIN_ROUTING.md` | 3-tier cascade, Doubleword Tier 0, brain selection policy |
-| Doubleword Integration | `docs/integrations/DOUBLEWORD_INTEGRATION.md` | Tier 0 batch inference, 235B VLA vision, 35B Neuro-Compilation, 397B reasoning, cost benchmarks, async batch protocol |
+| Doubleword Integration | `docs/integrations/DOUBLEWORD_INTEGRATION.md` | Tier 0 batch inference, 397B MoE reasoning, cost benchmarks, async batch protocol |
+| **JARVIS-Level Ouroboros** | `docs/architecture/JARVIS_LEVEL_OUROBOROS.md` | 7 tiers of transcendence: proactive judgment, emergency protocols, predictive intelligence, self-preservation, cross-domain reasoning, personality, autonomous judgment |
+| **Voice-First Conversation** | `docs/architecture/VOICE_FIRST_CONVERSATION.md` | ConversationManager, barge-in detection, proactive speech, multi-turn context, utterance classification, personality-aware responses |
 | Async Architecture | `docs/architecture/async-architecture.md` | Event loop design, cooperative cancellation, async-first patterns |
 | WebSocket Architecture | `docs/architecture/websocket-architecture.md` | Real-time communication protocol between frontend and backend |
 | Voice Sidecar Control Plane | `docs/architecture/VOICE_SIDECAR_CONTROL_PLANE.md` | Voice pipeline orchestration and audio bus design |
