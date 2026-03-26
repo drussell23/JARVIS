@@ -137,8 +137,8 @@ class WebSearchCapability:
 
     @property
     def is_available(self) -> bool:
-        """Check if any search backend is configured."""
-        return bool(_BRAVE_API_KEY) or bool(_GOOGLE_CSE_KEY and _GOOGLE_CSE_CX)
+        """Always available — DuckDuckGo requires no API key."""
+        return True
 
     @property
     def backend_name(self) -> str:
@@ -146,7 +146,7 @@ class WebSearchCapability:
             return "brave"
         if _GOOGLE_CSE_KEY:
             return "google_cse"
-        return "none"
+        return "duckduckgo"
 
     async def _get_session(self) -> Any:
         if self._session is None or self._session.closed:
@@ -166,19 +166,15 @@ class WebSearchCapability:
         The query is passed as-is to the search API — the model constructs
         the query string (agentic), this module executes it (deterministic).
         """
-        if not self.is_available:
-            return SearchResponse(
-                query=query, results=(), backend="none",
-                total_raw_results=0, filtered_count=0, search_time_ms=0,
-            )
-
         import time
         t0 = time.monotonic()
 
         if _BRAVE_API_KEY:
             raw_results = await self._search_brave(query)
-        else:
+        elif _GOOGLE_CSE_KEY and _GOOGLE_CSE_CX:
             raw_results = await self._search_google_cse(query)
+        else:
+            raw_results = await self._search_duckduckgo(query)
 
         # Apply epistemic allowlist filter
         allowed = []
@@ -407,6 +403,81 @@ class WebSearchCapability:
             raise
         except Exception as exc:
             logger.warning("[WebSearch] Google CSE failed: %s", exc)
+            return []
+
+    # ------------------------------------------------------------------
+    # DuckDuckGo HTML search (free, no API key, no account)
+    # ------------------------------------------------------------------
+
+    async def _search_duckduckgo(self, query: str) -> List[SearchResult]:
+        """Execute search via DuckDuckGo HTML. Free, no API key needed.
+
+        Uses the lite HTML version (html.duckduckgo.com/html/) which
+        returns structured results without JavaScript. Parsed via regex.
+        """
+        session = await self._get_session()
+
+        try:
+            async with session.post(
+                "https://html.duckduckgo.com/html/",
+                data={"q": query, "kl": "us-en"},
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "User-Agent": "JARVIS-Trinity/1.0 (Ouroboros WebSearch)",
+                },
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("[WebSearch] DuckDuckGo error: %d", resp.status)
+                    return []
+
+                html = await resp.text()
+
+            results = []
+
+            # Parse result blocks from DDG HTML
+            # Each result is in a <div class="result__body">
+            # Title: <a class="result__a" href="...">title</a>
+            # Snippet: <a class="result__snippet">...</a>
+            result_blocks = re.findall(
+                r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>'
+                r'.*?class="result__snippet"[^>]*>(.*?)</a>',
+                html,
+                re.DOTALL,
+            )
+
+            for url_raw, title_raw, snippet_raw in result_blocks:
+                # DDG wraps URLs in a redirect — extract the actual URL
+                actual_url = url_raw
+                uddg_match = re.search(r'uddg=([^&]+)', url_raw)
+                if uddg_match:
+                    from urllib.parse import unquote
+                    actual_url = unquote(uddg_match.group(1))
+
+                # Strip HTML tags from title and snippet
+                title = re.sub(r'<[^>]+>', '', title_raw).strip()
+                snippet = re.sub(r'<[^>]+>', '', snippet_raw).strip()
+
+                if len(snippet) > _MAX_SNIPPET_CHARS:
+                    snippet = snippet[:_MAX_SNIPPET_CHARS] + "..."
+
+                domain = urlparse(actual_url).hostname or ""
+
+                results.append(SearchResult(
+                    title=title,
+                    url=actual_url,
+                    snippet=snippet,
+                    domain=domain,
+                ))
+
+                if len(results) >= _MAX_RESULTS * 3:
+                    break
+
+            return results
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning("[WebSearch] DuckDuckGo search failed: %s", exc)
             return []
 
     # ------------------------------------------------------------------
