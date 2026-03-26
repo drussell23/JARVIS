@@ -293,14 +293,17 @@ class GitHubIssueSensor:
     @staticmethod
     def _classify_urgency(labels: Tuple[str, ...], title: str) -> str:
         _URGENCY_RANK = {"critical": 0, "high": 1, "normal": 2, "low": 3}
-        best = "normal"
+        best: Optional[str] = None
+        best_rank = 99
         for label in labels:
             for pattern, urgency in _LABEL_URGENCY.items():
                 if pattern in label:
-                    if _URGENCY_RANK.get(urgency, 9) < _URGENCY_RANK.get(best, 9):
+                    rank = _URGENCY_RANK.get(urgency, 9)
+                    if rank < best_rank:
                         best = urgency
+                        best_rank = rank
 
-        if best != "normal":
+        if best is not None:
             return best
 
         title_lower = title.lower()
