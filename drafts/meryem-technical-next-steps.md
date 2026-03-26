@@ -38,22 +38,49 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
    VL-235B is the winner -- 100% counter accuracy, returns pixel coordinates, and is surprisingly faster than the 30B on warm calls. OCR models returned 403 (see question #4 below).
 
-7. **Ouroboros Neuro-Compilation (this is the big one)** -- I'm now using Doubleword models as **compilers for local intelligence**, not just as runtime inference endpoints. Three of your models work together in a biological pipeline:
+7. **Ouroboros Neuro-Compilation (this is the big one)**
 
-   | Biological role | Doubleword model | What it does |
-   |---|---|---|
-   | **Visual cortex** (perception) | VL-235B | Observes screen every ~8s, reads text, tracks objects, classifies layout |
-   | **Prefrontal cortex** (code synthesis) | **397B** or 35B | Examines the 235B's analysis and writes local Python that replicates it in ~2ms |
-   | **Crystallized reflex** (subconscious) | Generated numpy code | Runs locally, zero API calls, every frame |
+   Most AI assistants take periodic screenshots to perceive the screen -- the equivalent of a human who blinks every 2 seconds and is blind between blinks. JARVIS keeps its eyes open via continuous video streaming (macOS ScreenCaptureKit, ~10-15fps raw numpy frames). But here's the key insight: **your models don't serve as JARVIS's eyes. They serve as its visual cortex -- the part of the brain that learns to see.**
 
-   The flow:
-   - The **VL-235B** observes JARVIS's screen every ~8 seconds (real-time `/v1/chat/completions`), running in parallel with Claude Vision.
-   - After 3 VLA cycles with consistent cross-validation (100% number agreement between 235B and local OCR across 21 test cycles), Ouroboros triggers a **Neuro-Compilation event**.
-   - The **397B** (for complex visual tasks) or **35B** (fast default) receives the 235B's structural analysis and generates a complete Python function (~80-100 lines of numpy code) that replicates the cloud perception locally in ~2ms.
-   - The generated code is sandboxed, validated against ground truth, and hot-swapped into the live vision loop.
-   - **After graduation, that scene type requires zero Doubleword API calls.** The cloud models' intelligence has been crystallized into a local reflex.
+   The biological analogy maps precisely to how I'm using the Doubleword API:
 
-   This is economically optimal: Doubleword charges per token, and after graduation, token consumption for that visual pattern drops to zero. The longer JARVIS runs, the more reflexes it compiles, and the less it calls your API.
+   | Biological role | Doubleword model | What it does | When it runs |
+   |---|---|---|---|
+   | **Visual cortex** (conscious scene analysis) | `Qwen/Qwen3-VL-235B` | Reads text, identifies UI elements, locates objects, classifies quadrants | Every ~8s, parallel with Claude Vision |
+   | **Prefrontal cortex** (learning to automate perception) | `Qwen/Qwen3.5-397B` or `35B` | Examines the 235B's analysis and writes local Python that replicates it in ~2ms | Once per scene type (background, ~60-120s) |
+   | **Crystallized reflex** (subconscious, instant) | Generated numpy code | Ball tracking, centroid detection, quadrant classification -- **zero API calls** | Every frame, ~2ms |
+
+   The Doubleword models are **compilers for local intelligence**, not runtime perception engines. The 235B provides the training signal (what to extract from the screen). The 397B writes the extraction code (how to extract it locally in numpy). After Ouroboros graduation, neither model runs for that scene type -- their intelligence has been crystallized into deterministic local code.
+
+   The end-to-end flow:
+
+   ```
+   VLA Cycle 1-3: Cloud perception (235B + Claude + OCR)
+       |
+       v
+   Cross-Validation: Numbers agree? Position agree? Motion agree?
+       |
+       v (3 cycles reached = graduation threshold)
+       |
+   CognitiveInefficiencyEvent fires
+       |
+       v
+   Background Task (VLA loop continues uninterrupted)
+       |--- 235B analyzes the current frame (5s)
+       |--- 397B/35B generates a reflex_extract() function (60s)
+       |--- Sandbox compiles and validates the generated code
+       |
+       v
+   Tier 4 Reflex Assimilated -- hot-swapped into live loop
+       |
+       v
+   Subsequent reads: local numpy reflex (~2ms) replaces cloud API (~8s)
+   ```
+
+   Cross-validation results from 21 live VLA cycles:
+   - Number agreement (235B vs local OCR): **100%** -- zero drift
+   - Position consensus (235B vs Claude): ~40-50% (expected -- ball moves between API calls)
+   - Motion consensus: ~80%
 
    Code generation stats:
    - 35B default: ~60s generation, `max_tokens=16384`
@@ -61,7 +88,7 @@ As promised, here's the technical next steps summary from our conversation on Mo
    - Sandbox compilation: 100% pass rate
    - Generated code: 80-100 lines of working numpy per reflex
 
-   I'm calling this "Neuro-Compilation" because it's the closest biological analogy -- the cloud models are the visual cortex during learning, and the generated code is the crystallized reflex that runs without conscious thought.
+   **Why this matters for Doubleword's positioning:** The longer JARVIS runs, the more scene types it encounters, the more reflexes Ouroboros compiles, and the less it calls the Doubleword API. Token consumption for learned patterns drops to zero. Your models pay for themselves by eliminating future cloud calls. This is not a typical inference use case -- it's using batch and real-time inference as a **compiler** that produces permanent local intelligence. The economic model is counterintuitive: the more value Doubleword delivers, the fewer tokens the system needs. But the upfront compilation cost per new scene type is significant, and the universe of scene types JARVIS encounters keeps growing. It's a self-expanding market for your inference.
 
 ---
 
