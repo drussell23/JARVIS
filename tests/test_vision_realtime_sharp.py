@@ -54,7 +54,7 @@ async def _speech_worker() -> None:
         text, voice = await _speech_queue.get()
         try:
             proc = await asyncio.create_subprocess_exec(
-                "say", "-v", voice, "-r", "220", text,
+                "say", "-v", voice, "-r", "185", text,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )

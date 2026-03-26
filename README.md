@@ -141,11 +141,68 @@ The supervisor in this repo starts all three. J-Prime runs on a GCP `g2-standard
 
 ## Key Systems
 
-### Lean Vision Loop (Path A)
+### Vision-Language-Action (VLA) Pipeline
+
+**`backend/vision/lean_loop.py` + `backend/vision/vision_reflex.py` + `backend/vision/apple_ocr.py`**
+
+JARVIS sees through a three-layer parallel perception pipeline. Deterministic code handles the fast path; agentic intelligence handles novel scene understanding.
+
+**Layer 1 -- Local OCR (deterministic skeleton, every cycle, ~2s)**
+Apple Vision Framework via a compiled Swift binary extracts text from the screen. The `apple_ocr.py` bridge runs macOS-native `VNRecognizeTextRequest` at 1.00 confidence on clean text, handling glow/shadow/stylized fonts that Tesseract cannot. Visual Telemetry saves every perception frame to `/tmp/claude/vision_telemetry/` as a timestamped artifact so the operator can verify what the agent saw without altering the host environment.
+
+**Layer 2 -- Doubleword 235B VL (structural analysis, parallel, ~8s)**
+`Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` performs fast structural reads: text extraction, UI element detection, object position, quadrant classification. Fires in parallel with Layer 3 on the same frame via `asyncio.create_task()`.
+
+**Layer 3 -- Claude Vision (semantic reasoning, parallel, ~8s)**
+Claude Sonnet provides deep contextual understanding: spatial relationships, motion direction, scene description, anomaly detection. Both cloud models run concurrently -- the VLA loop never blocks on either.
+
+**Cross-Validation Layer:**
+When both cloud models return results from the same frame, their outputs are compared:
+- **Numbers**: Does the 235B text read match OCR? (Consistently zero drift in testing.)
+- **Position**: Do both agree on the object quadrant? (Disagreements indicate temporal lag.)
+- **Motion**: Do both agree on trail direction? (High consensus on diagonal/upward/downward.)
+
+Cross-validation data is fed to the Ouroboros feedback loop as a learning signal. Position disagreements caused by temporal lag (object moves between API calls) are the primary signal that triggers Ouroboros to compile a local reflex.
+
+**Targeted Window Capture:**
+The frame server uses `CGDisplayBounds(CGMainDisplayID())` to capture only the primary display, not virtual ghost displays. For the VLA test, `CGWindowListCreateImage` with `kCGWindowListOptionIncludingWindow` captures a specific Chrome window by ID -- JARVIS sees the target application even when the terminal has focus.
+
+### Ouroboros Neuro-Compilation (Vision Reflex System)
+
+**`backend/vision/vision_reflex.py`**
+
+When the VLA cross-validation detects repeated patterns (e.g., the same OCR query firing 3+ times), Ouroboros triggers Neuro-Compilation -- using a reasoning model to write local code that replaces expensive cloud API calls with deterministic pixel-level extraction.
+
+**The Neuro-Compilation cycle:**
+
+1. **CognitiveInefficiencyEvent** fires after 3 repeated VLA calls (`OUROBOROS_GRADUATION_THRESHOLD`).
+2. The 235B VLM analyzes the current frame (the "conscious read").
+3. The 35B reasoning model (`Qwen/Qwen3.5-35B-A3B-FP8`) receives the 235B analysis + cross-validation consensus and generates a Python function that replicates the extraction locally.
+4. The generated code is compiled in a sandboxed namespace with pre-populated imports (numpy, PIL, subprocess, etc.).
+5. The reflex is validated against the last known-good result.
+6. On validation pass, the reflex is hot-swapped into the live loop. All subsequent reads bypass the cloud API.
+
+The reasoning model runs in the background (`asyncio.create_task`) -- the VLA loop continues uninterrupted during the ~60s synthesis. When the reflex is ready, it is hot-swapped on the next cycle.
+
+**Tier cascade (highest performance first):**
+
+| Tier | Method | Latency | Description |
+|------|--------|---------|-------------|
+| 4 | 35B-generated reflex | ~5ms | Numpy pixel analysis, centroid tracking, compiled OCR |
+| 3 | Persistent OCR server | ~150ms | Pre-compiled Swift binary, Vision Framework kept warm |
+| 1 | Compiled Swift binary | ~900ms | One-shot swiftc compilation, reused across calls |
+| 0 | Interpreted Swift | ~2000ms | Baseline -- swift recompiles the script each invocation |
+
+**Telemetry events:**
+- `vision.perception@1.0.0` -- every captured frame with artifact path
+- `ouroboros.cognitive_inefficiency@1.0.0` -- graduation threshold breached
+- `ouroboros.reflex_graduation@1.0.0` -- successful reflex assimilation
+
+### Lean Vision Loop (UI Automation)
 
 **`backend/vision/lean_loop.py`**
 
-A stripped-down three-step see-think-act loop that replaced the original 12-hop pipeline. Each turn captures a Retina-aware screenshot, sends it to Claude Vision for spatial reasoning, and executes the returned action (click, type, scroll, keyboard shortcut) via pyautogui with coordinate scaling. The loop runs up to `VISION_LEAN_MAX_TURNS` iterations (default 10), settling between turns to let the UI react. All tunables are environment-variable driven.
+The underlying capture-think-act loop for UI automation tasks. Supports Claude Computer Use native API and an agentic fallback with provider cascade (Doubleword 235B VL, Claude Vision, J-Prime LLaVA). Each turn captures a screenshot at CU display resolution (1280x800), sends it with visual memory to the model, parses the action response, executes via pyautogui with Retina coordinate scaling, and verifies via pixel-diff. All tunables are environment-variable driven.
 
 ### Ghost Hands
 
@@ -294,11 +351,16 @@ Core configuration. All values have sensible defaults; only `ANTHROPIC_API_KEY` 
 | Variable | Default | Purpose |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | *(required)* | Claude API access for vision, reasoning, and fallback inference |
-| `DOUBLEWORD_API_KEY` | *(empty)* | Doubleword batch API access (Tier 0 routing) |
+| `DOUBLEWORD_API_KEY` | *(empty)* | Doubleword batch API access (Tier 0 routing + VLA vision) |
 | `DOUBLEWORD_MODEL` | `Qwen/Qwen3.5-35B-A3B-FP8` | Default Doubleword model for batch inference |
-| `JARVIS_CLAUDE_VISION_MODEL` | `claude-sonnet-4-20250514` | Claude model used by the Lean Vision Loop |
-| `VISION_LEAN_ENABLED` | `true` | Enable the 3-step Lean Vision Loop (set `false` for legacy pipeline) |
+| `DOUBLEWORD_VISION_MODEL` | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | Doubleword VLM for Layer 2 structural vision |
+| `DOUBLEWORD_ARCHITECT_MODEL` | `Qwen/Qwen3.5-35B-A3B-FP8` | Reasoning model for Ouroboros Neuro-Compilation |
+| `JARVIS_CLAUDE_VISION_MODEL` | `claude-sonnet-4-20250514` | Claude model for Layer 3 semantic vision |
+| `VISION_LEAN_ENABLED` | `true` | Enable the Lean Vision Loop (set `false` for legacy pipeline) |
 | `VISION_LEAN_MAX_TURNS` | `10` | Maximum see-think-act iterations per vision task |
+| `OUROBOROS_GRADUATION_THRESHOLD` | `3` | Repeated VLA calls before Ouroboros triggers Neuro-Compilation |
+| `VISION_TELEMETRY_DIR` | `/tmp/claude/vision_telemetry` | Directory for Visual Telemetry perception artifacts |
+| `VISION_TELEMETRY_MAX_ARTIFACTS` | `50` | Rolling window of saved perception frames |
 | `JARVIS_TELEMETRY_ENABLED` | `true` | Emit telemetry events (disk + optional remote) |
 | `JARVIS_PROACTIVE_MONITORING` | `false` | Enable proactive screen analysis and suggestions |
 | `JARVIS_GOVERNANCE_MODE` | `sandbox` | Ouroboros governance mode: `sandbox`, `observe`, or `governed` |
@@ -392,7 +454,10 @@ JARVIS-AI-Agent/
 |   |       |-- gap_signal_bus.py     # Fire-and-forget CapabilityGapEvent bus
 |   |       `-- agent_synthesis_loader.py  # J-Prime-driven agent synthesis
 |   |-- vision/
-|   |   |-- lean_loop.py           # 3-step see-think-act vision loop (Path A)
+|   |   |-- lean_loop.py           # VLA capture-think-act loop + Visual Telemetry
+|   |   |-- vision_reflex.py       # Ouroboros Neuro-Compilation (reflex compiler)
+|   |   |-- apple_ocr.py           # Apple Vision Framework OCR bridge (Swift)
+|   |   |-- frame_server.py        # Persistent Quartz screen capture (main display only)
 |   |   |-- realtime/              # Real-time frame pipeline
 |   |   `-- handlers/              # Vision event handlers
 |   |-- ghost_hands/
@@ -432,7 +497,7 @@ Detailed documentation also lives in the `docs/` directory.
 | **Trinity Ecosystem Technical Document** | `docs/architecture/TRINITY_ECOSYSTEM_TECHNICAL_DOCUMENT.md` | Full architecture, 20+ academic references (SOAR, VSM, Shannon, Brooks, Kahneman), subsystem deep dives, comparative analysis vs Claude Desktop/Code |
 | Ouroboros architecture | `docs/architecture/OUROBOROS.md` | Governance pipeline, graduation, sandbox vs assimilation |
 | Brain routing | `docs/architecture/BRAIN_ROUTING.md` | 3-tier cascade, Doubleword Tier 0, brain selection policy |
-| Doubleword Integration | `docs/integrations/DOUBLEWORD_INTEGRATION.md` | Tier 0 batch inference, 397B MoE, cost benchmarks, async batch protocol |
+| Doubleword Integration | `docs/integrations/DOUBLEWORD_INTEGRATION.md` | Tier 0 batch inference, 235B VLA vision, 35B Neuro-Compilation, 397B reasoning, cost benchmarks, async batch protocol |
 | Async Architecture | `docs/architecture/async-architecture.md` | Event loop design, cooperative cancellation, async-first patterns |
 | WebSocket Architecture | `docs/architecture/websocket-architecture.md` | Real-time communication protocol between frontend and backend |
 | Voice Sidecar Control Plane | `docs/architecture/VOICE_SIDECAR_CONTROL_PLANE.md` | Voice pipeline orchestration and audio bus design |

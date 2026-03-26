@@ -548,6 +548,24 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] DocStalenessSensor skipped: %s", exc)
 
+        # ---- GitHubIssueSensor (auto-resolve issues across Trinity repos) ----
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.github_issue_sensor import (
+                GitHubIssueSensor,
+            )
+            _gh_poll_s = float(
+                os.environ.get("JARVIS_GITHUB_ISSUE_INTERVAL_S", "3600")
+            )
+            _gh_sensor = GitHubIssueSensor(
+                repo="jarvis",
+                router=self._router,
+                poll_interval_s=_gh_poll_s,
+            )
+            self._sensors.append(_gh_sensor)
+            logger.info("[IntakeLayer] GitHubIssueSensor added (Trinity issue auto-resolution)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] GitHubIssueSensor skipped: %s", exc)
+
         # ---- ProactiveExplorationSensor (P3: curiosity-driven domain exploration) ----
         try:
             from backend.core.ouroboros.governance.intake.sensors.proactive_exploration_sensor import (

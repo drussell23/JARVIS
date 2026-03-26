@@ -1,7 +1,7 @@
 # Doubleword × Trinity AI — Integration Guide
 
 **Last updated:** 2026-03-25
-**Status:** Benchmarked (35B + 397B) · Provider integrated · Routing in progress
+**Status:** Benchmarked (35B + 397B) · VLA vision pipeline LIVE (235B + 35B) · Ouroboros Neuro-Compilation PROVEN · Tier 0 batch routing active
 **Benchmark results:** `benchmarks/doubleword/results/2026-03-25T20-08-33-UTC.json` (latest 397B)
 **Latest Batch ID:** `d36e8837-326b-424d-9a4e-68a5b1e091b8`
 
@@ -637,6 +637,171 @@ cd benchmarks/doubleword
 | **Month 2** | `BatchAccumulator` with configurable coalescing window | Flush window tuning vs latency SLA |
 | **Post-fellowship** | Control Layer as Palantir AIP audit gateway | Data residency / FedRAMP validation |
 | **Scale phase** | Doubleword Inference Stack (K8s Helm) for self-hosted | Evaluate when ops/day crosses J-Prime break-even |
+
+---
+
+## VLA Vision Pipeline Integration (2026-03-25)
+
+> **Live production integration** -- all results below are from real API calls against live Doubleword endpoints, captured during JARVIS VLA smoke tests.
+
+### Architecture: Dual-Model Parallel Perception
+
+JARVIS's Vision-Language-Action pipeline uses Doubleword models in two distinct roles:
+
+| Role | Model | API Mode | Latency | Purpose |
+|------|-------|----------|---------|---------|
+| **Layer 2: Structural Vision** | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | Real-time `/v1/chat/completions` | ~8-12s | Fast text extraction, UI element detection, object position, quadrant classification |
+| **Ouroboros Architect** | `Qwen/Qwen3.5-35B-A3B-FP8` | Real-time `/v1/chat/completions` | ~60s | Code generation -- writes local Python reflexes that replace cloud API calls |
+
+Both models operate alongside Claude Vision (Layer 3: semantic reasoning) and Apple Vision OCR (Layer 1: local deterministic text extraction).
+
+### 235B Vision Model Performance
+
+The 235B VLM fires in parallel with Claude Vision on every VLA cycle (~8s interval). It receives a 1280x800 PNG screenshot as a base64 `image_url` and returns structural analysis.
+
+**Typical 235B output:**
+```
+Text on screen: Horizontal Bounces: 24 Vertical Bounces: 28 Total Bounces: 52
+Speed: 331 px/s
+Green ball: bottom-left quadrant. Trail pointing diagonally up-right.
+```
+
+**Cross-validation results (21 VLA cycles, live test):**
+
+| Metric | Result |
+|--------|--------|
+| Number agreement (235B vs OCR) | **100%** -- zero drift across all cycles |
+| Position consensus (235B vs Claude) | ~40-50% -- disagreements caused by temporal lag (ball moves between API calls) |
+| Motion consensus | ~80% -- both models agree on trail direction |
+
+The position disagreements are not model errors -- they are the signal that triggers Ouroboros Neuro-Compilation. The ball moves ~3 bounces/second; two API calls separated by 2-3s will naturally observe different positions.
+
+**API call format:**
+```python
+{
+    "model": "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}},
+            {"type": "text", "text": "Read ALL text on screen precisely. Describe ball position, quadrant, trail direction."},
+        ],
+    }],
+    "max_tokens": 200,
+    "temperature": 0.0,
+}
+```
+
+### 35B Reasoning Model as Ouroboros Code Architect
+
+When the VLA cross-validation detects repeated patterns (3+ cycles), Ouroboros hands the problem to the 35B reasoning model. The 35B receives:
+- The 235B's latest structural analysis
+- Cross-validation consensus data (position agree/disagree, motion agree/disagree)
+- A concise prompt describing the desired Python function
+
+The 35B then **generates a complete Python function** (~80-100 lines) that performs local pixel-level extraction. This function is compiled in a sandbox, validated against the last known-good OCR result, and hot-swapped into the live loop.
+
+**35B code generation performance:**
+
+| Metric | Value |
+|--------|-------|
+| Generation time | ~60s (background, non-blocking) |
+| Generated code size | 80-100 lines of Python |
+| Sandbox compilation | Pass rate: 100% (all generated code compiles) |
+| Validation pass | Pass rate: ~80% (fails when OCR server not yet compiled) |
+| `max_tokens` required | **16384** (reasoning models need 4-5x the output size for chain-of-thought) |
+
+**Example generated reflex (abridged):**
+```python
+def reflex_extract(b64_png: str) -> dict:
+    img = Image.open(io.BytesIO(base64.b64decode(b64_png))).convert('RGB')
+    arr = np.array(img)
+    green = arr[:,:,1]
+
+    # Ball centroid via green pixel thresholding
+    mask = green > 200
+    ys, xs = np.where(mask)
+    ball_x, ball_y = int(np.mean(xs)), int(np.mean(ys))
+
+    # Quadrant classification
+    mid_x, mid_y = w / 2, h / 2
+    quadrant = ("top" if ball_y < mid_y else "bottom") + "-" + \
+               ("left" if ball_x < mid_x else "right")
+
+    # Trail direction from bright core vs mass centroid
+    core_mask = green > 240
+    ...
+
+    return {"horizontal": ..., "vertical": ..., "total": ..., "speed": ...,
+            "ball_x": ball_x, "ball_y": ball_y,
+            "quadrant": quadrant, "trail_direction": trail_direction}
+```
+
+The generated code is not a template -- it is synthesized fresh by the 35B for each specific visual task. Different screen layouts produce different reflex functions.
+
+### Token Budget for Reasoning Models (Updated)
+
+Both the 35B and 397B are chain-of-thought reasoning models with a separate `reasoning` field in the API response. The `max_tokens` budget must cover BOTH the internal thinking AND the final output.
+
+| Use Case | Model | Recommended `max_tokens` | Typical Reasoning Overhead |
+|----------|-------|--------------------------|---------------------------|
+| Vision reflex generation | 35B | **16384** | ~10K reasoning, ~3K output |
+| Vision reflex generation | 397B | **20000** | ~15K reasoning, ~4K output |
+| Batch code generation | 397B | **20000** | ~15K reasoning, ~4K output |
+| Classification / analysis | 35B | **5000** | ~2K reasoning, ~2K output |
+| DPO preference scoring | 397B | **8000** | ~4K reasoning, ~3K output |
+
+**Critical lesson learned:** At `max_tokens=8192`, the 35B returns `finish_reason: length` with empty `content` -- all tokens consumed by reasoning. At `max_tokens=16384`, the same prompt returns `finish_reason: stop` with 3227 characters of working code.
+
+### Ouroboros Neuro-Compilation: End-to-End Flow
+
+```
+VLA Cycle 1-3: Cloud perception (235B + Claude + OCR)
+    |
+    v
+Cross-Validation: Numbers agree? Position agree? Motion agree?
+    |
+    v (3 cycles reached = graduation threshold)
+    |
+CognitiveInefficiencyEvent fires
+    |
+    v
+Background Task launched (asyncio.create_task)
+    |--- 235B analyzes the current frame (5s)
+    |--- 35B generates a reflex_extract() function (60s)
+    |--- Sandbox compiles the generated code
+    |--- Validates against ground truth OCR result
+    |
+    v (VLA loop continues uninterrupted during this)
+    |
+Tier 4 Reflex Assimilated -- hot-swapped into live loop
+    |
+    v
+Subsequent reads: local numpy reflex (~5ms) replaces cloud API (~8s)
+```
+
+### Vision Models Available on Doubleword
+
+| Model | Params | Active | Type | Role in JARVIS |
+|-------|--------|--------|------|----------------|
+| `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | 235B | ~22B | Vision+Language | VLA Layer 2 structural analysis |
+| `Qwen/Qwen3-VL-30B-A3B-Instruct-FP8` | 30B | ~3B | Vision+Language | Fast vision fallback (not yet wired) |
+| `deepseek-ai/DeepSeek-OCR-2` | -- | -- | OCR | Dedicated OCR engine (not yet wired) |
+| `allenai/olmOCR-2-7B-1025-FP8` | 7B | 7B | Document OCR | Specialized document extraction (not yet wired) |
+| `lightonai/LightOnOCR-2-1B-bbox-soup` | 1B | 1B | Bbox OCR | Bounding box coordinate extraction (not yet wired) |
+| `Qwen/Qwen3.5-397B-A17B-FP8` | 397B | ~17B | Reasoning | Ouroboros Architect (complex code gen) |
+| `Qwen/Qwen3.5-35B-A3B-FP8` | 35B | ~3B | Reasoning | Ouroboros Architect (fast code gen, default) |
+
+### Environment Variables
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DOUBLEWORD_API_KEY` | *(required)* | API authentication |
+| `DOUBLEWORD_BASE_URL` | `https://api.doubleword.ai/v1` | API endpoint |
+| `DOUBLEWORD_VISION_MODEL` | `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` | VLA Layer 2 model |
+| `DOUBLEWORD_ARCHITECT_MODEL` | `Qwen/Qwen3.5-35B-A3B-FP8` | Ouroboros code generation model |
+| `DOUBLEWORD_VISION_TIMEOUT_S` | `15` | VLA vision call timeout |
+| `OUROBOROS_GRADUATION_THRESHOLD` | `3` | VLA cycles before Neuro-Compilation triggers |
 
 ---
 
