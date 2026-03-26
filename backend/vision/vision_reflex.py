@@ -50,7 +50,7 @@ _TMP_DIR = os.environ.get("VISION_LEAN_TMP_DIR", "/tmp/claude")
 _DW_API_KEY = os.environ.get("DOUBLEWORD_API_KEY", "")
 _DW_BASE_URL = os.environ.get("DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1")
 _DW_ARCHITECT_MODEL = os.environ.get(
-    "DOUBLEWORD_ARCHITECT_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8",
+    "DOUBLEWORD_ARCHITECT_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8",
 )
 _DW_VISION_MODEL = os.environ.get(
     "DOUBLEWORD_VISION_MODEL", "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
@@ -349,7 +349,7 @@ class VisionReflexCompiler:
                         "Authorization": f"Bearer {_DW_API_KEY}",
                         "Content-Type": "application/json",
                     },
-                    timeout=aiohttp.ClientTimeout(total=150),
+                    timeout=aiohttp.ClientTimeout(total=300),
                 ) as resp:
                     if resp.status != 200:
                         body = await resp.text()
