@@ -710,6 +710,53 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
 
+        # ── JARVIS Tier 5: Cross-Domain Intelligence ──────────────────────
+        try:
+            from backend.core.ouroboros.governance.jarvis_intelligence import (
+                UnifiedIntelligenceLayer,
+            )
+            _intel = UnifiedIntelligenceLayer(self._config.project_root)
+            _syntheses = _intel.analyze_all_domains()
+            _intel_prompt = _intel.format_for_prompt(_syntheses)
+            if _intel_prompt:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=_existing + "\n\n" + _intel_prompt,
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[Orchestrator] JARVIS Tier 5: %d cross-domain syntheses injected",
+                    len(_syntheses),
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[Orchestrator] Tier 5 injection failed", exc_info=True)
+
+        # ── JARVIS Tier 6: Personality voice line ─────────────────────────
+        _gls = getattr(self._stack, "governed_loop_service", None)
+        if _gls is not None:
+            _pe = getattr(_gls, "_personality_engine", None)
+            if _pe is not None:
+                try:
+                    _chronic = getattr(_advisory, "chronic_entropy", 0.0) if _advisory else 0.0
+                    _emerg = getattr(self._stack, "_emergency_engine", None)
+                    _emerg_lvl = _emerg.current_level.value if _emerg else 0
+                    _state = _pe.compute_state(
+                        success_rate=_pe.success_rate,
+                        chronic_entropy=_chronic,
+                        emergency_level=_emerg_lvl,
+                    )
+                    if self._reasoning_narrator is not None:
+                        _voice = _pe.get_voice_line(_state)
+                        self._reasoning_narrator.record_classify(
+                            ctx.op_id, f"personality:{_state.value}", _voice,
+                        )
+                except Exception:
+                    pass
+
         # ── Advanced Repair: hierarchical localization + slow/fast thinking + doc-augmented ──
         try:
             from backend.core.ouroboros.governance.advanced_repair import (
@@ -1761,6 +1808,30 @@ class GovernedOrchestrator:
 
         except Exception:
             pass  # Self-evolution feedback is best-effort
+
+        # JARVIS Tier 6: Record operation in PersonalityEngine
+        _gls = getattr(self._stack, "governed_loop_service", None)
+        if _gls is not None:
+            _pe = getattr(_gls, "_personality_engine", None)
+            if _pe is not None:
+                try:
+                    _pe.record_operation(_is_success)
+                except Exception:
+                    pass
+
+            # JARVIS Tier 2: Record alert in EmergencyEngine on failure
+            if not _is_success:
+                _ee = getattr(_gls, "_emergency_engine", None)
+                if _ee is not None:
+                    try:
+                        from backend.core.ouroboros.governance.emergency_protocols import AlertType
+                        _ee.record_alert(
+                            AlertType.GENERATION_FAILURE,
+                            f"Operation {ctx.op_id} failed: {error_pattern or 'unknown'}",
+                            ctx.op_id,
+                        )
+                    except Exception:
+                        pass
 
     async def _run_benchmark(
         self,

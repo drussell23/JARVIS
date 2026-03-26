@@ -2461,6 +2461,54 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] OperationDialogueStore skipped: %s", exc)
 
+        # ---- JARVIS Tier 3: Predictive Regression Engine (background task) ----
+        self._predictive_engine = None
+        try:
+            from backend.core.ouroboros.governance.predictive_engine import PredictiveRegressionEngine
+            self._predictive_engine = PredictiveRegressionEngine(self._config.project_root)
+            asyncio.get_event_loop().create_task(self._predictive_engine.start())
+            logger.info("[GLS] PredictiveRegressionEngine started (JARVIS Tier 3)")
+        except Exception as exc:
+            logger.debug("[GLS] PredictiveRegressionEngine skipped: %s", exc)
+
+        # ---- JARVIS Tier 4: Distributed Resilience (heartbeat + sync) ----
+        self._resilience_manager = None
+        try:
+            from backend.core.ouroboros.governance.distributed_resilience import DistributedResilienceManager
+            self._resilience_manager = DistributedResilienceManager()
+            asyncio.get_event_loop().create_task(self._resilience_manager.start())
+            logger.info("[GLS] DistributedResilienceManager started (JARVIS Tier 4)")
+        except Exception as exc:
+            logger.debug("[GLS] DistributedResilienceManager skipped: %s", exc)
+
+        # ---- JARVIS Tier 2: Emergency Protocol Engine ----
+        self._emergency_engine = None
+        try:
+            from backend.core.ouroboros.governance.emergency_protocols import EmergencyProtocolEngine
+            _say = getattr(self, "_say_fn", None)
+            self._emergency_engine = EmergencyProtocolEngine(say_fn=_say)
+            logger.info("[GLS] EmergencyProtocolEngine wired (JARVIS Tier 2)")
+        except Exception as exc:
+            logger.debug("[GLS] EmergencyProtocolEngine skipped: %s", exc)
+
+        # ---- JARVIS Tier 6: Personality Engine ----
+        self._personality_engine = None
+        try:
+            from backend.core.ouroboros.governance.jarvis_intelligence import PersonalityEngine
+            self._personality_engine = PersonalityEngine()
+            logger.info("[GLS] PersonalityEngine wired (JARVIS Tier 6)")
+        except Exception as exc:
+            logger.debug("[GLS] PersonalityEngine skipped: %s", exc)
+
+        # ---- JARVIS Tier 7: Autonomous Judgment (daily review) ----
+        self._judgment_framework = None
+        try:
+            from backend.core.ouroboros.governance.jarvis_intelligence import AutonomousJudgmentFramework
+            self._judgment_framework = AutonomousJudgmentFramework()
+            logger.info("[GLS] AutonomousJudgmentFramework wired (JARVIS Tier 7)")
+        except Exception as exc:
+            logger.debug("[GLS] AutonomousJudgmentFramework skipped: %s", exc)
+
         # NOTE: IntakeLayerService is started by the supervisor (Zone 6.9) which
         # injects say_fn and repo_registry.  GLS exposes _repo_registry so Zone 6.9
         # can reuse the already-resolved registry without a second from_env() call.
