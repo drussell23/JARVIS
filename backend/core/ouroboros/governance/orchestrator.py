@@ -30,6 +30,7 @@ import logging
 import os
 import tempfile
 import time
+import dataclasses
 from dataclasses import asdict as _dc_asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -470,6 +471,34 @@ class GovernedOrchestrator:
         else:
             # Expansion disabled: skip directly from ROUTE to GENERATE
             ctx = ctx.advance(OperationPhase.GENERATE)
+
+        # ── P0: Test Coverage Enforcer (pre-GENERATE) ─────────────────────
+        # If target files lack test coverage, inject instruction into the
+        # generation context so the provider generates tests alongside code.
+        try:
+            from backend.core.ouroboros.governance.intelligence_hooks import (
+                TestCoverageEnforcer,
+            )
+            _coverage_enforcer = TestCoverageEnforcer(self._config.project_root)
+            _coverage_instruction = _coverage_enforcer.check_and_inject(
+                ctx.target_files, ctx.description,
+            )
+            if _coverage_instruction:
+                _existing_human = getattr(ctx, "human_instructions", "") or ""
+                ctx = dataclasses.replace(
+                    ctx,
+                    human_instructions=_existing_human + _coverage_instruction,
+                    previous_hash=ctx.context_hash,
+                )
+                logger.info(
+                    "[Orchestrator] TestCoverageEnforcer: injected test generation "
+                    "instruction for %d uncovered files (op=%s)",
+                    _coverage_instruction.count("`"), ctx.op_id,
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[Orchestrator] TestCoverageEnforcer failed", exc_info=True)
 
         # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
         generation: Optional[GenerationResult] = None
