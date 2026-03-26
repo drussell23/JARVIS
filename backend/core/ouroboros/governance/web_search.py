@@ -54,7 +54,9 @@ _MAX_PAGE_CHARS = int(os.environ.get("JARVIS_WEB_SEARCH_MAX_PAGE", "6000"))
 # This is the immune system boundary — prevents prompt injection from
 # untrusted web content entering the organism's context window.
 
-_EPISTEMIC_ALLOWLIST: frozenset[str] = frozenset({
+# Tier 1 — Fully trusted: official docs, vetted Q&A, code hosting
+# Content injected raw into generation context.
+_TIER1_DOMAINS: frozenset[str] = frozenset({
     # Q&A (community-vetted)
     "stackoverflow.com",
     "stackexchange.com",
@@ -87,12 +89,45 @@ _EPISTEMIC_ALLOWLIST: frozenset[str] = frozenset({
     "docs.anthropic.com",
     "sdk.vercel.ai",
     "platform.openai.com",
-    # Rust/Go (for native extensions)
+    # Rust/Go/JS ecosystems
     "doc.rust-lang.org",
     "pkg.go.dev",
+    "nodejs.org",
+    "docs.npmjs.com",
+    "tc39.es",
     # Mozilla / Web standards
     "developer.mozilla.org",
+    # Vercel / Next.js
+    "vercel.com",
+    "nextjs.org",
 })
+
+# Tier 2 — Semi-trusted: verified tech platforms with editorial oversight
+# Content injected with "[community source]" tag for provenance awareness.
+_TIER2_DOMAINS: frozenset[str] = frozenset({
+    "dev.to",
+    "hashnode.dev",
+    "realpython.com",
+    "testdriven.io",
+    "blog.rust-lang.org",
+    "go.dev",
+    "huggingface.co",
+    "docs.docker.com",
+    "kubernetes.io",
+    "grafana.com",
+    "prometheus.io",
+    "www.postgresql.org",
+    "wiki.python.org",
+})
+
+# Tier 3 — Untrusted: general web. Snippets only (no full page fetch).
+# Results tagged as "[unverified]" — model must treat as hints, not facts.
+_TIER3_ENABLED = os.environ.get(
+    "JARVIS_WEB_SEARCH_TIER3_ENABLED", "false"
+).lower() in ("true", "1", "yes")
+
+# Combined allowlist for backward compat
+_EPISTEMIC_ALLOWLIST = _TIER1_DOMAINS | _TIER2_DOMAINS
 
 
 @dataclass(frozen=True)
@@ -254,16 +289,21 @@ class WebSearchCapability:
         ]
 
         for i, result in enumerate(response.results, 1):
+            tier = self._get_trust_tier(result.url)
+            tier_label = {1: "verified", 2: "community source", 3: "unverified"}.get(tier, "unknown")
             lines.append(f"### Result {i}: {result.title}")
             lines.append(f"**Source:** {result.url}")
-            lines.append(f"**Domain:** {result.domain}")
+            lines.append(f"**Trust:** [{tier_label}] (Tier {tier})")
             lines.append("")
 
-            if result.page_text:
-                # Use full page text (already bounded by _MAX_PAGE_CHARS)
+            if tier == 3:
+                # Tier 3: snippet only, no full page (safety boundary)
+                lines.append(f"*[unverified snippet]* {result.snippet}")
+            elif result.page_text:
+                if tier == 2:
+                    lines.append(f"*[community source — verify before using]*")
                 lines.append(result.page_text)
             else:
-                # Use API snippet
                 lines.append(result.snippet)
 
             lines.append("")
@@ -283,20 +323,43 @@ class WebSearchCapability:
 
     @staticmethod
     def _is_domain_allowed(url: str) -> bool:
-        """Check if a URL's domain is on the epistemic allowlist.
+        """Check if a URL's domain is on any trust tier.
 
-        Matches exact domain or any subdomain of an allowlisted domain.
+        Tier 1 + Tier 2 always allowed. Tier 3 only if enabled via env.
         Deterministic — no inference, no ambiguity.
         """
         try:
             parsed = urlparse(url)
             host = (parsed.hostname or "").lower()
-            return any(
-                host == domain or host.endswith(f".{domain}")
-                for domain in _EPISTEMIC_ALLOWLIST
-            )
+            for domain in _EPISTEMIC_ALLOWLIST:  # Tier 1 + Tier 2
+                if host == domain or host.endswith(f".{domain}"):
+                    return True
+            if _TIER3_ENABLED:
+                return True  # All domains allowed in Tier 3 mode
+            return False
         except Exception:
             return False
+
+    @staticmethod
+    def _get_trust_tier(url: str) -> int:
+        """Get the trust tier for a URL. Deterministic domain matching.
+
+        Returns 1 (fully trusted), 2 (semi-trusted), 3 (unverified), or 0 (blocked).
+        """
+        try:
+            parsed = urlparse(url)
+            host = (parsed.hostname or "").lower()
+            for domain in _TIER1_DOMAINS:
+                if host == domain or host.endswith(f".{domain}"):
+                    return 1
+            for domain in _TIER2_DOMAINS:
+                if host == domain or host.endswith(f".{domain}"):
+                    return 2
+            if _TIER3_ENABLED:
+                return 3
+            return 0
+        except Exception:
+            return 0
 
     # ------------------------------------------------------------------
     # Brave Search API
