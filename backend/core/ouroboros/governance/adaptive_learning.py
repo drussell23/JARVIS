@@ -544,6 +544,42 @@ class ThresholdTuner:
 
         return recommendations
 
+    def auto_apply(self, min_sample_size: int = 20) -> List[ThresholdRecommendation]:
+        """Auto-apply threshold recommendations with sufficient confidence.
+
+        Only applies when the observation window is large enough
+        (min_sample_size) to avoid premature tuning. Updates os.environ
+        in-process — takes effect on the next pipeline run.
+
+        Deterministic: statistical threshold → env var write. No inference.
+        """
+        _auto_enabled = os.environ.get(
+            "JARVIS_THRESHOLD_AUTO_APPLY", "true"
+        ).lower() in ("true", "1", "yes")
+        if not _auto_enabled:
+            return []
+
+        applied = []
+        for rec in self.compute_recommendations():
+            # Only auto-apply with sufficient data
+            obs = self._observations.get(
+                rec.parameter.replace("JARVIS_", "").lower(), []
+            )
+            if len(obs) < min_sample_size:
+                continue
+
+            os.environ[rec.parameter] = str(rec.recommended_value)
+            applied.append(rec)
+            logger.info(
+                "[ThresholdTuner] Auto-applied: %s = %s -> %s (%s)",
+                rec.parameter, rec.current_value,
+                rec.recommended_value, rec.reason[:60],
+            )
+
+        if applied:
+            self._persist()
+        return applied
+
     def format_recommendations(self) -> str:
         """Format recommendations for logging/display."""
         recs = self.compute_recommendations()

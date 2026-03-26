@@ -108,16 +108,21 @@ class OperationDialogueStore:
         return self._active.get(op_id)
 
     def complete_dialogue(self, op_id: str, outcome: str) -> None:
-        """Complete and archive a dialogue."""
+        """Complete and archive a dialogue. Prunes stale entries."""
         record = self._active.pop(op_id, None)
         if record is None:
             return
         record.complete(outcome)
         self._dialogues[record.domain_key].append(record)
-        # Prune old dialogues
-        if len(self._dialogues[record.domain_key]) > _MAX_DIALOGUES_PER_DOMAIN:
-            self._dialogues[record.domain_key] = \
-                self._dialogues[record.domain_key][-_MAX_DIALOGUES_PER_DOMAIN:]
+
+        # Prune: keep max per domain + TTL (30 days)
+        _ttl_s = float(os.environ.get("JARVIS_DIALOGUE_TTL_S", "2592000"))
+        _now = time.time()
+        self._dialogues[record.domain_key] = [
+            d for d in self._dialogues[record.domain_key]
+            if (_now - d.completed_at) < _ttl_s or d.completed_at == 0
+        ][-_MAX_DIALOGUES_PER_DOMAIN:]
+
         self._persist()
 
     def get_past_dialogues(

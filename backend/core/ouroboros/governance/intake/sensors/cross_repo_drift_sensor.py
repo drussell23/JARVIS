@@ -115,13 +115,14 @@ class CrossRepoDriftSensor:
                 break
 
     def _capture_baselines(self) -> None:
-        """Hash all contract files to establish baselines."""
-        for repo_name, rel_path, description in _CONTRACT_FILES:
+        """Hash all contract files (normalized) to establish baselines."""
+        for repo_name, rel_path, _desc in _CONTRACT_FILES:
             full_path = self._resolve_repo_path(repo_name, rel_path)
             if full_path and full_path.exists():
                 try:
-                    content = full_path.read_bytes()
-                    h = hashlib.sha256(content).hexdigest()
+                    raw = full_path.read_text(errors="replace")
+                    normalized = "\n".join(line.rstrip() for line in raw.splitlines()) + "\n"
+                    h = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
                     self._baselines[f"{repo_name}:{rel_path}"] = h
                 except Exception:
                     pass
@@ -161,7 +162,11 @@ class CrossRepoDriftSensor:
                 continue
 
             try:
-                content = full_path.read_bytes()
+                # Normalize content: strip trailing whitespace + ensure newline
+                # Prevents false positives from formatting-only changes (P2 edge case)
+                raw = full_path.read_text(errors="replace")
+                normalized = "\n".join(line.rstrip() for line in raw.splitlines()) + "\n"
+                content = normalized.encode("utf-8")
                 current_hash = hashlib.sha256(content).hexdigest()
                 baseline_hash = self._baselines.get(key)
 

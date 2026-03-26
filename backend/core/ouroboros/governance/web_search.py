@@ -481,19 +481,34 @@ class WebSearchCapability:
         session = await self._get_session()
 
         try:
-            async with session.post(
-                "https://html.duckduckgo.com/html/",
-                data={"q": query, "kl": "us-en"},
-                headers={
-                    "Content-Type": "application/x-www-form-urlencoded",
-                    "User-Agent": "JARVIS-Trinity/1.0 (Ouroboros WebSearch)",
-                },
-            ) as resp:
-                if resp.status != 200:
+            # Exponential backoff for rate limiting (P2 edge case)
+            _max_retries = 2
+            _backoff_s = 2.0
+            html = ""
+            for _attempt in range(_max_retries + 1):
+                async with session.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": query, "kl": "us-en"},
+                    headers={
+                        "Content-Type": "application/x-www-form-urlencoded",
+                        "User-Agent": "JARVIS-Trinity/1.0 (Ouroboros WebSearch)",
+                    },
+                ) as resp:
+                    if resp.status == 200:
+                        html = await resp.text()
+                        break
+                    if resp.status in (429, 503) and _attempt < _max_retries:
+                        logger.info(
+                            "[WebSearch] DDG rate limited (%d), backing off %.1fs",
+                            resp.status, _backoff_s,
+                        )
+                        await asyncio.sleep(_backoff_s)
+                        _backoff_s *= 2
+                        continue
                     logger.warning("[WebSearch] DuckDuckGo error: %d", resp.status)
                     return []
-
-                html = await resp.text()
+            if not html:
+                return []
 
             results = []
 
