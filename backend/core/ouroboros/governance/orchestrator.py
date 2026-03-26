@@ -463,6 +463,18 @@ class GovernedOrchestrator:
                 except ImportError:
                     pass
 
+                # VisualCodeComprehension: screenshot-based analysis
+                _visual = None
+                try:
+                    from backend.core.ouroboros.governance.visual_comprehension import (
+                        VisualCodeComprehension,
+                    )
+                    _vc = VisualCodeComprehension()
+                    if _vc.is_available:
+                        _visual = _vc
+                except ImportError:
+                    pass
+
                 expander = ContextExpander(
                     generator=self._generator,
                     repo_root=self._config.project_root,
@@ -470,6 +482,7 @@ class GovernedOrchestrator:
                     skill_registry=_skill_registry,
                     doc_fetcher=_doc_fetcher,
                     web_search=_web_search,
+                    visual_comprehension=_visual,
                 )
                 ctx = await asyncio.wait_for(
                     expander.expand(ctx, expansion_deadline),

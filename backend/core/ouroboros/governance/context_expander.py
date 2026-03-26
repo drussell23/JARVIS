@@ -53,6 +53,7 @@ class ContextExpander:
         skill_registry: Optional[Any] = None,   # Optional[SkillRegistry]
         doc_fetcher: Optional[Any] = None,       # Optional[DocFetcher]
         web_search: Optional[Any] = None,        # Optional[WebSearchCapability]
+        visual_comprehension: Optional[Any] = None,  # Optional[VisualCodeComprehension]
     ) -> None:
         self._generator = generator
         self._repo_root = repo_root
@@ -60,6 +61,7 @@ class ContextExpander:
         self._skill_registry = skill_registry
         self._doc_fetcher = doc_fetcher
         self._web_search = web_search
+        self._visual_comprehension = visual_comprehension
 
     async def expand(
         self,
@@ -211,7 +213,33 @@ class ContextExpander:
                         ctx.op_id, search_exc,
                     )
 
-            if not confirmed and not external_docs and not search_queries:
+            # Visual analysis: if the model requested screen capture, analyze it
+            visual_type = self._parse_visual_request(raw)
+            if visual_type and self._visual_comprehension is not None:
+                try:
+                    vis_result = await self._visual_comprehension.analyze_for_context(visual_type)
+                    if vis_result.success and vis_result.insights:
+                        _vis_text = self._visual_comprehension.format_for_prompt(vis_result)
+                        _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                        ctx = ctx.with_strategic_memory_context(
+                            strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                            strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                            strategic_memory_prompt=_existing + "\n\n" + _vis_text,
+                            strategic_memory_digest=ctx.strategic_memory_digest,
+                        )
+                        logger.info(
+                            "[ContextExpander] op=%s round=%d: visual analysis (%s) "
+                            "returned %d insights",
+                            ctx.op_id, round_num + 1, visual_type,
+                            len(vis_result.insights),
+                        )
+                except Exception as vis_exc:
+                    logger.debug(
+                        "[ContextExpander] op=%s visual analysis failed: %s",
+                        ctx.op_id, vis_exc,
+                    )
+
+            if not confirmed and not external_docs and not search_queries and not visual_type:
                 logger.debug(
                     "[ContextExpander] op=%s round=%d: none of %d requested files found on disk",
                     ctx.op_id, round_num + 1, len(new_paths),
@@ -275,12 +303,14 @@ class ContextExpander:
             f"Which additional files (if any) would help understand the context for this task?\n"
             f"List only files that exist in the codebase. Do NOT request the target files themselves.\n"
             f"If you need documentation for an external Python package, list its PyPI name in external_package_docs.\n"
-            f"If you need to search for a solution to a specific technical problem, provide a search query in search_queries.\n\n"
+            f"If you need to search for a solution to a specific technical problem, provide a search query in search_queries.\n"
+            f"If you need to see the current screen state (UI, terminal, IDE), set visual_analysis to a type: code_structure, error_analysis, ui_state, or terminal_output.\n\n"
             f"Return ONLY this JSON:\n"
             f'{{"schema_version": "expansion.1", '
             f'"additional_files_needed": ["path/relative/to/repo.py", ...], '
             f'"external_package_docs": ["package-name", ...], '
             f'"search_queries": ["how to handle aiohttp session timeout python", ...], '
+            f'"visual_analysis": null, '
             f'"reasoning": "<one sentence max 200 chars>"}}'
         )
 
@@ -413,6 +443,33 @@ class ContextExpander:
             if isinstance(d, str) and d.strip() and len(d.strip()) < 100
         ]
         return valid[:MAX_FILES_PER_ROUND]
+
+    def _parse_visual_request(self, raw: str) -> Optional[str]:
+        """Extract visual_analysis type from expansion response.
+
+        Returns analysis type string ("code_structure", "error_analysis",
+        "ui_state", "terminal_output") or None if not requested.
+        """
+        try:
+            stripped = raw.strip()
+            if stripped.startswith("```"):
+                lines = stripped.split("\n")
+                stripped = "\n".join(
+                    line for line in lines if not line.startswith("```")
+                ).strip()
+            data = json.loads(stripped)
+        except (json.JSONDecodeError, ValueError):
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        visual = data.get("visual_analysis")
+        if visual and isinstance(visual, str) and visual in (
+            "code_structure", "error_analysis", "ui_state", "terminal_output",
+        ):
+            return visual
+        return None
 
     def _parse_search_queries(self, raw: str) -> List[str]:
         """Extract search_queries from expansion response.
