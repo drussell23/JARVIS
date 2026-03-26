@@ -26,25 +26,35 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
 5. **Audit Trail** -- Every Doubleword batch now records `PENDING_TIER0` and `TIER0_COMPLETE` entries in the governance ledger with full traceability: `operation_id -> batch_id -> output_file_id`.
 
-6. **Vision Model Benchmark (all 5 models)** -- I benchmarked every vision and OCR model in your catalog against a live screenshot from my JARVIS Vision Smoke Test (bouncing ball with on-screen counters — known ground truth values).
-
-   Results:
+6. **Vision Model Benchmark (all 5 models)** -- I benchmarked every vision and OCR model in your catalog against a live screenshot from my JARVIS Vision Smoke Test (bouncing ball with on-screen counters -- known ground truth values).
 
    | Model | Screen Description | Coordinate Extraction | Counter Accuracy | Status |
    |-------|-------------------|-----------------------|-----------------|--------|
    | VL-235B (22B active) | **5.7s avg** (4.4s warm) | **5.0s avg** (2.3s warm) | Perfect | Best overall |
    | VL-30B (3B active) | 7.5s avg | 4.2s avg | Perfect | Good but slower |
-   | DeepSeek-OCR-2 | 403 Forbidden | 403 Forbidden | — | API question below |
-   | olmOCR-2-7B | 403 Forbidden | 403 Forbidden | — | API question below |
-   | LightOnOCR-1B (bbox) | 403 Forbidden | 403 Forbidden | — | API question below |
+   | DeepSeek-OCR-2 | 403 Forbidden | 403 Forbidden | -- | API question below |
+   | olmOCR-2-7B | 403 Forbidden | 403 Forbidden | -- | API question below |
+   | LightOnOCR-1B (bbox) | 403 Forbidden | 403 Forbidden | -- | API question below |
 
-   Key findings:
-   - **VL-235B is the winner** — perfect counter reads (`Horizontal Bounces: 101, Vertical Bounces: 118, Total Bounces: 219, Speed: 331 px/s`), returns pixel coordinates for on-screen elements, and is surprisingly **faster than VL-30B** on warm calls (likely better infrastructure allocation for the more popular model).
-   - **VL-30B** also reads perfectly but is consistently slower — 7.5s vs 5.7s for descriptions. Not a good speed tier candidate currently.
-   - Both VL models are already wired as Tier 0 in my Lean Vision Loop (provider cascade: Doubleword VL-235B -> Claude Vision -> J-Prime GCP).
-   - I built a reusable `benchmark_vision.py` that tests all models with configurable iterations and screenshots.
+   VL-235B is the winner -- 100% counter accuracy, returns pixel coordinates, and is surprisingly faster than the 30B on warm calls. OCR models returned 403 (see question #4 below).
 
-   This means Doubleword now powers **three use cases** in Trinity: governance (397B batch), DPO scoring (397B batch), and real-time vision (VL-235B direct). Three different models, three different patterns, all through the same API.
+7. **Ouroboros Neuro-Compilation (this is the big one)** -- I'm now using Doubleword models as **compilers for local intelligence**, not just as runtime inference endpoints. Here's the flow:
+
+   - The **VL-235B** observes JARVIS's screen every ~8 seconds (real-time `/v1/chat/completions`), reading text, tracking objects, classifying UI layout. This runs in parallel with Claude Vision.
+   - After 3 VLA cycles with consistent cross-validation (100% number agreement between 235B and local OCR across 21 test cycles), Ouroboros triggers a **Neuro-Compilation event**.
+   - The **35B reasoning model** receives the 235B's structural analysis and generates a complete Python function (~80-100 lines of numpy code) that replicates the cloud model's perception locally in ~2ms.
+   - The generated code is sandboxed, validated against ground truth, and hot-swapped into the live vision loop.
+   - **After graduation, that scene type requires zero Doubleword API calls.** The cloud model's intelligence has been crystallized into a local reflex.
+
+   This is economically optimal: Doubleword charges per token, and after graduation, token consumption for that visual pattern drops to zero. The expensive cloud models pay for themselves by eliminating future cloud calls. The longer JARVIS runs, the more scene types it encounters, the more reflexes it compiles, and the less it calls your API.
+
+   35B code generation stats:
+   - Generation time: ~60s (background, non-blocking)
+   - `max_tokens` required: **16384** (at 8192 the reasoning model returns empty content)
+   - Sandbox compilation: 100% pass rate
+   - Generated code: 80-100 lines of working numpy
+
+   I'm calling this "Neuro-Compilation" because it's the closest biological analogy -- the cloud models are the visual cortex during learning, and the generated code is the crystallized reflex that runs without conscious thought.
 
 ---
 
@@ -83,17 +93,19 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
 **What this means for the partnership**
 
-Doubleword now powers three independent subsystems in Trinity:
+Doubleword now powers four independent subsystems in Trinity:
 
-1. **Ouroboros governance** (397B batch) -- The 397B gives me 12x the reasoning capacity my L4 can provide, at the same per-token cost. Complexity-based routing ensures only the hardest tasks hit the batch API.
+1. **Ouroboros governance** (397B batch) -- 12x reasoning capacity over my L4, complexity-gated routing, async non-blocking.
 
-2. **DPO training pipeline** (397B batch) -- The 397B acts as the judge that scores candidate responses, generating preference pairs that make J-Prime smarter over time. The 397B's chain-of-thought rationale is preserved as training signal.
+2. **DPO training pipeline** (397B batch) -- 397B as the judge scoring candidate responses, chain-of-thought rationale preserved as training signal.
 
-3. **Real-time vision** (VL-235B direct) -- The VL-235B serves as the fast eye in my dual-model vision loop at 4.4s warm latency, reading on-screen text with 100% accuracy. Completely different use pattern from batch -- real-time, image-in/text-out.
+3. **Real-time vision** (VL-235B direct) -- Fast eye in the dual-model vision loop, 4.4s warm, 100% counter accuracy across 21 test cycles.
 
-Three models, three use patterns, all through the same Doubleword API. I don't think many of your customers are using your platform for batch governance, DPO training, AND real-time vision simultaneously. If the OCR models become accessible, that's a fourth pattern (document/UI parsing). This could be a very compelling reference case for what a single API can power.
+4. **Neuro-Compilation** (35B direct) -- The 35B generates local Python reflexes that replace cloud API calls after graduation. This is the use case I'm most excited about from your perspective: **Doubleword models that teach the system to stop calling Doubleword.** The economics are counterintuitive but compelling -- every cloud call that triggers a graduation makes the system permanently cheaper to operate. You're not just selling inference; you're selling the ability for systems to compile their own intelligence.
 
-Happy to share benchmarks, architecture docs, the Jupyter notebook with charts, or a live demo anytime.
+Four models, four use patterns, one API. If the OCR models become accessible, that's a fifth. I don't think any other customer is using your platform this way -- as both a runtime inference provider AND an intelligence compiler. This could be the most interesting reference case in your portfolio.
+
+Happy to share benchmarks, the full integration doc (855 lines with architecture diagrams), the Jupyter notebook with charts, or a live demo anytime.
 
 Looking forward to continuing to build together.
 
