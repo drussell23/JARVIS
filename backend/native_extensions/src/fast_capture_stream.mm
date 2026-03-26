@@ -351,23 +351,54 @@ struct CallbackGuard {
         CGColorSpaceRelease(colorSpace);
     }
 
-    // Write to shared memory BEFORE unlocking the pixel buffer.
-    // This is the zero-copy bridge: Python reads shm directly via numpy.frombuffer.
-    // Cost: ~0.5ms for 1440x900x4 = 5.2MB memcpy. Runs on the GCD capture queue.
+    // Write to shared memory. When SHM is active, this is the PRIMARY output.
+    // Python reads shm directly — the frame.data buffer is only needed for
+    // pybind11 get_frame() calls (legacy path). With SHM, we can skip the
+    // frame.data copy entirely and write directly from the pixel buffer.
     if (_shmWriter && _shmWriter->is_open()) {
         auto ts = std::chrono::steady_clock::now().time_since_epoch();
         uint64_t ts_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(ts).count();
 
-        // Write the downsampled frame if retina, otherwise the raw frame
         if (frame.data.size() > 0) {
+            // Retina path: write the already-downsampled frame.data
             _shmWriter->write_frame(frame.data.data(), (uint32_t)frame.data.size(), ts_ns);
         } else {
-            // Fallback: write raw pixels directly (non-retina path)
-            _shmWriter->write_frame(
-                static_cast<const uint8_t*>(baseAddress),
-                (uint32_t)(bytesPerRow * height),
-                ts_ns
-            );
+            // Non-retina: write stride-corrected pixels directly to SHM
+            // Skip the frame.data copy entirely — write ONLY to SHM
+            size_t tight_row = width * 4;
+            size_t tight_size = tight_row * height;
+            if (bytesPerRow == tight_row) {
+                // No padding — direct write from pixel buffer
+                _shmWriter->write_frame(
+                    static_cast<const uint8_t*>(baseAddress),
+                    (uint32_t)tight_size, ts_ns
+                );
+            } else if (width <= 1600) {
+                // Non-retina with padding: stride-corrected write to SHM
+                _shmWriter->write_frame_strided(
+                    static_cast<const uint8_t*>(baseAddress),
+                    (uint32_t)width, (uint32_t)height, (uint32_t)bytesPerRow,
+                    ts_ns
+                );
+            } else {
+                // Retina without prior downsample — downsample + write to SHM
+                // SHM is sized at logical resolution, not retina
+                size_t dst_w = width / 2;
+                size_t dst_h = height / 2;
+                size_t dst_row = dst_w * 4;
+                size_t dst_size = dst_row * dst_h;
+                // Temporary buffer for downsampled frame
+                std::vector<uint8_t> tmp(dst_size);
+                const uint8_t* src = static_cast<const uint8_t*>(baseAddress);
+                for (size_t y = 0; y < dst_h; y++) {
+                    const uint8_t* sr = src + (y * 2) * bytesPerRow;
+                    uint8_t* dr = tmp.data() + y * dst_row;
+                    for (size_t x = 0; x < dst_w; x++) {
+                        memcpy(dr + x * 4, sr + x * 2 * 4, 4);
+                    }
+                }
+                _shmWriter->write_frame(tmp.data(), (uint32_t)dst_size, ts_ns);
+            }
         }
     }
 
@@ -626,7 +657,7 @@ public:
             streamConfig.width = scaled_width;
             streamConfig.height = scaled_height;
             streamConfig.minimumFrameInterval = CMTimeMake(1, config.target_fps);
-            streamConfig.queueDepth = 3;  // Small buffer for low latency
+            streamConfig.queueDepth = 8;  // Larger buffer absorbs processing jitter
             streamConfig.showsCursor = config.capture_cursor;
             streamConfig.pixelFormat = kCVPixelFormatType_32BGRA;
 

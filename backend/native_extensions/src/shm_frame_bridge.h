@@ -139,6 +139,35 @@ public:
         h->write_index.store((wi + 1) % RING_SIZE, std::memory_order_relaxed);
     }
 
+    /**
+     * Write a stride-corrected frame directly from a padded pixel buffer.
+     * Strips row padding in a single pass — no intermediate buffer.
+     * Used when bytesPerRow > width * 4 (retina display padding).
+     */
+    void write_frame_strided(const uint8_t* pixels, uint32_t width,
+                              uint32_t height, uint32_t src_stride,
+                              uint64_t timestamp_ns) {
+        if (!shm_ptr_) return;
+
+        auto* h = reinterpret_cast<RingHeader*>(shm_ptr_);
+        uint32_t fs = h->frame_size;
+        uint32_t tight_row = width * h->channels;
+
+        uint32_t wi = h->write_index.load(std::memory_order_relaxed);
+        uint8_t* dst = static_cast<uint8_t*>(shm_ptr_)
+                       + sizeof(RingHeader) + (wi * fs);
+
+        // Row-by-row copy stripping padding — one pass, direct to SHM
+        for (uint32_t y = 0; y < height; y++) {
+            memcpy(dst + y * tight_row, pixels + y * src_stride, tight_row);
+        }
+
+        h->timestamps[wi] = timestamp_ns;
+        h->latest_index.store(wi, std::memory_order_release);
+        h->frame_counter.fetch_add(1, std::memory_order_relaxed);
+        h->write_index.store((wi + 1) % RING_SIZE, std::memory_order_relaxed);
+    }
+
     void close() {
 #ifdef __APPLE__
         if (shm_ptr_) { munmap(shm_ptr_, shm_size_); shm_ptr_ = nullptr; }
