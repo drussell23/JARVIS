@@ -304,6 +304,86 @@ class GovernedOrchestrator:
         except Exception:
             pass
 
+        # ── JARVIS Tier 2: Emergency Protocol Check ──────────────────────
+        # If emergency level is ORANGE or higher, block autonomous operations
+        try:
+            from backend.core.ouroboros.governance.emergency_protocols import (
+                EmergencyProtocolEngine, AlertLevel,
+            )
+            _emergency = getattr(self._stack, "_emergency_engine", None)
+            if _emergency is not None and not _emergency.can_proceed():
+                state = _emergency.get_state()
+                logger.warning(
+                    "[Orchestrator] Emergency level %s — operation blocked (op=%s)",
+                    state.level.name, ctx.op_id,
+                )
+                if _serpent:
+                    await _serpent.stop(success=False)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code=f"emergency_{state.level.name.lower()}",
+                )
+                return ctx
+        except ImportError:
+            pass
+        except Exception:
+            pass
+
+        # ── JARVIS Tier 1: Operation Advisor ────────────────────────────
+        # "Sir, I wouldn't recommend that."
+        _advisory = None
+        try:
+            from backend.core.ouroboros.governance.operation_advisor import (
+                OperationAdvisor, AdvisoryDecision,
+            )
+            _advisor = OperationAdvisor(self._config.project_root)
+            _advisory = _advisor.advise(ctx.target_files, ctx.description, ctx.op_id)
+
+            if _advisory.decision == AdvisoryDecision.BLOCK:
+                logger.warning(
+                    "[Orchestrator] Advisor BLOCKED operation: %s (op=%s)",
+                    "; ".join(_advisory.reasons), ctx.op_id,
+                )
+                if _serpent:
+                    await _serpent.stop(success=False)
+                ctx = ctx.advance(
+                    OperationPhase.CANCELLED,
+                    terminal_reason_code="advisor_blocked",
+                )
+                return ctx
+
+            if _advisory.decision != AdvisoryDecision.RECOMMEND:
+                # Inject advisory into context for generation awareness
+                _adv_prompt = _advisor.format_for_prompt(_advisory)
+                if _adv_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _adv_prompt,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+
+                # Voice the warning
+                if _advisory.voice_message and self._reasoning_narrator is not None:
+                    try:
+                        self._reasoning_narrator.record_classify(
+                            ctx.op_id, _advisory.decision.value,
+                            _advisory.voice_message,
+                        )
+                    except Exception:
+                        pass
+
+                logger.info(
+                    "[Orchestrator] Advisor: %s (risk=%.2f) — %s",
+                    _advisory.decision.value, _advisory.risk_score,
+                    _advisory.reasons[0] if _advisory.reasons else "no specific reason",
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[Orchestrator] Advisor failed", exc_info=True)
+
         # ---- Phase 1: CLASSIFY ----
         profile = self._build_profile(ctx)
         classification = self._stack.risk_engine.classify(profile)
