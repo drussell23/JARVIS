@@ -26,15 +26,25 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
 5. **Audit Trail** -- Every Doubleword batch now records `PENDING_TIER0` and `TIER0_COMPLETE` entries in the governance ledger with full traceability: `operation_id -> batch_id -> output_file_id`.
 
-6. **VL-235B Vision Integration** -- I also ran a dual-model real-time vision test using your `Qwen/Qwen3-VL-235B-A22B-Instruct-FP8` as the "fast eye" alongside Claude Vision as the "deep brain." Both models observe the screen simultaneously -- VL-235B reads every ~4 seconds, Claude analyzes patterns every ~12 seconds.
+6. **Vision Model Benchmark (all 5 models)** -- I benchmarked every vision and OCR model in your catalog against a live screenshot from my JARVIS Vision Smoke Test (bouncing ball with on-screen counters — known ground truth values).
 
    Results:
-   - Cold start: 11.9s (first call)
-   - Warm calls: **3.6s** (fast enough for real-time screen observation)
-   - Accurately reads on-screen counters, tracks object position and direction
-   - Already wired as Tier 0 in my Lean Vision Loop (provider cascade: Doubleword VL-235B -> Claude Vision -> J-Prime GCP)
 
-   This means Doubleword now powers **two independent subsystems** in Trinity: the Ouroboros governance pipeline (397B batch) AND the real-time vision loop (VL-235B direct). Two different models, two different use patterns, both through the same API.
+   | Model | Screen Description | Coordinate Extraction | Counter Accuracy | Status |
+   |-------|-------------------|-----------------------|-----------------|--------|
+   | VL-235B (22B active) | **5.7s avg** (4.4s warm) | **5.0s avg** (2.3s warm) | Perfect | Best overall |
+   | VL-30B (3B active) | 7.5s avg | 4.2s avg | Perfect | Good but slower |
+   | DeepSeek-OCR-2 | 403 Forbidden | 403 Forbidden | — | API question below |
+   | olmOCR-2-7B | 403 Forbidden | 403 Forbidden | — | API question below |
+   | LightOnOCR-1B (bbox) | 403 Forbidden | 403 Forbidden | — | API question below |
+
+   Key findings:
+   - **VL-235B is the winner** — perfect counter reads (`Horizontal Bounces: 101, Vertical Bounces: 118, Total Bounces: 219, Speed: 331 px/s`), returns pixel coordinates for on-screen elements, and is surprisingly **faster than VL-30B** on warm calls (likely better infrastructure allocation for the more popular model).
+   - **VL-30B** also reads perfectly but is consistently slower — 7.5s vs 5.7s for descriptions. Not a good speed tier candidate currently.
+   - Both VL models are already wired as Tier 0 in my Lean Vision Loop (provider cascade: Doubleword VL-235B -> Claude Vision -> J-Prime GCP).
+   - I built a reusable `benchmark_vision.py` that tests all models with configurable iterations and screenshots.
+
+   This means Doubleword now powers **three use cases** in Trinity: governance (397B batch), DPO scoring (397B batch), and real-time vision (VL-235B direct). Three different models, three different patterns, all through the same API.
 
 ---
 
@@ -57,7 +67,7 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
 ---
 
-**Questions from our call I'm still working with**
+**Questions (some from our call, some new from benchmarking)**
 
 1. **Token budget guidance** -- My benchmarks confirmed the 397B needs 4-5x expected output. Is there a way to hint the model to allocate more budget to output vs reasoning? Or is the right approach simply setting `max_tokens` high and letting it self-regulate?
 
@@ -65,19 +75,25 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
 3. **Webhook on completion** -- Is this on the roadmap? It would simplify my async pattern significantly (replace polling with a POST to my webhook endpoint).
 
+4. **OCR model API endpoint** -- I benchmarked all 5 vision/OCR models via `/v1/chat/completions` with base64 image input. The two VL models worked perfectly, but the three OCR models (`DeepSeek-OCR-2`, `olmOCR-2-7B`, `LightOnOCR-1B-bbox-soup`) all returned `403 Forbidden`. Do these OCR models use a different API contract? For example, a document upload endpoint instead of chat completions with `image_url`? The `LightOnOCR-1B-bbox-soup` model is particularly interesting for my use case — if it returns bounding box coordinates for text regions, that would directly solve my UI element coordinate accuracy problem (currently my biggest vision gap).
+
+5. **VL-30B slower than VL-235B?** -- The 30B model was consistently slower than the 235B on warm calls (7.5s vs 5.7s avg for descriptions). Is this expected? If the 235B has more allocated infrastructure because it's higher-traffic, the 30B might not be a useful "faster, lighter" tier for me.
+
 ---
 
 **What this means for the partnership**
 
-Doubleword now powers two independent subsystems in Trinity:
+Doubleword now powers three independent subsystems in Trinity:
 
-1. **Ouroboros governance** (397B batch) -- The 397B gives me 12x the reasoning capacity my L4 can provide, at the same per-token cost. The DPO scoring pipeline means the 397B is the judge that makes J-Prime smarter over time. It's the intelligence multiplier for the entire ecosystem.
+1. **Ouroboros governance** (397B batch) -- The 397B gives me 12x the reasoning capacity my L4 can provide, at the same per-token cost. Complexity-based routing ensures only the hardest tasks hit the batch API.
 
-2. **Real-time vision** (VL-235B direct) -- The VL-235B serves as the fast eye in my dual-model vision loop at 3.6s warm latency. This is a completely different use pattern from batch -- real-time, image-in/text-out, sub-5-second response cycle. Same API, different model, different tier.
+2. **DPO training pipeline** (397B batch) -- The 397B acts as the judge that scores candidate responses, generating preference pairs that make J-Prime smarter over time. The 397B's chain-of-thought rationale is preserved as training signal.
 
-Two models, two use patterns, both through the same Doubleword API. I don't think many of your customers are using your platform for both batch governance AND real-time vision simultaneously. This could be a compelling reference case.
+3. **Real-time vision** (VL-235B direct) -- The VL-235B serves as the fast eye in my dual-model vision loop at 4.4s warm latency, reading on-screen text with 100% accuracy. Completely different use pattern from batch -- real-time, image-in/text-out.
 
-Happy to share benchmarks, architecture docs, or a live demo anytime.
+Three models, three use patterns, all through the same Doubleword API. I don't think many of your customers are using your platform for batch governance, DPO training, AND real-time vision simultaneously. If the OCR models become accessible, that's a fourth pattern (document/UI parsing). This could be a very compelling reference case for what a single API can power.
+
+Happy to share benchmarks, architecture docs, the Jupyter notebook with charts, or a live demo anytime.
 
 Looking forward to continuing to build together.
 
