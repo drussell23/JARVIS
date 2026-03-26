@@ -139,7 +139,11 @@ Doubleword now powers four independent subsystems in Trinity:
 
 Four models, four use patterns, one API. If the OCR models become accessible, that's a fifth. I don't think any other customer is using your platform this way -- as both a runtime inference provider AND an intelligence compiler. This could be the most interesting reference case in your portfolio.
 
-Happy to share benchmarks, the full integration doc (855 lines with architecture diagrams), the Jupyter notebook with charts, or a live demo anytime.
+I've documented all of this in a full integration guide on GitHub — architecture diagrams, benchmark charts, token budget tables, the Neuro-Compilation flow, and every model in your catalog mapped to its role in Trinity:
+
+**Full Integration Doc:** https://github.com/drussell23/JARVIS/blob/main/docs/integrations/DOUBLEWORD_INTEGRATION.md
+
+Happy to walk you through it on a call, or share the Jupyter notebook with the raw benchmark data if your engineering team wants to dig in.
 
 Looking forward to continuing to build together.
 
