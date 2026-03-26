@@ -244,6 +244,14 @@ class ContextExpander:
             if visual_type and self._visual_comprehension is not None:
                 try:
                     vis_result = await self._visual_comprehension.analyze_for_context(visual_type)
+                    # Multi-modal: capture raw screenshot for GENERATE phase
+                    # The ClaudeProvider will include this image alongside text
+                    try:
+                        _raw_screenshot = await self._visual_comprehension._capture_screenshot()
+                        if _raw_screenshot:
+                            object.__setattr__(ctx, "_visual_context_b64", _raw_screenshot)
+                    except Exception:
+                        pass
                     if vis_result.success and vis_result.insights:
                         _vis_text = self._visual_comprehension.format_for_prompt(vis_result)
                         _existing = getattr(ctx, "strategic_memory_prompt", "") or ""

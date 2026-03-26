@@ -254,12 +254,20 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
     ),
     "web_search": ToolManifest(
         name="web_search", version="1.0",
-        description="Search the web via DuckDuckGo, return titles/URLs/snippets",
+        description="Search the web via DuckDuckGo, return titles/URLs/snippets from developer docs",
         arg_schema={
             "query":       {"type": "string"},
             "max_results": {"type": "integer", "default": 5},
         },
         capabilities=frozenset({"network"}),
+    ),
+    "code_explore": ToolManifest(
+        name="code_explore", version="1.0",
+        description="Run a Python snippet in a sandboxed subprocess to test a hypothesis",
+        arg_schema={
+            "snippet": {"type": "string"},
+        },
+        capabilities=frozenset({"subprocess"}),
     ),
 }
 
@@ -700,6 +708,9 @@ class AsyncProcessToolBackend:
         async with self._semaphore:
             if call.name == "run_tests":
                 return await self._run_tests_async(call, policy_ctx, timeout, cap)
+            # Async-native tools (web search, code exploration)
+            if call.name in ("web_search", "web_fetch", "code_explore"):
+                return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
             return await self._run_sync_tool_async(call, policy_ctx.repo_root, timeout, cap)
 
     async def _run_sync_tool_async(
@@ -721,6 +732,57 @@ class AsyncProcessToolBackend:
             return ToolResult(tool_call=call, output="", error="TIMEOUT", status=ToolExecStatus.TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(tool_call=call, output="", error=str(exc), status=ToolExecStatus.EXEC_ERROR)
+
+    async def _run_async_native_tool(
+        self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
+    ) -> ToolResult:
+        """Execute async-native tools: web_search, web_fetch, code_explore.
+
+        These tools are async by nature and don't need the thread pool
+        executor path. They use the modules we built: WebSearchCapability,
+        DocFetcher, CodeExplorationTool.
+        """
+        try:
+            output = ""
+            if call.name == "web_search":
+                from backend.core.ouroboros.governance.web_search import WebSearchCapability
+                ws = WebSearchCapability()
+                query = call.arguments.get("query", "")
+                response = await asyncio.wait_for(ws.search(query), timeout=timeout)
+                output = ws.format_for_prompt(response)
+                await ws.close()
+
+            elif call.name == "web_fetch":
+                from backend.core.ouroboros.governance.doc_fetcher import DocFetcher
+                fetcher = DocFetcher()
+                url = call.arguments.get("url", "")
+                results = await asyncio.wait_for(fetcher.fetch_urls([url]), timeout=timeout)
+                output = "\n".join(r.text for r in results if r.success)[:cap]
+                await fetcher.close()
+
+            elif call.name == "code_explore":
+                from backend.core.ouroboros.governance.code_exploration import CodeExplorationTool
+                tool = CodeExplorationTool(str(policy_ctx.repo_root))
+                snippet = call.arguments.get("snippet", "")
+                result = await asyncio.wait_for(tool.explore(snippet), timeout=timeout)
+                output = f"exit={result.exit_code}\n{result.stdout}"
+                if result.stderr:
+                    output += f"\nstderr: {result.stderr}"
+
+            return ToolResult(
+                tool_call=call, output=output[:cap],
+                status=ToolExecStatus.SUCCESS,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                tool_call=call, output="", error="TIMEOUT",
+                status=ToolExecStatus.TIMEOUT,
+            )
+        except Exception as exc:
+            return ToolResult(
+                tool_call=call, output="", error=str(exc),
+                status=ToolExecStatus.EXEC_ERROR,
+            )
 
     async def _run_tests_async(
         self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,

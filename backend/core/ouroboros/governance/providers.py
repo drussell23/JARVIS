@@ -485,7 +485,8 @@ def _build_tool_section() -> str:
         "- `get_callers(function_name, file_path=None)` — find call sites of a function\n"
         "- `bash(command, timeout=30)` — execute a shell command (sandboxed, allowlisted)\n"
         "- `web_fetch(url)` — fetch a URL and return its text content (HTML stripped)\n"
-        '- `web_search(query, max_results=5)` — search the web, returns titles/URLs/snippets\n\n'
+        '- `web_search(query, max_results=5)` — search the web (DuckDuckGo), returns titles/URLs/snippets from developer docs\n'
+        '- `code_explore(snippet)` — run a Python snippet in a sandbox to test a hypothesis (e.g., check imports, types, return values)\n\n'
         f"Max {MAX_TOOL_ITERATIONS} tool calls total. After gathering info, respond with the patch JSON."
     )
 
@@ -1996,13 +1997,28 @@ class ClaudeProvider:
         async def _generate_raw(p: str) -> str:
             nonlocal total_cost
             timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+
+            # Multi-modal: if visual context is available, include screenshot
+            # alongside the text prompt. The model reasons over both simultaneously.
+            _visual_b64 = getattr(context, "_visual_context_b64", None)
+            if _visual_b64 and isinstance(_visual_b64, str):
+                _media = "image/jpeg" if _visual_b64[:4] == "/9j/" else "image/png"
+                user_content = [
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": _media, "data": _visual_b64,
+                    }},
+                    {"type": "text", "text": p},
+                ]
+            else:
+                user_content = p
+
             msg = await asyncio.wait_for(
                 client.messages.create(
                     model=self._model,
                     max_tokens=min(self._max_tokens, 8192),
                     temperature=0.2,
                     system=_CODEGEN_SYSTEM_PROMPT,
-                    messages=[{"role": "user", "content": p}],
+                    messages=[{"role": "user", "content": user_content}],
                 ),
                 timeout=timeout_s,
             )
