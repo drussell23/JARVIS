@@ -38,21 +38,28 @@ As promised, here's the technical next steps summary from our conversation on Mo
 
    VL-235B is the winner -- 100% counter accuracy, returns pixel coordinates, and is surprisingly faster than the 30B on warm calls. OCR models returned 403 (see question #4 below).
 
-7. **Ouroboros Neuro-Compilation (this is the big one)** -- I'm now using Doubleword models as **compilers for local intelligence**, not just as runtime inference endpoints. Here's the flow:
+7. **Ouroboros Neuro-Compilation (this is the big one)** -- I'm now using Doubleword models as **compilers for local intelligence**, not just as runtime inference endpoints. Three of your models work together in a biological pipeline:
 
-   - The **VL-235B** observes JARVIS's screen every ~8 seconds (real-time `/v1/chat/completions`), reading text, tracking objects, classifying UI layout. This runs in parallel with Claude Vision.
+   | Biological role | Doubleword model | What it does |
+   |---|---|---|
+   | **Visual cortex** (perception) | VL-235B | Observes screen every ~8s, reads text, tracks objects, classifies layout |
+   | **Prefrontal cortex** (code synthesis) | **397B** or 35B | Examines the 235B's analysis and writes local Python that replicates it in ~2ms |
+   | **Crystallized reflex** (subconscious) | Generated numpy code | Runs locally, zero API calls, every frame |
+
+   The flow:
+   - The **VL-235B** observes JARVIS's screen every ~8 seconds (real-time `/v1/chat/completions`), running in parallel with Claude Vision.
    - After 3 VLA cycles with consistent cross-validation (100% number agreement between 235B and local OCR across 21 test cycles), Ouroboros triggers a **Neuro-Compilation event**.
-   - The **35B reasoning model** receives the 235B's structural analysis and generates a complete Python function (~80-100 lines of numpy code) that replicates the cloud model's perception locally in ~2ms.
+   - The **397B** (for complex visual tasks) or **35B** (fast default) receives the 235B's structural analysis and generates a complete Python function (~80-100 lines of numpy code) that replicates the cloud perception locally in ~2ms.
    - The generated code is sandboxed, validated against ground truth, and hot-swapped into the live vision loop.
-   - **After graduation, that scene type requires zero Doubleword API calls.** The cloud model's intelligence has been crystallized into a local reflex.
+   - **After graduation, that scene type requires zero Doubleword API calls.** The cloud models' intelligence has been crystallized into a local reflex.
 
-   This is economically optimal: Doubleword charges per token, and after graduation, token consumption for that visual pattern drops to zero. The expensive cloud models pay for themselves by eliminating future cloud calls. The longer JARVIS runs, the more scene types it encounters, the more reflexes it compiles, and the less it calls your API.
+   This is economically optimal: Doubleword charges per token, and after graduation, token consumption for that visual pattern drops to zero. The longer JARVIS runs, the more reflexes it compiles, and the less it calls your API.
 
-   35B code generation stats:
-   - Generation time: ~60s (background, non-blocking)
-   - `max_tokens` required: **16384** (at 8192 the reasoning model returns empty content)
+   Code generation stats:
+   - 35B default: ~60s generation, `max_tokens=16384`
+   - 397B for complex scenes: ~60-120s generation, `max_tokens=20000`
    - Sandbox compilation: 100% pass rate
-   - Generated code: 80-100 lines of working numpy
+   - Generated code: 80-100 lines of working numpy per reflex
 
    I'm calling this "Neuro-Compilation" because it's the closest biological analogy -- the cloud models are the visual cortex during learning, and the generated code is the crystallized reflex that runs without conscious thought.
 
