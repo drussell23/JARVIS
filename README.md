@@ -222,7 +222,7 @@ The self-developing code pipeline — the organism's immune system and neuroplas
 |---|---|---|
 | CLASSIFY | RiskEngine + ComplexityClassifier | Deterministic risk tier assignment |
 | ROUTE | BrainSelector + RouteDecisionService | Policy-driven provider selection |
-| CONTEXT_EXPANSION | ContextExpander + TheOracle + DocFetcher | Semantic file neighborhood + bounded external doc retrieval |
+| CONTEXT_EXPANSION | ContextExpander + TheOracle + DocFetcher + WebSearch | Semantic file neighborhood + external docs + web search with epistemic allowlist |
 | GENERATE | DoublewordProvider → PrimeProvider → ClaudeProvider | 3-tier failback code generation (397B → 7B → Claude) |
 | VALIDATE | TestRunner (Python + C++ adapters) | Flake detection, structured critique, episodic memory |
 | GATE | PolicyEngine + ContractGate | Declarative YAML rules, FSM contract validation |
@@ -231,7 +231,7 @@ The self-developing code pipeline — the organism's immune system and neuroplas
 | VERIFY | ShadowHarness + PatchBenchmarker + Shannon Entropy | Structural integrity + performance + composite ignorance measurement |
 | COMPLETE | Ledger + LearningBridge | Immutable audit trail + outcome feedback for future operations |
 
-**10 Autonomous Sensors (Intake Layer):**
+**13 Autonomous Sensors (Intake Layer):**
 
 | Sensor | Detects | Poll Interval |
 |---|---|---|
@@ -245,6 +245,9 @@ The self-developing code pipeline — the organism's immune system and neuroplas
 | WebIntelligenceSensor | PyPI CVE/advisory vulnerabilities against installed packages | Daily |
 | PerformanceRegressionSensor | P50 latency drift, success rate drops, code quality degradation | Hourly |
 | DocStalenessSensor | Undocumented Python modules via AST analysis | Daily |
+| GitHubIssueSensor | Open issues across JARVIS/J-Prime/Reactor — auto-resolve bugs, test failures, dependency issues | Hourly |
+| ProactiveExplorationSensor | High-entropy domains identified for curiosity-driven learning | 2 hours |
+| CrossRepoDriftSensor | Contract/schema hash drift across Trinity repos | Hourly |
 
 **Shannon Entropy Calculator (Pillar 4 — Synthetic Soul):**
 
@@ -274,6 +277,30 @@ Deterministic post-APPLY hook. When the agentic layer modifies `requirements.txt
 **Graduation Orchestrator (Pillar 6):**
 
 Converts ephemeral tools into permanent agents: TRACKING → EVALUATING → WORKTREE_CREATING → GENERATING → VALIDATING → COMMITTING → AWAITING_APPROVAL → PUSHING → AWAITING_MERGE → REGISTERING → GRADUATED. After `JARVIS_GRADUATION_THRESHOLD` (default 3) successful uses, synthesizes production-ready agent code, runs contract tests, creates a Git PR, and hot-loads the new agent on merge.
+
+**Web Search Capability (Epistemic Allowlist):**
+
+Structured web search for CONTEXT_EXPANSION. When the 397B Architect encounters a capability gap, it can search for solutions across developer-verified domains. Three backends: DuckDuckGo (free, default, no API key), Brave Search API, Google Custom Search.
+
+Safety: Results are domain-restricted to an epistemic allowlist of 28 high-signal developer domains (stackoverflow.com, github.com, docs.python.org, readthedocs.io, pytorch.org, etc.). Results from unverified blogs, social media, and random websites are silently dropped to prevent prompt injection. Bounded: 3 results max, 10s timeout, 6K chars per page.
+
+**Adaptive Learning System:**
+
+Three interconnected learning components that make the organism smarter over time:
+
+- **LearningConsolidator**: Periodically synthesizes domain-level rules from outcome history. "Domain X fails 67% of the time due to import_error" becomes actionable context injected into future generation prompts. Persisted to `~/.jarvis/ouroboros/learning/`.
+- **SuccessPatternStore**: Records successful (domain, context, approach) triples. On future similar tasks, injects "a similar task succeeded with this approach." The positive counterpart to EpisodicMemory's failure tracking — the organism learns from what WORKS, not just what breaks.
+- **ThresholdTuner**: Analyzes false positive and miss rates for each threshold parameter. If the system triggers too often without value (FP > 40%), raises threshold. If regressions slip through (miss > 30%), lowers threshold. Self-calibrating organism.
+
+**Intelligence Hooks (Pre-GENERATE):**
+
+- **TestCoverageEnforcer**: Checks if target files have existing test coverage. If zero tests exist, injects "also generate tests" into the generation prompt. No code ships untested.
+- **TestGenerationHook**: Detects when candidates create new modules without companion test files. Flags for the retry/repair loop.
+- **SemanticReviewGate**: Path-based pre-filter for the existing SecurityReviewer. Identifies security-sensitive files (auth, crypto, unlock, supervisor) for focused LLM-as-a-Judge review before APPROVE.
+
+**GitHub Issue Auto-Resolution:**
+
+The organism fixes its own bugs. GitHubIssueSensor polls open issues across all three Trinity repos (JARVIS, J-Prime, Reactor) via the `gh` CLI. Issues are classified by labels and content to determine urgency and whether Ouroboros can auto-resolve them (test failures, dependency issues, tracebacks → yes; design decisions, architecture changes → requires human). Recurring issues (e.g., daily "Unlock Test Suite Failed") are deduplicated and emitted as a single high-priority envelope with `recurring_count`.
 
 ### Voice Biometric Authentication
 
@@ -376,6 +403,11 @@ Core configuration. All values have sensible defaults; only `ANTHROPIC_API_KEY` 
 | `JARVIS_CTX_COMMUNICATOR` | `false` | Enable Communicator Core Context |
 | `JARVIS_CTX_DEVELOPER` | `false` | Enable Developer Core Context |
 | `JARVIS_CTX_OBSERVER` | `false` | Enable Observer Core Context |
+| `BRAVE_SEARCH_API_KEY` | *(empty)* | Brave Search API (optional — DuckDuckGo is free default) |
+| `JARVIS_GITHUB_ISSUE_INTERVAL_S` | `3600` | GitHubIssueSensor poll interval (seconds) |
+| `JARVIS_EXPLORATION_INTERVAL_S` | `7200` | ProactiveExplorationSensor poll interval (seconds) |
+| `JARVIS_DRIFT_DETECTION_INTERVAL_S` | `3600` | CrossRepoDriftSensor poll interval (seconds) |
+| `JARVIS_SEMANTIC_REVIEW_ENABLED` | `true` | Enable semantic code review gate for sensitive files |
 | `JARVIS_VOICE_ENABLED` | `true` | Enable voice input/output |
 | `JARVIS_AUDIO_BUS_ENABLED` | `false` | Enable real-time full-duplex audio bus |
 | `JARVIS_DEBUG` | `false` | Verbose debug logging |
