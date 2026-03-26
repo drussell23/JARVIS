@@ -2491,6 +2491,33 @@ class GovernedLoopService:
         except Exception as exc:
             logger.debug("[GLS] UnlimitedFleetOrchestrator skipped: %s", exc)
 
+        # ---- Wire HybridTeammateExecutor (coroutine/subprocess routing) ----
+        self._hybrid_executor = None
+        try:
+            from backend.core.ouroboros.governance.hybrid_teammate_executor import (
+                HybridTeammateExecutor,
+            )
+            self._hybrid_executor = HybridTeammateExecutor(
+                project_root=self._config.project_root,
+            )
+            logger.info(
+                "[GLS] HybridTeammateExecutor wired (cognitive=coroutine, mutation=subprocess)"
+            )
+        except Exception as exc:
+            logger.debug("[GLS] HybridTeammateExecutor skipped: %s", exc)
+
+        # ---- Wire BackgroundAgentPool (non-blocking operation submission) ----
+        self._bg_pool = None
+        try:
+            from backend.core.ouroboros.governance.background_agent_pool import (
+                BackgroundAgentPool,
+            )
+            self._bg_pool = BackgroundAgentPool(orchestrator=self._orchestrator)
+            asyncio.get_event_loop().create_task(self._bg_pool.start())
+            logger.info("[GLS] BackgroundAgentPool started (non-blocking op submission)")
+        except Exception as exc:
+            logger.debug("[GLS] BackgroundAgentPool skipped: %s", exc)
+
         # ---- JARVIS Tier 3: Predictive Regression Engine (background task) ----
         self._predictive_engine = None
         try:

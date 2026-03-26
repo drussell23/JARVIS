@@ -1088,6 +1088,25 @@ class GovernedOrchestrator:
                 pass
 
         # ---- Phase 4: VALIDATE ----
+
+        # ── LSP Type Check (fast, incremental) ──
+        _lsp_result = None
+        try:
+            from backend.core.ouroboros.governance.lsp_checker import LSPTypeChecker
+            _lsp = LSPTypeChecker(project_root=self._config.project_root)
+            if _lsp.detect_checker_sync():
+                _changed = [str(self._config.project_root / f) for f in ctx.target_files]
+                _lsp_result = await asyncio.get_event_loop().run_in_executor(
+                    None, _lsp.check_incremental, _changed,
+                )
+                if not _lsp_result.passed:
+                    logger.info(
+                        "[Orchestrator] LSP found %d type errors in %s",
+                        _lsp_result.error_count, list(ctx.target_files)[:3],
+                    )
+        except Exception:
+            logger.debug("[Orchestrator] LSP check skipped", exc_info=True)
+
         best_candidate: Optional[Dict[str, Any]] = None
         best_validation: Optional[ValidationResult] = None
         validate_retries_remaining = self._config.max_validate_retries
@@ -1113,11 +1132,22 @@ class GovernedOrchestrator:
                 )
                 return ctx
 
-            # Try each candidate; pick first that passes
-            for candidate in generation.candidates:
-                _t_validate_start = time.monotonic()
-                validation = await self._run_validation(ctx, candidate, remaining_s)
-                _validate_duration_s = time.monotonic() - _t_validate_start
+            # Try all candidates in parallel; pick first that passes
+            async def _validate_one(cand: Dict[str, Any]) -> Tuple[Dict[str, Any], "ValidationResult", float]:
+                _t0 = time.monotonic()
+                _val = await self._run_validation(ctx, cand, remaining_s)
+                return (cand, _val, time.monotonic() - _t0)
+
+            _validation_tasks = [_validate_one(c) for c in generation.candidates]
+            _validation_results = await asyncio.gather(*_validation_tasks, return_exceptions=True)
+
+            # Process results in candidate order — preserves priority
+            _early_return_ctx: Optional[OperationContext] = None
+            for _vr in _validation_results:
+                if isinstance(_vr, BaseException):
+                    logger.debug("[Orchestrator] Candidate validation raised: %s", _vr)
+                    continue
+                candidate, validation, _validate_duration_s = _vr
 
                 # Per-candidate ledger entry — always, pass or fail
                 await self._record_ledger(ctx, OperationState.GATING, {
@@ -1131,13 +1161,13 @@ class GovernedOrchestrator:
                     "model": getattr(generation, "model_id", ""),
                 })
 
-                if validation.passed:
+                if validation.passed and best_candidate is None:
                     best_candidate = candidate
                     best_validation = validation
-                    break
+                    continue  # still record ledger for remaining, but winner is chosen
 
                 # Infra failure: non-retryable — escalate immediately
-                if validation.failure_class == "infra":
+                if validation.failure_class == "infra" and _early_return_ctx is None:
                     ctx = ctx.advance(
                         OperationPhase.POSTMORTEM,
                         validation=validation,
@@ -1154,10 +1184,10 @@ class GovernedOrchestrator:
                             "short_summary": validation.short_summary,
                         },
                     )
-                    return ctx
+                    _early_return_ctx = ctx
 
                 # Budget failure: non-retryable
-                if validation.failure_class == "budget":
+                if validation.failure_class == "budget" and _early_return_ctx is None:
                     ctx = ctx.advance(
                         OperationPhase.CANCELLED,
                         validation=validation,
@@ -1168,37 +1198,42 @@ class GovernedOrchestrator:
                         OperationState.FAILED,
                         {"reason": "validation_budget_exhausted"},
                     )
-                    return ctx
+                    _early_return_ctx = ctx
 
-                # test/build failure: track for ledger; try next candidate
-                best_validation = validation
+                if not validation.passed:
+                    # test/build failure: track for ledger; try next candidate
+                    best_validation = validation
 
-                # ---- Record failure in episodic memory + build structured critique ----
-                if _episodic_memory is not None and validation.failure_class in ("test", "build"):
-                    try:
-                        from backend.core.ouroboros.governance.structured_critique import CritiqueBuilder
-                        critique_report = CritiqueBuilder.from_validation_output(
-                            file_path=candidate.get("file_path", "unknown"),
-                            failure_class=validation.failure_class or "test",
-                            error_text=validation.error or "",
-                            test_output=validation.short_summary or "",
-                        )
-                        _episodic_memory.record(
-                            file_path=candidate.get("file_path", "unknown"),
-                            attempt=self._config.max_validate_retries - validate_retries_remaining + 1,
-                            failure_class=validation.failure_class or "test",
-                            error_summary=critique_report.summary,
-                            specific_errors=[c.what_failed for c in critique_report.critiques],
-                            line_numbers=[c.line_number for c in critique_report.critiques if c.line_number],
-                        )
-                        logger.info(
-                            "[Orchestrator] Episodic memory recorded: %s — %s [%s]",
-                            candidate.get("file_path", "?"),
-                            critique_report.summary,
-                            ctx.op_id,
-                        )
-                    except Exception:
-                        logger.debug("[Orchestrator] Episodic/critique recording failed", exc_info=True)
+                    # ---- Record failure in episodic memory + build structured critique ----
+                    if _episodic_memory is not None and validation.failure_class in ("test", "build"):
+                        try:
+                            from backend.core.ouroboros.governance.structured_critique import CritiqueBuilder
+                            critique_report = CritiqueBuilder.from_validation_output(
+                                file_path=candidate.get("file_path", "unknown"),
+                                failure_class=validation.failure_class or "test",
+                                error_text=validation.error or "",
+                                test_output=validation.short_summary or "",
+                            )
+                            _episodic_memory.record(
+                                file_path=candidate.get("file_path", "unknown"),
+                                attempt=self._config.max_validate_retries - validate_retries_remaining + 1,
+                                failure_class=validation.failure_class or "test",
+                                error_summary=critique_report.summary,
+                                specific_errors=[c.what_failed for c in critique_report.critiques],
+                                line_numbers=[c.line_number for c in critique_report.critiques if c.line_number],
+                            )
+                            logger.info(
+                                "[Orchestrator] Episodic memory recorded: %s — %s [%s]",
+                                candidate.get("file_path", "?"),
+                                critique_report.summary,
+                                ctx.op_id,
+                            )
+                        except Exception:
+                            logger.debug("[Orchestrator] Episodic/critique recording failed", exc_info=True)
+
+            # If a non-retryable failure was found and no candidate passed, return immediately
+            if _early_return_ctx is not None and best_candidate is None:
+                return _early_return_ctx
 
             if best_candidate is not None:
                 break  # at least one candidate passed
@@ -1238,6 +1273,48 @@ class GovernedOrchestrator:
                     },
                 )
                 return ctx
+
+            # ── Micro-Fix: try InteractiveRepair before expensive VALIDATE_RETRY ──
+            if self._pre_action_narrator is not None:
+                try:
+                    await self._pre_action_narrator.narrate_phase(
+                        "MICRO_FIX", {"target": list(ctx.target_files)[:1]},
+                    )
+                except Exception:
+                    pass
+            try:
+                from backend.core.ouroboros.governance.interactive_repair import InteractiveRepairLoop
+                _repair = InteractiveRepairLoop(
+                    provider=self._generator,
+                    project_root=self._config.project_root,
+                )
+                _repair_target = list(ctx.target_files)[0] if ctx.target_files else None
+                if _repair_target:
+                    _repair_abs = self._config.project_root / _repair_target
+                    if _repair_abs.exists():
+                        _repair_content = _repair_abs.read_text(errors="replace")
+                        _test_argv = ["python3", "-m", "pytest", "-x", "-q"]
+                        _repair_result = await asyncio.wait_for(
+                            _repair.repair(
+                                file_path=str(_repair_target),
+                                file_content=_repair_content,
+                                test_argv=_test_argv,
+                                op_id=ctx.op_id,
+                            ),
+                            timeout=90.0,
+                        )
+                        if _repair_result.fixed:
+                            logger.info(
+                                "[Orchestrator] Micro-fix succeeded in %d iterations for op=%s",
+                                _repair_result.iterations_used, ctx.op_id,
+                            )
+                            # Skip full regeneration — advance to GATE
+                            ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
+                            break
+            except asyncio.CancelledError:
+                raise
+            except Exception as _repair_exc:
+                logger.debug("[Orchestrator] Micro-fix failed: %s", _repair_exc)
 
             # Retry: advance to VALIDATE_RETRY with episodic memory context
             _vr_kwargs = {}

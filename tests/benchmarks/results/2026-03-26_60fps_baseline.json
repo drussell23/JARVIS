@@ -1,0 +1,57 @@
+{
+  "timestamp": "2026-03-26T14:40:00-07:00",
+  "version": "v6.0",
+  "test": "shm_60fps_benchmark",
+  "config": {
+    "target_fps": 60,
+    "duration_s": 10.0,
+    "capture_mode": "display",
+    "window_id": 0,
+    "frame_width": 1440,
+    "frame_height": 900,
+    "frame_channels": 4,
+    "frame_size_bytes": 5184000,
+    "ring_buffer_slots": 5,
+    "shm_segment": "/jarvis_frame_bridge",
+    "content": "bouncing_ball_animation"
+  },
+  "results": {
+    "frames_read": 576,
+    "actual_fps": 57.6,
+    "efficiency_pct": 96.0,
+    "poll_rate_per_sec": 473687,
+    "duplicate_polls": 4736291,
+    "frame_gap_ms": {
+      "mean": 17.36,
+      "median": 17.19,
+      "min": 6.69,
+      "max": 35.02,
+      "p95": 19.15,
+      "p99": 20.72,
+      "stddev": 1.24
+    },
+    "throughput_mbps": 298,
+    "bandwidth_savings_pct": 50
+  },
+  "static_desktop_results": {
+    "frames_read": 197,
+    "actual_fps": 19.7,
+    "efficiency_pct": 32.8,
+    "note": "SCK content-aware throttle on static desktop — expected behavior"
+  },
+  "environment": {
+    "display": "2880x1800 retina (downsampled to 1440x900)",
+    "os": "macOS Darwin 25.3.0",
+    "platform": "Apple Silicon M-series",
+    "python": "3.9.6",
+    "native_ext": "fast_capture_stream.cpython-39-darwin.so"
+  },
+  "progression": [
+    {"version": "v1.0", "fps": 0.5, "method": "Quartz CGWindowListCreateImage", "date": "2026-03-25"},
+    {"version": "v2.0", "fps": 9.0, "method": "Quartz targeted window", "date": "2026-03-26"},
+    {"version": "v3.0", "fps": 14.7, "method": "SHM + Quartz fallback", "date": "2026-03-26"},
+    {"version": "v4.0", "fps": 17.0, "method": "Pure Python mmap", "date": "2026-03-26"},
+    {"version": "v5.0", "fps": 19.7, "method": "SHM-only (no fallback)", "date": "2026-03-26"},
+    {"version": "v6.0", "fps": 57.6, "method": "SHM-first + FramePipeline", "date": "2026-03-26"}
+  ]
+}

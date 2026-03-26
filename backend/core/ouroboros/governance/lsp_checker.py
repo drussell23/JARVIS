@@ -261,3 +261,29 @@ class LSPTypeChecker:
             lines.append(f"- {err['file']}:{err['line']}: [{err['severity']}] {err['message']}")
         lines.append("\nFix these type errors.")
         return "\n".join(lines)
+
+    @staticmethod
+    def format_errors_for_repair(result: TypeCheckResult) -> str:
+        """Format type errors into a prompt-injectable string for InteractiveRepairLoop.
+
+        Produces a compact, LLM-friendly listing like::
+
+            Type errors found:
+            - file.py:42: error: Argument of type "str" is not assignable to parameter "x" of type "int"
+            - file.py:87: error: "foo" is not a known member of module "bar"
+
+        Returns an empty string when no errors are present.
+        """
+        if result.passed or not result.errors:
+            return ""
+        lines = ["Type errors found:"]
+        for err in result.errors[:15]:
+            sev = err.get("severity", "error")
+            rule = err.get("rule")
+            rule_suffix = f" [{rule}]" if rule else ""
+            lines.append(
+                f"- {err['file']}:{err['line']}: {sev}: {err['message']}{rule_suffix}"
+            )
+        if result.error_count > 15:
+            lines.append(f"... and {result.error_count - 15} more error(s)")
+        return "\n".join(lines)
