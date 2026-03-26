@@ -295,6 +295,15 @@ class GovernedOrchestrator:
     async def _run_pipeline(self, ctx: OperationContext) -> OperationContext:
         """Internal pipeline logic -- phases 1 through 8."""
 
+        # ── Ouroboros Serpent: visual indicator that the pipeline is active ──
+        _serpent = None
+        try:
+            from backend.core.ouroboros.governance.serpent_animation import get_serpent
+            _serpent = get_serpent()
+            await _serpent.start("CLASSIFY")
+        except Exception:
+            pass
+
         # ---- Phase 1: CLASSIFY ----
         profile = self._build_profile(ctx)
         classification = self._stack.risk_engine.classify(profile)
@@ -670,6 +679,7 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] Self-evolution injection failed", exc_info=True)
 
+        if _serpent: _serpent.update_phase("GENERATE")
         # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
         generation: Optional[GenerationResult] = None
         generate_retries_remaining = self._config.max_generate_retries
@@ -1200,6 +1210,7 @@ class GovernedOrchestrator:
         # Store compact validation result in context; full output is in ledger
         ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
 
+        if _serpent: _serpent.update_phase("GATE")
         # ---- Phase 5: GATE ----
         allowed, reason = self._stack.can_write(
             {"files": list(ctx.target_files)}
@@ -1466,6 +1477,7 @@ class GovernedOrchestrator:
                     r.file_trigger, r.duration_s, ctx.op_id,
                 )
 
+        if _serpent: _serpent.update_phase("APPLY")
         # ---- Phase 8: VERIFY ----
         ctx = ctx.advance(OperationPhase.VERIFY)
         await self._record_ledger(
@@ -1474,6 +1486,7 @@ class GovernedOrchestrator:
             {"op_id": ctx.op_id},
         )
         ctx = await self._run_benchmark(ctx, [])
+        if _serpent: _serpent.update_phase("COMPLETE")
         ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
         self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
         await self._publish_outcome(ctx, OperationState.APPLIED)
@@ -1496,6 +1509,14 @@ class GovernedOrchestrator:
                 self._dialogue_store.complete_dialogue(ctx.op_id, "success")
             except Exception:
                 pass
+
+        # ── Ouroboros Serpent: stop animation ──
+        if _serpent:
+            try:
+                await _serpent.stop(success=True)
+            except Exception:
+                pass
+
         return ctx
 
     # ------------------------------------------------------------------
