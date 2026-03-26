@@ -171,9 +171,10 @@ class PathScopedSkillRegistry:
         # Now convert single *
         r = r.replace("*", "[^/]*")
         # Restore ** patterns
+        # Replace ? BEFORE restoring placeholders (so ? in (.+/)? isn't clobbered)
+        r = r.replace("?", "[^/]")
         r = r.replace("<<DSTAR_SLASH>>", "(.+/)?")
         r = r.replace("<<DSTAR>>", ".*")
-        r = r.replace("?", "[^/]")
         return bool(_re.fullmatch(r, path))
 
     def get_matching(self, target_files: Tuple[str, ...]) -> List[ScopedRule]:
