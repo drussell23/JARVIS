@@ -32,11 +32,17 @@ py::dict stream_frame_to_dict(const StreamFrame& frame) {
 
     // Convert image data to numpy array if raw format
     if (frame.format == "raw" && !frame.data.empty()) {
-        auto result = py::array_t<uint8_t>({frame.height, frame.width, frame.channels});
-        auto buf = result.request();
-        uint8_t* ptr = static_cast<uint8_t*>(buf.ptr);
-        std::memcpy(ptr, frame.data.data(), frame.data.size());
-        d["image"] = result;
+        // Create numpy array that takes ownership of the data (move, no copy)
+        size_t expected = (size_t)frame.height * frame.width * frame.channels;
+        if (frame.data.size() >= expected) {
+            auto result = py::array_t<uint8_t>(
+                {frame.height, frame.width, frame.channels},
+                {frame.width * frame.channels, frame.channels, 1}  // strides
+            );
+            auto buf = result.request();
+            std::memcpy(static_cast<uint8_t*>(buf.ptr), frame.data.data(), expected);
+            d["image"] = result;
+        }
     } else {
         // For compressed formats, return bytes
         d["image_data"] = py::bytes(reinterpret_cast<const char*>(frame.data.data()),

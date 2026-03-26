@@ -252,11 +252,43 @@ struct CallbackGuard {
     frame.gpu_accelerated = (_metalDevice != nil);
 
     if (_outputFormat == "raw") {
-        // Zero-copy path: Store raw BGRA data
-        size_t dataSize = bytesPerRow * height;
-        frame.data.resize(dataSize);
-        std::memcpy(frame.data.data(), baseAddress, dataSize);
-        frame.memory_used = dataSize;
+        // Downsample retina frames in C++ BEFORE the copy.
+        // A 2880x1800x4 frame = 20MB. At 60fps that's 1.2GB/s of memcpy.
+        // Downsampling 2x here reduces it to 5MB = 300MB/s — 4x faster.
+        bool is_retina = (width > 1600);
+        if (is_retina) {
+            size_t dst_w = width / 2;
+            size_t dst_h = height / 2;
+            size_t dst_row = dst_w * 4;
+            size_t dst_size = dst_row * dst_h;
+            frame.data.resize(dst_size);
+
+            const uint8_t* src = static_cast<const uint8_t*>(baseAddress);
+            uint8_t* dst = frame.data.data();
+
+            // Stride copy: take every 2nd pixel from every 2nd row
+            for (size_t y = 0; y < dst_h; y++) {
+                const uint8_t* src_row = src + (y * 2) * bytesPerRow;
+                uint8_t* dst_row_ptr = dst + y * dst_row;
+                for (size_t x = 0; x < dst_w; x++) {
+                    const uint8_t* src_px = src_row + x * 2 * 4;
+                    uint8_t* dst_px = dst_row_ptr + x * 4;
+                    dst_px[0] = src_px[0];  // B
+                    dst_px[1] = src_px[1];  // G
+                    dst_px[2] = src_px[2];  // R
+                    dst_px[3] = src_px[3];  // A
+                }
+            }
+            frame.width = (int)dst_w;
+            frame.height = (int)dst_h;
+            frame.memory_used = dst_size;
+        } else {
+            // Non-retina: direct copy (already small enough)
+            size_t dataSize = bytesPerRow * height;
+            frame.data.resize(dataSize);
+            std::memcpy(frame.data.data(), baseAddress, dataSize);
+            frame.memory_used = dataSize;
+        }
     } else {
         // Compression path: Convert to JPEG/PNG
         CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();

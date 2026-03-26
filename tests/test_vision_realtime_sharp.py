@@ -132,11 +132,16 @@ async def _start_sck_stream(wid: int) -> bool:
     if sck_path not in sys.path:
         sys.path.insert(0, sck_path)
 
-    _sck_frame_queue = queue.Queue(maxsize=3)
+    _sck_frame_queue = queue.Queue(maxsize=5)
     _sck_ready = threading.Event()
 
     def _sck_thread():
-        """Dedicated thread: start SCK, pump CFRunLoop, push frames to queue."""
+        """Dedicated thread: SCK full-screen capture → frame queue.
+
+        Full screen (window_id=0) delivers 23fps proven. Window-specific
+        capture has a delegate callback issue — full screen bypasses it.
+        The tracker ignores non-ball content via green channel threshold.
+        """
         try:
             import fast_capture_stream
             config = fast_capture_stream.StreamConfig()
@@ -146,28 +151,30 @@ async def _start_sck_stream(wid: int) -> bool:
             config.use_gpu_acceleration = True
             config.drop_frames_on_overflow = True
 
-            stream = fast_capture_stream.CaptureStream(wid, config)
+            # Full screen capture (window_id=0) — proven 23fps
+            stream = fast_capture_stream.CaptureStream(0, config)
             if not stream.start():
+                print("  SCK thread: stream.start() returned False")
                 return
 
             _sck_ready.set()
 
-            # Pump frames into the shared queue
             while _sck_ready.is_set():
-                frame = stream.get_frame(50)  # 50ms timeout
-                if frame and frame.get("image") is not None:
+                frame = stream.get_frame(16)
+                if frame is None:
+                    continue
+                if frame.get("image") is None:
+                    continue
+
+                if _sck_frame_queue.full():
                     try:
-                        _sck_frame_queue.put_nowait(frame)
-                    except queue.Full:
-                        # Drop oldest, put newest
-                        try:
-                            _sck_frame_queue.get_nowait()
-                        except queue.Empty:
-                            pass
-                        try:
-                            _sck_frame_queue.put_nowait(frame)
-                        except queue.Full:
-                            pass
+                        _sck_frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                try:
+                    _sck_frame_queue.put_nowait(frame)
+                except queue.Full:
+                    pass
 
             stream.stop()
         except Exception as exc:
@@ -193,50 +200,38 @@ _sck_frame_queue = None  # thread-safe queue.Queue
 
 
 async def _get_sck_frame() -> Optional[np.ndarray]:
-    """Get the latest frame from the SCK thread's queue. Zero async overhead.
+    """Get the LATEST frame from the SCK thread's queue. Non-blocking.
 
-    The SCK thread pumps CFRunLoop and pushes frames into a queue.Queue.
-    We just pop the latest — no asyncio.to_thread, no GCD callback issues.
+    Strategy: drain all queued frames, keep only the newest.
+    If queue is empty, return None immediately (don't block).
+    The tracker runs at whatever rate frames arrive — no waiting.
     """
     global _sck_logical_size
     if _sck_frame_queue is None:
         return None
+    import queue as _q
+
+    # Non-blocking drain: grab all available, keep newest
+    latest = None
     try:
-        import queue
-        # Drain to get the LATEST frame (skip stale ones)
-        frame = None
         while True:
-            try:
-                frame = _sck_frame_queue.get_nowait()
-            except queue.Empty:
-                break
+            latest = _sck_frame_queue.get_nowait()
+    except _q.Empty:
+        pass
 
-        if frame is None:
-            return None
-        img = frame.get("image")
-        if img is None:
-            return None
-
-        # Ensure RGB
-        if img.ndim == 3 and img.shape[2] == 4:
-            img = img[:, :, [2, 1, 0]]
-        elif img.ndim != 3 or img.shape[2] != 3:
-            return None
-
-        h, w = img.shape[:2]
-
-        # Retina normalization
-        if _sck_logical_size is None:
-            _sck_logical_size = (w // 2, h // 2) if w > 1600 else (w, h)
-
-        lw, _ = _sck_logical_size
-        if w > lw * 1.5:
-            scale = w // lw
-            img = img[::scale, ::scale, :]
-
-        return img
-    except Exception:
+    if latest is None:
         return None
+
+    img = latest.get("image")
+    if img is None:
+        return None
+
+    # KEEP BGRA — no channel swap! The tracker only needs the green channel
+    # which is index 1 in BOTH BGRA and RGB. Zero copy, zero conversion.
+    if img.ndim != 3 or img.shape[2] < 3:
+        return None
+
+    return img
 
 
 async def _stop_sck_stream() -> None:
@@ -295,11 +290,16 @@ async def _capture_window_raw_async(wid: int) -> Optional[np.ndarray]:
 def _numpy_to_b64(frame: np.ndarray) -> str:
     """Slow path: encode numpy → b64 PNG. Only for cloud model API calls.
 
-    Resizes to 1280x800 HERE (not in the capture path) because cloud APIs
-    have token limits on image size. This runs every ~8s, not every frame.
+    Handles both BGRA (from SCK) and RGB frames. Resizes to 1280x800
+    for cloud APIs. This runs every ~8s, not every frame.
     """
     from PIL import Image as _Img
-    img = _Img.fromarray(frame)
+    # Convert BGRA → RGB if needed
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        rgb = frame[:, :, [2, 1, 0]]  # BGRA → RGB (copy only here, on slow path)
+    else:
+        rgb = frame
+    img = _Img.fromarray(rgb)
     if img.width != 1280 or img.height != 800:
         img = img.resize((1280, 800), _Img.Resampling.LANCZOS)
     buf = io.BytesIO()
@@ -347,22 +347,28 @@ class BallTracker:
         self._initialized: bool = False
 
     def process_frame(self, frame: np.ndarray) -> dict:
-        """Find ball, compute velocity, predict next wall. ~2ms."""
-        h, w = frame.shape[:2]
-        green = frame[:, :, 1]
+        """Find ball, compute velocity, predict next wall.
 
-        # Bright core pixels = the ball itself (not the fading trail)
-        core_mask = green > 225
+        Optimization: subsample every 2nd pixel for the threshold scan.
+        The ball is ~20px wide — subsampling by 2 still catches it but
+        runs in 1/4 the time. Centroid is scaled back to full coords.
+        """
+        h, w = frame.shape[:2]
+        # Subsample: every 2nd pixel in both dimensions (4x faster)
+        green_sub = frame[::2, ::2, 1]
+
+        core_mask = green_sub > 225
         core_ys, core_xs = np.where(core_mask)
 
-        if len(core_xs) < 5:
-            soft = green > 180
+        if len(core_xs) < 3:
+            soft = green_sub > 180
             ys, xs = np.where(soft)
-            if len(xs) < 10:
+            if len(xs) < 5:
                 return self._state("no_ball")
-            cx, cy = int(np.mean(xs)), int(np.mean(ys))
+            # Scale back to full resolution
+            cx, cy = int(np.mean(xs)) * 2, int(np.mean(ys)) * 2
         else:
-            cx, cy = int(np.mean(core_xs)), int(np.mean(core_ys))
+            cx, cy = int(np.mean(core_xs)) * 2, int(np.mean(core_ys)) * 2
 
         self.ball_x, self.ball_y = cx, cy
         self.frames_processed += 1
@@ -591,23 +597,23 @@ async def main(duration_s: int = 60):
     # Find Chrome window first
     _chrome_wid = _find_chrome_ball_window()
 
-    # Try SCK native 60fps (with CFRunLoop pump fix)
-    _sck_active = False
+    # SCK full-screen capture at 60fps (proven 23fps)
+    # Window-specific capture has delegate issues — full screen works.
+    # The tracker filters by green channel so non-ball content is ignored.
+    _sck_active = await _start_sck_stream(0)  # 0 = full screen
     from backend.vision.lean_loop import LeanVisionLoop
     loop = LeanVisionLoop.get_instance()
-    if _chrome_wid:
-        _sck_active = await _start_sck_stream(_chrome_wid)
     if _sck_active:
-        print(f"  Capture: SCK 60fps NATIVE (wid={_chrome_wid}) — eyes fully open")
+        print(f"  Capture: SCK FULL SCREEN 60fps — eyes open")
     elif _chrome_wid:
-        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — 19fps fallback")
+        print(f"  Capture: Quartz targeted (wid={_chrome_wid}) — fallback")
     else:
         loop._frame_server_proc = None
         loop._frame_server_ready = False
         await loop._ensure_frame_server()
         if loop._frame_server_ready:
             await asyncio.sleep(2.0)
-        print("  Capture: frame_server (full main display)")
+        print("  Capture: frame_server — fallback")
 
     # Initialize cloud clients
     claude_client = None
@@ -665,19 +671,18 @@ async def main(duration_s: int = 60):
     last_vla_time = 0.0
 
     while (time.monotonic() - t_start) < duration_s:
-        # ---- CAPTURE: SCK 60fps → Quartz fallback → frame_server fallback ----
+        # ---- CAPTURE: SCK 60fps → Quartz fallback ----
         raw_frame: Optional[np.ndarray] = None
         b64: Optional[str] = None
 
         if _sck_active:
             raw_frame = await _get_sck_frame()
+        # Always fall back to Quartz if SCK didn't deliver
         if raw_frame is None and _chrome_wid:
             raw_frame = await _capture_window_raw_async(_chrome_wid)
         if raw_frame is None:
-            b64 = await loop._capture_cu_screenshot()
-            if b64 is None:
-                await asyncio.sleep(0.01)
-                continue
+            await asyncio.sleep(0.016)  # ~60fps yield when no frame
+            continue
         # b64 lazily encoded only when OCR or cloud needs it
 
         n_cycles += 1
@@ -912,9 +917,10 @@ async def main(duration_s: int = 60):
                         _doubleword_vision(b64)
                     )
 
-        # Minimal sleep: let asyncio process other tasks (OCR, cloud, speech)
-        # The capture itself takes ~47ms so total cycle is ~57ms = ~17fps
-        await asyncio.sleep(0.01)
+        # Yield to asyncio for background tasks (OCR, cloud, speech).
+        # With SCK: frames arrive from thread queue — just yield, no sleep.
+        # Without SCK: Quartz capture takes ~47ms so a short sleep is fine.
+        await asyncio.sleep(0)
 
     # Cleanup
     for task in [claude_task, dw_task, ouroboros_task, ocr_bg_task]:
