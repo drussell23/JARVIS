@@ -260,6 +260,7 @@ class FramePipeline:
         self._running: bool = False
         self._frame_counter: int = 0
         self._latest_frame: Optional[FrameData] = None
+        self._frame_subscribers: list = []
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -316,6 +317,15 @@ class FramePipeline:
     def latest_frame(self) -> Optional["FrameData"]:
         """Most recent frame — non-destructive read. Does not consume from queue."""
         return self._latest_frame
+
+    def subscribe(self, callback) -> None:
+        """Register a callback to receive every processed frame.
+
+        Callback signature: callback(frame: np.ndarray, frame_number: int, timestamp: float)
+        Async callbacks (coroutines) are awaited; sync callbacks are called directly.
+        Used by VisionIntelligenceHub to feed frames to intelligence modules.
+        """
+        self._frame_subscribers.append(callback)
 
     # ------------------------------------------------------------------
     # Frame access
@@ -662,6 +672,16 @@ class FramePipeline:
 
                 if self._should_process(frame):
                     self._enqueue_frame(frame)
+
+                # Dispatch to frame subscribers (intelligence hub, etc.)
+                for sub in self._frame_subscribers:
+                    try:
+                        if asyncio.iscoroutinefunction(sub):
+                            await sub(rgb, self._frame_counter, time.time())
+                        else:
+                            sub(rgb, self._frame_counter, time.time())
+                    except Exception:
+                        pass
 
         except asyncio.CancelledError:
             logger.debug("SHM capture loop cancelled")
