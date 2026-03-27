@@ -286,10 +286,21 @@ class DoublewordProvider:
     async def generate(
         self,
         ctx: OperationContext,
+        deadline: Any = None,
         *,
         prompt_override: Optional[str] = None,
     ) -> GenerationResult:
         """Generate code via Doubleword batch API (blocking).
+
+        Parameters
+        ----------
+        ctx:
+            OperationContext with target files and description.
+        deadline:
+            datetime deadline from orchestrator (used to cap poll time).
+            Conforms to CandidateProvider protocol.
+        prompt_override:
+            Optional prompt to use instead of building from ctx.
 
         Returns GenerationResult with provider_used="doubleword".
         Falls through to empty result on failure (caller handles fallback).
