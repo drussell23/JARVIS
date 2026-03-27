@@ -1047,7 +1047,35 @@ class RuntimeTaskOrchestrator:
 
         await asyncio.sleep(2.0)  # Allow page load
 
-        # Phase 1: Lean Vision Loop (Path A)
+        # Phase 0.5: JARVIS-CU (local Computer Use — 3-layer cascade)
+        # Accessibility API (<5ms) → Doubleword 235B (~2s) → Claude Vision (fallback)
+        # Powered by 60fps SHM capture. Auto-activates vision on first call.
+        jarvis_cu_enabled = os.getenv("JARVIS_CU_ENABLED", "true").lower() in ("true", "1", "yes")
+        if jarvis_cu_enabled:
+            try:
+                from backend.vision.vision_activator import VisionActivator
+                activator = VisionActivator.get_instance()
+                logger.info("[RuntimeTask] === JARVIS-CU START === goal: %s", goal[:80])
+                cu_result = await activator.run_goal(goal)
+                logger.info(
+                    "[RuntimeTask] === JARVIS-CU END === success=%s steps=%s/%s layers=%s",
+                    cu_result.get("success"),
+                    cu_result.get("steps_completed"),
+                    cu_result.get("steps_total"),
+                    cu_result.get("layers_used"),
+                )
+                if cu_result.get("success"):
+                    return cu_result
+                # If JARVIS-CU failed, fall through to Lean Vision Loop
+                logger.warning(
+                    "[RuntimeTask] JARVIS-CU partial failure (%s/%s steps), "
+                    "falling back to Lean Vision Loop",
+                    cu_result.get("steps_completed"), cu_result.get("steps_total"),
+                )
+            except Exception as cu_exc:
+                logger.warning("[RuntimeTask] JARVIS-CU error: %s, falling back", cu_exc)
+
+        # Phase 1: Lean Vision Loop (Path A) — fallback when JARVIS-CU fails
         # Try BOTH import paths — unified_supervisor may use either root
         lean_enabled = os.getenv("VISION_LEAN_ENABLED", "true").lower() in ("true", "1", "yes")
         if lean_enabled:
