@@ -227,7 +227,9 @@ class TodoScannerSensor:
             return False
 
         # HACK/XXX are often quick fixes that can be resolved
-        if marker in ("HACK", "XXX"):
+        if marker in ("HACK", "XXX") and any(w in text_lower for w in (
+            "temporary", "workaround", "cleanup", "remove", "replace", "simplify", "quick fix", "todo",
+        )):
             return True
 
         return False
