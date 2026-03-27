@@ -510,6 +510,7 @@ class GovernedOrchestrator:
                 logger.debug("Reasoning chain bridge error", exc_info=True)
 
         # Advance to ROUTE with risk_tier set (and optional reasoning result)
+        if _serpent: _serpent.update_phase("ROUTE")
         ctx = ctx.advance(
             OperationPhase.ROUTE,
             risk_tier=risk_tier,
@@ -582,6 +583,7 @@ class GovernedOrchestrator:
                     )
                 except Exception:
                     pass
+            if _serpent: _serpent.update_phase("CONTEXT_EXPANSION")
             ctx = ctx.advance(OperationPhase.CONTEXT_EXPANSION)
 
             # ---- Phase 2b: CONTEXT_EXPANSION ----
@@ -1076,6 +1078,7 @@ class GovernedOrchestrator:
             return ctx
 
         # Store generation result in context
+        if _serpent: _serpent.update_phase("VALIDATE")
         ctx = ctx.advance(OperationPhase.VALIDATE, generation=generation)
 
         # ── PreActionNarrator: voice WHAT before VALIDATE ──
@@ -1803,6 +1806,7 @@ class GovernedOrchestrator:
 
         if _serpent: _serpent.update_phase("APPLY")
         # ---- Phase 8: VERIFY ----
+        if _serpent: _serpent.update_phase("VERIFY")
         ctx = ctx.advance(OperationPhase.VERIFY)
         await self._record_ledger(
             ctx,
