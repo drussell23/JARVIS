@@ -311,6 +311,10 @@ class DynamicWebSocketClient {
     // State
     this.isDestroyed = false;
 
+    // v360.2: Event Stream Protocol codec (activated for /ws/stream URLs)
+    this._esCodec = new EventStreamCodec();
+    this._esUrls = new Set(); // URLs that use the event stream protocol
+
     console.log(`[WS-CLIENT] Created instance ${this.instanceId}`);
   }
 
@@ -413,24 +417,39 @@ class DynamicWebSocketClient {
 
       ws.onopen = () => {
         clearTimeout(timeoutId);
-        
+
         this.connections.set(url, ws);
         this.connectionStates.set(url, ConnectionState.CONNECTED);
         this.reconnectAttempts.set(url, 0);
-        
+
         // Initialize metrics
         this._initMetrics(url);
-        
-        // Start heartbeat
-        this._startHeartbeat(url);
-        
+
+        // v360.2: Event Stream protocol — send handshake, skip legacy heartbeat
+        const isEventStream = url.includes('/ws/stream');
+        if (isEventStream) {
+          this._esUrls.add(url);
+          this._esCodec.resetWsFailures();
+          this._esCodec.stopSSEFallback();
+          // Send handshake frame
+          try {
+            ws.send(this._esCodec.makeHandshake());
+          } catch (e) {
+            console.warn('[EventStream] Handshake send failed:', e);
+          }
+          // Do NOT start legacy heartbeat — _sync frames handle liveness
+        } else {
+          // Legacy: start ping/pong heartbeat
+          this._startHeartbeat(url);
+        }
+
         // Flush offline queue
         this._flushQueue();
-        
+
         // Emit connected event
         this._emit('connected', { endpoint: url });
-        
-        console.log(`✅ WebSocket connected: ${url}`);
+
+        console.log(`✅ WebSocket connected: ${url}${isEventStream ? ' [EventStream]' : ''}`);
         resolve(ws);
       };
 
@@ -456,6 +475,16 @@ class DynamicWebSocketClient {
   }
 
   /**
+   * Get the URL for a WebSocket instance (reverse lookup).
+   */
+  _getConnectionUrl(ws) {
+    for (const [url, conn] of this.connections) {
+      if (conn === ws) return url;
+    }
+    return null;
+  }
+
+  /**
    * Handle WebSocket close event
    */
   _handleClose(url, event) {
@@ -464,6 +493,20 @@ class DynamicWebSocketClient {
     this._stopHeartbeat(url);
     this.connections.delete(url);
     this.connectionStates.set(url, ConnectionState.DISCONNECTED);
+
+    // v360.2: Track consecutive WS failures for SSE fallback trigger
+    if (this._esUrls.has(url)) {
+      const shouldFallback = this._esCodec.recordWsFailure();
+      if (shouldFallback && !this._esCodec._sseFallback) {
+        // Derive HTTP base URL from WS URL
+        const httpBase = url.replace('wss://', 'https://').replace('ws://', 'http://')
+          .replace(/\/ws\/stream$/, '');
+        this._esCodec.startSSEFallback(httpBase, (data) => {
+          this._routeMessage(data, url);
+        });
+        console.log('[EventStream] Activated SSE fallback after 3 WS failures');
+      }
+    }
 
     // Notify global lock that connection is closed
     if (this.config.useGlobalLock) {
@@ -676,31 +719,49 @@ class DynamicWebSocketClient {
 
   _handleMessage(url, event) {
     try {
+      // v360.2: Event Stream protocol — unwrap envelope
+      if (this._esUrls.has(url)) {
+        const inner = this._esCodec.unwrapInbound(event.data);
+        if (inner === null) {
+          // Sync frame or handshake_ack — already processed by codec
+          this.lastPong.set(url, Date.now()); // Treat as liveness signal
+          return;
+        }
+        // Route the unwrapped inner payload
+        if (inner.type && !this.learnedSchemas.has(inner.type)) {
+          this._learnSchema(inner);
+        }
+        this._updateMetrics(url, 'message', inner);
+        this._routeMessage(inner, url);
+        return;
+      }
+
+      // Legacy path
       const data = JSON.parse(event.data);
-      
+
       // Handle pong
       if (data.type === 'pong' || data.type === 'ping') {
         this.lastPong.set(url, Date.now());
         return;
       }
-      
+
       // Handle ACK
       if (data.type === 'ack' && data.ackId) {
         this._handleACK(data.ackId, data);
         return;
       }
-      
+
       // Learn message schema
       if (data.type && !this.learnedSchemas.has(data.type)) {
         this._learnSchema(data);
       }
-      
+
       // Update metrics
       this._updateMetrics(url, 'message', data);
-      
+
       // Route to handlers
       this._routeMessage(data, url);
-      
+
     } catch (error) {
       console.error('Message parsing error:', error);
       this._updateMetrics(url, 'error');
@@ -756,15 +817,30 @@ class DynamicWebSocketClient {
    * Send a message (fire and forget)
    */
   async send(message, capability = null) {
+    // v360.2: SSE fallback path — if active, route commands via REST
+    if (this._esCodec._sseFallback && !this._getConnection(capability)) {
+      try {
+        return await this._esCodec.sendViaREST(message);
+      } catch (error) {
+        console.error('[EventStream] REST send failed:', error);
+        return this._queueMessage(message, capability, 'normal');
+      }
+    }
+
     const ws = this._getConnection(capability);
-    
+
     if (!ws || ws.readyState !== WebSocket.OPEN) {
-      // Queue for later
       return this._queueMessage(message, capability, 'normal');
     }
 
     try {
-      ws.send(JSON.stringify(message));
+      // v360.2: Wrap with event stream envelope if applicable
+      const url = this._getConnectionUrl(ws);
+      if (url && this._esUrls.has(url)) {
+        ws.send(this._esCodec.wrapOutbound(message));
+      } else {
+        ws.send(JSON.stringify(message));
+      }
       return true;
     } catch (error) {
       console.error('Send failed:', error);
@@ -1028,5 +1104,158 @@ class DynamicWebSocketClient {
   }
 }
 
+// ============================================================================
+// EVENT STREAM CODEC (v360.2)
+// Handles seq tracking, ACK piggybacking, handshake, and SSE fallback
+// for the /ws/stream persistent bidirectional event stream protocol.
+// ============================================================================
+
+class EventStreamCodec {
+  constructor() {
+    this.lastAck = 0;           // Highest contiguous seq we've processed
+    this.sessionId = null;      // Set by handshake_ack
+    this.channels = ['command', 'voice', 'governance', 'telemetry'];
+    this._active = false;       // Set true after successful handshake
+    this._sseFallback = null;   // EventSource instance if WS fails
+    this._sseCommandUrl = null;
+    this._consecutiveWsFailures = 0;
+  }
+
+  get active() { return this._active; }
+
+  makeHandshake(lastAck = null) {
+    return JSON.stringify({
+      v: 1,
+      type: 'handshake',
+      last_ack: lastAck !== null ? lastAck : this.lastAck,
+      channels: this.channels,
+    });
+  }
+
+  wrapOutbound(payload) {
+    return JSON.stringify({
+      v: 1,
+      ack: this.lastAck,
+      ch: payload.type ? this._resolveChannel(payload.type) : 'command',
+      d: payload,
+    });
+  }
+
+  unwrapInbound(rawData) {
+    let frame;
+    try {
+      frame = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
+    } catch {
+      return null;
+    }
+
+    // Not an event stream frame — pass through as-is (legacy)
+    if (!frame || frame.v !== 1) {
+      return frame;
+    }
+
+    // Update our ACK tracker
+    const seq = frame.seq;
+    if (seq && seq === this.lastAck + 1) {
+      this.lastAck = seq;
+    } else if (seq && seq > this.lastAck + 1) {
+      // Gap detected — we missed messages. Accept what we have.
+      // The server will replay on next reconnect.
+      this.lastAck = seq;
+    }
+
+    // Sync frame — no payload, just liveness
+    if (frame.ch === '_sync') {
+      return null; // Swallow — the seq update above is the only effect
+    }
+
+    // Handshake ACK
+    if (frame.ch === '_ctrl' && frame.d && frame.d.type === 'handshake_ack') {
+      this.sessionId = frame.d.session_id;
+      this._active = true;
+      console.log(`[EventStream] Handshake OK (session=${this.sessionId}, ` +
+        `replay=${frame.d.replay_from}→${frame.d.replay_to})`);
+      return null; // Don't route to message handlers
+    }
+
+    // Normal message — return inner payload with metadata
+    const inner = frame.d;
+    if (inner) {
+      inner._es_seq = seq;
+      inner._es_channel = frame.ch;
+    }
+    return inner;
+  }
+
+  _resolveChannel(msgType) {
+    const map = {
+      command: 'command', voice_command: 'command', jarvis_command: 'command',
+      ml_audio_stream: 'voice', audio_error: 'voice',
+      notification: 'governance', model_status: 'governance',
+      network_status: 'governance', system_updating: 'governance',
+      system_metrics: 'telemetry', health_check: 'telemetry',
+      cost_update: 'telemetry',
+      vision_analyze: 'vision', vision_monitor: 'vision',
+    };
+    return map[msgType] || 'command';
+  }
+
+  // --- SSE Fallback ---
+
+  startSSEFallback(baseUrl, onMessage) {
+    const params = new URLSearchParams({
+      last_ack: String(this.lastAck),
+      channels: this.channels.join(','),
+    });
+    const sseUrl = `${baseUrl}/api/stream/sse?${params}`;
+    this._sseCommandUrl = `${baseUrl}/api/stream/command`;
+
+    console.log(`[EventStream] Starting SSE fallback: ${sseUrl}`);
+    this._sseFallback = new EventSource(sseUrl);
+
+    this._sseFallback.onmessage = (event) => {
+      const inner = this.unwrapInbound(event.data);
+      if (inner) {
+        onMessage(inner);
+      }
+    };
+
+    this._sseFallback.onerror = () => {
+      console.warn('[EventStream] SSE error — browser will auto-reconnect');
+    };
+
+    return this._sseFallback;
+  }
+
+  stopSSEFallback() {
+    if (this._sseFallback) {
+      this._sseFallback.close();
+      this._sseFallback = null;
+    }
+  }
+
+  async sendViaREST(payload) {
+    if (!this._sseCommandUrl) {
+      throw new Error('SSE fallback not active');
+    }
+    const resp = await fetch(this._sseCommandUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: this.wrapOutbound(payload),
+    });
+    return resp.json();
+  }
+
+  recordWsFailure() {
+    this._consecutiveWsFailures++;
+    return this._consecutiveWsFailures >= 3;
+  }
+
+  resetWsFailures() {
+    this._consecutiveWsFailures = 0;
+  }
+}
+
+
 export default DynamicWebSocketClient;
-export { ConnectionState };
+export { ConnectionState, EventStreamCodec };

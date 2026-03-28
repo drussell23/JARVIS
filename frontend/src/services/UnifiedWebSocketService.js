@@ -118,12 +118,21 @@ class UnifiedWebSocketService {
         }
 
         if (config?.WS_BASE_URL) {
-          // Configure endpoints - including reactor-core training
+          // Configure endpoints - v360.2: /ws/stream is the primary persistent
+          // event stream with seq guarantees + channel multiplexing.
+          // Legacy /ws kept as fallback if handshake fails.
           this.client.endpoints = [
             {
+              // v360.2: Persistent bidirectional event stream (primary)
+              path: `${config.WS_BASE_URL}/ws/stream`,
+              capabilities: ['general', 'voice', 'command', 'governance', 'telemetry'],
+              priority: 10
+            },
+            {
+              // Legacy unified WebSocket (fallback)
               path: `${config.WS_BASE_URL}/ws`,
               capabilities: ['general', 'voice', 'command'],
-              priority: 10
+              priority: 5
             },
             {
               // Reactor-Core training feedback (v9.0)
@@ -141,7 +150,7 @@ class UnifiedWebSocketService {
               // Broadcast WebSocket for maintenance mode events from supervisor
               path: `${config.WS_BASE_URL}/api/broadcast/ws`,
               capabilities: ['broadcast', 'maintenance'],
-              priority: 5
+              priority: 4
             }
           ];
 

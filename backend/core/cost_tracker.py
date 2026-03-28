@@ -769,6 +769,15 @@ class CostTracker:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        # v360.2: Also push through EventStream for /ws/stream clients
+        try:
+            from backend.core.event_stream import get_event_stream_if_initialized
+            es = get_event_stream_if_initialized()
+            if es is not None:
+                await es.broadcast_event("telemetry", message)
+        except Exception:
+            pass  # Event stream not initialized yet — fine
+
     def register_websocket_subscriber(self, callback: Callable):
         """
         Register a WebSocket connection for real-time updates.
