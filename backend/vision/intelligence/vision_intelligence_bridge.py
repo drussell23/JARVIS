@@ -42,12 +42,20 @@ except ImportError:
     get_vsms = None
 
 try:
-    # Import Rust components (will be available after building)
+    # Import Rust components — add the .so directory to path if needed
     import vision_intelligence as rust_vi
     RUST_AVAILABLE = True
 except ImportError:
-    RUST_AVAILABLE = False
-    rust_vi = None
+    try:
+        import sys as _sys
+        _rust_so_dir = str(Path(__file__).parent)
+        if _rust_so_dir not in _sys.path:
+            _sys.path.insert(0, _rust_so_dir)
+        import vision_intelligence as rust_vi
+        RUST_AVAILABLE = True
+    except ImportError:
+        RUST_AVAILABLE = False
+        rust_vi = None
 
 # Cross-repo integrations (dynamic with fallbacks)
 try:
