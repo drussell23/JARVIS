@@ -43,8 +43,10 @@ except ImportError:
     rust_vi = None
     RUST_AVAILABLE = False
 
-print("✨ JARVIS Vision Intelligence System initialized")
+import logging as _logging
+_logger = _logging.getLogger(__name__)
+
 if RUST_AVAILABLE:
-    print("  ✅ Rust acceleration available")
+    _logger.debug("Vision Intelligence: Rust acceleration available")
 else:
-    print("  ⚠️  Rust acceleration not available - run build.sh to enable")
+    _logger.debug("Vision Intelligence: Rust acceleration not available (Python fallback active)")

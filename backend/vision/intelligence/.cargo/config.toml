@@ -1,0 +1,5 @@
+# PyO3 extensions on macOS need Python symbols resolved at runtime,
+# not link time.  Without this, `cargo build` fails with
+# "ld: symbol(s) not found for architecture arm64" on every _Py* symbol.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

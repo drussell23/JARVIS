@@ -631,10 +631,11 @@ class PrimeClient:
             await self._pool.initialize()
 
             # Pillar 2 (Progressive Awakening): Do NOT block boot on health check.
-            # Start as DEGRADED and let the background monitor promote to AVAILABLE
-            # once J-Prime responds. This prevents event loop starvation during
-            # heavy parallel boot when GCP clients, Docker, etc. compete for I/O.
-            self._status = PrimeStatus.DEGRADED
+            # Start as UNKNOWN and let the background monitor promote to AVAILABLE
+            # once J-Prime actually responds. Starting as DEGRADED caused the router
+            # to immediately route to GCP_PRIME before any health check ran, leading
+            # to TimeoutError spam when no J-Prime is running.
+            self._status = PrimeStatus.UNKNOWN
 
             # Start background health monitor — will promote to AVAILABLE on first success
             self._health_check_task = asyncio.create_task(
