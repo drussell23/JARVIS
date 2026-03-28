@@ -149,14 +149,24 @@ def _resolve_prime_port() -> int:
       3. JARVIS_PRIME_PORT (explicit override)
       4. 8000 (fallback)
     """
+    _DEFAULT_PORT = 8000
+
+    def _valid(p: int) -> bool:
+        return 1024 <= p <= 65535  # reject privileged / sentinel ports
+
     # Priority 1: Parse port from JARVIS_PRIME_URL
     prime_url = os.getenv("JARVIS_PRIME_URL", "")
     if prime_url:
         try:
             from urllib.parse import urlparse
             parsed = urlparse(prime_url)
-            if parsed.port:
+            if parsed.port and _valid(parsed.port):
                 return parsed.port
+            elif parsed.port:
+                logger.warning(
+                    f"[PrimePort] JARVIS_PRIME_URL port {parsed.port} is outside "
+                    f"valid range (1024-65535), falling through"
+                )
         except Exception:
             pass
 
@@ -164,12 +174,14 @@ def _resolve_prime_port() -> int:
     invincible_port = os.getenv("JARVIS_INVINCIBLE_NODE_PORT", "")
     if invincible_port:
         try:
-            return int(invincible_port)
+            p = int(invincible_port)
+            if _valid(p):
+                return p
         except ValueError:
             pass
 
     # Priority 3: Explicit port override
-    return _get_env_int("JARVIS_PRIME_PORT", 8000)
+    return _get_env_int("JARVIS_PRIME_PORT", _DEFAULT_PORT)
 
 
 @dataclass
