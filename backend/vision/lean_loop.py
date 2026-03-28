@@ -284,6 +284,16 @@ class LeanVisionLoop:
 
             # Goal achieved? (multi-signal fusion)
             if response.get("goal_achieved"):
+                # v308.0: Guard against claiming success when no real actions
+                # actually succeeded (e.g., all clicks/types failed due to
+                # missing pyautogui, but model claims done anyway).
+                _real_acts = [
+                    a for a in action_log
+                    if a.get("action") not in ("screenshot", "wait", "cursor_position")
+                ]
+                _any_real_ok = any(
+                    a.get("result") == "success" for a in _real_acts
+                )
                 if (
                     turn == 1
                     and not action_log
@@ -291,6 +301,13 @@ class LeanVisionLoop:
                 ):
                     logger.warning(
                         "[LeanVision:AG] Turn 1: premature goal_achieved — overriding",
+                    )
+                    response["goal_achieved"] = False
+                elif _real_acts and not _any_real_ok:
+                    logger.warning(
+                        "[LeanVision:AG] Model claims done but ALL %d real "
+                        "actions failed — overriding to failure",
+                        len(_real_acts),
                     )
                     response["goal_achieved"] = False
                 else:
@@ -1237,13 +1254,41 @@ class LeanVisionLoop:
                     "[LeanVision:CU] Task complete on turn %d: %s",
                     turn, summary[:120],
                 )
-                success = any(
-                    kw in summary.lower()
-                    for kw in (
-                        "complete", "done", "sent", "success",
-                        "achieved", "finished", "accomplished",
+
+                # v308.0: Action-based success detection.  The old keyword
+                # matcher ("sent", "done", …) produced false positives when
+                # Claude described a *hypothetical* plan containing those
+                # words.  Instead, success requires that at least one REAL
+                # action (not screenshot/wait/cursor_position) actually
+                # succeeded during the session.
+                _real_actions = [
+                    a for a in action_log
+                    if a.get("action") not in ("screenshot", "wait", "cursor_position")
+                ]
+                _any_real_succeeded = any(
+                    a.get("result") == "success" for a in _real_actions
+                )
+
+                summary_lower = summary.lower()
+                _failure_signals = any(
+                    phrase in summary_lower
+                    for phrase in (
+                        "unable to", "can't", "cannot", "couldn't",
+                        "not able to", "failed to", "unresponsive",
+                        "would do", "here's what i",
                     )
                 )
+
+                if _failure_signals or not _any_real_succeeded:
+                    success = False
+                    logger.warning(
+                        "[LeanVision:CU] Overriding to failure: "
+                        "failure_signals=%s real_actions_succeeded=%s",
+                        _failure_signals, _any_real_succeeded,
+                    )
+                else:
+                    success = True
+
                 return {
                     "success": success,
                     "result": summary or f"Goal completed: {goal}",

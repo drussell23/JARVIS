@@ -179,14 +179,16 @@ class JarvisCU:
         steps_total = len(steps)
         if steps_total == 0:
             elapsed = time.monotonic() - t_start
-            logger.info("[JarvisCU] Planner returned 0 steps for goal: %s", goal)
+            # v308.0: 0 planned steps means the planner couldn't figure out
+            # what to do (likely bad/black frame).  This is NOT success.
+            logger.warning("[JarvisCU] Planner returned 0 steps for goal: %s", goal)
             return {
-                "success": True,
+                "success": False,
                 "steps_completed": 0,
                 "steps_total": 0,
                 "step_results": [],
                 "elapsed_s": elapsed,
-                "error": None,
+                "error": "Planner generated 0 steps — likely bad screenshot or unclear goal",
                 "layers_used": dict(layers_used),
             }
 

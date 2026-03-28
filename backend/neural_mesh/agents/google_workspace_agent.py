@@ -2576,6 +2576,10 @@ class GoogleWorkspaceClient:
                 )
                 try:
                     await self._rebuild_services()
+                    # Brief pause to let OS-level SSL state settle (sleep/wake,
+                    # network transition). Without this the retry hits the same
+                    # stale TCP state immediately.
+                    await asyncio.sleep(1.0)
                     result = await asyncio.wait_for(
                         loop.run_in_executor(None, operation),
                         timeout=operation_timeout,
@@ -2587,7 +2591,7 @@ class GoogleWorkspaceClient:
                     )
                     return result
                 except Exception as transport_retry_err:
-                    logger.warning(
+                    logger.debug(
                         "[GoogleWorkspaceClient] Transport retry also failed: %s",
                         transport_retry_err,
                     )
@@ -3105,7 +3109,12 @@ class GoogleWorkspaceClient:
             return result
 
         except Exception as e:
-            logger.exception(f"Error fetching emails: {e}")
+            # Transport/SSL errors already logged by _execute_with_retry
+            import ssl as _ssl
+            if isinstance(e, (_ssl.SSLError, ConnectionError, BrokenPipeError)):
+                logger.warning("Email fetch failed (transport): %s", e)
+            else:
+                logger.exception("Error fetching emails: %s", e)
             return {"error": str(e), "emails": []}
 
     def _fetch_unread_sync(self, limit: int, label: str) -> Dict[str, Any]:
