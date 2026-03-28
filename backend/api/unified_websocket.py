@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 # Import async pipeline for non-blocking WebSocket operations
 from core.async_pipeline import get_async_pipeline
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from starlette.responses import StreamingResponse
 
 # Import VBI Debug Tracer for comprehensive voice unlock logging
 try:
@@ -3042,6 +3043,90 @@ async def unified_websocket_endpoint(websocket: WebSocket):
             manager.circuit_failures += 1
     finally:
         await manager.disconnect(client_id)
+
+
+# ============================================================================
+# Persistent Bidirectional Event Stream (v360.2)
+# ============================================================================
+
+@router.websocket("/ws/stream")
+async def event_stream_websocket(websocket: WebSocket):
+    """
+    Persistent bidirectional event stream with sequence guarantees.
+
+    Protocol: seq + ack + channel multiplexing + replay on reconnect.
+    Falls back to legacy mode if client does not handshake within 2s.
+    See backend/core/event_stream.py for full protocol documentation.
+    """
+    from backend.core.event_stream import get_event_stream, set_event_stream_ws_manager
+    es = get_event_stream()
+    # Ensure ws_manager is wired (lazy — first connection triggers it)
+    if es._ws_manager is None:
+        set_event_stream_ws_manager(get_ws_manager())
+    await es.handle_connection(websocket)
+
+
+@router.get("/api/stream/sse")
+async def event_stream_sse(request: Request):
+    """
+    SSE fallback for the event stream.
+
+    Query params:
+      - last_ack: int (default 0) — replay events after this seq
+      - channels: str (comma-separated, default all) — subscribe to specific channels
+    """
+    from backend.core.event_stream import get_event_stream, set_event_stream_ws_manager
+    es = get_event_stream()
+    if es._ws_manager is None:
+        set_event_stream_ws_manager(get_ws_manager())
+
+    last_ack = int(request.query_params.get("last_ack", "0"))
+    # Also support Last-Event-ID header (browser-native SSE reconnect)
+    last_event_id = request.headers.get("Last-Event-ID")
+    if last_event_id:
+        try:
+            last_ack = max(last_ack, int(last_event_id))
+        except ValueError:
+            pass
+
+    channels_param = request.query_params.get("channels", "")
+    channels = set(channels_param.split(",")) if channels_param else None
+
+    return StreamingResponse(
+        es.sse_stream(last_ack=last_ack, channels=channels),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.post("/api/stream/command")
+async def event_stream_command(request: Request):
+    """
+    REST command endpoint (SSE fallback path).
+
+    Accepts the same JSON payload as a WS command frame's "d" field.
+    Returns the handler response directly.
+    """
+    from backend.core.event_stream import get_event_stream, set_event_stream_ws_manager
+    es = get_event_stream()
+    if es._ws_manager is None:
+        set_event_stream_ws_manager(get_ws_manager())
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return {"success": False, "error": "invalid_json"}
+
+    # Unwrap if client sends full envelope
+    if "d" in payload and "v" in payload:
+        payload = payload["d"]
+
+    response = await es.handle_post_command(payload)
+    return response
 
 
 # ============================================================================
