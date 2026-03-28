@@ -75,13 +75,20 @@ class VisionActivator:
                 logger.info("[VisionActivator] JarvisCU: READY")
 
                 # 3. Start Intelligence Hub and subscribe to frame feed
-                from backend.vision.intelligence.vision_intelligence_hub import (
-                    VisionIntelligenceHub,
-                )
-                self._intel_hub = VisionIntelligenceHub()
-                VisionIntelligenceHub.set_instance(self._intel_hub)
-                self._frame_pipeline.subscribe(self._intel_hub.on_frame)
-                logger.info("[VisionActivator] Intelligence Hub: WIRED (5 modules)")
+                # Non-fatal: CU works fine without the intelligence modules.
+                try:
+                    from backend.vision.intelligence.vision_intelligence_hub import (
+                        VisionIntelligenceHub,
+                    )
+                    self._intel_hub = VisionIntelligenceHub()
+                    # VisionIntelligenceHub uses __new__ singleton (no set_instance)
+                    self._frame_pipeline.subscribe(self._intel_hub.on_frame)
+                    logger.info("[VisionActivator] Intelligence Hub: WIRED (5 modules)")
+                except Exception as hub_exc:
+                    logger.warning(
+                        "[VisionActivator] Intelligence Hub unavailable (non-fatal): %s",
+                        hub_exc,
+                    )
 
                 self._activated = True
                 logger.info("[VisionActivator] Vision pipeline ACTIVE")

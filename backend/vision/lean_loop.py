@@ -114,6 +114,8 @@ class LeanVisionLoop:
         self._frame_server_ready: bool = False
         # Visual Telemetry: monotonic perception counter
         self._perception_seq: int = 0
+        # SHM direct reader (in-process SCK capture, no subprocess TCC issues)
+        self._shm_reader: Any = None
 
     # ------------------------------------------------------------------
     # Singleton access (matches codebase convention)
@@ -1490,28 +1492,100 @@ class LeanVisionLoop:
     async def _capture_cu_screenshot(self) -> Optional[str]:
         """Capture screen as PNG at CU display resolution.
 
-        Capture cascade (fastest first):
+        Capture cascade (fastest first, in-process first):
         0. VisionActionLoop FramePipeline (if running) — sub-10ms
-        1. Ferrari Engine (frame_server subprocess via Quartz)    — ~50ms
-        2. screencapture subprocess                               — ~200ms
+        1. SHM ring buffer direct read (VisionActivator's SCK)  — sub-10ms
+        2. Ferrari Engine (frame_server subprocess via Quartz)   — ~50ms
+        3. screencapture subprocess                              — ~200ms
+
+        v308.0: Added SHM direct read at tier 1.  When JARVIS runs as a
+        launchd agent (PPID=1), subprocess-based capture (tiers 2-3)
+        fails because the child process inherits a different TCC context
+        that lacks Screen Recording permission.  SHM is in-process — it
+        reads from the ScreenCaptureKit pipeline that VisionActivator
+        starts, which has the correct TCC grant.
         """
-        # --- Try VisionActionLoop FramePipeline (sub-10ms) ---
+        # --- Tier 0: VisionActionLoop FramePipeline (sub-10ms) ---
         result = await self._try_val_frame_pipeline()
         if result is not None:
             self._emit_perception_artifact(result, "val_pipeline")
             return result
 
-        # --- Try Ferrari Engine (frame_server atomic file) ---
+        # --- Tier 1: SHM direct read (in-process, SCK-backed) ---
+        result = self._try_shm_direct()
+        if result is not None:
+            self._emit_perception_artifact(result, "shm_direct")
+            return result
+
+        # --- Tier 2: Ferrari Engine (frame_server subprocess) ---
         result = await self._try_frame_server_capture()
         if result is not None:
             self._emit_perception_artifact(result, "frame_server")
             return result
 
-        # --- Fallback: screencapture subprocess ---
+        # --- Tier 3: screencapture subprocess (last resort) ---
         result = await self._screencapture_fallback()
         if result is not None:
             self._emit_perception_artifact(result, "screencapture")
         return result
+
+    def _try_shm_direct(self) -> Optional[str]:
+        """Read latest frame directly from the SHM ring buffer.
+
+        The SHM segment is written by ScreenCaptureKit (via FramePipeline
+        or the native C++ capture path). Reading is in-process — no
+        subprocess spawn, no TCC inheritance issue.  This is the
+        structural fix for launchd-launched JARVIS where subprocess-based
+        capture fails due to macOS TCC permission inheritance.
+        """
+        try:
+            from backend.vision.shm_frame_reader import ShmFrameReader
+        except ImportError:
+            return None
+
+        if self._shm_reader is None:
+            reader = ShmFrameReader()
+            if not reader.open():
+                return None
+            self._shm_reader = reader
+
+        try:
+            frame, counter = self._shm_reader.read_latest()
+            if frame is None:
+                return None
+
+            from PIL import Image
+            # SHM frames are BGRA (4ch) from SCK — convert to RGB
+            if frame.ndim == 3 and frame.shape[2] == 4:
+                frame = frame[:, :, [2, 1, 0]]  # BGRA → RGB (drop alpha)
+
+            img = Image.fromarray(frame)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+            # Track coordinate scale
+            logical_w, logical_h = self._get_logical_screen_size()
+            if logical_w > 0 and logical_h > 0:
+                self._cu_scale = (
+                    logical_w / _CU_DISPLAY_W,
+                    logical_h / _CU_DISPLAY_H,
+                )
+            else:
+                self._cu_scale = (
+                    img.width / _CU_DISPLAY_W,
+                    img.height / _CU_DISPLAY_H,
+                )
+
+            img = img.resize(
+                (_CU_DISPLAY_W, _CU_DISPLAY_H), Image.Resampling.LANCZOS,
+            )
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            logger.debug("[LeanVision:SHM] Frame from SHM direct read (sub-10ms)")
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+        except Exception as exc:
+            logger.debug("[LeanVision:SHM] SHM read failed: %s", exc)
+            return None
 
     async def _try_frame_server_capture(self) -> Optional[str]:
         """Read latest frame from frame_server subprocess (~50ms, Quartz CGWindowListCreateImage).
