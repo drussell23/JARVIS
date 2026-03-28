@@ -168,32 +168,41 @@ class HardwareDetector:
 
             # Try to load ARM64 SIMD module
             try:
-                # Try multiple import paths
-                arm64_simd = None
+                # Guard: arm64_simd was compiled against numpy 1.x — skip if numpy 2.x
+                import numpy as _np
+                _np_major = int(getattr(_np, '__version__', '1').split('.')[0])
+                if _np_major >= 2:
+                    logger.debug(
+                        "[Acceleration] Skipping ARM64 SIMD module — compiled for "
+                        f"NumPy 1.x, found NumPy {_np.__version__}. "
+                        "Rebuild with: python3 backend/core/setup_arm64.py"
+                    )
+                else:
+                    arm64_simd = None
 
-                # Path 1: Direct import
-                try:
-                    import arm64_simd as _arm64_simd
-                    arm64_simd = _arm64_simd
-                except ImportError:
-                    pass
-
-                # Path 2: From core directory
-                if arm64_simd is None:
+                    # Path 1: Direct import
                     try:
-                        core_path = Path(__file__).parent.parent
-                        if str(core_path) not in sys.path:
-                            sys.path.insert(0, str(core_path))
                         import arm64_simd as _arm64_simd
                         arm64_simd = _arm64_simd
-                    except ImportError:
-                        pass
+                    except Exception:
+                        sys.modules.pop('arm64_simd', None)
 
-                if arm64_simd is not None:
-                    self._arm64_simd_module = arm64_simd
-                    logger.info("[Acceleration] ARM64 NEON SIMD module loaded (40-50x speedup)")
-                else:
-                    logger.debug("[Acceleration] ARM64 NEON module not compiled")
+                    # Path 2: From core directory
+                    if arm64_simd is None:
+                        try:
+                            core_path = Path(__file__).parent.parent
+                            if str(core_path) not in sys.path:
+                                sys.path.insert(0, str(core_path))
+                            import arm64_simd as _arm64_simd
+                            arm64_simd = _arm64_simd
+                        except Exception:
+                            sys.modules.pop('arm64_simd', None)
+
+                    if arm64_simd is not None:
+                        self._arm64_simd_module = arm64_simd
+                        logger.info("[Acceleration] ARM64 NEON SIMD module loaded (40-50x speedup)")
+                    else:
+                        logger.debug("[Acceleration] ARM64 NEON module not compiled")
 
             except Exception as e:
                 logger.debug(f"[Acceleration] ARM64 SIMD load error: {e}")

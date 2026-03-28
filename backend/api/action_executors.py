@@ -13,7 +13,10 @@ import aiohttp
 from typing import Dict, Any, List, Optional, Tuple
 from datetime import datetime
 import logging
-import pyautogui
+try:
+    import pyautogui
+except ImportError:
+    pyautogui = None  # optional — native CGEvent path preferred
 from abc import ABC, abstractmethod
 from pathlib import Path
 
@@ -37,6 +40,97 @@ except ImportError:
     _HAS_GAP_BUS = False
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Native macOS input helpers (preferred over pyautogui)
+# ---------------------------------------------------------------------------
+
+def _native_hotkey(*keys: str) -> None:
+    """Send a hotkey combo via AppleScript (no pyautogui needed)."""
+    # Map common modifier names to AppleScript key names
+    _MOD_MAP = {"cmd": "command", "ctrl": "control", "alt": "option",
+                "shift": "shift", "super": "command"}
+    modifiers = [_MOD_MAP.get(k, k) for k in keys[:-1]]
+    key = keys[-1]
+    using = " & ".join(f"{m} down" for m in modifiers)
+    script = f'tell application "System Events" to keystroke "{key}" using {{{using}}}'
+    subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+
+
+def _native_typewrite(text: str) -> None:
+    """Type text via AppleScript."""
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"')
+    script = f'tell application "System Events" to keystroke "{escaped}"'
+    subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+
+
+def _native_move_rel(dx: int, dy: int) -> None:
+    """Nudge the mouse cursor (wake display)."""
+    # Use Quartz CoreGraphics if available, else skip
+    try:
+        import Quartz
+        pos = Quartz.NSEvent.mouseLocation()
+        screen_h = Quartz.CGDisplayPixelsHigh(Quartz.CGMainDisplayID())
+        # NSEvent y is flipped vs CG
+        cg_point = Quartz.CGPointMake(pos.x + dx, screen_h - pos.y + dy)
+        Quartz.CGEventPost(
+            Quartz.kCGHIDEventTap,
+            Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved,
+                                           cg_point, Quartz.kCGMouseButtonLeft),
+        )
+    except Exception:
+        pass  # wake via caffeinate is sufficient
+
+
+def _hotkey(*keys: str) -> None:
+    if pyautogui is not None:
+        pyautogui.hotkey(*keys)
+    else:
+        _native_hotkey(*keys)
+
+
+def _typewrite(text: str) -> None:
+    if pyautogui is not None:
+        pyautogui.typewrite(text)
+    else:
+        _native_typewrite(text)
+
+
+def _move_rel(dx: int, dy: int) -> None:
+    if pyautogui is not None:
+        pyautogui.moveRel(dx, dy)
+    else:
+        _native_move_rel(dx, dy)
+
+
+def _click_at(x: int, y: int) -> None:
+    if pyautogui is not None:
+        pyautogui.moveTo(x, y)
+        pyautogui.click()
+    else:
+        try:
+            import Quartz
+            point = Quartz.CGPointMake(x, y)
+            for etype in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp):
+                Quartz.CGEventPost(
+                    Quartz.kCGHIDEventTap,
+                    Quartz.CGEventCreateMouseEvent(None, etype, point,
+                                                   Quartz.kCGMouseButtonLeft),
+                )
+        except Exception:
+            pass
+
+
+def _screen_size() -> Tuple[int, int]:
+    if pyautogui is not None:
+        return pyautogui.size()
+    try:
+        import Quartz
+        mid = Quartz.CGMainDisplayID()
+        return (Quartz.CGDisplayPixelsWide(mid), Quartz.CGDisplayPixelsHigh(mid))
+    except Exception:
+        return (1920, 1080)
 
 
 class BaseActionExecutor(ABC):
@@ -101,7 +195,7 @@ class SystemUnlockExecutor(BaseActionExecutor):
             subprocess.run(['caffeinate', '-u', '-t', '1'])
             
             # Simulate mouse movement to wake
-            pyautogui.moveRel(1, 0)
+            _move_rel(1, 0)
             await asyncio.sleep(0.5)
             
             # Check if TouchID is available
@@ -913,9 +1007,9 @@ class SearchExecutor(BaseActionExecutor):
             )
             await asyncio.sleep(1)
 
-            pyautogui.hotkey('cmd', 'f')
+            _hotkey('cmd', 'f')
             await asyncio.sleep(0.5)
-            pyautogui.typewrite(query)
+            _typewrite(query)
 
             return {
                 "status": "success",
@@ -1042,8 +1136,8 @@ class ResourceCheckerExecutor(BaseActionExecutor):
         """Check notifications"""
         try:
             # Click notification center
-            pyautogui.moveTo(pyautogui.size()[0] - 10, 10)
-            pyautogui.click()
+            w, _h = _screen_size()
+            _click_at(w - 10, 10)
             
             return {
                 "status": "success",
@@ -1124,7 +1218,7 @@ class ItemCreatorExecutor(BaseActionExecutor):
             await asyncio.sleep(2)
             
             # Create new document (Cmd+N)
-            pyautogui.hotkey('cmd', 'n')
+            _hotkey('cmd', 'n')
             
             # Set document context
             doc_name = f"Document_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{file_ext}"
@@ -1147,7 +1241,7 @@ class ItemCreatorExecutor(BaseActionExecutor):
             await asyncio.sleep(1)
             
             # Create new event (Cmd+N)
-            pyautogui.hotkey('cmd', 'n')
+            _hotkey('cmd', 'n')
             
             return {
                 "status": "success",
@@ -1165,7 +1259,7 @@ class ItemCreatorExecutor(BaseActionExecutor):
             await asyncio.sleep(1)
             
             # Create new email (Cmd+N)
-            pyautogui.hotkey('cmd', 'n')
+            _hotkey('cmd', 'n')
             
             return {
                 "status": "success",
@@ -1183,7 +1277,7 @@ class ItemCreatorExecutor(BaseActionExecutor):
             await asyncio.sleep(1)
             
             # Create new note (Cmd+N)
-            pyautogui.hotkey('cmd', 'n')
+            _hotkey('cmd', 'n')
             
             return {
                 "status": "success",

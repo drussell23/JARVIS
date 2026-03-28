@@ -613,41 +613,88 @@ class CostTracker:
 
     async def _pubsub_listener_loop(self):
         """
-        Background loop to receive Pub/Sub messages.
-        
+        Background loop to receive Pub/Sub messages with auto-reconnect.
+
         This enables cross-instance communication and real-time updates.
         Messages received here are forwarded to WebSocket subscribers.
+        On any error the old pubsub object is torn down and a **fresh**
+        one is created from ``self._redis`` — reusing a broken pubsub
+        causes ``RuntimeError: readuntil() called while another coroutine
+        is already waiting`` because the underlying TCP stream is
+        corrupted after a timeout or connection drop.
         """
-        try:
-            async for message in self._redis_pubsub.listen():
-                if message["type"] == "message":
-                    channel = message["channel"]
-                    data = message["data"]
-                    
-                    try:
-                        # Parse JSON data
-                        if isinstance(data, str):
-                            parsed_data = json.loads(data)
-                        else:
-                            parsed_data = data
-                        
-                        # Forward to WebSocket subscribers
-                        await self._broadcast_to_websockets(channel, parsed_data)
-                        
-                        # Trigger local callbacks
-                        await self._notify_event(f"redis:{channel}", parsed_data)
-                        
-                    except json.JSONDecodeError:
-                        logger.debug(f"Non-JSON message on {channel}: {data}")
-                        
-        except asyncio.CancelledError:
-            logger.debug("Pub/Sub listener cancelled")
-        except Exception as e:
-            log_component_failure(
-                "cost-tracker",
-                "Pub/Sub listener error",
-                error=e,
-            )
+        backoff = 1.0
+        max_backoff = 60.0
+        _CHANNELS = (
+            REDIS_CHANNEL_COST_UPDATES,
+            REDIS_CHANNEL_VM_EVENTS,
+            REDIS_CHANNEL_ALERTS,
+            REDIS_CHANNEL_BUDGET,
+        )
+
+        while True:
+            try:
+                async for message in self._redis_pubsub.listen():
+                    backoff = 1.0
+
+                    if message["type"] == "message":
+                        channel = message["channel"]
+                        data = message["data"]
+
+                        try:
+                            if isinstance(data, str):
+                                parsed_data = json.loads(data)
+                            else:
+                                parsed_data = data
+
+                            await self._broadcast_to_websockets(channel, parsed_data)
+                            await self._notify_event(f"redis:{channel}", parsed_data)
+
+                        except json.JSONDecodeError:
+                            logger.debug(f"Non-JSON message on {channel}: {data}")
+
+                # listen() iterator exhausted (connection closed)
+
+            except asyncio.CancelledError:
+                logger.debug("Pub/Sub listener cancelled")
+                return
+
+            except Exception as e:
+                etype = type(e).__name__
+                if etype in ("TimeoutError", "ConnectionError", "RedisError",
+                             "RuntimeError") or isinstance(
+                        e, (TimeoutError, OSError, ConnectionError)):
+                    logger.debug(f"Pub/Sub transient error ({etype}), reconnecting in {backoff:.0f}s")
+                else:
+                    log_component_failure(
+                        "cost-tracker",
+                        f"Pub/Sub listener error, reconnecting in {backoff:.0f}s",
+                        error=e,
+                    )
+
+            # Tear down the old (possibly corrupted) pubsub and create fresh
+            try:
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+
+                # Best-effort close of the old pubsub
+                old_ps = self._redis_pubsub
+                try:
+                    await old_ps.unsubscribe()
+                    await old_ps.aclose()
+                except Exception:
+                    pass
+
+                # Fresh pubsub from the connection pool
+                self._redis_pubsub = self._redis.pubsub()
+                await self._redis_pubsub.subscribe(*_CHANNELS)
+                logger.debug("Redis Pub/Sub reconnected (fresh pubsub)")
+
+            except asyncio.CancelledError:
+                logger.debug("Pub/Sub listener cancelled during reconnect")
+                return
+            except Exception as e:
+                logger.debug(f"Pub/Sub reconnect failed: {e}")
 
     async def _publish_event(self, channel: str, data: Dict[str, Any]):
         """

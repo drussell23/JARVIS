@@ -117,10 +117,20 @@ class ARM64Vectorizer:
                 so_files = glob.glob(so_file.replace('*', '*'))
                 
                 if so_files:
-                    import arm64_simd
-                    self.arm64_simd = arm64_simd
-                    self.use_neon = True
-                    logger.info("✅ ARM64 NEON assembly loaded (33x speedup)")
+                    # Guard: arm64_simd compiled against numpy 1.x crashes on numpy 2.x
+                    import numpy as _np
+                    _np_major = int(getattr(_np, '__version__', '1').split('.')[0])
+                    if _np_major >= 2:
+                        logger.debug(
+                            "[v148.0] ARM64 NEON extension skipped — compiled for "
+                            f"NumPy 1.x, found NumPy {_np.__version__}. "
+                            "Rebuild with: python3 backend/core/setup_arm64.py"
+                        )
+                    else:
+                        import arm64_simd
+                        self.arm64_simd = arm64_simd
+                        self.use_neon = True
+                        logger.info("ARM64 NEON assembly loaded (33x speedup)")
                 else:
                     # Not built yet - this is fine, just log at DEBUG level
                     logger.debug(
@@ -128,14 +138,9 @@ class ARM64Vectorizer:
                         "To enable 33x speedup, run: "
                         "cd backend/core && python setup_arm64.py build_ext --inplace"
                     )
-            except ImportError:
-                # Extension exists but can't be loaded - log at DEBUG since it's optional
-                logger.debug(
-                    "[v148.0] ARM64 NEON extension not available. "
-                    "Using numpy fallback (still performant)."
-                )
             except Exception as e:
-                # Unexpected error - log but continue
+                # Extension exists but can't be loaded - log at DEBUG since it's optional
+                sys.modules.pop('arm64_simd', None)
                 logger.debug(f"[v148.0] ARM64 NEON init error (using fallback): {e}")
         else:
             # Not on ARM64 - no point trying to load ARM64 extension
