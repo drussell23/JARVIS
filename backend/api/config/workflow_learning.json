@@ -1,0 +1,21 @@
+{
+  "patterns": {
+    "open_app_unknown": {
+      "success": 1,
+      "failure": 0,
+      "avg_duration": 8.362484
+    }
+  },
+  "preferences": {},
+  "success_rates": {
+    "open_app": {
+      "success": 1,
+      "total": 1
+    },
+    "unknown": {
+      "success": 1,
+      "total": 1
+    }
+  },
+  "last_updated": "2026-03-28T10:17:31.515966"
+}
