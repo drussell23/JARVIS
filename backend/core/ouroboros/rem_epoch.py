@@ -126,6 +126,7 @@ class RemEpoch:
         doubleword: Any,
         config: DaemonConfig,
         hypothesis_cache_dir: Any = None,
+        architect: Any = None,
     ) -> None:
         self._epoch_id = epoch_id
         self._oracle = oracle
@@ -135,6 +136,7 @@ class RemEpoch:
         self._doubleword = doubleword
         self._config = config
         self._hypothesis_cache_dir = hypothesis_cache_dir
+        self._architect = architect
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -205,10 +207,27 @@ class RemEpoch:
             top_findings = findings[: self._config.rem_max_findings_per_epoch]
             envelopes = findings_to_envelopes(top_findings, epoch_id=self._epoch_id)
 
-            for envelope in envelopes:
+            for finding, envelope in zip(top_findings, envelopes):
                 if token.is_cancelled:
                     result.cancelled = True
                     return result
+
+                # Architect routing: intercept roadmap findings that signal
+                # missing capabilities or manifesto violations before they
+                # enter the normal envelope path.  In v1 the architect logs
+                # and returns None (model bridge pending); when the bridge is
+                # built it will produce plans that feed into SagaOrchestrator.
+                if (
+                    self._architect is not None
+                    and hasattr(finding, "source_check")
+                    and finding.source_check.startswith("roadmap:")
+                    and finding.category in ("missing_capability", "manifesto_violation")
+                    and self._architect.should_design(finding)
+                ):
+                    logger.info(
+                        "[RemEpoch] Routing to architect: %s", finding.description
+                    )
+                    continue  # skip normal envelope path — architect handles this
 
                 ingest_result = await self._intake_router.ingest(envelope)
 
