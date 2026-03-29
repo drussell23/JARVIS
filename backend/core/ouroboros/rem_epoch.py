@@ -127,6 +127,7 @@ class RemEpoch:
         config: DaemonConfig,
         hypothesis_cache_dir: Any = None,
         architect: Any = None,
+        saga_orchestrator: Any = None,
     ) -> None:
         self._epoch_id = epoch_id
         self._oracle = oracle
@@ -137,6 +138,7 @@ class RemEpoch:
         self._config = config
         self._hypothesis_cache_dir = hypothesis_cache_dir
         self._architect = architect
+        self._saga_orchestrator = saga_orchestrator
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -214,9 +216,8 @@ class RemEpoch:
 
                 # Architect routing: intercept roadmap findings that signal
                 # missing capabilities or manifesto violations before they
-                # enter the normal envelope path.  In v1 the architect logs
-                # and returns None (model bridge pending); when the bridge is
-                # built it will produce plans that feed into SagaOrchestrator.
+                # enter the normal envelope path.  The architect designs a
+                # plan and the SagaOrchestrator executes it end-to-end.
                 if (
                     self._architect is not None
                     and hasattr(finding, "source_check")
@@ -227,7 +228,30 @@ class RemEpoch:
                     logger.info(
                         "[RemEpoch] Routing to architect: %s", finding.description
                     )
-                    continue  # skip normal envelope path — architect handles this
+                    try:
+                        plan = await self._architect.design(finding, None, self._oracle)
+                        if plan is not None and self._saga_orchestrator is not None:
+                            from backend.core.ouroboros.architect.plan_validator import PlanValidator
+
+                            validation = PlanValidator(max_steps=10).validate(plan)
+                            if validation.passed:
+                                self._saga_orchestrator._plan_store.store(plan)
+                                saga = self._saga_orchestrator.create_saga(plan)
+                                await self._saga_orchestrator.execute(saga.saga_id)
+                                logger.info(
+                                    "[RemEpoch] Saga %s executed for: %s",
+                                    saga.saga_id,
+                                    finding.description,
+                                )
+                            else:
+                                logger.warning(
+                                    "[RemEpoch] Plan validation failed: %s",
+                                    validation.reasons,
+                                )
+                    except Exception as exc:
+                        logger.warning("[RemEpoch] Architect pipeline failed: %s", exc)
+
+                    continue  # skip normal envelope path
 
                 ingest_result = await self._intake_router.ingest(envelope)
 

@@ -99,6 +99,7 @@ class RemSleepDaemon:
         hypothesis_cache_dir: Any = None,
         architect: Any = None,
         narrator: Any = None,
+        saga_orchestrator: Any = None,
     ) -> None:
         self._oracle = oracle
         self._fleet = fleet
@@ -110,6 +111,7 @@ class RemSleepDaemon:
         self._hypothesis_cache_dir = hypothesis_cache_dir
         self._architect = architect
         self._narrator = narrator
+        self._saga_orchestrator = saga_orchestrator
 
         # State machine
         self._state: RemState = RemState.IDLE_WATCH
@@ -256,6 +258,7 @@ class RemSleepDaemon:
             config=self._config,
             hypothesis_cache_dir=self._hypothesis_cache_dir,
             architect=self._architect,
+            saga_orchestrator=self._saga_orchestrator,
         )
 
         try:

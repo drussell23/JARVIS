@@ -43,6 +43,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Optional
 
 _HYPOTHESIS_CACHE_DIR: str = os.path.expanduser("~/.jarvis/ouroboros/roadmap")
@@ -151,6 +152,9 @@ class OuroborosDaemon:
         self._spinal_status: Optional[SpinalStatus] = None
         self._rem: Optional[RemSleepDaemon] = None
         self._narrator: Optional[Any] = None
+        self._roadmap_sensor: Optional[Any] = None
+        self._synthesis_engine: Optional[Any] = None
+        self._saga_orchestrator: Optional[Any] = None
         self._awakened: bool = False
 
         # Cached report — set on first successful awaken()
@@ -416,6 +420,84 @@ class OuroborosDaemon:
                 except Exception as exc:
                     logger.warning("[OuroborosDaemon] DaemonNarrator init failed: %s", exc)
 
+            # ---- RoadmapSensor (Clock 1) + FeatureSynthesisEngine (Clock 2) ----
+            if self._config.roadmap_enabled:
+                try:
+                    from backend.core.ouroboros.roadmap.sensor import (
+                        RoadmapSensor,
+                        RoadmapSensorConfig,
+                    )
+                    from backend.core.ouroboros.roadmap.synthesis_engine import (
+                        FeatureSynthesisEngine,
+                        SynthesisConfig,
+                    )
+                    from backend.core.ouroboros.roadmap.hypothesis_cache import HypothesisCache
+
+                    sensor_config = RoadmapSensorConfig(
+                        p1_enabled=self._config.roadmap_p1_enabled,
+                        p1_commit_limit=self._config.roadmap_p1_commit_limit,
+                        p1_days=self._config.roadmap_p1_days,
+                        p2_enabled=self._config.roadmap_p2_enabled,
+                        p3_enabled=self._config.roadmap_p3_enabled,
+                        refresh_interval_s=self._config.roadmap_refresh_s,
+                    )
+
+                    cache = HypothesisCache(cache_dir=Path(_HYPOTHESIS_CACHE_DIR))
+
+                    synthesis_config = SynthesisConfig(
+                        min_interval_s=self._config.synthesis_min_interval_s,
+                        ttl_s=self._config.synthesis_ttl_s,
+                        prompt_version=self._config.synthesis_prompt_version,
+                    )
+
+                    self._synthesis_engine = FeatureSynthesisEngine(
+                        oracle=self._oracle,
+                        doubleword=self._doubleword,
+                        cache=cache,
+                        config=synthesis_config,
+                        narrator=self._narrator,
+                    )
+
+                    self._roadmap_sensor = RoadmapSensor(
+                        repo_root=Path("."),
+                        config=sensor_config,
+                        on_snapshot_changed=lambda snapshot: asyncio.ensure_future(
+                            self._synthesis_engine.trigger(snapshot)
+                        ),
+                    )
+
+                    # Initial snapshot refresh
+                    self._roadmap_sensor.refresh()
+                    logger.info("[OuroborosDaemon] RoadmapSensor + SynthesisEngine wired")
+
+                except Exception as exc:
+                    logger.warning("[OuroborosDaemon] Roadmap/Synthesis init failed: %s", exc)
+
+            # ---- SagaOrchestrator ----
+            if self._config.architect_enabled:
+                try:
+                    from backend.core.ouroboros.architect.saga_orchestrator import SagaOrchestrator
+                    from backend.core.ouroboros.architect.plan_store import PlanStore
+                    from backend.core.ouroboros.architect.acceptance_runner import AcceptanceRunner
+
+                    plan_store = PlanStore(
+                        store_dir=Path(os.path.expanduser("~/.jarvis/ouroboros/plans"))
+                    )
+                    acceptance_runner = AcceptanceRunner()
+
+                    self._saga_orchestrator = SagaOrchestrator(
+                        plan_store=plan_store,
+                        intake_router=self._intake_router,
+                        acceptance_runner=acceptance_runner,
+                        saga_dir=Path(os.path.expanduser("~/.jarvis/ouroboros/sagas")),
+                        spinal_cord=self._spinal,
+                        narrator=self._narrator,
+                    )
+                    logger.info("[OuroborosDaemon] SagaOrchestrator wired")
+
+                except Exception as exc:
+                    logger.warning("[OuroborosDaemon] SagaOrchestrator init failed: %s", exc)
+
             self._rem = RemSleepDaemon(
                 oracle=self._oracle,
                 fleet=self._fleet,
@@ -427,6 +509,7 @@ class OuroborosDaemon:
                 hypothesis_cache_dir=_HYPOTHESIS_CACHE_DIR,
                 architect=architect,
                 narrator=self._narrator,
+                saga_orchestrator=self._saga_orchestrator,
             )
             await self._rem.start()
             logger.info("OuroborosDaemon Phase 3 complete: RemSleepDaemon started")
