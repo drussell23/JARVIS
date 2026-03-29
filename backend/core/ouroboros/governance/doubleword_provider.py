@@ -466,6 +466,154 @@ class DoublewordProvider:
             return ("", None)
 
     # ------------------------------------------------------------------
+    # Governance-free inference: prompt_only()
+    # ------------------------------------------------------------------
+
+    async def prompt_only(
+        self,
+        prompt: str,
+        model: Optional[str] = None,
+        caller_id: str = "ouroboros_cognition",
+        response_format: Optional[Dict] = None,
+        max_tokens: Optional[int] = None,
+    ) -> str:
+        """Direct inference via Doubleword batch API without OperationContext.
+
+        Intended for cognition layers (Synthesis Engine, Architecture Agent)
+        that need 397B inference without governance pipeline overhead.
+
+        Runs the full 4-stage batch cycle synchronously (upload → create →
+        poll → retrieve) and returns the raw text response.
+
+        Parameters
+        ----------
+        prompt:
+            User prompt text. A default system message is applied.
+        model:
+            Override the model slug. Defaults to self._model.
+        caller_id:
+            Identifier embedded in the JSONL custom_id for traceability.
+        response_format:
+            Optional response_format dict (e.g. ``{"type": "json_object"}``)
+            passed directly to the chat completions body.
+        max_tokens:
+            Token cap. Defaults to self._max_tokens.
+
+        Returns
+        -------
+        str
+            The assistant message content from choices[0].message.content.
+            Returns an empty string on failure (caller handles fallback).
+
+        Raises
+        ------
+        ValueError
+            If DOUBLEWORD_API_KEY is not configured.
+        """
+        if not self._api_key:
+            raise ValueError(
+                "DOUBLEWORD_API_KEY is not set — cannot call prompt_only()"
+            )
+
+        await self._get_session()
+
+        effective_model = model or self._model
+        effective_max_tokens = max_tokens if max_tokens is not None else self._max_tokens
+        custom_id = f"prompt_only_{caller_id}"
+
+        body: Dict[str, Any] = {
+            "model": effective_model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior AI reasoning engine for the JARVIS Trinity "
+                        "ecosystem. Think step by step and return well-structured output."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            "max_tokens": effective_max_tokens,
+            "temperature": _DW_TEMPERATURE,
+        }
+        if response_format is not None:
+            body["response_format"] = response_format
+
+        jsonl_line = json.dumps({
+            "custom_id": custom_id,
+            "method": "POST",
+            "url": "/v1/chat/completions",
+            "body": body,
+        })
+
+        t0 = time.monotonic()
+
+        try:
+            file_id = await self._upload_file(jsonl_line)
+            if not file_id:
+                logger.warning("[DoublewordProvider] prompt_only: file upload failed (caller=%s)", caller_id)
+                return ""
+
+            batch_id = await self._create_batch(file_id)
+            if not batch_id:
+                logger.warning("[DoublewordProvider] prompt_only: batch creation failed (caller=%s)", caller_id)
+                return ""
+
+            logger.info(
+                "[DoublewordProvider] prompt_only batch %s submitted (model=%s, caller=%s)",
+                batch_id, effective_model, caller_id,
+            )
+
+            output_file_id = await self._poll_batch(batch_id)
+            if not output_file_id:
+                self._stats.failed_batches += 1
+                logger.warning(
+                    "[DoublewordProvider] prompt_only: batch %s failed or timed out (caller=%s)",
+                    batch_id, caller_id,
+                )
+                return ""
+
+            content, usage = await self._retrieve_result(output_file_id, custom_id)
+
+            elapsed = time.monotonic() - t0
+            self._stats.total_batches += 1
+            self._stats.total_latency_s += elapsed
+
+            if usage:
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                self._stats.total_input_tokens += input_tokens
+                self._stats.total_output_tokens += output_tokens
+                cost = (
+                    input_tokens * _DW_INPUT_COST_PER_M / 1_000_000
+                    + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
+                )
+                self._stats.total_cost_usd += cost
+
+            if not content:
+                self._stats.empty_content_retries += 1
+                logger.warning(
+                    "[DoublewordProvider] prompt_only: empty content returned (caller=%s, batch=%s)",
+                    caller_id, batch_id,
+                )
+                return ""
+
+            logger.info(
+                "[DoublewordProvider] prompt_only complete: %.1fs, %d chars (caller=%s)",
+                elapsed, len(content), caller_id,
+            )
+            return content
+
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self._stats.failed_batches += 1
+            logger.exception(
+                "[DoublewordProvider] prompt_only unexpected error (caller=%s)", caller_id
+            )
+            return ""
+
+    # ------------------------------------------------------------------
     # Utility
     # ------------------------------------------------------------------
 
