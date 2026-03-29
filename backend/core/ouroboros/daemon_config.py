@@ -90,6 +90,17 @@ class DaemonConfig:
     rem_idle_eligible_s         → OUROBOROS_REM_IDLE_ELIGIBLE_S
     exploration_model_enabled   → OUROBOROS_EXPLORATION_MODEL_ENABLED
     exploration_model_rpm       → OUROBOROS_EXPLORATION_MODEL_RPM
+    roadmap_enabled             → OUROBOROS_ROADMAP_ENABLED
+    roadmap_refresh_s           → OUROBOROS_ROADMAP_REFRESH_S
+    roadmap_p1_enabled          → OUROBOROS_ROADMAP_P1_ENABLED
+    roadmap_p1_commit_limit     → OUROBOROS_ROADMAP_P1_COMMIT_LIMIT
+    roadmap_p1_days             → OUROBOROS_ROADMAP_P1_DAYS
+    roadmap_p2_enabled          → OUROBOROS_ROADMAP_P2_ENABLED
+    roadmap_p3_enabled          → OUROBOROS_ROADMAP_P3_ENABLED
+    synthesis_enabled           → OUROBOROS_SYNTHESIS_ENABLED
+    synthesis_min_interval_s    → OUROBOROS_SYNTHESIS_MIN_INTERVAL_S
+    synthesis_ttl_s             → OUROBOROS_SYNTHESIS_TTL_S
+    synthesis_prompt_version    → OUROBOROS_SYNTHESIS_PROMPT_VERSION
     """
 
     # General daemon
@@ -109,6 +120,21 @@ class DaemonConfig:
     # Exploration model (optional external LLM)
     exploration_model_enabled: bool = False
     exploration_model_rpm: int = 10
+
+    # Roadmap sensor (Clock 1)
+    roadmap_enabled: bool = True
+    roadmap_refresh_s: float = 3600.0
+    roadmap_p1_enabled: bool = True
+    roadmap_p1_commit_limit: int = 50
+    roadmap_p1_days: int = 30
+    roadmap_p2_enabled: bool = False
+    roadmap_p3_enabled: bool = False
+
+    # Feature synthesis (Clock 2)
+    synthesis_enabled: bool = True
+    synthesis_min_interval_s: float = 21600.0
+    synthesis_ttl_s: float = 86400.0
+    synthesis_prompt_version: int = 1
 
     # ------------------------------------------------------------------
     # Factory
@@ -135,4 +161,19 @@ class DaemonConfig:
                 "OUROBOROS_EXPLORATION_MODEL_ENABLED", False
             ),
             exploration_model_rpm=_env_int("OUROBOROS_EXPLORATION_MODEL_RPM", 10),
+            roadmap_enabled=_env_bool("OUROBOROS_ROADMAP_ENABLED", True),
+            roadmap_refresh_s=_env_float("OUROBOROS_ROADMAP_REFRESH_S", 3600.0),
+            roadmap_p1_enabled=_env_bool("OUROBOROS_ROADMAP_P1_ENABLED", True),
+            roadmap_p1_commit_limit=_env_int("OUROBOROS_ROADMAP_P1_COMMIT_LIMIT", 50),
+            roadmap_p1_days=_env_int("OUROBOROS_ROADMAP_P1_DAYS", 30),
+            roadmap_p2_enabled=_env_bool("OUROBOROS_ROADMAP_P2_ENABLED", False),
+            roadmap_p3_enabled=_env_bool("OUROBOROS_ROADMAP_P3_ENABLED", False),
+            synthesis_enabled=_env_bool("OUROBOROS_SYNTHESIS_ENABLED", True),
+            synthesis_min_interval_s=_env_float(
+                "OUROBOROS_SYNTHESIS_MIN_INTERVAL_S", 21600.0
+            ),
+            synthesis_ttl_s=_env_float("OUROBOROS_SYNTHESIS_TTL_S", 86400.0),
+            synthesis_prompt_version=_env_int(
+                "OUROBOROS_SYNTHESIS_PROMPT_VERSION", 1
+            ),
         )

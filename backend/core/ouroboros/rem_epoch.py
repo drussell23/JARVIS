@@ -125,6 +125,7 @@ class RemEpoch:
         intake_router: Any,
         doubleword: Any,
         config: DaemonConfig,
+        hypothesis_cache_dir: Any = None,
     ) -> None:
         self._epoch_id = epoch_id
         self._oracle = oracle
@@ -133,6 +134,7 @@ class RemEpoch:
         self._intake_router = intake_router
         self._doubleword = doubleword
         self._config = config
+        self._hypothesis_cache_dir = hypothesis_cache_dir
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -281,7 +283,8 @@ class RemEpoch:
         for task in pending:
             task.cancel()
 
-        all_findings = oracle_findings + fleet_findings
+        hypothesis_findings = self._load_cached_hypotheses()
+        all_findings = oracle_findings + fleet_findings + hypothesis_findings
         return merge_and_rank(all_findings)
 
     async def _run_oracle_checks(self, token: CancellationToken) -> List[RankedFinding]:
@@ -427,3 +430,37 @@ class RemEpoch:
                     finding.file_path,
                     exc,
                 )
+
+    def _load_cached_hypotheses(self) -> List[RankedFinding]:
+        """Load cached FeatureHypotheses and convert to RankedFinding for ranking."""
+        if self._hypothesis_cache_dir is None:
+            return []
+        try:
+            from backend.core.ouroboros.roadmap.hypothesis_cache import HypothesisCache
+            cache = HypothesisCache(cache_dir=self._hypothesis_cache_dir)
+            hypotheses = cache.load()
+            findings = []
+            _BLAST_RADIUS = {
+                "missing_capability": 0.5,
+                "incomplete_wiring": 0.3,
+                "stale_implementation": 0.2,
+                "manifesto_violation": 0.7,
+            }
+            for h in hypotheses:
+                if getattr(h, "status", "active") != "active":
+                    continue
+                findings.append(RankedFinding(
+                    description=h.description,
+                    category=h.gap_type,
+                    file_path=h.suggested_scope,
+                    blast_radius=_BLAST_RADIUS.get(h.gap_type, 0.3),
+                    confidence=h.confidence,
+                    urgency=h.urgency,
+                    last_modified=h.synthesized_at,
+                    repo=h.suggested_repos[0] if h.suggested_repos else "jarvis",
+                    source_check=f"roadmap:{h.provenance}",
+                ))
+            return findings
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[RemEpoch] Hypothesis load failed: %s", exc)
+            return []

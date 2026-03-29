@@ -41,8 +41,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+
+_HYPOTHESIS_CACHE_DIR: str = os.path.expanduser("~/.jarvis/ouroboros/roadmap")
 
 from backend.core.ouroboros.daemon_config import DaemonConfig
 from backend.core.ouroboros.rem_sleep import RemSleepDaemon
@@ -381,6 +384,7 @@ class OuroborosDaemon:
                 proactive_drive=self._proactive_drive,
                 doubleword=self._doubleword,
                 config=self._config,
+                hypothesis_cache_dir=_HYPOTHESIS_CACHE_DIR,
             )
             await self._rem.start()
             logger.info("OuroborosDaemon Phase 3 complete: RemSleepDaemon started")

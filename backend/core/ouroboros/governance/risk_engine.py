@@ -238,7 +238,7 @@ class RiskEngine:
             and policy version.
         """
         # Exploration-source stricter rules — evaluated before all other rules
-        if profile.source == "exploration":
+        if profile.source in ("exploration", "roadmap"):
             file_strs = [str(f) for f in profile.files_affected]
 
             # Rule E1: Cannot modify the kernel
