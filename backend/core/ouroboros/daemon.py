@@ -150,6 +150,7 @@ class OuroborosDaemon:
         self._spinal: Optional[SpinalCord] = None
         self._spinal_status: Optional[SpinalStatus] = None
         self._rem: Optional[RemSleepDaemon] = None
+        self._narrator: Optional[Any] = None
         self._awakened: bool = False
 
         # Cached report — set on first successful awaken()
@@ -394,6 +395,27 @@ class OuroborosDaemon:
                         "[OuroborosDaemon] Architect init failed: %s", exc
                     )
 
+            # DaemonNarrator (voice transparency)
+            self._narrator = None
+            if self._config.narrator_enabled:
+                try:
+                    from backend.core.ouroboros.daemon_narrator import DaemonNarrator
+                    # Import safe_say — may fail if voice orchestrator not initialized
+                    try:
+                        from backend.core.supervisor.unified_voice_orchestrator import safe_say
+                        say_fn = safe_say
+                    except ImportError:
+                        say_fn = None
+
+                    if say_fn is not None:
+                        self._narrator = DaemonNarrator(
+                            say_fn=say_fn,
+                            rate_limit_s=self._config.narrator_rate_limit_s,
+                        )
+                        logger.info("[OuroborosDaemon] DaemonNarrator enabled")
+                except Exception as exc:
+                    logger.warning("[OuroborosDaemon] DaemonNarrator init failed: %s", exc)
+
             self._rem = RemSleepDaemon(
                 oracle=self._oracle,
                 fleet=self._fleet,
@@ -404,6 +426,7 @@ class OuroborosDaemon:
                 config=self._config,
                 hypothesis_cache_dir=_HYPOTHESIS_CACHE_DIR,
                 architect=architect,
+                narrator=self._narrator,
             )
             await self._rem.start()
             logger.info("OuroborosDaemon Phase 3 complete: RemSleepDaemon started")
