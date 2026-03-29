@@ -9,6 +9,7 @@ from backend.core.tui.pipeline_panel import PipelineData
 from backend.core.tui.agents_panel import AgentsData
 from backend.core.tui.system_panel import SystemData
 from backend.core.tui.faults_panel import FaultsData
+from backend.core.tui.ouroboros_panel import OuroborosData
 
 
 @dataclass
@@ -71,18 +72,21 @@ class TelemetryBusConsumer:
         system: SystemData,
         faults: FaultsData,
         status: StatusBarData,
+        ouroboros: OuroborosData | None = None,
     ) -> None:
         self._pipeline = pipeline
         self._agents = agents
         self._system = system
         self._faults = faults
         self._status = status
+        self._ouroboros = ouroboros
         self._routing: Dict[str, List[Any]] = {
             "reasoning": [self._pipeline, self._system],
             "lifecycle": [self._system],
             "scheduler": [self._agents],
             "fault": [self._faults],
             "recovery": [self._faults],
+            "ouroboros": [self._ouroboros] if self._ouroboros else [],
         }
 
     def handle_sync(self, envelope: TelemetryEnvelope) -> None:

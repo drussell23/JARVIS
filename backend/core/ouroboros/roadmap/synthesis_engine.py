@@ -265,6 +265,21 @@ class FeatureSynthesisEngine:
         if self._narrator is not None:
             await self._narrator.on_event("synthesis.complete", {"hypothesis_count": len(merged)})
 
+        # Emit to TelemetryBus for TUI panel (best-effort)
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            bus.emit(TelemetryEnvelope.create(
+                event_schema="ouroboros.synthesis.complete@1.0.0",
+                source="synthesis_engine",
+                trace_id=f"synthesis-{fingerprint[:12]}",
+                span_id=f"synthesis-complete-{fingerprint[:12]}",
+                partition_key="ouroboros",
+                payload={"hypothesis_count": len(merged)},
+            ))
+        except Exception:
+            pass  # TUI telemetry is best-effort
+
         return merged
 
     async def _run_doubleword(

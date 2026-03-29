@@ -246,6 +246,21 @@ class RemSleepDaemon:
         if self._narrator is not None:
             await self._narrator.on_event("rem.epoch_start", {"epoch_id": epoch_id})
 
+        # Emit to TelemetryBus for TUI panel (best-effort, never blocks epoch)
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            bus.emit(TelemetryEnvelope.create(
+                event_schema="ouroboros.rem.epoch_start@1.0.0",
+                source="rem_sleep_daemon",
+                trace_id=f"rem-epoch-{epoch_id}",
+                span_id=f"epoch-start-{epoch_id}",
+                partition_key="ouroboros",
+                payload={"epoch_id": epoch_id},
+            ))
+        except Exception:
+            pass  # TUI telemetry is best-effort
+
         self._transition(RemState.EXPLORING)
 
         epoch = RemEpoch(
@@ -285,6 +300,26 @@ class RemSleepDaemon:
                 "findings_count": result.findings_count,
                 "envelopes_submitted": result.envelopes_submitted,
             })
+
+        # Emit to TelemetryBus for TUI panel (best-effort)
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            bus.emit(TelemetryEnvelope.create(
+                event_schema="ouroboros.rem.epoch_complete@1.0.0",
+                source="rem_sleep_daemon",
+                trace_id=f"rem-epoch-{epoch_id}",
+                span_id=f"epoch-complete-{epoch_id}",
+                partition_key="ouroboros",
+                payload={
+                    "epoch_id": epoch_id,
+                    "findings_count": result.findings_count,
+                    "envelopes_submitted": result.envelopes_submitted,
+                    "duration_s": result.duration_s,
+                },
+            ))
+        except Exception:
+            pass  # TUI telemetry is best-effort
 
         self._current_token = None
 
@@ -327,6 +362,22 @@ class RemSleepDaemon:
             while True:
                 # Wait for the system to become idle
                 self._transition(RemState.IDLE_WATCH)
+
+                # Emit idle_watch to TelemetryBus for TUI panel (best-effort)
+                try:
+                    from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+                    bus = get_telemetry_bus()
+                    bus.emit(TelemetryEnvelope.create(
+                        event_schema="ouroboros.rem.idle_watch@1.0.0",
+                        source="rem_sleep_daemon",
+                        trace_id="rem-daemon",
+                        span_id="idle-watch",
+                        partition_key="ouroboros",
+                        payload={},
+                    ))
+                except Exception:
+                    pass
+
                 logger.debug("RemSleepDaemon: waiting for idle signal…")
                 await idle_event.wait()
                 idle_event.clear()

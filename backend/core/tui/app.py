@@ -21,6 +21,7 @@ from backend.core.tui.pipeline_panel import PipelineData
 from backend.core.tui.agents_panel import AgentsData
 from backend.core.tui.system_panel import SystemData
 from backend.core.tui.faults_panel import FaultsData
+from backend.core.tui.ouroboros_panel import OuroborosData, format_ouroboros_display
 from backend.core.tui.bus_consumer import TelemetryBusConsumer, StatusBarData
 
 logger = logging.getLogger(__name__)
@@ -105,15 +106,18 @@ class JarvisDashboard(App):
         self.agents_data = AgentsData()
         self.system_data = SystemData()
         self.faults_data = FaultsData()
+        self.ouroboros_data = OuroborosData()
         self.status_data = StatusBarData()
         self.consumer = TelemetryBusConsumer(
             self.pipeline_data, self.agents_data,
             self.system_data, self.faults_data, self.status_data,
+            ouroboros=self.ouroboros_data,
         )
         self._pipeline_log: Optional[RichLog] = None
         self._agents_log: Optional[RichLog] = None
         self._system_log: Optional[RichLog] = None
         self._faults_log: Optional[RichLog] = None
+        self._ouroboros_log: Optional[RichLog] = None
         self._status_bar: Optional[StatusBar] = None
         self._last_pipeline_count = 0
         self._last_system_count = 0
@@ -129,6 +133,8 @@ class JarvisDashboard(App):
                 yield RichLog(id="system-log", highlight=True, markup=True)
             with TabPane("Faults", id="faults"):
                 yield RichLog(id="faults-log", highlight=True, markup=True)
+            with TabPane("Ouroboros", id="ouroboros"):
+                yield RichLog(id="ouroboros-log", highlight=True, markup=True, wrap=True, min_width=50)
         yield StatusBar(self.status_data, id="status-bar")
 
     def on_mount(self) -> None:
@@ -136,6 +142,7 @@ class JarvisDashboard(App):
         self._agents_log = self.query_one("#agents-log", RichLog)
         self._system_log = self.query_one("#system-log", RichLog)
         self._faults_log = self.query_one("#faults-log", RichLog)
+        self._ouroboros_log = self.query_one("#ouroboros-log", RichLog)
         self._status_bar = self.query_one("#status-bar", StatusBar)
         self.set_interval(1.0, self._refresh_panels)
 
@@ -144,6 +151,7 @@ class JarvisDashboard(App):
         self._refresh_agents()
         self._refresh_system()
         self._refresh_faults()
+        self._refresh_ouroboros()
         if self._status_bar:
             self._status_bar.refresh_display()
 
@@ -245,6 +253,13 @@ class JarvisDashboard(App):
         for f in list(self.faults_data.resolved_faults)[-10:]:
             ts = datetime.fromtimestamp(f.timestamp).strftime("%H:%M:%S")
             log.write(f"  [dim]{ts}[/]  {f.component}  {f.fault_class}  {f.resolution}  ({f.duration_ms:.0f}ms)")
+
+    def _refresh_ouroboros(self) -> None:
+        if not self._ouroboros_log:
+            return
+        content = format_ouroboros_display(self.ouroboros_data)
+        self._ouroboros_log.clear()
+        self._ouroboros_log.write(content)
 
 
 def start_dashboard() -> Optional[threading.Thread]:

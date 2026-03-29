@@ -182,6 +182,26 @@ class SagaOrchestrator:
         if self._narrator:
             await self._narrator.on_event("saga.started", {"saga_id": saga_id, "plan_id": saga.plan_id})
 
+        # Emit to TelemetryBus for TUI panel (best-effort)
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            bus.emit(TelemetryEnvelope.create(
+                event_schema="ouroboros.saga.started@1.0.0",
+                source="saga_orchestrator",
+                trace_id=f"saga-{saga_id}",
+                span_id=f"saga-start-{saga_id}",
+                partition_key="ouroboros",
+                payload={
+                    "saga_id": saga_id,
+                    "plan_id": saga.plan_id,
+                    "title": saga.plan_id,
+                    "step_count": len(envelopes),
+                },
+            ))
+        except Exception:
+            pass  # TUI telemetry is best-effort
+
         # Decompose plan into ordered envelopes.
         envelopes = PlanDecomposer.decompose(plan, saga_id)
 
@@ -261,6 +281,22 @@ class SagaOrchestrator:
             await self._spinal_cord.stream_up("saga.complete", {"saga_id": saga_id, "plan_id": saga.plan_id})
         if self._narrator:
             await self._narrator.on_event("saga.complete", {"saga_id": saga_id, "plan_id": saga.plan_id})
+
+        # Emit to TelemetryBus for TUI panel (best-effort)
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            bus.emit(TelemetryEnvelope.create(
+                event_schema="ouroboros.saga.complete@1.0.0",
+                source="saga_orchestrator",
+                trace_id=f"saga-{saga_id}",
+                span_id=f"saga-complete-{saga_id}",
+                partition_key="ouroboros",
+                payload={"saga_id": saga_id, "plan_id": saga.plan_id},
+            ))
+        except Exception:
+            pass  # TUI telemetry is best-effort
+
         return saga
 
     def get_saga(self, saga_id: str) -> Optional[SagaRecord]:
@@ -339,6 +375,22 @@ class SagaOrchestrator:
             await self._spinal_cord.stream_up("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
         if self._narrator:
             await self._narrator.on_event("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
+
+        # Emit to TelemetryBus for TUI panel (best-effort)
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            bus.emit(TelemetryEnvelope.create(
+                event_schema="ouroboros.saga.aborted@1.0.0",
+                source="saga_orchestrator",
+                trace_id=f"saga-{saga.saga_id}",
+                span_id=f"saga-abort-{saga.saga_id}",
+                partition_key="ouroboros",
+                payload={"saga_id": saga.saga_id, "reason": reason},
+            ))
+        except Exception:
+            pass  # TUI telemetry is best-effort
+
         return result
 
     async def _abort_remaining_async(
@@ -350,6 +402,22 @@ class SagaOrchestrator:
             await self._spinal_cord.stream_up("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
         if self._narrator:
             await self._narrator.on_event("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
+
+        # Emit to TelemetryBus for TUI panel (best-effort)
+        try:
+            from backend.core.telemetry_contract import get_telemetry_bus, TelemetryEnvelope
+            bus = get_telemetry_bus()
+            bus.emit(TelemetryEnvelope.create(
+                event_schema="ouroboros.saga.aborted@1.0.0",
+                source="saga_orchestrator",
+                trace_id=f"saga-{saga.saga_id}",
+                span_id=f"saga-abort-remaining-{saga.saga_id}",
+                partition_key="ouroboros",
+                payload={"saga_id": saga.saga_id, "reason": reason},
+            ))
+        except Exception:
+            pass  # TUI telemetry is best-effort
+
         return result
 
     def _abort_remaining(
