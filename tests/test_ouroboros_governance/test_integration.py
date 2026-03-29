@@ -148,7 +148,7 @@ class TestGovernanceConfig:
 
         args = self._make_args()
         config = GovernanceConfig.from_env_and_args(args)
-        assert config.policy_version == "v0.1.0"
+        assert config.policy_version == "v0.2.0"
 
     def test_hashes_are_sha256(self):
         from backend.core.ouroboros.governance.integration import GovernanceConfig
@@ -248,7 +248,7 @@ def _make_mock_stack_components():
         "event_bridge": None,
         "blast_adapter": None,
         "learning_bridge": None,
-        "policy_version": "v0.1.0",
+        "policy_version": "v0.2.0",
         "capabilities": {},
     }
 
@@ -387,7 +387,7 @@ class TestGovernanceStack:
             return_value=RiskClassification(
                 tier=RiskTier.SAFE_AUTO,
                 reason_code="safe_single_file",
-                policy_version="v0.1.0",
+                policy_version="v0.2.0",
             )
         )
 
@@ -439,7 +439,7 @@ class TestCreateGovernanceStack:
         config = self._make_config(tmp_path)
         stack = await create_governance_stack(config)
         assert isinstance(stack, GovernanceStack)
-        assert stack.policy_version == "v0.1.0"
+        assert stack.policy_version == "v0.2.0"
 
     @pytest.mark.asyncio
     async def test_optional_bridges_missing(self, tmp_path):
@@ -712,7 +712,7 @@ class TestEndToEnd:
         health = stack.health()
         assert "mode" in health
         assert "policy_version" in health
-        assert health["policy_version"] == "v0.1.0"
+        assert health["policy_version"] == "v0.2.0"
 
         # Stop
         await stack.stop()

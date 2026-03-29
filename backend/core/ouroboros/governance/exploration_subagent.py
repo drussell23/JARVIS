@@ -76,6 +76,20 @@ class ExplorationSubagent:
 
     def __init__(self, project_root: Path) -> None:
         self._root = project_root
+        self._yield_requested: bool = False
+
+    def request_yield(self) -> None:
+        """Signal the agent to stop at the next safe checkpoint.
+
+        Cooperative cancellation — the agent will exit the file-reading loop
+        cleanly rather than being forcefully cancelled. Safe to call from any
+        coroutine or thread.
+        """
+        self._yield_requested = True
+
+    def should_yield(self) -> bool:
+        """Returns True if a yield has been requested."""
+        return self._yield_requested
 
     async def explore(
         self,
@@ -111,6 +125,8 @@ class ExplorationSubagent:
             next_round: List[str] = []
 
             for rel_path in to_explore:
+                if self.should_yield():
+                    break
                 if rel_path in visited:
                     continue
                 visited.add(rel_path)

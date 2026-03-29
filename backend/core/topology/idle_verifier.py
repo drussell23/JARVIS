@@ -94,10 +94,19 @@ class ProactiveDrive:
         self._state = "REACTIVE"
         self._eligible_since: Optional[float] = None
         self._last_exploration_end: float = 0.0
+        self._eligible_callbacks: list = []
 
     @property
     def state(self) -> str:
         return self._state
+
+    def on_eligible(self, callback) -> None:
+        """Register a callback to fire when state transitions TO ELIGIBLE.
+
+        Callbacks are called exactly once per transition (not on re-entry).
+        Useful for wiring idle detection to exploration triggers without polling.
+        """
+        self._eligible_callbacks.append(callback)
 
     def tick(self) -> Tuple[str, str]:
         """Called by a background coroutine every 10 seconds.
@@ -129,7 +138,12 @@ class ProactiveDrive:
             return self._state, f"Idle confirmed, starting eligibility timer: {reasons}"
 
         if now - self._eligible_since >= self.MIN_ELIGIBLE_SECONDS:
+            prev_state = self._state
             self._state = "ELIGIBLE"
+            # Fire callbacks only on the transition, not on re-entry
+            if prev_state != "ELIGIBLE":
+                for cb in self._eligible_callbacks:
+                    cb()
             return self._state, f"Eligible: {reasons}"
 
         remaining = self.MIN_ELIGIBLE_SECONDS - (now - self._eligible_since)

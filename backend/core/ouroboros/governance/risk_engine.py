@@ -29,7 +29,7 @@ from typing import List
 # Policy version -- bump on every rule change
 # ---------------------------------------------------------------------------
 
-POLICY_VERSION: str = "v0.1.0"
+POLICY_VERSION: str = "v0.2.0"
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +116,7 @@ class OperationProfile:
     test_scope_confidence: float
     is_dependency_change: bool = False
     is_core_orchestration_path: bool = False
+    source: str = ""
 
 
 @dataclass(frozen=True)
@@ -174,11 +175,46 @@ class RiskEngine:
     # Classification
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Exploration-source sentinel strings (no hardcoding of paths beyond
+    # these category descriptors — the engine checks substrings so that
+    # new modules added under these packages are automatically covered).
+    # ------------------------------------------------------------------
+    _EXPLORATION_KERNEL_SENTINELS: tuple = (
+        "unified_supervisor",
+    )
+    _EXPLORATION_SELF_MOD_SENTINELS: tuple = (
+        "ouroboros/daemon",
+        "ouroboros/vital_scan",
+        "ouroboros/spinal_cord",
+        "ouroboros/rem_sleep",
+        "ouroboros/rem_epoch",
+        "ouroboros/governance/risk_engine",
+        "ouroboros/governance/orchestrator",
+        "ouroboros/governance/governed_loop",
+    )
+    _EXPLORATION_SECURITY_SENTINELS: tuple = (
+        "auth/",
+        "credential",
+        "secret",
+        "token",
+        ".env",
+    )
+    # Blast-radius threshold stricter than the default for exploration ops.
+    _EXPLORATION_BLAST_RADIUS_THRESHOLD: int = 3
+
     def classify(self, profile: OperationProfile) -> RiskClassification:
         """Classify an operation profile into a risk tier.
 
         Rules are evaluated in strict priority order; **first match wins**.
 
+        Exploration-source rules (evaluated first when profile.source == "exploration"):
+        E1. Files touching unified_supervisor          -> BLOCKED
+        E2. Files touching ouroboros daemon/governance -> BLOCKED (no self-modification)
+        E3. Files touching security surface paths      -> BLOCKED
+        E4. blast_radius > 3                           -> APPROVAL_REQUIRED (stricter)
+
+        General rules (applied to all sources, and as fallthrough for exploration):
         1. ``touches_supervisor``        -> BLOCKED
         2. ``touches_security_surface``  -> BLOCKED
         3. ``crosses_repo_boundary``     -> APPROVAL_REQUIRED
@@ -201,6 +237,52 @@ class RiskEngine:
             The deterministic classification including tier, reason code,
             and policy version.
         """
+        # Exploration-source stricter rules — evaluated before all other rules
+        if profile.source == "exploration":
+            file_strs = [str(f) for f in profile.files_affected]
+
+            # Rule E1: Cannot modify the kernel
+            if any(
+                sentinel in fpath
+                for fpath in file_strs
+                for sentinel in self._EXPLORATION_KERNEL_SENTINELS
+            ):
+                return RiskClassification(
+                    tier=RiskTier.BLOCKED,
+                    reason_code="exploration_touches_kernel",
+                )
+
+            # Rule E2: Cannot self-modify ouroboros daemon / governance code
+            if any(
+                sentinel in fpath
+                for fpath in file_strs
+                for sentinel in self._EXPLORATION_SELF_MOD_SENTINELS
+            ):
+                return RiskClassification(
+                    tier=RiskTier.BLOCKED,
+                    reason_code="exploration_self_modification",
+                )
+
+            # Rule E3: Cannot touch security surface paths
+            if any(
+                sentinel in fpath
+                for fpath in file_strs
+                for sentinel in self._EXPLORATION_SECURITY_SENTINELS
+            ):
+                return RiskClassification(
+                    tier=RiskTier.BLOCKED,
+                    reason_code="exploration_touches_security",
+                )
+
+            # Rule E4: Stricter blast-radius cap for exploration ops
+            if profile.blast_radius > self._EXPLORATION_BLAST_RADIUS_THRESHOLD:
+                return RiskClassification(
+                    tier=RiskTier.APPROVAL_REQUIRED,
+                    reason_code="exploration_blast_radius_exceeded",
+                )
+
+            # Remaining exploration changes fall through to the standard rules below
+
         # Rule 1: Supervisor is unconditionally off-limits
         if profile.touches_supervisor:
             return RiskClassification(
