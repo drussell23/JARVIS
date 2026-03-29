@@ -58,12 +58,14 @@ def _make_epoch_result(
     cancelled: bool = False,
     error: str | None = None,
 ) -> MagicMock:
-    """Return a mock EpochResult."""
+    """Return a mock EpochResult with the real EpochResult field names."""
     result = MagicMock()
     result.epoch_id = epoch_id
-    result.findings = [MagicMock() for _ in range(findings_count)]
+    result.findings_count = findings_count  # EpochResult uses findings_count (int)
     result.envelopes_submitted = envelopes_submitted
+    result.envelopes_backpressured = 0
     result.cancelled = cancelled
+    result.completed = not cancelled
     result.error = error
     result.duration_s = 0.001
     return result
