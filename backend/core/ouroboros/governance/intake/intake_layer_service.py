@@ -50,7 +50,7 @@ class IntakeLayerConfig:
     dedup_window_s: float = 60.0
     backlog_scan_interval_s: float = 30.0
     miner_scan_interval_s: float = 300.0
-    miner_complexity_threshold: int = 75
+    miner_complexity_threshold: int = 150
     miner_auto_submit_threshold: float = 0.75
     miner_scan_paths: List[str] = field(default_factory=lambda: ["backend/"])
     voice_stt_confidence_threshold: float = 0.70
@@ -72,7 +72,7 @@ class IntakeLayerConfig:
                 os.getenv("JARVIS_INTAKE_MINER_SCAN_INTERVAL_S", "300.0")
             ),
             miner_complexity_threshold=int(
-                os.getenv("JARVIS_INTAKE_MINER_COMPLEXITY_THRESHOLD", "75")
+                os.getenv("JARVIS_INTAKE_MINER_COMPLEXITY_THRESHOLD", "150")
             ),
             miner_auto_submit_threshold=float(
                 os.getenv("JARVIS_INTAKE_MINER_AUTO_SUBMIT_THRESHOLD", "0.75")

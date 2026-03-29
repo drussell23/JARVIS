@@ -16,6 +16,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Optional
@@ -72,6 +73,7 @@ class OpportunityMinerSensor:
         complexity_threshold: int = 10,
         repo: str = "jarvis",
         poll_interval_s: float = 3600.0,
+        max_candidates_per_scan: int = 0,
     ) -> None:
         self._repo_root = repo_root
         self._router = router
@@ -81,6 +83,12 @@ class OpportunityMinerSensor:
         self._poll_interval_s = poll_interval_s
         self._running = False
         self._seen_file_paths: set[str] = set()
+        # Per-scan cap: only queue the N most complex files. 0 = no cap.
+        # Prevents intake flooding on large codebases. Highest CC first
+        # ensures intelligence is deployed where it creates most leverage.
+        self._max_per_scan = max_candidates_per_scan or int(
+            os.environ.get("JARVIS_MINER_MAX_PER_SCAN", "10")
+        )
 
     # v350.4: Third-party / non-project directory segments that must
     # never be scanned. These are structural boundaries — scanning torch,
@@ -183,42 +191,65 @@ class OpportunityMinerSensor:
                     cyclomatic_complexity=cc,
                     static_evidence_score=static_score,
                 )
+                candidates.append(candidate)
 
-                envelope = make_envelope(
-                    source="ai_miner",
-                    description=f"High complexity detected in {rel} (CC={cc})",
-                    target_files=(rel,),
-                    repo=self._repo,
-                    confidence=max(0.1, confidence),  # clamp for envelope; routing uses pre-clamp value
-                    urgency="low",
-                    evidence={
-                        "cyclomatic_complexity": cc,
-                        "static_evidence_score": static_score,
-                        "signature": rel,
-                    },
-                    requires_human_ack=True,  # AC2 safety invariant: miner always requires human ACK
-                )
-                try:
-                    result = await self._router.ingest(envelope)
-                    if result in ("enqueued", "pending_ack"):
-                        self._seen_file_paths.add(rel)
-                        candidates.append(candidate)
-                        logger.info(
-                            "OpportunityMinerSensor: queued %s (CC=%d, result=%s)",
-                            rel, cc, result,
-                        )
-                except Exception:
-                    logger.exception(
-                        "OpportunityMinerSensor: ingest failed for %s", rel
-                    )
+        # Sort by CC descending — highest complexity first (most leverage).
+        candidates.sort(key=lambda c: c.cyclomatic_complexity, reverse=True)
 
-        if skipped_non_package > 0:
+        # Per-scan cap: only ingest the top N to prevent intake flooding.
+        if self._max_per_scan > 0 and len(candidates) > self._max_per_scan:
+            dropped = len(candidates) - self._max_per_scan
+            candidates = candidates[:self._max_per_scan]
             logger.info(
-                "OpportunityMinerSensor: scanned %d package files, "
-                "skipped %d non-package scripts, queued %d candidates",
-                scanned, skipped_non_package, len(candidates),
+                "OpportunityMinerSensor: capped to top %d candidates "
+                "(dropped %d lower-CC files)",
+                self._max_per_scan, dropped,
             )
-        return candidates
+
+        # Ingest the prioritized candidates.
+        ingested: List[StaticCandidate] = []
+        for candidate in candidates:
+            rel = candidate.file_path
+            cc = candidate.cyclomatic_complexity
+            confidence = candidate.static_evidence_score
+
+            envelope = make_envelope(
+                source="ai_miner",
+                description=f"High complexity detected in {rel} (CC={cc})",
+                target_files=(rel,),
+                repo=self._repo,
+                confidence=max(0.1, confidence),
+                urgency="low",
+                evidence={
+                    "cyclomatic_complexity": cc,
+                    "static_evidence_score": confidence,
+                    "signature": rel,
+                },
+                requires_human_ack=True,  # AC2 safety invariant
+            )
+            try:
+                result = await self._router.ingest(envelope)
+                if result in ("enqueued", "pending_ack"):
+                    self._seen_file_paths.add(rel)
+                    ingested.append(candidate)
+                    logger.info(
+                        "OpportunityMinerSensor: queued %s (CC=%d, result=%s)",
+                        rel, cc, result,
+                    )
+            except Exception:
+                logger.exception(
+                    "OpportunityMinerSensor: ingest failed for %s", rel
+                )
+
+        if skipped_non_package > 0 or len(candidates) > 0:
+            logger.info(
+                "OpportunityMinerSensor: scanned %d files, "
+                "skipped %d non-package, found %d above threshold, "
+                "ingested %d (cap=%d)",
+                scanned, skipped_non_package, len(candidates),
+                len(ingested), self._max_per_scan,
+            )
+        return ingested
 
     async def start(self) -> None:
         """Start background scanning loop."""
