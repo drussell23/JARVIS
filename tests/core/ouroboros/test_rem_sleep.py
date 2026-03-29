@@ -24,6 +24,7 @@ def _make_spinal_cord() -> MagicMock:
     """Return a mock SpinalCord whose wait_for_gate returns immediately."""
     cord = MagicMock()
     cord.wait_for_gate = AsyncMock(return_value=None)
+    cord.stream_up = AsyncMock(return_value=None)
     return cord
 
 
