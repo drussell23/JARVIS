@@ -97,6 +97,7 @@ class RemSleepDaemon:
         doubleword: Any,
         config: Any,
         hypothesis_cache_dir: Any = None,
+        architect: Any = None,
     ) -> None:
         self._oracle = oracle
         self._fleet = fleet
@@ -106,6 +107,7 @@ class RemSleepDaemon:
         self._doubleword = doubleword
         self._config = config
         self._hypothesis_cache_dir = hypothesis_cache_dir
+        self._architect = architect
 
         # State machine
         self._state: RemState = RemState.IDLE_WATCH
@@ -247,6 +249,7 @@ class RemSleepDaemon:
             doubleword=self._doubleword,
             config=self._config,
             hypothesis_cache_dir=self._hypothesis_cache_dir,
+            architect=self._architect,
         )
 
         try:

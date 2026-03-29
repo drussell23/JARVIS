@@ -283,6 +283,24 @@ class RiskEngine:
 
             # Remaining exploration changes fall through to the standard rules below
 
+        # Architecture-source rules — evaluated before all other rules for architecture ops
+        if profile.source == "architecture":
+            file_strs = [str(f) for f in profile.files_affected]
+
+            # A1: BLOCK kernel + security (same sentinels as exploration)
+            if any(sentinel in fpath for fpath in file_strs for sentinel in self._EXPLORATION_KERNEL_SENTINELS):
+                return RiskClassification(tier=RiskTier.BLOCKED, reason_code="architecture_touches_kernel")
+            if any(sentinel in fpath for fpath in file_strs for sentinel in self._EXPLORATION_SECURITY_SENTINELS):
+                return RiskClassification(tier=RiskTier.BLOCKED, reason_code="architecture_touches_security")
+
+            # A2: APPROVAL_REQUIRED for ouroboros self-modification
+            if any(sentinel in fpath for fpath in file_strs for sentinel in self._EXPLORATION_SELF_MOD_SENTINELS):
+                return RiskClassification(tier=RiskTier.APPROVAL_REQUIRED, reason_code="architecture_self_modification")
+
+            # A3: APPROVAL_REQUIRED for cross-repo
+            if getattr(profile, 'crosses_repo_boundary', False):
+                return RiskClassification(tier=RiskTier.APPROVAL_REQUIRED, reason_code="architecture_cross_repo")
+
         # Rule 1: Supervisor is unconditionally off-limits
         if profile.touches_supervisor:
             return RiskClassification(

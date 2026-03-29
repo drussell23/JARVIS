@@ -136,6 +136,14 @@ class DaemonConfig:
     synthesis_ttl_s: float = 86400.0
     synthesis_prompt_version: int = 1
 
+    # Architecture reasoning agent
+    architect_enabled: bool = True
+    architect_max_steps: int = 10
+    architect_max_sagas_per_epoch: int = 2
+    saga_step_timeout_s: float = 300.0
+    saga_total_timeout_s: float = 3600.0
+    acceptance_timeout_s: float = 120.0
+
     # ------------------------------------------------------------------
     # Factory
     # ------------------------------------------------------------------
@@ -176,4 +184,10 @@ class DaemonConfig:
             synthesis_prompt_version=_env_int(
                 "OUROBOROS_SYNTHESIS_PROMPT_VERSION", 1
             ),
+            architect_enabled=_env_bool("OUROBOROS_ARCHITECT_ENABLED", True),
+            architect_max_steps=_env_int("OUROBOROS_ARCHITECT_MAX_STEPS", 10),
+            architect_max_sagas_per_epoch=_env_int("OUROBOROS_ARCHITECT_MAX_SAGAS_PER_EPOCH", 2),
+            saga_step_timeout_s=_env_float("OUROBOROS_SAGA_STEP_TIMEOUT_S", 300.0),
+            saga_total_timeout_s=_env_float("OUROBOROS_SAGA_TOTAL_TIMEOUT_S", 3600.0),
+            acceptance_timeout_s=_env_float("OUROBOROS_ACCEPTANCE_TIMEOUT_S", 120.0),
         )
