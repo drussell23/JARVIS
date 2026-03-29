@@ -7430,6 +7430,9 @@ class JARVISLearningDatabase:
         """
         predictions = []
 
+        if not self.db or not self._initialized:
+            return predictions
+
         try:
             now = datetime.now()
             current_app = current_context.get("current_app")
@@ -8835,7 +8838,8 @@ class JARVISLearningDatabase:
             except Exception as e:
                 logger.warning(f"   ⚠ Database close error: {e}")
 
-        # Reset state
+        # Reset state — db must be None so callers see a closed connection
+        self.db = None
         self._initialized = False
         self._background_tasks.clear()
 

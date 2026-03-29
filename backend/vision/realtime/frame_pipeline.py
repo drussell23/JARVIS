@@ -602,11 +602,17 @@ class FramePipeline:
     async def _shm_capture_loop(self) -> None:
         """SHM bridge capture loop — polls SHM ring buffer from asyncio.
 
-        1. Start SCK in a background thread (with CFRunLoop pump)
-        2. Wait for SHM to have data
-        3. Poll SHM at maximum rate, yielding to asyncio between reads
+        1. Clean stale SHM from previous crashed sessions
+        2. Start SCK in a background thread (with CFRunLoop pump)
+        3. Wait for SHM to have data
+        4. Poll SHM at maximum rate, yielding to asyncio between reads
         """
         from backend.vision.shm_frame_reader import ShmFrameReader
+
+        # Phase 0: Proactively clean stale SHM before writer starts.
+        # Without this, the writer creates a fresh segment but the reader
+        # finds the old stale one first, fails, and falls back to 3fps CG.
+        ShmFrameReader.cleanup_stale()
 
         # Phase 1: Start SCK background thread
         if not self._start_sck_background_thread():

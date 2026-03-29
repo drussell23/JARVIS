@@ -47,6 +47,41 @@ class ShmFrameReader:
         self.channels: int = 0
         self.frame_size: int = 0
 
+    @classmethod
+    def cleanup_stale(cls) -> None:
+        """Proactively unlink SHM segments left by crashed sessions.
+
+        Call BEFORE starting the SCK writer so it creates a fresh segment.
+        Safe to call even if no stale segment exists.
+        """
+        fd = _libc.shm_open(SHM_NAME, os.O_RDWR, 0o666)
+        if fd < 0:
+            return  # No segment exists — nothing to clean
+        try:
+            total = os.fstat(fd).st_size
+            if total < HEADER_SIZE:
+                os.close(fd)
+                _libc.shm_unlink(SHM_NAME)
+                logger.info("[ShmRing] Undersized stale segment — unlinked")
+                return
+            mm = mmap.mmap(fd, HEADER_SIZE, access=mmap.ACCESS_READ)
+            writer_pid = struct.unpack_from("<I", mm, 36)[0]
+            mm.close()
+            try:
+                os.kill(writer_pid, 0)
+                # Writer PID is alive — segment belongs to a running session
+                logger.debug("[ShmRing] Segment owned by live pid %d — kept", writer_pid)
+            except ProcessLookupError:
+                _libc.shm_unlink(SHM_NAME)
+                logger.info("[ShmRing] Cleaned stale segment (pid %d dead)", writer_pid)
+        except Exception as exc:
+            logger.debug("[ShmRing] cleanup_stale error: %s", exc)
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
     def open(self) -> bool:
         if self._mm is not None:
             return True
