@@ -724,7 +724,7 @@ class FramePipeline:
             while self._running:
                 try:
                     proc = await asyncio.create_subprocess_exec(
-                        "screencapture", "-x", "-C", tmp_path,
+                        "screencapture", "-x", "-m", "-C", tmp_path,
                         stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
