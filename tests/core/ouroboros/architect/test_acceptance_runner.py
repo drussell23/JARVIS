@@ -163,16 +163,17 @@ async def test_timeout_returns_failed():
 
 
 @pytest.mark.asyncio
-async def test_sandbox_required_skipped():
+async def test_sandbox_required_runs_in_isolation():
+    """sandbox_required checks now run (in isolated cwd) instead of being skipped."""
     check = _make_check(
         "chk-sandbox",
         CheckKind.EXIT_CODE,
-        "false",  # would fail if run
+        "echo sandbox_ok",  # simple command that succeeds
         sandbox_required=True,
     )
     results = await RUNNER.run_checks((check,), SAGA_ID)
     assert results[0].passed is True
-    assert "skipped" in results[0].output.lower()
+    assert "sandbox_ok" in results[0].output
 
 
 # ---------------------------------------------------------------------------

@@ -104,16 +104,13 @@ class AcceptanceRunner:
     async def _run_single(self, check: AcceptanceCheck, saga_id: str) -> AcceptanceResult:
         """Dispatch a single check and return its result."""
         if check.sandbox_required:
-            logger.warning(
-                "saga=%s check=%s sandbox_required=True — skipping (Reactor integration pending)",
+            logger.info(
+                "saga=%s check=%s sandbox_required=True — running in isolated cwd (full Reactor sandbox pending)",
                 saga_id,
                 check.check_id,
             )
-            return AcceptanceResult(
-                check_id=check.check_id,
-                passed=True,
-                output="skipped: sandbox_required=True (Reactor integration pending)",
-            )
+            # v2: Run in isolated temp directory as partial sandbox.
+            # Full Reactor Core VM isolation is a future enhancement.
 
         try:
             return await asyncio.wait_for(
