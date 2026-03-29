@@ -762,6 +762,26 @@ class GovernedLoopService:
         """Immutable snapshot of the supervisor-admitted brain set."""
         return self._active_brain_set
 
+    @property
+    def oracle(self):
+        """TheOracle instance (None until oracle_index_loop completes initialization)."""
+        return self._oracle
+
+    @property
+    def exploration_fleet(self):
+        """ExplorationFleet reference (None if not yet wired or import failed)."""
+        return getattr(self, "_exploration_fleet_ref", None)
+
+    @property
+    def background_pool(self):
+        """BackgroundAgentPool reference (None if not yet wired)."""
+        return self._bg_pool
+
+    @property
+    def doubleword_provider(self):
+        """DoublewordProvider reference (None if API key not set or build failed)."""
+        return getattr(self, "_doubleword_ref", None)
+
     def set_active_brain_set(self, brain_set: FrozenSet[str]) -> None:
         """Update the admitted active brain set.
 
@@ -2235,6 +2255,7 @@ class GovernedLoopService:
                     repo_root=self._config.project_root,
                     repo_roots=repo_roots_map,
                 )
+                self._doubleword_ref = tier0
                 logger.info(
                     "[GovernedLoop] DoublewordProvider: configured (model=%s)",
                     tier0._model,
@@ -2509,6 +2530,7 @@ class GovernedLoopService:
         try:
             from backend.core.ouroboros.governance.exploration_fleet import ExplorationFleet
             _fleet = ExplorationFleet(jarvis_root=self._config.project_root)
+            self._exploration_fleet_ref = _fleet
             self._orchestrator.set_exploration_fleet(_fleet)
             logger.info("[GLS] ExplorationFleet wired (parallel Trinity repo exploration)")
         except Exception as exc:
