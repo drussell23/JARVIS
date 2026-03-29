@@ -101,6 +101,12 @@ class DaemonConfig:
     synthesis_min_interval_s    → OUROBOROS_SYNTHESIS_MIN_INTERVAL_S
     synthesis_ttl_s             → OUROBOROS_SYNTHESIS_TTL_S
     synthesis_prompt_version    → OUROBOROS_SYNTHESIS_PROMPT_VERSION
+    architect_enabled           → OUROBOROS_ARCHITECT_ENABLED
+    architect_max_steps         → OUROBOROS_ARCHITECT_MAX_STEPS
+    architect_max_sagas_per_epoch → OUROBOROS_ARCHITECT_MAX_SAGAS_PER_EPOCH
+    saga_step_timeout_s         → OUROBOROS_SAGA_STEP_TIMEOUT_S
+    saga_total_timeout_s        → OUROBOROS_SAGA_TOTAL_TIMEOUT_S
+    acceptance_timeout_s        → OUROBOROS_ACCEPTANCE_TIMEOUT_S
     """
 
     # General daemon

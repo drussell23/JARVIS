@@ -376,6 +376,24 @@ class OuroborosDaemon:
 
         logger.info("OuroborosDaemon Phase 3: starting RemSleepDaemon…")
         try:
+            architect = None
+            if self._config.architect_enabled:
+                try:
+                    from backend.core.ouroboros.architect.reasoning_agent import (
+                        ArchitectureReasoningAgent,
+                        AgentConfig,
+                    )
+                    architect = ArchitectureReasoningAgent(
+                        oracle=self._oracle,
+                        doubleword=self._doubleword,
+                        config=AgentConfig(max_steps=self._config.architect_max_steps),
+                    )
+                    logger.info("OuroborosDaemon Phase 3: ArchitectureReasoningAgent initialised")
+                except Exception as exc:
+                    logger.warning(
+                        "[OuroborosDaemon] Architect init failed: %s", exc
+                    )
+
             self._rem = RemSleepDaemon(
                 oracle=self._oracle,
                 fleet=self._fleet,
@@ -385,6 +403,7 @@ class OuroborosDaemon:
                 doubleword=self._doubleword,
                 config=self._config,
                 hypothesis_cache_dir=_HYPOTHESIS_CACHE_DIR,
+                architect=architect,
             )
             await self._rem.start()
             logger.info("OuroborosDaemon Phase 3 complete: RemSleepDaemon started")
