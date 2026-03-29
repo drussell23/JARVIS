@@ -93,10 +93,12 @@ class DaemonNarrator:
         say_fn: Optional[Callable[..., Any]] = None,
         rate_limit_s: float = 60.0,
         enabled: bool = True,
+        voice: str = "Karen",
     ) -> None:
         self._say_fn = say_fn
         self.rate_limit_s = rate_limit_s
         self.enabled = enabled
+        self._voice = voice
         # Maps category → monotonic timestamp of last spoken message.
         self._last_spoken_at: Dict[str, float] = {}
 
@@ -141,7 +143,7 @@ class DaemonNarrator:
         message = self._format(template, payload)
 
         try:
-            await self._say_fn(message, source="ouroboros_narrator", skip_dedup=True)
+            await self._say_fn(message, voice=self._voice, source="ouroboros_narrator", skip_dedup=True)
             self._last_spoken_at[category] = time.monotonic()
         except Exception:
             logger.debug(

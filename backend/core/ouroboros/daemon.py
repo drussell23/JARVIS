@@ -415,8 +415,9 @@ class OuroborosDaemon:
                         self._narrator = DaemonNarrator(
                             say_fn=say_fn,
                             rate_limit_s=self._config.narrator_rate_limit_s,
+                            voice=self._config.narrator_voice,
                         )
-                        logger.info("[OuroborosDaemon] DaemonNarrator enabled")
+                        logger.info("[OuroborosDaemon] DaemonNarrator enabled (voice=%s)", self._config.narrator_voice)
                 except Exception as exc:
                     logger.warning("[OuroborosDaemon] DaemonNarrator init failed: %s", exc)
 
