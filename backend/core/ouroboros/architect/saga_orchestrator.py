@@ -29,7 +29,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from backend.core.ouroboros.architect.plan import ArchitecturalPlan
 from backend.core.ouroboros.architect.plan_decomposer import PlanDecomposer
@@ -69,12 +69,16 @@ class SagaOrchestrator:
         intake_router,
         acceptance_runner,
         saga_dir: Optional[Path] = None,
+        spinal_cord: Any = None,
+        narrator: Any = None,
     ) -> None:
         self._plan_store = plan_store
         self._intake_router = intake_router
         self._acceptance_runner = acceptance_runner
         self._saga_dir: Path = saga_dir if saga_dir is not None else _DEFAULT_SAGA_DIR
         self._saga_dir.mkdir(parents=True, exist_ok=True)
+        self._spinal_cord = spinal_cord
+        self._narrator = narrator
 
         # In-memory index — populated from WAL on startup and kept in sync.
         self._sagas: Dict[str, SagaRecord] = {}
@@ -164,7 +168,7 @@ class SagaOrchestrator:
                 saga_id,
                 saga.plan_hash,
             )
-            return self._abort(
+            return await self._abort_async(
                 saga,
                 reason=f"Plan not found in store for plan_hash={saga.plan_hash}",
             )
@@ -173,6 +177,10 @@ class SagaOrchestrator:
         saga.phase = SagaPhase.RUNNING
         self._persist(saga)
         _log.info("saga.running saga_id=%s", saga_id)
+        if self._spinal_cord:
+            await self._spinal_cord.stream_up("saga.started", {"saga_id": saga_id, "plan_id": saga.plan_id})
+        if self._narrator:
+            await self._narrator.on_event("saga.started", {"saga_id": saga_id, "plan_id": saga.plan_id})
 
         # Decompose plan into ordered envelopes.
         envelopes = PlanDecomposer.decompose(plan, saga_id)
@@ -199,7 +207,7 @@ class SagaOrchestrator:
                     )
                     step_state.phase = StepPhase.FAILED
                     step_state.error = reason
-                    return self._abort_remaining(saga, step_index, reason=reason)
+                    return await self._abort_remaining_async(saga, step_index, reason=reason)
 
             # Mark step RUNNING.
             step_state.phase = StepPhase.RUNNING
@@ -221,7 +229,7 @@ class SagaOrchestrator:
                 step_state.phase = StepPhase.FAILED
                 step_state.error = error_msg
                 step_state.completed_at = time.time()
-                return self._abort_remaining(
+                return await self._abort_remaining_async(
                     saga, step_index, reason=error_msg
                 )
 
@@ -242,13 +250,17 @@ class SagaOrchestrator:
             _log.warning(
                 "saga.acceptance_failed saga_id=%s checks=%s", saga_id, failed_ids
             )
-            return self._abort(saga, reason=reason)
+            return await self._abort_async(saga, reason=reason)
 
         # Success.
         saga.phase = SagaPhase.COMPLETE
         saga.completed_at = time.time()
         self._persist(saga)
         _log.info("saga.complete saga_id=%s", saga_id)
+        if self._spinal_cord:
+            await self._spinal_cord.stream_up("saga.complete", {"saga_id": saga_id, "plan_id": saga.plan_id})
+        if self._narrator:
+            await self._narrator.on_event("saga.complete", {"saga_id": saga_id, "plan_id": saga.plan_id})
         return saga
 
     def get_saga(self, saga_id: str) -> Optional[SagaRecord]:
@@ -319,6 +331,26 @@ class SagaOrchestrator:
         self._persist(saga)
         _log.warning("saga.aborted saga_id=%s reason=%s", saga.saga_id, reason)
         return saga
+
+    async def _abort_async(self, saga: SagaRecord, *, reason: str) -> SagaRecord:
+        """Async variant of :meth:`_abort` that also emits lifecycle events."""
+        result = self._abort(saga, reason=reason)
+        if self._spinal_cord:
+            await self._spinal_cord.stream_up("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
+        if self._narrator:
+            await self._narrator.on_event("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
+        return result
+
+    async def _abort_remaining_async(
+        self, saga: SagaRecord, failed_step_index: int, *, reason: str
+    ) -> SagaRecord:
+        """Async variant of :meth:`_abort_remaining` that also emits lifecycle events."""
+        result = self._abort_remaining(saga, failed_step_index, reason=reason)
+        if self._spinal_cord:
+            await self._spinal_cord.stream_up("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
+        if self._narrator:
+            await self._narrator.on_event("saga.aborted", {"saga_id": saga.saga_id, "reason": reason})
+        return result
 
     def _abort_remaining(
         self, saga: SagaRecord, failed_step_index: int, *, reason: str

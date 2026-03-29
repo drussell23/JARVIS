@@ -116,11 +116,13 @@ class FeatureSynthesisEngine:
         doubleword: Optional[Any],
         cache: HypothesisCache,
         config: SynthesisConfig,
+        narrator: Optional[Any] = None,
     ) -> None:
         self._oracle = oracle
-        self._doubleword = doubleword  # reserved — not yet used
+        self._doubleword = doubleword
         self._cache = cache
         self._config = config
+        self._narrator = narrator
 
         self._synthesis_lock: asyncio.Lock = asyncio.Lock()
         self._last_synthesis_at: float = 0.0
@@ -232,9 +234,13 @@ class FeatureSynthesisEngine:
         # --- Tier 0: deterministic hints (zero model tokens) ---
         tier0: List[FeatureHypothesis] = generate_tier0_hints(snapshot, self._oracle)
 
-        # --- v2 placeholder: Doubleword 397B ---
-        # model_hints = await self._run_doubleword(snapshot, fingerprint)
+        # --- Doubleword 397B synthesis ---
         model_hints: List[FeatureHypothesis] = []
+        if self._doubleword is not None and hasattr(self._doubleword, "prompt_only"):
+            try:
+                model_hints = await self._run_doubleword(snapshot, tier0)
+            except Exception as exc:
+                logger.warning("FeatureSynthesisEngine: Doubleword failed: %s", exc)
 
         # --- Merge & dedup by hypothesis_fingerprint ---
         # Deterministic provenance wins over model provenance on collision.
@@ -256,7 +262,134 @@ class FeatureSynthesisEngine:
         )
         self._last_synthesis_at = time.monotonic()
 
+        if self._narrator is not None:
+            await self._narrator.on_event("synthesis.complete", {"hypothesis_count": len(merged)})
+
         return merged
+
+    async def _run_doubleword(
+        self,
+        snapshot: RoadmapSnapshot,
+        tier0_hints: List[FeatureHypothesis],
+    ) -> List[FeatureHypothesis]:
+        """Call Doubleword 397B for model-driven gap synthesis.
+
+        Builds the synthesis prompt, trims it to a 6000-token budget via
+        :func:`shed_context`, submits it to Doubleword via ``prompt_only()``,
+        and parses the JSON response into :class:`FeatureHypothesis` objects.
+
+        Returns an empty list when the context budget is exceeded or the
+        response cannot be parsed — the caller logs a warning and falls back
+        to Tier 0 only.
+        """
+        from backend.core.ouroboros.roadmap.synthesis_prompt import (
+            build_synthesis_prompt,
+            shed_context,
+            SYNTHESIS_JSON_SCHEMA,
+            ContextBudgetExceededError,
+        )
+
+        prompt = build_synthesis_prompt(snapshot, tier0_hints, oracle_summary="")
+        try:
+            prompt = shed_context(prompt, max_tokens=6000)
+        except ContextBudgetExceededError:
+            logger.warning(
+                "FeatureSynthesisEngine: context budget exceeded, using tier0 only"
+            )
+            return []
+
+        response = await self._doubleword.prompt_only(
+            prompt=prompt,
+            caller_id="synthesis_engine",
+            response_format=SYNTHESIS_JSON_SCHEMA,
+        )
+        return self._parse_doubleword_response(response, snapshot)
+
+    def _parse_doubleword_response(
+        self,
+        response: str,
+        snapshot: RoadmapSnapshot,
+    ) -> List[FeatureHypothesis]:
+        """Parse a raw Doubleword JSON response into :class:`FeatureHypothesis` objects.
+
+        Expects the response to conform to :data:`SYNTHESIS_JSON_SCHEMA`:
+        ``{"gaps": [{description, evidence_fragments, gap_type, confidence,
+        urgency, suggested_scope, suggested_repos}, ...]}``.
+
+        Malformed items are skipped with a ``DEBUG`` log rather than raising,
+        so a partially-valid response still contributes hypotheses.
+
+        Parameters
+        ----------
+        response:
+            Raw string returned by :meth:`~DoublewordProvider.prompt_only`.
+        snapshot:
+            The snapshot the hypotheses were synthesised against.
+
+        Returns
+        -------
+        List[FeatureHypothesis]
+            Parsed hypotheses with ``provenance="model:doubleword-397b"`` and
+            ``confidence_rule_id="model_inference"``.
+        """
+        import json as _json
+
+        if not response:
+            logger.debug("FeatureSynthesisEngine: Doubleword returned empty response")
+            return []
+
+        try:
+            data = _json.loads(response)
+        except _json.JSONDecodeError as exc:
+            logger.warning(
+                "FeatureSynthesisEngine: Doubleword response is not valid JSON: %s", exc
+            )
+            return []
+
+        gaps = data.get("gaps")
+        if not isinstance(gaps, list):
+            logger.warning(
+                "FeatureSynthesisEngine: Doubleword response missing 'gaps' array"
+            )
+            return []
+
+        fingerprint = compute_input_fingerprint(
+            snapshot.content_hash,
+            self._config.prompt_version,
+            self._config.model_id,
+        )
+
+        hypotheses: List[FeatureHypothesis] = []
+        for item in gaps:
+            if not isinstance(item, dict):
+                continue
+            try:
+                h = FeatureHypothesis.new(
+                    description=str(item["description"]),
+                    evidence_fragments=tuple(item.get("evidence_fragments", [])),
+                    gap_type=str(item["gap_type"]),
+                    confidence=float(item.get("confidence", 0.5)),
+                    confidence_rule_id="model_inference",
+                    urgency=str(item.get("urgency", "medium")),
+                    suggested_scope=str(item.get("suggested_scope", "refactor")),
+                    suggested_repos=tuple(item.get("suggested_repos", [])),
+                    provenance="model:doubleword-397b",
+                    synthesized_for_snapshot_hash=snapshot.content_hash,
+                    synthesis_input_fingerprint=fingerprint,
+                )
+                hypotheses.append(h)
+            except Exception as exc:
+                logger.debug(
+                    "FeatureSynthesisEngine: skipping malformed gap item: %s — %s",
+                    item,
+                    exc,
+                )
+
+        logger.info(
+            "FeatureSynthesisEngine: Doubleword produced %d hypothesis(es)",
+            len(hypotheses),
+        )
+        return hypotheses
 
 
 # ---------------------------------------------------------------------------

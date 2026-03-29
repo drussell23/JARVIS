@@ -219,9 +219,20 @@ def test_health_returns_dict():
 
 
 def test_health_contains_model_integration_pending():
-    agent = _make_agent()
+    """model_integration is 'pending' when doubleword is None."""
+    oracle = MagicMock()
+    agent = ArchitectureReasoningAgent(oracle=oracle, doubleword=None)
     result = agent.health()
     assert result.get("model_integration") == "pending"
+
+
+def test_health_contains_model_integration_active():
+    """model_integration is 'active' when doubleword exposes prompt_only."""
+    oracle = MagicMock()
+    doubleword = MagicMock()  # MagicMock auto-creates prompt_only attribute
+    agent = ArchitectureReasoningAgent(oracle=oracle, doubleword=doubleword)
+    result = agent.health()
+    assert result.get("model_integration") == "active"
 
 
 def test_health_reflects_config():

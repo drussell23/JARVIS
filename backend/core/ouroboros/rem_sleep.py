@@ -98,6 +98,7 @@ class RemSleepDaemon:
         config: Any,
         hypothesis_cache_dir: Any = None,
         architect: Any = None,
+        narrator: Any = None,
     ) -> None:
         self._oracle = oracle
         self._fleet = fleet
@@ -108,6 +109,7 @@ class RemSleepDaemon:
         self._config = config
         self._hypothesis_cache_dir = hypothesis_cache_dir
         self._architect = architect
+        self._narrator = narrator
 
         # State machine
         self._state: RemState = RemState.IDLE_WATCH
@@ -238,6 +240,10 @@ class RemSleepDaemon:
         epoch_id = self._next_epoch_id()
         self._current_token = CancellationToken(epoch_id=epoch_id)
 
+        await self._spinal_cord.stream_up("rem.epoch_start", {"epoch_id": epoch_id})
+        if self._narrator is not None:
+            await self._narrator.on_event("rem.epoch_start", {"epoch_id": epoch_id})
+
         self._transition(RemState.EXPLORING)
 
         epoch = RemEpoch(
@@ -264,6 +270,18 @@ class RemSleepDaemon:
         self._total_findings += result.findings_count
         self._total_envelopes += result.envelopes_submitted
         self._last_epoch_result = result
+
+        await self._spinal_cord.stream_up("rem.epoch_complete", {
+            "epoch_id": epoch_id,
+            "findings_count": result.findings_count,
+            "envelopes_submitted": result.envelopes_submitted,
+            "duration_s": result.duration_s,
+        })
+        if self._narrator is not None:
+            await self._narrator.on_event("rem.epoch_complete", {
+                "findings_count": result.findings_count,
+                "envelopes_submitted": result.envelopes_submitted,
+            })
 
         self._current_token = None
 
