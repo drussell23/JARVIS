@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -172,14 +173,27 @@ class ArchitectureReasoningAgent:
             hypothesis.gap_type,
             hypothesis.confidence,
         )
-        # v2: attempt model-based plan generation
+        # Attempt model-based plan generation: Doubleword first, then Claude fallback.
         if self._doubleword is not None and hasattr(self._doubleword, "prompt_only"):
             try:
                 return await self._generate_plan(hypothesis, snapshot, oracle)
             except Exception as exc:
-                logger.warning("ArchitectureReasoningAgent: plan generation failed: %s", exc)
+                logger.warning(
+                    "ArchitectureReasoningAgent: Doubleword failed, trying Claude: %s",
+                    exc,
+                )
+
+        # Claude API fallback (reached when Doubleword is absent or raised).
+        if os.environ.get("ANTHROPIC_API_KEY"):
+            try:
+                return await self._generate_plan_claude(hypothesis, snapshot, oracle)
+            except Exception as exc:
+                logger.warning(
+                    "ArchitectureReasoningAgent: Claude fallback also failed: %s", exc
+                )
                 return None
-        return None  # no doubleword available
+
+        return None  # no model available
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -356,17 +370,188 @@ class ArchitectureReasoningAgent:
         )
         return plan
 
+    async def _generate_plan_claude(
+        self,
+        hypothesis: Any,
+        snapshot: Any,
+        oracle: Any,
+    ) -> Optional[ArchitecturalPlan]:
+        """Generate an ArchitecturalPlan via Claude API fallback.
+
+        Mirrors :meth:`_generate_plan` but routes inference through
+        :func:`~backend.core.ouroboros.claude_fallback.claude_inference`
+        instead of ``self._doubleword.prompt_only()``.
+
+        All parsing, validation, and plan construction logic is identical
+        to the Doubleword path.
+        """
+        from backend.core.ouroboros.claude_fallback import claude_inference
+
+        # --- 1. Gather oracle context ---
+        oracle_context = ""
+        try:
+            if oracle is not None and hasattr(oracle, "get_file_neighbourhood"):
+                neighbourhood = oracle.get_file_neighbourhood(
+                    getattr(hypothesis, "suggested_repos", ()) or ()
+                )
+                if neighbourhood is not None:
+                    oracle_context = str(neighbourhood)
+        except Exception as oracle_exc:  # noqa: BLE001
+            logger.debug(
+                "ArchitectureReasoningAgent: oracle context retrieval failed: %s",
+                oracle_exc,
+            )
+
+        # --- 2. Build prompt ---
+        prompt = build_design_prompt(
+            hypothesis=hypothesis,
+            oracle_context=oracle_context,
+            max_steps=self._config.max_steps,
+        )
+
+        # --- 3. Call Claude ---
+        raw = await claude_inference(
+            prompt, caller_id="architecture_agent", max_tokens=8000
+        )
+
+        if not raw:
+            logger.warning(
+                "ArchitectureReasoningAgent: empty response from Claude fallback "
+                "(hypothesis=%r)",
+                getattr(hypothesis, "hypothesis_id", repr(hypothesis)),
+            )
+            return None
+
+        # --- 4. Parse JSON ---
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "ArchitectureReasoningAgent: JSON parse error (Claude): %s (raw[:200]=%r)",
+                exc,
+                raw[:200],
+            )
+            return None
+
+        if "steps" not in data:
+            logger.warning(
+                "ArchitectureReasoningAgent: Claude response missing 'steps' key",
+            )
+            return None
+
+        # --- 4a. Parse PlanStep objects ---
+        raw_steps: list[dict] = data.get("steps", [])
+        steps: list[PlanStep] = []
+        for raw_step in raw_steps:
+            try:
+                intent_str = raw_step.get("intent_kind", "create_file")
+                intent_kind = StepIntentKind(intent_str)
+                step = PlanStep(
+                    step_index=int(raw_step["step_index"]),
+                    description=str(raw_step.get("description", "")),
+                    intent_kind=intent_kind,
+                    target_paths=tuple(raw_step.get("target_paths", [])),
+                    repo=str(raw_step.get("repo", "")),
+                    ancillary_paths=tuple(raw_step.get("ancillary_paths", [])),
+                    interface_contracts=tuple(raw_step.get("interface_contracts", [])),
+                    tests_required=tuple(raw_step.get("tests_required", [])),
+                    risk_tier_hint=str(raw_step.get("risk_tier_hint", "safe_auto")),
+                    depends_on=tuple(int(d) for d in raw_step.get("depends_on", [])),
+                )
+                steps.append(step)
+            except (KeyError, ValueError, TypeError) as step_exc:
+                logger.warning(
+                    "ArchitectureReasoningAgent: failed to parse step %r (Claude): %s",
+                    raw_step,
+                    step_exc,
+                )
+                return None
+
+        # --- 4b. Parse AcceptanceCheck objects ---
+        raw_checks: list[dict] = data.get("acceptance_checks", [])
+        checks: list[AcceptanceCheck] = []
+        for raw_chk in raw_checks:
+            try:
+                check_kind_str = raw_chk.get("check_kind", "exit_code")
+                check_kind = CheckKind(check_kind_str)
+                check = AcceptanceCheck(
+                    check_id=str(raw_chk["check_id"]),
+                    check_kind=check_kind,
+                    command=str(raw_chk.get("command", "")),
+                    expected=str(raw_chk.get("expected", "")),
+                    cwd=str(raw_chk.get("cwd", ".")),
+                    timeout_s=float(raw_chk.get("timeout_s", 120.0)),
+                    run_after_step=raw_chk.get("run_after_step"),
+                    sandbox_required=bool(raw_chk.get("sandbox_required", True)),
+                )
+                checks.append(check)
+            except (KeyError, ValueError, TypeError) as chk_exc:
+                logger.warning(
+                    "ArchitectureReasoningAgent: failed to parse acceptance check %r (Claude): %s",
+                    raw_chk,
+                    chk_exc,
+                )
+                return None
+
+        # --- 4c. Derive hypothesis provenance fields ---
+        parent_id = str(getattr(hypothesis, "hypothesis_id", ""))
+        parent_fingerprint = str(getattr(hypothesis, "hypothesis_fingerprint", ""))
+        snapshot_hash = str(
+            getattr(hypothesis, "synthesized_for_snapshot_hash", "")
+        )
+
+        # --- 4d. Construct ArchitecturalPlan ---
+        plan = ArchitecturalPlan.create(
+            parent_hypothesis_id=parent_id,
+            parent_hypothesis_fingerprint=parent_fingerprint,
+            title=str(data.get("title", "")),
+            description=str(data.get("description", "")),
+            repos_affected=tuple(data.get("repos_affected", [])),
+            non_goals=tuple(data.get("non_goals", [])),
+            steps=tuple(steps),
+            acceptance_checks=tuple(checks),
+            model_used=self._config.fallback_model,
+            snapshot_hash=snapshot_hash,
+        )
+
+        # --- 5. Validate ---
+        result = PlanValidator(max_steps=self._config.max_steps).validate(plan)
+        if not result.passed:
+            logger.warning(
+                "ArchitectureReasoningAgent: plan validation failed (Claude) "
+                "(hypothesis=%r, reasons=%r)",
+                parent_id,
+                result.reasons,
+            )
+            return None
+
+        logger.info(
+            "ArchitectureReasoningAgent: plan %r generated via Claude fallback "
+            "(steps=%d, hypothesis=%r)",
+            plan.plan_id,
+            len(plan.steps),
+            parent_id,
+        )
+        return plan
+
     def health(self) -> dict:
         """Return a dict describing the agent's configuration and readiness.
 
         ``"model_integration"`` is ``"active"`` when a Doubleword client with
         ``prompt_only`` is injected, otherwise ``"pending"``.
         """
-        integration_status = (
-            "active"
-            if self._doubleword is not None and hasattr(self._doubleword, "prompt_only")
-            else "pending"
+        has_doubleword = (
+            self._doubleword is not None and hasattr(self._doubleword, "prompt_only")
         )
+        has_claude = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+        if has_doubleword:
+            integration_status = "active"
+        elif has_claude:
+            integration_status = "fallback_only"
+        else:
+            integration_status = "pending"
+
         return {
             "min_confidence": self._config.min_confidence,
             "model": self._config.model,

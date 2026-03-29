@@ -218,8 +218,9 @@ def test_health_returns_dict():
     assert isinstance(result, dict)
 
 
-def test_health_contains_model_integration_pending():
-    """model_integration is 'pending' when doubleword is None."""
+def test_health_contains_model_integration_pending(monkeypatch):
+    """model_integration is 'pending' when doubleword is None and no Claude key."""
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     oracle = MagicMock()
     agent = ArchitectureReasoningAgent(oracle=oracle, doubleword=None)
     result = agent.health()

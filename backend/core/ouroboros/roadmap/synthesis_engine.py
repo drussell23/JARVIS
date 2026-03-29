@@ -27,6 +27,7 @@ import asyncio
 import dataclasses
 import hashlib
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional
@@ -234,13 +235,20 @@ class FeatureSynthesisEngine:
         # --- Tier 0: deterministic hints (zero model tokens) ---
         tier0: List[FeatureHypothesis] = generate_tier0_hints(snapshot, self._oracle)
 
-        # --- Doubleword 397B synthesis ---
+        # --- Doubleword 397B synthesis (with Claude API fallback) ---
         model_hints: List[FeatureHypothesis] = []
         if self._doubleword is not None and hasattr(self._doubleword, "prompt_only"):
             try:
                 model_hints = await self._run_doubleword(snapshot, tier0)
             except Exception as exc:
-                logger.warning("FeatureSynthesisEngine: Doubleword failed: %s", exc)
+                logger.warning(
+                    "FeatureSynthesisEngine: Doubleword failed, trying Claude fallback: %s",
+                    exc,
+                )
+                model_hints = await self._run_claude_fallback(snapshot, tier0)
+        elif os.environ.get("ANTHROPIC_API_KEY"):
+            # No Doubleword available but Claude API key is set — use Claude directly.
+            model_hints = await self._run_claude_fallback(snapshot, tier0)
 
         # --- Merge & dedup by hypothesis_fingerprint ---
         # Deterministic provenance wins over model provenance on collision.
@@ -318,14 +326,57 @@ class FeatureSynthesisEngine:
             caller_id="synthesis_engine",
             response_format=SYNTHESIS_JSON_SCHEMA,
         )
-        return self._parse_doubleword_response(response, snapshot)
+        return self._parse_model_response(response, snapshot)
 
-    def _parse_doubleword_response(
+    async def _run_claude_fallback(
+        self,
+        snapshot: RoadmapSnapshot,
+        tier0_hints: List[FeatureHypothesis],
+    ) -> List[FeatureHypothesis]:
+        """Fall back to Claude API when Doubleword is unavailable.
+
+        Builds the same synthesis prompt and parses the response using the
+        same JSON schema, but routes inference through
+        :func:`~backend.core.ouroboros.claude_fallback.claude_inference`.
+
+        Returns an empty list on any failure so the caller gracefully
+        degrades to Tier 0 only.
+        """
+        try:
+            from backend.core.ouroboros.claude_fallback import claude_inference
+            from backend.core.ouroboros.roadmap.synthesis_prompt import (
+                build_synthesis_prompt,
+                shed_context,
+                ContextBudgetExceededError,
+            )
+
+            prompt = build_synthesis_prompt(snapshot, tier0_hints, oracle_summary="")
+            try:
+                prompt = shed_context(prompt, max_tokens=6000)
+            except ContextBudgetExceededError:
+                logger.warning(
+                    "FeatureSynthesisEngine: context budget exceeded in Claude fallback"
+                )
+                return []
+
+            response = await claude_inference(prompt, caller_id="synthesis_engine")
+            if response is None:
+                return []
+
+            return self._parse_model_response(
+                response, snapshot, provenance="model:claude-api"
+            )
+        except Exception as exc:
+            logger.warning("FeatureSynthesisEngine: Claude fallback failed: %s", exc)
+            return []
+
+    def _parse_model_response(
         self,
         response: str,
         snapshot: RoadmapSnapshot,
+        provenance: str = "model:doubleword-397b",
     ) -> List[FeatureHypothesis]:
-        """Parse a raw Doubleword JSON response into :class:`FeatureHypothesis` objects.
+        """Parse a raw model JSON response into :class:`FeatureHypothesis` objects.
 
         Expects the response to conform to :data:`SYNTHESIS_JSON_SCHEMA`:
         ``{"gaps": [{description, evidence_fragments, gap_type, confidence,
@@ -337,14 +388,17 @@ class FeatureSynthesisEngine:
         Parameters
         ----------
         response:
-            Raw string returned by :meth:`~DoublewordProvider.prompt_only`.
+            Raw string returned by the model (Doubleword or Claude).
         snapshot:
             The snapshot the hypotheses were synthesised against.
+        provenance:
+            Provenance label to attach to each parsed hypothesis.
+            Defaults to ``"model:doubleword-397b"``.
 
         Returns
         -------
         List[FeatureHypothesis]
-            Parsed hypotheses with ``provenance="model:doubleword-397b"`` and
+            Parsed hypotheses with the specified provenance and
             ``confidence_rule_id="model_inference"``.
         """
         import json as _json
@@ -388,7 +442,7 @@ class FeatureSynthesisEngine:
                     urgency=str(item.get("urgency", "medium")),
                     suggested_scope=str(item.get("suggested_scope", "refactor")),
                     suggested_repos=tuple(item.get("suggested_repos", [])),
-                    provenance="model:doubleword-397b",
+                    provenance=provenance,
                     synthesized_for_snapshot_hash=snapshot.content_hash,
                     synthesis_input_fingerprint=fingerprint,
                 )
@@ -401,10 +455,15 @@ class FeatureSynthesisEngine:
                 )
 
         logger.info(
-            "FeatureSynthesisEngine: Doubleword produced %d hypothesis(es)",
+            "FeatureSynthesisEngine: model (%s) produced %d hypothesis(es)",
+            provenance,
             len(hypotheses),
         )
         return hypotheses
+
+    # Backward-compatible alias so existing call-sites and tests that
+    # reference the old name continue to work.
+    _parse_doubleword_response = _parse_model_response
 
 
 # ---------------------------------------------------------------------------
