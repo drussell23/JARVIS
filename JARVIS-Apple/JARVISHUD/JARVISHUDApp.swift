@@ -14,10 +14,14 @@ struct JARVISHUDApp: App {
 }
 
 @MainActor
-class HUDAppDelegate: NSObject, NSApplicationDelegate {
+class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate {
     let appState = AppState()
     let wakeWord = WakeWordListener()
     private let tts = AVSpeechSynthesizer()
+
+    // True while JARVIS TTS is playing — prevents the mic from restarting mid-speech
+    // and feeding JARVIS's own voice back as a command.
+    private var isTTSSpeaking = false
 
     private var overlayWindow: ClickThroughWindow?
     private var hudVisible = false
@@ -40,6 +44,9 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Voice: wake word + TTS responses
 
     private func setupVoice() {
+        // Wire TTS delegate so we know when speech finishes → restart mic
+        tts.delegate = self
+
         // When JARVIS finishes a response → Daniel speaks it
         appState.pythonBridge.onSpeak = { [weak self] text, _ in
             self?.speak(text)
@@ -60,12 +67,13 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Start wake word listening once cloud connects
+        // Start wake word listening once cloud connects.
+        // Guard isTTSSpeaking so reconnect events don't turn the mic on mid-speech.
         appState.pythonBridge.$connectionStatus
             .receive(on: RunLoop.main)
             .sink { [weak self] status in
                 guard let self else { return }
-                if status == .connected && self.wakeWord.state == .off {
+                if status == .connected && self.wakeWord.state == .off && !self.isTTSSpeaking {
                     print("[JARVIS] Cloud connected — starting wake word listener")
                     self.wakeWord.start()
                 }
@@ -95,7 +103,6 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
 
     private func speak(_ text: String) {
         guard !text.isEmpty else { return }
-        // Strip markdown and truncate for speech
         var cleaned = text
             .replacingOccurrences(of: "**", with: "")
             .replacingOccurrences(of: "`", with: "")
@@ -104,12 +111,36 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
             .replacingOccurrences(of: "# ", with: "")
         if cleaned.count > 400 { cleaned = String(cleaned.prefix(400)) + "..." }
 
+        // Stop the mic BEFORE TTS starts so JARVIS can't hear itself and echo.
+        // isTTSSpeaking flag blocks the connection-status subscription from
+        // accidentally restarting the mic while we're speaking.
+        isTTSSpeaking = true
+        wakeWord.stop()
+
         let utterance = AVSpeechUtterance(string: cleaned)
         utterance.voice = AVSpeechSynthesisVoice(identifier: "com.apple.voice.compact.en-GB.Daniel")
             ?? AVSpeechSynthesisVoice(language: "en-GB")
         utterance.rate = 0.52
         utterance.volume = 0.85
-        tts.speak(utterance)
+
+        // Dispatch off the Swift Concurrency stack — AVSpeechSynthesizer internally calls
+        // DispatchQueue.main.sync which triggers "unsafeForcedSync" when invoked from @MainActor.
+        DispatchQueue.main.async { [weak self] in
+            self?.tts.speak(utterance)
+        }
+    }
+
+    // Restart the mic once JARVIS finishes speaking — this is the gate that prevents echo.
+    nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.isTTSSpeaking = false
+            // Only restart if cloud is still connected
+            if self.appState.pythonBridge.connectionStatus == .connected {
+                print("[JARVIS Voice] TTS done — resuming mic")
+                self.wakeWord.start()
+            }
+        }
     }
 
     // MARK: - Menu Bar
