@@ -22,6 +22,7 @@ struct JARVISHUDApp: App {
 @MainActor
 class HUDAppDelegate: NSObject, NSApplicationDelegate {
     let appState = AppState()
+    let wakeWord = WakeWordListener()
 
     // Overlay window — created lazily on first toggle
     private var overlayWindow: ClickThroughWindow?
@@ -41,6 +42,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
             NSApp.setActivationPolicy(.accessory)
 
             self.setupMenuBar()
+            self.setupVoice()
             self.appState.boot()
         }
     }
@@ -158,6 +160,48 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
             ctx.strokePath()
             return true
         }
+    }
+
+    // MARK: - Voice (wake word)
+
+    private func setupVoice() {
+        wakeWord.onCommand = { [weak self] command in
+            guard let self else { return }
+            print("[JARVIS Voice] Sending: \"\(command)\"")
+            Task {
+                try? await self.appState.pythonBridge.sendCommand(command)
+            }
+        }
+
+        // Update menu bar status label when voice state changes
+        wakeWord.$state
+            .receive(on: RunLoop.main)
+            .sink { [weak self] voiceState in
+                guard let self, let line = self.statusMenu?.item(withTag: 100) else { return }
+                let connStatus = self.appState.pythonBridge.connectionStatus
+                switch voiceState {
+                case .listening:
+                    if connStatus == .connected {
+                        line.title = "JARVIS — Listening..."
+                    }
+                case .capturing:
+                    line.title = "JARVIS — Hearing you..."
+                default:
+                    self.updateLabel(status: connStatus)
+                }
+            }
+            .store(in: &subs)
+
+        // Start listening once connected
+        appState.pythonBridge.$connectionStatus
+            .receive(on: RunLoop.main)
+            .sink { [weak self] status in
+                guard let self else { return }
+                if status == .connected && self.wakeWord.state == .off {
+                    self.wakeWord.start()
+                }
+            }
+            .store(in: &subs)
     }
 
     // MARK: - HUD Overlay (lazy, manual toggle only)

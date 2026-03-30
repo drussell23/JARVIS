@@ -99,3 +99,7 @@ schemes:
         JARVISHUD: all
     run:
       config: Debug
+      environmentVariables:
+        JARVIS_DEVICE_ID: mac-m1-derek
+        JARVIS_DEVICE_SECRET: b110e2fd04a9baf2d5923373929af3a06e7abac06168120f063a05329de7151d
+        JARVIS_VERCEL_URL: https://jarvis-cloud-five.vercel.app

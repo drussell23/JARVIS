@@ -16,6 +16,7 @@
 		644F315E21A6FF607A2E238F /* ClickThroughWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59B809F2B04897D040BBE2CB /* ClickThroughWindow.swift */; };
 		6A6DE9BC09C7393AC5D3BFDA /* JARVISHUDApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */; };
 		787D831FBA5AA3338F9BC38C /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E75506CB26E637E4674ED069 /* PairingView.swift */; };
+		7E167813DA477376FA50A02A /* WakeWordListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */; };
 		8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F2D54D7706047B14362D0D6 /* TransparentWindow.swift */; };
 		8870023BBC6B975AB2B4A378 /* StatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 853E0D7E9218220610520FB8 /* StatusView.swift */; };
 		8CA64BEF2D84BA9055DCC700 /* JARVISPulseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15DC284C7811731206FA7AF5 /* JARVISPulseView.swift */; };
@@ -47,7 +48,9 @@
 		4784C00A28BAB42B47C1A4F1 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		496ADA6BEACAC0F28324C87E /* JARVISWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		59B809F2B04897D040BBE2CB /* ClickThroughWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClickThroughWindow.swift; sourceTree = "<group>"; };
+		62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeWordListener.swift; sourceTree = "<group>"; };
 		698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPhoneApp.swift; sourceTree = "<group>"; };
+		6A73D85D2FBC6659D4A47810 /* JARVISHUD.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JARVISHUD.entitlements; sourceTree = "<group>"; };
 		6C63F894E57C0794BF52C3F0 /* ClickThroughHostingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClickThroughHostingView.swift; sourceTree = "<group>"; };
 		7A0A5C4460F31FD5CB53DD10 /* HUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HUDView.swift; sourceTree = "<group>"; };
 		7F2D54D7706047B14362D0D6 /* TransparentWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransparentWindow.swift; sourceTree = "<group>"; };
@@ -106,6 +109,7 @@
 		1DBE12D0C8C5C68320118845 /* JARVISHUD */ = {
 			isa = PBXGroup;
 			children = (
+				6A73D85D2FBC6659D4A47810 /* JARVISHUD.entitlements */,
 				7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */,
 				4C449CDADB043C7331150D64 /* Services */,
 				243C003B3193F42692D7BF8F /* Views */,
@@ -152,6 +156,7 @@
 			isa = PBXGroup;
 			children = (
 				4784C00A28BAB42B47C1A4F1 /* AppState.swift */,
+				62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -389,6 +394,7 @@
 				8CA64BEF2D84BA9055DCC700 /* JARVISPulseView.swift in Sources */,
 				F2372C4356B52F4C5EE16B1C /* LoadingHUDView.swift in Sources */,
 				8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */,
+				7E167813DA477376FA50A02A /* WakeWordListener.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -453,10 +459,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = JARVISHUD/JARVISHUD.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "JARVIS needs microphone access for voice commands — say Hey JARVIS to activate";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "JARVIS uses on-device speech recognition for wake word detection";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -473,10 +482,13 @@
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = JARVISHUD/JARVISHUD.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "JARVIS needs microphone access for voice commands — say Hey JARVIS to activate";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "JARVIS uses on-device speech recognition for wake word detection";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
