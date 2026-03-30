@@ -415,24 +415,79 @@ class PythonBridge: ObservableObject {
         let baseURL: String
     }
 
-    // Mac device defaults — same credentials as brainstem/.env
-    private static let defaultDeviceId = "mac-m1-derek"
-    private static let defaultDeviceSecret = "b110e2fd04a9baf2d5923373929af3a06e7abac06168120f063a05329de7151d"
-    private static let defaultBaseURL = "https://jarvis-cloud-five.vercel.app"
-
     private func loadCredentials() -> HUDCredentials? {
-        // Priority: Keychain → Environment → built-in defaults
+        // If keychain is empty, try seeding from brainstem/.env
+        if KeychainStore.load(key: "device_id") == nil {
+            seedKeychainFromBrainstemEnv()
+        }
+
+        // Priority: Keychain → Environment
         let deviceId = KeychainStore.load(key: "device_id")
             ?? ProcessInfo.processInfo.environment["JARVIS_DEVICE_ID"]
-            ?? Self.defaultDeviceId
         let deviceSecret = KeychainStore.load(key: "device_secret")
             ?? ProcessInfo.processInfo.environment["JARVIS_DEVICE_SECRET"]
-            ?? Self.defaultDeviceSecret
         let baseURL = KeychainStore.load(key: "vercel_url")
             ?? ProcessInfo.processInfo.environment["JARVIS_VERCEL_URL"]
-            ?? Self.defaultBaseURL
+            ?? "https://jarvis-cloud-five.vercel.app"
 
-        return HUDCredentials(deviceId: deviceId, deviceSecret: deviceSecret, baseURL: baseURL)
+        guard let id = deviceId, let secret = deviceSecret else {
+            print("[JARVIS] No credentials found in Keychain or environment.")
+            return nil
+        }
+
+        print("[JARVIS] Credentials loaded for device: \(id)")
+        return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: baseURL)
+    }
+
+    /// Seeds keychain from brainstem/.env file (auto-discovers repo root).
+    /// The app writes its own keychain entries → no password prompts.
+    private func seedKeychainFromBrainstemEnv() {
+        // Walk up from the app bundle to find the repo root with brainstem/.env
+        let candidates = [
+            // When run from Xcode, the binary is deep in DerivedData — check common repo locations
+            NSHomeDirectory() + "/Documents/repos/JARVIS-AI-Agent/brainstem/.env",
+            FileManager.default.currentDirectoryPath + "/brainstem/.env",
+            FileManager.default.currentDirectoryPath + "/../brainstem/.env",
+        ]
+
+        var envPath: String?
+        for path in candidates {
+            if FileManager.default.fileExists(atPath: path) {
+                envPath = path
+                break
+            }
+        }
+
+        guard let path = envPath,
+              let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
+            print("[JARVIS] brainstem/.env not found — cannot auto-seed keychain")
+            return
+        }
+
+        // Parse KEY=VALUE lines
+        var env: [String: String] = [:]
+        for line in contents.components(separatedBy: "\n") {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard !trimmed.isEmpty, !trimmed.hasPrefix("#"),
+                  let eqIdx = trimmed.firstIndex(of: "=") else { continue }
+            let key = String(trimmed[trimmed.startIndex..<eqIdx])
+            let value = String(trimmed[trimmed.index(after: eqIdx)...])
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            env[key] = value
+        }
+
+        // Write to keychain (app-owned → no password prompts)
+        if let id = env["JARVIS_DEVICE_ID"] {
+            _ = KeychainStore.save(key: "device_id", value: id)
+        }
+        if let secret = env["JARVIS_DEVICE_SECRET"] {
+            _ = KeychainStore.save(key: "device_secret", value: secret)
+        }
+        if let url = env["JARVIS_VERCEL_URL"] {
+            _ = KeychainStore.save(key: "vercel_url", value: url)
+        }
+
+        print("[JARVIS] Keychain seeded from brainstem/.env")
     }
 }
 
