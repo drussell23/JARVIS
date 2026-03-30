@@ -72,13 +72,16 @@ class PythonBridge: ObservableObject {
     @Published var serverVersion: String = "unknown"
     @Published var serverCapabilities: [String] = []
 
-    // Loading state (drives LoadingHUDView)
+    // Loading state (kept for LoadingHUDView compatibility — not used in menu bar mode)
     @Published var loadingProgress: Int = 0
     @Published var loadingMessage: String = "Connecting to JARVIS Cloud..."
     @Published var loadingComplete: Bool = false
 
     // HUD state
     @Published var hudState: HUDState = .offline
+    /// True when JARVIS is actively working (processing command, streaming tokens, or speaking).
+    /// The app delegate observes this to auto-summon/dismiss the HUD overlay.
+    @Published var isActive: Bool = false
     @Published var lastMessage: String = ""
     @Published var isVisionActive: Bool = false
     @Published var transcriptMessages: [TranscriptMessage] = []
@@ -156,6 +159,8 @@ class PythonBridge: ObservableObject {
         guard let sender = commandSender else {
             throw JARVISError.notPaired
         }
+        hudState = .processing
+        isActive = true
         let result = try await sender.send(command, intentHint: intentHint)
         if result.status == "streaming" {
             // Tokens arrive via SSE — nothing more to do
@@ -289,6 +294,7 @@ class PythonBridge: ObservableObject {
 
     private func handleToken(_ data: TokenEvent) {
         hudState = .processing
+        isActive = true
 
         // Accumulate tokens per command
         if activeStreams[data.commandId] == nil {
@@ -357,6 +363,15 @@ class PythonBridge: ObservableObject {
         if !fullResponse.isEmpty {
             let cleaned = stripMarkdownForSpeech(fullResponse)
             onSpeak?(cleaned, .normal)
+        }
+
+        // Mark inactive after a short delay (lets the user read the response)
+        Task {
+            try? await Task.sleep(for: .seconds(8))
+            // Only deactivate if nothing new started
+            if hudState == .idle {
+                isActive = false
+            }
         }
     }
 

@@ -6,6 +6,7 @@ public final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Senda
     private let tokenManager: StreamTokenManager
     private var task: URLSessionDataTask?
     private var session: URLSession?
+    private let lock = NSLock()  // Protect buffer from concurrent delegate callbacks
     private var buffer = ""
     private var lastEventId: String?
 
@@ -21,10 +22,15 @@ public final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Senda
 
     public func connect() async throws {
         let token = try await tokenManager.getToken()
-        var urlComponents = URLComponents(string: "\(baseURL)/api/stream/\(deviceId)")!
+        guard var urlComponents = URLComponents(string: "\(baseURL)/api/stream/\(deviceId)") else {
+            throw URLError(.badURL)
+        }
         urlComponents.queryItems = [URLQueryItem(name: "t", value: token)]
 
-        var request = URLRequest(url: urlComponents.url!)
+        guard let url = urlComponents.url else {
+            throw URLError(.badURL)
+        }
+        var request = URLRequest(url: url)
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 310 // Slightly over Vercel's 300s max
 
@@ -52,14 +58,22 @@ public final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Senda
 
     public func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         guard let chunk = String(data: data, encoding: .utf8) else { return }
-        buffer += chunk
 
+        // Thread-safe: URLSession delegate fires on its own queue
+        var events: [JARVISEvent] = []
+        lock.lock()
+        buffer += chunk
         while let range = buffer.range(of: "\n\n") {
             let block = String(buffer[buffer.startIndex..<range.lowerBound])
             buffer = String(buffer[range.upperBound...])
             if let event = parseBlock(block) {
-                onEvent?(event)
+                events.append(event)
             }
+        }
+        lock.unlock()
+
+        for event in events {
+            onEvent?(event)
         }
     }
 
