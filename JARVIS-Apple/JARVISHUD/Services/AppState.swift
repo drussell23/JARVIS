@@ -100,6 +100,7 @@ class PythonBridge: ObservableObject {
     private var baseURL: String?
     private var consecutiveFailures = 0
     private var isRunning = false
+    private var hasGreeted = false
 
     // Active stream accumulator (token → full response per commandId)
     private var activeStreams: [String: [String]] = [:]
@@ -251,12 +252,9 @@ class PythonBridge: ObservableObject {
         hudState = .idle
         consecutiveFailures = 0
 
-        if !loadingComplete {
-            updateLoading(progress: 100, message: "JARVIS Online")
-            Task {
-                try? await Task.sleep(for: .milliseconds(500))
-                loadingComplete = true
-            }
+        if !hasGreeted {
+            hasGreeted = true
+            onSpeak?("Hello Derek! JARVIS is online.", .normal)
         }
     }
 
@@ -286,9 +284,17 @@ class PythonBridge: ObservableObject {
         }
     }
 
+    // Track which commands we've already spoken (prevent repeats on SSE reconnect)
+    private var spokenCommands = Set<String>()
+
     private func handleToken(_ data: TokenEvent) {
         hudState = .processing
         isActive = true
+
+        // First token of a new command — log it
+        if activeStreams[data.commandId] == nil {
+            print("[JARVIS] Receiving response for: \(data.commandId) via \(data.sourceBrain)")
+        }
 
         // Accumulate tokens per command
         if activeStreams[data.commandId] == nil {
@@ -342,6 +348,8 @@ class PythonBridge: ObservableObject {
         let tokens = activeStreams.removeValue(forKey: data.commandId)
         let fullResponse = tokens?.joined() ?? ""
 
+        print("[JARVIS] Response complete: \(data.commandId) — \(data.sourceBrain) \(data.latencyMs)ms, \(fullResponse.count) chars")
+
         // Finalize the transcript message
         if let lastIdx = transcriptMessages.lastIndex(where: { $0.speaker == "JARVIS" }) {
             transcriptMessages[lastIdx] = TranscriptMessage(
@@ -353,19 +361,23 @@ class PythonBridge: ObservableObject {
 
         detailedConnectionState = "Ready — \(data.sourceBrain) (\(data.latencyMs)ms)"
 
-        // Speak the response via Daniel TTS
-        if !fullResponse.isEmpty {
+        // Speak the response — but ONLY ONCE per command (dedup on SSE reconnect)
+        if !fullResponse.isEmpty && !spokenCommands.contains(data.commandId) {
+            spokenCommands.insert(data.commandId)
             let cleaned = stripMarkdownForSpeech(fullResponse)
+            print("[JARVIS] Speaking response (\(cleaned.count) chars)")
             onSpeak?(cleaned, .normal)
+
+            // Cap dedup set size
+            if spokenCommands.count > 50 {
+                spokenCommands.removeFirst()
+            }
         }
 
-        // Mark inactive after a short delay (lets the user read the response)
+        // Mark inactive after delay
         Task {
             try? await Task.sleep(for: .seconds(8))
-            // Only deactivate if nothing new started
-            if hudState == .idle {
-                isActive = false
-            }
+            if hudState == .idle { isActive = false }
         }
     }
 

@@ -67,10 +67,11 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
         let engine = AVAudioEngine()
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        if #available(macOS 15, *) { req.requiresOnDeviceRecognition = true }
+        // Don't force on-device — let the system decide (on-device can fail silently)
 
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
+        print("[JARVIS Voice] Audio format: \(format.sampleRate)Hz, \(format.channelCount)ch")
 
         // Track state with simple character offset (NOT String.Index)
         var wakeWordFound = false
@@ -120,9 +121,18 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
                 }
             }
 
-            if error != nil && !wakeWordFound {
-                // Recognition timed out without wake word — restart
-                self.restart(delay: 0.3)
+            if let error {
+                let nsError = error as NSError
+                print("[JARVIS Voice] Recognition ended: \(nsError.domain) code=\(nsError.code) — \(error.localizedDescription)")
+
+                if wakeWordFound {
+                    // Had a wake word, use whatever we captured
+                    let cmd = self.safeSubstring(result?.bestTranscription.formattedString ?? "", fromOffset: wakeEndOffset)
+                    if !cmd.isEmpty { self.finalize(cmd) } else { self.restart(delay: 0.5) }
+                } else {
+                    // Normal timeout or no speech — restart listening
+                    self.restart(delay: 0.3)
+                }
             }
         }
 
