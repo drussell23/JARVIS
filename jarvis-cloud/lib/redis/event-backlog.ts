@@ -33,8 +33,8 @@ export async function replayBacklog(
     parts.length === 2
       ? `${parts[0]}-${parseInt(parts[1], 10) + 1}`
       : `${lastEventId}-1`;
-  const entries = await redis.xrange(key, exclusiveStart, "+", MAX_REPLAY);
-  return entries.map(([id, fields]: [string, Record<string, string>]) => {
+  const entries = await redis.xrange<Record<string, string>>(key, exclusiveStart, "+", MAX_REPLAY);
+  return Object.entries(entries).map(([id, fields]) => {
     const parsed = JSON.parse(fields.payload);
     return { id, event: parsed.event, data: parsed.data };
   });

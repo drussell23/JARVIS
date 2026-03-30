@@ -42,10 +42,11 @@ export async function GET(
       while (!req.signal.aborted) {
         try {
           const exclusiveStart = cursor === "0" ? "0" : `${cursor.split("-")[0]}-${parseInt(cursor.split("-")[1] ?? "0", 10) + 1}`;
-          const entries = await redis.xrange(streamKey, exclusiveStart, "+", 50);
+          const entries = await redis.xrange<Record<string, string>>(streamKey, exclusiveStart, "+", 50);
+          const entryPairs = Object.entries(entries);
 
-          for (const [id, fields] of entries) {
-            const parsed = JSON.parse((fields as Record<string, string>).payload);
+          for (const [id, fields] of entryPairs) {
+            const parsed = JSON.parse(fields.payload);
             controller.enqueue(encoder.encode(formatSSE(parsed.event, parsed.data, id)));
             cursor = id;
           }
@@ -56,7 +57,7 @@ export async function GET(
             heartbeatCounter = 0;
           }
 
-          if (entries.length === 0) {
+          if (entryPairs.length === 0) {
             await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
           }
         } catch { break; }
