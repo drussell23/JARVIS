@@ -199,7 +199,7 @@ class PythonBridge: ObservableObject {
     }
 
     private func connectOnce(deviceAuth: DeviceAuth, config: HUDCredentials) async throws {
-        updateLoading(progress: 40, message: "Requesting stream token...")
+        print("[JARVIS] Requesting stream token...")
         detailedConnectionState = "Requesting stream token..."
 
         let tokenManager = StreamTokenManager(
@@ -214,39 +214,33 @@ class PythonBridge: ObservableObject {
             tokenManager: tokenManager
         )
 
-        // Wire event handlers (nonisolated closures for Sendable)
+        // SSEClient.connect() returns immediately after starting the HTTP task.
+        // We use AsyncStream to block until onDisconnect fires.
         let bridge = Weak(self)
-
-        client.onEvent = { event in
-            Task { @MainActor in
-                bridge.value?.handleEvent(event)
+        let disconnectStream = AsyncStream<Void> { continuation in
+            client.onEvent = { event in
+                Task { @MainActor in bridge.value?.handleEvent(event) }
             }
-        }
-
-        client.onConnect = {
-            Task { @MainActor in
-                bridge.value?.onConnected()
-            }
-        }
-
-        client.onDisconnect = {
-            Task { @MainActor in
-                bridge.value?.onDisconnected()
+            client.onDisconnect = {
+                Task { @MainActor in bridge.value?.onDisconnected() }
+                continuation.finish()
             }
         }
 
         sseClient = client
-
-        updateLoading(progress: 60, message: "Connecting SSE stream...")
+        print("[JARVIS] Connecting SSE stream to \(config.baseURL)...")
         detailedConnectionState = "Connecting to event stream..."
 
         try await client.connect()
-
-        // If connect() returns without throwing, we're connected
+        print("[JARVIS] SSE stream started, waiting for events...")
         onConnected()
 
-        // Block until disconnect (connect returns when the stream ends)
-        // The SSE client will call onDisconnect via delegate when the stream closes
+        // Block here until the SSE stream closes (onDisconnect fires → stream finishes)
+        for await _ in disconnectStream { }
+        print("[JARVIS] SSE stream ended")
+
+        // Throw so connectLoop knows to reconnect
+        throw JARVISError.connectionFailed
     }
 
     // MARK: - Connection lifecycle
@@ -472,8 +466,8 @@ final class VoiceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegat
     }
 
     nonisolated func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        Task { @MainActor in
-            self.isSpeaking = false
+        DispatchQueue.main.async { [weak self] in
+            self?.isSpeaking = false
         }
     }
 
@@ -528,10 +522,8 @@ class AppState: ObservableObject {
         self.voiceManager = voice
         self.visionManager = vision
 
-        // Wire TTS: when cloud sends a response or urgent daemon, speak it
-        bridge.onSpeak = { [weak voice] text, priority in
-            voice?.speak(text, priority: priority)
-        }
+        // TTS disabled by default — user controls when JARVIS speaks
+        // To enable: bridge.onSpeak = { [weak voice] text, priority in voice?.speak(text, priority: priority) }
 
         // Give VisionManager the command sender for cloud routing
         vision.commandSender = bridge
