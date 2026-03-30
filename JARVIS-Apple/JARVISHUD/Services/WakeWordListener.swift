@@ -67,10 +67,22 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
         let engine = AVAudioEngine()
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        // Don't force on-device — let the system decide (on-device can fail silently)
 
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
+
+        // kAudioUnitErr_CannotDoInCurrentContext (-10877): hardware reports sampleRate=0 during
+        // warmup. Installing a tap with this format and calling engine.start() will always fail.
+        // Retry quickly — the hardware is usually ready within ~500ms.
+        guard format.sampleRate > 0 else {
+            print("[JARVIS Voice] Audio hardware not ready (sampleRate=0), retrying in 0.5s...")
+            audioQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self, self.isRunning else { return }
+                self.beginListening()
+            }
+            return
+        }
+
         print("[JARVIS Voice] Audio format: \(format.sampleRate)Hz, \(format.channelCount)ch")
 
         // Track state with simple character offset (NOT String.Index)
@@ -163,7 +175,10 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
             }
         }
 
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { buffer, _ in
+        // 4096 frames ≈ 85ms at 48kHz — large enough to prevent HALC I/O overload.
+        // Guard against zero-byte buffers produced during audio hardware warmup.
+        inputNode.installTap(onBus: 0, bufferSize: 4096, format: format) { buffer, _ in
+            guard buffer.frameLength > 0 else { return }
             req.append(buffer)
         }
 
@@ -175,8 +190,27 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
             DispatchQueue.main.async { self.state = .listening }
             print("[JARVIS Voice] Listening...")
         } catch {
-            print("[JARVIS Voice] Engine start failed: \(error)")
-            restart(delay: 2)
+            // self.audioEngine was never assigned, so teardown() won't clean up the local engine.
+            // Manually remove the tap and cancel the recognition task to avoid leaking resources
+            // into the next attempt.
+            inputNode.removeTap(onBus: 0)
+            req.endAudio()
+            recognitionTask?.cancel()
+            recognitionTask = nil
+
+            let nsError = error as NSError
+            // -10877 = kAudioUnitErr_CannotDoInCurrentContext — hardware transitioning (common
+            // during AirPods swap, wake-from-sleep, audio route change). Retry quickly.
+            if nsError.code == -10877 {
+                print("[JARVIS Voice] Hardware context unavailable (-10877), retrying in 1s...")
+                audioQueue.asyncAfter(deadline: .now() + 1) { [weak self] in
+                    guard let self, self.isRunning else { return }
+                    self.beginListening()
+                }
+            } else {
+                print("[JARVIS Voice] Engine start failed: \(error)")
+                restart(delay: 2)
+            }
         }
     }
 
