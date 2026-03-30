@@ -11,58 +11,72 @@ class PhoneSessionManager: ObservableObject {
     private var auth: DeviceAuth?
     private var sender: CommandSender?
     private var sseClient: SSEClient?
-    private var transcriber = SpeechTranscriber()
 
     func connect() async {
         guard let deviceId = KeychainStore.load(key: "device_id"),
               let secret = KeychainStore.load(key: "device_secret"),
-              let baseURL = KeychainStore.load(key: "vercel_url") else { return }
+              let baseURL = KeychainStore.load(key: "vercel_url") else {
+            lastDaemon = "Not paired — go to Settings"
+            return
+        }
 
         let deviceAuth = DeviceAuth(deviceId: deviceId, deviceType: .iphone, deviceSecret: secret)
         auth = deviceAuth
         sender = CommandSender(baseURL: baseURL, auth: deviceAuth)
 
+        // SSE connection for receiving events
         let tokenManager = StreamTokenManager(deviceId: deviceId, auth: deviceAuth, baseURL: baseURL)
-        sseClient = SSEClient(baseURL: baseURL, deviceId: deviceId, tokenManager: tokenManager)
-        sseClient?.onEvent = { [weak self] event in
-            Task { @MainActor in self?.handleEvent(event) }
-        }
-        sseClient?.onDisconnect = { [weak self] in
+        let client = SSEClient(baseURL: baseURL, deviceId: deviceId, tokenManager: tokenManager)
+
+        // Use nonisolated closures to avoid Swift 6 Sendable issues
+        let weakSelf = Weak(self)
+        client.onEvent = { event in
             Task { @MainActor in
-                self?.isConnected = false
-                try? await Task.sleep(for: .seconds(2))
-                await self?.connect()
+                weakSelf.value?.handleEvent(event)
+            }
+        }
+        client.onDisconnect = {
+            Task { @MainActor in
+                weakSelf.value?.isConnected = false
+                try? await Task.sleep(for: .seconds(3))
+                await weakSelf.value?.connect()
             }
         }
 
+        sseClient = client
+
         do {
-            try await sseClient?.connect()
+            try await client.connect()
             isConnected = true
+            lastDaemon = nil
         } catch {
-            lastDaemon = "Connection failed"
+            lastDaemon = "Connection failed: \(error.localizedDescription)"
+            isConnected = false
+        }
+    }
+
+    func sendCommand(_ text: String) async {
+        guard let sender else {
+            lastDaemon = "Not connected"
+            return
+        }
+        activeResponse = nil
+        do {
+            let result = try await sender.send(text)
+            if result.status == "streaming" {
+                // Tokens will arrive via SSE
+                lastDaemon = nil
+            } else {
+                lastDaemon = "Job queued: \(result.jobId ?? "?")"
+            }
+        } catch {
+            lastDaemon = "Failed: \(error.localizedDescription)"
         }
     }
 
     func startVoiceCommand() {
-        isListening = true
-        transcriber.onTranscript = { [weak self] text, isFinal in
-            guard isFinal else { return }
-            Task { @MainActor in
-                self?.isListening = false
-                await self?.sendCommand(text)
-            }
-        }
-        try? transcriber.startListening()
-    }
-
-    func sendCommand(_ text: String) async {
-        guard let sender else { return }
-        activeResponse = nil
-        do {
-            _ = try await sender.send(text)
-        } catch {
-            lastDaemon = "Failed: \(error.localizedDescription)"
-        }
+        // Voice requires microphone permission — skip in simulator
+        lastDaemon = "Voice input not available in simulator. Use text input."
     }
 
     private func handleEvent(_ event: JARVISEvent) {
@@ -71,13 +85,20 @@ class PhoneSessionManager: ObservableObject {
             activeResponse = (activeResponse ?? "") + data.token
         case .daemon(let data):
             lastDaemon = data.narrationText
-        case .complete:
-            Task {
-                try? await Task.sleep(for: .seconds(5))
-                activeResponse = nil
+        case .complete(let data):
+            if activeResponse == nil {
+                lastDaemon = "Done (\(data.latencyMs)ms)"
             }
-        case .status, .heartbeat, .action:
+        case .status(let data):
+            lastDaemon = "[\(data.phase)] \(data.message)"
+        case .heartbeat, .action:
             break
         }
     }
+}
+
+/// Helper to avoid capturing `self` strongly in @Sendable closures
+private final class Weak<T: AnyObject>: @unchecked Sendable {
+    weak var value: T?
+    init(_ value: T) { self.value = value }
 }
