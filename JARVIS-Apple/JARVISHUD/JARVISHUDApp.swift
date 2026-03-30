@@ -137,10 +137,11 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             self.isTTSSpeaking = false
             // Only restart if cloud is still connected
             guard self.appState.pythonBridge.connectionStatus == .connected else { return }
-            // Wait 1.5s for CoreAudio output hardware to fully release before opening input.
-            // Without this, the first two beginListening() attempts throw -10877 because the
-            // audio subsystem is still in output mode immediately after TTS completes.
-            try? await Task.sleep(for: .seconds(1.5))
+            // Wait 3s for CoreAudio output hardware to fully release before opening input.
+            // AVSpeechSynthesizer holds the output device for ~2-3s after didFinish fires.
+            // Without this delay, beginListening() throws -10877 repeatedly while the audio
+            // subsystem transitions from output to input mode.
+            try? await Task.sleep(for: .seconds(3.0))
             // Re-check connection state and TTS flag after the sleep — a new TTS may have started
             guard !self.isTTSSpeaking,
                   self.appState.pythonBridge.connectionStatus == .connected else { return }

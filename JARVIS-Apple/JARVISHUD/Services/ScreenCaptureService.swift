@@ -16,21 +16,29 @@ struct ScreenCaptureService: Sendable {
         CGPreflightScreenCaptureAccess()
     }
 
-    /// Trigger the system permission dialog once at startup so the user can grant access
-    /// before the first voice command arrives.
+    /// Trigger the ScreenCaptureKit permission dialog at startup.
+    /// SCShareableContent.excludingDesktopWindows() surfaces the proper macOS TCC dialog
+    /// (CGRequestScreenCaptureAccess just silently opens System Settings without a prompt).
     func requestPermission() {
-        CGRequestScreenCaptureAccess()
+        if hasPermission { return }
+        Task.detached {
+            do {
+                // This call triggers the system "Screen Recording" permission dialog on macOS 14+.
+                _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                print("[JARVIS Vision] Screen Recording permission granted")
+            } catch {
+                print("[JARVIS Vision] Screen Recording permission not yet granted — user must enable in System Settings > Privacy & Security > Screen Recording")
+            }
+        }
     }
 
     // MARK: - Capture
 
     /// Captures the main display and returns a base64 JPEG string, or nil on failure.
     /// All heavy work runs on a background Task — never blocks @MainActor.
+    /// If permission hasn't been granted, attempts the capture anyway — SCShareableContent
+    /// triggers the permission dialog automatically on first use.
     func captureBase64() async -> String? {
-        guard hasPermission else {
-            print("[JARVIS Vision] Screen Recording permission not granted — skipping screenshot")
-            return nil
-        }
         guard #available(macOS 14.0, *) else {
             print("[JARVIS Vision] SCScreenshotManager requires macOS 14+")
             return nil

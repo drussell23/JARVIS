@@ -77,6 +77,20 @@ export function resolveRoute(payload: CommandPayload): RoutingDecision {
     }
   }
 
+  // VLA: screenshot present → upgrade to Sonnet with vision prompt for better visual reasoning.
+  // Haiku can handle vision but Sonnet produces significantly better spatial understanding
+  // and action recommendations. This fires regardless of command text.
+  if (payload.context?.screenshot) {
+    return {
+      brain: "claude",
+      mode: "stream",
+      model: "claude-sonnet-4-6",
+      fan_out: [],
+      system_prompt_key: "vision",
+      estimated_latency: "realtime",
+    };
+  }
+
   // Default: Haiku streaming (fast + cheap for conversation)
   return { ...CLAUDE_HAIKU_DEFAULT };
 }
