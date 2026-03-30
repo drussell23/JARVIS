@@ -415,21 +415,24 @@ class PythonBridge: ObservableObject {
         let baseURL: String
     }
 
+    // Mac device defaults — same credentials as brainstem/.env
+    private static let defaultDeviceId = "mac-m1-derek"
+    private static let defaultDeviceSecret = "b110e2fd04a9baf2d5923373929af3a06e7abac06168120f063a05329de7151d"
+    private static let defaultBaseURL = "https://jarvis-cloud-five.vercel.app"
+
     private func loadCredentials() -> HUDCredentials? {
-        // Priority: Keychain → Environment → nil
+        // Priority: Keychain → Environment → built-in defaults
         let deviceId = KeychainStore.load(key: "device_id")
             ?? ProcessInfo.processInfo.environment["JARVIS_DEVICE_ID"]
+            ?? Self.defaultDeviceId
         let deviceSecret = KeychainStore.load(key: "device_secret")
             ?? ProcessInfo.processInfo.environment["JARVIS_DEVICE_SECRET"]
+            ?? Self.defaultDeviceSecret
         let baseURL = KeychainStore.load(key: "vercel_url")
             ?? ProcessInfo.processInfo.environment["JARVIS_VERCEL_URL"]
-            ?? "https://jarvis-cloud-five.vercel.app"
+            ?? Self.defaultBaseURL
 
-        guard let id = deviceId, let secret = deviceSecret else {
-            return nil
-        }
-
-        return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: baseURL)
+        return HUDCredentials(deviceId: deviceId, deviceSecret: deviceSecret, baseURL: baseURL)
     }
 }
 
