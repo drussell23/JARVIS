@@ -12,6 +12,8 @@ export interface CommandContext {
   screen_summary?: string;
   location?: string;
   battery_level?: number;
+  /** Base64-encoded JPEG screenshot for VLA (Vision Language Agent). */
+  screenshot?: string;
 }
 
 export interface CommandPayload {

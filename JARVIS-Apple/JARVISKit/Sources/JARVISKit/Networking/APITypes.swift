@@ -72,13 +72,23 @@ public struct CommandContext: Codable, Sendable {
     public var screenSummary: String?
     public var location: String?
     public var batteryLevel: Double?
+    /// Base64-encoded JPEG screenshot of the main display for VLA (Vision Language Agent).
+    public var screenshot: String?
 
-    public init(activeApp: String? = nil, activeFile: String? = nil, screenSummary: String? = nil, location: String? = nil, batteryLevel: Double? = nil) {
+    public init(
+        activeApp: String? = nil,
+        activeFile: String? = nil,
+        screenSummary: String? = nil,
+        location: String? = nil,
+        batteryLevel: Double? = nil,
+        screenshot: String? = nil
+    ) {
         self.activeApp = activeApp
         self.activeFile = activeFile
         self.screenSummary = screenSummary
         self.location = location
         self.batteryLevel = batteryLevel
+        self.screenshot = screenshot
     }
 
     enum CodingKeys: String, CodingKey {
@@ -87,6 +97,7 @@ public struct CommandContext: Codable, Sendable {
         case screenSummary = "screen_summary"
         case location
         case batteryLevel = "battery_level"
+        case screenshot
     }
 }
 

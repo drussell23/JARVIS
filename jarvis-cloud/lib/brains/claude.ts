@@ -19,7 +19,7 @@ export function getSystemPrompt(key: string): string {
 }
 
 export function buildMessages(payload: CommandPayload): Anthropic.MessageParam[] {
-  let content = payload.text;
+  let textContent = payload.text;
   if (payload.context) {
     const ctx = payload.context;
     const parts: string[] = [];
@@ -28,10 +28,35 @@ export function buildMessages(payload: CommandPayload): Anthropic.MessageParam[]
     if (ctx.screen_summary) parts.push(`Screen: ${ctx.screen_summary}`);
     if (ctx.location) parts.push(`Location: ${ctx.location}`);
     if (parts.length > 0) {
-      content = `[Context: ${parts.join(", ")}]\n\n${content}`;
+      textContent = `[Context: ${parts.join(", ")}]\n\n${textContent}`;
     }
   }
-  return [{ role: "user", content }];
+
+  // VLA path: screenshot present → multi-part message with vision
+  const screenshot = payload.context?.screenshot;
+  if (screenshot) {
+    return [
+      {
+        role: "user",
+        content: [
+          {
+            type: "image",
+            source: {
+              type: "base64",
+              media_type: "image/jpeg",
+              data: screenshot,
+            },
+          },
+          {
+            type: "text",
+            text: textContent,
+          },
+        ],
+      },
+    ];
+  }
+
+  return [{ role: "user", content: textContent }];
 }
 
 export function streamClaude(

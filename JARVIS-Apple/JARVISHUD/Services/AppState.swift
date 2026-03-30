@@ -160,7 +160,7 @@ class PythonBridge: ObservableObject {
 
     // MARK: - Command sending
 
-    func sendCommand(_ command: String, intentHint: String? = nil) async throws {
+    func sendCommand(_ command: String, intentHint: String? = nil, context: CommandContext? = nil) async throws {
         guard let sender = commandSender else {
             throw JARVISError.notPaired
         }
@@ -175,7 +175,21 @@ class PythonBridge: ObservableObject {
         sessionCommandIds.insert(commandId)
         print("[JARVIS] Sending command \(commandId): \"\(command)\"")
 
-        let result = try await sender.send(command, commandId: commandId, intentHint: intentHint)
+        // VLA: auto-capture a screenshot and attach it to every command so Claude has
+        // full situational awareness. Capture runs async off the main thread.
+        // If Screen Recording permission is not yet granted, screenshot is nil and the
+        // command is sent as text-only — graceful degradation, no failure path.
+        var resolvedContext = context ?? CommandContext()
+        if resolvedContext.screenshot == nil {
+            resolvedContext.screenshot = await ScreenCaptureService.shared.captureBase64()
+        }
+
+        let result = try await sender.send(
+            command,
+            commandId: commandId,
+            intentHint: intentHint,
+            context: resolvedContext
+        )
         print("[JARVIS] Command acknowledged — status: \(result.status)")
     }
 

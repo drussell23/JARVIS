@@ -35,6 +35,9 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             NSApp.setActivationPolicy(.accessory)
             self.setupMenuBar()
             self.setupVoice()
+            // Request Screen Recording permission early — surfaces the TCC dialog
+            // before the first voice command so capture is ready when needed.
+            ScreenCaptureService.shared.requestPermission()
             self.appState.boot()
         }
     }
@@ -123,10 +126,12 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         utterance.rate = 0.52
         utterance.volume = 0.85
 
-        // Dispatch off the Swift Concurrency stack — AVSpeechSynthesizer internally calls
-        // DispatchQueue.main.sync which triggers "unsafeForcedSync" when invoked from @MainActor.
-        DispatchQueue.main.async { [weak self] in
-            self?.tts.speak(utterance)
+        // Double-hop: escape Swift Concurrency executor ancestry FIRST (global queue),
+        // then hop to main for AVSpeechSynthesizer — breaks the unsafeForcedSync chain.
+        DispatchQueue.global(qos: .userInitiated).async {
+            DispatchQueue.main.async { [weak self] in
+                self?.tts.speak(utterance)
+            }
         }
     }
 
@@ -136,10 +141,16 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             guard let self else { return }
             self.isTTSSpeaking = false
             // Only restart if cloud is still connected
-            if self.appState.pythonBridge.connectionStatus == .connected {
-                print("[JARVIS Voice] TTS done — resuming mic")
-                self.wakeWord.start()
-            }
+            guard self.appState.pythonBridge.connectionStatus == .connected else { return }
+            // Wait 1.5s for CoreAudio output hardware to fully release before opening input.
+            // Without this, the first two beginListening() attempts throw -10877 because the
+            // audio subsystem is still in output mode immediately after TTS completes.
+            try? await Task.sleep(for: .seconds(1.5))
+            // Re-check connection state and TTS flag after the sleep — a new TTS may have started
+            guard !self.isTTSSpeaking,
+                  self.appState.pythonBridge.connectionStatus == .connected else { return }
+            print("[JARVIS Voice] TTS done — resuming mic")
+            self.wakeWord.start()
         }
     }
 
