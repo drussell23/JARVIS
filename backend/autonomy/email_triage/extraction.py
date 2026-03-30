@@ -241,7 +241,13 @@ async def extract_features(
                 "details": details,
             })
             return heuristic
-        parsed = json.loads(response.content)
+        # Guard: empty or non-JSON content (router returned error string
+        # or empty body without setting source="degraded")
+        _content = getattr(response, "content", None) or ""
+        if not _content.strip() or not _content.strip().startswith("{"):
+            logger.debug("Extraction skipped — response content not JSON (len=%d)", len(_content))
+            return heuristic
+        parsed = json.loads(_content)
 
         # Contract validation (WS3)
         valid, warnings = _validate_extraction_contract(parsed)
