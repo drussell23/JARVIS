@@ -69,6 +69,12 @@ targets:
         CODE_SIGN_STYLE: Automatic
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         GENERATE_INFOPLIST_FILE: "YES"
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "JARVIS needs microphone access for voice commands — say Hey JARVIS to activate"
+        INFOPLIST_KEY_NSSpeechRecognitionUsageDescription: "JARVIS uses on-device speech recognition for wake word detection"
+    entitlements:
+      path: JARVISHUD/JARVISHUD.entitlements
+      properties:
+        com.apple.security.device.audio-input: true
 
 schemes:
   JARVISPhone:
