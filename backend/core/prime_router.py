@@ -446,21 +446,39 @@ class PrimeRouter:
             if self._initialized:
                 return
 
-            logger.info("[PrimeRouter] Initializing...")
+            # v310.0: When GCP is disabled and no remote target is configured,
+            # skip PrimeClient initialization entirely to avoid timeout spam.
+            _gcp_disabled = os.environ.get(
+                "JARVIS_GCP_ENABLED", "true"
+            ).lower() in ("false", "0", "no")
+            _has_remote_target = bool(
+                os.environ.get("JARVIS_PRIME_URL", "")
+                or os.environ.get("JARVIS_INVINCIBLE_NODE_IP", "")
+                or (os.environ.get("JARVIS_PRIME_HOST", "") not in ("", "localhost"))
+            )
 
-            # Initialize Prime client
-            try:
-                from backend.core.prime_client import get_prime_client
-                self._prime_client = await get_prime_client()
-                logger.info("[PrimeRouter] Prime client initialized")
-            except ImportError:
+            if _gcp_disabled and not _has_remote_target:
+                logger.info(
+                    "[PrimeRouter] GCP disabled, no remote target — "
+                    "skipping Prime client, cloud-only mode"
+                )
+                self._prime_client = None
+            else:
+                logger.info("[PrimeRouter] Initializing...")
+
+                # Initialize Prime client
                 try:
-                    from core.prime_client import get_prime_client
+                    from backend.core.prime_client import get_prime_client
                     self._prime_client = await get_prime_client()
-                    logger.info("[PrimeRouter] Prime client initialized (relative import)")
-                except Exception as e:
-                    logger.warning(f"[PrimeRouter] Could not initialize Prime client: {e}")
-                    self._prime_client = None
+                    logger.info("[PrimeRouter] Prime client initialized")
+                except ImportError:
+                    try:
+                        from core.prime_client import get_prime_client
+                        self._prime_client = await get_prime_client()
+                        logger.info("[PrimeRouter] Prime client initialized (relative import)")
+                    except Exception as e:
+                        logger.warning(f"[PrimeRouter] Could not initialize Prime client: {e}")
+                        self._prime_client = None
 
             # Initialize graceful degradation
             try:

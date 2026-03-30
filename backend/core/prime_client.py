@@ -628,6 +628,28 @@ class PrimeClient:
             if self._initialized:
                 return
 
+            # v310.0: Skip health monitor entirely when GCP is disabled.
+            # Without this guard, PrimeClient spams connection timeouts to
+            # localhost:8000 every boot when no J-Prime server is running.
+            _gcp_disabled = os.environ.get(
+                "JARVIS_GCP_ENABLED", "true"
+            ).lower() in ("false", "0", "no")
+            _prime_url = os.environ.get("JARVIS_PRIME_URL", "")
+            _prime_host = os.environ.get("JARVIS_PRIME_HOST", "")
+            _invincible_ip = os.environ.get("JARVIS_INVINCIBLE_NODE_IP", "")
+            _has_remote_target = bool(_prime_url or _invincible_ip or (
+                _prime_host and _prime_host != "localhost"
+            ))
+
+            if _gcp_disabled and not _has_remote_target:
+                self._status = PrimeStatus.UNAVAILABLE
+                self._initialized = True
+                logger.info(
+                    "[PrimeClient] GCP disabled, no remote target — "
+                    "skipping health monitor (status=unavailable)"
+                )
+                return
+
             await self._pool.initialize()
 
             # Pillar 2 (Progressive Awakening): Do NOT block boot on health check.
