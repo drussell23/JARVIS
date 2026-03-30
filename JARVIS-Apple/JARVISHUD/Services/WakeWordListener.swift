@@ -1,12 +1,14 @@
 /// WakeWordListener — Always-on "Hey JARVIS" detection via on-device speech recognition.
 /// Listens continuously for the wake word, then captures the command that follows.
 /// Uses AVAudioEngine + SFSpeechRecognizer (on-device, no data sent to Apple).
+///
+/// Threading: Audio engine and speech callbacks run on background threads.
+/// Only @Published properties are dispatched to main via DispatchQueue.main.async.
 import Foundation
 import Speech
 import AVFoundation
 
-@MainActor
-final class WakeWordListener: ObservableObject {
+final class WakeWordListener: ObservableObject, @unchecked Sendable {
     enum State: Equatable {
         case off
         case listening          // Waiting for wake word
@@ -17,21 +19,21 @@ final class WakeWordListener: ObservableObject {
     @Published var state: State = .off
     @Published var partialTranscript: String = ""
 
-    /// Called when a full command is captured after the wake word.
+    /// Called on the main thread when a full command is captured after the wake word.
     var onCommand: ((String) -> Void)?
 
     private let wakeWords = ["jarvis", "hey jarvis", "yo jarvis"]
     private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+
+    // Audio runs on a dedicated background queue — never on main
+    private let audioQueue = DispatchQueue(label: "com.jarvis.hud.audio", qos: .userInitiated)
     private var audioEngine: AVAudioEngine?
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var task: SFSpeechRecognitionTask?
     private var silenceTimer: Timer?
     private var isRunning = false
 
-    // After wake word detected, how long of silence before we finalize the command
     private let commandSilenceTimeout: TimeInterval = 2.0
-    // Max command duration after wake word
-    private let maxCommandDuration: TimeInterval = 15.0
 
     // MARK: - Lifecycle
 
@@ -43,34 +45,36 @@ final class WakeWordListener: ObservableObject {
 
     func stop() {
         isRunning = false
-        teardownAudio()
-        state = .off
-        partialTranscript = ""
+        audioQueue.async { [weak self] in
+            self?.teardownAudio()
+        }
+        DispatchQueue.main.async { [weak self] in
+            self?.state = .off
+            self?.partialTranscript = ""
+        }
     }
 
     // MARK: - Permission
 
     private func requestPermissionAndListen() {
         SFSpeechRecognizer.requestAuthorization { [weak self] status in
-            DispatchQueue.main.async {
-                guard let self, self.isRunning else { return }
-                if status == .authorized {
-                    print("[JARVIS Voice] Speech recognition authorized")
-                    self.startListeningCycle()
-                } else {
-                    print("[JARVIS Voice] Speech recognition denied (status: \(status.rawValue))")
-                    self.state = .off
-                }
+            guard let self, self.isRunning else { return }
+            if status == .authorized {
+                print("[JARVIS Voice] Speech recognition authorized")
+                self.audioQueue.async { self.startListeningCycle() }
+            } else {
+                print("[JARVIS Voice] Speech recognition denied (status: \(status.rawValue))")
+                DispatchQueue.main.async { self.state = .off }
             }
         }
     }
 
-    // MARK: - Listening cycle (restarts automatically)
+    // MARK: - Listening cycle (runs on audioQueue, restarts automatically)
 
     private func startListeningCycle() {
         guard isRunning, let recognizer, recognizer.isAvailable else {
             print("[JARVIS Voice] Recognizer not available, retrying in 5s...")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            audioQueue.asyncAfter(deadline: .now() + 5) { [weak self] in
                 self?.startListeningCycle()
             }
             return
@@ -81,55 +85,53 @@ final class WakeWordListener: ObservableObject {
         let engine = AVAudioEngine()
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
-        req.requiresOnDeviceRecognition = true // Privacy: never send audio to Apple
+        if #available(macOS 15, *) {
+            req.requiresOnDeviceRecognition = true
+        }
 
         let inputNode = engine.inputNode
         let format = inputNode.outputFormat(forBus: 0)
 
-        // Track whether we've found the wake word in this recognition session
         var wakeWordFound = false
         var commandStartIndex: String.Index?
 
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
+        let recognitionTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self else { return }
 
             if let result {
                 let text = result.bestTranscription.formattedString.lowercased()
 
-                DispatchQueue.main.async {
-                    if !wakeWordFound {
-                        // Phase 1: Scanning for wake word
-                        for wake in self.wakeWords {
-                            if let range = text.range(of: wake) {
-                                wakeWordFound = true
-                                commandStartIndex = range.upperBound
-                                self.state = .capturing
+                if !wakeWordFound {
+                    // Phase 1: Scanning for wake word
+                    for wake in self.wakeWords {
+                        if let range = text.range(of: wake) {
+                            wakeWordFound = true
+                            commandStartIndex = range.upperBound
+                            DispatchQueue.main.async { self.state = .capturing }
+                            self.resetSilenceTimer()
+                            print("[JARVIS Voice] Wake word detected!")
+
+                            let after = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                            if !after.isEmpty {
+                                DispatchQueue.main.async { self.partialTranscript = after }
                                 self.resetSilenceTimer()
-                                print("[JARVIS Voice] Wake word detected!")
-
-                                // Extract any command text that came with the wake word
-                                let after = String(text[range.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                                if !after.isEmpty {
-                                    self.partialTranscript = after
-                                    self.resetSilenceTimer()
-                                }
-                                break
                             }
+                            break
                         }
-                    } else if let startIdx = commandStartIndex {
-                        // Phase 2: Capturing command after wake word
-                        let command = String(text[startIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        self.partialTranscript = command
-                        self.resetSilenceTimer()
                     }
+                } else if let startIdx = commandStartIndex {
+                    // Phase 2: Capturing command after wake word
+                    let command = String(text[startIdx...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    DispatchQueue.main.async { self.partialTranscript = command }
+                    self.resetSilenceTimer()
+                }
 
-                    // If recognition is final, process what we have
-                    if result.isFinal && wakeWordFound {
+                if result.isFinal && wakeWordFound {
+                    DispatchQueue.main.async {
                         let command = self.partialTranscript
                         if !command.isEmpty {
                             self.finalizeCommand(command)
                         } else {
-                            // Wake word only, no command — restart
                             self.restartAfterCooldown()
                         }
                     }
@@ -137,10 +139,7 @@ final class WakeWordListener: ObservableObject {
             }
 
             if error != nil {
-                DispatchQueue.main.async {
-                    // Recognition timed out or errored — restart the cycle
-                    self.restartAfterCooldown()
-                }
+                self.audioQueue.async { self.restartAfterCooldown() }
             }
         }
 
@@ -153,7 +152,8 @@ final class WakeWordListener: ObservableObject {
             try engine.start()
             audioEngine = engine
             request = req
-            state = .listening
+            task = recognitionTask
+            DispatchQueue.main.async { self.state = .listening }
             print("[JARVIS Voice] Listening for wake word...")
         } catch {
             print("[JARVIS Voice] Audio engine failed: \(error)")
@@ -164,10 +164,10 @@ final class WakeWordListener: ObservableObject {
     // MARK: - Command finalization
 
     private func resetSilenceTimer() {
-        silenceTimer?.invalidate()
-        silenceTimer = Timer.scheduledTimer(withTimeInterval: commandSilenceTimeout, repeats: false) { [weak self] _ in
-            DispatchQueue.main.async {
-                guard let self, self.state == .capturing else { return }
+        DispatchQueue.main.async { [weak self] in
+            self?.silenceTimer?.invalidate()
+            self?.silenceTimer = Timer.scheduledTimer(withTimeInterval: self?.commandSilenceTimeout ?? 2.0, repeats: false) { [weak self] _ in
+                guard let self else { return }
                 let command = self.partialTranscript
                 if !command.isEmpty {
                     self.finalizeCommand(command)
@@ -182,31 +182,41 @@ final class WakeWordListener: ObservableObject {
         print("[JARVIS Voice] Command: \"\(command)\"")
         silenceTimer?.invalidate()
         silenceTimer = nil
-        teardownAudio()
-        state = .cooldown
-        partialTranscript = ""
 
-        onCommand?(command)
+        audioQueue.async { [weak self] in
+            self?.teardownAudio()
+        }
 
-        // Restart listening after a brief cooldown (let response play first)
-        restartAfterCooldown(delay: 3.0)
-    }
+        DispatchQueue.main.async { [weak self] in
+            self?.state = .cooldown
+            self?.partialTranscript = ""
+            self?.onCommand?(command)
+        }
 
-    private func restartAfterCooldown(delay: TimeInterval = 0.5) {
-        teardownAudio()
-        state = .cooldown
-        partialTranscript = ""
-        silenceTimer?.invalidate()
-        silenceTimer = nil
-
-        guard isRunning else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+        // Restart listening after cooldown
+        audioQueue.asyncAfter(deadline: .now() + 3.0) { [weak self] in
             guard let self, self.isRunning else { return }
             self.startListeningCycle()
         }
     }
 
-    // MARK: - Cleanup
+    private func restartAfterCooldown(delay: TimeInterval = 0.5) {
+        teardownAudio()
+        DispatchQueue.main.async { [weak self] in
+            self?.state = .cooldown
+            self?.partialTranscript = ""
+            self?.silenceTimer?.invalidate()
+            self?.silenceTimer = nil
+        }
+
+        guard isRunning else { return }
+        audioQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, self.isRunning else { return }
+            self.startListeningCycle()
+        }
+    }
+
+    // MARK: - Cleanup (call from audioQueue only)
 
     private func teardownAudio() {
         audioEngine?.stop()

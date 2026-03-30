@@ -192,7 +192,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &subs)
 
-        // Start listening once connected
+        // Start listening once connected to cloud
         appState.pythonBridge.$connectionStatus
             .receive(on: RunLoop.main)
             .sink { [weak self] status in
