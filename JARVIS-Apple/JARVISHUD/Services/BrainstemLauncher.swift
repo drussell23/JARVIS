@@ -46,17 +46,25 @@ final class BrainstemLauncher {
             return
         }
 
-        let envFilePath = repoRoot + "/brainstem/.env"
-        guard FileManager.default.fileExists(atPath: envFilePath) else {
-            print("[Brainstem] No brainstem/.env found at \(envFilePath) — skipping auto-launch")
+        let brainstemEnv = repoRoot + "/brainstem/.env"
+        guard FileManager.default.fileExists(atPath: brainstemEnv) else {
+            print("[Brainstem] No brainstem/.env found at \(brainstemEnv) — skipping auto-launch")
             return
         }
 
-        // Load env vars from brainstem/.env for the subprocess
+        // Layer env files: root .env (API keys) → backend/.env → brainstem/.env (connection creds)
+        // Later files override earlier ones, so brainstem-specific values always win.
         var env = ProcessInfo.processInfo.environment
-        if let envVars = loadEnvFile(path: envFilePath) {
-            for (key, value) in envVars {
-                env[key] = value
+        let envFiles = [
+            repoRoot + "/.env",
+            repoRoot + "/backend/.env",
+            brainstemEnv,
+        ]
+        for path in envFiles {
+            if let vars = loadEnvFile(path: path) {
+                for (key, value) in vars {
+                    env[key] = value
+                }
             }
         }
 
