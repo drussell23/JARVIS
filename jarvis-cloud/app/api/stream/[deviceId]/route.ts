@@ -46,7 +46,10 @@ export async function GET(
           const entryPairs = Object.entries(entries);
 
           for (const [id, fields] of entryPairs) {
-            const parsed = JSON.parse(fields.payload);
+            // Upstash REST auto-deserializes JSON — payload may be object or string
+            const parsed = typeof fields.payload === "string"
+              ? JSON.parse(fields.payload)
+              : fields.payload;
             controller.enqueue(encoder.encode(formatSSE(parsed.event, parsed.data, id)));
             cursor = id;
           }
