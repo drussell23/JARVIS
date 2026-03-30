@@ -123,8 +123,9 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
 
             if let error {
                 let nsError = error as NSError
-                // Only log real errors, not routine speech recognizer timeouts (code 203/216 = no speech detected)
-                let isRoutineTimeout = nsError.domain == "kAFAssistantErrorDomain" && [203, 216].contains(nsError.code)
+                // Only log real errors, not routine speech recognizer timeouts
+                let isRoutineTimeout = (nsError.domain == "kAFAssistantErrorDomain" && [203, 216, 1110].contains(nsError.code))
+                    || (nsError.domain == "kLSRErrorDomain" && nsError.code == 301) // recognition canceled (normal after finalize)
                 if !isRoutineTimeout {
                     print("[JARVIS Voice] Recognition ended: \(nsError.domain) code=\(nsError.code) — \(error.localizedDescription)")
                 }

@@ -166,13 +166,17 @@ class PythonBridge: ObservableObject {
         }
         hudState = .processing
         isActive = true
-        let result = try await sender.send(command, intentHint: intentHint)
 
-        // Track this command so we only speak responses to commands WE sent.
-        // Backlog-replayed events from old sessions won't be in this set.
-        if let id = result.commandId {
-            sessionCommandIds.insert(id)
-        }
+        // Generate command ID up front and register it BEFORE the network call.
+        // This prevents a race: SSE events (tokens + complete) arrive via Redis
+        // before the POST response returns, so handleComplete would skip speech
+        // if the ID wasn't already in sessionCommandIds.
+        let commandId = UUID().uuidString
+        sessionCommandIds.insert(commandId)
+        print("[JARVIS] Sending command \(commandId): \"\(command)\"")
+
+        let result = try await sender.send(command, commandId: commandId, intentHint: intentHint)
+        print("[JARVIS] Command acknowledged — status: \(result.status)")
     }
 
     func startVision() { isVisionActive = true }

@@ -9,8 +9,9 @@ public final class CommandSender: Sendable {
         self.auth = auth
     }
 
-    public func send(_ text: String, priority: Priority = .realtime, responseMode: ResponseMode = .stream, intentHint: String? = nil, context: CommandContext? = nil) async throws -> CommandResponse {
+    public func send(_ text: String, commandId: String? = nil, priority: Priority = .realtime, responseMode: ResponseMode = .stream, intentHint: String? = nil, context: CommandContext? = nil) async throws -> CommandResponse {
         var payload = CommandPayload(
+            commandId: commandId ?? UUID().uuidString,
             deviceId: auth.deviceId,
             deviceType: auth.deviceType,
             text: text,

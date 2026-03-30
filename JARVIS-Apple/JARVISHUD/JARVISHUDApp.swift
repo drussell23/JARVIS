@@ -49,7 +49,15 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
         wakeWord.onCommand = { [weak self] command in
             guard let self else { return }
             print("[JARVIS] Voice command: \"\(command)\"")
-            Task { try? await self.appState.pythonBridge.sendCommand(command) }
+            Task {
+                do {
+                    try await self.appState.pythonBridge.sendCommand(command)
+                    print("[JARVIS] Command sent successfully")
+                } catch {
+                    print("[JARVIS] Command failed: \(error)")
+                    self.speak("Sorry, I couldn't reach the cloud. Try again.")
+                }
+            }
         }
 
         // Start wake word listening once cloud connects
