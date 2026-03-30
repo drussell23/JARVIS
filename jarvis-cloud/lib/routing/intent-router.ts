@@ -17,14 +17,22 @@ const TIER_0_ROUTES: RouteRule[] = [
   { pattern: /screenshot|screen capture|visual/i, brain: "doubleword_235b", mode: "batch", model: "Qwen/Qwen3.5-235B-Vision", system_prompt_key: "vision", estimated_latency: "minutes" },
 ];
 
-const CLAUDE_DEFAULT: RoutingDecision = {
+// Haiku for real-time conversation (fast, cheap: $0.25/$1.25 per 1M)
+// Sonnet reserved for complex tasks that need deeper reasoning
+const CLAUDE_HAIKU_DEFAULT: RoutingDecision = {
   brain: "claude",
   mode: "stream",
-  model: "claude-sonnet-4-6",
+  model: "claude-haiku-4-5-20251001",
   fan_out: [],
   system_prompt_key: "jarvis",
   estimated_latency: "realtime",
 };
+
+// Sonnet for commands that need more reasoning but still real-time
+const CLAUDE_SONNET_ROUTES: RouteRule[] = [
+  { pattern: /^(explain|debug|review|refactor|fix|architect)/i, brain: "claude", mode: "stream", model: "claude-sonnet-4-6", system_prompt_key: "jarvis", estimated_latency: "realtime" },
+  { pattern: /\b(why|how does|what causes|trade.?offs?)\b.*\?$/i, brain: "claude", mode: "stream", model: "claude-sonnet-4-6", system_prompt_key: "jarvis", estimated_latency: "realtime" },
+];
 
 export function resolveRoute(payload: CommandPayload): RoutingDecision {
   // Fast-path: trusted intent_hint skips regex
@@ -55,6 +63,20 @@ export function resolveRoute(payload: CommandPayload): RoutingDecision {
     }
   }
 
-  // Default: Claude streaming
-  return { ...CLAUDE_DEFAULT };
+  // Tier 0.5: Sonnet for complex real-time tasks
+  for (const rule of CLAUDE_SONNET_ROUTES) {
+    if (rule.pattern.test(payload.text)) {
+      return {
+        brain: rule.brain,
+        mode: rule.mode,
+        model: rule.model,
+        fan_out: [],
+        system_prompt_key: rule.system_prompt_key,
+        estimated_latency: rule.estimated_latency,
+      };
+    }
+  }
+
+  // Default: Haiku streaming (fast + cheap for conversation)
+  return { ...CLAUDE_HAIKU_DEFAULT };
 }

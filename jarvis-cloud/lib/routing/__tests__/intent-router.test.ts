@@ -48,10 +48,31 @@ describe("resolveRoute — Tier 0", () => {
     expect(decision.mode).toBe("batch");
   });
 
-  it("defaults unmatched text to claude streaming", () => {
+  it("defaults unmatched text to claude haiku streaming", () => {
     const decision = resolveRoute(makePayload({ text: "what's the weather today?" }));
     expect(decision.brain).toBe("claude");
     expect(decision.mode).toBe("stream");
+    expect(decision.model).toBe("claude-haiku-4-5-20251001");
+  });
+
+  it("routes 'explain' to claude sonnet streaming", () => {
+    const decision = resolveRoute(makePayload({ text: "explain how the auth module works" }));
+    expect(decision.brain).toBe("claude");
+    expect(decision.mode).toBe("stream");
+    expect(decision.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("routes 'why' questions to claude sonnet", () => {
+    const decision = resolveRoute(makePayload({ text: "why does the boot take so long?" }));
+    expect(decision.brain).toBe("claude");
+    expect(decision.mode).toBe("stream");
+    expect(decision.model).toBe("claude-sonnet-4-6");
+  });
+
+  it("routes simple hello to haiku (not sonnet)", () => {
+    const decision = resolveRoute(makePayload({ text: "hello jarvis" }));
+    expect(decision.brain).toBe("claude");
+    expect(decision.model).toBe("claude-haiku-4-5-20251001");
   });
 
   it("honors trusted intent_hint (short-circuits regex)", () => {
