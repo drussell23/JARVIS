@@ -27,6 +27,18 @@ export async function POST(req: Request): Promise<Response> {
 
   // 3. HMAC verification
   const secret = await deriveDeviceSecret(payload.device_id, device.hkdf_version);
+  // DEBUG: temporary logging to diagnose HMAC mismatch
+  const { canonicalize, signPayload } = await import("@/lib/auth/hmac");
+  const debugCanonical = canonicalize(payload);
+  const debugExpected = signPayload(payload, secret);
+  console.log("[DEBUG] HMAC check:", JSON.stringify({
+    secret_prefix: secret.slice(0, 16),
+    canonical_len: debugCanonical.length,
+    canonical_preview: debugCanonical.slice(0, 80),
+    expected_sig: debugExpected.slice(0, 16),
+    received_sig: payload.signature.slice(0, 16),
+    master_secret_len: (process.env.JARVIS_MASTER_SECRET ?? "").length,
+  }));
   if (!verifyHMAC(payload, secret)) {
     return new Response("Invalid signature", { status: 401 });
   }
