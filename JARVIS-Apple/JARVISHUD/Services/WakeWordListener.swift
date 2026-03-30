@@ -25,6 +25,10 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
     private var silenceTimer: Timer?
     private var isRunning = false
     private let commandSilenceTimeout: TimeInterval = 2.5
+    // Incremented on every teardown. Recognition task callbacks capture the generation
+    // value at creation time and bail out if it no longer matches — this prevents the
+    // cancelled-task callback from racing with the newly-started task and killing it.
+    private var listenerGeneration = 0
 
     // MARK: - Lifecycle
 
@@ -64,6 +68,10 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
 
         teardown()
 
+        // Snapshot generation AFTER teardown (which incremented it). This task owns
+        // this value; any callback firing with a different generation is stale and ignored.
+        let generation = listenerGeneration
+
         let engine = AVAudioEngine()
         let req = SFSpeechAudioBufferRecognitionRequest()
         req.shouldReportPartialResults = true
@@ -90,11 +98,13 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
         var wakeEndOffset = 0
 
         recognitionTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
-            guard let self else { return }
+            guard let self, self.listenerGeneration == generation else { return }
 
             if let result {
                 let fullText = result.bestTranscription.formattedString
                 let lower = fullText.lowercased()
+                // Log every partial so we can confirm audio is flowing
+                print("[JARVIS Voice] [\(result.isFinal ? "FINAL" : "partial")] \"\(fullText)\"")
 
                 if !wakeWordFound {
                     // Phase 1: scan for wake word
@@ -277,6 +287,7 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
     }
 
     private func teardown() {
+        listenerGeneration += 1     // Must be first — any in-flight callback reads this
         audioEngine?.stop()
         audioEngine?.inputNode.removeTap(onBus: 0)
         request?.endAudio()
