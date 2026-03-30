@@ -1,113 +1,159 @@
-/// ScreenCaptureService — Async VLA screenshot capture via ScreenCaptureKit.
-/// Captures main display → resizes to 1280px wide → JPEG base64.
-/// Requires Screen Recording permission (TCC). Returns nil gracefully if not granted.
+/// ScreenCaptureService — Always-on SCStream for continuous VLA.
+/// Maintains a persistent ScreenCaptureKit stream at 1 fps. The macOS purple recording
+/// indicator stays visible, confirming JARVIS's eyes are open. Voice commands grab the
+/// latest cached frame instantly (no capture delay).
 import Foundation
 import ScreenCaptureKit
 import CoreGraphics
 import ImageIO
+import os
 
-struct ScreenCaptureService: Sendable {
+@available(macOS 14.0, *)
+final class ScreenCaptureService: NSObject, SCStreamOutput, @unchecked Sendable {
     static let shared = ScreenCaptureService()
+
+    /// True when the stream is actively capturing frames.
+    private(set) var isStreaming = false
 
     // MARK: - Permission
 
-    /// True if Screen Recording permission has been granted.
     var hasPermission: Bool {
         CGPreflightScreenCaptureAccess()
     }
 
-    /// Trigger the ScreenCaptureKit permission dialog at startup.
-    /// SCShareableContent.excludingDesktopWindows() surfaces the proper macOS TCC dialog
-    /// (CGRequestScreenCaptureAccess just silently opens System Settings without a prompt).
     func requestPermission() {
         if hasPermission { return }
         Task.detached {
             do {
-                // This call triggers the system "Screen Recording" permission dialog on macOS 14+.
                 _ = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 print("[JARVIS Vision] Screen Recording permission granted")
             } catch {
-                print("[JARVIS Vision] Screen Recording permission not yet granted — user must enable in System Settings > Privacy & Security > Screen Recording")
+                print("[JARVIS Vision] Screen Recording not yet granted — enable in System Settings > Privacy & Security > Screen Recording")
             }
         }
     }
 
-    // MARK: - Capture
+    // MARK: - Stream lifecycle
 
-    /// Captures the main display and returns a base64 JPEG string, or nil on failure.
-    /// All heavy work runs on a background Task — never blocks @MainActor.
-    /// If permission hasn't been granted, attempts the capture anyway — SCShareableContent
-    /// triggers the permission dialog automatically on first use.
+    private var stream: SCStream?
+    /// Swift 6-safe lock for the cached frame (OSAllocatedUnfairLock.withLock is async-context safe)
+    private let frameStore = OSAllocatedUnfairLock<CGImage?>(initialState: nil)
+
+    /// Start the persistent screen stream. Call once at app boot.
+    /// The macOS purple recording indicator appears automatically.
+    func startStream() {
+        guard !isStreaming else { return }
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                guard let display = content.displays.first else {
+                    print("[JARVIS Vision] No display found — cannot start stream")
+                    return
+                }
+
+                let config = SCStreamConfiguration()
+                config.width = 1280
+                let aspect = CGFloat(display.height) / CGFloat(display.width)
+                config.height = max(1, Int(1280.0 * aspect))
+                config.capturesAudio = false
+                config.showsCursor = false
+                // 1 fps — enough for voice-command context, minimal CPU
+                config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+
+                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let newStream = SCStream(filter: filter, configuration: config, delegate: nil)
+                try newStream.addStreamOutput(self, type: .screen, sampleHandlerQueue: .global(qos: .utility))
+                try await newStream.startCapture()
+
+                self.stream = newStream
+                self.isStreaming = true
+                print("[JARVIS Vision] Stream started — 1fps, \(config.width)×\(config.height), purple indicator active")
+            } catch {
+                print("[JARVIS Vision] Stream start failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func stopStream() {
+        guard isStreaming, let stream else { return }
+        Task {
+            try? await stream.stopCapture()
+            self.stream = nil
+            self.isStreaming = false
+            frameStore.withLock { $0 = nil }
+            print("[JARVIS Vision] Stream stopped")
+        }
+    }
+
+    // MARK: - SCStreamOutput (frame callback — runs on utility queue)
+
+    nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen else { return }
+        guard let imageBuffer = sampleBuffer.imageBuffer else { return }
+
+        let ciImage = CIImage(cvImageBuffer: imageBuffer)
+        let ctx = CIContext()
+        let rect = CGRect(x: 0, y: 0,
+                          width: CVPixelBufferGetWidth(imageBuffer),
+                          height: CVPixelBufferGetHeight(imageBuffer))
+        guard let cgImage = ctx.createCGImage(ciImage, from: rect) else { return }
+
+        frameStore.withLock { $0 = cgImage }
+    }
+
+    // MARK: - Public API
+
+    /// Returns the latest streamed frame as base64 JPEG, or falls back to one-shot.
     func captureBase64() async -> String? {
-        print("[JARVIS Vision] captureBase64() called — hasPermission=\(hasPermission)")
-        guard #available(macOS 14.0, *) else {
-            print("[JARVIS Vision] SCScreenshotManager requires macOS 14+")
-            return nil
+        // Fast path: grab cached frame from stream (instant, no API call)
+        let cached = frameStore.withLock { $0 }
+
+        if let cached {
+            if let result = encodeJPEGBase64(cached) {
+                print("[JARVIS Vision] Frame from stream — \(cached.width)×\(cached.height), \(result.count) chars")
+                return result
+            }
         }
-        let result = await _capture()
-        print("[JARVIS Vision] captureBase64() result: \(result != nil ? "\(result!.count) chars" : "nil")")
-        return result
+
+        // Slow path: stream not running yet — one-shot capture
+        print("[JARVIS Vision] No cached frame — one-shot fallback")
+        return await oneShotCapture()
     }
 
-    // MARK: - Private
+    // MARK: - One-shot fallback
 
-    @available(macOS 14.0, *)
-    private func _capture() async -> String? {
+    private func oneShotCapture() async -> String? {
         do {
-            print("[JARVIS Vision] _capture() starting — querying SCShareableContent...")
-            // Discover all shareable content (displays, windows)
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                false,
-                onScreenWindowsOnly: true
-            )
-            print("[JARVIS Vision] Found \(content.displays.count) display(s), \(content.windows.count) window(s)")
-            guard let display = content.displays.first else {
-                print("[JARVIS Vision] No display found via SCShareableContent")
-                return nil
-            }
-
-            // Target 1280px wide — keeps base64 payload under ~300KB
-            let targetWidth = 1280
-            let aspectRatio = CGFloat(display.height) / CGFloat(display.width)
-            let targetHeight = max(1, Int(CGFloat(targetWidth) * aspectRatio))
+            let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard let display = content.displays.first else { return nil }
 
             let config = SCStreamConfiguration()
-            config.width = targetWidth
-            config.height = targetHeight
+            config.width = 1280
+            let aspect = CGFloat(display.height) / CGFloat(display.width)
+            config.height = max(1, Int(1280.0 * aspect))
             config.capturesAudio = false
             config.showsCursor = false
 
             let filter = SCContentFilter(display: display, excludingWindows: [])
-            let cgImage = try await SCScreenshotManager.captureImage(
-                contentFilter: filter,
-                configuration: config
-            )
-
-            return _encodeJPEGBase64(cgImage)
+            let cgImage = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            if let result = encodeJPEGBase64(cgImage) {
+                print("[JARVIS Vision] One-shot \(cgImage.width)×\(cgImage.height), \(result.count) chars")
+                return result
+            }
+            return nil
         } catch {
-            print("[JARVIS Vision] Capture failed: \(error.localizedDescription)")
+            print("[JARVIS Vision] One-shot failed: \(error.localizedDescription)")
             return nil
         }
     }
 
-    private func _encodeJPEGBase64(_ cgImage: CGImage) -> String? {
-        let buffer = NSMutableData()
-        guard let dest = CGImageDestinationCreateWithData(
-            buffer,
-            "public.jpeg" as CFString,
-            1,
-            nil
-        ) else { return nil }
+    // MARK: - JPEG encoding
 
-        CGImageDestinationAddImage(
-            dest,
-            cgImage,
-            [kCGImageDestinationLossyCompressionQuality: 0.6] as CFDictionary
-        )
+    private func encodeJPEGBase64(_ cgImage: CGImage) -> String? {
+        let buf = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(buf, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.6] as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
-
-        let base64 = (buffer as Data).base64EncodedString()
-        print("[JARVIS Vision] Captured \(cgImage.width)×\(cgImage.height) — \(buffer.length / 1024)KB → \(base64.count / 1024)KB base64")
-        return base64
+        return (buf as Data).base64EncodedString()
     }
 }

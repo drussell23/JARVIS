@@ -36,9 +36,10 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             self.terminateOlderInstancesIfNeeded()
             self.setupMenuBar()
             self.setupVoice()
-            // Request Screen Recording permission early — surfaces the TCC dialog
-            // before the first voice command so capture is ready when needed.
+            // Request Screen Recording permission early, then start persistent stream.
+            // The stream shows the macOS purple recording indicator — JARVIS's eyes are open.
             ScreenCaptureService.shared.requestPermission()
+            ScreenCaptureService.shared.startStream()
             self.appState.boot()
         }
     }
@@ -234,7 +235,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
     }
 
     @objc private func toggleHUD() { if hudVisible { hideHUD() } else { showHUD() } }
-    @objc private func quitApp() { appState.pythonBridge.shutdown(); NSApp.terminate(nil) }
+    @objc private func quitApp() { ScreenCaptureService.shared.stopStream(); appState.pythonBridge.shutdown(); NSApp.terminate(nil) }
 
     // MARK: - Icon
 
