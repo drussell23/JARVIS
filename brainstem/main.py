@@ -129,20 +129,25 @@ async def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    # --- Inline SSE smoke test (runs before tasks, logging is proven here) ---
+    import aiohttp as _aiohttp
+    logger.info("[Main] Testing SSE token request to %s ...", config.vercel_url)
+    try:
+        async with _aiohttp.ClientSession() as _sess:
+            _token = await asyncio.wait_for(
+                auth.get_stream_token(_sess, config.vercel_url), timeout=15,
+            )
+            logger.info("[Main] SSE token OK: %s...", _token[:8] if _token else "NONE")
+    except Exception as _e:
+        logger.error("[Main] SSE token FAILED: %s: %s", type(_e).__name__, _e)
+
     logger.info("[Main] Starting SSE consumer + voice intake...")
     try:
-        consumer_task = asyncio.create_task(consumer.run(shutdown))
-        voice_task = asyncio.create_task(voice.run(shutdown))
-
-        # Monitor consumer task — log immediately if it dies
-        async def _watch_consumer() -> None:
-            try:
-                await consumer_task
-            except Exception as exc:
-                logger.error("[Main] SSE consumer DIED: %s: %s", type(exc).__name__, exc)
-
-        asyncio.create_task(_watch_consumer())
-        await voice_task
+        await asyncio.gather(
+            consumer.run(shutdown),
+            voice.run(shutdown),
+            return_exceptions=True,
+        )
     finally:
         hud.show_status("Shutting down...")
         await sender.close()
