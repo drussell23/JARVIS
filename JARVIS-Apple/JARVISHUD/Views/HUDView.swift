@@ -8,14 +8,7 @@
 
 import SwiftUI
 
-/// Main HUD state
-enum HUDState {
-    case offline
-    case listening
-    case processing
-    case speaking
-    case idle
-}
+// HUDState and TranscriptMessage are defined in AppState.swift
 
 /// Voice interaction state
 enum VoiceState {
@@ -34,19 +27,6 @@ struct VoiceStatus {
     static let waitingForWakeWord = VoiceStatus(state: .waitingForWakeWord, message: "Say \"Hey JARVIS\"")
     static let listeningForCommand = VoiceStatus(state: .listeningForCommand, message: "Listening...")
     static let processing = VoiceStatus(state: .processing, message: "Processing...")
-}
-
-/// Transcript message
-struct TranscriptMessage: Identifiable, Equatable {
-    let id = UUID()
-    let speaker: String // "YOU" or "JARVIS"
-    let text: String
-    let timestamp: Date
-
-    // Equatable conformance (required for onChange)
-    static func == (lhs: TranscriptMessage, rhs: TranscriptMessage) -> Bool {
-        lhs.id == rhs.id
-    }
 }
 
 /// Main JARVIS HUD View - Matches web app exactly
@@ -342,17 +322,15 @@ struct HUDView: View {
     private func sendCommand() {
         // Handle command sending via PythonBridge
         if !commandText.isEmpty {
-            // Add to local transcript immediately for responsive UI
+            // Add to transcript immediately for responsive UI
             let message = TranscriptMessage(speaker: "YOU", text: commandText, timestamp: Date())
-            transcriptMessages.append(message)
+            pythonBridge.transcriptMessages.append(message)
 
             // Send to backend via HTTP API
             Task {
                 do {
                     try await pythonBridge.sendCommand(commandText)
-                    print("✅ Command sent to backend: \(commandText)")
                 } catch {
-                    print("❌ Failed to send command: \(error)")
                     statusText = "ERROR: Failed to send command"
                 }
             }

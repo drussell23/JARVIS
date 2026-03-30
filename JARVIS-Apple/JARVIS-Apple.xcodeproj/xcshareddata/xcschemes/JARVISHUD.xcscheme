@@ -63,6 +63,23 @@
       </BuildableProductRunnable>
       <CommandLineArguments>
       </CommandLineArguments>
+      <EnvironmentVariables>
+         <EnvironmentVariable
+            key = "JARVIS_DEVICE_ID"
+            value = "mac-m1-derek"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "JARVIS_DEVICE_SECRET"
+            value = "b110e2fd04a9baf2d5923373929af3a06e7abac06168120f063a05329de7151d"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "JARVIS_VERCEL_URL"
+            value = "https://jarvis-cloud-five.vercel.app"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+      </EnvironmentVariables>
    </LaunchAction>
    <ProfileAction
       buildConfiguration = "Release"
