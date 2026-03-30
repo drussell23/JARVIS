@@ -43,7 +43,12 @@ export async function POST(req: Request): Promise<Response> {
   if (decision.mode === "local") {
     // VLA Local: emit action event for brainstem to pick up via SSE.
     // JarvisCU on the Mac plans + executes using the screenshot and 3-layer cascade.
-    await publishToDevices(decision.fan_out, {
+    // Guarantee the sender's brainstem receives the event even if devices:active_list
+    // is empty (e.g. device was registered manually, not through /api/devices/pair).
+    const targets = decision.fan_out.length > 0
+      ? decision.fan_out
+      : [{ device_id: payload.device_id, channel: "redis" as const, role: "executor" as const }];
+    await publishToDevices(targets, {
       event: "action",
       data: {
         command_id: payload.command_id,
@@ -55,7 +60,7 @@ export async function POST(req: Request): Promise<Response> {
         },
       },
     });
-    await publishToDevices(decision.fan_out, {
+    await publishToDevices(targets, {
       event: "status",
       data: {
         command_id: payload.command_id,

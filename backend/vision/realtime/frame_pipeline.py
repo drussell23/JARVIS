@@ -614,8 +614,12 @@ class FramePipeline:
         # finds the old stale one first, fails, and falls back to 3fps CG.
         ShmFrameReader.cleanup_stale()
 
-        # Phase 1: Start SCK background thread
-        if not self._start_sck_background_thread():
+        # Phase 1: Start SCK background thread.
+        # _start_sck_background_thread() blocks for up to 5s on a threading.Event
+        # wait. Run it in a thread executor so it doesn't freeze the event loop
+        # (which would starve SSE consumer, voice intake, and other async tasks).
+        started = await asyncio.to_thread(self._start_sck_background_thread)
+        if not started:
             raise RuntimeError("SCK background thread failed to start")
 
         # Phase 2: Open SHM reader
