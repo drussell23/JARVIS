@@ -51,7 +51,11 @@ class BrainstemAuth:
             "response_mode": "stream",
         }
         body["signature"] = self.sign(body)
-        async with session.post(f"{vercel_url}/api/stream/token", json=body) as resp:
+        url = f"{vercel_url}/api/stream/token"
+        timeout = aiohttp.ClientTimeout(total=15, connect=10)
+        logger.info("[Auth] Requesting stream token from %s", url)
+        async with session.post(url, json=body, timeout=timeout) as resp:
+            logger.info("[Auth] Token response: %d", resp.status)
             if resp.status != 200:
                 text = await resp.text()
                 raise RuntimeError(f"Stream token request failed ({resp.status}): {text}")

@@ -50,9 +50,7 @@ class SSEConsumer:
     _consecutive_failures: int = field(default=0, init=False)
 
     async def run(self, shutdown: asyncio.Event) -> None:
-        import sys
-        print("[SSE] Consumer starting...", flush=True)
-        print(f"[SSE] Target: {self.config.vercel_url}", flush=True, file=sys.stderr)
+        logger.info("[SSE] Consumer starting (target=%s)", self.config.vercel_url)
         self._session = aiohttp.ClientSession()
         try:
             while not shutdown.is_set():
@@ -87,7 +85,8 @@ class SSEConsumer:
         if self._last_event_id:
             headers["Last-Event-ID"] = self._last_event_id
         logger.info("[SSE] Connecting to %s", url.split("?")[0])
-        async with self._session.get(url, headers=headers, timeout=None) as resp:
+        connect_timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_read=None)
+        async with self._session.get(url, headers=headers, timeout=connect_timeout) as resp:
             if resp.status == 401:
                 raise aiohttp.ClientError("401 Unauthorized")
             resp.raise_for_status()
