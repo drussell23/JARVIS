@@ -416,35 +416,27 @@ class PythonBridge: ObservableObject {
     }
 
     private func loadCredentials() -> HUDCredentials? {
-        // If keychain is empty, try seeding from brainstem/.env
-        if KeychainStore.load(key: "device_id") == nil {
-            seedKeychainFromBrainstemEnv()
+        // Priority: Environment → brainstem/.env file (no Keychain — avoids password prompts)
+        if let id = ProcessInfo.processInfo.environment["JARVIS_DEVICE_ID"],
+           let secret = ProcessInfo.processInfo.environment["JARVIS_DEVICE_SECRET"] {
+            let url = ProcessInfo.processInfo.environment["JARVIS_VERCEL_URL"] ?? "https://jarvis-cloud-five.vercel.app"
+            print("[JARVIS] Credentials from environment for device: \(id)")
+            return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: url)
         }
 
-        // Priority: Keychain → Environment
-        let deviceId = KeychainStore.load(key: "device_id")
-            ?? ProcessInfo.processInfo.environment["JARVIS_DEVICE_ID"]
-        let deviceSecret = KeychainStore.load(key: "device_secret")
-            ?? ProcessInfo.processInfo.environment["JARVIS_DEVICE_SECRET"]
-        let baseURL = KeychainStore.load(key: "vercel_url")
-            ?? ProcessInfo.processInfo.environment["JARVIS_VERCEL_URL"]
-            ?? "https://jarvis-cloud-five.vercel.app"
-
-        guard let id = deviceId, let secret = deviceSecret else {
-            print("[JARVIS] No credentials found in Keychain or environment.")
-            return nil
+        // Auto-discover from brainstem/.env
+        if let creds = loadFromBrainstemEnv() {
+            print("[JARVIS] Credentials from brainstem/.env for device: \(creds.deviceId)")
+            return creds
         }
 
-        print("[JARVIS] Credentials loaded for device: \(id)")
-        return HUDCredentials(deviceId: id, deviceSecret: secret, baseURL: baseURL)
+        print("[JARVIS] No credentials found. Create brainstem/.env with JARVIS_DEVICE_ID and JARVIS_DEVICE_SECRET.")
+        return nil
     }
 
-    /// Seeds keychain from brainstem/.env file (auto-discovers repo root).
-    /// The app writes its own keychain entries → no password prompts.
-    private func seedKeychainFromBrainstemEnv() {
-        // Walk up from the app bundle to find the repo root with brainstem/.env
+    /// Reads credentials directly from brainstem/.env — no Keychain, no prompts.
+    private func loadFromBrainstemEnv() -> HUDCredentials? {
         let candidates = [
-            // When run from Xcode, the binary is deep in DerivedData — check common repo locations
             NSHomeDirectory() + "/Documents/repos/JARVIS-AI-Agent/brainstem/.env",
             FileManager.default.currentDirectoryPath + "/brainstem/.env",
             FileManager.default.currentDirectoryPath + "/../brainstem/.env",
@@ -460,11 +452,9 @@ class PythonBridge: ObservableObject {
 
         guard let path = envPath,
               let contents = try? String(contentsOfFile: path, encoding: .utf8) else {
-            print("[JARVIS] brainstem/.env not found — cannot auto-seed keychain")
-            return
+            return nil
         }
 
-        // Parse KEY=VALUE lines
         var env: [String: String] = [:]
         for line in contents.components(separatedBy: "\n") {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
@@ -476,18 +466,16 @@ class PythonBridge: ObservableObject {
             env[key] = value
         }
 
-        // Write to keychain (app-owned → no password prompts)
-        if let id = env["JARVIS_DEVICE_ID"] {
-            _ = KeychainStore.save(key: "device_id", value: id)
-        }
-        if let secret = env["JARVIS_DEVICE_SECRET"] {
-            _ = KeychainStore.save(key: "device_secret", value: secret)
-        }
-        if let url = env["JARVIS_VERCEL_URL"] {
-            _ = KeychainStore.save(key: "vercel_url", value: url)
+        guard let id = env["JARVIS_DEVICE_ID"],
+              let secret = env["JARVIS_DEVICE_SECRET"] else {
+            return nil
         }
 
-        print("[JARVIS] Keychain seeded from brainstem/.env")
+        return HUDCredentials(
+            deviceId: id,
+            deviceSecret: secret,
+            baseURL: env["JARVIS_VERCEL_URL"] ?? "https://jarvis-cloud-five.vercel.app"
+        )
     }
 }
 
