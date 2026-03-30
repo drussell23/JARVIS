@@ -1,8 +1,8 @@
 export type DeviceType = "watch" | "iphone" | "mac" | "browser";
 export type Priority = "realtime" | "background" | "deferred";
 export type ResponseMode = "stream" | "notify";
-export type BrainId = "claude" | "doubleword_397b" | "doubleword_235b";
-export type RoutingMode = "stream" | "batch";
+export type BrainId = "claude" | "doubleword_397b" | "doubleword_235b" | "vla_local";
+export type RoutingMode = "stream" | "batch" | "local";
 export type DeviceRole = "executor" | "observer";
 export type FanOutChannel = "redis" | "queue";
 

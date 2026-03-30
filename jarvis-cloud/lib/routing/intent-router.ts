@@ -1,11 +1,22 @@
 // jarvis-cloud/lib/routing/intent-router.ts
 import type { CommandPayload, RoutingDecision, BrainId, RouteRule } from "./types";
 
+/**
+ * Action-intent pattern: detects commands that require physical screen interaction.
+ * These route to the local Python VLA backend (JarvisCU) instead of Claude Vision.
+ *
+ * Matches: "click the search bar", "open Safari", "type hello", "scroll down",
+ *          "press enter", "select all text", "close this window", "minimize", "drag"
+ */
+const ACTION_INTENT_PATTERN =
+  /\b(click|tap|press|open|launch|type|enter|scroll|drag|swipe|select|close|minimize|maximize|switch to|go to|navigate to|move to|send|submit|toggle|check|uncheck|expand|collapse)\b/i;
+
 const TRUSTED_HINTS: Record<string, { brain: BrainId; mode: "batch" }> = {
   ouroboros_scan: { brain: "doubleword_397b", mode: "batch" },
   ouroboros_review: { brain: "doubleword_397b", mode: "batch" },
   deep_analysis: { brain: "doubleword_397b", mode: "batch" },
   vision_capture: { brain: "doubleword_235b", mode: "batch" },
+  vision_action: { brain: "vla_local", mode: "local" as any },
   code_generation: { brain: "doubleword_397b", mode: "batch" },
 };
 
@@ -77,9 +88,22 @@ export function resolveRoute(payload: CommandPayload): RoutingDecision {
     }
   }
 
-  // VLA: screenshot present → upgrade to Sonnet with vision prompt for better visual reasoning.
-  // Haiku can handle vision but Sonnet produces significantly better spatial understanding
-  // and action recommendations. This fires regardless of command text.
+  // VLA Action Tier: screenshot present + action-intent → route to local Python VLA backend.
+  // JarvisCU plans via Claude Vision, executes via 3-layer cascade (Accessibility → Doubleword → Claude),
+  // and controls the screen via Ghost Hands. This bypasses Vercel for execution — brainstem handles it.
+  if (payload.context?.screenshot && ACTION_INTENT_PATTERN.test(payload.text)) {
+    return {
+      brain: "vla_local",
+      mode: "local",
+      model: "jarvis-cu-cascade",
+      fan_out: [],
+      system_prompt_key: "vision",
+      estimated_latency: "realtime",
+    };
+  }
+
+  // VLA Awareness Tier: screenshot present but NOT an action → Claude Sonnet for description/analysis.
+  // Haiku can handle vision but Sonnet produces significantly better spatial understanding.
   if (payload.context?.screenshot) {
     return {
       brain: "claude",
