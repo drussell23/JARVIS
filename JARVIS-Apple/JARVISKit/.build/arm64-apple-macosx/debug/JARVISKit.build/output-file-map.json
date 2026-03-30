@@ -1,0 +1,54 @@
+{
+  "": {
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/master.swiftdeps"
+  },
+  "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/Sources/JARVISKit/Auth/DeviceAuth.swift": {
+    "dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/DeviceAuth.d",
+    "object": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/DeviceAuth.swift.o",
+    "swiftmodule": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/DeviceAuth~partial.swiftmodule",
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/DeviceAuth.swiftdeps",
+    "diagnostics": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/DeviceAuth.dia"
+  },
+  "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/Sources/JARVISKit/Auth/KeychainStore.swift": {
+    "dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/KeychainStore.d",
+    "object": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/KeychainStore.swift.o",
+    "swiftmodule": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/KeychainStore~partial.swiftmodule",
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/KeychainStore.swiftdeps",
+    "diagnostics": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/KeychainStore.dia"
+  },
+  "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/Sources/JARVISKit/Auth/StreamToken.swift": {
+    "dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/StreamToken.d",
+    "object": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/StreamToken.swift.o",
+    "swiftmodule": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/StreamToken~partial.swiftmodule",
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/StreamToken.swiftdeps",
+    "diagnostics": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/StreamToken.dia"
+  },
+  "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/Sources/JARVISKit/Networking/APITypes.swift": {
+    "dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/APITypes.d",
+    "object": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/APITypes.swift.o",
+    "swiftmodule": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/APITypes~partial.swiftmodule",
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/APITypes.swiftdeps",
+    "diagnostics": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/APITypes.dia"
+  },
+  "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/Sources/JARVISKit/Networking/CommandSender.swift": {
+    "dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/CommandSender.d",
+    "object": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/CommandSender.swift.o",
+    "swiftmodule": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/CommandSender~partial.swiftmodule",
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/CommandSender.swiftdeps",
+    "diagnostics": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/CommandSender.dia"
+  },
+  "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/Sources/JARVISKit/Networking/SSEClient.swift": {
+    "dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SSEClient.d",
+    "object": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SSEClient.swift.o",
+    "swiftmodule": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SSEClient~partial.swiftmodule",
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SSEClient.swiftdeps",
+    "diagnostics": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SSEClient.dia"
+  },
+  "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/Sources/JARVISKit/Voice/SpeechTranscriber.swift": {
+    "dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SpeechTranscriber.d",
+    "object": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SpeechTranscriber.swift.o",
+    "swiftmodule": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SpeechTranscriber~partial.swiftmodule",
+    "swift-dependencies": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SpeechTranscriber.swiftdeps",
+    "diagnostics": "/Users/djrussell23/Documents/repos/JARVIS-AI-Agent/JARVIS-Apple/JARVISKit/.build/arm64-apple-macosx/debug/JARVISKit.build/SpeechTranscriber.dia"
+  }
+}
