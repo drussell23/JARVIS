@@ -40,7 +40,17 @@ export async function POST(req: Request): Promise<Response> {
     master_secret_len: (process.env.JARVIS_MASTER_SECRET ?? "").length,
   }));
   if (!verifyHMAC(payload, secret)) {
-    return new Response("Invalid signature", { status: 401 });
+    // DEBUG: return diagnostic info (remove after fixing)
+    return Response.json({
+      error: "Invalid signature",
+      debug: {
+        secret_prefix: secret.slice(0, 16),
+        canonical_preview: debugCanonical.slice(0, 120),
+        expected_sig_prefix: debugExpected.slice(0, 16),
+        received_sig_prefix: payload.signature.slice(0, 16),
+        master_len: (process.env.JARVIS_MASTER_SECRET ?? "").length,
+      }
+    }, { status: 401 });
   }
 
   // 4. Route
