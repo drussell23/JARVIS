@@ -40,6 +40,9 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // The stream shows the macOS purple recording indicator — JARVIS's eyes are open.
             ScreenCaptureService.shared.requestPermission()
             ScreenCaptureService.shared.startStream()
+            // Auto-start the Python brainstem — the nervous system that handles
+            // action events (vision_task, ghost_hands) from the Vercel SSE stream.
+            BrainstemLauncher.shared.start()
             self.appState.boot()
         }
     }
@@ -235,7 +238,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
     }
 
     @objc private func toggleHUD() { if hudVisible { hideHUD() } else { showHUD() } }
-    @objc private func quitApp() { ScreenCaptureService.shared.stopStream(); appState.pythonBridge.shutdown(); NSApp.terminate(nil) }
+    @objc private func quitApp() { BrainstemLauncher.shared.stop(); ScreenCaptureService.shared.stopStream(); appState.pythonBridge.shutdown(); NSApp.terminate(nil) }
 
     // MARK: - Icon
 
