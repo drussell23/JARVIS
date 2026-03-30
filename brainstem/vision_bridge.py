@@ -142,8 +142,12 @@ class VisionBridge:
 
         try:
             from backend.vision.jarvis_cu import JarvisCU
-            self._jarvis_cu = JarvisCU()
-            logger.info("[Vision] JarvisCU initialized")
+            # Pass FramePipeline to JarvisCU for 60fps motion-aware verification.
+            # When available, JarvisCU uses FramePipeline.latest_frame for step
+            # frames and _wait_for_settle() for motion-aware transitions.
+            self._jarvis_cu = JarvisCU(frame_pipeline=self._frame_pipeline)
+            logger.info("[Vision] JarvisCU initialized (frame_pipeline=%s)",
+                        "60fps" if self._frame_pipeline else "none")
         except ImportError as e:
             logger.warning("[Vision] JarvisCU not available: %s", e)
             # Pipeline runs without CU — can still capture frames

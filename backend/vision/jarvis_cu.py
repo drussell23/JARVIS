@@ -338,6 +338,9 @@ class JarvisCU:
                         attempt + 1, 1 + self._max_retries,
                         getattr(result, "error", "unknown"),
                     )
+                    # On retry, wait for settle to get a fresh frame
+                    if attempt < self._max_retries:
+                        await self._wait_for_settle()
 
             step_results.append(last_result)
 
@@ -352,9 +355,11 @@ class JarvisCU:
                 logger.error("[JarvisCU] %s", error)
                 break
 
-            # Brief pause between steps (let UI settle)
-            if self._step_delay_s > 0 and idx < steps_total - 1:
-                await asyncio.sleep(self._step_delay_s)
+            # Motion-aware settling: wait for screen to stop changing after
+            # the action (animations, transitions). With FramePipeline this
+            # uses 60fps dhash detection; without it falls back to fixed delay.
+            if idx < steps_total - 1:
+                await self._wait_for_settle()
 
         elapsed = time.monotonic() - t_start
         success = steps_completed == steps_total and error is None

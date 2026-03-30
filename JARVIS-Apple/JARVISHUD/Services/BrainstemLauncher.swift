@@ -9,6 +9,7 @@
 /// Logs pipe to Xcode console via [Brainstem] prefix.
 import Foundation
 
+@MainActor
 final class BrainstemLauncher {
     static let shared = BrainstemLauncher()
 
@@ -102,11 +103,12 @@ final class BrainstemLauncher {
             }
         }
 
-        // Handle unexpected termination — log but don't restart (user can re-run)
-        proc.terminationHandler = { [weak self] p in
+        // Handle unexpected termination — log but don't restart (user can re-run).
+        // Use Task { @MainActor in } to hop back to the main actor for property mutation.
+        proc.terminationHandler = { p in
             let code = p.terminationStatus
             print("[Brainstem] Process exited with code \(code)")
-            DispatchQueue.main.async {
+            Task { @MainActor [weak self] in
                 self?.process = nil
                 self?.stdoutPipe = nil
                 self?.stderrPipe = nil
@@ -131,15 +133,17 @@ final class BrainstemLauncher {
         print("[Brainstem] Stopping (PID \(proc.processIdentifier))...")
         proc.interrupt()  // SIGINT — triggers graceful shutdown in brainstem
 
-        // Give it 3 seconds to shut down gracefully, then force kill
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3.0) { [weak self] in
+        // Give it 3 seconds to shut down gracefully, then force kill.
+        // Task inherits @MainActor isolation from the enclosing context.
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
             if proc.isRunning {
                 print("[Brainstem] Force killing (PID \(proc.processIdentifier))")
                 proc.terminate()  // SIGTERM
             }
-            self?.process = nil
             self?.stdoutPipe?.fileHandleForReading.readabilityHandler = nil
             self?.stderrPipe?.fileHandleForReading.readabilityHandler = nil
+            self?.process = nil
             self?.stdoutPipe = nil
             self?.stderrPipe = nil
         }
