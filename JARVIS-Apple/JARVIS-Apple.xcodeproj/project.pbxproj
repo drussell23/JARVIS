@@ -17,6 +17,7 @@
 		6A6DE9BC09C7393AC5D3BFDA /* JARVISHUDApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */; };
 		787D831FBA5AA3338F9BC38C /* PairingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E75506CB26E637E4674ED069 /* PairingView.swift */; };
 		7E167813DA477376FA50A02A /* WakeWordListener.swift in Sources */ = {isa = PBXBuildFile; fileRef = 62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */; };
+		A1B2C3D4E5F6A7B8C9D0E1F2 /* ScreenCaptureService.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2C3D4E5F6A7B8C9D0E1F2A3 /* ScreenCaptureService.swift */; };
 		8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F2D54D7706047B14362D0D6 /* TransparentWindow.swift */; };
 		8870023BBC6B975AB2B4A378 /* StatusView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 853E0D7E9218220610520FB8 /* StatusView.swift */; };
 		8CA64BEF2D84BA9055DCC700 /* JARVISPulseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15DC284C7811731206FA7AF5 /* JARVISPulseView.swift */; };
@@ -49,6 +50,7 @@
 		496ADA6BEACAC0F28324C87E /* JARVISWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		59B809F2B04897D040BBE2CB /* ClickThroughWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClickThroughWindow.swift; sourceTree = "<group>"; };
 		62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WakeWordListener.swift; sourceTree = "<group>"; };
+		B2C3D4E5F6A7B8C9D0E1F2A3 /* ScreenCaptureService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ScreenCaptureService.swift; sourceTree = "<group>"; };
 		698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPhoneApp.swift; sourceTree = "<group>"; };
 		6A73D85D2FBC6659D4A47810 /* JARVISHUD.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = JARVISHUD.entitlements; sourceTree = "<group>"; };
 		6C63F894E57C0794BF52C3F0 /* ClickThroughHostingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClickThroughHostingView.swift; sourceTree = "<group>"; };
@@ -156,6 +158,7 @@
 			isa = PBXGroup;
 			children = (
 				4784C00A28BAB42B47C1A4F1 /* AppState.swift */,
+				B2C3D4E5F6A7B8C9D0E1F2A3 /* ScreenCaptureService.swift */,
 				62C68475EAAD735E3FB66AAE /* WakeWordListener.swift */,
 			);
 			path = Services;
@@ -395,6 +398,7 @@
 				F2372C4356B52F4C5EE16B1C /* LoadingHUDView.swift in Sources */,
 				8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */,
 				7E167813DA477376FA50A02A /* WakeWordListener.swift in Sources */,
+				A1B2C3D4E5F6A7B8C9D0E1F2 /* ScreenCaptureService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

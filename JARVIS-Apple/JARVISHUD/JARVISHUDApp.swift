@@ -126,13 +126,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         utterance.rate = 0.52
         utterance.volume = 0.85
 
-        // Double-hop: escape Swift Concurrency executor ancestry FIRST (global queue),
-        // then hop to main for AVSpeechSynthesizer — breaks the unsafeForcedSync chain.
-        DispatchQueue.global(qos: .userInitiated).async {
-            DispatchQueue.main.async { [weak self] in
-                self?.tts.speak(utterance)
-            }
-        }
+        tts.speak(utterance)
     }
 
     // Restart the mic once JARVIS finishes speaking — this is the gate that prevents echo.
@@ -298,8 +292,13 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
     private func hideHUD() {
         guard let win = overlayWindow, hudVisible else { return }
         hudVisible = false
-        NSAnimationContext.runAnimationGroup({ $0.duration = 0.3; win.animator().alphaValue = 0 },
-            completionHandler: { [weak self] in self?.overlayWindow?.orderOut(nil) })
+        let fadeDuration = 0.3
+        NSAnimationContext.runAnimationGroup({ $0.duration = fadeDuration; win.animator().alphaValue = 0 })
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(fadeDuration))
+            guard let self, !self.hudVisible, self.overlayWindow === win else { return }
+            self.overlayWindow?.orderOut(nil)
+        }
         statusMenu?.item(withTag: 200)?.title = "Show HUD"
     }
 }
