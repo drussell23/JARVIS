@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		08C77D9CDE005FF673F81A84 /* ActiveCommandView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34F82AD2C9BC90F1C2C04004 /* ActiveCommandView.swift */; };
 		18B2C64EE92544B8575B5EEC /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4784C00A28BAB42B47C1A4F1 /* AppState.swift */; };
+		2522BF54B9B8951CD6B796B7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2445A32150108499C49E55C8 /* Assets.xcassets */; };
 		2DBBC321399F2814B57E803B /* JARVISWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD88BEB46021CA8E341A9460 /* JARVISWatchApp.swift */; };
 		2F9DD0FD134CECE6BB8C8562 /* JARVISKit in Frameworks */ = {isa = PBXBuildFile; productRef = F5E69E21A5404E28DA729815 /* JARVISKit */; };
 		57B50BAE6FB2347BD92BA512 /* PhoneSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE05089C690A3B7B63861CF9 /* PhoneSessionManager.swift */; };
@@ -37,6 +38,7 @@
 /* Begin PBXFileReference section */
 		1571F443B7AD32CA6860E6BE /* JARVISPhone.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = JARVISPhone.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		15DC284C7811731206FA7AF5 /* JARVISPulseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPulseView.swift; sourceTree = "<group>"; };
+		2445A32150108499C49E55C8 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		266CC1C8FBBB302AD623A3D9 /* HapticEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HapticEngine.swift; sourceTree = "<group>"; };
 		26744ECD2240E57AF517188D /* ArcReactorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArcReactorView.swift; sourceTree = "<group>"; };
 		34F82AD2C9BC90F1C2C04004 /* ActiveCommandView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActiveCommandView.swift; sourceTree = "<group>"; };
@@ -93,6 +95,7 @@
 		1A329E66F1A554D5EA630C29 /* JARVISPhone */ = {
 			isa = PBXGroup;
 			children = (
+				2445A32150108499C49E55C8 /* Assets.xcassets */,
 				698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */,
 				F0A82FD8CD023A9CF873A3C7 /* Services */,
 				FC6CA73ACD325BAEB067CCC8 /* Views */,
@@ -249,6 +252,7 @@
 			buildConfigurationList = ACEEF3683FDCB7FA26E3880A /* Build configuration list for PBXNativeTarget "JARVISPhone" */;
 			buildPhases = (
 				0D28416C004DCDD915F84AFB /* Sources */,
+				2DF2C4FEF6FA30948E8B4853 /* Resources */,
 				6963B81E13F207B1C14E70D4 /* Frameworks */,
 			);
 			buildRules = (
@@ -344,6 +348,17 @@
 			);
 		};
 /* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		2DF2C4FEF6FA30948E8B4853 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				2522BF54B9B8951CD6B796B7 /* Assets.xcassets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		0D28416C004DCDD915F84AFB /* Sources */ = {
