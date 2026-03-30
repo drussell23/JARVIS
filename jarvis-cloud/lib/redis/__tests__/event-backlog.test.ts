@@ -33,9 +33,9 @@ describe("event backlog", () => {
   });
 
   it("replayBacklog calls XRANGE from lastEventId", async () => {
-    mockRedis.xrange.mockResolvedValue([
-      ["1234567891-0", { payload: JSON.stringify({ event: "token", data: { token: "x" } }) }],
-    ]);
+    mockRedis.xrange.mockResolvedValue({
+      "1234567891-0": { payload: JSON.stringify({ event: "token", data: { token: "x" } }) },
+    });
     const { replayBacklog } = await import("../event-backlog");
     const events = await replayBacklog("device-abc", "1234567890-0");
     expect(events).toHaveLength(1);
