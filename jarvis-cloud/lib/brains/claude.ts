@@ -68,18 +68,17 @@ export function streamClaude(
                 }),
               ),
             );
-            await publishToDevices(
-              decision.fan_out.filter((d) => d.device_id !== payload.device_id),
-              {
-                event: "token",
-                data: {
-                  command_id: payload.command_id,
-                  token,
-                  source_brain: "claude",
-                  sequence,
-                },
+            // Fan-out tokens to ALL devices (including sender).
+            // The SSE stream is the canonical delivery channel.
+            await publishToDevices(decision.fan_out, {
+              event: "token",
+              data: {
+                command_id: payload.command_id,
+                token,
+                source_brain: "claude",
+                sequence,
               },
-            );
+            });
           }
         }
 
