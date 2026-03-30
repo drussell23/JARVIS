@@ -56,21 +56,28 @@ class SSEConsumer:
                 try:
                     await self._connect_and_consume(shutdown)
                     self._consecutive_failures = 0
-                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                except asyncio.CancelledError:
+                    break
+                except Exception as e:
+                    # Catch ALL exceptions (including RuntimeError from failed token requests,
+                    # aiohttp.ClientError, TimeoutError, etc.) so the consumer always retries
+                    # and errors are always logged rather than silently swallowed.
                     self._consecutive_failures += 1
                     backoff = min(
                         self.config.reconnect_backoff_base * (2 ** self._consecutive_failures),
                         self.config.reconnect_backoff_max,
                     )
-                    logger.warning("[SSE] Connection lost (%s), reconnecting in %.0fs...", e, backoff)
+                    logger.warning(
+                        "[SSE] Connection error (%s: %s), reconnecting in %.0fs...",
+                        type(e).__name__, e, backoff,
+                    )
                     await asyncio.sleep(backoff)
-                except asyncio.CancelledError:
-                    break
         finally:
             await self._session.close()
 
     async def _connect_and_consume(self, shutdown: asyncio.Event) -> None:
         assert self._session is not None
+        logger.info("[SSE] Requesting stream token from %s...", self.config.vercel_url)
         token = await self.auth.get_stream_token(self._session, self.config.vercel_url)
         url = f"{self.config.vercel_url}/api/stream/{self.config.device_id}?t={token}"
         headers: Dict[str, str] = {}
