@@ -8,10 +8,9 @@
 
 /* Begin PBXBuildFile section */
 		08C77D9CDE005FF673F81A84 /* ActiveCommandView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 34F82AD2C9BC90F1C2C04004 /* ActiveCommandView.swift */; };
-		2B9974464D91FA608214D05F /* VisionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8EDE82B9570AD102A09032E4 /* VisionManager.swift */; };
+		18B2C64EE92544B8575B5EEC /* AppState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4784C00A28BAB42B47C1A4F1 /* AppState.swift */; };
 		2DBBC321399F2814B57E803B /* JARVISWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD88BEB46021CA8E341A9460 /* JARVISWatchApp.swift */; };
 		2F9DD0FD134CECE6BB8C8562 /* JARVISKit in Frameworks */ = {isa = PBXBuildFile; productRef = F5E69E21A5404E28DA729815 /* JARVISKit */; };
-		4E78E7830E9A6DD29B905A0A /* VoiceManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0E5469BD34838E9B75C874C6 /* VoiceManager.swift */; };
 		57B50BAE6FB2347BD92BA512 /* PhoneSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE05089C690A3B7B63861CF9 /* PhoneSessionManager.swift */; };
 		644F315E21A6FF607A2E238F /* ClickThroughWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59B809F2B04897D040BBE2CB /* ClickThroughWindow.swift */; };
 		6A6DE9BC09C7393AC5D3BFDA /* JARVISHUDApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */; };
@@ -36,7 +35,6 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		0E5469BD34838E9B75C874C6 /* VoiceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VoiceManager.swift; sourceTree = "<group>"; };
 		1571F443B7AD32CA6860E6BE /* JARVISPhone.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = JARVISPhone.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		15DC284C7811731206FA7AF5 /* JARVISPulseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPulseView.swift; sourceTree = "<group>"; };
 		266CC1C8FBBB302AD623A3D9 /* HapticEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HapticEngine.swift; sourceTree = "<group>"; };
@@ -44,6 +42,7 @@
 		34F82AD2C9BC90F1C2C04004 /* ActiveCommandView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActiveCommandView.swift; sourceTree = "<group>"; };
 		363CFA575B249D1A15B71B0E /* PRQueueView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PRQueueView.swift; sourceTree = "<group>"; };
 		419C0FA1835D967E34A0FA5F /* CommandInputView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CommandInputView.swift; sourceTree = "<group>"; };
+		4784C00A28BAB42B47C1A4F1 /* AppState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppState.swift; sourceTree = "<group>"; };
 		496ADA6BEACAC0F28324C87E /* JARVISWatch.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISWatch.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		59B809F2B04897D040BBE2CB /* ClickThroughWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClickThroughWindow.swift; sourceTree = "<group>"; };
 		698E4531C1F4FD5A0215C9B1 /* JARVISPhoneApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISPhoneApp.swift; sourceTree = "<group>"; };
@@ -52,7 +51,6 @@
 		7F2D54D7706047B14362D0D6 /* TransparentWindow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransparentWindow.swift; sourceTree = "<group>"; };
 		7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISHUDApp.swift; sourceTree = "<group>"; };
 		853E0D7E9218220610520FB8 /* StatusView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StatusView.swift; sourceTree = "<group>"; };
-		8EDE82B9570AD102A09032E4 /* VisionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisionManager.swift; sourceTree = "<group>"; };
 		AF2D1789D766C67E4B4A3D2A /* JARVISHUD.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISHUD.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B91850E89902256710524BEA /* LoadingHUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingHUDView.swift; sourceTree = "<group>"; };
 		C953EA1271F55784A7D1004B /* JARVISColors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISColors.swift; sourceTree = "<group>"; };
@@ -150,8 +148,7 @@
 		4C449CDADB043C7331150D64 /* Services */ = {
 			isa = PBXGroup;
 			children = (
-				8EDE82B9570AD102A09032E4 /* VisionManager.swift */,
-				0E5469BD34838E9B75C874C6 /* VoiceManager.swift */,
+				4784C00A28BAB42B47C1A4F1 /* AppState.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -367,6 +364,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				18B2C64EE92544B8575B5EEC /* AppState.swift in Sources */,
 				A0BD7790CE0BF3EDAC6D6372 /* ArcReactorView.swift in Sources */,
 				947B0C2CACC0D367EDE7AF88 /* ClickThroughHostingView.swift in Sources */,
 				644F315E21A6FF607A2E238F /* ClickThroughWindow.swift in Sources */,
@@ -376,8 +374,6 @@
 				8CA64BEF2D84BA9055DCC700 /* JARVISPulseView.swift in Sources */,
 				F2372C4356B52F4C5EE16B1C /* LoadingHUDView.swift in Sources */,
 				8343F8E9601E5B1F4058448D /* TransparentWindow.swift in Sources */,
-				2B9974464D91FA608214D05F /* VisionManager.swift in Sources */,
-				4E78E7830E9A6DD29B905A0A /* VoiceManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -403,6 +399,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "JARVIS needs microphone access for voice commands";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "JARVIS uses on-device speech recognition for voice commands";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -424,6 +421,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "JARVIS needs microphone access for voice commands";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "JARVIS uses on-device speech recognition for voice commands";
 				MARKETING_VERSION = 1.0.0;
@@ -443,6 +441,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -462,6 +461,7 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
@@ -601,6 +601,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "JARVIS needs microphone access for voice commands";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "JARVIS uses on-device speech recognition for voice commands";
 				MARKETING_VERSION = 1.0.0;
@@ -620,6 +621,7 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "JARVIS needs microphone access for voice commands";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "JARVIS uses on-device speech recognition for voice commands";
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

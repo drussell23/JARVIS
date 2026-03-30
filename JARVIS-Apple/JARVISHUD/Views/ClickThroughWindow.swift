@@ -38,7 +38,7 @@ class ClickThroughWindow: NSWindow {
 
     /// Override hit testing to enable smart click-through
     /// Returns nil for transparent areas, allowing clicks to pass through to desktop
-    override func contentView(at point: NSPoint) -> NSView? {
+    func contentView(at point: NSPoint) -> NSView? {
         // Get the view at this point
         guard let contentView = self.contentView else { return nil }
 

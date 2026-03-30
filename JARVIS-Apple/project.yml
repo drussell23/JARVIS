@@ -31,6 +31,7 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: "YES"
 
   JARVISWatch:
     type: application
@@ -49,6 +50,7 @@ targets:
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Automatic
         WATCHOS_DEPLOYMENT_TARGET: "10.0"
+        GENERATE_INFOPLIST_FILE: "YES"
 
   JARVISHUD:
     type: application
@@ -66,6 +68,7 @@ targets:
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Automatic
         MACOSX_DEPLOYMENT_TARGET: "14.0"
+        GENERATE_INFOPLIST_FILE: "YES"
 
 schemes:
   JARVISPhone:
