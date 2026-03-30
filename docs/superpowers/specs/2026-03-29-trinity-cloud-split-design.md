@@ -632,7 +632,27 @@ Signs and sends commands to `POST /api/command`. Gathers local context automatic
 - `text/event-stream` → tokens arrive on SSE consumer, POST response discarded to avoid duplicates
 - `application/json` → batch job queued, return job_id
 
-### 6.6 — Eliminated from Mac
+### 6.6 — Vision Bridge (60fps VLA Loop)
+
+The real-time vision pipeline **stays entirely on the brainstem** and **bypasses Vercel**. Adding a Vercel hop to the vision loop would add latency for zero benefit — frames are captured locally and actions execute locally.
+
+**Data flow:**
+1. **FramePipeline** (60fps SHM capture via SCK) — local, hardware-bound
+2. **L1 Scene Graph Cache** (KnowledgeFabric) — local in-memory, ~5ms, TTL 5s
+3. **Doubleword VL-235B** (`/chat/completions` sync endpoint) — direct API call from Mac, ~1-3s
+4. **Claude Vision API** (fallback) — direct API call from Mac, ~5-15s
+5. **Ghost Hands** executes the action — local AX APIs
+
+**On-demand activation:** The FramePipeline does NOT start at boot. It lazy-starts when:
+- A `vision_task` action arrives via SSE from Vercel
+- `JARVIS_VISION_LOOP_ENABLED=true` is set
+- The user explicitly requests vision ("what do you see" → Vercel routes to batch Doubleword, but also triggers local capture for the response context)
+
+**JarvisCU** (Computer Use orchestrator) stays local: planning via Claude Vision, per-step execution via the 3-layer cascade (Accessibility API → Doubleword VL-235B → Claude Vision), verification via dhash frame comparison.
+
+**Only ad-hoc text commands go through Vercel:** "analyze this screenshot" → Vercel intent router → Doubleword 235B batch. The continuous VLA loop never touches Vercel.
+
+### 6.7 — Eliminated from Mac
 
 | Component | Reason |
 |---|---|
