@@ -8,7 +8,6 @@ Activation: lazy — starts when first vision_task arrives or when
 JARVIS_VISION_LOOP_ENABLED=true.
 """
 
-import asyncio
 import logging
 import os
 from typing import Any, Optional
@@ -65,10 +64,20 @@ class VisionBridge:
         self._active = False
         logger.info("[Vision] Vision pipeline deactivated")
 
-    async def execute_goal(self, goal: str) -> Optional[dict]:
+    async def execute_goal(self, goal: str, screenshot_b64: Optional[str] = None) -> Optional[dict]:
         """Execute a vision task via JarvisCU.
 
         Auto-activates the pipeline if not already running.
+
+        Parameters
+        ----------
+        goal:
+            Natural language description of the action to perform.
+        screenshot_b64:
+            Optional base64-encoded JPEG screenshot from the HUD.
+            If provided, JarvisCU uses it for the planning phase instead
+            of capturing from SHM. Verification frames between steps
+            still come from SHM or CoreGraphics fallback.
         """
         if not self._active:
             activated = await self.activate()
@@ -80,12 +89,34 @@ class VisionBridge:
             logger.warning("[Vision] JarvisCU not available")
             return None
 
-        logger.info("[Vision] Executing goal: %s", goal[:80])
+        logger.info("[Vision] Executing goal: %s (screenshot=%s)", goal[:80], "hud" if screenshot_b64 else "shm")
+
+        # Decode HUD screenshot to numpy if provided
+        initial_frame = None
+        if screenshot_b64:
+            initial_frame = self._decode_screenshot(screenshot_b64)
+
         try:
-            result = await self._jarvis_cu.execute_goal(goal)
+            result = await self._jarvis_cu.run(goal, initial_frame=initial_frame)
             return result
         except Exception as e:
             logger.error("[Vision] Goal execution failed: %s", e)
+            return None
+
+    @staticmethod
+    def _decode_screenshot(b64_data: str) -> Optional[Any]:
+        """Decode a base64 JPEG into a numpy RGB array for JarvisCU."""
+        try:
+            import base64
+            import io
+            import numpy as np
+            from PIL import Image
+
+            raw = base64.b64decode(b64_data)
+            img = Image.open(io.BytesIO(raw)).convert("RGB")
+            return np.array(img)
+        except Exception as e:
+            logger.warning("[Vision] Screenshot decode failed: %s", e)
             return None
 
     async def _start_pipeline(self) -> bool:

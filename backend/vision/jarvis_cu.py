@@ -139,8 +139,22 @@ class JarvisCU:
 
     # -- Main entry point ---------------------------------------------------
 
-    async def run(self, goal: str) -> Dict[str, Any]:
+    async def run(
+        self,
+        goal: str,
+        initial_frame: Optional[np.ndarray] = None,
+    ) -> Dict[str, Any]:
         """Plan and execute *goal*, returning a result dict.
+
+        Parameters
+        ----------
+        goal:
+            Natural language description of the task to accomplish.
+        initial_frame:
+            Optional pre-captured screenshot (numpy RGB array) from the HUD.
+            If provided, used for the planning phase instead of reading from
+            SHM. Verification frames between execution steps still come from
+            SHM or the black-frame fallback.
 
         Returns
         -------
@@ -161,7 +175,10 @@ class JarvisCU:
 
         # -- Phase 1: Plan --------------------------------------------------
         try:
-            frame = self._get_frame()
+            # Use HUD screenshot for planning if provided, else capture from SHM
+            frame = initial_frame if initial_frame is not None else self._get_frame()
+            if initial_frame is not None:
+                logger.info("[JarvisCU] Using HUD screenshot for planning (%s)", initial_frame.shape)
             steps = await self._planner.plan_goal(goal, frame)
         except Exception as exc:
             elapsed = time.monotonic() - t_start

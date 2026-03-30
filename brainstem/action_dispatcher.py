@@ -164,9 +164,52 @@ class ActionDispatcher:
         )
 
     async def _exec_vision_task(self, payload: dict) -> None:
+        goal = payload.get("goal", "")
+        if not goal:
+            logger.warning("[Dispatch] vision_task with empty goal — skipped")
+            return
+
+        screenshot_b64 = payload.get("screenshot")
+
+        # Activate vision pipeline on demand if not already running
         if self.jarvis_cu is None:
             logger.warning("[Dispatch] JarvisCU not initialized — vision task skipped")
+            if self.tts_speak:
+                await self.tts_speak("Vision backend is not available. I can't execute screen actions right now.")
             return
-        goal = payload.get("goal", "")
-        if goal:
-            await self.jarvis_cu.execute_goal(goal)
+
+        logger.info("[Dispatch] VLA executing goal: %s (screenshot=%s)", goal[:80], "yes" if screenshot_b64 else "no")
+        if self.tts_speak:
+            await self.tts_speak(f"On it. Executing: {goal[:60]}")
+
+        try:
+            result = await self.jarvis_cu.execute_goal(goal, screenshot_b64=screenshot_b64)
+        except Exception as e:
+            logger.error("[Dispatch] VLA execution failed: %s", e)
+            if self.tts_speak:
+                await self.tts_speak(f"Action failed: {e}")
+            return
+
+        if result is None:
+            if self.tts_speak:
+                await self.tts_speak("Vision pipeline couldn't start. Check screen recording permissions.")
+            return
+
+        # Narrate result
+        if result.get("success"):
+            completed = result.get("steps_completed", 0)
+            total = result.get("steps_total", 0)
+            elapsed = result.get("elapsed_s", 0)
+            layers = result.get("layers_used", {})
+            layer_summary = ", ".join(f"{k}: {v}" for k, v in layers.items()) if layers else "none"
+            narration = f"Done. Completed {completed} of {total} steps in {elapsed:.1f} seconds. Layers used: {layer_summary}."
+            logger.info("[Dispatch] VLA success: %s", narration)
+        else:
+            error = result.get("error", "unknown error")
+            completed = result.get("steps_completed", 0)
+            total = result.get("steps_total", 0)
+            narration = f"Action incomplete. Finished {completed} of {total} steps. Issue: {error}"
+            logger.warning("[Dispatch] VLA partial: %s", narration)
+
+        if self.tts_speak:
+            await self.tts_speak(narration)

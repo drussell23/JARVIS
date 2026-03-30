@@ -1,5 +1,5 @@
 // jarvis-cloud/lib/routing/intent-router.ts
-import type { CommandPayload, RoutingDecision, BrainId, RouteRule } from "./types";
+import type { CommandPayload, RoutingDecision, RoutingMode, BrainId, RouteRule } from "./types";
 
 /**
  * Action-intent pattern: detects commands that require physical screen interaction.
@@ -11,12 +11,12 @@ import type { CommandPayload, RoutingDecision, BrainId, RouteRule } from "./type
 const ACTION_INTENT_PATTERN =
   /\b(click|tap|press|open|launch|type|enter|scroll|drag|swipe|select|close|minimize|maximize|switch to|go to|navigate to|move to|send|submit|toggle|check|uncheck|expand|collapse)\b/i;
 
-const TRUSTED_HINTS: Record<string, { brain: BrainId; mode: "batch" }> = {
+const TRUSTED_HINTS: Record<string, { brain: BrainId; mode: RoutingMode }> = {
   ouroboros_scan: { brain: "doubleword_397b", mode: "batch" },
   ouroboros_review: { brain: "doubleword_397b", mode: "batch" },
   deep_analysis: { brain: "doubleword_397b", mode: "batch" },
   vision_capture: { brain: "doubleword_235b", mode: "batch" },
-  vision_action: { brain: "vla_local", mode: "local" as any },
+  vision_action: { brain: "vla_local", mode: "local" },
   code_generation: { brain: "doubleword_397b", mode: "batch" },
 };
 

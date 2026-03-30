@@ -40,7 +40,36 @@ export async function POST(req: Request): Promise<Response> {
   await redis.set(`device:${payload.device_id}`, JSON.stringify(device));
 
   // 6. Execute
-  if (decision.mode === "stream") {
+  if (decision.mode === "local") {
+    // VLA Local: emit action event for brainstem to pick up via SSE.
+    // JarvisCU on the Mac plans + executes using the screenshot and 3-layer cascade.
+    await publishToDevices(decision.fan_out, {
+      event: "action",
+      data: {
+        command_id: payload.command_id,
+        action_type: "vision_task",
+        payload: {
+          goal: payload.text,
+          screenshot: payload.context?.screenshot ?? null,
+          source_brain: "vla_local",
+        },
+      },
+    });
+    await publishToDevices(decision.fan_out, {
+      event: "status",
+      data: {
+        command_id: payload.command_id,
+        phase: "dispatched",
+        message: "Action dispatched to local VLA backend",
+      },
+    });
+    return Response.json({
+      command_id: payload.command_id,
+      brain: "vla_local",
+      status: "dispatched",
+      message: "Vision task dispatched to local brainstem for execution",
+    });
+  } else if (decision.mode === "stream") {
     const reserved = await redis.set(
       `cmd:${payload.command_id}`,
       JSON.stringify({ status: "in_flight", brain: decision.brain }),
