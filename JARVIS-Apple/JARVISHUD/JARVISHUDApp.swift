@@ -33,6 +33,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         Task { @MainActor in
             for w in NSApp.windows { w.orderOut(nil) }
             NSApp.setActivationPolicy(.accessory)
+            self.terminateOlderInstancesIfNeeded()
             self.setupMenuBar()
             self.setupVoice()
             // Request Screen Recording permission early — surfaces the TCC dialog
@@ -150,7 +151,23 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
 
     // MARK: - Menu Bar
 
+    private func terminateOlderInstancesIfNeeded() {
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else { return }
+
+        let currentPID = ProcessInfo.processInfo.processIdentifier
+        let duplicates = NSRunningApplication.runningApplications(withBundleIdentifier: bundleIdentifier)
+            .filter { $0.processIdentifier != currentPID }
+
+        guard !duplicates.isEmpty else { return }
+
+        for app in duplicates {
+            app.forceTerminate()
+        }
+    }
+
     private func setupMenuBar() {
+        guard statusItem == nil else { return }
+
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem = item
         updateIcon(status: .disconnected, active: false)
