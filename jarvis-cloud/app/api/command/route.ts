@@ -64,12 +64,16 @@ export async function POST(req: Request): Promise<Response> {
   }
 }
 
-async function buildFanOut(redis: any, excludeDeviceId: string) {
+async function buildFanOut(redis: any, _excludeDeviceId: string) {
+  // Include ALL devices in fan-out (including the sender).
+  // The SSE stream is the canonical event delivery channel for every device.
+  // The POST response also streams tokens to the requester, but the brainstem
+  // discards that (returns {status: "streaming"}) and relies on SSE instead.
   const deviceListRaw = await redis.get("devices:active_list");
   if (!deviceListRaw) return [];
   const deviceIds: string[] = typeof deviceListRaw === "string" ? JSON.parse(deviceListRaw) : deviceListRaw;
   const targets = await Promise.all(
-    deviceIds.filter((id) => id !== excludeDeviceId).map(async (id) => {
+    deviceIds.map(async (id) => {
       const raw = await redis.get(`device:${id}`);
       if (!raw) return null;
       const device: DeviceRecord = typeof raw === "string" ? JSON.parse(raw) : raw;
