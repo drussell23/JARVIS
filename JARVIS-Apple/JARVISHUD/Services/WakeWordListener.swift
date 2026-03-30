@@ -89,19 +89,30 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
                     for wake in self.wakeWords {
                         if let range = lower.range(of: wake) {
                             wakeWordFound = true
-                            // Store CHARACTER OFFSET, not String.Index
                             wakeEndOffset = lower.distance(from: lower.startIndex, to: range.upperBound)
                             DispatchQueue.main.async { self.state = .capturing }
-                            self.scheduleTimeout()
                             print("[JARVIS Voice] Wake word detected in: \"\(fullText)\"")
 
-                            // Extract any trailing command
+                            // Extract any trailing command inline with wake word
                             let afterWake = self.safeSubstring(fullText, fromOffset: wakeEndOffset)
                             if !afterWake.isEmpty {
                                 DispatchQueue.main.async { self.partialTranscript = afterWake }
-                                self.scheduleTimeout()
                             }
+                            self.scheduleTimeout()
                             break
+                        }
+                    }
+
+                    // Direct command mode: if no wake word but substantial speech,
+                    // capture it anyway. This lets you speak naturally without "Hey JARVIS".
+                    if !wakeWordFound {
+                        let wordCount = lower.split(separator: " ").count
+                        if wordCount >= 2 {
+                            DispatchQueue.main.async {
+                                self.partialTranscript = fullText
+                                self.state = .capturing
+                            }
+                            self.scheduleTimeout()
                         }
                     }
                 } else {
@@ -111,12 +122,23 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
                     self.scheduleTimeout()
                 }
 
-                if result.isFinal && wakeWordFound {
-                    let command = self.safeSubstring(fullText, fromOffset: wakeEndOffset)
-                    if !command.isEmpty {
-                        self.finalize(command)
+                if result.isFinal {
+                    if wakeWordFound {
+                        let command = self.safeSubstring(fullText, fromOffset: wakeEndOffset)
+                        if !command.isEmpty {
+                            self.finalize(command)
+                        } else {
+                            self.restart(delay: 0.3)
+                        }
                     } else {
-                        self.restart(delay: 0.3)
+                        // Direct command: send if substantial (≥ 2 words)
+                        let command = self.partialTranscript.isEmpty ? fullText : self.partialTranscript
+                        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if trimmed.split(separator: " ").count >= 2 {
+                            self.finalize(trimmed)
+                        } else {
+                            self.restart(delay: 0.3)
+                        }
                     }
                 }
             }
