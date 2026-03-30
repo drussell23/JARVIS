@@ -105,6 +105,10 @@ class PythonBridge: ObservableObject {
     // Active stream accumulator (token → full response per commandId)
     private var activeStreams: [String: [String]] = [:]
 
+    // Commands sent by THIS session — only these get spoken aloud.
+    // Prevents backlog replay from speaking old responses on reconnect.
+    private var sessionCommandIds = Set<String>()
+
     // MARK: - Boot sequence
 
     /// Progressive awakening — connect to the cloud brain.
@@ -163,8 +167,11 @@ class PythonBridge: ObservableObject {
         hudState = .processing
         isActive = true
         let result = try await sender.send(command, intentHint: intentHint)
-        if result.status == "streaming" {
-            // Tokens arrive via SSE — nothing more to do
+
+        // Track this command so we only speak responses to commands WE sent.
+        // Backlog-replayed events from old sessions won't be in this set.
+        if let id = result.commandId {
+            sessionCommandIds.insert(id)
         }
     }
 
@@ -359,8 +366,11 @@ class PythonBridge: ObservableObject {
 
         detailedConnectionState = "Ready — \(data.sourceBrain) (\(data.latencyMs)ms)"
 
-        // Speak the response — but ONLY ONCE per command (dedup on SSE reconnect)
-        if !fullResponse.isEmpty && !spokenCommands.contains(data.commandId) {
+        // Speak the response ONLY if:
+        // 1. This command was sent by THIS session (not backlog replay)
+        // 2. We haven't already spoken it (dedup on SSE reconnect)
+        let isOurCommand = sessionCommandIds.contains(data.commandId)
+        if isOurCommand && !fullResponse.isEmpty && !spokenCommands.contains(data.commandId) {
             spokenCommands.insert(data.commandId)
             let cleaned = stripMarkdownForSpeech(fullResponse)
             print("[JARVIS] Speaking response (\(cleaned.count) chars)")
@@ -370,6 +380,8 @@ class PythonBridge: ObservableObject {
             if spokenCommands.count > 50 {
                 spokenCommands.removeFirst()
             }
+        } else if !isOurCommand {
+            print("[JARVIS] Skipping speech for replayed command: \(data.commandId)")
         }
 
         // Mark inactive after delay
