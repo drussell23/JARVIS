@@ -123,15 +123,19 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
 
             if let error {
                 let nsError = error as NSError
-                print("[JARVIS Voice] Recognition ended: \(nsError.domain) code=\(nsError.code) — \(error.localizedDescription)")
+                // Only log real errors, not routine speech recognizer timeouts (code 203/216 = no speech detected)
+                let isRoutineTimeout = nsError.domain == "kAFAssistantErrorDomain" && [203, 216].contains(nsError.code)
+                if !isRoutineTimeout {
+                    print("[JARVIS Voice] Recognition ended: \(nsError.domain) code=\(nsError.code) — \(error.localizedDescription)")
+                }
 
                 if wakeWordFound {
                     // Had a wake word, use whatever we captured
                     let cmd = self.safeSubstring(result?.bestTranscription.formattedString ?? "", fromOffset: wakeEndOffset)
                     if !cmd.isEmpty { self.finalize(cmd) } else { self.restart(delay: 0.5) }
                 } else {
-                    // Normal timeout or no speech — restart listening
-                    self.restart(delay: 0.3)
+                    // Normal timeout or no speech — seamless restart (mic stays "on")
+                    self.restart(delay: 0.1)
                 }
             }
         }
@@ -202,7 +206,8 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
     private func restart(delay: TimeInterval) {
         audioQueue.async { [weak self] in self?.teardown() }
         DispatchQueue.main.async { [weak self] in
-            self?.state = .cooldown
+            // Stay in .listening during normal restarts — no visible flicker.
+            // Only clear transcript and timers, don't transition to .cooldown.
             self?.partialTranscript = ""
             self?.silenceTimer?.invalidate()
             self?.silenceTimer = nil

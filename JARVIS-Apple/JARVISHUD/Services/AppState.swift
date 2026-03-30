@@ -254,7 +254,7 @@ class PythonBridge: ObservableObject {
 
         if !hasGreeted {
             hasGreeted = true
-            onSpeak?("Hello Derek! JARVIS is online.", .normal)
+            onSpeak?("JARVIS Online.", .normal)
         }
     }
 
@@ -326,12 +326,10 @@ class PythonBridge: ObservableObject {
         lastMessage = data.narrationText
         detailedConnectionState = "[\(data.sourceBrain)] \(data.narrationText)"
 
-        // Speak urgent/informational daemon narrations
-        if data.narrationPriority == "urgent" {
-            onSpeak?(data.narrationText, .high)
-        } else if data.narrationPriority == "informational" {
-            onSpeak?(data.narrationText, .normal)
-        }
+        // Daemon narrations are logged but NOT spoken — JARVIS only speaks
+        // in response to user commands. This prevents unsolicited chatter
+        // like repeated "online" announcements and status narrations.
+        print("[JARVIS] Daemon [\(data.narrationPriority)]: \(data.narrationText)")
     }
 
     private func handleStatus(_ data: StatusEvent) {

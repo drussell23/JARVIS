@@ -64,8 +64,9 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &subs)
 
-        // Update menu label based on voice state
+        // Update menu label based on voice state — only on meaningful transitions
         wakeWord.$state
+            .removeDuplicates()
             .receive(on: RunLoop.main)
             .sink { [weak self] voiceState in
                 guard let self else { return }
@@ -76,7 +77,8 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate {
                     if self.appState.pythonBridge.connectionStatus == .connected {
                         self.statusMenu?.item(withTag: 100)?.title = "JARVIS — Online (listening)"
                     }
-                default:
+                case .cooldown, .off:
+                    // Don't update label during cooldown/restart — keeps "Online (listening)" stable
                     break
                 }
             }
