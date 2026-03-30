@@ -1,12 +1,12 @@
 """HMAC authentication for the brainstem."""
+import asyncio
 import hashlib
 import hmac
 import json
 import logging
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-
-import aiohttp
 
 logger = logging.getLogger("jarvis.brainstem.auth")
 
@@ -14,6 +14,9 @@ CANONICAL_FIELDS = [
     "command_id", "device_id", "device_type",
     "priority", "response_mode", "text", "timestamp",
 ]
+
+# Token request timeout in seconds
+_TOKEN_TIMEOUT_S = 15
 
 
 class BrainstemAuth:
@@ -39,9 +42,15 @@ class BrainstemAuth:
             hashlib.sha256,
         ).hexdigest()
 
-    async def get_stream_token(self, session: aiohttp.ClientSession, vercel_url: str) -> str:
+    async def get_stream_token(self, session: Any, vercel_url: str) -> str:
+        """Get a stream token from Vercel.
+
+        Uses urllib (system SSL stack) in a thread instead of aiohttp,
+        because aiohttp's TLS handshake hangs on macOS when launched
+        as a subprocess from Xcode.
+        """
         timestamp = datetime.now(timezone.utc).isoformat()
-        body = {
+        body: Dict[str, Any] = {
             "device_id": self.device_id,
             "timestamp": timestamp,
             "command_id": "stream-token",
@@ -52,16 +61,28 @@ class BrainstemAuth:
         }
         body["signature"] = self.sign(body)
         url = f"{vercel_url}/api/stream/token"
-        timeout = aiohttp.ClientTimeout(total=15, connect=10)
         logger.info("[Auth] Requesting stream token from %s", url)
-        async with session.post(url, json=body, timeout=timeout) as resp:
-            logger.info("[Auth] Token response: %d", resp.status)
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"Stream token request failed ({resp.status}): {text}")
-            data = await resp.json()
-            self._stream_token = data["token"]
-            return self._stream_token
 
-    async def refresh_stream_token(self, session: aiohttp.ClientSession, vercel_url: str) -> str:
+        def _do_request() -> str:
+            data = json.dumps(body).encode("utf-8")
+            req = urllib.request.Request(
+                url, data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=_TOKEN_TIMEOUT_S) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(
+                        f"Stream token request failed ({resp.status}): "
+                        f"{resp.read().decode()}"
+                    )
+                result = json.loads(resp.read().decode())
+                return result["token"]
+
+        token = await asyncio.to_thread(_do_request)
+        logger.info("[Auth] Token received: %s...", token[:8])
+        self._stream_token = token
+        return token
+
+    async def refresh_stream_token(self, session: Any, vercel_url: str) -> str:
         return await self.get_stream_token(session, vercel_url)
