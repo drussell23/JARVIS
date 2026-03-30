@@ -39,11 +39,14 @@ struct ScreenCaptureService: Sendable {
     /// If permission hasn't been granted, attempts the capture anyway — SCShareableContent
     /// triggers the permission dialog automatically on first use.
     func captureBase64() async -> String? {
+        print("[JARVIS Vision] captureBase64() called — hasPermission=\(hasPermission)")
         guard #available(macOS 14.0, *) else {
             print("[JARVIS Vision] SCScreenshotManager requires macOS 14+")
             return nil
         }
-        return await _capture()
+        let result = await _capture()
+        print("[JARVIS Vision] captureBase64() result: \(result != nil ? "\(result!.count) chars" : "nil")")
+        return result
     }
 
     // MARK: - Private
@@ -51,11 +54,13 @@ struct ScreenCaptureService: Sendable {
     @available(macOS 14.0, *)
     private func _capture() async -> String? {
         do {
+            print("[JARVIS Vision] _capture() starting — querying SCShareableContent...")
             // Discover all shareable content (displays, windows)
             let content = try await SCShareableContent.excludingDesktopWindows(
                 false,
                 onScreenWindowsOnly: true
             )
+            print("[JARVIS Vision] Found \(content.displays.count) display(s), \(content.windows.count) window(s)")
             guard let display = content.displays.first else {
                 print("[JARVIS Vision] No display found via SCShareableContent")
                 return nil

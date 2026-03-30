@@ -46,8 +46,11 @@ public final class DeviceAuth: Sendable {
             parts.insert("intent_hint=\(hint)", at: 3)
         }
 
-        // context as sorted-key JSON
-        if let context = payload.context {
+        // context as sorted-key JSON — exclude screenshot from HMAC to avoid
+        // serialization mismatches between Swift JSONEncoder and TypeScript JSON.stringify
+        // on large binary payloads. Screenshot is visual context, not command identity.
+        if var context = payload.context {
+            context.screenshot = nil
             let encoder = JSONEncoder()
             encoder.outputFormatting = [.sortedKeys]
             if let data = try? encoder.encode(context),

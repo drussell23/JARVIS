@@ -26,10 +26,14 @@ export function canonicalize(payload: CommandPayload): string {
   }
 
   if (payload.context) {
-    const sortedKeys = Object.keys(payload.context).sort();
+    // Exclude screenshot from HMAC — large binary data causes serialization
+    // mismatches between Swift JSONEncoder and JS JSON.stringify. Screenshot is
+    // visual context, not command identity or replay-protection material.
+    const { screenshot: _, ...ctxWithoutScreenshot } = payload.context;
+    const sortedKeys = Object.keys(ctxWithoutScreenshot).sort();
     const sorted: Record<string, unknown> = {};
     for (const k of sortedKeys) {
-      sorted[k] = (payload.context as Record<string, unknown>)[k];
+      sorted[k] = (ctxWithoutScreenshot as Record<string, unknown>)[k];
     }
     parts.push(`context=${JSON.stringify(sorted)}`);
   }

@@ -181,8 +181,10 @@ class PythonBridge: ObservableObject {
         // command is sent as text-only — graceful degradation, no failure path.
         var resolvedContext = context ?? CommandContext()
         if resolvedContext.screenshot == nil {
+            print("[JARVIS] Capturing screenshot for VLA...")
             resolvedContext.screenshot = await ScreenCaptureService.shared.captureBase64()
         }
+        print("[JARVIS] Screenshot: \(resolvedContext.screenshot != nil ? "\(resolvedContext.screenshot!.count) chars base64" : "nil — sending text-only")")
 
         let result = try await sender.send(
             command,
