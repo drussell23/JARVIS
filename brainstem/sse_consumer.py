@@ -50,6 +50,9 @@ class SSEConsumer:
     _consecutive_failures: int = field(default=0, init=False)
 
     async def run(self, shutdown: asyncio.Event) -> None:
+        import sys
+        print("[SSE] Consumer starting...", flush=True)
+        print(f"[SSE] Target: {self.config.vercel_url}", flush=True, file=sys.stderr)
         self._session = aiohttp.ClientSession()
         try:
             while not shutdown.is_set():

@@ -129,12 +129,20 @@ async def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
+    logger.info("[Main] Starting SSE consumer + voice intake...")
     try:
-        await asyncio.gather(
-            consumer.run(shutdown),
-            voice.run(shutdown),
-            return_exceptions=True,
-        )
+        consumer_task = asyncio.create_task(consumer.run(shutdown))
+        voice_task = asyncio.create_task(voice.run(shutdown))
+
+        # Monitor consumer task — log immediately if it dies
+        async def _watch_consumer() -> None:
+            try:
+                await consumer_task
+            except Exception as exc:
+                logger.error("[Main] SSE consumer DIED: %s: %s", type(exc).__name__, exc)
+
+        asyncio.create_task(_watch_consumer())
+        await voice_task
     finally:
         hud.show_status("Shutting down...")
         await sender.close()
