@@ -1315,7 +1315,10 @@ def global_speech_dedup_check(text: str, window: Optional[float] = None) -> bool
 # ===========================================================================
 
 # v304.0: Voice fallback — "Daniel" may not exist on macOS 25.3+ (Tahoe).
-_validated_voice: Optional[str] = None
+# v400.0: Per-voice cache — Karen (Ouroboros) and Daniel (JARVIS) are
+# separate voices. The old global singleton cached ONE voice for ALL
+# callers, so Karen was silently replaced by Daniel.
+_validated_voices: Dict[str, str] = {}
 
 
 async def _resolve_voice(preferred: str) -> str:
@@ -1323,11 +1326,10 @@ async def _resolve_voice(preferred: str) -> str:
 
     Enumerates installed voices via ``say -v ?`` and selects the preferred
     voice if available, otherwise falls back through a preference list.
-    Caches the result for the session lifetime.
+    Caches per voice name for the session lifetime.
     """
-    global _validated_voice
-    if _validated_voice is not None:
-        return _validated_voice
+    if preferred in _validated_voices:
+        return _validated_voices[preferred]
 
     fallback_preferences = ["Daniel", "Samantha", "Alex", "Fred"]
     try:
@@ -1345,7 +1347,7 @@ async def _resolve_voice(preferred: str) -> str:
                     available.add(parts[0])
 
             if preferred in available:
-                _validated_voice = preferred
+                _validated_voices[preferred] = preferred
                 return preferred
 
             for voice in fallback_preferences:
@@ -1354,19 +1356,19 @@ async def _resolve_voice(preferred: str) -> str:
                         "[safe_say] Voice '%s' unavailable, using '%s' (%d voices installed)",
                         preferred, voice, len(available),
                     )
-                    _validated_voice = voice
+                    _validated_voices[preferred] = voice
                     return voice
 
             if available:
                 first = sorted(available)[0]
                 logger.warning("[safe_say] No preferred voice found, using '%s'", first)
-                _validated_voice = first
+                _validated_voices[preferred] = first
                 return first
     except (asyncio.TimeoutError, OSError) as exc:
         logger.debug("[safe_say] Voice enumeration failed: %s", exc)
 
     logger.warning("[safe_say] Could not enumerate voices, using '%s' as-is", preferred)
-    _validated_voice = preferred
+    _validated_voices[preferred] = preferred
     return preferred
 
 

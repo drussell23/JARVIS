@@ -39,10 +39,12 @@ class VoiceNarrator:
         say_fn: Callable[..., Coroutine[Any, Any, bool]],
         debounce_s: float = 60.0,
         source: str = "intent_engine",
+        voice: str = "Karen",
     ) -> None:
         self._say_fn = say_fn
         self._debounce_s = debounce_s
         self._source = source
+        self._voice = voice
         self._last_narration: float = float("-inf")  # monotonic; -inf so first msg always passes
         self._narrated_ids: OrderedDict[str, None] = OrderedDict()  # bounded LRU for idempotency
         # P2-1: internal bounded queue + lazy drain worker
@@ -146,7 +148,7 @@ class VoiceNarrator:
             return
 
         try:
-            await self._say_fn(text, source=self._source)
+            await self._say_fn(text, voice=self._voice, source=self._source)
             self._narrated_ids[notification_id] = None
             if len(self._narrated_ids) > _MAX_NARRATED_IDS:
                 self._narrated_ids.popitem(last=False)

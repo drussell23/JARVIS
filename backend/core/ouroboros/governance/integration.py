@@ -254,6 +254,16 @@ def _build_comm_protocol(
         transports.append(TUITransport())
         logger.info("[Integration] TUITransport added to CommProtocol")
 
+    # TUISelfProgramPanel — tracks active ops, pending approvals, completions
+    # for the Textual TUI dashboard. Safe to add; maintains state independently.
+    try:
+        from backend.core.ouroboros.governance.comms.tui_panel import TUISelfProgramPanel
+    except ImportError:
+        logger.debug("[Integration] TUISelfProgramPanel skipped: module not available")
+    else:
+        transports.append(TUISelfProgramPanel())
+        logger.info("[Integration] TUISelfProgramPanel added to CommProtocol")
+
     # VoiceNarrator — requires safe_say; skip if unavailable or voice disabled
     _voice_enabled = os.environ.get("JARVIS_VOICE_ENABLED", "1").strip().lower() not in ("0", "false", "no")
     if not _voice_enabled:

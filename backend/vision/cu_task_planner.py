@@ -71,6 +71,18 @@ Rules:
 5. Include wait steps after launching apps or navigating to new screens.
 6. After typing in a search/chat field, wait briefly before the next action.
 
+For CHAT APPS (WhatsApp, Messages, Slack, Telegram), always plan these steps IN ORDER:
+a. Click the search bar and type the contact name ONCE (not twice).
+b. Wait for search results to appear.
+c. Click the correct contact in search results.
+d. Wait for the conversation to load.
+e. Press Escape to dismiss search and clear stale focus.
+f. Click the message input field at the BOTTOM of the chat.
+g. Type the message text.
+h. Press Return to send.
+Never skip step (e) — stale search focus causes typing in the wrong field.
+Never skip step (f) — the message field must have explicit focus before typing.
+
 Return ONLY a JSON array of step objects. Each object has:
 - "action": one of click/type/key/hotkey/scroll/wait
 - "description": human-readable description of what this step does
