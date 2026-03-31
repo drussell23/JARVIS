@@ -215,12 +215,22 @@ async def main() -> None:
                 except Exception as diag_err:
                     logger.warning("[Stdin] fd 0 diagnostic failed: %s", diag_err)
 
+                import select as _select
+
                 raw = sys.stdin.buffer   # BufferedReader — binary, 8KB default buf
-                logger.info("[Stdin] Thread: blocking on first readline...")
+                logger.info("[Stdin] Thread: entering read loop (using select + readline)...")
                 while True:
+                    # Use select() to confirm data availability at OS level before
+                    # calling readline(). This separates "data not in pipe" from
+                    # "BufferedReader broken" as the root cause.
+                    readable, _, _ = _select.select([0], [], [], 5.0)
+                    if not readable:
+                        logger.debug("[Stdin] Thread: select timeout (5s), no data on fd 0")
+                        continue
+                    logger.info("[Stdin] Thread: select fired — data on fd 0, calling readline...")
                     line = raw.readline(2 * 1024 * 1024)   # 2MB hard cap
                     if not line:
-                        logger.info("[Stdin] Thread: stdin closed (EOF)")
+                        logger.info("[Stdin] Thread: readline returned empty (EOF)")
                         break
                     logger.info("[Stdin] Thread: read %d bytes, queuing via call_soon_threadsafe", len(line))
                     try:
