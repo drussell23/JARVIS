@@ -170,17 +170,23 @@ async def main() -> None:
     # broken: select() on inherited pipe fd 0 hangs forever in Python threads
     # when asyncio's event loop is running kqueue on macOS.
     async def _inbox_reader() -> None:
-        """Poll the file-based inbox for events from HUD."""
+        """Poll the file-based inbox for events from HUD.
+
+        Uses threading.Queue + run_in_executor instead of asyncio.Queue +
+        call_soon_threadsafe.  The latter silently fails when the asyncio
+        event loop is busy with SSE/FramePipeline tasks and doesn't
+        process the threadsafe callback.
+        """
         import json as _json
         import fcntl
         import threading
+        import queue as thread_queue
 
         inbox_path = os.path.join(os.getcwd(), ".jarvis", "brainstem_inbox.jsonl")
         logger.info("[Inbox] Watching %s for events from HUD", inbox_path)
 
         last_mtime: float = 0.0
-        queue: asyncio.Queue[str] = asyncio.Queue()
-        loop = asyncio.get_running_loop()
+        q: thread_queue.Queue[str] = thread_queue.Queue()
 
         def _poll_thread() -> None:
             """Daemon thread that polls the inbox file for new content."""
@@ -210,14 +216,12 @@ async def main() -> None:
                         fd = os.open(inbox_path, os.O_RDWR)
                         try:
                             fcntl.flock(fd, fcntl.LOCK_EX)
-                            # Read all content
                             content = b""
                             while True:
                                 chunk = os.read(fd, 65536)
                                 if not chunk:
                                     break
                                 content += chunk
-                            # Truncate after reading
                             os.ftruncate(fd, 0)
                             os.lseek(fd, 0, os.SEEK_SET)
                             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -233,24 +237,26 @@ async def main() -> None:
                         logger.debug("[Inbox] Read error (will retry): %s", e)
                         continue
 
-                    # Queue each line for the async consumer
                     for line_text in lines:
-                        try:
-                            loop.call_soon_threadsafe(queue.put_nowait, line_text)
-                        except Exception as qe:
-                            logger.error("[Inbox] Queue error: %s", qe)
+                        logger.info("[Inbox] Poll thread: queuing event (%d chars)", len(line_text))
+                        q.put(line_text)
 
                 except Exception as e:
                     logger.warning("[Inbox] Poll thread error: %s", e)
-                    time.sleep(1.0)  # back off on unexpected errors
+                    time.sleep(1.0)
 
         thread = threading.Thread(target=_poll_thread, daemon=True, name="inbox-reader")
         thread.start()
         logger.info("[Inbox] Poll thread started (100ms interval)")
 
+        loop = asyncio.get_running_loop()
         while not shutdown.is_set():
             try:
-                text = await asyncio.wait_for(queue.get(), timeout=1.0)
+                # run_in_executor does a blocking q.get(timeout=1) in the
+                # thread pool — doesn't need call_soon_threadsafe at all.
+                text = await loop.run_in_executor(
+                    None, lambda: q.get(timeout=1.0),
+                )
                 if not text:
                     continue
                 try:
@@ -261,12 +267,10 @@ async def main() -> None:
                     await dispatcher.dispatch(event_type, data)
                 except _json.JSONDecodeError:
                     logger.debug("[Inbox] Non-JSON line: %s", text[:100])
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
             except Exception as e:
-                logger.warning("[Inbox] Dispatch error: %s", e)
+                # queue.Empty from timeout — just loop
+                if "Empty" not in type(e).__name__:
+                    logger.warning("[Inbox] Dispatch error: %s", e)
 
     logger.info("[Main] Starting inbox reader + SSE consumer + voice intake...")
     try:
