@@ -145,6 +145,47 @@ class CUStep:
     direction: Optional[str] = None
     amount: Optional[int] = None
 
+    # ------------------------------------------------------------------
+    # Executor-compatible computed fields
+    # ------------------------------------------------------------------
+
+    @property
+    def value(self) -> str:
+        """Single-string value for the executor's _execute_action_impl.
+
+        The executor reads step.value generically across all action types.
+        This property translates CUStep's typed fields into that format:
+          type    → text content to type
+          key     → key name to press
+          hotkey  → comma-joined key list (e.g. "command,space")
+          scroll  → scroll clicks as signed integer string (negative = down)
+          others  → empty string
+        """
+        if self.action == "type":
+            return self.text or ""
+        elif self.action == "key":
+            return self.key or ""
+        elif self.action == "hotkey":
+            if self.keys:
+                return ",".join(str(k) for k in self.keys)
+            return ""
+        elif self.action == "scroll":
+            amount = self.amount or 3
+            if (self.direction or "down") == "up":
+                return str(amount)
+            return str(-amount)
+        return ""
+
+    @property
+    def app_name(self) -> str:
+        """Executor-compatible alias for step.app."""
+        return self.app or ""
+
+    @property
+    def step_id(self) -> str:
+        """Executor-compatible step identifier."""
+        return f"step-{self.index}"
+
     @property
     def needs_visual_grounding(self) -> bool:
         """Whether this step requires visual grounding to resolve a target.

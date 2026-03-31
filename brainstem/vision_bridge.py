@@ -8,6 +8,7 @@ Activation: lazy — starts when first vision_task arrives or when
 JARVIS_VISION_LOOP_ENABLED=true.
 """
 
+import asyncio
 import logging
 import os
 from typing import Any, Optional
@@ -124,35 +125,52 @@ class VisionBridge:
 
         These imports are lazy to avoid loading heavy backend deps at boot.
         The vision pipeline only starts when actually needed.
+
+        FramePipeline is **optional** — if SCK lacks Screen Recording permission
+        or SHM isn't ready, JarvisCU still initializes in degraded mode using
+        ShmFrameReader static reads or black-frame fallback for verification.
+        HUD-forwarded screenshots are used for the planning phase regardless.
         """
+        # FramePipeline (optional) — 60fps motion-aware verification + settling.
+        # A 5s timeout guards against SCK permission prompts hanging indefinitely.
         try:
             from backend.vision.realtime.frame_pipeline import FramePipeline
-            self._frame_pipeline = FramePipeline(
-                use_sck=True,
-                motion_detect=True,
-            )
-            await self._frame_pipeline.start()
+            fp = FramePipeline(use_sck=True, motion_detect=True)
+            await asyncio.wait_for(fp.start(), timeout=5.0)
+            self._frame_pipeline = fp
             logger.info("[Vision] FramePipeline started (60fps SHM)")
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[Vision] FramePipeline start timed out (5s) — "
+                "degraded mode (fixed-delay settling, black-frame verification)"
+            )
         except ImportError as e:
-            logger.warning("[Vision] FramePipeline not available: %s", e)
-            return False
+            logger.warning(
+                "[Vision] FramePipeline not available: %s — "
+                "degraded mode (fixed-delay settling, black-frame verification)", e
+            )
         except Exception as e:
-            logger.error("[Vision] FramePipeline start failed: %s", e)
-            return False
+            logger.warning(
+                "[Vision] FramePipeline start failed: %s — "
+                "degraded mode (fixed-delay settling, black-frame verification)", e
+            )
 
+        # JarvisCU (required) — Computer Use orchestrator.
+        # Works with or without FramePipeline: planning uses HUD screenshot,
+        # execution uses Accessibility API → Doubleword → Claude cascade.
         try:
             from backend.vision.jarvis_cu import JarvisCU
-            # Pass FramePipeline to JarvisCU for 60fps motion-aware verification.
-            # When available, JarvisCU uses FramePipeline.latest_frame for step
-            # frames and _wait_for_settle() for motion-aware transitions.
             self._jarvis_cu = JarvisCU(frame_pipeline=self._frame_pipeline)
-            logger.info("[Vision] JarvisCU initialized (frame_pipeline=%s)",
-                        "60fps" if self._frame_pipeline else "none")
+            logger.info(
+                "[Vision] JarvisCU initialized (frame_pipeline=%s)",
+                "60fps" if self._frame_pipeline else "none — degraded mode",
+            )
         except ImportError as e:
-            logger.warning("[Vision] JarvisCU not available: %s", e)
-            # Pipeline runs without CU — can still capture frames
+            logger.error("[Vision] JarvisCU not available: %s", e)
+            return False
         except Exception as e:
             logger.error("[Vision] JarvisCU init failed: %s", e)
+            return False
 
         return True
 
