@@ -178,7 +178,6 @@ async def main() -> None:
         process the threadsafe callback.
         """
         import json as _json
-        import fcntl
         import threading
         import queue as thread_queue
 
@@ -189,25 +188,39 @@ async def main() -> None:
         q: thread_queue.Queue[str] = thread_queue.Queue()
 
         def _poll_thread() -> None:
-            """Daemon thread: read inbox, dispatch events, truncate."""
+            """Daemon thread: read inbox via atomic rename, dispatch events."""
             os.write(2, b"INBOX_THREAD: alive\n")
+            processing_path = inbox_path + ".processing"
             while not shutdown.is_set():
                 time.sleep(0.1)
                 try:
-                    # Simple: open, lock, read, truncate, close. No mtime/size checks.
+                    # Atomic rename: grab the inbox file for exclusive processing.
+                    # If rename succeeds, no other reader can see the data.
+                    # If it fails (file doesn't exist or is empty), skip.
                     try:
-                        fd = os.open(inbox_path, os.O_RDWR)
-                    except OSError:
+                        if not os.path.exists(inbox_path):
+                            continue
+                        if os.path.getsize(inbox_path) == 0:
+                            continue
+                        os.rename(inbox_path, processing_path)
+                    except (OSError, FileNotFoundError):
                         continue
+
+                    # Read the renamed file (we own it exclusively now)
                     try:
-                        fcntl.flock(fd, fcntl.LOCK_EX)
-                        content = os.read(fd, 1024 * 1024)  # 1MB max
-                        if content:
-                            os.ftruncate(fd, 0)
-                            os.lseek(fd, 0, os.SEEK_SET)
-                        fcntl.flock(fd, fcntl.LOCK_UN)
+                        with open(processing_path, "rb") as f:
+                            content = f.read(1024 * 1024)
                     finally:
-                        os.close(fd)
+                        # Delete after reading — recreate empty inbox for next event
+                        try:
+                            os.unlink(processing_path)
+                        except OSError:
+                            pass
+                        # Recreate the inbox file so Swift can write to it
+                        try:
+                            open(inbox_path, "a").close()
+                        except OSError:
+                            pass
 
                     if not content:
                         continue
