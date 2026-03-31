@@ -40,6 +40,16 @@ async def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    # Strip proxy env vars that break Python's urllib/aiohttp.
+    # The brainstem inherits https_proxy from the parent process which points
+    # to a local proxy (localhost:65403) that can't reach Vercel. Swift's
+    # URLSession uses macOS system proxy instead and works fine.
+    import os
+    for _proxy_key in list(os.environ):
+        if _proxy_key.lower() in ("https_proxy", "http_proxy", "all_proxy"):
+            logger.info("[Boot] Stripping proxy env: %s=%s", _proxy_key, os.environ[_proxy_key][:30])
+            del os.environ[_proxy_key]
+
     # Phase 1: Config + Auth
     try:
         config = BrainstemConfig.from_env()
@@ -64,7 +74,7 @@ async def main() -> None:
     try:
         from backend.ghost_hands.yabai_aware_actuator import YabaiAwareActuator
         ghost_hands = YabaiAwareActuator()
-        if await ghost_hands.initialize():
+        if await ghost_hands.start():
             logger.info("[Boot] Ghost Hands initialized")
         else:
             logger.warning("[Boot] Ghost Hands init returned False")
