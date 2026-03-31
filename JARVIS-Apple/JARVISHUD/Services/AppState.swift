@@ -412,6 +412,13 @@ class PythonBridge: ObservableObject {
     }
 
     private func handleAction(commandId: String, actionType: String, payload: [String: String]) {
+        // Only forward action events for commands issued in THIS session.
+        // Prevents replaying old action events from the Redis backlog on reconnect.
+        guard sessionCommandIds.contains(commandId) else {
+            print("[JARVIS] Skipping replayed action for old command: \(commandId)")
+            return
+        }
+
         hudState = .processing
         detailedConnectionState = "Executing: \(actionType)"
         print("[JARVIS] Action event received: \(actionType) (cmd=\(commandId))")
@@ -419,7 +426,7 @@ class PythonBridge: ObservableObject {
         // Forward action events to the brainstem via stdin pipe.
         // The brainstem can't reach Vercel directly (Python SSL issue),
         // so the HUD acts as the network gateway and forwards events locally.
-        var eventData: [String: Any] = [
+        let eventData: [String: Any] = [
             "command_id": commandId,
             "action_type": actionType,
             "payload": payload,

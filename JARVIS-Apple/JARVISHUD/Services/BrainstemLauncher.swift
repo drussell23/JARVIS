@@ -70,9 +70,12 @@ final class BrainstemLauncher {
             }
         }
 
-        // Ensure PYTHONPATH includes the repo root so `backend.*` imports work
+        // Ensure PYTHONPATH includes the repo root AND Homebrew site-packages.
+        // Xcode's subprocess environment may not include Homebrew's default paths.
+        let sitePackages = "/opt/homebrew/lib/python3.12/site-packages"
         let existingPythonPath = env["PYTHONPATH"] ?? ""
-        env["PYTHONPATH"] = existingPythonPath.isEmpty ? repoRoot : "\(repoRoot):\(existingPythonPath)"
+        let pathParts = [repoRoot, sitePackages, existingPythonPath].filter { !$0.isEmpty }
+        env["PYTHONPATH"] = pathParts.joined(separator: ":")
 
         // Ensure PATH includes Homebrew so Python 3.12 can find its packages/tools
         let existingPath = env["PATH"] ?? "/usr/bin:/bin"
