@@ -191,11 +191,18 @@ async def main() -> None:
         def _poll_thread() -> None:
             """Daemon thread that polls the inbox file for new content."""
             nonlocal last_mtime
+            os.write(2, b"INBOX_THREAD: alive, entering loop\n")
+            poll_count = 0
             while not shutdown.is_set():
                 try:
                     time.sleep(0.1)  # 100ms poll interval
+                    poll_count += 1
+                    if poll_count <= 3 or poll_count % 100 == 0:
+                        os.write(2, f"INBOX_THREAD: poll #{poll_count}\n".encode())
 
                     if not os.path.exists(inbox_path):
+                        if poll_count <= 3:
+                            os.write(2, f"INBOX_THREAD: file not found: {inbox_path}\n".encode())
                         continue
 
                     try:
@@ -231,6 +238,7 @@ async def main() -> None:
                         last_mtime = time.time()
 
                         if content:
+                            os.write(2, f"INBOX_THREAD: read {len(content)} bytes from inbox!\n".encode())
                             text = content.decode("utf-8", errors="replace")
                             lines = [l.strip() for l in text.splitlines() if l.strip()]
                     except OSError as e:
