@@ -60,17 +60,38 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             self?.speak(text)
         }
 
-        // When wake word captures a command → send to cloud
+        // When wake word captures a command → route locally (VLA) or via cloud
         wakeWord.onCommand = { [weak self] command in
             guard let self else { return }
             print("[JARVIS] Voice command: \"\(command)\"")
-            Task {
-                do {
-                    try await self.appState.pythonBridge.sendCommand(command)
-                    print("[JARVIS] Command sent successfully")
-                } catch {
-                    print("[JARVIS] Command failed: \(error)")
-                    self.speak("Sorry, I couldn't reach the cloud. Try again.")
+
+            if Self.isVLAIntent(command) && BrainstemLauncher.shared.isRunning {
+                // Tier 0: Local fast-path — skip Vercel round-trip entirely.
+                // No screenshot needed — brainstem has FramePipeline at 60fps.
+                // Payload is ~150 bytes (no 192KB base64 screenshot), so pipe
+                // write completes in <1ms instead of potentially blocking.
+                print("[JARVIS] VLA fast-path: routing locally (skipping Vercel)")
+                self.speak("On it.")
+                BrainstemLauncher.shared.sendEvent(
+                    eventType: "action",
+                    data: [
+                        "action_type": "vision_task",
+                        "payload": [
+                            "goal": command,
+                            "source": "local_fast_path",
+                        ] as [String: Any],
+                    ]
+                )
+            } else {
+                // Normal path: send to Vercel for routing (conversation, analysis, etc.)
+                Task {
+                    do {
+                        try await self.appState.pythonBridge.sendCommand(command)
+                        print("[JARVIS] Command sent successfully")
+                    } catch {
+                        print("[JARVIS] Command failed: \(error)")
+                        self.speak("Sorry, I couldn't reach the cloud. Try again.")
+                    }
                 }
             }
         }
@@ -152,6 +173,24 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             print("[JARVIS Voice] TTS done — resuming mic")
             self.wakeWord.start()
         }
+    }
+
+    // MARK: - VLA Intent Detection (Tier 0)
+
+    /// Mirrors Vercel's ACTION_INTENT_PATTERN from intent-router.ts.
+    /// When matched, the command routes directly to the brainstem without
+    /// a Vercel cloud round-trip — saving 2-3 seconds of latency.
+    private static let vlaPattern: NSRegularExpression? = {
+        try? NSRegularExpression(
+            pattern: #"\b(click|tap|press|open|launch|type|enter|scroll|drag|swipe|select|close|minimize|maximize|switch to|go to|navigate to|move to|send|submit|toggle|check|uncheck|expand|collapse)\b"#,
+            options: .caseInsensitive
+        )
+    }()
+
+    private static func isVLAIntent(_ command: String) -> Bool {
+        guard let regex = vlaPattern else { return false }
+        let range = NSRange(command.startIndex..., in: command)
+        return regex.firstMatch(in: command, range: range) != nil
     }
 
     // MARK: - Menu Bar

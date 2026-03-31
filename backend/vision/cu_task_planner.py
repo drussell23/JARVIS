@@ -211,24 +211,50 @@ class CUStep:
 class CUTaskPlanner:
     """Decomposes a natural language goal into atomic CUStep objects.
 
-    Uses Claude Vision to analyze the current screen state and produce
-    a step-by-step plan. The plan is a list of CUStep dataclass instances
-    that the CU executor can run sequentially.
+    System 1 / System 2 biological vision pipeline:
+
+      System 1 (Peripheral/Scout): Doubleword Qwen3-VL-235B (~2-3s)
+        Fast spatial planner. Handles basic screen geometry, element
+        identification, and simple UI navigation natively.
+
+      System 2 (Deep Fovea/Semantic): Claude Vision (~5-15s)
+        Frontier-level semantic understanding. Activated ONLY when
+        System 1 signals low confidence or the task requires deep
+        pixel-level reasoning, complex multi-step UI workflows, or
+        precise text reading from the screenshot.
+
+    This prevents burning Claude's latency and tokens on simple spatial
+    awareness while retaining frontier-level vision when needed.
 
     All configuration is sourced from environment variables at construction
     time, so different planner instances can have different settings.
     """
 
     def __init__(self) -> None:
-        # Lazy import to avoid hard dependency at module level
-        import anthropic
+        # System 2: Claude Vision (deep fovea fallback)
+        self._anthropic_key: str = os.environ.get("ANTHROPIC_API_KEY", "")
+        self._claude_client: Any = None
+        if self._anthropic_key:
+            try:
+                import anthropic
+                self._claude_client = anthropic.AsyncAnthropic(api_key=self._anthropic_key)
+            except ImportError:
+                logger.warning("[CUTaskPlanner] anthropic SDK not installed — System 2 disabled")
 
-        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        # System 1: Doubleword Qwen3-VL-235B (fast spatial scout)
+        self._dw_api_key: str = os.environ.get("DOUBLEWORD_API_KEY", "")
+        self._dw_base_url: str = os.environ.get(
+            "DOUBLEWORD_BASE_URL", "https://api.doubleword.ai/v1"
+        )
+        self._dw_model: str = os.environ.get(
+            "DOUBLEWORD_PLANNER_MODEL",
+            "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+        )
+        self._dw_timeout: float = float(os.environ.get("JARVIS_CU_DW_PLANNER_TIMEOUT_S", "15"))
 
         # Read tunables at construction (not at call time) so they are
         # stable for the lifetime of this planner instance.
-        self._model: str = os.environ.get(
+        self._claude_model: str = os.environ.get(
             "JARVIS_CU_PLANNER_MODEL", "claude-sonnet-4-6-20250514"
         )
         self._max_tokens: int = int(
@@ -241,11 +267,11 @@ class CUTaskPlanner:
             os.environ.get("JARVIS_CU_PLANNER_MAX_IMAGE_DIM", "1280")
         )
 
+        s1 = "Qwen3-VL" if self._dw_api_key else "disabled"
+        s2 = "Claude" if self._claude_client else "disabled"
         logger.info(
-            "[CUTaskPlanner] initialized — model=%s max_tokens=%d jpeg_q=%d",
-            self._model,
-            self._max_tokens,
-            self._jpeg_quality,
+            "[CUTaskPlanner] initialized — System1=%s System2=%s jpeg_q=%d",
+            s1, s2, self._jpeg_quality,
         )
 
     # ------------------------------------------------------------------
@@ -259,6 +285,10 @@ class CUTaskPlanner:
     ) -> List[CUStep]:
         """Decompose a goal into atomic CUStep objects.
 
+        Tries System 1 (Qwen3-VL, ~2-3s) first. Falls back to System 2
+        (Claude Vision, ~5-15s) when System 1 signals it needs help or
+        is unavailable.
+
         Parameters
         ----------
         goal:
@@ -269,29 +299,158 @@ class CUTaskPlanner:
         Returns
         -------
         List of CUStep objects in execution order.
-
-        Raises
-        ------
-        Exception:
-            If the Claude API call fails (network, auth, rate limit, etc.).
         """
         logger.info("[CUTaskPlanner] planning goal: %s", goal[:120])
 
-        raw_steps = await self._call_claude_vision(goal, current_frame)
+        raw_steps = None
+        planner_used = "none"
+
+        # System 1: Qwen3-VL fast spatial planner (~2-3s)
+        if self._dw_api_key:
+            try:
+                raw_steps, needs_escalation = await self._call_system1(goal, current_frame)
+                if needs_escalation:
+                    logger.info(
+                        "[CUTaskPlanner] System 1 requested escalation → System 2"
+                    )
+                    raw_steps = None  # Discard and let System 2 handle
+                elif raw_steps:
+                    planner_used = "system1_qwen3vl"
+            except Exception as exc:
+                logger.warning("[CUTaskPlanner] System 1 failed: %s — escalating", exc)
+
+        # System 2: Claude Vision deep fovea (~5-15s)
+        if raw_steps is None and self._claude_client:
+            try:
+                raw_steps = await self._call_system2(goal, current_frame)
+                planner_used = "system2_claude"
+            except Exception as exc:
+                logger.error("[CUTaskPlanner] System 2 failed: %s", exc)
+                raise
+
+        if raw_steps is None:
+            logger.error("[CUTaskPlanner] Both systems failed — no plan generated")
+            return []
+
         steps = self._parse_steps(raw_steps)
 
         logger.info(
-            "[CUTaskPlanner] plan complete — %d steps, %d need grounding",
+            "[CUTaskPlanner] plan complete via %s — %d steps, %d need grounding",
+            planner_used,
             len(steps),
             sum(1 for s in steps if s.needs_visual_grounding),
         )
         return steps
 
     # ------------------------------------------------------------------
-    # Claude Vision API call
+    # System 1: Doubleword Qwen3-VL-235B (fast spatial planner, ~2-3s)
     # ------------------------------------------------------------------
 
-    async def _call_claude_vision(
+    async def _call_system1(
+        self,
+        goal: str,
+        frame: np.ndarray,
+    ) -> tuple[Optional[List[Dict[str, Any]]], bool]:
+        """Call Qwen3-VL-235B for fast spatial planning.
+
+        Returns (raw_steps, needs_escalation).
+        If needs_escalation is True, the caller should fall through to System 2.
+        The model signals escalation by including {"escalate": true} in its
+        response or returning an empty step list with a reason.
+        """
+        try:
+            import aiohttp
+        except ImportError:
+            logger.warning("[CUTaskPlanner] aiohttp not installed — System 1 disabled")
+            return None, True
+
+        b64_image = self._frame_to_b64(frame)
+
+        # Same planning prompt as System 2, plus escalation instruction
+        prompt_text = _PLANNING_PROMPT.format(goal=goal) + (
+            "\n\nIMPORTANT: If this task requires reading small or blurry text, "
+            "complex multi-level menus, precise sub-pixel positioning, or you are "
+            "not confident in your plan, respond with ONLY: "
+            '{"escalate": true, "reason": "brief explanation"}\n'
+            "Otherwise return the JSON step array as instructed above."
+        )
+
+        payload = {
+            "model": self._dw_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{b64_image}",
+                            },
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt_text,
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": self._max_tokens,
+            "temperature": 0.0,
+        }
+
+        url = f"{self._dw_base_url}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self._dw_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        logger.info("[CUTaskPlanner] System 1 (Qwen3-VL): calling Doubleword...")
+        timeout = aiohttp.ClientTimeout(total=self._dw_timeout)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers=headers) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning("[CUTaskPlanner] System 1 API %d: %s", resp.status, body[:200])
+                    return None, True
+                data = await resp.json()
+
+        # Extract text from OpenAI-compatible response
+        choices = data.get("choices", [])
+        if not choices:
+            return None, True
+        raw_text = choices[0].get("message", {}).get("content", "")
+        if not raw_text:
+            return None, True
+
+        raw_text = raw_text.strip()
+        json_text = self._extract_json(raw_text)
+
+        try:
+            parsed = json.loads(json_text)
+        except json.JSONDecodeError:
+            logger.warning("[CUTaskPlanner] System 1 returned non-JSON: %s", raw_text[:200])
+            return None, True
+
+        # Check for escalation signal
+        if isinstance(parsed, dict):
+            if parsed.get("escalate"):
+                reason = parsed.get("reason", "unspecified")
+                logger.info("[CUTaskPlanner] System 1 escalated: %s", reason)
+                return None, True
+            # Single step dict — wrap in list
+            parsed = [parsed]
+
+        if not isinstance(parsed, list):
+            return None, True
+
+        logger.info("[CUTaskPlanner] System 1 planned %d steps", len(parsed))
+        return parsed, False
+
+    # ------------------------------------------------------------------
+    # System 2: Claude Vision (deep fovea, ~5-15s)
+    # ------------------------------------------------------------------
+
+    async def _call_system2(
         self,
         goal: str,
         frame: np.ndarray,
@@ -301,11 +460,11 @@ class CUTaskPlanner:
         Returns the parsed JSON list of step dicts from Claude's response.
         """
         b64_image = self._frame_to_b64(frame)
-
         prompt_text = _PLANNING_PROMPT.format(goal=goal)
 
-        response = await self._client.messages.create(
-            model=self._model,
+        logger.info("[CUTaskPlanner] System 2 (Claude): calling Anthropic...")
+        response = await self._claude_client.messages.create(
+            model=self._claude_model,
             max_tokens=self._max_tokens,
             messages=[
                 {
@@ -342,19 +501,19 @@ class CUTaskPlanner:
             parsed = json.loads(json_text)
         except json.JSONDecodeError as exc:
             logger.error(
-                "[CUTaskPlanner] Failed to parse Claude response as JSON: %s — raw: %s",
-                exc,
-                raw_text[:500],
+                "[CUTaskPlanner] System 2 failed to parse JSON: %s — raw: %s",
+                exc, raw_text[:500],
             )
             raise
 
         if not isinstance(parsed, list):
             logger.warning(
-                "[CUTaskPlanner] Expected list, got %s — wrapping in list",
+                "[CUTaskPlanner] Expected list, got %s — wrapping",
                 type(parsed).__name__,
             )
             parsed = [parsed] if isinstance(parsed, dict) else []
 
+        logger.info("[CUTaskPlanner] System 2 planned %d steps", len(parsed))
         return parsed
 
     # ------------------------------------------------------------------

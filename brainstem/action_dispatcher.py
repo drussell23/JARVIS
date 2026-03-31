@@ -1,11 +1,47 @@
 """Action Dispatcher — routes SSE events to local hardware."""
 import asyncio
 import logging
-from typing import Any, Callable, Coroutine, Dict, Optional
+import re
+from typing import Any, Callable, Coroutine, Dict, Optional, Tuple
 
 logger = logging.getLogger("jarvis.brainstem.dispatch")
 
 _DANGEROUS_COMMANDS = frozenset(["rm -rf /", "rm -rf ~", "mkfs", "> /dev/", "dd if=", ":(){", "chmod -R 777 /"])
+
+# ---------------------------------------------------------------------------
+# Tier 0: Deterministic fast-path patterns (no model call, <100ms)
+# ---------------------------------------------------------------------------
+
+# "open WhatsApp", "launch Safari", "open the terminal"
+_OPEN_APP_PATTERN = re.compile(
+    r"^(?:open|launch|start|run)\s+(?:the\s+)?(.+?)(?:\s+app)?$",
+    re.IGNORECASE,
+)
+
+# "open WhatsApp and message Zach" → app="WhatsApp", remainder="message Zach"
+_OPEN_APP_AND_PATTERN = re.compile(
+    r"^(?:open|launch|start)\s+(?:the\s+)?(.+?)\s+and\s+(.+)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_app_launch(goal: str) -> Optional[Tuple[str, Optional[str]]]:
+    """Extract app name and optional remainder from a goal string.
+
+    Returns (app_name, remainder) or None if not an app-launch command.
+    Examples:
+        "open WhatsApp"                        → ("WhatsApp", None)
+        "open WhatsApp and message Zach"       → ("WhatsApp", "message Zach saying what's up")
+        "launch Safari"                        → ("Safari", None)
+        "what's the weather?"                  → None
+    """
+    m = _OPEN_APP_AND_PATTERN.match(goal.strip())
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = _OPEN_APP_PATTERN.match(goal.strip())
+    if m:
+        return m.group(1).strip(), None
+    return None
 
 
 class ActionDispatcher:
@@ -178,8 +214,10 @@ class ActionDispatcher:
                 await self.tts_speak("Vision backend is not available. I can't execute screen actions right now.")
             return
 
-        logger.info("[Dispatch] VLA executing goal: %s (screenshot=%s)", goal[:80], "yes" if screenshot_b64 else "no")
-        if self.tts_speak:
+        source = payload.get("source", "")
+        logger.info("[Dispatch] VLA executing goal: %s (screenshot=%s, source=%s)", goal[:80], "yes" if screenshot_b64 else "no", source or "sse")
+        # HUD already spoke "On it." for local fast-path — skip duplicate TTS
+        if self.tts_speak and source != "local_fast_path":
             await self.tts_speak(f"On it. Executing: {goal[:60]}")
 
         try:
