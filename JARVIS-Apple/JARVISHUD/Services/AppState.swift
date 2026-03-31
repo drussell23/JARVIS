@@ -414,8 +414,17 @@ class PythonBridge: ObservableObject {
     private func handleAction(commandId: String, actionType: String, payload: [String: String]) {
         hudState = .processing
         detailedConnectionState = "Executing: \(actionType)"
-        // Actions (ghost hands, file edits) are handled by the brainstem, not the HUD
-        // HUD just shows the status
+        print("[JARVIS] Action event received: \(actionType) (cmd=\(commandId))")
+
+        // Forward action events to the brainstem via stdin pipe.
+        // The brainstem can't reach Vercel directly (Python SSL issue),
+        // so the HUD acts as the network gateway and forwards events locally.
+        var eventData: [String: Any] = [
+            "command_id": commandId,
+            "action_type": actionType,
+            "payload": payload,
+        ]
+        BrainstemLauncher.shared.sendEvent(eventType: "action", data: eventData)
     }
 
     // MARK: - Speech helpers

@@ -14,6 +14,7 @@ final class BrainstemLauncher {
     static let shared = BrainstemLauncher()
 
     private var process: Process?
+    private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
 
@@ -78,6 +79,11 @@ final class BrainstemLauncher {
         proc.arguments = ["python3", "-m", "brainstem"]
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         proc.environment = env
+
+        // Pipe stdin for sending action events from HUD → brainstem
+        let stdin = Pipe()
+        proc.standardInput = stdin
+        self.stdinPipe = stdin
 
         // Pipe stdout/stderr to Xcode console
         let stdout = Pipe()
@@ -146,6 +152,28 @@ final class BrainstemLauncher {
             self?.process = nil
             self?.stdoutPipe = nil
             self?.stderrPipe = nil
+        }
+    }
+
+    /// Send an action event to the brainstem via stdin (JSON line).
+    /// Called by the HUD when it receives action events from Vercel SSE.
+    func sendEvent(eventType: String, data: [String: Any]) {
+        guard let pipe = stdinPipe, process?.isRunning == true else {
+            print("[Brainstem] Cannot send event — process not running")
+            return
+        }
+        do {
+            let jsonData = try JSONSerialization.data(withJSONObject: [
+                "event_type": eventType,
+                "data": data,
+            ])
+            // Write as a JSON line (newline-delimited)
+            var line = jsonData
+            line.append(0x0A) // newline
+            pipe.fileHandleForWriting.write(line)
+            print("[Brainstem] Forwarded event: \(eventType)")
+        } catch {
+            print("[Brainstem] Failed to serialize event: \(error)")
         }
     }
 

@@ -139,18 +139,51 @@ async def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    logger.info("[Main] Starting SSE consumer + voice intake...")
+    # Stdin reader: HUD forwards action events to brainstem via stdin pipe.
+    # This bypasses the brainstem's broken Vercel SSE connection entirely.
+    async def _stdin_reader() -> None:
+        """Read JSON lines from stdin (sent by HUD via BrainstemLauncher.sendEvent)."""
+        import json as _json
+        logger.info("[Stdin] Listening for events from HUD via stdin pipe...")
+        reader = asyncio.StreamReader()
+        protocol = asyncio.StreamReaderProtocol(reader)
+        await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+
+        while not shutdown.is_set():
+            try:
+                line = await reader.readline()
+                if not line:
+                    break  # stdin closed
+                text = line.decode("utf-8", errors="replace").strip()
+                if not text:
+                    continue
+                try:
+                    msg = _json.loads(text)
+                    event_type = msg.get("event_type", "")
+                    data = msg.get("data", {})
+                    logger.info("[Stdin] Event from HUD: %s", event_type)
+                    await dispatcher.dispatch(event_type, data)
+                except _json.JSONDecodeError:
+                    logger.debug("[Stdin] Non-JSON line: %s", text[:100])
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning("[Stdin] Read error: %s", e)
+
+    logger.info("[Main] Starting stdin reader + SSE consumer + voice intake...")
     try:
+        stdin_task = asyncio.create_task(_stdin_reader())
         consumer_task = asyncio.create_task(consumer.run(shutdown))
         voice_task = asyncio.create_task(voice.run(shutdown))
 
-        # Surface consumer crashes immediately instead of swallowing them
-        async def _watch_consumer() -> None:
-            try:
-                await consumer_task
-            except Exception as exc:
-                logger.error("[Main] SSE consumer crashed: %s: %s", type(exc).__name__, exc)
-        asyncio.create_task(_watch_consumer())
+        # Surface crashes immediately
+        async def _watch_tasks() -> None:
+            for name, task in [("stdin", stdin_task), ("SSE", consumer_task)]:
+                try:
+                    await task
+                except Exception as exc:
+                    logger.error("[Main] %s task crashed: %s: %s", name, type(exc).__name__, exc)
+        asyncio.create_task(_watch_tasks())
 
         await voice_task
     finally:
