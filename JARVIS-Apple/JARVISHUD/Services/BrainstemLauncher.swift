@@ -179,9 +179,10 @@ final class BrainstemLauncher {
     /// screenshots (~200KB) which would block the main actor on a 64KB pipe buffer.
     func sendEvent(eventType: String, data: [String: Any]) {
         guard let pipe = stdinPipe, process?.isRunning == true else {
-            print("[Brainstem] Cannot send event — process not running")
+            print("[Brainstem] Cannot send event — process not running (pipe=\(stdinPipe != nil), running=\(process?.isRunning ?? false))")
             return
         }
+        print("[Brainstem] sendEvent: preparing \(eventType)")
         do {
             let jsonData = try JSONSerialization.data(withJSONObject: [
                 "event_type": eventType,
@@ -191,10 +192,12 @@ final class BrainstemLauncher {
             var line = jsonData
             line.append(0x0A) // newline
             let handle = pipe.fileHandleForWriting
+            print("[Brainstem] sendEvent: serialized \(eventType) (\(line.count) bytes), dispatching write")
             // Dispatch to background — pipe write blocks until Python drains the buffer.
             // Screenshots are ~200KB; default pipe buffer is 64KB; blocking main actor
             // here would freeze the UI until the brainstem asyncio loop drains the pipe.
             DispatchQueue.global(qos: .userInitiated).async {
+                print("[Brainstem] sendEvent: writing to pipe...")
                 handle.write(line)
                 print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes)")
             }
