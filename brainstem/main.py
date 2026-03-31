@@ -225,7 +225,7 @@ async def main() -> None:
                     # "BufferedReader broken" as the root cause.
                     readable, _, _ = _select.select([0], [], [], 5.0)
                     if not readable:
-                        logger.debug("[Stdin] Thread: select timeout (5s), no data on fd 0")
+                        logger.info("[Stdin] Thread: select timeout (5s), no data on fd 0 yet")
                         continue
                     logger.info("[Stdin] Thread: select fired — data on fd 0, calling readline...")
                     line = raw.readline(2 * 1024 * 1024)   # 2MB hard cap
