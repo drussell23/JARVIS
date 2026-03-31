@@ -115,6 +115,19 @@ public final class SSEClient: NSObject, URLSessionDataDelegate, @unchecked Senda
             return .complete(event)
         case "heartbeat":
             return .heartbeat
+        case "action":
+            // Parse action event: { command_id, action_type, payload: { goal, screenshot, ... } }
+            guard let json = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any],
+                  let commandId = json["command_id"] as? String,
+                  let actionType = json["action_type"] as? String else { return nil }
+            // Flatten payload dict to [String: String] for the event
+            var payload: [String: String] = [:]
+            if let p = json["payload"] as? [String: Any] {
+                for (k, v) in p {
+                    if let s = v as? String { payload[k] = s }
+                }
+            }
+            return .action(commandId: commandId, actionType: actionType, payload: payload)
         default:
             return nil
         }
