@@ -48,7 +48,7 @@ Environment Variables:
 """
 
 # Orchestrator (main entry point)
-from ghost_hands.orchestrator import (
+from backend.ghost_hands.orchestrator import (
     GhostHandsOrchestrator,
     GhostHandsConfig,
     GhostAction,
@@ -60,7 +60,7 @@ from ghost_hands.orchestrator import (
 )
 
 # N-Optic Nerve (vision)
-from ghost_hands.n_optic_nerve import (
+from backend.ghost_hands.n_optic_nerve import (
     NOpticNerve,
     NOpticConfig,
     VisionEvent,
@@ -75,7 +75,7 @@ from ghost_hands.n_optic_nerve import (
 )
 
 # Background Actuator (actions)
-from ghost_hands.background_actuator import (
+from backend.ghost_hands.background_actuator import (
     BackgroundActuator,
     ActuatorConfig,
     Action,
@@ -86,7 +86,7 @@ from ghost_hands.background_actuator import (
 )
 
 # Narration Engine (voice)
-from ghost_hands.narration_engine import (
+from backend.ghost_hands.narration_engine import (
     NarrationEngine,
     NarrationConfig,
     NarrationItem,
@@ -98,7 +98,7 @@ from ghost_hands.narration_engine import (
 )
 
 # Yabai-Aware Actuator (cross-space actions)
-from ghost_hands.yabai_aware_actuator import (
+from backend.ghost_hands.yabai_aware_actuator import (
     YabaiAwareActuator,
     YabaiActuatorConfig,
     YabaiWindowInfo,

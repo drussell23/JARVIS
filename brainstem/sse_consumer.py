@@ -101,7 +101,9 @@ class SSEConsumer:
             """Blocking SSE reader — runs in thread pool."""
             try:
                 req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=_CONNECT_TIMEOUT_S) as resp:
+                # Bypass https_proxy (localhost:65403) which can't reach Vercel
+                opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+                with opener.open(req, timeout=_CONNECT_TIMEOUT_S) as resp:
                     if resp.status == 401:
                         raise RuntimeError("401 Unauthorized")
                     logger.info("[SSE] Connected (status=%d)", resp.status)

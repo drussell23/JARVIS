@@ -70,7 +70,10 @@ class BrainstemAuth:
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=_TOKEN_TIMEOUT_S) as resp:
+            # Bypass https_proxy (localhost:65403) which can't reach Vercel.
+            # The HUD's Swift URLSession bypasses it, but Python respects it.
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with opener.open(req, timeout=_TOKEN_TIMEOUT_S) as resp:
                 if resp.status != 200:
                     raise RuntimeError(
                         f"Stream token request failed ({resp.status}): "
