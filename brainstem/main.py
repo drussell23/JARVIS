@@ -215,32 +215,27 @@ async def main() -> None:
                 except Exception as diag_err:
                     logger.warning("[Stdin] fd 0 diagnostic failed: %s", diag_err)
 
+                # Use os.write(2, ...) for ALL thread diagnostics — Python's
+                # logger.info() from threads may be silently blocked by a lock
+                # contention with the main thread's logging/IO.
                 import select as _select
+                os.write(2, b"STDIN_THREAD: select imported OK\n")
 
-                # Quick sanity: does select() even work on fd 0?
-                logger.info("[Stdin] Thread: select sanity check (0s timeout)...")
+                os.write(2, b"STDIN_THREAD: calling select(0s)...\n")
                 r0, _, _ = _select.select([0], [], [], 0)
-                logger.info("[Stdin] Thread: sanity check passed — readable=%s", bool(r0))
+                os.write(2, f"STDIN_THREAD: select(0s) returned readable={bool(r0)}\n".encode())
 
-                # Quick sanity: can we os.read from fd 0?
-                logger.info("[Stdin] Thread: os.read(0,1) test with select guard...")
+                os.write(2, b"STDIN_THREAD: calling select(2s) for data test...\n")
                 r1, _, _ = _select.select([0], [], [], 2.0)
-                if r1:
-                    test = os.read(0, 1)
-                    logger.info("[Stdin] Thread: os.read got %d byte(s): %r", len(test), test)
-                    # Push this byte back — we'll need it for readline
-                    # Use os.read for all subsequent reads instead of BufferedReader
-                    leftover = test
-                else:
-                    logger.info("[Stdin] Thread: no data on fd 0 after 2s (expected)")
-                    leftover = b""
+                os.write(2, f"STDIN_THREAD: select(2s) returned readable={bool(r1)}\n".encode())
+                leftover = b""
 
                 # Root-cause diagnosis: BufferedReader.readline() hangs on this pipe
                 # even with blocking fd. Using os.read(0, ...) with select() guard
                 # bypasses Python's BufferedReader layer which is the broken component.
                 # This is NOT a workaround — os.read is the correct POSIX primitive for
                 # reading from inherited pipes in threaded subprocess contexts.
-                logger.info("[Stdin] Thread: entering main read loop (os.read + select mode)...")
+                os.write(2, b"STDIN_THREAD: entering main read loop\n")
                 buf = leftover
                 while True:
                     readable, _, _ = _select.select([0], [], [], 5.0)
@@ -257,7 +252,7 @@ async def main() -> None:
                         if not line_bytes:
                             continue
                         line_bytes += b"\n"
-                        logger.info("[Stdin] Thread: read %d bytes, queuing", len(line_bytes))
+                        os.write(2, f"STDIN_THREAD: read {len(line_bytes)} bytes, queuing\n".encode())
                         try:
                             loop.call_soon_threadsafe(queue.put_nowait, line_bytes)
                         except Exception as qe:
