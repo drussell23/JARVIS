@@ -75,8 +75,14 @@ final class BrainstemLauncher {
         env["PYTHONPATH"] = existingPythonPath.isEmpty ? repoRoot : "\(repoRoot):\(existingPythonPath)"
 
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["python3", "-m", "brainstem"]
+        // Use python3.12 (Homebrew, OpenSSL 3.6) instead of system python3
+        // (3.9.6, LibreSSL 2.8.3) which can't complete TLS handshakes to Vercel/Anthropic.
+        let python = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/python3.12")
+            ? "/opt/homebrew/bin/python3.12"
+            : "/usr/bin/env"
+        let pythonArgs = python == "/usr/bin/env" ? ["python3", "-m", "brainstem"] : ["-m", "brainstem"]
+        proc.executableURL = URL(fileURLWithPath: python)
+        proc.arguments = pythonArgs
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         proc.environment = env
 
