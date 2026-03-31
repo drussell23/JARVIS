@@ -189,12 +189,18 @@ async def main() -> None:
             """
             try:
                 raw = sys.stdin.buffer   # BufferedReader — binary, 8KB default buf
+                logger.info("[Stdin] Thread: blocking on first readline...")
                 while True:
                     line = raw.readline(2 * 1024 * 1024)   # 2MB hard cap
                     if not line:
-                        logger.info("[Stdin] stdin closed (EOF)")
+                        logger.info("[Stdin] Thread: stdin closed (EOF)")
                         break
-                    loop.call_soon_threadsafe(queue.put_nowait, line)
+                    logger.info("[Stdin] Thread: read %d bytes, queuing via call_soon_threadsafe", len(line))
+                    try:
+                        loop.call_soon_threadsafe(queue.put_nowait, line)
+                        logger.info("[Stdin] Thread: queued successfully")
+                    except Exception as qe:
+                        logger.error("[Stdin] Thread: call_soon_threadsafe FAILED: %s", qe)
             except Exception as e:
                 logger.warning("[Stdin] Reader thread error: %s", e)
 
@@ -205,6 +211,7 @@ async def main() -> None:
         while not shutdown.is_set():
             try:
                 line = await asyncio.wait_for(queue.get(), timeout=1.0)
+                logger.info("[Stdin] Consumer: got %d bytes from queue", len(line))
                 text = line.decode("utf-8", errors="replace").strip()
                 if not text:
                     continue
