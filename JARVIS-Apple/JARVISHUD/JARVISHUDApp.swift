@@ -84,6 +84,12 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                     }
                 }
 
+                // Wait for launched app to become frontmost before forwarding
+                // remainder — otherwise the brainstem's screenshot shows Xcode.
+                if appName != nil {
+                    Thread.sleep(forTimeInterval: 2.0)
+                }
+
                 // Forward to brainstem for complex remainder (messaging, etc.)
                 if BrainstemLauncher.shared.isRunning {
                     let remainder = appName != nil ? Self.extractRemainder(command) : command

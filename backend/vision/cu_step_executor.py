@@ -18,7 +18,7 @@ Env vars:
   DOUBLEWORD_BASE_URL           -- API base (default https://api.doubleword.ai/v1)
   ANTHROPIC_API_KEY             -- enables Layer 3
   JARVIS_CU_DW_TIMEOUT_S       -- Doubleword request timeout (default 10)
-  JARVIS_CU_VISION_MODEL       -- Claude model for vision (default claude-sonnet-4-5-20241022)
+  JARVIS_CU_VISION_MODEL       -- Claude model for vision (default claude-3-5-sonnet-20241022)
   JARVIS_CU_VERIFY_DELAY_S     -- post-action verification delay (default 0.3)
   JARVIS_CU_JPEG_QUALITY       -- JPEG quality for frame encoding (default 80)
 """
@@ -265,7 +265,7 @@ class CUStepExecutor:
         # Layer 3: Claude
         self._anthropic_key: str = _env_str("ANTHROPIC_API_KEY", "")
         self._claude_model: str = _env_str(
-            "JARVIS_CU_VISION_MODEL", "claude-sonnet-4-5-20241022",
+            "JARVIS_CU_VISION_MODEL", "claude-3-5-sonnet-20241022",
         )
 
         # SHM frame reader

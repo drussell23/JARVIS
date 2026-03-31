@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Environment-driven tunables — no hardcoding
 # ---------------------------------------------------------------------------
-_MODEL = os.environ.get("JARVIS_CU_PLANNER_MODEL", "claude-sonnet-4-5-20241022")
+_MODEL = os.environ.get("JARVIS_CU_PLANNER_MODEL", "claude-3-5-sonnet-20241022")
 _MAX_TOKENS = int(os.environ.get("JARVIS_CU_PLANNER_MAX_TOKENS", "2048"))
 _JPEG_QUALITY = int(os.environ.get("JARVIS_CU_PLANNER_JPEG_QUALITY", "80"))
 
@@ -255,7 +255,7 @@ class CUTaskPlanner:
         # Read tunables at construction (not at call time) so they are
         # stable for the lifetime of this planner instance.
         self._claude_model: str = os.environ.get(
-            "JARVIS_CU_PLANNER_MODEL", "claude-sonnet-4-5-20241022"
+            "JARVIS_CU_PLANNER_MODEL", "claude-3-5-sonnet-20241022"
         )
         self._max_tokens: int = int(
             os.environ.get("JARVIS_CU_PLANNER_MAX_TOKENS", "2048")
