@@ -189,90 +189,50 @@ async def main() -> None:
         q: thread_queue.Queue[str] = thread_queue.Queue()
 
         def _poll_thread() -> None:
-            """Daemon thread that polls the inbox file for new content."""
-            nonlocal last_mtime
-            os.write(2, b"INBOX_THREAD: alive, entering loop\n")
-            poll_count = 0
+            """Daemon thread: read inbox, dispatch events, truncate."""
+            os.write(2, b"INBOX_THREAD: alive\n")
             while not shutdown.is_set():
+                time.sleep(0.1)
                 try:
-                    time.sleep(0.1)  # 100ms poll interval
-                    poll_count += 1
-                    if poll_count <= 3 or poll_count % 100 == 0:
-                        os.write(2, f"INBOX_THREAD: poll #{poll_count}\n".encode())
-
-                    if not os.path.exists(inbox_path):
-                        if poll_count <= 3:
-                            os.write(2, f"INBOX_THREAD: file not found: {inbox_path}\n".encode())
-                        continue
-
-                    try:
-                        st = os.stat(inbox_path)
-                    except OSError:
-                        continue
-
-                    # Skip if file hasn't been modified and is empty
-                    if st.st_mtime == last_mtime and st.st_size == 0:
-                        continue
-                    if st.st_size == 0:
-                        last_mtime = st.st_mtime
-                        continue
-
-                    # Read and truncate under flock
-                    lines: list[str] = []
+                    # Simple: open, lock, read, truncate, close. No mtime/size checks.
                     try:
                         fd = os.open(inbox_path, os.O_RDWR)
-                        try:
-                            fcntl.flock(fd, fcntl.LOCK_EX)
-                            content = b""
-                            while True:
-                                chunk = os.read(fd, 65536)
-                                if not chunk:
-                                    break
-                                content += chunk
+                    except OSError:
+                        continue
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX)
+                        content = os.read(fd, 1024 * 1024)  # 1MB max
+                        if content:
                             os.ftruncate(fd, 0)
                             os.lseek(fd, 0, os.SEEK_SET)
-                            fcntl.flock(fd, fcntl.LOCK_UN)
-                        finally:
-                            os.close(fd)
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                    finally:
+                        os.close(fd)
 
-                        last_mtime = time.time()
-
-                        if content:
-                            os.write(2, f"INBOX_THREAD: read {len(content)} bytes from inbox!\n".encode())
-                            text = content.decode("utf-8", errors="replace")
-                            lines = [l.strip() for l in text.splitlines() if l.strip()]
-                    except OSError as e:
-                        logger.debug("[Inbox] Read error (will retry): %s", e)
+                    if not content:
                         continue
 
-                    # Dispatch directly in the poll thread using a fresh event
-                    # loop. The main asyncio event loop's call_soon_threadsafe
-                    # is broken in this macOS subprocess context — neither
-                    # asyncio.Queue nor run_in_executor can reliably deliver
-                    # data from threads to the main loop.
-                    for line_text in lines:
+                    os.write(2, f"INBOX_THREAD: got {len(content)} bytes\n".encode())
+                    text = content.decode("utf-8", errors="replace")
+                    for line_text in text.splitlines():
+                        line_text = line_text.strip()
+                        if not line_text:
+                            continue
                         try:
                             msg = _json.loads(line_text)
                             event_type = msg.get("event_type", "")
                             data = msg.get("data", {})
-                            logger.info("[Inbox] Event from HUD: %s (%d chars)", event_type, len(line_text))
-                            # Run dispatch in a dedicated event loop for this thread.
-                            # This avoids all call_soon_threadsafe / main-loop issues.
-                            _dispatch_loop = asyncio.new_event_loop()
+                            os.write(2, f"INBOX_THREAD: dispatching {event_type}\n".encode())
+                            _loop = asyncio.new_event_loop()
                             try:
-                                _dispatch_loop.run_until_complete(
-                                    dispatcher.dispatch(event_type, data)
-                                )
+                                _loop.run_until_complete(dispatcher.dispatch(event_type, data))
                             finally:
-                                _dispatch_loop.close()
-                            logger.info("[Inbox] Dispatch complete for %s", event_type)
-                        except _json.JSONDecodeError:
-                            logger.debug("[Inbox] Non-JSON line: %s", line_text[:100])
+                                _loop.close()
+                            os.write(2, f"INBOX_THREAD: dispatch done\n".encode())
                         except Exception as de:
-                            logger.error("[Inbox] Dispatch error: %s", de)
-
+                            os.write(2, f"INBOX_THREAD: ERROR: {de}\n".encode())
                 except Exception as e:
-                    logger.warning("[Inbox] Poll thread error: %s", e)
+                    os.write(2, f"INBOX_THREAD: POLL ERROR: {e}\n".encode())
                     time.sleep(1.0)
 
         thread = threading.Thread(target=_poll_thread, daemon=True, name="inbox-reader")
