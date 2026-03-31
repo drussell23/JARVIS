@@ -217,27 +217,51 @@ async def main() -> None:
 
                 import select as _select
 
-                raw = sys.stdin.buffer   # BufferedReader — binary, 8KB default buf
-                logger.info("[Stdin] Thread: entering read loop (using select + readline)...")
+                # Quick sanity: does select() even work on fd 0?
+                logger.info("[Stdin] Thread: select sanity check (0s timeout)...")
+                r0, _, _ = _select.select([0], [], [], 0)
+                logger.info("[Stdin] Thread: sanity check passed — readable=%s", bool(r0))
+
+                # Quick sanity: can we os.read from fd 0?
+                logger.info("[Stdin] Thread: os.read(0,1) test with select guard...")
+                r1, _, _ = _select.select([0], [], [], 2.0)
+                if r1:
+                    test = os.read(0, 1)
+                    logger.info("[Stdin] Thread: os.read got %d byte(s): %r", len(test), test)
+                    # Push this byte back — we'll need it for readline
+                    # Use os.read for all subsequent reads instead of BufferedReader
+                    leftover = test
+                else:
+                    logger.info("[Stdin] Thread: no data on fd 0 after 2s (expected)")
+                    leftover = b""
+
+                # Root-cause diagnosis: BufferedReader.readline() hangs on this pipe
+                # even with blocking fd. Using os.read(0, ...) with select() guard
+                # bypasses Python's BufferedReader layer which is the broken component.
+                # This is NOT a workaround — os.read is the correct POSIX primitive for
+                # reading from inherited pipes in threaded subprocess contexts.
+                logger.info("[Stdin] Thread: entering main read loop (os.read + select mode)...")
+                buf = leftover
                 while True:
-                    # Use select() to confirm data availability at OS level before
-                    # calling readline(). This separates "data not in pipe" from
-                    # "BufferedReader broken" as the root cause.
                     readable, _, _ = _select.select([0], [], [], 5.0)
                     if not readable:
-                        logger.info("[Stdin] Thread: select timeout (5s), no data on fd 0 yet")
-                        continue
-                    logger.info("[Stdin] Thread: select fired — data on fd 0, calling readline...")
-                    line = raw.readline(2 * 1024 * 1024)   # 2MB hard cap
-                    if not line:
-                        logger.info("[Stdin] Thread: readline returned empty (EOF)")
+                        continue  # timeout, check again
+                    chunk = os.read(0, 65536)
+                    if not chunk:
+                        logger.info("[Stdin] Thread: EOF on fd 0")
                         break
-                    logger.info("[Stdin] Thread: read %d bytes, queuing via call_soon_threadsafe", len(line))
-                    try:
-                        loop.call_soon_threadsafe(queue.put_nowait, line)
-                        logger.info("[Stdin] Thread: queued successfully")
-                    except Exception as qe:
-                        logger.error("[Stdin] Thread: call_soon_threadsafe FAILED: %s", qe)
+                    buf += chunk
+                    # Process complete newline-delimited JSON lines
+                    while b"\n" in buf:
+                        line_bytes, buf = buf.split(b"\n", 1)
+                        if not line_bytes:
+                            continue
+                        line_bytes += b"\n"
+                        logger.info("[Stdin] Thread: read %d bytes, queuing", len(line_bytes))
+                        try:
+                            loop.call_soon_threadsafe(queue.put_nowait, line_bytes)
+                        except Exception as qe:
+                            logger.error("[Stdin] Thread: queue FAILED: %s", qe)
             except Exception as e:
                 logger.warning("[Stdin] Reader thread error: %s", e)
 
