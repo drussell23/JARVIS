@@ -145,7 +145,8 @@ async def main() -> None:
         """Read JSON lines from stdin (sent by HUD via BrainstemLauncher.sendEvent)."""
         import json as _json
         logger.info("[Stdin] Listening for events from HUD via stdin pipe...")
-        reader = asyncio.StreamReader()
+        # 1MB limit — action events include base64 screenshots (~185KB)
+        reader = asyncio.StreamReader(limit=1024 * 1024)
         protocol = asyncio.StreamReaderProtocol(reader)
         await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
 
