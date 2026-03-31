@@ -188,6 +188,33 @@ async def main() -> None:
             correctly — it drains the OS pipe buffer in 8KB chunks until \\n.
             """
             try:
+                import fcntl
+                import stat as _stat
+
+                # Diagnose fd 0 state — is it a pipe? Is it non-blocking?
+                try:
+                    st = os.fstat(0)
+                    is_pipe = _stat.S_ISFIFO(st.st_mode)
+                    flags = fcntl.fcntl(0, fcntl.F_GETFL)
+                    is_nonblock = bool(flags & os.O_NONBLOCK)
+                    logger.info(
+                        "[Stdin] fd 0 diagnostics: pipe=%s nonblock=%s flags=%s closed=%s fileno=%d",
+                        is_pipe, is_nonblock, oct(flags),
+                        sys.stdin.closed, sys.stdin.fileno(),
+                    )
+                    # ROOT CAUSE FIX: if something set fd 0 to O_NONBLOCK
+                    # (e.g., asyncio event loop setup), BufferedReader.readline()
+                    # gets EAGAIN and either raises BlockingIOError or spins.
+                    # Restore blocking mode so readline() works correctly.
+                    if is_nonblock:
+                        fcntl.fcntl(0, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
+                        logger.warning(
+                            "[Stdin] fd 0 was O_NONBLOCK — restored to blocking mode. "
+                            "This was likely set by asyncio event loop setup."
+                        )
+                except Exception as diag_err:
+                    logger.warning("[Stdin] fd 0 diagnostic failed: %s", diag_err)
+
                 raw = sys.stdin.buffer   # BufferedReader — binary, 8KB default buf
                 logger.info("[Stdin] Thread: blocking on first readline...")
                 while True:
