@@ -237,9 +237,31 @@ async def main() -> None:
                         logger.debug("[Inbox] Read error (will retry): %s", e)
                         continue
 
+                    # Dispatch directly in the poll thread using a fresh event
+                    # loop. The main asyncio event loop's call_soon_threadsafe
+                    # is broken in this macOS subprocess context — neither
+                    # asyncio.Queue nor run_in_executor can reliably deliver
+                    # data from threads to the main loop.
                     for line_text in lines:
-                        logger.info("[Inbox] Poll thread: queuing event (%d chars)", len(line_text))
-                        q.put(line_text)
+                        try:
+                            msg = _json.loads(line_text)
+                            event_type = msg.get("event_type", "")
+                            data = msg.get("data", {})
+                            logger.info("[Inbox] Event from HUD: %s (%d chars)", event_type, len(line_text))
+                            # Run dispatch in a dedicated event loop for this thread.
+                            # This avoids all call_soon_threadsafe / main-loop issues.
+                            _dispatch_loop = asyncio.new_event_loop()
+                            try:
+                                _dispatch_loop.run_until_complete(
+                                    dispatcher.dispatch(event_type, data)
+                                )
+                            finally:
+                                _dispatch_loop.close()
+                            logger.info("[Inbox] Dispatch complete for %s", event_type)
+                        except _json.JSONDecodeError:
+                            logger.debug("[Inbox] Non-JSON line: %s", line_text[:100])
+                        except Exception as de:
+                            logger.error("[Inbox] Dispatch error: %s", de)
 
                 except Exception as e:
                     logger.warning("[Inbox] Poll thread error: %s", e)
@@ -247,30 +269,11 @@ async def main() -> None:
 
         thread = threading.Thread(target=_poll_thread, daemon=True, name="inbox-reader")
         thread.start()
-        logger.info("[Inbox] Poll thread started (100ms interval)")
+        logger.info("[Inbox] Poll thread started (100ms interval, direct dispatch)")
 
-        loop = asyncio.get_running_loop()
+        # The poll thread handles everything — async consumer just keeps task alive
         while not shutdown.is_set():
-            try:
-                # run_in_executor does a blocking q.get(timeout=1) in the
-                # thread pool — doesn't need call_soon_threadsafe at all.
-                text = await loop.run_in_executor(
-                    None, lambda: q.get(timeout=1.0),
-                )
-                if not text:
-                    continue
-                try:
-                    msg = _json.loads(text)
-                    event_type = msg.get("event_type", "")
-                    data = msg.get("data", {})
-                    logger.info("[Inbox] Event from HUD: %s (%d chars)", event_type, len(text))
-                    await dispatcher.dispatch(event_type, data)
-                except _json.JSONDecodeError:
-                    logger.debug("[Inbox] Non-JSON line: %s", text[:100])
-            except Exception as e:
-                # queue.Empty from timeout — just loop
-                if "Empty" not in type(e).__name__:
-                    logger.warning("[Inbox] Dispatch error: %s", e)
+            await asyncio.sleep(1.0)
 
     logger.info("[Main] Starting inbox reader + SSE consumer + voice intake...")
     try:
