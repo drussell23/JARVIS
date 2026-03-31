@@ -162,139 +162,121 @@ async def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    # Stdin reader: HUD forwards action events to brainstem via stdin pipe.
-    # This bypasses the brainstem's broken Vercel SSE connection entirely.
+    # Inbox reader: HUD forwards action events to brainstem via a file-based
+    # inbox at .jarvis/brainstem_inbox.jsonl.  The HUD appends JSON lines;
+    # this reader polls for new content, processes it, then truncates the file.
     #
-    # IMPORTANT: asyncio.connect_read_pipe(sys.stdin) does NOT reliably drain
-    # inherited pipes on macOS Python 3.12 — the kqueue transport never fires
-    # data_received(), so the 192KB action payload fills the 64KB pipe buffer
-    # and the Swift writer blocks forever.  A daemon thread + asyncio.Queue is
-    # the robust alternative.
-    async def _stdin_reader() -> None:
-        """Read JSON lines from stdin (sent by HUD via BrainstemLauncher.sendEvent)."""
+    # This replaces the previous stdin pipe approach which was fundamentally
+    # broken: select() on inherited pipe fd 0 hangs forever in Python threads
+    # when asyncio's event loop is running kqueue on macOS.
+    async def _inbox_reader() -> None:
+        """Poll the file-based inbox for events from HUD."""
         import json as _json
+        import fcntl
         import threading
-        logger.info("[Stdin] Listening for events from HUD via stdin pipe...")
 
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        inbox_path = os.path.join(os.getcwd(), ".jarvis", "brainstem_inbox.jsonl")
+        logger.info("[Inbox] Watching %s for events from HUD", inbox_path)
+
+        last_mtime: float = 0.0
+        queue: asyncio.Queue[str] = asyncio.Queue()
         loop = asyncio.get_running_loop()
 
-        def _reader_thread() -> None:
-            """Blocking stdin reader in a daemon thread.
-
-            Reads complete newline-delimited JSON lines from sys.stdin.buffer
-            (binary mode) and feeds them into the asyncio queue via
-            call_soon_threadsafe.  The BufferedReader handles 192KB+ lines
-            correctly — it drains the OS pipe buffer in 8KB chunks until \\n.
-            """
-            try:
-                import fcntl
-                import stat as _stat
-
-                # Diagnose fd 0 state — is it a pipe? Is it non-blocking?
+        def _poll_thread() -> None:
+            """Daemon thread that polls the inbox file for new content."""
+            nonlocal last_mtime
+            while not shutdown.is_set():
                 try:
-                    st = os.fstat(0)
-                    is_pipe = _stat.S_ISFIFO(st.st_mode)
-                    flags = fcntl.fcntl(0, fcntl.F_GETFL)
-                    is_nonblock = bool(flags & os.O_NONBLOCK)
-                    logger.info(
-                        "[Stdin] fd 0 diagnostics: pipe=%s nonblock=%s flags=%s closed=%s fileno=%d",
-                        is_pipe, is_nonblock, oct(flags),
-                        sys.stdin.closed, sys.stdin.fileno(),
-                    )
-                    # ROOT CAUSE FIX: if something set fd 0 to O_NONBLOCK
-                    # (e.g., asyncio event loop setup), BufferedReader.readline()
-                    # gets EAGAIN and either raises BlockingIOError or spins.
-                    # Restore blocking mode so readline() works correctly.
-                    if is_nonblock:
-                        fcntl.fcntl(0, fcntl.F_SETFL, flags & ~os.O_NONBLOCK)
-                        logger.warning(
-                            "[Stdin] fd 0 was O_NONBLOCK — restored to blocking mode. "
-                            "This was likely set by asyncio event loop setup."
-                        )
-                except Exception as diag_err:
-                    logger.warning("[Stdin] fd 0 diagnostic failed: %s", diag_err)
+                    time.sleep(0.1)  # 100ms poll interval
 
-                # Use os.write(2, ...) for ALL thread diagnostics — Python's
-                # logger.info() from threads may be silently blocked by a lock
-                # contention with the main thread's logging/IO.
-                import select as _select
-                os.write(2, b"STDIN_THREAD: select imported OK\n")
+                    if not os.path.exists(inbox_path):
+                        continue
 
-                os.write(2, b"STDIN_THREAD: calling select(0s)...\n")
-                r0, _, _ = _select.select([0], [], [], 0)
-                os.write(2, f"STDIN_THREAD: select(0s) returned readable={bool(r0)}\n".encode())
+                    try:
+                        st = os.stat(inbox_path)
+                    except OSError:
+                        continue
 
-                os.write(2, b"STDIN_THREAD: calling select(2s) for data test...\n")
-                r1, _, _ = _select.select([0], [], [], 2.0)
-                os.write(2, f"STDIN_THREAD: select(2s) returned readable={bool(r1)}\n".encode())
-                leftover = b""
+                    # Skip if file hasn't been modified and is empty
+                    if st.st_mtime == last_mtime and st.st_size == 0:
+                        continue
+                    if st.st_size == 0:
+                        last_mtime = st.st_mtime
+                        continue
 
-                # Root-cause diagnosis: BufferedReader.readline() hangs on this pipe
-                # even with blocking fd. Using os.read(0, ...) with select() guard
-                # bypasses Python's BufferedReader layer which is the broken component.
-                # This is NOT a workaround — os.read is the correct POSIX primitive for
-                # reading from inherited pipes in threaded subprocess contexts.
-                os.write(2, b"STDIN_THREAD: entering main read loop\n")
-                buf = leftover
-                while True:
-                    readable, _, _ = _select.select([0], [], [], 5.0)
-                    if not readable:
-                        continue  # timeout, check again
-                    chunk = os.read(0, 65536)
-                    if not chunk:
-                        logger.info("[Stdin] Thread: EOF on fd 0")
-                        break
-                    buf += chunk
-                    # Process complete newline-delimited JSON lines
-                    while b"\n" in buf:
-                        line_bytes, buf = buf.split(b"\n", 1)
-                        if not line_bytes:
-                            continue
-                        line_bytes += b"\n"
-                        os.write(2, f"STDIN_THREAD: read {len(line_bytes)} bytes, queuing\n".encode())
+                    # Read and truncate under flock
+                    lines: list[str] = []
+                    try:
+                        fd = os.open(inbox_path, os.O_RDWR)
                         try:
-                            loop.call_soon_threadsafe(queue.put_nowait, line_bytes)
-                        except Exception as qe:
-                            logger.error("[Stdin] Thread: queue FAILED: %s", qe)
-            except Exception as e:
-                logger.warning("[Stdin] Reader thread error: %s", e)
+                            fcntl.flock(fd, fcntl.LOCK_EX)
+                            # Read all content
+                            content = b""
+                            while True:
+                                chunk = os.read(fd, 65536)
+                                if not chunk:
+                                    break
+                                content += chunk
+                            # Truncate after reading
+                            os.ftruncate(fd, 0)
+                            os.lseek(fd, 0, os.SEEK_SET)
+                            fcntl.flock(fd, fcntl.LOCK_UN)
+                        finally:
+                            os.close(fd)
 
-        thread = threading.Thread(target=_reader_thread, daemon=True, name="stdin-reader")
+                        last_mtime = time.time()
+
+                        if content:
+                            text = content.decode("utf-8", errors="replace")
+                            lines = [l.strip() for l in text.splitlines() if l.strip()]
+                    except OSError as e:
+                        logger.debug("[Inbox] Read error (will retry): %s", e)
+                        continue
+
+                    # Queue each line for the async consumer
+                    for line_text in lines:
+                        try:
+                            loop.call_soon_threadsafe(queue.put_nowait, line_text)
+                        except Exception as qe:
+                            logger.error("[Inbox] Queue error: %s", qe)
+
+                except Exception as e:
+                    logger.warning("[Inbox] Poll thread error: %s", e)
+                    time.sleep(1.0)  # back off on unexpected errors
+
+        thread = threading.Thread(target=_poll_thread, daemon=True, name="inbox-reader")
         thread.start()
-        logger.info("[Stdin] Reader thread started (threaded mode)")
+        logger.info("[Inbox] Poll thread started (100ms interval)")
 
         while not shutdown.is_set():
             try:
-                line = await asyncio.wait_for(queue.get(), timeout=1.0)
-                logger.info("[Stdin] Consumer: got %d bytes from queue", len(line))
-                text = line.decode("utf-8", errors="replace").strip()
+                text = await asyncio.wait_for(queue.get(), timeout=1.0)
                 if not text:
                     continue
                 try:
                     msg = _json.loads(text)
                     event_type = msg.get("event_type", "")
                     data = msg.get("data", {})
-                    logger.info("[Stdin] Event from HUD: %s (%d bytes)", event_type, len(line))
+                    logger.info("[Inbox] Event from HUD: %s (%d chars)", event_type, len(text))
                     await dispatcher.dispatch(event_type, data)
                 except _json.JSONDecodeError:
-                    logger.debug("[Stdin] Non-JSON line: %s", text[:100])
+                    logger.debug("[Inbox] Non-JSON line: %s", text[:100])
             except asyncio.TimeoutError:
-                continue   # re-check shutdown flag
+                continue
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.warning("[Stdin] Read error: %s", e)
+                logger.warning("[Inbox] Dispatch error: %s", e)
 
-    logger.info("[Main] Starting stdin reader + SSE consumer + voice intake...")
+    logger.info("[Main] Starting inbox reader + SSE consumer + voice intake...")
     try:
-        stdin_task = asyncio.create_task(_stdin_reader())
+        inbox_task = asyncio.create_task(_inbox_reader())
         consumer_task = asyncio.create_task(consumer.run(shutdown))
         voice_task = asyncio.create_task(voice.run(shutdown))
 
         # Surface crashes immediately
         async def _watch_tasks() -> None:
-            for name, task in [("stdin", stdin_task), ("SSE", consumer_task)]:
+            for name, task in [("inbox", inbox_task), ("SSE", consumer_task)]:
                 try:
                     await task
                 except Exception as exc:

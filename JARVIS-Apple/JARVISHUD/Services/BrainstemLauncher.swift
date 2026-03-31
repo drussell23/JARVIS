@@ -14,9 +14,12 @@ final class BrainstemLauncher {
     static let shared = BrainstemLauncher()
 
     private var process: Process?
-    private var stdinPipe: Pipe?
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
+
+    /// File-based inbox for HUD → brainstem message passing.
+    /// The HUD appends JSON lines here; the brainstem polls and truncates.
+    private var inboxPath: String { repoRoot + "/.jarvis/brainstem_inbox.jsonl" }
 
     /// The repo root, derived from the known brainstem .env path.
     private let repoRoot: String = {
@@ -86,6 +89,18 @@ final class BrainstemLauncher {
         // Remove PYTHONHOME if set — it breaks Homebrew Python's module search
         env.removeValue(forKey: "PYTHONHOME")
 
+        // Ensure .jarvis/ directory exists for the file-based inbox
+        let jarvisDir = repoRoot + "/.jarvis"
+        if !FileManager.default.fileExists(atPath: jarvisDir) {
+            try? FileManager.default.createDirectory(
+                atPath: jarvisDir,
+                withIntermediateDirectories: true,
+                attributes: nil
+            )
+        }
+        // Clear any stale inbox from a previous session
+        FileManager.default.createFile(atPath: inboxPath, contents: nil, attributes: nil)
+
         let proc = Process()
         // Use python3.12 (Homebrew, OpenSSL 3.6) instead of system python3
         // (3.9.6, LibreSSL 2.8.3) which can't complete TLS handshakes to Vercel/Anthropic.
@@ -98,10 +113,7 @@ final class BrainstemLauncher {
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         proc.environment = env
 
-        // Pipe stdin for sending action events from HUD → brainstem
-        let stdin = Pipe()
-        proc.standardInput = stdin
-        self.stdinPipe = stdin
+        // No stdin pipe needed — HUD communicates via file-based inbox
 
         // Pipe stdout/stderr to Xcode console
         let stdout = Pipe()
@@ -129,10 +141,10 @@ final class BrainstemLauncher {
 
         // Handle unexpected termination — log but don't restart (user can re-run).
         // Use Task { @MainActor in } to hop back to the main actor for property mutation.
-        proc.terminationHandler = { p in
+        proc.terminationHandler = { [weak self] p in
             let code = p.terminationStatus
             print("[Brainstem] Process exited with code \(code)")
-            Task { @MainActor [weak self] in
+            Task { @MainActor in
                 self?.process = nil
                 self?.stdoutPipe = nil
                 self?.stderrPipe = nil
@@ -173,13 +185,13 @@ final class BrainstemLauncher {
         }
     }
 
-    /// Send an action event to the brainstem via stdin (JSON line).
+    /// Send an action event to the brainstem via the file-based inbox.
     /// Called by the HUD when it receives action events from Vercel SSE.
-    /// The write runs on a background queue — action payloads include base64
-    /// screenshots (~200KB) which would block the main actor on a 64KB pipe buffer.
+    /// The write runs on a background queue to avoid blocking the main actor
+    /// (action payloads include base64 screenshots ~200KB).
     func sendEvent(eventType: String, data: [String: Any]) {
-        guard let pipe = stdinPipe, process?.isRunning == true else {
-            print("[Brainstem] Cannot send event — process not running (pipe=\(stdinPipe != nil), running=\(process?.isRunning ?? false))")
+        guard process?.isRunning == true else {
+            print("[Brainstem] Cannot send event — process not running")
             return
         }
         print("[Brainstem] sendEvent: preparing \(eventType)")
@@ -188,18 +200,30 @@ final class BrainstemLauncher {
                 "event_type": eventType,
                 "data": data,
             ])
-            // Write as a JSON line (newline-delimited)
+            // Build a newline-terminated JSON line
             var line = jsonData
             line.append(0x0A) // newline
-            let handle = pipe.fileHandleForWriting
-            print("[Brainstem] sendEvent: serialized \(eventType) (\(line.count) bytes), dispatching write")
-            // Dispatch to background — pipe write blocks until Python drains the buffer.
-            // Screenshots are ~200KB; default pipe buffer is 64KB; blocking main actor
-            // here would freeze the UI until the brainstem asyncio loop drains the pipe.
+            let path = self.inboxPath
+            print("[Brainstem] sendEvent: serialized \(eventType) (\(line.count) bytes), writing to inbox")
+
             DispatchQueue.global(qos: .userInitiated).async {
-                print("[Brainstem] sendEvent: writing to pipe...")
-                handle.write(line)
-                print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes)")
+                let url = URL(fileURLWithPath: path)
+                do {
+                    // Open for writing, create if missing, append to end
+                    let handle = try FileHandle(forWritingTo: url)
+                    handle.seekToEndOfFile()
+                    handle.write(line)
+                    handle.closeFile()
+                    print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes) via inbox")
+                } catch {
+                    // File may not exist yet (race with start()) — create it
+                    do {
+                        try line.write(to: url)
+                        print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes) via inbox (created)")
+                    } catch {
+                        print("[Brainstem] Failed to write event to inbox: \(error)")
+                    }
+                }
             }
         } catch {
             print("[Brainstem] Failed to serialize event: \(error)")
