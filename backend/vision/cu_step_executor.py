@@ -285,7 +285,7 @@ class CUStepExecutor:
         if self._shm_reader is None:
             return None
         try:
-            frame, _counter = self._shm_reader.read_latest()
+            frame, _ = self._shm_reader.read_latest()
             if frame is None:
                 return None
             # Convert BGRA (4 channels) -> RGB (3 channels)
@@ -689,11 +689,11 @@ class CUStepExecutor:
             logger.warning("[CUExec] Claude Vision failed: %s", exc)
             return None
 
-        # Extract text from response
+        # Extract text from response (filter to TextBlock only)
         text = ""
         for block in response.content:
-            if hasattr(block, "text"):
-                text += block.text
+            if getattr(block, "type", None) == "text":
+                text += block.text  # type: ignore[union-attr]
         if not text:
             return None
 
@@ -717,7 +717,7 @@ class CUStepExecutor:
         return float(diff) > 1.0
 
     async def _verify_with_frame(
-        self, step: Any, pre_frame: np.ndarray,
+        self, _step: Any, pre_frame: np.ndarray,
     ) -> bool:
         """Wait, capture post-frame, compare."""
         await asyncio.sleep(self._verify_delay)

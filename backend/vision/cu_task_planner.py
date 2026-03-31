@@ -29,22 +29,12 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Environment-driven tunables — no hardcoding
-# ---------------------------------------------------------------------------
-_MODEL = os.environ.get("JARVIS_CU_PLANNER_MODEL", "claude-3-5-sonnet-20241022")
-_MAX_TOKENS = int(os.environ.get("JARVIS_CU_PLANNER_MAX_TOKENS", "2048"))
-_JPEG_QUALITY = int(os.environ.get("JARVIS_CU_PLANNER_JPEG_QUALITY", "80"))
-
-# Maximum image dimension before resizing (keeps API costs and latency sane)
-_MAX_IMAGE_DIM = int(os.environ.get("JARVIS_CU_PLANNER_MAX_IMAGE_DIM", "1280"))
 
 # ---------------------------------------------------------------------------
 # Planning prompt — instructs Claude how to decompose goals
@@ -492,7 +482,7 @@ class CUTaskPlanner:
         raw_text = ""
         for block in response.content:
             if getattr(block, "type", None) == "text":
-                raw_text += block.text
+                raw_text += block.text  # type: ignore[union-attr]
 
         # Parse JSON — handle markdown code fence wrapping
         raw_text = raw_text.strip()
@@ -561,7 +551,7 @@ class CUTaskPlanner:
             scale = max_dim / max(w, h)
             new_w = int(w * scale)
             new_h = int(h * scale)
-            img = img.resize((new_w, new_h), Image.LANCZOS)
+            img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
         # Encode as JPEG
         buf = io.BytesIO()
