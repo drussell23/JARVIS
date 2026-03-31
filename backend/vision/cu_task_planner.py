@@ -255,7 +255,8 @@ class CUTaskPlanner:
         # Read tunables at construction (not at call time) so they are
         # stable for the lifetime of this planner instance.
         self._claude_model: str = os.environ.get(
-            "JARVIS_CU_PLANNER_MODEL", "claude-3-5-sonnet-20241022"
+            "JARVIS_CU_PLANNER_MODEL",
+            os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022"),
         )
         self._max_tokens: int = int(
             os.environ.get("JARVIS_CU_PLANNER_MAX_TOKENS", "2048")

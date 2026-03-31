@@ -265,7 +265,8 @@ class CUStepExecutor:
         # Layer 3: Claude
         self._anthropic_key: str = _env_str("ANTHROPIC_API_KEY", "")
         self._claude_model: str = _env_str(
-            "JARVIS_CU_VISION_MODEL", "claude-3-5-sonnet-20241022",
+            "JARVIS_CU_VISION_MODEL",
+            os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022"),
         )
 
         # SHM frame reader
