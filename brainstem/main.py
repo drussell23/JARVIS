@@ -164,20 +164,47 @@ async def main() -> None:
 
     # Stdin reader: HUD forwards action events to brainstem via stdin pipe.
     # This bypasses the brainstem's broken Vercel SSE connection entirely.
+    #
+    # IMPORTANT: asyncio.connect_read_pipe(sys.stdin) does NOT reliably drain
+    # inherited pipes on macOS Python 3.12 — the kqueue transport never fires
+    # data_received(), so the 192KB action payload fills the 64KB pipe buffer
+    # and the Swift writer blocks forever.  A daemon thread + asyncio.Queue is
+    # the robust alternative.
     async def _stdin_reader() -> None:
         """Read JSON lines from stdin (sent by HUD via BrainstemLauncher.sendEvent)."""
         import json as _json
+        import threading
         logger.info("[Stdin] Listening for events from HUD via stdin pipe...")
-        # 1MB limit — action events include base64 screenshots (~185KB)
-        reader = asyncio.StreamReader(limit=1024 * 1024)
-        protocol = asyncio.StreamReaderProtocol(reader)
-        await asyncio.get_event_loop().connect_read_pipe(lambda: protocol, sys.stdin)
+
+        queue: asyncio.Queue[bytes] = asyncio.Queue()
+        loop = asyncio.get_running_loop()
+
+        def _reader_thread() -> None:
+            """Blocking stdin reader in a daemon thread.
+
+            Reads complete newline-delimited JSON lines from sys.stdin.buffer
+            (binary mode) and feeds them into the asyncio queue via
+            call_soon_threadsafe.  The BufferedReader handles 192KB+ lines
+            correctly — it drains the OS pipe buffer in 8KB chunks until \\n.
+            """
+            try:
+                raw = sys.stdin.buffer   # BufferedReader — binary, 8KB default buf
+                while True:
+                    line = raw.readline(2 * 1024 * 1024)   # 2MB hard cap
+                    if not line:
+                        logger.info("[Stdin] stdin closed (EOF)")
+                        break
+                    loop.call_soon_threadsafe(queue.put_nowait, line)
+            except Exception as e:
+                logger.warning("[Stdin] Reader thread error: %s", e)
+
+        thread = threading.Thread(target=_reader_thread, daemon=True, name="stdin-reader")
+        thread.start()
+        logger.info("[Stdin] Reader thread started (threaded mode)")
 
         while not shutdown.is_set():
             try:
-                line = await reader.readline()
-                if not line:
-                    break  # stdin closed
+                line = await asyncio.wait_for(queue.get(), timeout=1.0)
                 text = line.decode("utf-8", errors="replace").strip()
                 if not text:
                     continue
@@ -185,10 +212,12 @@ async def main() -> None:
                     msg = _json.loads(text)
                     event_type = msg.get("event_type", "")
                     data = msg.get("data", {})
-                    logger.info("[Stdin] Event from HUD: %s", event_type)
+                    logger.info("[Stdin] Event from HUD: %s (%d bytes)", event_type, len(line))
                     await dispatcher.dispatch(event_type, data)
                 except _json.JSONDecodeError:
                     logger.debug("[Stdin] Non-JSON line: %s", text[:100])
+            except asyncio.TimeoutError:
+                continue   # re-check shutdown flag
             except asyncio.CancelledError:
                 break
             except Exception as e:
