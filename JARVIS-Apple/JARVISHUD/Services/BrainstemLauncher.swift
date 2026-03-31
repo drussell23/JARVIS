@@ -74,6 +74,15 @@ final class BrainstemLauncher {
         let existingPythonPath = env["PYTHONPATH"] ?? ""
         env["PYTHONPATH"] = existingPythonPath.isEmpty ? repoRoot : "\(repoRoot):\(existingPythonPath)"
 
+        // Ensure PATH includes Homebrew so Python 3.12 can find its packages/tools
+        let existingPath = env["PATH"] ?? "/usr/bin:/bin"
+        if !existingPath.contains("/opt/homebrew") {
+            env["PATH"] = "/opt/homebrew/bin:/opt/homebrew/sbin:\(existingPath)"
+        }
+
+        // Remove PYTHONHOME if set — it breaks Homebrew Python's module search
+        env.removeValue(forKey: "PYTHONHOME")
+
         let proc = Process()
         // Use python3.12 (Homebrew, OpenSSL 3.6) instead of system python3
         // (3.9.6, LibreSSL 2.8.3) which can't complete TLS handshakes to Vercel/Anthropic.
