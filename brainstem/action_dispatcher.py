@@ -216,6 +216,36 @@ class ActionDispatcher:
 
         source = payload.get("source", "")
         logger.info("[Dispatch] VLA executing goal: %s (screenshot=%s, source=%s)", goal[:80], "yes" if screenshot_b64 else "no", source or "sse")
+
+        # ----- Tier 0: Deterministic fast-path for app launch (<100ms) -----
+        app_launch = _parse_app_launch(goal)
+        if app_launch is not None:
+            app_name, remainder = app_launch
+            logger.info("[Dispatch] Tier 0 fast-path: launching '%s' via macOS open", app_name)
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "open", "-a", app_name,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr_data = await proc.communicate()
+                if proc.returncode == 0:
+                    logger.info("[Dispatch] Tier 0: '%s' launched (exit 0)", app_name)
+                    if remainder:
+                        logger.info("[Dispatch] Tier 0 → vision: remainder goal: %s", remainder)
+                        await asyncio.sleep(1.0)
+                        goal = remainder
+                        screenshot_b64 = None
+                    else:
+                        if self.tts_speak:
+                            await self.tts_speak(f"Opened {app_name}.")
+                        return
+                else:
+                    err = stderr_data.decode("utf-8", errors="replace").strip() if stderr_data else "unknown"
+                    logger.warning("[Dispatch] Tier 0: 'open -a %s' failed (exit %d): %s", app_name, proc.returncode, err)
+            except Exception as e:
+                logger.warning("[Dispatch] Tier 0 error: %s — falling back to vision", e)
+
         # HUD already spoke "On it." for local fast-path — skip duplicate TTS
         if self.tts_speak and source != "local_fast_path":
             await self.tts_speak(f"On it. Executing: {goal[:60]}")
