@@ -65,23 +65,51 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             guard let self else { return }
             print("[JARVIS] Voice command: \"\(command)\"")
 
-            if Self.isVLAIntent(command) && BrainstemLauncher.shared.isRunning {
-                // Tier 0: Local fast-path — skip Vercel round-trip entirely.
-                // No screenshot needed — brainstem has FramePipeline at 60fps.
-                // Payload is ~150 bytes (no 192KB base64 screenshot), so pipe
-                // write completes in <1ms instead of potentially blocking.
-                print("[JARVIS] VLA fast-path: routing locally (skipping Vercel)")
-                self.speak("On it.")
-                BrainstemLauncher.shared.sendEvent(
-                    eventType: "action",
-                    data: [
-                        "action_type": "vision_task",
-                        "payload": [
-                            "goal": command,
-                            "source": "local_fast_path",
-                        ] as [String: Any],
-                    ]
-                )
+            if Self.isVLAIntent(command) {
+                // Tier 0: Try to launch the app directly from Swift first.
+                // This works even if the brainstem crashed (SIGKILL/OOM).
+                let appName = Self.extractAppName(command)
+                if let app = appName {
+                    print("[JARVIS] Tier 0: launching '\(app)' via macOS open")
+                    self.speak("On it.")
+                    let proc = Process()
+                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    proc.arguments = ["-a", app]
+                    try? proc.run()
+                    proc.waitUntilExit()
+                    if proc.terminationStatus == 0 {
+                        print("[JARVIS] Tier 0: '\(app)' launched successfully")
+                    } else {
+                        print("[JARVIS] Tier 0: 'open -a \(app)' failed (exit \(proc.terminationStatus))")
+                    }
+                }
+
+                // Forward to brainstem for complex remainder (messaging, etc.)
+                if BrainstemLauncher.shared.isRunning {
+                    let remainder = appName != nil ? Self.extractRemainder(command) : command
+                    let goal = remainder ?? command
+                    print("[JARVIS] VLA: forwarding to brainstem: \(goal)")
+                    BrainstemLauncher.shared.sendEvent(
+                        eventType: "action",
+                        data: [
+                            "action_type": "vision_task",
+                            "payload": [
+                                "goal": goal,
+                                "source": "local_fast_path",
+                            ] as [String: Any],
+                        ]
+                    )
+                } else if appName == nil {
+                    // Not an app launch and brainstem is dead — fall back to Vercel
+                    print("[JARVIS] Brainstem not running, falling back to Vercel")
+                    Task {
+                        do {
+                            try await self.appState.pythonBridge.sendCommand(command)
+                        } catch {
+                            self.speak("Sorry, I couldn't reach the backend.")
+                        }
+                    }
+                }
             } else {
                 // Normal path: send to Vercel for routing (conversation, analysis, etc.)
                 Task {
@@ -191,6 +219,35 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         guard let regex = vlaPattern else { return false }
         let range = NSRange(command.startIndex..., in: command)
         return regex.firstMatch(in: command, range: range) != nil
+    }
+
+    /// Extract app name from "open WhatsApp and ..." or "open WhatsApp"
+    private static func extractAppName(_ command: String) -> String? {
+        let patterns = [
+            #"^(?:open|launch|start)\s+(?:the\s+)?(.+?)\s+and\s+.+"#,
+            #"^(?:open|launch|start)\s+(?:the\s+)?(.+?)(?:\s+app)?$"#,
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
+            let range = NSRange(command.startIndex..., in: command)
+            if let match = regex.firstMatch(in: command, range: range),
+               let appRange = Range(match.range(at: 1), in: command) {
+                return String(command[appRange])
+            }
+        }
+        return nil
+    }
+
+    /// Extract remainder after "open <app> and ..." → "..."
+    private static func extractRemainder(_ command: String) -> String? {
+        let pattern = #"^(?:open|launch|start)\s+(?:the\s+)?.+?\s+and\s+(.+)$"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
+        let range = NSRange(command.startIndex..., in: command)
+        if let match = regex.firstMatch(in: command, range: range),
+           let remRange = Range(match.range(at: 1), in: command) {
+            return String(command[remRange])
+        }
+        return nil
     }
 
     // MARK: - Menu Bar
