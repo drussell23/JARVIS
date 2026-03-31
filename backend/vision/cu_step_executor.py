@@ -237,6 +237,17 @@ class CUStepExecutor:
     """
 
     def __init__(self) -> None:
+        # Accessibility permissions check — cache at construction so we only
+        # pay the ctypes cost once and can warn loudly if not trusted.
+        self._ax_trusted: bool = self._check_ax_trusted()
+        if not self._ax_trusted:
+            logger.warning(
+                "[CUExec] *** macOS Accessibility NOT GRANTED ***\n"
+                "  pyautogui clicks will be SILENTLY DROPPED.\n"
+                "  System Settings → Privacy & Security → Accessibility\n"
+                "  Add: /opt/homebrew/bin/python3.12  AND  Xcode"
+            )
+
         # Layer 1: Accessibility
         self._ax_resolver: Any = _get_ax_resolver()
 
@@ -376,6 +387,13 @@ class CUStepExecutor:
             )
 
         # Execute the action at resolved coords
+        if not self._ax_trusted:
+            logger.warning(
+                "[CUExec] Executing %s at %s WITHOUT Accessibility permissions — "
+                "macOS may silently drop this event. Grant access in System Settings.",
+                action, coords,
+            )
+        logger.info("[CUExec] Executing %s at coords=%s via layer=%s", action, coords, layer_used)
         try:
             await asyncio.to_thread(
                 _execute_action_impl, action, coords, value or None,
@@ -392,7 +410,7 @@ class CUStepExecutor:
                 error=str(exc),
             )
 
-        # Verification
+        # Verification — check if screen actually changed
         verified = False
         if frame is not None:
             try:
@@ -402,6 +420,24 @@ class CUStepExecutor:
                     verified = self._verify_frames_changed(frame, post_frame)
             except Exception as exc:
                 logger.debug("[CUExec] Verification failed: %s", exc)
+
+        if not verified and not self._ax_trusted:
+            # Screen didn't change AND we don't have AX permissions → almost
+            # certainly the event was silently dropped by macOS.
+            elapsed = (time.monotonic() - t0) * 1000
+            return StepResult(
+                success=False,
+                layer_used=layer_used,
+                step_index=step_index,
+                coords=coords,
+                confidence=confidence,
+                elapsed_ms=elapsed,
+                error=(
+                    "Screen unchanged after action — event likely dropped by macOS "
+                    "(no Accessibility permissions). Grant access in System Settings → "
+                    "Privacy & Security → Accessibility → add python3.12 + Xcode."
+                ),
+            )
 
         elapsed = (time.monotonic() - t0) * 1000
         return StepResult(
@@ -413,6 +449,23 @@ class CUStepExecutor:
             elapsed_ms=elapsed,
             verified=verified,
         )
+
+    # ------------------------------------------------------------------
+    # AX trust check
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_ax_trusted() -> bool:
+        """Return True if this process has macOS Accessibility permissions."""
+        try:
+            import ctypes
+            ax = ctypes.cdll.LoadLibrary(
+                "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+            )
+            ax.AXIsProcessTrusted.restype = ctypes.c_bool
+            return bool(ax.AXIsProcessTrusted())
+        except Exception:
+            return False
 
     # ------------------------------------------------------------------
     # Direct / wait handlers

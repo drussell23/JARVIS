@@ -175,6 +175,8 @@ final class BrainstemLauncher {
 
     /// Send an action event to the brainstem via stdin (JSON line).
     /// Called by the HUD when it receives action events from Vercel SSE.
+    /// The write runs on a background queue — action payloads include base64
+    /// screenshots (~200KB) which would block the main actor on a 64KB pipe buffer.
     func sendEvent(eventType: String, data: [String: Any]) {
         guard let pipe = stdinPipe, process?.isRunning == true else {
             print("[Brainstem] Cannot send event — process not running")
@@ -188,8 +190,14 @@ final class BrainstemLauncher {
             // Write as a JSON line (newline-delimited)
             var line = jsonData
             line.append(0x0A) // newline
-            pipe.fileHandleForWriting.write(line)
-            print("[Brainstem] Forwarded event: \(eventType)")
+            let handle = pipe.fileHandleForWriting
+            // Dispatch to background — pipe write blocks until Python drains the buffer.
+            // Screenshots are ~200KB; default pipe buffer is 64KB; blocking main actor
+            // here would freeze the UI until the brainstem asyncio loop drains the pipe.
+            DispatchQueue.global(qos: .userInitiated).async {
+                handle.write(line)
+                print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes)")
+            }
         } catch {
             print("[Brainstem] Failed to serialize event: \(error)")
         }

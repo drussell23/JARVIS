@@ -50,6 +50,29 @@ async def main() -> None:
             logger.info("[Boot] Stripping proxy env: %s=%s", _proxy_key, os.environ[_proxy_key][:30])
             del os.environ[_proxy_key]
 
+    # Phase 0: Accessibility permissions check — required for pyautogui to post
+    # synthetic mouse/keyboard events to macOS. Without this, clicks and keypresses
+    # are silently dropped by the OS (no exception, no error — just phantom clicks).
+    try:
+        import ctypes
+        _ax_lib = ctypes.cdll.LoadLibrary(
+            "/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices"
+        )
+        _ax_lib.AXIsProcessTrusted.restype = ctypes.c_bool
+        _ax_trusted = _ax_lib.AXIsProcessTrusted()
+        if _ax_trusted:
+            logger.info("[Boot] Accessibility permissions: GRANTED — Ghost Hands can control the screen")
+        else:
+            logger.warning(
+                "[Boot] *** ACCESSIBILITY PERMISSIONS NOT GRANTED ***\n"
+                "  pyautogui clicks/keypresses will be SILENTLY DROPPED by macOS.\n"
+                "  Fix: System Settings → Privacy & Security → Accessibility\n"
+                "       Add /opt/homebrew/bin/python3.12 AND Xcode to the list.\n"
+                "  Voice commands that require screen interaction WILL NOT EXECUTE."
+            )
+    except Exception as _ax_exc:
+        logger.debug("[Boot] Could not check AX permissions: %s", _ax_exc)
+
     # Phase 1: Config + Auth
     try:
         config = BrainstemConfig.from_env()
