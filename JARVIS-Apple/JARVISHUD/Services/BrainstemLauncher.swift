@@ -8,6 +8,7 @@
 /// Lifecycle: starts in applicationDidFinishLaunching, kills in quitApp().
 /// Logs pipe to Xcode console via [Brainstem] prefix.
 import Foundation
+import Network
 
 @MainActor
 final class BrainstemLauncher {
@@ -17,9 +18,10 @@ final class BrainstemLauncher {
     private var stdoutPipe: Pipe?
     private var stderrPipe: Pipe?
 
-    /// File-based inbox for HUD → brainstem message passing.
-    /// The HUD appends JSON lines here; the brainstem polls and truncates.
-    private var inboxPath: String { repoRoot + "/.jarvis/brainstem_inbox.jsonl" }
+    /// TCP connection to the brainstem IPC server.
+    private var connection: NWConnection?
+    private let ipcPort: UInt16 = 8742
+    private let ipcQueue = DispatchQueue(label: "com.jarvis.brainstem.ipc", qos: .userInitiated)
 
     /// The repo root, derived from the known brainstem .env path.
     private let repoRoot: String = {
@@ -89,18 +91,6 @@ final class BrainstemLauncher {
         // Remove PYTHONHOME if set — it breaks Homebrew Python's module search
         env.removeValue(forKey: "PYTHONHOME")
 
-        // Ensure .jarvis/ directory exists for the file-based inbox
-        let jarvisDir = repoRoot + "/.jarvis"
-        if !FileManager.default.fileExists(atPath: jarvisDir) {
-            try? FileManager.default.createDirectory(
-                atPath: jarvisDir,
-                withIntermediateDirectories: true,
-                attributes: nil
-            )
-        }
-        // Clear any stale inbox from a previous session
-        FileManager.default.createFile(atPath: inboxPath, contents: nil, attributes: nil)
-
         let proc = Process()
         // Use python3.12 (Homebrew, OpenSSL 3.6) instead of system python3
         // (3.9.6, LibreSSL 2.8.3) which can't complete TLS handshakes to Vercel/Anthropic.
@@ -113,7 +103,7 @@ final class BrainstemLauncher {
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         proc.environment = env
 
-        // No stdin pipe needed — HUD communicates via file-based inbox
+        // No stdin pipe needed — HUD communicates via TCP IPC
 
         // Pipe stdout/stderr to Xcode console
         let stdout = Pipe()
@@ -155,6 +145,10 @@ final class BrainstemLauncher {
             try proc.run()
             self.process = proc
             print("[Brainstem] Started (PID \(proc.processIdentifier)) from \(repoRoot)")
+
+            // Connect to the brainstem's TCP IPC server.
+            // The brainstem takes a few seconds to boot, so we retry.
+            connectToBrainstem(retriesLeft: 10)
         } catch {
             print("[Brainstem] Failed to start: \(error)")
         }
@@ -162,6 +156,10 @@ final class BrainstemLauncher {
 
     /// Gracefully stop the brainstem subprocess.
     func stop() {
+        // Tear down TCP connection first
+        connection?.cancel()
+        connection = nil
+
         guard let proc = process, proc.isRunning else {
             process = nil
             return
@@ -185,16 +183,17 @@ final class BrainstemLauncher {
         }
     }
 
-    /// Send an action event to the brainstem via the file-based inbox.
+    /// Send an action event to the brainstem via the TCP IPC connection.
     /// Called by the HUD when it receives action events from Vercel SSE.
-    /// The write runs on a background queue to avoid blocking the main actor
-    /// (action payloads include base64 screenshots ~200KB).
     func sendEvent(eventType: String, data: [String: Any]) {
         guard process?.isRunning == true else {
             print("[Brainstem] Cannot send event — process not running")
             return
         }
-        print("[Brainstem] sendEvent: preparing \(eventType)")
+        guard let conn = connection, conn.state == .ready else {
+            print("[Brainstem] Cannot send event — IPC not connected (state: \(String(describing: connection?.state)))")
+            return
+        }
         do {
             let jsonData = try JSONSerialization.data(withJSONObject: [
                 "event_type": eventType,
@@ -203,31 +202,69 @@ final class BrainstemLauncher {
             // Build a newline-terminated JSON line
             var line = jsonData
             line.append(0x0A) // newline
-            let path = self.inboxPath
-            print("[Brainstem] sendEvent: serialized \(eventType) (\(line.count) bytes), writing to inbox")
+            print("[Brainstem] sendEvent: \(eventType) (\(line.count) bytes) via TCP")
 
-            DispatchQueue.global(qos: .userInitiated).async {
-                let url = URL(fileURLWithPath: path)
-                do {
-                    // Open for writing, create if missing, append to end
-                    let handle = try FileHandle(forWritingTo: url)
-                    handle.seekToEndOfFile()
-                    handle.write(line)
-                    handle.closeFile()
-                    print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes) via inbox")
-                } catch {
-                    // File may not exist yet (race with start()) — create it
-                    do {
-                        try line.write(to: url)
-                        print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes) via inbox (created)")
-                    } catch {
-                        print("[Brainstem] Failed to write event to inbox: \(error)")
-                    }
+            conn.send(content: line, completion: .contentProcessed { error in
+                if let error = error {
+                    print("[Brainstem] TCP send error for \(eventType): \(error)")
+                } else {
+                    print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes) via TCP")
                 }
-            }
+            })
         } catch {
             print("[Brainstem] Failed to serialize event: \(error)")
         }
+    }
+
+    // MARK: - TCP IPC Connection
+
+    /// Connect to the brainstem's TCP IPC server with retry.
+    /// The brainstem takes a few seconds to boot, so we retry every 500ms.
+    private func connectToBrainstem(retriesLeft: Int) {
+        guard retriesLeft > 0, process?.isRunning == true else {
+            if retriesLeft <= 0 {
+                print("[Brainstem] IPC connection failed after all retries")
+            }
+            return
+        }
+
+        let host = NWEndpoint.Host("127.0.0.1")
+        let port = NWEndpoint.Port(rawValue: ipcPort)!
+        let conn = NWConnection(host: host, port: port, using: .tcp)
+
+        conn.stateUpdateHandler = { [weak self] state in
+            guard let self = self else { return }
+            switch state {
+            case .ready:
+                print("[Brainstem] IPC connected to localhost:\(self.ipcPort)")
+                Task { @MainActor in
+                    self.connection = conn
+                }
+            case .failed(let error):
+                print("[Brainstem] IPC connection failed: \(error) — retries left: \(retriesLeft - 1)")
+                conn.cancel()
+                // Retry after 500ms
+                self.ipcQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    Task { @MainActor in
+                        self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
+                    }
+                }
+            case .waiting(let error):
+                print("[Brainstem] IPC connection waiting: \(error) — retries left: \(retriesLeft - 1)")
+                conn.cancel()
+                self.ipcQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                    Task { @MainActor in
+                        self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
+                    }
+                }
+            case .cancelled:
+                break
+            default:
+                break
+            }
+        }
+
+        conn.start(queue: ipcQueue)
     }
 
     /// Whether the brainstem is currently running.

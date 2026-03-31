@@ -162,109 +162,88 @@ async def main() -> None:
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGTERM, handle_signal)
 
-    # Inbox reader: HUD forwards action events to brainstem via a file-based
-    # inbox at .jarvis/brainstem_inbox.jsonl.  The HUD appends JSON lines;
-    # this reader polls for new content, processes it, then truncates the file.
-    #
-    # This replaces the previous stdin pipe approach which was fundamentally
-    # broken: select() on inherited pipe fd 0 hangs forever in Python threads
-    # when asyncio's event loop is running kqueue on macOS.
-    async def _inbox_reader() -> None:
-        """Poll the file-based inbox for events from HUD.
+    # IPC server: HUD connects to a local TCP socket and sends newline-
+    # delimited JSON events.  This replaces the file-based inbox which
+    # suffered from race conditions and polling latency.
+    async def _ipc_server() -> None:
+        """TCP server on localhost for HUD -> brainstem IPC.
 
-        Uses threading.Queue + run_in_executor instead of asyncio.Queue +
-        call_soon_threadsafe.  The latter silently fails when the asyncio
-        event loop is busy with SSE/FramePipeline tasks and doesn't
-        process the threadsafe callback.
+        Each connected client sends newline-delimited JSON messages.
+        Events are dispatched in a fresh thread/event-loop because
+        call_soon_threadsafe is unreliable in this subprocess context
+        on macOS.
         """
         import json as _json
         import threading
-        import queue as thread_queue
 
-        inbox_path = os.path.join(os.getcwd(), ".jarvis", "brainstem_inbox.jsonl")
-        logger.info("[Inbox] Watching %s for events from HUD", inbox_path)
+        ipc_port = int(os.environ.get("JARVIS_IPC_PORT", "8742"))
 
-        last_mtime: float = 0.0
-        q: thread_queue.Queue[str] = thread_queue.Queue()
+        def _dispatch_in_thread(event_type: str, data: dict) -> None:
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(dispatcher.dispatch(event_type, data))
+            finally:
+                loop.close()
 
-        def _poll_thread() -> None:
-            """Daemon thread: read inbox via atomic rename, dispatch events."""
-            os.write(2, b"INBOX_THREAD: alive\n")
-            processing_path = inbox_path + ".processing"
-            while not shutdown.is_set():
-                time.sleep(0.1)
+        async def _handle_client(
+            reader: asyncio.StreamReader,
+            writer: asyncio.StreamWriter,
+        ) -> None:
+            peer = writer.get_extra_info("peername")
+            logger.info("[IPC] Client connected: %s", peer)
+            try:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break  # client disconnected
+                    text = line.decode("utf-8", errors="replace").strip()
+                    if not text:
+                        continue
+                    try:
+                        msg = _json.loads(text)
+                        event_type = msg.get("event_type", "")
+                        data = msg.get("data", {})
+                        logger.info("[IPC] Received event: %s (%d bytes)", event_type, len(line))
+                        threading.Thread(
+                            target=_dispatch_in_thread,
+                            args=(event_type, data),
+                            daemon=True,
+                        ).start()
+                    except _json.JSONDecodeError as je:
+                        logger.warning("[IPC] Bad JSON from client: %s", je)
+                    except Exception as de:
+                        logger.error("[IPC] Dispatch error: %s", de)
+            except asyncio.CancelledError:
+                pass
+            except ConnectionResetError:
+                logger.info("[IPC] Client disconnected (reset): %s", peer)
+            except Exception as exc:
+                logger.error("[IPC] Client handler error: %s", exc)
+            finally:
                 try:
-                    # Atomic rename: grab the inbox file for exclusive processing.
-                    # If rename succeeds, no other reader can see the data.
-                    # If it fails (file doesn't exist or is empty), skip.
-                    try:
-                        if not os.path.exists(inbox_path):
-                            continue
-                        if os.path.getsize(inbox_path) == 0:
-                            continue
-                        os.rename(inbox_path, processing_path)
-                    except (OSError, FileNotFoundError):
-                        continue
+                    writer.close()
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                logger.info("[IPC] Client disconnected: %s", peer)
 
-                    # Read the renamed file (we own it exclusively now)
-                    try:
-                        with open(processing_path, "rb") as f:
-                            content = f.read(1024 * 1024)
-                    finally:
-                        # Delete after reading — recreate empty inbox for next event
-                        try:
-                            os.unlink(processing_path)
-                        except OSError:
-                            pass
-                        # Recreate the inbox file so Swift can write to it
-                        try:
-                            open(inbox_path, "a").close()
-                        except OSError:
-                            pass
+        server = await asyncio.start_server(
+            _handle_client, "127.0.0.1", ipc_port,
+        )
+        logger.info("[IPC] TCP server listening on localhost:%d", ipc_port)
 
-                    if not content:
-                        continue
+        async with server:
+            await shutdown.wait()
 
-                    os.write(2, f"INBOX_THREAD: got {len(content)} bytes\n".encode())
-                    text = content.decode("utf-8", errors="replace")
-                    for line_text in text.splitlines():
-                        line_text = line_text.strip()
-                        if not line_text:
-                            continue
-                        try:
-                            msg = _json.loads(line_text)
-                            event_type = msg.get("event_type", "")
-                            data = msg.get("data", {})
-                            os.write(2, f"INBOX_THREAD: dispatching {event_type}\n".encode())
-                            _loop = asyncio.new_event_loop()
-                            try:
-                                _loop.run_until_complete(dispatcher.dispatch(event_type, data))
-                            finally:
-                                _loop.close()
-                            os.write(2, f"INBOX_THREAD: dispatch done\n".encode())
-                        except Exception as de:
-                            os.write(2, f"INBOX_THREAD: ERROR: {de}\n".encode())
-                except Exception as e:
-                    os.write(2, f"INBOX_THREAD: POLL ERROR: {e}\n".encode())
-                    time.sleep(1.0)
-
-        thread = threading.Thread(target=_poll_thread, daemon=True, name="inbox-reader")
-        thread.start()
-        logger.info("[Inbox] Poll thread started (100ms interval, direct dispatch)")
-
-        # The poll thread handles everything — async consumer just keeps task alive
-        while not shutdown.is_set():
-            await asyncio.sleep(1.0)
-
-    logger.info("[Main] Starting inbox reader + SSE consumer + voice intake...")
+    logger.info("[Main] Starting IPC server + SSE consumer + voice intake...")
     try:
-        inbox_task = asyncio.create_task(_inbox_reader())
+        ipc_task = asyncio.create_task(_ipc_server())
         consumer_task = asyncio.create_task(consumer.run(shutdown))
         voice_task = asyncio.create_task(voice.run(shutdown))
 
         # Surface crashes immediately
         async def _watch_tasks() -> None:
-            for name, task in [("inbox", inbox_task), ("SSE", consumer_task)]:
+            for name, task in [("IPC", ipc_task), ("SSE", consumer_task)]:
                 try:
                     await task
                 except Exception as exc:
