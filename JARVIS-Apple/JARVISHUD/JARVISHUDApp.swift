@@ -101,17 +101,38 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                     if let app = appName {
                         actionPayload["app_context"] = app
                     }
-                    // Backend captures its own screenshot via screencapture CLI
-                    // at planning time — no need to send one from Swift.
-                    // This ensures the screenshot shows the current display state
-                    // (with the target app in front), not a stale SCK frame.
-                    BrainstemLauncher.shared.sendEvent(
-                        eventType: "action",
-                        data: [
-                            "action_type": "vision_task",
-                            "payload": actionPayload,
-                        ]
-                    )
+                    // Wait for the target app to be frontmost before telling the
+                    // backend to capture a screenshot. The backend uses CGDisplayCreateImage
+                    // which captures the CURRENT display — the app must be visible.
+                    Task {
+                        if let targetApp = appName {
+                            // Activate the app and bring it to THIS Space
+                            for _ in 0..<10 {
+                                if let running = NSWorkspace.shared.runningApplications.first(
+                                    where: { $0.localizedName == targetApp }
+                                ) {
+                                    running.activate(options: [.activateIgnoringOtherApps])
+                                    // Check if it's now frontmost
+                                    try? await Task.sleep(for: .milliseconds(500))
+                                    if running.isActive {
+                                        print("[JARVIS] VLA: \(targetApp) is frontmost")
+                                        break
+                                    }
+                                } else {
+                                    try? await Task.sleep(for: .milliseconds(500))
+                                }
+                            }
+                            // Extra settle time for the app to render its UI
+                            try? await Task.sleep(for: .seconds(1))
+                        }
+                        BrainstemLauncher.shared.sendEvent(
+                            eventType: "action",
+                            data: [
+                                "action_type": "vision_task",
+                                "payload": actionPayload,
+                            ]
+                        )
+                    }
                 } else if appName == nil {
                     // Not an app launch and brainstem is dead — fall back to Vercel
                     print("[JARVIS] Brainstem not running, falling back to Vercel")

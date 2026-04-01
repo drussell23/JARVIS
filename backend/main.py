@@ -2002,8 +2002,8 @@ async def parallel_lifespan(app: FastAPI):
                                         app.state.jarvis_cu = cu
 
                                     # Capture the ENTIRE main display using CoreGraphics.
-                                    # This bypasses SCK RunLoop issues and always captures
-                                    # what's actually on screen (not a stale cached frame).
+                                    # This reads the GPU framebuffer directly — no SCK, no
+                                    # RunLoop, no focus issues. Works in headless Python.
                                     initial_frame = None
                                     try:
                                         import Quartz
@@ -2014,15 +2014,18 @@ async def parallel_lifespan(app: FastAPI):
                                             bpr = Quartz.CGImageGetBytesPerRow(cg_image)
                                             data_provider = Quartz.CGImageGetDataProvider(cg_image)
                                             raw = Quartz.CGDataProviderCopyData(data_provider)
-                                            # CGImage is BGRA — convert to RGB via PIL
-                                            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, bpr // 4, 4))[:, :w, :]
-                                            img = Image.fromarray(arr[:, :, [2, 1, 0]])  # BGRA → RGB
+                                            # Retina: bpr may include padding. Use bpr for row stride.
+                                            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, bpr))
+                                            # Extract BGRA channels (4 bytes per pixel, ignore padding)
+                                            bgra = arr[:, :w * 4].reshape((h, w, 4))
+                                            # BGRA → RGB via PIL
+                                            img = Image.fromarray(bgra[:, :, [2, 1, 0]])
                                             # Resize for API efficiency
                                             if w > 1280:
                                                 scale = 1280 / w
                                                 img = img.resize((1280, int(h * scale)), Image.Resampling.LANCZOS)
                                             initial_frame = np.array(img)
-                                            logger.info("[HUD] Display capture: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
+                                            logger.info("[HUD] Display capture: %dx%d (native %dx%d)", initial_frame.shape[1], initial_frame.shape[0], w, h)
                                         else:
                                             logger.warning("[HUD] CGDisplayCreateImage returned None")
                                     except Exception as cg_err:
