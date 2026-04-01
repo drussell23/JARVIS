@@ -381,9 +381,30 @@ final class BrainstemLauncher {
             try? task.run()
             task.waitUntilExit()
         }
-        // Brief pause to let the OS release the ports
-        Thread.sleep(forTimeInterval: 0.3)
-        print("[Brainstem] Cleaned up stale processes on ports \(ports)")
+        // Wait for ports to actually be released (SIGKILL + TIME_WAIT)
+        for attempt in 1...5 {
+            Thread.sleep(forTimeInterval: 0.5)
+            // Check if ports are free
+            var allFree = true
+            for port in ports {
+                let check = Process()
+                let pipe = Pipe()
+                check.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+                check.arguments = ["bash", "-c", "lsof -ti :\(port) 2>/dev/null"]
+                check.standardOutput = pipe
+                try? check.run()
+                check.waitUntilExit()
+                let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                if !output.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    allFree = false
+                }
+            }
+            if allFree {
+                print("[Brainstem] Ports \(ports) cleared (attempt \(attempt))")
+                return
+            }
+        }
+        print("[Brainstem] Warning: ports may still be in use after cleanup")
     }
 
     // MARK: - Env file parser
