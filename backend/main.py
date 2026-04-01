@@ -2001,38 +2001,32 @@ async def parallel_lifespan(app: FastAPI):
                                         cu = JarvisCU()
                                         app.state.jarvis_cu = cu
 
-                                    # Take a FRESH screenshot using macOS screencapture.
-                                    # The HUD's SCK stream often captures Xcode (the dev
-                                    # console) instead of the target app. screencapture CLI
-                                    # captures the actual display state at planning time.
+                                    # Capture the ENTIRE main display using CoreGraphics.
+                                    # This bypasses SCK RunLoop issues and always captures
+                                    # what's actually on screen (not a stale cached frame).
                                     initial_frame = None
                                     try:
-                                        import tempfile
-                                        import os as _os
-                                        tmp_path = tempfile.mktemp(suffix=".jpg")
-                                        # screencapture: -x no sound, -t jpg, no cursor
-                                        proc = await asyncio.create_subprocess_exec(
-                                            "screencapture", "-x", "-t", "jpg", tmp_path,
-                                            stdout=asyncio.subprocess.DEVNULL,
-                                            stderr=asyncio.subprocess.DEVNULL,
-                                        )
-                                        await proc.wait()
-                                        if proc.returncode == 0:
-                                            img = Image.open(tmp_path)
-                                            w, h = img.size
+                                        import Quartz
+                                        cg_image = Quartz.CGDisplayCreateImage(Quartz.CGMainDisplayID())
+                                        if cg_image:
+                                            w = Quartz.CGImageGetWidth(cg_image)
+                                            h = Quartz.CGImageGetHeight(cg_image)
+                                            bpr = Quartz.CGImageGetBytesPerRow(cg_image)
+                                            data_provider = Quartz.CGImageGetDataProvider(cg_image)
+                                            raw = Quartz.CGDataProviderCopyData(data_provider)
+                                            # CGImage is BGRA — convert to RGB via PIL
+                                            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, bpr // 4, 4))[:, :w, :]
+                                            img = Image.fromarray(arr[:, :, [2, 1, 0]])  # BGRA → RGB
+                                            # Resize for API efficiency
                                             if w > 1280:
                                                 scale = 1280 / w
                                                 img = img.resize((1280, int(h * scale)), Image.Resampling.LANCZOS)
-                                            initial_frame = np.array(img.convert("RGB"))
-                                            logger.info("[HUD] Fresh screenshot: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
+                                            initial_frame = np.array(img)
+                                            logger.info("[HUD] Display capture: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
                                         else:
-                                            logger.warning("[HUD] screencapture exit %d", proc.returncode)
-                                        try:
-                                            _os.unlink(tmp_path)
-                                        except OSError:
-                                            pass
-                                    except Exception as sc_err:
-                                        logger.warning("[HUD] Screenshot failed: %s", sc_err)
+                                            logger.warning("[HUD] CGDisplayCreateImage returned None")
+                                    except Exception as cg_err:
+                                        logger.warning("[HUD] Display capture failed: %s", cg_err)
 
                                     if initial_frame is None:
                                         logger.warning("[HUD] No screenshot — planner will see black frames")
