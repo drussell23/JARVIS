@@ -223,7 +223,7 @@ class PythonBridge: ObservableObject {
                 // Greet once in local mode
                 if !hasGreeted {
                     hasGreeted = true
-                    speak("Online in local mode. Cloud relay is unavailable.", priority: .normal)
+                    onSpeak?("Online in local mode. Cloud relay is unavailable.", .normal)
                 }
 
                 // Stay alive but don't retry cloud — the brainstem IPC handles everything.
