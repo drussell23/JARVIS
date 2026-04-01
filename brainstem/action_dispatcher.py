@@ -1,12 +1,20 @@
 """Action Dispatcher — routes SSE events to local hardware."""
 import asyncio
 import logging
+import os
 import re
 from typing import Any, Callable, Coroutine, Dict, Optional, Tuple
 
 logger = logging.getLogger("jarvis.brainstem.dispatch")
 
 _DANGEROUS_COMMANDS = frozenset(["rm -rf /", "rm -rf ~", "mkfs", "> /dev/", "dd if=", ":(){", "chmod -R 777 /"])
+
+# ---------------------------------------------------------------------------
+# Message signature — appended to outgoing messages so recipients know
+# the message was sent by JARVIS, not the user typing manually.
+# Disable via JARVIS_MSG_SIGNATURE="" in env.
+# ---------------------------------------------------------------------------
+_MSG_SIGNATURE = os.environ.get("JARVIS_MSG_SIGNATURE", "🤖 - sent via JARVIS")
 
 # ---------------------------------------------------------------------------
 # Tier 0: Deterministic fast-path patterns (no model call, <100ms)
@@ -77,6 +85,17 @@ def _parse_messaging_intent(goal: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _sign_message(body: str) -> str:
+    """Append the JARVIS signature to an outgoing message body.
+
+    The signature tells recipients the message was sent by JARVIS,
+    not the user typing manually.  Disabled when JARVIS_MSG_SIGNATURE="".
+    """
+    if not _MSG_SIGNATURE or not body:
+        return body
+    return f"{body} {_MSG_SIGNATURE}"
+
+
 def _rewrite_msg_with_app(goal: str) -> Optional[str]:
     """Rewrite 'message X on APP saying Y' → 'open APP and message X saying Y'."""
     m = _MSG_WITH_APP_PATTERN.match(goal.strip())
@@ -86,6 +105,7 @@ def _rewrite_msg_with_app(goal: str) -> Optional[str]:
     app = m.group(2).strip()
     body = m.group(3).strip()
     if body:
+        body = _sign_message(body)
         return f"open {app} and message {contact} saying {body}"
     return f"open {app} and message {contact}"
 
@@ -301,7 +321,8 @@ class ActionDispatcher:
                 _msg_contact = contact
                 _msg_app = routing.app_name
                 if body:
-                    goal = f"open {routing.app_name} and message {contact} saying {body}"
+                    signed_body = _sign_message(body)
+                    goal = f"open {routing.app_name} and message {contact} saying {signed_body}"
                 else:
                     goal = f"open {routing.app_name} and message {contact}"
                 logger.info(
