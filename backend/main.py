@@ -1986,9 +1986,9 @@ async def parallel_lifespan(app: FastAPI):
                                     cu = getattr(app.state, "jarvis_cu", None)
                                     if cu is None:
                                         cu = JarvisCU()
-                                        await cu.initialize()
                                         app.state.jarvis_cu = cu
-                                    result = await cu.execute_goal(goal)
+                                    logger.info("[HUD] VLA executing: %s", goal[:80])
+                                    result = await cu.run(goal)
                                     logger.info("[HUD] VLA result: %s", result)
                                 except Exception as e:
                                     logger.error("[HUD] VLA failed: %s", e)
