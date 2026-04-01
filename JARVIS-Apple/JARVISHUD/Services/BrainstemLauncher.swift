@@ -213,15 +213,27 @@ final class BrainstemLauncher {
         }
     }
 
+    /// Pending events queued while IPC is connecting (backend still booting).
+    /// Replayed in order once IPC connects.
+    private var pendingEvents: [(eventType: String, data: [String: Any])] = []
+    private let maxPendingEvents = 20
+
     /// Send an action event to the brainstem via the TCP IPC connection.
-    /// Called by the HUD when it receives action events from Vercel SSE.
+    /// If IPC isn't connected yet (backend still booting), queues the event
+    /// and replays it once the connection is established.
     func sendEvent(eventType: String, data: [String: Any]) {
         guard process?.isRunning == true else {
             print("[Brainstem] Cannot send event — process not running")
             return
         }
         guard let conn = connection, conn.state == .ready else {
-            print("[Brainstem] Cannot send event — IPC not connected (state: \(String(describing: connection?.state)))")
+            // Queue for replay when IPC connects
+            if pendingEvents.count < maxPendingEvents {
+                pendingEvents.append((eventType: eventType, data: data))
+                print("[Brainstem] IPC not ready — queued event '\(eventType)' (\(pendingEvents.count) pending, backend still booting)")
+            } else {
+                print("[Brainstem] IPC not ready — queue full, dropping event '\(eventType)'")
+            }
             return
         }
         do {
@@ -270,6 +282,15 @@ final class BrainstemLauncher {
                 print("[Brainstem] IPC connected to localhost:\(self.ipcPort)")
                 Task { @MainActor in
                     self.connection = conn
+                    // Replay any events queued while backend was booting
+                    if !self.pendingEvents.isEmpty {
+                        print("[Brainstem] Replaying \(self.pendingEvents.count) queued event(s)")
+                        let queued = self.pendingEvents
+                        self.pendingEvents.removeAll()
+                        for event in queued {
+                            self.sendEvent(eventType: event.eventType, data: event.data)
+                        }
+                    }
                 }
             case .failed(let error):
                 print("[Brainstem] IPC connection failed: \(error) — retries left: \(retriesLeft - 1)")

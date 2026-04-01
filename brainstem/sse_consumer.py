@@ -70,6 +70,16 @@ class SSEConsumer:
                 except asyncio.CancelledError:
                     break
                 except Exception as e:
+                    # v351.0: Detect Vercel 402 (deployment disabled) and stop
+                    # retrying. The HUD operates in local-only mode via IPC.
+                    err_str = str(e)
+                    if "402" in err_str or "Payment Required" in err_str:
+                        logger.warning(
+                            "[SSE] Vercel deployment disabled (402) — "
+                            "stopping SSE consumer. HUD operates via local IPC."
+                        )
+                        break
+
                     self._consecutive_failures += 1
                     backoff = min(
                         self.config.reconnect_backoff_base * (2 ** self._consecutive_failures),
