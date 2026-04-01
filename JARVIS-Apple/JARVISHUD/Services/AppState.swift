@@ -207,6 +207,47 @@ class PythonBridge: ObservableObject {
                 consecutiveFailures = 0
             } catch is CancellationError {
                 break
+            } catch let error as JARVISError where error == .cloudDisabled {
+                // Vercel deployment disabled (402) — stop retrying cloud,
+                // switch to local-only mode via brainstem IPC.
+                print("[JARVIS] Cloud disabled (Vercel 402) — switching to local mode")
+                connectionStatus = .connected  // IPC is already connected
+                detailedConnectionState = "Local mode — brainstem IPC"
+                hudState = .idle
+
+                if !loadingComplete {
+                    updateLoading(progress: 100, message: "JARVIS Online (local mode)")
+                    loadingComplete = true
+                }
+
+                // Greet once in local mode
+                if !hasGreeted {
+                    hasGreeted = true
+                    speak("Online in local mode. Cloud relay is unavailable.", priority: .normal)
+                }
+
+                // Stay alive but don't retry cloud — the brainstem IPC handles everything.
+                // Check periodically if cloud recovers.
+                while isRunning {
+                    try? await Task.sleep(for: .seconds(60))
+                    // Quick probe to see if Vercel is back
+                    do {
+                        let tokenManager = StreamTokenManager(
+                            deviceId: config.deviceId,
+                            auth: deviceAuth,
+                            baseURL: config.baseURL
+                        )
+                        _ = try await tokenManager.getToken()
+                        // Cloud is back — break to reconnect via outer loop
+                        print("[JARVIS] Cloud recovered — reconnecting SSE")
+                        detailedConnectionState = "Cloud recovered — reconnecting..."
+                        break
+                    } catch let e as JARVISError where e == .cloudDisabled {
+                        continue  // Still disabled, keep local
+                    } catch {
+                        continue  // Other error, keep local
+                    }
+                }
             } catch {
                 consecutiveFailures += 1
                 let backoff = min(2.0 * pow(2.0, Double(consecutiveFailures)), 60.0)

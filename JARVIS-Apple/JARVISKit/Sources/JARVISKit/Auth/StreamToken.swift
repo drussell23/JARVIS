@@ -32,7 +32,16 @@ public actor StreamTokenManager {
         request.httpBody = try JSONEncoder().encode(payload)
 
         let (data, response) = try await URLSession.shared.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw JARVISError.tokenRequestFailed
+        }
+        // 402 = Vercel deployment disabled (billing/usage limit).
+        // Surface this specifically so the HUD can fall back to local-only mode
+        // instead of retrying the cloud connection forever.
+        if httpResponse.statusCode == 402 {
+            throw JARVISError.cloudDisabled
+        }
+        guard httpResponse.statusCode == 200 else {
             throw JARVISError.tokenRequestFailed
         }
 
@@ -57,4 +66,6 @@ public enum JARVISError: Error, Sendable {
     case tokenRequestFailed
     case connectionFailed
     case authFailed
+    /// Vercel deployment disabled (402) — fall back to local brainstem IPC.
+    case cloudDisabled
 }
