@@ -89,12 +89,6 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                     }
                 }
 
-                // Wait for launched app to become frontmost before forwarding
-                // remainder — otherwise the brainstem's screenshot shows Xcode.
-                if appName != nil {
-                    Thread.sleep(forTimeInterval: 2.0)
-                }
-
                 // Forward to brainstem for complex remainder (messaging, etc.)
                 if BrainstemLauncher.shared.isRunning {
                     let remainder = appName != nil ? Self.extractRemainder(command) : command
@@ -107,25 +101,17 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                     if let app = appName {
                         actionPayload["app_context"] = app
                     }
-                    // Capture screenshot from Swift's SCK stream (has Screen Recording
-                    // permission + NSApplication RunLoop). Python/uvicorn is headless —
-                    // SCK won't deliver frames without a GUI run loop, so the backend's
-                    // FramePipeline gets black frames. The Swift HUD is the screen's eyes.
-                    Task {
-                        if let b64 = await ScreenCaptureService.shared.captureBase64() {
-                            actionPayload["screenshot"] = b64
-                            print("[JARVIS] VLA: screenshot attached (\(b64.count / 1024)KB)")
-                        } else {
-                            print("[JARVIS] VLA: no screenshot available")
-                        }
-                        BrainstemLauncher.shared.sendEvent(
-                            eventType: "action",
-                            data: [
-                                "action_type": "vision_task",
-                                "payload": actionPayload,
-                            ]
-                        )
-                    }
+                    // Backend captures its own screenshot via screencapture CLI
+                    // at planning time — no need to send one from Swift.
+                    // This ensures the screenshot shows the current display state
+                    // (with the target app in front), not a stale SCK frame.
+                    BrainstemLauncher.shared.sendEvent(
+                        eventType: "action",
+                        data: [
+                            "action_type": "vision_task",
+                            "payload": actionPayload,
+                        ]
+                    )
                 } else if appName == nil {
                     // Not an app launch and brainstem is dead — fall back to Vercel
                     print("[JARVIS] Brainstem not running, falling back to Vercel")

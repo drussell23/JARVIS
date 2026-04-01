@@ -767,6 +767,9 @@ class CUStepExecutor:
             return base64.b64encode(frame.tobytes()).decode("ascii")
 
         img = Image.fromarray(frame)
+        # JPEG doesn't support alpha — convert RGBA to RGB
+        if img.mode == "RGBA":
+            img = img.convert("RGB")
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=self._jpeg_quality)
         return base64.b64encode(buf.getvalue()).decode("ascii")

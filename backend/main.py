@@ -2001,19 +2001,41 @@ async def parallel_lifespan(app: FastAPI):
                                         cu = JarvisCU()
                                         app.state.jarvis_cu = cu
 
-                                    # Decode the screenshot from Swift HUD (base64 JPEG)
+                                    # Take a FRESH screenshot using macOS screencapture.
+                                    # The HUD's SCK stream often captures Xcode (the dev
+                                    # console) instead of the target app. screencapture CLI
+                                    # captures the actual display state at planning time.
                                     initial_frame = None
-                                    screenshot_b64 = payload.get("screenshot")
-                                    if screenshot_b64:
-                                        try:
-                                            img_bytes = base64.b64decode(screenshot_b64)
-                                            img = Image.open(io.BytesIO(img_bytes))
+                                    try:
+                                        import tempfile
+                                        import os as _os
+                                        tmp_path = tempfile.mktemp(suffix=".jpg")
+                                        # screencapture: -x no sound, -t jpg, no cursor
+                                        proc = await asyncio.create_subprocess_exec(
+                                            "screencapture", "-x", "-t", "jpg", tmp_path,
+                                            stdout=asyncio.subprocess.DEVNULL,
+                                            stderr=asyncio.subprocess.DEVNULL,
+                                        )
+                                        await proc.wait()
+                                        if proc.returncode == 0:
+                                            img = Image.open(tmp_path)
+                                            w, h = img.size
+                                            if w > 1280:
+                                                scale = 1280 / w
+                                                img = img.resize((1280, int(h * scale)), Image.Resampling.LANCZOS)
                                             initial_frame = np.array(img.convert("RGB"))
-                                            logger.info("[HUD] Screenshot decoded: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
-                                        except Exception as dec_err:
-                                            logger.warning("[HUD] Screenshot decode failed: %s", dec_err)
-                                    else:
-                                        logger.warning("[HUD] No screenshot in payload — planner will see black frames")
+                                            logger.info("[HUD] Fresh screenshot: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
+                                        else:
+                                            logger.warning("[HUD] screencapture exit %d", proc.returncode)
+                                        try:
+                                            _os.unlink(tmp_path)
+                                        except OSError:
+                                            pass
+                                    except Exception as sc_err:
+                                        logger.warning("[HUD] Screenshot failed: %s", sc_err)
+
+                                    if initial_frame is None:
+                                        logger.warning("[HUD] No screenshot — planner will see black frames")
 
                                     logger.info("[HUD] VLA executing: %s", goal[:80])
                                     result = await cu.run(goal, initial_frame=initial_frame)
