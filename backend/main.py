@@ -1988,24 +1988,35 @@ async def parallel_lifespan(app: FastAPI):
                             if goal:
                                 try:
                                     from backend.vision.jarvis_cu import JarvisCU
+                                    import numpy as np
+                                    import base64
+                                    from PIL import Image
+                                    import io
+
                                     cu = getattr(app.state, "jarvis_cu", None)
                                     if cu is None:
-                                        # Start FramePipeline for live screen capture.
-                                        # JarvisCU needs real screenshots (not black frames)
-                                        # to plan and execute screen actions.
-                                        fp = None
-                                        try:
-                                            from backend.vision.realtime.frame_pipeline import FramePipeline
-                                            fp = FramePipeline()
-                                            await fp.start()
-                                            logger.info("[HUD] FramePipeline started for VLA")
-                                        except Exception as fp_err:
-                                            logger.warning("[HUD] FramePipeline unavailable: %s — VLA will use screenshots", fp_err)
-                                        cu = JarvisCU(frame_pipeline=fp)
+                                        # No FramePipeline — Python/uvicorn is headless,
+                                        # SCK won't deliver frames without a GUI RunLoop.
+                                        # The Swift HUD sends screenshots via IPC instead.
+                                        cu = JarvisCU()
                                         app.state.jarvis_cu = cu
-                                        app.state.frame_pipeline = fp
+
+                                    # Decode the screenshot from Swift HUD (base64 JPEG)
+                                    initial_frame = None
+                                    screenshot_b64 = payload.get("screenshot")
+                                    if screenshot_b64:
+                                        try:
+                                            img_bytes = base64.b64decode(screenshot_b64)
+                                            img = Image.open(io.BytesIO(img_bytes))
+                                            initial_frame = np.array(img.convert("RGB"))
+                                            logger.info("[HUD] Screenshot decoded: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
+                                        except Exception as dec_err:
+                                            logger.warning("[HUD] Screenshot decode failed: %s", dec_err)
+                                    else:
+                                        logger.warning("[HUD] No screenshot in payload — planner will see black frames")
+
                                     logger.info("[HUD] VLA executing: %s", goal[:80])
-                                    result = await cu.run(goal)
+                                    result = await cu.run(goal, initial_frame=initial_frame)
                                     logger.info("[HUD] VLA result: %s", result)
                                 except Exception as e:
                                     logger.error("[HUD] VLA failed: %s", e)

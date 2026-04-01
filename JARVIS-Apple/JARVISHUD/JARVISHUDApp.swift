@@ -104,17 +104,28 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                         "goal": goal,
                         "source": "local_fast_path",
                     ]
-                    // Tell the VLA planner which app is already open and in foreground
                     if let app = appName {
                         actionPayload["app_context"] = app
                     }
-                    BrainstemLauncher.shared.sendEvent(
-                        eventType: "action",
-                        data: [
-                            "action_type": "vision_task",
-                            "payload": actionPayload,
-                        ]
-                    )
+                    // Capture screenshot from Swift's SCK stream (has Screen Recording
+                    // permission + NSApplication RunLoop). Python/uvicorn is headless —
+                    // SCK won't deliver frames without a GUI run loop, so the backend's
+                    // FramePipeline gets black frames. The Swift HUD is the screen's eyes.
+                    Task {
+                        if let b64 = await ScreenCaptureService.shared.captureBase64() {
+                            actionPayload["screenshot"] = b64
+                            print("[JARVIS] VLA: screenshot attached (\(b64.count / 1024)KB)")
+                        } else {
+                            print("[JARVIS] VLA: no screenshot available")
+                        }
+                        BrainstemLauncher.shared.sendEvent(
+                            eventType: "action",
+                            data: [
+                                "action_type": "vision_task",
+                                "payload": actionPayload,
+                            ]
+                        )
+                    }
                 } else if appName == nil {
                     // Not an app launch and brainstem is dead — fall back to Vercel
                     print("[JARVIS] Brainstem not running, falling back to Vercel")
