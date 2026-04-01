@@ -17,7 +17,7 @@ from backend.core.ouroboros.governance.operation_id import generate_operation_id
 
 SCHEMA_VERSION = "2c.1"
 
-_VALID_SOURCES = frozenset({"architecture", "backlog", "test_failure", "voice_human", "ai_miner", "capability_gap", "runtime_health", "exploration", "roadmap"})
+_VALID_SOURCES = frozenset({"architecture", "backlog", "test_failure", "voice_human", "ai_miner", "capability_gap", "runtime_health", "exploration", "roadmap", "cu_execution"})
 _VALID_URGENCIES = frozenset({"critical", "high", "normal", "low"})
 
 

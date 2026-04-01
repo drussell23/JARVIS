@@ -23,6 +23,7 @@ import ast
 import enum
 import hashlib
 import logging
+import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -57,6 +58,86 @@ from backend.core.ouroboros.governance.tool_hook_registry import (
 )
 
 logger = logging.getLogger("Ouroboros.ChangeEngine")
+
+
+# ---------------------------------------------------------------------------
+# Ouroboros code signature (Manifesto §7 — Absolute Observability)
+# ---------------------------------------------------------------------------
+
+_SIGNATURE_ENABLED = os.environ.get("OUROBOROS_CODE_SIGNATURE", "1").lower() in (
+    "1", "true", "yes",
+)
+
+
+def _inject_ouroboros_signature(
+    content: str,
+    op_id: str,
+    goal: str,
+    target_path: str,
+) -> str:
+    """Inject an Ouroboros attribution comment into the changed content.
+
+    Adds a comment block near the top of the file (after any existing
+    module docstring / shebang / encoding declarations) so the user
+    can see in their IDE diff exactly what Ouroboros changed and why.
+
+    The signature is deterministic (Manifesto §7 Tier 0) — no model
+    call, just structured metadata.
+    """
+    if not _SIGNATURE_ENABLED:
+        return content
+
+    from datetime import datetime, timezone
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    goal_short = goal[:120].replace("\n", " ")
+
+    # Determine comment style from file extension
+    ext = Path(target_path).suffix.lower()
+    if ext in (".py", ".pyi", ".sh", ".yaml", ".yml", ".toml"):
+        sig = (
+            f"# [Ouroboros] Modified by Karen (op={op_id[:12]}) at {ts}\n"
+            f"# Reason: {goal_short}\n"
+        )
+    elif ext in (".js", ".ts", ".jsx", ".tsx", ".swift", ".java", ".c", ".cpp", ".go", ".rs"):
+        sig = (
+            f"// [Ouroboros] Modified by Karen (op={op_id[:12]}) at {ts}\n"
+            f"// Reason: {goal_short}\n"
+        )
+    else:
+        # Unknown extension — use hash-style comment
+        sig = (
+            f"# [Ouroboros] Modified by Karen (op={op_id[:12]}) at {ts}\n"
+            f"# Reason: {goal_short}\n"
+        )
+
+    # Insert after shebang / encoding / module docstring preamble.
+    # Find the first non-preamble line to insert before.
+    lines = content.split("\n")
+    insert_at = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Skip shebang
+        if i == 0 and stripped.startswith("#!"):
+            insert_at = i + 1
+            continue
+        # Skip encoding declaration
+        if i <= 1 and stripped.startswith("# -*- coding"):
+            insert_at = i + 1
+            continue
+        # Skip existing Ouroboros signatures (don't stack them)
+        if stripped.startswith("# [Ouroboros]") or stripped.startswith("// [Ouroboros]"):
+            insert_at = i + 1
+            continue
+        # Skip blank lines at the very top
+        if i <= insert_at and not stripped:
+            insert_at = i + 1
+            continue
+        break
+
+    lines.insert(insert_at, sig)
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -423,15 +504,21 @@ class ChangeEngine:
                         f"Tool hook blocked file write for {target} (op={op_id})"
                     )
 
+            # Inject Ouroboros signature so the user knows who changed this file
+            signed_content = _inject_ouroboros_signature(
+                content=request.proposed_content,
+                op_id=op_id,
+                goal=request.goal,
+                target_path=str(target),
+            )
+
             # Acquire file lock for the write
             async with self._lock_manager.acquire(
                 level=LockLevel.FILE_LOCK,
                 resource=str(target),
                 mode=LockMode.EXCLUSIVE_WRITE,
             ) as handle:
-                target.write_text(
-                    request.proposed_content, encoding="utf-8"
-                )
+                target.write_text(signed_content, encoding="utf-8")
 
             # Post-hook notification (fire-and-forget; errors swallowed by registry)
             if self._tool_hook_registry is not None:

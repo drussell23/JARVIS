@@ -428,6 +428,50 @@ class ActionDispatcher:
                     )
                 await self.tts_speak(narration)
 
+        # --- Ouroboros telemetry: feed CU result to CUExecutionSensor ---
+        await self._emit_cu_telemetry(
+            goal=goal,
+            result=result,
+            msg_contact=_msg_contact,
+            msg_app=_msg_app,
+        )
+
+    # ------------------------------------------------------------------
+    # Ouroboros CU telemetry (Manifesto §6 Neuroplasticity + §7 Observability)
+    # ------------------------------------------------------------------
+
+    async def _emit_cu_telemetry(
+        self,
+        goal: str,
+        result: Optional[dict],
+        msg_contact: Optional[str],
+        msg_app: Optional[str],
+    ) -> None:
+        """Feed CU execution result to the Ouroboros CUExecutionSensor."""
+        if result is None:
+            return
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.cu_execution_sensor import (
+                CUExecutionRecord,
+                get_cu_execution_sensor,
+            )
+
+            rec = CUExecutionRecord(
+                goal=goal,
+                success=bool(result.get("success")),
+                steps_completed=result.get("steps_completed", 0),
+                steps_total=result.get("steps_total", 0),
+                elapsed_s=result.get("elapsed_s", 0),
+                error=result.get("error"),
+                is_messaging=msg_contact is not None,
+                contact=msg_contact,
+                app=msg_app,
+                layers_used=result.get("layers_used", {}),
+            )
+            await get_cu_execution_sensor().record(rec)
+        except Exception as exc:
+            logger.debug("[Dispatch] CU telemetry emission failed: %s", exc)
+
     # ------------------------------------------------------------------
     # Messaging Router integration
     # ------------------------------------------------------------------
