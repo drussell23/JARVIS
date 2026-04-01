@@ -109,6 +109,7 @@ class JarvisCU:
     def __init__(self, frame_pipeline: Optional[Any] = None) -> None:
         self._planner = CUTaskPlanner()
         self._executor = CUStepExecutor()
+        self._hud_frame: Optional[np.ndarray] = None  # HUD screenshot fallback
 
         # 60fps FramePipeline — motion-aware verification between steps.
         # When available, replaces both SHM static reads AND fixed delays.
@@ -157,7 +158,8 @@ class JarvisCU:
         Priority:
         1. FramePipeline.latest_frame (60fps, motion-filtered)
         2. SHM static read (60fps, no motion awareness)
-        3. Black frame fallback
+        3. Stored HUD screenshot (from initial_frame, static but real)
+        4. Black frame fallback
         """
         # 60fps FramePipeline — best path
         if self._frame_pipeline is not None:
@@ -173,6 +175,11 @@ class JarvisCU:
                     return frame
             except Exception as exc:
                 logger.debug("[JarvisCU] SHM read failed: %s", exc)
+
+        # HUD screenshot fallback — static but shows actual screen content.
+        # Better than a black frame for the executor's visual grounding.
+        if self._hud_frame is not None:
+            return self._hud_frame
 
         return _make_black_frame()
 
@@ -259,6 +266,11 @@ class JarvisCU:
         layers_used: Dict[str, int] = defaultdict(int)
         steps_completed = 0
         error: Optional[str] = None
+
+        # Store HUD screenshot for _get_frame() fallback during step execution.
+        # Without FramePipeline/SHM, the executor would get black frames.
+        if initial_frame is not None:
+            self._hud_frame = initial_frame
 
         # -- Phase 1: Plan --------------------------------------------------
         try:

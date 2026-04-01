@@ -394,10 +394,32 @@ class CUStepExecutor:
                 "macOS may silently drop this event. Grant access in System Settings.",
                 action, coords,
             )
-        logger.info("[CUExec] Executing %s at coords=%s via layer=%s", action, coords, layer_used)
+        # Scale coordinates from screenshot space to screen points.
+        # The screenshot is resized (e.g., 1280x800) but pyautogui uses
+        # macOS logical points (e.g., 1440x900 on MacBook Pro Retina).
+        # Without scaling, clicks land in the wrong position.
+        scaled_coords = coords
+        if coords and frame is not None:
+            img_h, img_w = frame.shape[:2]
+            try:
+                import Quartz
+                bounds = Quartz.CGDisplayBounds(Quartz.CGMainDisplayID())
+                screen_w = int(bounds.size.width) or 1440
+                screen_h = int(bounds.size.height) or 900
+            except Exception:
+                screen_w, screen_h = 1440, 900
+            if img_w > 0 and img_h > 0:
+                scale_x = screen_w / img_w
+                scale_y = screen_h / img_h
+                scaled_coords = (int(coords[0] * scale_x), int(coords[1] * scale_y))
+                if scaled_coords != coords:
+                    logger.info("[CUExec] Scaled coords: %s → %s (image %dx%d → screen %dx%d)",
+                                coords, scaled_coords, img_w, img_h, screen_w, screen_h)
+
+        logger.info("[CUExec] Executing %s at coords=%s via layer=%s", action, scaled_coords, layer_used)
         try:
             await asyncio.to_thread(
-                _execute_action_impl, action, coords, value or None,
+                _execute_action_impl, action, scaled_coords, value or None,
             )
         except Exception as exc:
             elapsed = (time.monotonic() - t0) * 1000

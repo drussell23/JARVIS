@@ -124,23 +124,29 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                     // which captures the CURRENT display — the app must be visible.
                     Task {
                         if let targetApp = appName {
-                            // Activate the app and bring it to THIS Space
-                            for attempt in 1...10 {
-                                if let running = NSWorkspace.shared.runningApplications.first(
-                                    where: { $0.localizedName == targetApp }
-                                ) {
-                                    running.activate(options: [.activateIgnoringOtherApps])
-                                    try? await Task.sleep(for: .milliseconds(500))
-                                    if running.isActive {
-                                        print("[JARVIS] VLA: \(targetApp) is frontmost (attempt \(attempt))")
-                                        break
-                                    }
-                                } else {
-                                    try? await Task.sleep(for: .milliseconds(500))
-                                }
+                            // Force macOS to switch TO the app's Space and make it frontmost.
+                            // NSRunningApplication.activate doesn't switch Spaces — it only
+                            // activates if the app is already on the current Space.
+                            // AppleScript "activate" forces a full Space switch.
+                            let script = "tell application \"\(targetApp)\" to activate"
+                            let proc = Process()
+                            proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                            proc.arguments = ["-e", script]
+                            try? proc.run()
+                            proc.waitUntilExit()
+                            print("[JARVIS] VLA: activated \(targetApp) via AppleScript (Space switch)")
+
+                            // Wait for the Space animation to complete and app to render
+                            try? await Task.sleep(for: .seconds(3))
+
+                            // Verify it's actually frontmost
+                            if let running = NSWorkspace.shared.frontmostApplication,
+                               running.localizedName == targetApp {
+                                print("[JARVIS] VLA: \(targetApp) confirmed frontmost")
+                            } else {
+                                let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
+                                print("[JARVIS] VLA: WARNING — frontmost is '\(front)', not '\(targetApp)'")
                             }
-                            // Settle time for the app to fully render its UI
-                            try? await Task.sleep(for: .seconds(2))
                         }
 
                         // FRESH screenshot (bypasses 1fps stream cache).
