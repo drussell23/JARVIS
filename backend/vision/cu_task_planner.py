@@ -521,6 +521,13 @@ class CUTaskPlanner:
         for i, raw in enumerate(raw_steps):
             # Filter to only known CUStep fields
             filtered = {k: v for k, v in raw.items() if k in _CUSTEP_FIELDS}
+            # Ensure required fields have defaults
+            if "action" not in filtered:
+                filtered["action"] = "click"
+            if "description" not in filtered:
+                # Synthesize description from action + target/text
+                target = filtered.get("target", filtered.get("text", ""))
+                filtered["description"] = f"{filtered['action']} {target}".strip()
             step = CUStep(index=i, **filtered)
             steps.append(step)
         return steps
