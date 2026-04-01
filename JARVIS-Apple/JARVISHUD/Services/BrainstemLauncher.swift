@@ -253,13 +253,14 @@ final class BrainstemLauncher {
             // Build a newline-terminated JSON line
             var line = jsonData
             line.append(0x0A) // newline
-            print("[Brainstem] sendEvent: \(eventType) (\(line.count) bytes) via TCP")
+            let byteCount = line.count  // Capture for Sendable closure
+            print("[Brainstem] sendEvent: \(eventType) (\(byteCount) bytes) via TCP")
 
             conn.send(content: line, completion: .contentProcessed { error in
                 if let error = error {
                     print("[Brainstem] TCP send error for \(eventType): \(error)")
                 } else {
-                    print("[Brainstem] Forwarded event: \(eventType) (\(line.count) bytes) via TCP")
+                    print("[Brainstem] Forwarded event: \(eventType) (\(byteCount) bytes) via TCP")
                 }
             })
         } catch {
