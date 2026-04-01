@@ -1985,6 +1985,18 @@ async def parallel_lifespan(app: FastAPI):
                             # prepend context so the planner knows it's open.
                             if app_context and goal:
                                 goal = f"[{app_context} is already open and in the foreground] {goal}"
+
+                            # Inject JARVIS signature into messaging goals
+                            # so recipients know the message was AI-sent.
+                            _msg_sig = os.environ.get("JARVIS_MSG_SIGNATURE", "\U0001F916 - sent via JARVIS")
+                            if _msg_sig and goal:
+                                import re as _re
+                                _sig_match = _re.search(r"(saying\s+)(.+)$", goal, _re.IGNORECASE)
+                                if _sig_match and _msg_sig not in _sig_match.group(2):
+                                    _body = _sig_match.group(2)
+                                    goal = goal[:_sig_match.start(2)] + f"{_body} {_msg_sig}"
+                                    logger.info("[HUD] Signed message goal: %s", goal[:100])
+
                             if goal:
                                 try:
                                     from backend.vision.jarvis_cu import JarvisCU

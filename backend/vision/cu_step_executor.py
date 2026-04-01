@@ -171,14 +171,18 @@ def _execute_action_impl(
 
 
 def _clipboard_type(text: str) -> None:
-    """Type text via clipboard (pbcopy + cmd+v) for reliability.
+    """Type text via clipboard (pbcopy + osascript Cmd+V) for reliability.
 
     Uses clipboard paste because pyautogui.typewrite doesn't support
     unicode characters or special chars reliably on macOS.
+
+    CRITICAL: Uses osascript for the Cmd+V keystroke instead of
+    pyautogui.hotkey("command", "v") because pyautogui drops the
+    Command modifier under system load (CoreAudio IOWorkLoop overload),
+    causing only "v" to be typed instead of pasting.
     """
     logger.info("[CUExec] Typing via clipboard: %r (%d chars)", text[:50], len(text))
     try:
-        import pyautogui
         # Copy text to clipboard
         proc = subprocess.run(
             ["pbcopy"],
@@ -187,21 +191,49 @@ def _clipboard_type(text: str) -> None:
             timeout=5,
         )
         if proc.returncode != 0:
-            logger.warning("[CUExec] pbcopy failed (exit %d), using typewrite", proc.returncode)
-            pyautogui.typewrite(text, interval=0.02)
+            logger.warning("[CUExec] pbcopy failed (exit %d), falling back to osascript keystroke", proc.returncode)
+            # Fallback: type via osascript keystroke directly
+            _osascript_type(text)
             return
+
         # Wait for the input field to be focused before pasting
         time.sleep(0.3)
-        # Paste from clipboard
-        pyautogui.hotkey("command", "v")
-        logger.info("[CUExec] Pasted '%s' via cmd+v", text[:50])
-    except Exception as e:
-        logger.warning("[CUExec] Clipboard type failed: %s, trying typewrite", e)
-        try:
+
+        # Paste via osascript — more reliable than pyautogui.hotkey on macOS.
+        # pyautogui.hotkey("command", "v") drops the modifier under load,
+        # causing just "v" to be typed. osascript keystroke goes through
+        # the native macOS event system and never drops modifiers.
+        paste_result = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to keystroke "v" using command down'],
+            capture_output=True,
+            timeout=5,
+        )
+        if paste_result.returncode != 0:
+            err = paste_result.stderr.decode("utf-8", errors="replace").strip()
+            logger.warning("[CUExec] osascript paste failed (exit %d): %s — trying pyautogui", paste_result.returncode, err[:100])
             import pyautogui
-            pyautogui.typewrite(text, interval=0.02)
+            pyautogui.hotkey("command", "v")
+
+        logger.info("[CUExec] Pasted '%s' via cmd+v (osascript)", text[:50])
+    except Exception as e:
+        logger.warning("[CUExec] Clipboard type failed: %s, trying osascript keystroke", e)
+        try:
+            _osascript_type(text)
         except Exception as exc:
             raise RuntimeError(f"Cannot type text: {exc}") from exc
+
+
+def _osascript_type(text: str) -> None:
+    """Type text via osascript keystroke (fallback when clipboard fails)."""
+    # Escape for AppleScript string
+    safe = text.replace("\\", "\\\\").replace('"', '\\"')
+    subprocess.run(
+        ["osascript", "-e",
+         f'tell application "System Events" to keystroke "{safe}"'],
+        capture_output=True,
+        timeout=10,
+    )
 
 
 # ---------------------------------------------------------------------------
