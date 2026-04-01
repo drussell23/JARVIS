@@ -98,21 +98,29 @@ final class BrainstemLauncher {
         env["JARVIS_HUD_PORT"] = String(httpPort)
 
         let proc = Process()
-        // Use python3.12 (Homebrew, OpenSSL 3.6) instead of system python3
-        // (3.9.6, LibreSSL 2.8.3) which can't complete TLS handshakes to Vercel/Anthropic.
+        // v351.0: Use the project's venv Python — it has uvicorn, FastAPI,
+        // and all backend dependencies installed. The bare Homebrew python3.12
+        // doesn't have them, causing "ModuleNotFoundError: No module named 'uvicorn'".
         //
-        // Dock icon suppression: Python.framework's Info.plist registers the
-        // process as a GUI app, showing a rocket icon. We suppress it by
-        // setting LSBackgroundOnly BEFORE the process connects to WindowServer.
-        // This works because Process() launches the binary directly, not via
-        // open(1) which would read the .app bundle's Info.plist.
-        let python = "/opt/homebrew/bin/python3.12"
-        let usePython = FileManager.default.fileExists(atPath: python) ? python : "/usr/bin/env"
-        let pythonArgs = usePython == "/usr/bin/env" ? ["python3", "-m", "brainstem"] : ["-m", "brainstem"]
-        proc.executableURL = URL(fileURLWithPath: usePython)
+        // Priority: venv/bin/python3.12 > /opt/homebrew/bin/python3.12 > /usr/bin/env python3
+        let venvPython = "\(repoRoot)/venv/bin/python3.12"
+        let brewPython = "/opt/homebrew/bin/python3.12"
+        let python: String
+        let pythonArgs: [String]
+
+        if FileManager.default.fileExists(atPath: venvPython) {
+            python = venvPython
+            pythonArgs = ["-m", "brainstem"]
+        } else if FileManager.default.fileExists(atPath: brewPython) {
+            python = brewPython
+            pythonArgs = ["-m", "brainstem"]
+        } else {
+            python = "/usr/bin/env"
+            pythonArgs = ["python3", "-m", "brainstem"]
+        }
+
+        proc.executableURL = URL(fileURLWithPath: python)
         proc.arguments = pythonArgs
-        // QualityOfService.background prevents WindowServer registration
-        proc.qualityOfService = .utility
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         proc.environment = env
 
