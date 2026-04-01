@@ -100,12 +100,19 @@ final class BrainstemLauncher {
         let proc = Process()
         // Use python3.12 (Homebrew, OpenSSL 3.6) instead of system python3
         // (3.9.6, LibreSSL 2.8.3) which can't complete TLS handshakes to Vercel/Anthropic.
-        let python = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/python3.12")
-            ? "/opt/homebrew/bin/python3.12"
-            : "/usr/bin/env"
-        let pythonArgs = python == "/usr/bin/env" ? ["python3", "-m", "brainstem"] : ["-m", "brainstem"]
-        proc.executableURL = URL(fileURLWithPath: python)
+        //
+        // Dock icon suppression: Python.framework's Info.plist registers the
+        // process as a GUI app, showing a rocket icon. We suppress it by
+        // setting LSBackgroundOnly BEFORE the process connects to WindowServer.
+        // This works because Process() launches the binary directly, not via
+        // open(1) which would read the .app bundle's Info.plist.
+        let python = "/opt/homebrew/bin/python3.12"
+        let usePython = FileManager.default.fileExists(atPath: python) ? python : "/usr/bin/env"
+        let pythonArgs = usePython == "/usr/bin/env" ? ["python3", "-m", "brainstem"] : ["-m", "brainstem"]
+        proc.executableURL = URL(fileURLWithPath: usePython)
         proc.arguments = pythonArgs
+        // QualityOfService.background prevents WindowServer registration
+        proc.qualityOfService = .utility
         proc.currentDirectoryURL = URL(fileURLWithPath: repoRoot)
         proc.environment = env
 
