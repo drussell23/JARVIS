@@ -53,11 +53,16 @@ final class BrainstemLauncher {
     private init() {}
 
     /// Spawn the brainstem. Safe to call multiple times — only starts once.
+    /// Kills any stale Python processes on HUD ports from a previous Xcode run.
     func start() {
         guard process == nil else {
             print("[Brainstem] Already running (PID \(process?.processIdentifier ?? 0))")
             return
         }
+
+        // Kill stale processes from previous Xcode runs that didn't clean up.
+        // When Xcode kills the HUD, the child Python process can survive as an orphan.
+        killStaleProcesses()
 
         let brainstemEnv = repoRoot + "/brainstem/.env"
         guard FileManager.default.fileExists(atPath: brainstemEnv) else {
@@ -331,6 +336,25 @@ final class BrainstemLauncher {
     /// Whether the brainstem is currently running.
     var isRunning: Bool {
         process?.isRunning ?? false
+    }
+
+    // MARK: - Stale process cleanup
+
+    /// Kill orphaned Python processes from previous Xcode runs.
+    /// When Xcode's Stop button kills the HUD, the child Python backend
+    /// can survive as an orphan, holding ports 8011 and 8742.
+    private func killStaleProcesses() {
+        let ports = [httpPort, ipcPort]
+        for port in ports {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+            task.arguments = ["bash", "-c", "lsof -ti :\(port) | xargs kill -9 2>/dev/null"]
+            try? task.run()
+            task.waitUntilExit()
+        }
+        // Brief pause to let the OS release the ports
+        Thread.sleep(forTimeInterval: 0.3)
+        print("[Brainstem] Cleaned up stale processes on ports \(ports)")
     }
 
     // MARK: - Env file parser
