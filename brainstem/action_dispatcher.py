@@ -96,6 +96,26 @@ def _sign_message(body: str) -> str:
     return f"{body} {_MSG_SIGNATURE}"
 
 
+def _sign_goal(goal: str) -> str:
+    """Sign any messaging goal that contains 'saying <message>'.
+
+    This is the universal catch-all that works for ALL goal formats:
+      - "open WhatsApp and message Zack saying hey"
+      - "message Delia saying happy Wednesday"
+      - "message Delia on WhatsApp saying hey"
+
+    Injects the signature into the message body portion of the goal
+    so the CU pipeline types the signed text.
+    """
+    if not _MSG_SIGNATURE:
+        return goal
+    m = re.search(r"(saying\s+)(.+)$", goal, re.IGNORECASE)
+    if m and _MSG_SIGNATURE not in m.group(2):
+        body = m.group(2)
+        return goal[: m.start(2)] + f"{body} {_MSG_SIGNATURE}"
+    return goal
+
+
 def _rewrite_msg_with_app(goal: str) -> Optional[str]:
     """Rewrite 'message X on APP saying Y' → 'open APP and message X saying Y'."""
     m = _MSG_WITH_APP_PATTERN.match(goal.strip())
@@ -105,7 +125,6 @@ def _rewrite_msg_with_app(goal: str) -> Optional[str]:
     app = m.group(2).strip()
     body = m.group(3).strip()
     if body:
-        body = _sign_message(body)
         return f"open {app} and message {contact} saying {body}"
     return f"open {app} and message {contact}"
 
@@ -302,6 +321,9 @@ class ActionDispatcher:
         source = payload.get("source", "")
         logger.info("[Dispatch] VLA executing goal: %s (screenshot=%s, source=%s)", goal[:80], "yes" if screenshot_b64 else "no", source or "sse")
 
+        # ----- Universal message signature (catches ALL goal formats) -----
+        goal = _sign_goal(goal)
+
         # Track messaging context for learn() after success
         _msg_contact: Optional[str] = None
         _msg_app: Optional[str] = None
@@ -321,8 +343,7 @@ class ActionDispatcher:
                 _msg_contact = contact
                 _msg_app = routing.app_name
                 if body:
-                    signed_body = _sign_message(body)
-                    goal = f"open {routing.app_name} and message {contact} saying {signed_body}"
+                    goal = f"open {routing.app_name} and message {contact} saying {body}"
                 else:
                     goal = f"open {routing.app_name} and message {contact}"
                 logger.info(
