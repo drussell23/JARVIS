@@ -23,6 +23,10 @@ final class BrainstemLauncher {
     private let ipcPort: UInt16 = 8742
     /// HTTP port for the backend in HUD mode (separate from supervisor's 8010).
     let httpPort: UInt16 = 8011
+
+    /// Called when the backend IPC is connected and ready for commands.
+    /// AppState sets this to announce "JARVIS Online" and complete the loading screen.
+    var onReady: (() -> Void)?
     private let ipcQueue = DispatchQueue(label: "com.jarvis.brainstem.ipc", qos: .userInitiated)
 
     /// The repo root, derived from the known brainstem .env path.
@@ -282,6 +286,10 @@ final class BrainstemLauncher {
                 print("[Brainstem] IPC connected to localhost:\(self.ipcPort)")
                 Task { @MainActor in
                     self.connection = conn
+
+                    // Notify HUD that JARVIS is online and ready for commands
+                    self.onReady?()
+
                     // Replay any events queued while backend was booting
                     if !self.pendingEvents.isEmpty {
                         print("[Brainstem] Replaying \(self.pendingEvents.count) queued event(s)")

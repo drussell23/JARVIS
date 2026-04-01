@@ -148,6 +148,24 @@ class PythonBridge: ObservableObject {
         await connectLoop(deviceAuth: deviceAuth, config: creds)
     }
 
+    /// Called by BrainstemLauncher when IPC connects — backend is fully
+    /// booted and ready for commands. This is the definitive "JARVIS Online" moment.
+    func onBackendReady() {
+        connectionStatus = .connected
+        detailedConnectionState = "JARVIS Online — local backend ready"
+        hudState = .idle
+
+        if !loadingComplete {
+            updateLoading(progress: 100, message: "JARVIS Online")
+            loadingComplete = true
+        }
+
+        if !hasGreeted {
+            hasGreeted = true
+            onSpeak?("JARVIS Online. All systems ready.", .normal)
+        }
+    }
+
     /// Disconnect and stop the SSE loop.
     func shutdown() {
         isRunning = false
@@ -208,22 +226,17 @@ class PythonBridge: ObservableObject {
             } catch is CancellationError {
                 break
             } catch let error as JARVISError where error == .cloudDisabled {
-                // Vercel deployment disabled (402) — stop retrying cloud,
-                // switch to local-only mode via brainstem IPC.
-                print("[JARVIS] Cloud disabled (Vercel 402) — switching to local mode")
-                connectionStatus = .connected  // IPC is already connected
-                detailedConnectionState = "Local mode — brainstem IPC"
-                hudState = .idle
+                // Vercel deployment disabled (402) — stop retrying cloud.
+                // Don't announce "online" here — wait for onBackendReady()
+                // which fires when IPC connects (backend fully booted).
+                print("[JARVIS] Cloud disabled (Vercel 402) — waiting for local backend IPC")
+                detailedConnectionState = "Cloud unavailable — waiting for local backend..."
 
                 if !loadingComplete {
-                    updateLoading(progress: 100, message: "JARVIS Online (local mode)")
-                    loadingComplete = true
-                }
-
-                // Greet once in local mode
-                if !hasGreeted {
-                    hasGreeted = true
-                    onSpeak?("Online in local mode. Cloud relay is unavailable.", .normal)
+                    updateLoading(
+                        progress: max(loadingProgress, 30),
+                        message: "Starting local backend..."
+                    )
                 }
 
                 // Stay alive but don't retry cloud — the brainstem IPC handles everything.

@@ -40,8 +40,13 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // The stream shows the macOS purple recording indicator — JARVIS's eyes are open.
             ScreenCaptureService.shared.requestPermission()
             ScreenCaptureService.shared.startStream()
-            // Auto-start the Python brainstem — the nervous system that handles
-            // action events (vision_task, ghost_hands) from the Vercel SSE stream.
+            // Auto-start the Python brainstem — full backend in HUD mode.
+            // The onReady callback fires when IPC connects (backend fully booted),
+            // telling the HUD to announce "JARVIS Online" to the user.
+            BrainstemLauncher.shared.onReady = { [weak self] in
+                guard let self = self else { return }
+                self.appState.onBackendReady()
+            }
             BrainstemLauncher.shared.start()
             self.appState.boot()
         }
