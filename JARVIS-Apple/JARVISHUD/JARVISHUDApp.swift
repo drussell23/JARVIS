@@ -45,7 +45,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // telling the HUD to announce "JARVIS Online" to the user.
             BrainstemLauncher.shared.onReady = { [weak self] in
                 guard let self = self else { return }
-                self.appState.onBackendReady()
+                self.appState.pythonBridge.onBackendReady()
             }
             BrainstemLauncher.shared.start()
             self.appState.boot()
