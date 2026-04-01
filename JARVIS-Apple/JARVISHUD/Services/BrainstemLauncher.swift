@@ -21,6 +21,8 @@ final class BrainstemLauncher {
     /// TCP connection to the brainstem IPC server.
     private var connection: NWConnection?
     private let ipcPort: UInt16 = 8742
+    /// HTTP port for the backend in HUD mode (separate from supervisor's 8010).
+    let httpPort: UInt16 = 8011
     private let ipcQueue = DispatchQueue(label: "com.jarvis.brainstem.ipc", qos: .userInitiated)
 
     /// The repo root, derived from the known brainstem .env path.
@@ -90,6 +92,10 @@ final class BrainstemLauncher {
 
         // Remove PYTHONHOME if set — it breaks Homebrew Python's module search
         env.removeValue(forKey: "PYTHONHOME")
+
+        // v351.0: HUD mode — full backend stack on separate port from supervisor
+        env["JARVIS_MODE"] = "hud"
+        env["JARVIS_HUD_PORT"] = String(httpPort)
 
         let proc = Process()
         // Use python3.12 (Homebrew, OpenSSL 3.6) instead of system python3
