@@ -538,11 +538,13 @@ class CUTaskPlanner:
         """
         from PIL import Image
 
-        # Handle grayscale
+        # Handle grayscale and RGBA → RGB (JPEG doesn't support alpha)
         if frame.ndim == 2:
             img = Image.fromarray(frame, mode="L").convert("RGB")
         else:
             img = Image.fromarray(frame)
+            if img.mode == "RGBA":
+                img = img.convert("RGB")
 
         # Resize if needed
         w, h = img.size
