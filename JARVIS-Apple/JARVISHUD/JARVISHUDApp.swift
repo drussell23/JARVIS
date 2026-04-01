@@ -83,113 +83,71 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             self?.speak(text)
         }
 
-        // When wake word captures a command → route locally (VLA) or via cloud
+        // ALL commands route through local IPC (brainstem backend).
+        // Vercel cloud is disabled (402). IPC is the PRIMARY and ONLY path.
         wakeWord.onCommand = { [weak self] command in
             guard let self else { return }
             print("[JARVIS] Voice command: \"\(command)\"")
 
-            if Self.isVLAIntent(command) {
-                // Tier 0: Try to launch the app directly from Swift first.
-                // This works even if the brainstem crashed (SIGKILL/OOM).
-                let appName = Self.extractAppName(command)
-                if let app = appName {
-                    print("[JARVIS] Tier 0: launching '\(app)' via macOS open")
-                    self.speak("On it.")
+            guard BrainstemLauncher.shared.isRunning else {
+                print("[JARVIS] Backend not running — cannot execute command")
+                self.speak("Backend is still starting. Try again in a moment.")
+                return
+            }
+
+            self.speak("On it.")
+
+            // Tier 0: If an app launch is detected, open it immediately from Swift
+            let appName = Self.extractAppName(command)
+            if let app = appName {
+                print("[JARVIS] Tier 0: launching '\(app)' via macOS open")
+                let proc = Process()
+                proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                proc.arguments = ["-a", app]
+                try? proc.run()
+                proc.waitUntilExit()
+                print("[JARVIS] Tier 0: '\(app)' \(proc.terminationStatus == 0 ? "launched" : "failed")")
+            }
+
+            // Route everything to the local backend via IPC
+            let remainder = appName != nil ? Self.extractRemainder(command) : nil
+            let goal = remainder ?? command
+            print("[JARVIS] IPC: \(goal)")
+
+            var actionPayload: [String: Any] = [
+                "goal": goal,
+                "source": "local_fast_path",
+            ]
+            if let app = appName {
+                actionPayload["app_context"] = app
+            }
+
+            Task {
+                // If an app was launched, switch to it and wait for it to render
+                if let targetApp = appName {
+                    let script = "tell application \"\(targetApp)\" to activate"
                     let proc = Process()
-                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                    proc.arguments = ["-a", app]
+                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+                    proc.arguments = ["-e", script]
                     try? proc.run()
                     proc.waitUntilExit()
-                    if proc.terminationStatus == 0 {
-                        print("[JARVIS] Tier 0: '\(app)' launched successfully")
-                    } else {
-                        print("[JARVIS] Tier 0: 'open -a \(app)' failed (exit \(proc.terminationStatus))")
-                    }
+                    print("[JARVIS] VLA: activated \(targetApp)")
+                    try? await Task.sleep(for: .seconds(3))
                 }
 
-                // Forward to brainstem for complex remainder (messaging, etc.)
-                if BrainstemLauncher.shared.isRunning {
-                    let remainder = appName != nil ? Self.extractRemainder(command) : command
-                    let goal = remainder ?? command
-                    print("[JARVIS] VLA: forwarding to brainstem: \(goal)")
-                    var actionPayload: [String: Any] = [
-                        "goal": goal,
-                        "source": "local_fast_path",
+                // Fresh screenshot for the VLA planner
+                if let b64 = await ScreenCaptureService.shared.captureFresh() {
+                    actionPayload["screenshot"] = b64
+                    print("[JARVIS] VLA: screenshot (\(b64.count / 1024)KB)")
+                }
+
+                BrainstemLauncher.shared.sendEvent(
+                    eventType: "action",
+                    data: [
+                        "action_type": "vision_task",
+                        "payload": actionPayload,
                     ]
-                    if let app = appName {
-                        actionPayload["app_context"] = app
-                    }
-                    // Wait for the target app to be frontmost before telling the
-                    // backend to capture a screenshot. The backend uses CGDisplayCreateImage
-                    // which captures the CURRENT display — the app must be visible.
-                    Task {
-                        if let targetApp = appName {
-                            // Force macOS to switch TO the app's Space and make it frontmost.
-                            // NSRunningApplication.activate doesn't switch Spaces — it only
-                            // activates if the app is already on the current Space.
-                            // AppleScript "activate" forces a full Space switch.
-                            let script = "tell application \"\(targetApp)\" to activate"
-                            let proc = Process()
-                            proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                            proc.arguments = ["-e", script]
-                            try? proc.run()
-                            proc.waitUntilExit()
-                            print("[JARVIS] VLA: activated \(targetApp) via AppleScript (Space switch)")
-
-                            // Wait for the Space animation to complete and app to render
-                            try? await Task.sleep(for: .seconds(3))
-
-                            // Verify it's actually frontmost
-                            if let running = NSWorkspace.shared.frontmostApplication,
-                               running.localizedName == targetApp {
-                                print("[JARVIS] VLA: \(targetApp) confirmed frontmost")
-                            } else {
-                                let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "unknown"
-                                print("[JARVIS] VLA: WARNING — frontmost is '\(front)', not '\(targetApp)'")
-                            }
-                        }
-
-                        // FRESH screenshot (bypasses 1fps stream cache).
-                        // The cached frame may show the PREVIOUS app (e.g., Xcode).
-                        // captureFresh() does a one-shot SCScreenshotManager capture
-                        // which grabs the display RIGHT NOW — showing the target app.
-                        if let b64 = await ScreenCaptureService.shared.captureFresh() {
-                            actionPayload["screenshot"] = b64
-                            print("[JARVIS] VLA: FRESH screenshot captured (\(b64.count / 1024)KB)")
-                        } else {
-                            print("[JARVIS] VLA: WARNING — no screenshot captured")
-                        }
-
-                        BrainstemLauncher.shared.sendEvent(
-                            eventType: "action",
-                            data: [
-                                "action_type": "vision_task",
-                                "payload": actionPayload,
-                            ]
-                        )
-                    }
-                } else if appName == nil {
-                    // Not an app launch and brainstem is dead — fall back to Vercel
-                    print("[JARVIS] Brainstem not running, falling back to Vercel")
-                    Task {
-                        do {
-                            try await self.appState.pythonBridge.sendCommand(command)
-                        } catch {
-                            self.speak("Sorry, I couldn't reach the backend.")
-                        }
-                    }
-                }
-            } else {
-                // Normal path: send to Vercel for routing (conversation, analysis, etc.)
-                Task {
-                    do {
-                        try await self.appState.pythonBridge.sendCommand(command)
-                        print("[JARVIS] Command sent successfully")
-                    } catch {
-                        print("[JARVIS] Command failed: \(error)")
-                        self.speak("Sorry, I couldn't reach the cloud. Try again.")
-                    }
-                }
+                )
             }
         }
 
@@ -279,7 +237,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
     /// a Vercel cloud round-trip — saving 2-3 seconds of latency.
     private static let vlaPattern: NSRegularExpression? = {
         try? NSRegularExpression(
-            pattern: #"\b(click|tap|press|open|launch|type|enter|scroll|drag|swipe|select|close|minimize|maximize|switch to|go to|navigate to|move to|send|submit|toggle|check|uncheck|expand|collapse)\b"#,
+            pattern: #"\b(click|tap|press|open|launch|type|enter|scroll|drag|swipe|select|close|minimize|maximize|switch to|go to|navigate to|move to|send|submit|toggle|check|uncheck|expand|collapse|message|text|reply|respond|write|compose|search|find|look up)\b"#,
             options: .caseInsensitive
         )
     }()
