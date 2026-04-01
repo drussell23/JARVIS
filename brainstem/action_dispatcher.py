@@ -331,7 +331,14 @@ class ActionDispatcher:
                     routing.confidence, routing.routing_time_ms,
                 )
                 if self.tts_speak:
-                    await self.tts_speak(f"Messaging {contact} on {routing.app_name}.")
+                    if body:
+                        await self.tts_speak(
+                            f"Sending your message to {contact} on {routing.app_name}."
+                        )
+                    else:
+                        await self.tts_speak(
+                            f"Opening a conversation with {contact} on {routing.app_name}."
+                        )
 
         # ----- Tier 0: Deterministic fast-path for app launch (<100ms) -----
         app_launch = _parse_app_launch(goal)
@@ -362,8 +369,8 @@ class ActionDispatcher:
             except Exception as e:
                 logger.warning("[Dispatch] Tier 0 error: %s — falling back to vision", e)
 
-        # HUD already spoke "On it." for local fast-path — skip duplicate TTS
-        if self.tts_speak and source != "local_fast_path":
+        # Narrate what we're about to do (skip if messaging router already spoke)
+        if self.tts_speak and source != "local_fast_path" and not _msg_contact:
             await self.tts_speak(f"On it. Executing: {goal[:60]}")
 
         try:
@@ -371,7 +378,7 @@ class ActionDispatcher:
         except Exception as e:
             logger.error("[Dispatch] VLA execution failed: %s", e)
             if self.tts_speak:
-                await self.tts_speak(f"Action failed: {e}")
+                await self.tts_speak(f"Sorry, that action failed. {e}")
             return
 
         if result is None:
@@ -379,28 +386,47 @@ class ActionDispatcher:
                 await self.tts_speak("Vision pipeline couldn't start. Check screen recording permissions.")
             return
 
-        # Narrate result
+        # --- Narrate result (human-friendly, messaging-aware) ---
+        completed = result.get("steps_completed", 0)
+        total = result.get("steps_total", 0)
+        elapsed = result.get("elapsed_s", 0)
+
         if result.get("success"):
-            completed = result.get("steps_completed", 0)
-            total = result.get("steps_total", 0)
-            elapsed = result.get("elapsed_s", 0)
             layers = result.get("layers_used", {})
             layer_summary = ", ".join(f"{k}: {v}" for k, v in layers.items()) if layers else "none"
-            narration = f"Done. Completed {completed} of {total} steps in {elapsed:.1f} seconds. Layers used: {layer_summary}."
-            logger.info("[Dispatch] VLA success: %s", narration)
+            logger.info(
+                "[Dispatch] VLA success: %d/%d steps, %.1fs, layers: %s",
+                completed, total, elapsed, layer_summary,
+            )
 
             # Learn messaging route on success
             if _msg_contact and _msg_app:
                 self._learn_messaging_route(_msg_contact, _msg_app)
+
+            # Human-friendly TTS narration
+            if self.tts_speak:
+                if _msg_contact:
+                    narration = f"Done. Your message to {_msg_contact} has been sent on {_msg_app}."
+                else:
+                    narration = f"Done. Completed in {elapsed:.1f} seconds."
+                await self.tts_speak(narration)
         else:
             error = result.get("error", "unknown error")
-            completed = result.get("steps_completed", 0)
-            total = result.get("steps_total", 0)
-            narration = f"Action incomplete. Finished {completed} of {total} steps. Issue: {error}"
-            logger.warning("[Dispatch] VLA partial: %s", narration)
-
-        if self.tts_speak:
-            await self.tts_speak(narration)
+            logger.warning(
+                "[Dispatch] VLA partial: %d/%d steps. Error: %s",
+                completed, total, error,
+            )
+            if self.tts_speak:
+                if _msg_contact:
+                    narration = (
+                        f"I had trouble sending that message to {_msg_contact}. "
+                        f"Got through {completed} of {total} steps. {error}"
+                    )
+                else:
+                    narration = (
+                        f"Action incomplete. Finished {completed} of {total} steps. {error}"
+                    )
+                await self.tts_speak(narration)
 
     # ------------------------------------------------------------------
     # Messaging Router integration
