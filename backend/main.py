@@ -1598,6 +1598,28 @@ PARALLEL_STARTUP_ENABLED = os.getenv("JARVIS_PARALLEL_STARTUP", "true").lower() 
 # Adds: IPC server on 8742, optional SSE consumer for Vercel cloud relay.
 HUD_MODE = os.getenv("JARVIS_MODE", "").lower() == "hud"
 
+# v351.0: When BOTH supervisor (8010) and HUD (8011) run simultaneously,
+# hardware singletons must have a single owner to avoid contention:
+#
+# | Resource              | Supervisor (8010) | HUD (8011)          |
+# |-----------------------|-------------------|---------------------|
+# | Microphone / AudioBus | NO (headless)     | YES (local UX)      |
+# | Wake Word Detection   | NO                | YES                 |
+# | Screen Capture / SHM  | NO                | YES                 |
+# | Ghost Hands (AX API)  | NO                | YES                 |
+# | Voice Biometrics      | shared (Cloud SQL)| shared (Cloud SQL)  |
+# | Ouroboros Daemon       | YES               | YES (independent)   |
+# | Trinity Cross-Repo    | YES               | NO (skipped)        |
+# | GCP VM Lifecycle      | YES               | NO (skipped)        |
+# | Neural Mesh           | YES               | YES (independent)   |
+# | Cloud SQL             | YES               | YES (shared pool)   |
+#
+# In HUD mode, the backend IS the local UX process — it owns all hardware.
+# In supervisor mode, hardware is owned by the supervisor's own boot sequence
+# (unified_supervisor.py), not by backend/main.py's lifespan.
+# When both run, the supervisor doesn't start backend/main.py directly —
+# it starts its own FastAPI via its own lifespan which doesn't conflict.
+
 
 @asynccontextmanager
 async def parallel_lifespan(app: FastAPI):
