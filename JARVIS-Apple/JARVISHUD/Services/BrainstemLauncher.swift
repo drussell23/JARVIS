@@ -143,7 +143,30 @@ final class BrainstemLauncher {
         self.stdoutPipe = stdout
         self.stderrPipe = stderr
 
-        // Async read handlers — prefix all output with [Brainstem]
+        // Async read handlers — filter backend logs for readability.
+        // Only show important events in Xcode console, not every startup detail.
+        //
+        // Shown (always):
+        //   [HUD]      — HUD mode events (IPC, VLA dispatch)
+        //   [IPC]      — IPC connection lifecycle
+        //   [Dispatch]  — VLA step execution
+        //   [JarvisCU] — Vision planning/execution
+        //   [CUTaskPlanner] — Step planning
+        //   [CUExec]   — Click/type execution
+        //   ERROR/WARNING — All errors and warnings
+        //   HUD MODE   — Mode banner
+        //   INTERACTIVE — Ready signal
+        //
+        // Hidden: verbose startup (AI loader, Cloud SQL, memory, cost tracker, etc.)
+
+        let importantPatterns = [
+            "[HUD]", "[IPC]", "[Dispatch]", "[JarvisCU]", "[CUTaskPlanner]", "[CUExec]",
+            "ERROR", "WARNING", "HUD MODE", "INTERACTIVE MODE", "JARVIS Online",
+            "Application startup complete", "Uvicorn running", "[Boot]",
+            "[SSE]", "[AgentRuntime]", "Ghost Hands", "FramePipeline",
+            "VLA", "vision_task", "screenshot",
+        ]
+
         stdout.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
@@ -155,7 +178,12 @@ final class BrainstemLauncher {
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             for line in text.components(separatedBy: "\n") where !line.isEmpty {
-                print("[Brainstem:err] \(line)")
+                // Only show important log lines — filter out verbose startup noise
+                let isImportant = importantPatterns.contains { line.contains($0) }
+                if isImportant {
+                    print("[Backend] \(line)")
+                }
+
                 // Trigger IPC connection when brainstem's TCP server is actually listening.
                 // This prevents connecting to a stale socket from a previous process.
                 if line.contains("[IPC] TCP server listening") {

@@ -95,11 +95,14 @@ async def start_ipc_server(
                 pass
             logger.info("[IPC] Client disconnected: %s", peer)
 
+    # 2MB limit per line — screenshots from the HUD can be 200-500KB as base64 JPEG.
+    # Default asyncio limit is 64KB which truncates screenshot payloads.
     server = await asyncio.start_server(
         _handle_client,
         "127.0.0.1",
         ipc_port,
         reuse_address=True,
+        limit=2 * 1024 * 1024,
     )
     logger.info("[IPC] TCP server listening on localhost:%d", ipc_port)
     return server
