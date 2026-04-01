@@ -852,9 +852,20 @@ class ParallelInitializer:
         # + background DB verification. Keep at 45s — proxy itself is fast, the
         # verify_db_level_readiness background task has its own lifecycle.
         self._add_component("cloud_sql_proxy", priority=10, stale_threshold=45.0)
-        # Learning DB should still initialize when Cloud SQL is degraded/unavailable
-        # because it has a first-class SQLite fallback path. Keep Cloud SQL as a
-        # soft dependency for context logging, not as a hard startup gate.
+        # v351.0: learning_database MUST wait for cloud_sql_proxy to RESOLVE
+        # (complete OR fail) before starting its own initialization.
+        #
+        # ROOT CAUSE FIX: When learning_database was a pure soft dependency,
+        # it started asyncpg pool creation concurrently with Cloud SQL proxy
+        # init. Two threads performed TLS handshakes through the same OpenSSL
+        # context simultaneously, corrupting the heap:
+        #   libmalloc: memory corruption of free block → SIGTRAP in SSL_read_ex
+        #
+        # Using a hard dependency prevents the TLS race but would cascade-skip
+        # learning_database when cloud_sql_proxy fails — losing the SQLite
+        # fallback. Instead, we keep soft_dependencies for failure context but
+        # add a sequencing gate inside _init_learning_database() that awaits
+        # cloud_sql_proxy resolution before touching asyncpg.
         self._add_component(
             "learning_database",
             priority=12,
@@ -3068,10 +3079,47 @@ class ParallelInitializer:
         - Uses singleton initialization path instead of ad-hoc per-component
           instances, preventing duplicate cold-start work and lock contention
         - Uses startup-aware fast mode by default for deterministic readiness
+        - v351.0: Waits for cloud_sql_proxy to RESOLVE before touching asyncpg,
+          preventing SSL heap corruption from concurrent TLS handshakes
         """
         try:
             import importlib
             import sys
+
+            # ═══════════════════════════════════════════════════════════════
+            # v351.0: SEQUENCING GATE — wait for cloud_sql_proxy to resolve.
+            #
+            # ROOT CAUSE: Starting asyncpg pool creation while the Cloud SQL
+            # proxy is still initializing causes two threads to perform TLS
+            # handshakes through OpenSSL concurrently, corrupting the heap:
+            #   Thread 6:  SSL_read_ex → PySSL_select (waiting)
+            #   Thread 24: SSL_read_ex → CRYPTO_malloc → heap corruption
+            #
+            # We wait up to 30s for cloud_sql_proxy to complete or fail.
+            # If it fails or times out, we proceed with fast_mode=True
+            # (SQLite fallback). This eliminates the concurrent TLS race.
+            # ═══════════════════════════════════════════════════════════════
+            proxy_comp = self.components.get("cloud_sql_proxy")
+            if proxy_comp is not None and proxy_comp.phase not in (
+                InitPhase.COMPLETE, InitPhase.FAILED, InitPhase.SKIPPED
+            ):
+                logger.info(
+                    "   Learning DB: waiting for cloud_sql_proxy to resolve "
+                    "(prevents SSL TLS race)..."
+                )
+                wait_start = asyncio.get_event_loop().time()
+                max_wait = 30.0
+                while (asyncio.get_event_loop().time() - wait_start) < max_wait:
+                    if proxy_comp.phase in (
+                        InitPhase.COMPLETE, InitPhase.FAILED, InitPhase.SKIPPED
+                    ):
+                        break
+                    await asyncio.sleep(0.5)
+                elapsed = asyncio.get_event_loop().time() - wait_start
+                logger.info(
+                    "   Learning DB: cloud_sql_proxy resolved → %s (%.1fs)",
+                    proxy_comp.phase.value, elapsed,
+                )
 
             backend_mod_name = "backend.intelligence.learning_database"
             legacy_mod_name = "intelligence.learning_database"
@@ -3137,6 +3185,16 @@ class ParallelInitializer:
                     fast_mode = True
             except Exception:
                 pass
+
+            # v351.0: If cloud_sql_proxy failed/skipped, force SQLite fallback
+            if proxy_comp is not None and proxy_comp.phase in (
+                InitPhase.FAILED, InitPhase.SKIPPED
+            ):
+                fast_mode = True
+                logger.info(
+                    "   Learning DB: cloud_sql_proxy %s — forcing SQLite fallback",
+                    proxy_comp.phase.value,
+                )
 
             logger.info(
                 "   Learning DB bootstrap policy: module=%s, mode=%s, gate=%s",
