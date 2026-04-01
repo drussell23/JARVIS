@@ -50,6 +50,10 @@ If the element you need (a contact, button, app, field) is VISIBLE on screen,
 interact with it directly. Do NOT search for things you can already see.
 Only use search bars or Spotlight when the target is genuinely not on screen.
 
+MINIMUM-STEP PRINCIPLE:
+Generate the FEWEST steps necessary. Every unnecessary step is a chance for error.
+If the screen already shows what you need, skip navigation steps entirely.
+
 Each step must use exactly ONE of these action types:
 - click: Click on a UI element. Include "target" describing what to click.
 - type: Type text. Include "text" with the string to type. Optionally include "target" if a specific field must be clicked first.
@@ -65,11 +69,60 @@ Rules:
 4. Be specific about targets — describe the UI element precisely.
 5. Include wait steps after launching apps or navigating to new screens.
 
-For CHAT APPS (WhatsApp, Messages, Slack, Telegram):
-- If the contact is VISIBLE in the sidebar or chat list, click them directly.
-- Only use the search bar if the contact is NOT visible on screen.
-- After opening the conversation, click the message input field at the bottom.
-- Type the message, then press Return to send.
+=== MESSAGING APPS — CRITICAL INSTRUCTIONS ===
+
+STEP 0 — OBSERVE BEFORE ACTING:
+Before generating ANY steps, answer these questions by examining the screenshot:
+  Q1: Which messaging app is in the foreground? (Messages, WhatsApp, Telegram, Slack, etc.)
+  Q2: Is a conversation with the target contact ALREADY OPEN and ACTIVE?
+      → Check: Is the contact's name displayed at the TOP of the conversation pane?
+      → If YES: The conversation is ALREADY ACTIVE — skip ALL navigation steps.
+  Q3: Is the target contact visible in the sidebar/chat list?
+      → If YES: Just click their name in the sidebar — do NOT use the search bar.
+  Q4: Where is the message input field?
+      → It is ALWAYS at the BOTTOM of the conversation area.
+
+CONVERSATION ALREADY ACTIVE (Q2 = YES):
+If the contact's conversation is already showing on screen, your ENTIRE plan is:
+  1. Click the message input field at the bottom of the conversation
+  2. Type the message text
+  3. Press Return to send
+That's it. Do NOT search, do NOT click the sidebar, do NOT use keyboard shortcuts.
+
+NEED TO NAVIGATE TO CONTACT (Q2 = NO):
+  - If contact is VISIBLE in sidebar (Q3 = YES): click them in the sidebar, then type + send.
+  - If contact is NOT visible: click the search bar, type the contact name, click the matching result, then type + send.
+
+APP-SPECIFIC UI LANDMARKS:
+  Messages (iMessage):
+    - Message input: text field labeled "iMessage" at the bottom of the conversation
+    - Search bar: field with magnifying glass icon at the top-LEFT of the sidebar
+    - Active contact: name shown in the header bar at the top-center of the conversation
+    - DANGER: Do NOT press Cmd+N (creates a new message window and changes context)
+    - DANGER: Do NOT type contact names into the message input — they will be SENT as messages
+
+  WhatsApp:
+    - Message input: text field labeled "Type a message" at the bottom
+    - Search bar: field labeled "Search" at the top of the sidebar
+    - Active contact: name shown at the top of the conversation pane
+    - DANGER: Do NOT type contact names into the message input
+
+  Telegram:
+    - Message input: text field labeled "Message" at the bottom
+    - Search bar: magnifying glass icon at the top of the chat list
+
+  Slack:
+    - Message input: field at the bottom labeled "Message #channel" or "Message @person"
+    - Search bar: Cmd+K or search box at the top
+
+ANTI-PATTERNS (things that CAUSE BUGS — never do these):
+  ✗ Using Cmd+N in a messaging app (creates new message, loses context)
+  ✗ Typing a contact name into the message input field (it gets SENT as a message!)
+  ✗ Searching for a contact when their conversation is already open
+  ✗ Using keyboard shortcuts for navigation in chat apps (unreliable)
+  ✗ Clicking the search bar when the contact is visible in the sidebar
+
+=== END MESSAGING INSTRUCTIONS ===
 
 Return ONLY a JSON array of step objects. Each object has:
 - "action": one of click/type/key/hotkey/scroll/wait
@@ -530,7 +583,85 @@ class CUTaskPlanner:
                 filtered["description"] = f"{filtered['action']} {target}".strip()
             step = CUStep(index=i, **filtered)
             steps.append(step)
+
+        # Post-parse safety: filter dangerous messaging patterns
+        steps = self._filter_messaging_antipatterns(steps)
         return steps
+
+    @staticmethod
+    def _filter_messaging_antipatterns(steps: List[CUStep]) -> List[CUStep]:
+        """Remove or fix steps that match known messaging bug patterns.
+
+        Catches the exact bugs that have occurred in production:
+          - Cmd+N in messaging apps (creates new message, loses context)
+          - Typing a contact name followed by Return before the actual message
+            (sends the contact name as a message)
+
+        This is a deterministic safety net (Manifesto §5 Tier 0) — the planning
+        prompt should prevent these, but defense-in-depth catches model errors.
+        """
+        if len(steps) < 2:
+            return steps
+
+        filtered: List[CUStep] = []
+        i = 0
+        while i < len(steps):
+            step = steps[i]
+
+            # Block Cmd+N in messaging context (creates new message window)
+            if step.action == "hotkey" and step.keys:
+                keys_lower = [k.lower() for k in step.keys]
+                if "command" in keys_lower and "n" in keys_lower:
+                    desc = step.description.lower()
+                    if any(w in desc for w in ("message", "new", "compose", "chat")):
+                        logger.warning(
+                            "[CUTaskPlanner] BLOCKED Cmd+N anti-pattern at step %d: %s",
+                            step.index, step.description,
+                        )
+                        i += 1
+                        continue
+
+            # Detect "type contact name → Return → type message" pattern.
+            # If a type step is immediately followed by a key=Return, and then
+            # another type step, the first type is likely a navigation search
+            # that will accidentally send the contact name as a message.
+            if (
+                step.action == "type"
+                and step.text
+                and i + 2 < len(steps)
+                and steps[i + 1].action == "key"
+                and (steps[i + 1].key or "").lower() == "return"
+                and steps[i + 2].action == "type"
+            ):
+                # Check if the first type text looks like a contact name
+                # (short, no punctuation, capitalized) rather than a message
+                text = step.text.strip()
+                next_text = steps[i + 2].text or ""
+                is_short = len(text.split()) <= 3
+                has_no_punct = not any(c in text for c in ".!?,;:")
+                if is_short and has_no_punct and next_text:
+                    logger.warning(
+                        "[CUTaskPlanner] BLOCKED type-name-then-send anti-pattern: "
+                        "would have sent %r as a message before %r",
+                        text, next_text[:40],
+                    )
+                    # Skip the contact-name type AND the return that follows it
+                    i += 2
+                    continue
+
+            filtered.append(step)
+            i += 1
+
+        # Re-index if we removed steps
+        if len(filtered) != len(steps):
+            for idx, s in enumerate(filtered):
+                s.index = idx  # type: ignore[misc]
+            logger.info(
+                "[CUTaskPlanner] Safety filter: %d → %d steps",
+                len(steps), len(filtered),
+            )
+
+        return filtered
 
     # ------------------------------------------------------------------
     # Frame encoding

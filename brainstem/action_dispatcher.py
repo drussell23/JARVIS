@@ -24,6 +24,71 @@ _OPEN_APP_AND_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# Messaging intent patterns — detect "message X" WITHOUT an app name.
+# These fire BEFORE Tier 0 to resolve which app to use via MessagingRouter.
+# ---------------------------------------------------------------------------
+
+# "message Delia on WhatsApp saying ..." — explicit app, just rewrite goal
+_MSG_WITH_APP_PATTERN = re.compile(
+    r"^(?:message|msg|text)\s+(.+?)\s+on\s+(\S+)\s+(?:saying\s+)?(.*)$",
+    re.IGNORECASE,
+)
+
+# Patterns matched top-to-bottom; first match wins.
+_MESSAGING_PATTERNS = [
+    # With "saying" delimiter (handles multi-word contact names)
+    re.compile(r"^(?:message|msg)\s+(.+?)\s+saying\s+(.+)$", re.IGNORECASE),
+    re.compile(r"^send\s+(?:a\s+)?message\s+to\s+(.+?)\s+saying\s+(.+)$", re.IGNORECASE),
+    re.compile(r"^send\s+(.+?)\s+a\s+message\s+saying\s+(.+)$", re.IGNORECASE),
+    re.compile(r"^text\s+(.+?)\s+saying\s+(.+)$", re.IGNORECASE),
+    # Without "saying" — single-word contact, rest is message
+    re.compile(r"^(?:message|msg)\s+(\S+)\s+(.+)$", re.IGNORECASE),
+    re.compile(r"^text\s+(\S+)\s+(.+)$", re.IGNORECASE),
+    # No message body — just open conversation
+    re.compile(r"^(?:message|msg|text)\s+(\S+(?:\s+\S+)?)$", re.IGNORECASE),
+    re.compile(r"^send\s+(\S+(?:\s+\S+)?)\s+a\s+message$", re.IGNORECASE),
+    re.compile(r"^send\s+(?:a\s+)?message\s+to\s+(\S+(?:\s+\S+)?)$", re.IGNORECASE),
+]
+
+
+def _parse_messaging_intent(goal: str) -> Optional[Tuple[str, str]]:
+    """Extract (contact, message_body) from a messaging command without app name.
+
+    Returns None when the goal already specifies an app or isn't messaging.
+    """
+    g = goal.strip()
+
+    # Already handled by Tier 0 app-launch patterns
+    if _OPEN_APP_AND_PATTERN.match(g) or _OPEN_APP_PATTERN.match(g):
+        return None
+
+    # Already specifies "on <app>" — handled separately
+    if _MSG_WITH_APP_PATTERN.match(g):
+        return None
+
+    for pattern in _MESSAGING_PATTERNS:
+        m = pattern.match(g)
+        if m:
+            contact = m.group(1).strip()
+            body = m.group(2).strip() if m.lastindex and m.lastindex >= 2 else ""
+            return contact, body
+
+    return None
+
+
+def _rewrite_msg_with_app(goal: str) -> Optional[str]:
+    """Rewrite 'message X on APP saying Y' → 'open APP and message X saying Y'."""
+    m = _MSG_WITH_APP_PATTERN.match(goal.strip())
+    if not m:
+        return None
+    contact = m.group(1).strip()
+    app = m.group(2).strip()
+    body = m.group(3).strip()
+    if body:
+        return f"open {app} and message {contact} saying {body}"
+    return f"open {app} and message {contact}"
+
 
 def _parse_app_launch(goal: str) -> Optional[Tuple[str, Optional[str]]]:
     """Extract app name and optional remainder from a goal string.
@@ -217,6 +282,36 @@ class ActionDispatcher:
         source = payload.get("source", "")
         logger.info("[Dispatch] VLA executing goal: %s (screenshot=%s, source=%s)", goal[:80], "yes" if screenshot_b64 else "no", source or "sse")
 
+        # Track messaging context for learn() after success
+        _msg_contact: Optional[str] = None
+        _msg_app: Optional[str] = None
+
+        # ----- Rewrite "message X on APP saying Y" → "open APP and ..." -----
+        rewritten = _rewrite_msg_with_app(goal)
+        if rewritten is not None:
+            logger.info("[Dispatch] Rewrote messaging goal → '%s'", rewritten)
+            goal = rewritten
+
+        # ----- Messaging Router: resolve app for app-less messaging -----
+        messaging_intent = _parse_messaging_intent(goal)
+        if messaging_intent is not None:
+            contact, body = messaging_intent
+            routing = await self._resolve_messaging_app(contact, body)
+            if routing is not None:
+                _msg_contact = contact
+                _msg_app = routing.app_name
+                if body:
+                    goal = f"open {routing.app_name} and message {contact} saying {body}"
+                else:
+                    goal = f"open {routing.app_name} and message {contact}"
+                logger.info(
+                    "[Dispatch] MessagingRouter: '%s' → %s (source=%s, conf=%.2f, %.0fms)",
+                    contact, routing.app_name, routing.source,
+                    routing.confidence, routing.routing_time_ms,
+                )
+                if self.tts_speak:
+                    await self.tts_speak(f"Messaging {contact} on {routing.app_name}.")
+
         # ----- Tier 0: Deterministic fast-path for app launch (<100ms) -----
         app_launch = _parse_app_launch(goal)
         if app_launch is not None:
@@ -272,6 +367,10 @@ class ActionDispatcher:
             layer_summary = ", ".join(f"{k}: {v}" for k, v in layers.items()) if layers else "none"
             narration = f"Done. Completed {completed} of {total} steps in {elapsed:.1f} seconds. Layers used: {layer_summary}."
             logger.info("[Dispatch] VLA success: %s", narration)
+
+            # Learn messaging route on success
+            if _msg_contact and _msg_app:
+                self._learn_messaging_route(_msg_contact, _msg_app)
         else:
             error = result.get("error", "unknown error")
             completed = result.get("steps_completed", 0)
@@ -281,3 +380,25 @@ class ActionDispatcher:
 
         if self.tts_speak:
             await self.tts_speak(narration)
+
+    # ------------------------------------------------------------------
+    # Messaging Router integration
+    # ------------------------------------------------------------------
+
+    async def _resolve_messaging_app(self, contact: str, message: str) -> Optional[Any]:
+        """Route a messaging command to the correct app via MessagingRouter."""
+        try:
+            from backend.system.messaging_router import get_messaging_router
+            router = get_messaging_router()
+            return await router.route(contact, message)
+        except Exception as exc:
+            logger.warning("[Dispatch] MessagingRouter failed: %s", exc)
+            return None
+
+    def _learn_messaging_route(self, contact: str, app: str) -> None:
+        """Record a successful messaging route for future lookups."""
+        try:
+            from backend.system.messaging_router import get_messaging_router
+            get_messaging_router().learn(contact, app)
+        except Exception as exc:
+            logger.debug("[Dispatch] MessagingRouter learn failed: %s", exc)
