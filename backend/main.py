@@ -1591,6 +1591,13 @@ async def memory_pressure_callback(pressure_level: str):
 # =============================================================================
 PARALLEL_STARTUP_ENABLED = os.getenv("JARVIS_PARALLEL_STARTUP", "true").lower() == "true"
 
+# v351.0: HUD mode — the JARVIS HUD (Swift) launches the backend directly
+# instead of the lightweight brainstem. Gets the FULL stack (Ouroboros,
+# Doubleword, Claude, Vision, Ghost Hands, Voice Biometrics, Neural Mesh)
+# but skips supervisor-heavy orchestration (Trinity cross-repo, GCP VM).
+# Adds: IPC server on 8742, optional SSE consumer for Vercel cloud relay.
+HUD_MODE = os.getenv("JARVIS_MODE", "").lower() == "hud"
+
 
 @asynccontextmanager
 async def parallel_lifespan(app: FastAPI):
@@ -1614,10 +1621,14 @@ async def parallel_lifespan(app: FastAPI):
         from core.parallel_initializer import ParallelInitializer
 
     # v4.0: Ultra-minimal pre-yield setup
+    mode_label = "HUD MODE" if HUD_MODE else "PARALLEL STARTUP MODE v4.0.0 (Ultra-Fast)"
     logger.info("=" * 60)
-    logger.info("PARALLEL STARTUP MODE v4.0.0 (Ultra-Fast)")
+    logger.info(mode_label)
     logger.info("=" * 60)
-    logger.info("Server accepting requests in <2s, heavy init in background")
+    if HUD_MODE:
+        logger.info("Full stack for JARVIS HUD — Ouroboros, Vision, Ghost Hands")
+    else:
+        logger.info("Server accepting requests in <2s, heavy init in background")
     logger.info("=" * 60)
 
     # Create parallel initializer
@@ -1740,6 +1751,8 @@ async def parallel_lifespan(app: FastAPI):
         # v85.0: Enhanced Trinity initialization with intelligent repo discovery
         # and cross-repo verification. Uses IntelligentRepoDiscovery for
         # zero-hardcoding path resolution.
+        # v351.0: Skipped in HUD mode — Trinity cross-repo orchestration is
+        # supervisor-only. HUD gets everything else (Ouroboros, Vision, etc.)
         app.state.trinity_initialized = False
         app.state.prime_router = None
         app.state.trinity_discovery = None
@@ -1866,8 +1879,11 @@ async def parallel_lifespan(app: FastAPI):
                 logger.warning(f"⚠️ Trinity initialization failed: {e}")
                 app.state.trinity_initialized = False
 
-        # Launch Trinity initialization in background
-        create_safe_task(_init_trinity_background(), name="trinity_init_v85")
+        # Launch Trinity initialization in background (skip in HUD mode)
+        if not HUD_MODE:
+            create_safe_task(_init_trinity_background(), name="trinity_init_v85")
+        else:
+            logger.info("[HUD Mode] Skipping Trinity cross-repo orchestration")
 
         # =================================================================
         # AGENT RUNTIME: Autonomous housekeeping (email triage, goals)
@@ -1910,6 +1926,98 @@ async def parallel_lifespan(app: FastAPI):
                 app.state.agent_runtime = None
 
         create_safe_task(_init_agent_runtime_background(), name="agent_runtime_init")
+
+        # =================================================================
+        # v351.0: HUD MODE — IPC server + SSE consumer for Swift HUD
+        # =================================================================
+        _hud_ipc_server = None
+        _hud_shutdown = None
+        if HUD_MODE:
+            logger.info("")
+            logger.info("=" * 60)
+            logger.info("  JARVIS HUD MODE — Full stack, local operation")
+            logger.info("  IPC: localhost:8742 (Swift HUD)")
+            logger.info("  Stack: Ouroboros + Doubleword + Claude + Vision + Ghost Hands")
+            logger.info("  Skipped: Trinity cross-repo, GCP VM lifecycle")
+            logger.info("=" * 60)
+            logger.info("")
+
+            try:
+                from backend.hud.ipc_server import start_ipc_server
+
+                _hud_shutdown = asyncio.Event()
+
+                # Dispatch IPC events through the same command processor
+                async def _hud_dispatch(event_type: str, data: dict) -> None:
+                    """Route HUD IPC events to the unified command processor."""
+                    if event_type == "action":
+                        action_type = data.get("action_type", "")
+                        payload = data.get("payload", {})
+                        cmd_id = data.get("command_id", "")
+                        logger.info("[HUD] Action: %s (cmd=%s)", action_type, cmd_id)
+
+                        if action_type == "vision_task":
+                            goal = payload.get("goal", "")
+                            if goal:
+                                try:
+                                    from backend.vision.jarvis_cu import JarvisCU
+                                    cu = getattr(app.state, "jarvis_cu", None)
+                                    if cu is None:
+                                        cu = JarvisCU()
+                                        await cu.initialize()
+                                        app.state.jarvis_cu = cu
+                                    result = await cu.execute_goal(goal)
+                                    logger.info("[HUD] VLA result: %s", result)
+                                except Exception as e:
+                                    logger.error("[HUD] VLA failed: %s", e)
+                        else:
+                            # Route through unified command processor for other actions
+                            try:
+                                from api.unified_command_processor import get_unified_processor
+                                processor = get_unified_processor()
+                                await processor.process_command(
+                                    data.get("text", payload.get("goal", "")),
+                                    request_id=cmd_id,
+                                )
+                            except Exception as e:
+                                logger.error("[HUD] Command dispatch failed: %s", e)
+                    else:
+                        logger.debug("[HUD] Unhandled event: %s", event_type)
+
+                _hud_ipc_server = await start_ipc_server(
+                    dispatch=_hud_dispatch,
+                    shutdown=_hud_shutdown,
+                )
+                logger.info("[HUD] IPC server started — Swift HUD can connect")
+            except Exception as e:
+                logger.error("[HUD] IPC server failed to start: %s", e)
+
+            # Optional: SSE consumer for Vercel cloud relay
+            try:
+                from brainstem.config import BrainstemConfig
+                from brainstem.sse_consumer import SSEConsumer
+                from brainstem.auth import BrainstemAuth
+
+                bs_config = BrainstemConfig.from_env()
+                bs_auth = BrainstemAuth(bs_config.device_id, bs_config.device_secret)
+
+                async def _sse_dispatch(event_type: str, data: dict) -> None:
+                    await _hud_dispatch(event_type, data)
+
+                sse_consumer = SSEConsumer(
+                    config=bs_config,
+                    auth=bs_auth,
+                    on_event=_sse_dispatch,
+                )
+                create_safe_task(
+                    sse_consumer.run(_hud_shutdown),
+                    name="hud_sse_consumer",
+                )
+                logger.info("[HUD] SSE consumer started (Vercel cloud relay)")
+            except (ImportError, ValueError) as e:
+                logger.info("[HUD] SSE consumer not available (local-only mode): %s", e)
+            except Exception as e:
+                logger.warning("[HUD] SSE consumer failed: %s", e)
 
         yield
 
@@ -2007,6 +2115,20 @@ async def parallel_lifespan(app: FastAPI):
                 logger.info("📊 Performance Optimizer shutdown complete")
             except Exception as e:
                 logger.debug(f"Performance Optimizer shutdown error (non-critical): {e}")
+
+        # =================================================================
+        # v351.0: HUD IPC server shutdown
+        # =================================================================
+        if _hud_ipc_server is not None:
+            try:
+                logger.info("[HUD] Shutting down IPC server...")
+                if _hud_shutdown is not None:
+                    _hud_shutdown.set()
+                _hud_ipc_server.close()
+                await _hud_ipc_server.wait_closed()
+                logger.info("[HUD] IPC server shutdown complete")
+            except Exception as e:
+                logger.debug(f"[HUD] IPC shutdown error (non-critical): {e}")
 
         await initializer.shutdown()
 
