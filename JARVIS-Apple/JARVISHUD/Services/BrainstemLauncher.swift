@@ -121,11 +121,18 @@ final class BrainstemLauncher {
                 print("[Brainstem] \(line)")
             }
         }
-        stderr.fileHandleForReading.readabilityHandler = { handle in
+        stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
             for line in text.components(separatedBy: "\n") where !line.isEmpty {
                 print("[Brainstem:err] \(line)")
+                // Trigger IPC connection when brainstem's TCP server is actually listening.
+                // This prevents connecting to a stale socket from a previous process.
+                if line.contains("[IPC] TCP server listening") {
+                    Task { @MainActor in
+                        self?.connectToBrainstem(retriesLeft: 5)
+                    }
+                }
             }
         }
 
@@ -146,10 +153,11 @@ final class BrainstemLauncher {
             self.process = proc
             print("[Brainstem] Started (PID \(proc.processIdentifier)) from \(repoRoot)")
 
-            // Connect to the brainstem's TCP IPC server.
-            // The brainstem takes ~11s to boot before the IPC server binds.
-            // 20 retries × 1s intervals = 20s window, enough for boot + margin.
-            connectToBrainstem(retriesLeft: 20)
+            // IPC connection is deferred until the brainstem logs
+            // "[IPC] TCP server listening" — see stderr handler above.
+            // This prevents connecting to a stale socket from a previous
+            // brainstem process and ensures the connection reaches the
+            // correct server instance.
         } catch {
             print("[Brainstem] Failed to start: \(error)")
         }
