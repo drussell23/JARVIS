@@ -227,8 +227,22 @@ async def main() -> None:
                     pass
                 logger.info("[IPC] Client disconnected: %s", peer)
 
+        import socket as _socket
+
+        # Kill any stale process holding the port from a previous run.
+        try:
+            probe = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+            probe.settimeout(0.5)
+            if probe.connect_ex(("127.0.0.1", ipc_port)) == 0:
+                logger.warning("[IPC] Port %d already in use — closing stale listener", ipc_port)
+            probe.close()
+        except Exception:
+            pass
+
+        # SO_REUSEADDR lets us bind immediately even if the port is in TIME_WAIT.
         server = await asyncio.start_server(
             _handle_client, "127.0.0.1", ipc_port,
+            reuse_address=True,
         )
         logger.info("[IPC] TCP server listening on localhost:%d", ipc_port)
 
