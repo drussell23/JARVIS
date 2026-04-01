@@ -6044,18 +6044,48 @@ async def health_ready():
         critical_services_failed.append("ghost_proxies")
 
     # ═══════════════════════════════════════════════════════════════════════════
-    # DETERMINE OVERALL READINESS (Progressive Model v3.1 - Ghost-Aware + Graceful Degradation)
+    # DETERMINE OVERALL READINESS (Progressive Model v3.2 - Tier-Aware)
     # ═══════════════════════════════════════════════════════════════════════════
-    # Progressive readiness levels:
-    # 1. ghosts_ready → Ghost Proxies (Voice + Vision) are materialized
-    # 2. interactive_ready → ParallelInitializer says user can interact
-    # 3. websocket_ready → WebSocket routes registered
-    # 4. voice_operational → voice features work
-    # 5. ml_ready → full ML capabilities
-    #
-    # v3.1: GRACEFUL DEGRADATION - Don't block forever on failed Ghost Proxies!
-    # After STARTUP_GRACE_PERIOD seconds, allow degraded mode startup.
-    # This prevents infinite "warming_up" loops when AI models fail to load.
+    # v3.2: Consult ProgressiveReadiness tier FIRST.
+    # If the DAG has reached ACTIVE_LOCAL (tier >= 1), the user CAN interact.
+    # Ghost Proxies (GPU models) warm up in the background — they should NOT
+    # block the loading page from redirecting. The old logic required ghosts
+    # to be materialized, which caused "Backend became unavailable" when
+    # J-Prime/GPU models were slow to start.
+    # ═══════════════════════════════════════════════════════════════════════════
+    try:
+        from backend.core.progressive_readiness import get_readiness
+        pr = get_readiness()
+        if pr.is_local_ready:
+            # ACTIVE_LOCAL reached — system is usable for user interaction.
+            # Return ready=True with appropriate status based on tier.
+            tier_status = "ready" if pr.is_fully_operational else "degraded"
+            return {
+                "status": tier_status,
+                "ready": True,
+                "operational": True,
+                "ghosts_ready": ghosts_ready,
+                "source": "ProgressiveReadiness",
+                "tier": pr.snapshot().get("tier", "ACTIVE_LOCAL"),
+                "details": {
+                    **details,
+                    "progressive_readiness": True,
+                    "tier_value": pr.snapshot().get("tier_value", 1),
+                    "ghosts_warming": not ghosts_ready,
+                },
+                "services": {
+                    "ready": critical_services_ready,
+                    "failed": critical_services_failed,
+                },
+            }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # LEGACY FALLBACK: Ghost-Aware + Graceful Degradation (v3.1)
+    # Only reached if ProgressiveReadiness is unavailable or not ACTIVE_LOCAL.
     # ═══════════════════════════════════════════════════════════════════════════
 
     # v3.1: Calculate startup elapsed time for graceful degradation

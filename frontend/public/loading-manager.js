@@ -5801,10 +5801,14 @@ class JARVISLoadingManager {
                 );
 
                 // v87.0 ULTRA: Atomic state update
+                // v351.0: Use correct field names from unified health endpoint
+                // Backend returns { status, components, circuit_breakers }
+                const healthState = health.state || health.status || 'unknown';
+                const healthPercent = health.overall_health ?? (healthState === 'healthy' ? 100 : healthState === 'degraded' ? 75 : 0);
                 await this.atomicStateUpdate(() => {
                     this.state.unifiedHealth = {
-                        overallHealth: health.overall_health || 0,
-                        state: health.state || 'unknown',
+                        overallHealth: healthPercent,
+                        state: healthState,
                         components: health.components || {},
                         circuitBreakers: health.circuit_breakers || {},
                         lastPoll: now,
@@ -5812,7 +5816,7 @@ class JARVISLoadingManager {
                     };
                 });
 
-                console.log(`[v87.0] 🏥 Health: ${health.state} (${health.overall_health}%)${health._cached ? ' [CACHED]' : ''}`);
+                console.log(`[v87.0] Health: ${healthState} (${healthPercent}%)${health._cached ? ' [CACHED]' : ''}`);
             });
         } catch (error) {
             console.debug('[v87.0] Health polling error:', error.message);

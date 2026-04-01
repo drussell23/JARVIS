@@ -1122,6 +1122,7 @@ class LoadingServer:
         self._message = "Starting JARVIS..."
         self._components: Dict[str, Dict[str, Any]] = {}
         self._startup_timeout_ms: Optional[int] = None  # v270.2: Backend-negotiated startup timeout
+        self._completion_metadata: Optional[Dict[str, Any]] = None  # v351.0: Authoritative completion metadata
         self._shutdown_requested = False
         self._stopping = False
         self._server: Optional[asyncio.Server] = None
@@ -1400,6 +1401,10 @@ class LoadingServer:
         # v270.2: Include backend-negotiated startup timeout for frontend negotiation
         if self._startup_timeout_ms is not None:
             ws_data["startup_timeout_ms"] = self._startup_timeout_ms
+        # v351.0: Include authoritative completion metadata so frontend
+        # takes the fast-path (skip /health/ready re-verification).
+        if self._completion_metadata is not None:
+            ws_data["metadata"] = self._completion_metadata
         message = json.dumps({
             "type": "progress",
             "data": ws_data,
@@ -3266,6 +3271,15 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
                         self._phase = "complete"
                         self._message = "JARVIS is online!"
                         self._progress = 100
+                        # v351.0: Authoritative completion metadata
+                        self._completion_metadata = {
+                            "supervisor_verified": True,
+                            "final": True,
+                            "authority": "unified_supervisor",
+                            "frontend_optional": False,
+                            "tier": tier_name,
+                            "tier_value": tier_value,
+                        }
                         self._sequence_number += 1
                         await self._broadcast_progress()
                         logger.info("[v350.5] FULLY_OPERATIONAL — broadcasting stage=complete")
@@ -3293,6 +3307,19 @@ console.log('[v186.0] Port config injected by loading_server.py:', {{
                     self._phase = "complete"
                     self._message = "JARVIS is online!"
                     self._progress = 100
+                    # v351.0: Mark as supervisor-authoritative so the loading
+                    # page takes the fast-path (skip re-verification via
+                    # /health/ready which has a stricter Ghost Proxy gate).
+                    # ACTIVE_LOCAL means the user CAN interact — cloud/GPU
+                    # models warm up in the background.
+                    self._completion_metadata = {
+                        "supervisor_verified": True,
+                        "final": True,
+                        "authority": "unified_supervisor",
+                        "frontend_optional": False,
+                        "tier": tier_name,
+                        "tier_value": tier_value,
+                    }
                     self._sequence_number += 1
                     await self._broadcast_progress()
                     _completion_sent = True
