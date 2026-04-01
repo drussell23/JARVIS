@@ -147,8 +147,9 @@ final class BrainstemLauncher {
             print("[Brainstem] Started (PID \(proc.processIdentifier)) from \(repoRoot)")
 
             // Connect to the brainstem's TCP IPC server.
-            // The brainstem takes a few seconds to boot, so we retry.
-            connectToBrainstem(retriesLeft: 10)
+            // The brainstem takes ~11s to boot before the IPC server binds.
+            // 20 retries × 1s intervals = 20s window, enough for boot + margin.
+            connectToBrainstem(retriesLeft: 20)
         } catch {
             print("[Brainstem] Failed to start: \(error)")
         }
@@ -219,7 +220,8 @@ final class BrainstemLauncher {
     // MARK: - TCP IPC Connection
 
     /// Connect to the brainstem's TCP IPC server with retry.
-    /// The brainstem takes a few seconds to boot, so we retry every 500ms.
+    /// The brainstem takes ~11s to boot before the IPC server binds,
+    /// so we retry every 1s with enough headroom for slow starts.
     private func connectToBrainstem(retriesLeft: Int) {
         guard retriesLeft > 0, process?.isRunning == true else {
             if retriesLeft <= 0 {
@@ -243,16 +245,17 @@ final class BrainstemLauncher {
             case .failed(let error):
                 print("[Brainstem] IPC connection failed: \(error) — retries left: \(retriesLeft - 1)")
                 conn.cancel()
-                // Retry after 500ms
-                self.ipcQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self.ipcQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     Task { @MainActor in
                         self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
                     }
                 }
             case .waiting(let error):
+                // .waiting means the OS is still attempting — connection refused
+                // during brainstem boot. Cancel and retry after a delay.
                 print("[Brainstem] IPC connection waiting: \(error) — retries left: \(retriesLeft - 1)")
                 conn.cancel()
-                self.ipcQueue.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                self.ipcQueue.asyncAfter(deadline: .now() + 1.0) { [weak self] in
                     Task { @MainActor in
                         self?.connectToBrainstem(retriesLeft: retriesLeft - 1)
                     }
