@@ -128,6 +128,10 @@ def _execute_action_impl(
 
     elif action == "type":
         if value:
+            # Click the target field first if coords provided (to focus it)
+            if coords:
+                pyautogui.click(x=coords[0], y=coords[1])
+                time.sleep(0.3)  # Wait for field to gain focus
             # Use clipboard for reliability with special chars / unicode
             _clipboard_type(value)
         else:
@@ -167,9 +171,15 @@ def _execute_action_impl(
 
 
 def _clipboard_type(text: str) -> None:
-    """Type text via clipboard (pbcopy + cmd+v) for reliability."""
+    """Type text via clipboard (pbcopy + cmd+v) for reliability.
+
+    Uses clipboard paste because pyautogui.typewrite doesn't support
+    unicode characters or special chars reliably on macOS.
+    """
+    logger.info("[CUExec] Typing via clipboard: %r (%d chars)", text[:50], len(text))
     try:
         import pyautogui
+        # Copy text to clipboard
         proc = subprocess.run(
             ["pbcopy"],
             input=text.encode("utf-8"),
@@ -177,13 +187,16 @@ def _clipboard_type(text: str) -> None:
             timeout=5,
         )
         if proc.returncode != 0:
-            # Fallback: direct typing
+            logger.warning("[CUExec] pbcopy failed (exit %d), using typewrite", proc.returncode)
             pyautogui.typewrite(text, interval=0.02)
             return
-        time.sleep(0.05)
+        # Wait for the input field to be focused before pasting
+        time.sleep(0.3)
+        # Paste from clipboard
         pyautogui.hotkey("command", "v")
-    except Exception:
-        # Final fallback
+        logger.info("[CUExec] Pasted '%s' via cmd+v", text[:50])
+    except Exception as e:
+        logger.warning("[CUExec] Clipboard type failed: %s, trying typewrite", e)
         try:
             import pyautogui
             pyautogui.typewrite(text, interval=0.02)
@@ -318,6 +331,11 @@ class CUStepExecutor:
         value = getattr(step, "value", None) or ""
         description = getattr(step, "description", "") or ""
         app_name = getattr(step, "app_name", "") or ""
+
+        # Log step details for debugging VLA execution
+        text_field = getattr(step, "text", None)
+        logger.info("[CUExec] Step: action=%s, target=%r, value=%r, text=%r, desc=%r",
+                     action, target[:50], value[:50] if value else "", text_field, description[:50])
 
         # ------ Wait action ------
         if action == "wait":
