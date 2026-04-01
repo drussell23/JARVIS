@@ -1985,8 +1985,20 @@ async def parallel_lifespan(app: FastAPI):
                                     from backend.vision.jarvis_cu import JarvisCU
                                     cu = getattr(app.state, "jarvis_cu", None)
                                     if cu is None:
-                                        cu = JarvisCU()
+                                        # Start FramePipeline for live screen capture.
+                                        # JarvisCU needs real screenshots (not black frames)
+                                        # to plan and execute screen actions.
+                                        fp = None
+                                        try:
+                                            from backend.vision.realtime.frame_pipeline import FramePipeline
+                                            fp = FramePipeline()
+                                            await fp.start()
+                                            logger.info("[HUD] FramePipeline started for VLA")
+                                        except Exception as fp_err:
+                                            logger.warning("[HUD] FramePipeline unavailable: %s — VLA will use screenshots", fp_err)
+                                        cu = JarvisCU(frame_pipeline=fp)
                                         app.state.jarvis_cu = cu
+                                        app.state.frame_pipeline = fp
                                     logger.info("[HUD] VLA executing: %s", goal[:80])
                                     result = await cu.run(goal)
                                     logger.info("[HUD] VLA result: %s", result)
