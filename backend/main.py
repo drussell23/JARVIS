@@ -1980,6 +1980,11 @@ async def parallel_lifespan(app: FastAPI):
 
                         if action_type == "vision_task":
                             goal = payload.get("goal", "")
+                            app_context = payload.get("app_context")
+                            # If the HUD already launched an app via Tier 0,
+                            # prepend context so the planner knows it's open.
+                            if app_context and goal:
+                                goal = f"[{app_context} is already open and in the foreground] {goal}"
                             if goal:
                                 try:
                                     from backend.vision.jarvis_cu import JarvisCU

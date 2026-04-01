@@ -266,10 +266,12 @@ class AccessibilityResolver:
                 AXUIElementCreateApplication,
                 AXUIElementCopyAttributeValue,
             )
-            from Quartz import (
-                kAXWindowsAttribute,
-                kAXChildrenAttribute,
-            )
+            # AX attribute constants are plain strings — Quartz may not export them
+            try:
+                from Quartz import kAXWindowsAttribute, kAXChildrenAttribute
+            except ImportError:
+                kAXWindowsAttribute = "AXWindows"
+                kAXChildrenAttribute = "AXChildren"
         except ImportError as exc:
             logger.error("[AXResolver] Missing AX framework: %s", exc)
             return None
@@ -581,16 +583,27 @@ class AccessibilityResolver:
                 AXUIElementCreateApplication,
                 AXUIElementCopyAttributeValue,
             )
-            from Quartz import (
-                kAXWindowsAttribute,
-                kAXChildrenAttribute,
-                kAXTitleAttribute,
-                kAXRoleAttribute,
-                kAXDescriptionAttribute,
-                kAXPositionAttribute,
-                kAXSizeAttribute,
-                kAXValueAttribute,
-            )
+            # AX attribute constants are plain strings — Quartz may not export them
+            try:
+                from Quartz import (
+                    kAXWindowsAttribute,
+                    kAXChildrenAttribute,
+                    kAXTitleAttribute,
+                    kAXRoleAttribute,
+                    kAXDescriptionAttribute,
+                    kAXPositionAttribute,
+                    kAXSizeAttribute,
+                    kAXValueAttribute,
+                )
+            except ImportError:
+                kAXWindowsAttribute = "AXWindows"
+                kAXChildrenAttribute = "AXChildren"
+                kAXTitleAttribute = "AXTitle"
+                kAXRoleAttribute = "AXRole"
+                kAXDescriptionAttribute = "AXDescription"
+                kAXPositionAttribute = "AXPosition"
+                kAXSizeAttribute = "AXSize"
+                kAXValueAttribute = "AXValue"
         except ImportError:
             return []
 

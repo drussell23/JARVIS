@@ -100,14 +100,19 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                     let remainder = appName != nil ? Self.extractRemainder(command) : command
                     let goal = remainder ?? command
                     print("[JARVIS] VLA: forwarding to brainstem: \(goal)")
+                    var actionPayload: [String: Any] = [
+                        "goal": goal,
+                        "source": "local_fast_path",
+                    ]
+                    // Tell the VLA planner which app is already open and in foreground
+                    if let app = appName {
+                        actionPayload["app_context"] = app
+                    }
                     BrainstemLauncher.shared.sendEvent(
                         eventType: "action",
                         data: [
                             "action_type": "vision_task",
-                            "payload": [
-                                "goal": goal,
-                                "source": "local_fast_path",
-                            ] as [String: Any],
+                            "payload": actionPayload,
                         ]
                     )
                 } else if appName == nil {
