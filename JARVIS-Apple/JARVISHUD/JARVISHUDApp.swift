@@ -49,6 +49,24 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             }
             BrainstemLauncher.shared.start()
             self.appState.boot()
+
+            // Smoke test: verify screenshot capture works from Swift
+            Task {
+                try? await Task.sleep(for: .seconds(3))
+                print("[SMOKE TEST] Testing screenshot capture...")
+                if let b64 = await ScreenCaptureService.shared.captureBase64() {
+                    print("[SMOKE TEST] SUCCESS — captured \(b64.count / 1024)KB screenshot")
+                    // Save to disk so we can visually verify
+                    if let data = Data(base64Encoded: b64) {
+                        let path = "/tmp/jarvis_smoke_test.jpg"
+                        try? data.write(to: URL(fileURLWithPath: path))
+                        print("[SMOKE TEST] Saved to \(path) — open in Finder to verify")
+                    }
+                } else {
+                    print("[SMOKE TEST] FAILED — no screenshot captured")
+                    print("[SMOKE TEST] Check: System Settings > Privacy > Screen Recording > JARVISHUD")
+                }
+            }
         }
     }
 
@@ -107,24 +125,35 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                     Task {
                         if let targetApp = appName {
                             // Activate the app and bring it to THIS Space
-                            for _ in 0..<10 {
+                            for attempt in 1...10 {
                                 if let running = NSWorkspace.shared.runningApplications.first(
                                     where: { $0.localizedName == targetApp }
                                 ) {
                                     running.activate(options: [.activateIgnoringOtherApps])
-                                    // Check if it's now frontmost
                                     try? await Task.sleep(for: .milliseconds(500))
                                     if running.isActive {
-                                        print("[JARVIS] VLA: \(targetApp) is frontmost")
+                                        print("[JARVIS] VLA: \(targetApp) is frontmost (attempt \(attempt))")
                                         break
                                     }
                                 } else {
                                     try? await Task.sleep(for: .milliseconds(500))
                                 }
                             }
-                            // Extra settle time for the app to render its UI
-                            try? await Task.sleep(for: .seconds(1))
+                            // Settle time for the app to fully render its UI
+                            try? await Task.sleep(for: .seconds(2))
                         }
+
+                        // FRESH screenshot (bypasses 1fps stream cache).
+                        // The cached frame may show the PREVIOUS app (e.g., Xcode).
+                        // captureFresh() does a one-shot SCScreenshotManager capture
+                        // which grabs the display RIGHT NOW — showing the target app.
+                        if let b64 = await ScreenCaptureService.shared.captureFresh() {
+                            actionPayload["screenshot"] = b64
+                            print("[JARVIS] VLA: FRESH screenshot captured (\(b64.count / 1024)KB)")
+                        } else {
+                            print("[JARVIS] VLA: WARNING — no screenshot captured")
+                        }
+
                         BrainstemLauncher.shared.sendEvent(
                             eventType: "action",
                             data: [

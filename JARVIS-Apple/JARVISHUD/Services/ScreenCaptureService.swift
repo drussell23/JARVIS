@@ -120,6 +120,14 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, @unchecked Sendable 
         return await oneShotCapture()
     }
 
+    /// Force a FRESH screenshot (bypasses the 1fps stream cache).
+    /// Use this when you need the current display state RIGHT NOW,
+    /// e.g., after switching to a target app for VLA planning.
+    func captureFresh() async -> String? {
+        print("[JARVIS Vision] Fresh capture requested (bypassing cache)")
+        return await oneShotCapture()
+    }
+
     // MARK: - One-shot fallback
 
     private func oneShotCapture() async -> String? {

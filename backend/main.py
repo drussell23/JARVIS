@@ -2001,35 +2001,21 @@ async def parallel_lifespan(app: FastAPI):
                                         cu = JarvisCU()
                                         app.state.jarvis_cu = cu
 
-                                    # Capture the ENTIRE main display using CoreGraphics.
-                                    # This reads the GPU framebuffer directly — no SCK, no
-                                    # RunLoop, no focus issues. Works in headless Python.
+                                    # Screenshot comes from the Swift HUD via IPC payload.
+                                    # Python child processes do NOT inherit Screen Recording
+                                    # permission — CGDisplayCreateImage and screencapture both
+                                    # return None/fail. Only the JARVISHUD process (Swift) can
+                                    # capture the screen via SCK/CoreGraphics.
                                     initial_frame = None
-                                    try:
-                                        import Quartz
-                                        cg_image = Quartz.CGDisplayCreateImage(Quartz.CGMainDisplayID())
-                                        if cg_image:
-                                            w = Quartz.CGImageGetWidth(cg_image)
-                                            h = Quartz.CGImageGetHeight(cg_image)
-                                            bpr = Quartz.CGImageGetBytesPerRow(cg_image)
-                                            data_provider = Quartz.CGImageGetDataProvider(cg_image)
-                                            raw = Quartz.CGDataProviderCopyData(data_provider)
-                                            # Retina: bpr may include padding. Use bpr for row stride.
-                                            arr = np.frombuffer(raw, dtype=np.uint8).reshape((h, bpr))
-                                            # Extract BGRA channels (4 bytes per pixel, ignore padding)
-                                            bgra = arr[:, :w * 4].reshape((h, w, 4))
-                                            # BGRA → RGB via PIL
-                                            img = Image.fromarray(bgra[:, :, [2, 1, 0]])
-                                            # Resize for API efficiency
-                                            if w > 1280:
-                                                scale = 1280 / w
-                                                img = img.resize((1280, int(h * scale)), Image.Resampling.LANCZOS)
-                                            initial_frame = np.array(img)
-                                            logger.info("[HUD] Display capture: %dx%d (native %dx%d)", initial_frame.shape[1], initial_frame.shape[0], w, h)
-                                        else:
-                                            logger.warning("[HUD] CGDisplayCreateImage returned None")
-                                    except Exception as cg_err:
-                                        logger.warning("[HUD] Display capture failed: %s", cg_err)
+                                    screenshot_b64 = payload.get("screenshot")
+                                    if screenshot_b64:
+                                        try:
+                                            img_bytes = base64.b64decode(screenshot_b64)
+                                            img = Image.open(io.BytesIO(img_bytes))
+                                            initial_frame = np.array(img.convert("RGB"))
+                                            logger.info("[HUD] Screenshot from HUD: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
+                                        except Exception as dec_err:
+                                            logger.warning("[HUD] Screenshot decode failed: %s", dec_err)
 
                                     if initial_frame is None:
                                         logger.warning("[HUD] No screenshot — planner will see black frames")
