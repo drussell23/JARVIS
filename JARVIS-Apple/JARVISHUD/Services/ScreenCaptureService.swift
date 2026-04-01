@@ -99,6 +99,21 @@ final class ScreenCaptureService: NSObject, SCStreamOutput, @unchecked Sendable 
         guard let cgImage = ctx.createCGImage(ciImage, from: rect) else { return }
 
         frameStore.withLock { $0 = cgImage }
+
+        // Write live frame to disk for Python backend to read between VLA steps.
+        // The backend's JarvisCU reads /tmp/jarvis_live_frame.jpg after each
+        // step execution to get an updated view of the screen.
+        if let data = encodeJPEGData(cgImage) {
+            try? data.write(to: URL(fileURLWithPath: "/tmp/jarvis_live_frame.jpg"), options: .atomic)
+        }
+    }
+
+    private nonisolated func encodeJPEGData(_ cgImage: CGImage) -> Data? {
+        let buf = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(buf, "public.jpeg" as CFString, 1, nil) else { return nil }
+        CGImageDestinationAddImage(dest, cgImage, [kCGImageDestinationLossyCompressionQuality: 0.7] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return buf as Data
     }
 
     // MARK: - Public API

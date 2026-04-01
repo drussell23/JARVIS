@@ -106,10 +106,17 @@ class JarvisCU:
 
     # -- Construction -------------------------------------------------------
 
-    def __init__(self, frame_pipeline: Optional[Any] = None) -> None:
+    def __init__(
+        self,
+        frame_pipeline: Optional[Any] = None,
+        capture_callback: Optional[Any] = None,
+    ) -> None:
         self._planner = CUTaskPlanner()
         self._executor = CUStepExecutor()
         self._hud_frame: Optional[np.ndarray] = None  # HUD screenshot fallback
+        # Async callback that returns a fresh np.ndarray screenshot on demand.
+        # Set by the HUD dispatch to request live frames from Swift between steps.
+        self._capture_callback = capture_callback
 
         # 60fps FramePipeline — motion-aware verification between steps.
         # When available, replaces both SHM static reads AND fixed delays.
@@ -158,7 +165,7 @@ class JarvisCU:
         Priority:
         1. FramePipeline.latest_frame (60fps, motion-filtered)
         2. SHM static read (60fps, no motion awareness)
-        3. Stored HUD screenshot (from initial_frame, static but real)
+        3. Stored HUD screenshot (from initial_frame or capture_callback)
         4. Black frame fallback
         """
         # 60fps FramePipeline — best path
@@ -176,12 +183,49 @@ class JarvisCU:
             except Exception as exc:
                 logger.debug("[JarvisCU] SHM read failed: %s", exc)
 
-        # HUD screenshot fallback — static but shows actual screen content.
-        # Better than a black frame for the executor's visual grounding.
+        # HUD screenshot — updated between steps via capture_callback
         if self._hud_frame is not None:
             return self._hud_frame
 
         return _make_black_frame()
+
+    async def _refresh_hud_frame(self) -> None:
+        """Read a fresh screenshot from the shared file written by Swift HUD.
+
+        The Swift HUD's ScreenCaptureService streams at 1fps and writes
+        the latest frame to /tmp/jarvis_live_frame.jpg. This method reads
+        that file to get an updated view of the screen after each step.
+        """
+        import os
+        frame_path = "/tmp/jarvis_live_frame.jpg"
+        try:
+            if os.path.exists(frame_path):
+                # Check if the file was updated recently (within 5s)
+                mtime = os.path.getmtime(frame_path)
+                import time as _time
+                age = _time.time() - mtime
+                if age < 5.0:
+                    from PIL import Image
+                    img = Image.open(frame_path)
+                    self._hud_frame = np.array(img.convert("RGB"))
+                    logger.info("[JarvisCU] Fresh frame from disk: %dx%d (%.1fs old)",
+                                self._hud_frame.shape[1], self._hud_frame.shape[0], age)
+                else:
+                    logger.debug("[JarvisCU] Live frame too old (%.1fs), keeping current", age)
+            else:
+                logger.debug("[JarvisCU] No live frame file at %s", frame_path)
+        except Exception as exc:
+            logger.warning("[JarvisCU] Live frame read failed: %s", exc)
+
+        # Also try the capture callback if set
+        if self._capture_callback is not None:
+            try:
+                fresh = await self._capture_callback()
+                if fresh is not None:
+                    self._hud_frame = fresh
+                    logger.info("[JarvisCU] Fresh frame from callback: %dx%d", fresh.shape[1], fresh.shape[0])
+            except Exception as exc:
+                logger.warning("[JarvisCU] Capture callback failed: %s", exc)
 
     async def _wait_for_settle(self) -> np.ndarray:
         """Wait for the screen to stop changing after an action.
@@ -341,6 +385,12 @@ class JarvisCU:
                         getattr(step, "step_id", "?"),
                         layer, attempt + 1,
                     )
+                    # After each successful step, get a FRESH screenshot from the
+                    # Swift HUD. The screen has changed (e.g., clicked a conversation
+                    # → now shows the chat view). Without this, the next step uses
+                    # a stale frame and can't find the new UI elements.
+                    await asyncio.sleep(1.0)  # Let the UI settle after the action
+                    await self._refresh_hud_frame()
                     break
                 else:
                     logger.warning(
