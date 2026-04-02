@@ -171,3 +171,65 @@ def test_function_index_long_signature_truncated():
     for line in result.split("\n"):
         if "long_func" in line:
             assert len(line) <= 120, f"Signature line too long: {len(line)} chars"
+
+
+# ---------------------------------------------------------------------------
+# Task 4: Recent file history
+# ---------------------------------------------------------------------------
+
+def test_recent_file_history_with_git(tmp_path):
+    """Returns last commits touching the file when .git exists."""
+    import subprocess
+    from backend.core.ouroboros.governance.providers import _build_recent_file_history
+    # Set up a real git repo
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+    f = tmp_path / "example.py"
+    f.write_text("x = 1\n")
+    subprocess.run(["git", "add", "example.py"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "initial commit"], cwd=tmp_path, capture_output=True)
+    f.write_text("x = 2\n")
+    subprocess.run(["git", "add", "example.py"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "update value"], cwd=tmp_path, capture_output=True)
+
+    result = _build_recent_file_history(f, tmp_path)
+    assert "Recent Changes" in result
+    assert "update value" in result
+    assert "initial commit" in result
+
+
+def test_recent_file_history_no_git(tmp_path):
+    """Returns empty string when .git directory missing."""
+    from backend.core.ouroboros.governance.providers import _build_recent_file_history
+    f = tmp_path / "example.py"
+    f.write_text("x = 1\n")
+    result = _build_recent_file_history(f, tmp_path)
+    assert result == ""
+
+
+def test_recent_file_history_path_outside_repo(tmp_path):
+    """Returns empty string when path is not under repo_root."""
+    from backend.core.ouroboros.governance.providers import _build_recent_file_history
+    (tmp_path / ".git").mkdir()  # fake .git dir
+    outside = Path("/tmp/not_in_repo.py")
+    result = _build_recent_file_history(outside, tmp_path)
+    assert result == ""
+
+
+def test_recent_file_history_capped_length(tmp_path):
+    """Output must not exceed 500 chars."""
+    import subprocess
+    from backend.core.ouroboros.governance.providers import _build_recent_file_history
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+    f = tmp_path / "example.py"
+    for i in range(10):
+        f.write_text(f"x = {i}\n")
+        subprocess.run(["git", "add", "example.py"], cwd=tmp_path, capture_output=True)
+        subprocess.run(["git", "commit", "-m", f"commit {i} with a {'long ' * 20}message"], cwd=tmp_path, capture_output=True)
+
+    result = _build_recent_file_history(f, tmp_path)
+    # Header + content should be bounded
+    assert len(result) <= 600  # small buffer for header

@@ -235,6 +235,39 @@ def _build_function_index(content: str, file_path: str) -> str:
     return header + "\n".join(entries)
 
 
+def _build_recent_file_history(path: Path, repo_root: Path) -> str:
+    """Build a summary of recent commits touching a file.
+
+    Returns empty string if .git is missing, path is outside repo_root,
+    or git fails for any reason. Never raises.
+    """
+    if not (repo_root / ".git").exists():
+        return ""
+    try:
+        rel_path = path.relative_to(repo_root)
+    except ValueError:
+        return ""
+
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            ["git", "log", "--oneline", "-5", "--", str(rel_path)],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return ""
+    except (OSError, _sp.TimeoutExpired):
+        return ""
+
+    lines = result.stdout.strip().split("\n")[:5]
+    body = "\n".join(f"- {line}" for line in lines)
+    output = f"## Recent Changes (last {len(lines)} commits touching this file)\n\n{body}"
+    return output[:500]
+
+
 def _file_source_hash(content: str) -> str:
     """Return hex SHA-256 of file content."""
     return hashlib.sha256(content.encode()).hexdigest()
