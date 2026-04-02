@@ -9,7 +9,6 @@ Covers:
 - HiveThread creation, add_message, token tracking, consensus detection, roundtrip
 """
 
-import time
 from datetime import datetime, timezone
 
 import pytest
