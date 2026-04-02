@@ -8,7 +8,7 @@
 
 The 397B brain (Doubleword Qwen3.5) generates valid Python that matches code style. But the pipeline around it is disconnected in HUD mode:
 
-1. CUExecutionSensor counts failures but cannot hand off to the orchestrator (router not wired)
+1. CUExecutionSensor counts failures but cannot hand off to the orchestrator (router not wired) — affects all modes that start IntakeLayerService, not only HUD
 2. Context injection truncates large files, causing blind duplication
 3. VALIDATE checks syntax but not semantic duplication
 4. DaemonNarrator not wired into the live HUD process
@@ -17,7 +17,7 @@ The 397B brain (Doubleword Qwen3.5) generates valid Python that matches code sty
 
 | ID | Name | Type | Depends On |
 |----|------|------|------------|
-| A | The Severed Nerve | Deterministic infrastructure | None |
+| A | The Severed Nerve | Deterministic infrastructure (all modes) | None |
 | B | The Eyes | Agentic quality | A |
 | C | The Immune System | Deterministic guards | A (B improves C) |
 | D | The Voice | Observability / UX | A |
