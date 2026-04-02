@@ -2352,6 +2352,31 @@ class GovernedOrchestrator:
                 adapter_names_run=(),
             )
 
+        # Step 1b: Duplication guard — check for structural duplication (Python only)
+        if target_file_str.endswith(".py"):
+            try:
+                from backend.core.ouroboros.governance.duplication_checker import check_duplication
+                _source_content = ""
+                _src_path = Path(target_file_str)
+                if not _src_path.is_absolute():
+                    _src_path = self._config.project_root / _src_path
+                if _src_path.exists():
+                    _source_content = _src_path.read_text(encoding="utf-8", errors="replace")
+                if _source_content:
+                    _dup_error = check_duplication(content, _source_content, target_file_str)
+                    if _dup_error is not None:
+                        return ValidationResult(
+                            passed=False,
+                            best_candidate=None,
+                            validation_duration_s=0.0,
+                            error=_dup_error,
+                            failure_class="duplication",
+                            short_summary=_dup_error[:300],
+                            adapter_names_run=(),
+                        )
+            except Exception as exc:
+                logger.debug("[Orchestrator] Duplication check skipped: %s", exc)
+
         # Non-code files (docs, configs, etc.) need no test/syntax runner
         _RUNNABLE_EXTENSIONS = {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}
         if Path(target_file_str).suffix not in _RUNNABLE_EXTENSIONS:
