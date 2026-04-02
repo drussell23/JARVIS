@@ -1164,6 +1164,18 @@ class GovernedOrchestrator:
                     "model": getattr(generation, "model_id", ""),
                 })
 
+                # Emit gate event for duplication blocks
+                if validation.failure_class == "duplication":
+                    try:
+                        await self._stack.comm.emit_decision(
+                            op_id=ctx.op_id,
+                            outcome="blocked",
+                            reason_code="duplication",
+                            target_files=list(ctx.target_files),
+                        )
+                    except Exception:
+                        pass
+
                 if validation.passed and best_candidate is None:
                     best_candidate = candidate
                     best_validation = validation
@@ -1601,6 +1613,16 @@ class GovernedOrchestrator:
                         )
                         if risk_tier is not RiskTier.APPROVAL_REQUIRED:
                             risk_tier = RiskTier.APPROVAL_REQUIRED
+                        # Emit gate event for VoiceNarrator
+                        try:
+                            await self._stack.comm.emit_decision(
+                                op_id=ctx.op_id,
+                                outcome="escalated",
+                                reason_code="similarity_escalation",
+                                target_files=list(ctx.target_files),
+                            )
+                        except Exception:
+                            pass
             except Exception:
                 logger.debug("[Orchestrator] Similarity gate skipped", exc_info=True)
 
@@ -1858,6 +1880,16 @@ class GovernedOrchestrator:
                 "[Orchestrator] VERIFY regression gate fired: %s [%s]",
                 _verify_error, ctx.op_id,
             )
+            # Emit gate event for VoiceNarrator
+            try:
+                await self._stack.comm.emit_postmortem(
+                    op_id=ctx.op_id,
+                    root_cause=f"verify_regression: {_verify_error}",
+                    failed_phase="VERIFY",
+                    target_files=list(ctx.target_files),
+                )
+            except Exception:
+                pass
             # Rollback files
             try:
                 _snapshots = getattr(ctx, "pre_apply_snapshots", {})
