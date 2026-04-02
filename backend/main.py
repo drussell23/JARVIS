@@ -6602,7 +6602,11 @@ async def health_readiness_tier():
             "query_ready": pr.is_local_ready,
             "action_ready": pr.is_full_ready,
             "jprime_ready": pr.is_full_ready,
-            "governance_ready": pr.is_fully_operational,
+            "governance_ready": (
+                getattr(getattr(app.state, "hud_gov_ctx", None), "is_active", False)
+                if HUD_MODE
+                else pr.is_fully_operational
+            ),
         }
         return {
             "tier": tier,
