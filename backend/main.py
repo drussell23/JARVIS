@@ -1969,18 +1969,28 @@ async def parallel_lifespan(app: FastAPI):
 
                 _hud_shutdown = asyncio.Event()
 
-                # TTS helper — uses macOS `say` for voice feedback to the user.
-                # safe_say pattern: write to temp AIFF then afplay (no GIL/CoreAudio contention).
+                # TTS helper — uses macOS `say -v Daniel` for voice feedback.
+                # CRITICAL: Creates /tmp/jarvis_speaking flag file BEFORE speaking
+                # and removes it AFTER. The Swift HUD's WakeWordListener checks
+                # this flag to suppress the mic during Python-side TTS, preventing
+                # the voice feedback loop (mic picking up JARVIS's own speech).
+                _SPEAKING_FLAG = "/tmp/jarvis_speaking"
+                _TTS_VOICE = os.environ.get("JARVIS_TTS_VOICE", "Daniel")
+
                 async def _hud_tts(text: str) -> None:
-                    """Speak text to the user via macOS TTS (non-blocking)."""
+                    """Speak text to the user via macOS TTS with mic suppression."""
                     if not text:
                         return
                     try:
                         import tempfile as _tf
+                        # Signal Swift HUD to mute mic
+                        with open(_SPEAKING_FLAG, "w") as f:
+                            f.write("1")
+
                         with _tf.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
                             tmp_path = tmp.name
                         proc = await asyncio.create_subprocess_exec(
-                            "say", "-o", tmp_path, text,
+                            "say", "-v", _TTS_VOICE, "-o", tmp_path, text,
                             stdout=asyncio.subprocess.DEVNULL,
                             stderr=asyncio.subprocess.DEVNULL,
                         )
@@ -1997,6 +2007,12 @@ async def parallel_lifespan(app: FastAPI):
                             pass
                     except Exception as tts_err:
                         logger.debug("[HUD] TTS failed: %s", tts_err)
+                    finally:
+                        # Remove flag — allow mic to resume
+                        try:
+                            os.unlink(_SPEAKING_FLAG)
+                        except OSError:
+                            pass
 
                 # Dispatch IPC events through the same command processor
                 async def _hud_dispatch(event_type: str, data: dict) -> None:

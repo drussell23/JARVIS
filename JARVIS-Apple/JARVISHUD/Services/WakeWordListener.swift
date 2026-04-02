@@ -100,6 +100,13 @@ final class WakeWordListener: ObservableObject, @unchecked Sendable {
         recognitionTask = recognizer.recognitionTask(with: req) { [weak self] result, error in
             guard let self, self.listenerGeneration == generation else { return }
 
+            // Mic suppression: if the Python backend is speaking via TTS,
+            // ignore all audio to prevent voice feedback loops (JARVIS hearing
+            // its own speech and treating it as a new command).
+            if FileManager.default.fileExists(atPath: "/tmp/jarvis_speaking") {
+                return
+            }
+
             if let result {
                 let fullText = result.bestTranscription.formattedString
                 let lower = fullText.lowercased()
