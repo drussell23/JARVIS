@@ -1969,6 +1969,35 @@ async def parallel_lifespan(app: FastAPI):
 
                 _hud_shutdown = asyncio.Event()
 
+                # TTS helper — uses macOS `say` for voice feedback to the user.
+                # safe_say pattern: write to temp AIFF then afplay (no GIL/CoreAudio contention).
+                async def _hud_tts(text: str) -> None:
+                    """Speak text to the user via macOS TTS (non-blocking)."""
+                    if not text:
+                        return
+                    try:
+                        import tempfile as _tf
+                        with _tf.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
+                            tmp_path = tmp.name
+                        proc = await asyncio.create_subprocess_exec(
+                            "say", "-o", tmp_path, text,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(proc.communicate(), timeout=15)
+                        play = await asyncio.create_subprocess_exec(
+                            "afplay", tmp_path,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await asyncio.wait_for(play.communicate(), timeout=15)
+                        try:
+                            os.unlink(tmp_path)
+                        except OSError:
+                            pass
+                    except Exception as tts_err:
+                        logger.debug("[HUD] TTS failed: %s", tts_err)
+
                 # Dispatch IPC events through the same command processor
                 async def _hud_dispatch(event_type: str, data: dict) -> None:
                     """Route HUD IPC events to the unified command processor."""
@@ -2032,11 +2061,73 @@ async def parallel_lifespan(app: FastAPI):
                                     if initial_frame is None:
                                         logger.warning("[HUD] No screenshot — planner will see black frames")
 
+                                    # --- TTS: Narrate intent before execution ---
+                                    _is_messaging = "message" in goal.lower() and "saying" in goal.lower()
+                                    _msg_contact_match = None
+                                    if _is_messaging:
+                                        import re as _re2
+                                        _msg_contact_match = _re2.search(
+                                            r"message\s+(\S+(?:\s+\S+)?)\s+saying", goal, _re2.IGNORECASE
+                                        )
+                                    if _is_messaging and _msg_contact_match:
+                                        _contact_name = _msg_contact_match.group(1)
+                                        _app_name = app_context or "the messaging app"
+                                        await _hud_tts(f"Sending your message to {_contact_name} on {_app_name}.")
+                                    else:
+                                        await _hud_tts(f"On it. Executing: {goal[:60]}")
+
                                     logger.info("[HUD] VLA executing: %s", goal[:80])
                                     result = await cu.run(goal, initial_frame=initial_frame)
                                     logger.info("[HUD] VLA result: %s", result)
+
+                                    # --- TTS: Narrate result ---
+                                    if result and result.get("success"):
+                                        if _is_messaging and _msg_contact_match:
+                                            _cn = _msg_contact_match.group(1)
+                                            _an = app_context or "the app"
+                                            await _hud_tts(f"Done. Your message to {_cn} has been sent on {_an}.")
+                                        else:
+                                            _elapsed = result.get("elapsed_s", 0)
+                                            await _hud_tts(f"Done. Completed in {_elapsed:.1f} seconds.")
+                                    elif result:
+                                        _err = result.get("error", "unknown issue")
+                                        _completed = result.get("steps_completed", 0)
+                                        _total = result.get("steps_total", 0)
+                                        if _is_messaging and _msg_contact_match:
+                                            _cn = _msg_contact_match.group(1)
+                                            await _hud_tts(
+                                                f"I had trouble sending that message to {_cn}. "
+                                                f"Got through {_completed} of {_total} steps."
+                                            )
+                                        else:
+                                            await _hud_tts(
+                                                f"Action incomplete. Finished {_completed} of {_total} steps."
+                                            )
+                                    # --- Ouroboros: Feed CU telemetry to CUExecutionSensor ---
+                                    try:
+                                        from backend.core.ouroboros.governance.intake.sensors.cu_execution_sensor import (
+                                            CUExecutionRecord, get_cu_execution_sensor,
+                                        )
+                                        _cu_contact = _msg_contact_match.group(1) if _msg_contact_match else None
+                                        _cu_rec = CUExecutionRecord(
+                                            goal=goal,
+                                            success=bool(result.get("success")) if result else False,
+                                            steps_completed=result.get("steps_completed", 0) if result else 0,
+                                            steps_total=result.get("steps_total", 0) if result else 0,
+                                            elapsed_s=result.get("elapsed_s", 0) if result else 0,
+                                            error=result.get("error") if result else "cu.run returned None",
+                                            is_messaging=_is_messaging,
+                                            contact=_cu_contact,
+                                            app=app_context,
+                                            layers_used=result.get("layers_used", {}) if result else {},
+                                        )
+                                        await get_cu_execution_sensor().record(_cu_rec)
+                                    except Exception as _ouro_err:
+                                        logger.debug("[HUD] Ouroboros CU telemetry failed: %s", _ouro_err)
+
                                 except Exception as e:
                                     logger.error("[HUD] VLA failed: %s", e)
+                                    await _hud_tts("Sorry, that action failed.")
                         else:
                             # Route through unified command processor for other actions
                             try:
