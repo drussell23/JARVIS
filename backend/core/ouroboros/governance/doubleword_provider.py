@@ -295,11 +295,15 @@ class DoublewordProvider:
 
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
             self._stats.failed_batches += 1
-            logger.exception(
-                "[DoublewordProvider] poll_and_retrieve failed for batch %s",
+            # Log the raw response for debugging parse failures
+            logger.warning(
+                "[DoublewordProvider] poll_and_retrieve failed for batch %s: %s. "
+                "Raw response first 300 chars: %s",
                 pending.batch_id,
+                exc,
+                content[:300].replace("\n", "\\n") if content else "(no content)",
             )
             return None
 
