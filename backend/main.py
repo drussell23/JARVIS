@@ -2077,7 +2077,7 @@ async def parallel_lifespan(app: FastAPI):
                                     if initial_frame is None:
                                         logger.warning("[HUD] No screenshot — planner will see black frames")
 
-                                    # --- TTS: Narrate intent before execution ---
+                                    # --- Detect messaging context for Ouroboros telemetry ---
                                     _is_messaging = "message" in goal.lower() and "saying" in goal.lower()
                                     _msg_contact_match = None
                                     if _is_messaging:
@@ -2085,40 +2085,48 @@ async def parallel_lifespan(app: FastAPI):
                                         _msg_contact_match = _re2.search(
                                             r"message\s+(\S+(?:\s+\S+)?)\s+saying", goal, _re2.IGNORECASE
                                         )
-                                    if _is_messaging and _msg_contact_match:
-                                        _contact_name = _msg_contact_match.group(1)
-                                        _app_name = app_context or "the messaging app"
-                                        await _hud_tts(f"Sending your message to {_contact_name} on {_app_name}.")
-                                    else:
-                                        await _hud_tts(f"On it. Executing: {goal[:60]}")
+
+                                    # --- TTS: Voice narration (gated by JARVIS_HUD_TTS) ---
+                                    # OFF by default — causes voice feedback loop until the
+                                    # Swift HUD is rebuilt with the /tmp/jarvis_speaking
+                                    # mic-suppression check in WakeWordListener.swift.
+                                    # Enable with: JARVIS_HUD_TTS=1 after rebuilding Swift.
+                                    _tts_enabled = os.environ.get("JARVIS_HUD_TTS", "0").lower() in ("1", "true", "yes")
+                                    if _tts_enabled:
+                                        if _is_messaging and _msg_contact_match:
+                                            _contact_name = _msg_contact_match.group(1)
+                                            _app_name = app_context or "the messaging app"
+                                            await _hud_tts(f"Sending your message to {_contact_name} on {_app_name}.")
+                                        else:
+                                            await _hud_tts(f"On it. Executing: {goal[:60]}")
 
                                     logger.info("[HUD] VLA executing: %s", goal[:80])
                                     result = await cu.run(goal, initial_frame=initial_frame)
                                     logger.info("[HUD] VLA result: %s", result)
 
                                     # --- TTS: Narrate result ---
-                                    if result and result.get("success"):
-                                        if _is_messaging and _msg_contact_match:
-                                            _cn = _msg_contact_match.group(1)
-                                            _an = app_context or "the app"
-                                            await _hud_tts(f"Done. Your message to {_cn} has been sent on {_an}.")
-                                        else:
-                                            _elapsed = result.get("elapsed_s", 0)
-                                            await _hud_tts(f"Done. Completed in {_elapsed:.1f} seconds.")
-                                    elif result:
-                                        _err = result.get("error", "unknown issue")
-                                        _completed = result.get("steps_completed", 0)
-                                        _total = result.get("steps_total", 0)
-                                        if _is_messaging and _msg_contact_match:
-                                            _cn = _msg_contact_match.group(1)
-                                            await _hud_tts(
-                                                f"I had trouble sending that message to {_cn}. "
-                                                f"Got through {_completed} of {_total} steps."
-                                            )
-                                        else:
-                                            await _hud_tts(
-                                                f"Action incomplete. Finished {_completed} of {_total} steps."
-                                            )
+                                    if _tts_enabled:
+                                        if result and result.get("success"):
+                                            if _is_messaging and _msg_contact_match:
+                                                _cn = _msg_contact_match.group(1)
+                                                _an = app_context or "the app"
+                                                await _hud_tts(f"Done. Your message to {_cn} has been sent on {_an}.")
+                                            else:
+                                                _elapsed = result.get("elapsed_s", 0)
+                                                await _hud_tts(f"Done. Completed in {_elapsed:.1f} seconds.")
+                                        elif result:
+                                            _completed = result.get("steps_completed", 0)
+                                            _total = result.get("steps_total", 0)
+                                            if _is_messaging and _msg_contact_match:
+                                                _cn = _msg_contact_match.group(1)
+                                                await _hud_tts(
+                                                    f"I had trouble sending that message to {_cn}. "
+                                                    f"Got through {_completed} of {_total} steps."
+                                                )
+                                            else:
+                                                await _hud_tts(
+                                                    f"Action incomplete. Finished {_completed} of {_total} steps."
+                                                )
                                     # --- Ouroboros: Feed CU telemetry to CUExecutionSensor ---
                                     try:
                                         from backend.core.ouroboros.governance.intake.sensors.cu_execution_sensor import (
