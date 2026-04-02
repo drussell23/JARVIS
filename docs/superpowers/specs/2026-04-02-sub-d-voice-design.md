@@ -23,10 +23,11 @@ Add `say_fn: Optional[Callable[..., Coroutine[Any, Any, bool]]] = None` to `__in
 
 **Callers to update:**
 
-| File | Line | Current | Change |
-|------|------|---------|--------|
-| `unified_supervisor.py` | ~85020 | `GovernedLoopService(stack=..., prime_client=..., config=..., active_brain_set=...)` | Add `say_fn=safe_say` (import from `unified_voice_orchestrator`) |
-| `trigger_ignition.py` | ~264 | `GovernedLoopService(stack=..., prime_client=..., config=...)` | Add `say_fn=safe_say` (import already available in scope) |
+| File | Location | Current | Change |
+|------|----------|---------|--------|
+| `unified_supervisor.py` | Search `GovernedLoopService(` (~line 85020, fallback path) | No `say_fn` | Add `say_fn=safe_say` (import from `unified_voice_orchestrator` with try/except) |
+| `unified_supervisor.py` | Search `GovernedLoopService(` (~line 87273, handshake path) | No `say_fn` | Add `say_fn=safe_say` (same import) |
+| `trigger_ignition.py` | Search `GovernedLoopService(` (~line 264) | No `say_fn` | Import `safe_say` from `unified_voice_orchestrator` (with try/except fallback to None), then pass `say_fn=safe_say`. Note: `safe_say` is NOT currently imported in this file — `_mock_safe_say` exists but is not the same function. |
 
 Tests pass `None` (default) — no behavior change.
 
@@ -129,7 +130,7 @@ Add corresponding entries to `_REQUIRED_KEYS`:
 ```python
 "duplication_blocked":   ("file",),
 "similarity_escalated":  ("file",),
-"verify_regression":     ("root_cause",),
+"verify_regression":     ("file", "root_cause"),
 ```
 
 **Context availability:**
@@ -164,6 +165,12 @@ Add corresponding entries to `_REQUIRED_KEYS`:
 | `unified_supervisor.py` | Modify (pass say_fn to GLS) |
 | `trigger_ignition.py` | Modify (pass say_fn to GLS) |
 | `tests/governance/test_daemon_narrator_wiring.py` | Create |
+
+## Implementation Notes
+
+- **`root_cause` prefix stripping for speech:** The `verify_regression` template uses `{root_cause}` which contains the prefix `"verify_regression: ..."`. For speech quality, strip the prefix before formatting: `root_cause.replace("verify_regression: ", "", 1)` in the context before calling `format_narration`. This keeps full string in logs while Samantha says the human-readable part.
+- **CommProtocol test follow-up:** Adding optional `target_files` to `emit_decision`/`emit_postmortem` is backward compatible for callers, but tests that mock these methods with strict arity (`assert_called_with`) may need updating. Grep for `emit_decision` and `emit_postmortem` mock assertions after implementation.
+- **Line numbers are approximate:** Use symbol-based searches (`GovernedLoopService.__init__`, `GovernedLoopService(` in supervisor) rather than relying on exact line numbers which drift with edits.
 
 ## Out of Scope
 
