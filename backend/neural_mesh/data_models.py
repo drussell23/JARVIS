@@ -123,6 +123,12 @@ class MessageType(Enum):
     PROACTIVE_INTENT = "proactive_intent"
     TIER_DECISION = "tier_decision"  # ExecutionTierRouter tier selection event
 
+    # Hive (Autonomous Engineering Hive — agent-to-agent social network)
+    HIVE_AGENT_LOG = auto()
+    HIVE_PERSONA_REASONING = auto()
+    HIVE_THREAD_LIFECYCLE = auto()
+    HIVE_COGNITIVE_TRANSITION = auto()
+
 
 # ============================================================================
 # AGENT MESSAGE
