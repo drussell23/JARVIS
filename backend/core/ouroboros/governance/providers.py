@@ -150,6 +150,91 @@ def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -
     return head + marker + tail
 
 
+def _build_function_index(content: str, file_path: str) -> str:
+    """Build a structural index of functions/classes in a Python file.
+
+    Returns a compact listing of top-level and class-level definitions
+    with line numbers, signatures, and first-line docstrings. Helps the
+    code generation model understand what already exists in the file.
+
+    Non-Python files or syntax errors return empty string.
+    """
+    if not file_path.endswith(".py"):
+        return ""
+    import ast as _ast
+    try:
+        tree = _ast.parse(content)
+    except SyntaxError:
+        return ""
+
+    _MAX_ENTRIES = 50
+    _MAX_TOTAL_CHARS = 3072
+    _MAX_SIG_CHARS = 100
+    entries: list[str] = []
+    total_chars = 0
+
+    def _first_docline(node: _ast.AST) -> str:
+        """Extract first line of docstring, if any."""
+        if (
+            node.body
+            and isinstance(node.body[0], _ast.Expr)
+            and isinstance(node.body[0].value, (_ast.Constant, _ast.Str))
+        ):
+            val = getattr(node.body[0].value, "value", None) or getattr(node.body[0].value, "s", "")
+            if isinstance(val, str):
+                first = val.strip().split("\n")[0].strip()
+                if len(first) > 60:
+                    first = first[:57] + "..."
+                return f': "{first}"'
+        return ""
+
+    def _sig(node: _ast.AST) -> str:
+        """Build parameter signature string."""
+        if not isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            return ""
+        try:
+            sig = _ast.unparse(node.args)
+        except Exception:
+            sig = "..."
+        if len(sig) > _MAX_SIG_CHARS:
+            sig = sig[:_MAX_SIG_CHARS - 3] + "..."
+        return f"({sig})"
+
+    def _add_entry(prefix: str, node: _ast.AST, kind: str) -> bool:
+        nonlocal total_chars
+        if len(entries) >= _MAX_ENTRIES or total_chars >= _MAX_TOTAL_CHARS:
+            return False
+        lineno = getattr(node, "lineno", None) or "?"
+        name = getattr(node, "name", "?")
+        if kind == "class":
+            line = f"{prefix}L{lineno} class {name}{_first_docline(node)}"
+        else:
+            is_async = "async " if isinstance(node, _ast.AsyncFunctionDef) else ""
+            line = f"{prefix}L{lineno} {is_async}def {name}{_sig(node)}{_first_docline(node)}"
+        if len(line) > 120:
+            line = line[:117] + "..."
+        entries.append(line)
+        total_chars += len(line)
+        return True
+
+    for node in tree.body:
+        if isinstance(node, _ast.ClassDef):
+            if not _add_entry("- ", node, "class"):
+                break
+            for item in node.body:
+                if isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                    if not _add_entry("  - ", item, "func"):
+                        break
+        elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            if not _add_entry("- ", node, "func"):
+                break
+
+    if not entries:
+        return ""
+    header = "## Structural Index (what already exists — DO NOT duplicate)\n\n"
+    return header + "\n".join(entries)
+
+
 def _file_source_hash(content: str) -> str:
     """Return hex SHA-256 of file content."""
     return hashlib.sha256(content.encode()).hexdigest()

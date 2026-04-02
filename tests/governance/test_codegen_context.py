@@ -84,3 +84,90 @@ def test_system_prompt_contains_minimal_edit_guidance():
     """Anti-duplication must include minimal-edit language to avoid over-refusal."""
     from backend.core.ouroboros.governance.providers import _CODEGEN_SYSTEM_PROMPT
     assert "minimal edit" in _CODEGEN_SYSTEM_PROMPT.lower() or "preserve existing" in _CODEGEN_SYSTEM_PROMPT.lower()
+
+
+# ---------------------------------------------------------------------------
+# Task 3: AST function index
+# ---------------------------------------------------------------------------
+
+def test_function_index_basic_python():
+    """Extracts top-level and class method definitions."""
+    from backend.core.ouroboros.governance.providers import _build_function_index
+    source = textwrap.dedent('''\
+        """Module docstring."""
+        import os
+
+        def top_level_func(x: int, y: str) -> bool:
+            """Check something."""
+            return True
+
+        async def async_func():
+            """Async helper."""
+            pass
+
+        class MyClass:
+            """A class."""
+
+            def method_one(self, data: list) -> None:
+                """Process data."""
+                pass
+
+            @staticmethod
+            def static_helper(n: int) -> int:
+                """Helper."""
+                return n * 2
+
+            @property
+            def name(self) -> str:
+                """Get name."""
+                return "foo"
+    ''')
+    result = _build_function_index(source, "example.py")
+    assert "top_level_func" in result
+    assert "async_func" in result
+    assert "MyClass" in result
+    assert "method_one" in result
+    assert "static_helper" in result
+    assert "name" in result  # @property
+    assert "DO NOT duplicate" in result
+
+
+def test_function_index_syntax_error():
+    """Unparseable Python returns empty string."""
+    from backend.core.ouroboros.governance.providers import _build_function_index
+    result = _build_function_index("def broken(:\n  pass", "bad.py")
+    assert result == ""
+
+
+def test_function_index_non_python():
+    """Non-.py files return empty string."""
+    from backend.core.ouroboros.governance.providers import _build_function_index
+    result = _build_function_index("const x = 1;", "file.js")
+    assert result == ""
+
+
+def test_function_index_caps():
+    """Index respects 50-entry cap."""
+    from backend.core.ouroboros.governance.providers import _build_function_index
+    # Generate 60 functions
+    lines = []
+    for i in range(60):
+        lines.append(f"def func_{i}():\n    pass\n")
+    source = "\n".join(lines)
+    result = _build_function_index(source, "many.py")
+    # Should have at most 50 function entries
+    func_count = result.count("def func_")
+    assert func_count <= 50
+
+
+def test_function_index_long_signature_truncated():
+    """Very long signatures get truncated."""
+    from backend.core.ouroboros.governance.providers import _build_function_index
+    long_params = ", ".join(f"param_{i}: str" for i in range(20))
+    source = f"def long_func({long_params}) -> None:\n    pass\n"
+    result = _build_function_index(source, "long.py")
+    assert "long_func" in result
+    # The signature line should not be excessively long
+    for line in result.split("\n"):
+        if "long_func" in line:
+            assert len(line) <= 120, f"Signature line too long: {len(line)} chars"
