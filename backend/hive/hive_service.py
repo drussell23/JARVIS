@@ -36,6 +36,10 @@ from backend.hive.hud_relay_agent import HudRelayAgent
 from backend.hive.model_router import HiveModelRouter
 from backend.hive.ouroboros_handoff import serialize_consensus
 from backend.hive.persona_engine import PersonaEngine
+from backend.hive.rem_council import RemCouncil
+from backend.hive.rem_graduation_auditor import GraduationAuditor
+from backend.hive.rem_health_scanner import HealthScanner
+from backend.hive.rem_manifesto_reviewer import ManifestoReviewer
 from backend.hive.thread_manager import ThreadManager
 from backend.hive.thread_models import (
     AgentLogMessage,
@@ -94,7 +98,7 @@ class HiveService:
         self._governed_loop = governed_loop
         self._doubleword = doubleword
 
-        resolved_state_dir = state_dir or Path(
+        self._state_dir = state_dir or Path(
             os.environ.get(
                 "JARVIS_HIVE_STATE_DIR",
                 str(Path.home() / ".jarvis" / "hive"),
@@ -103,10 +107,10 @@ class HiveService:
 
         # Core components
         self._fsm = CognitiveFsm(
-            state_file=resolved_state_dir / "cognitive_state.json"
+            state_file=self._state_dir / "cognitive_state.json"
         )
         self._thread_mgr = ThreadManager(
-            storage_dir=resolved_state_dir / "threads"
+            storage_dir=self._state_dir / "threads"
         )
         self._model_router = HiveModelRouter()
         self._persona_engine = PersonaEngine(
@@ -395,6 +399,52 @@ class HiveService:
                 )
 
     # ------------------------------------------------------------------
+    # REM council
+    # ------------------------------------------------------------------
+
+    async def _run_rem_council(self) -> None:
+        """Run the REM Council session with all three review modules."""
+        health = HealthScanner(self._persona_engine, self._thread_mgr, self._relay)
+        graduation = GraduationAuditor(self._persona_engine, self._thread_mgr, self._relay)
+        manifesto = ManifestoReviewer(
+            self._persona_engine, self._thread_mgr, self._relay,
+            repo_root=Path("."),
+            state_dir=self._state_dir,
+        )
+        council = RemCouncil(
+            health_scanner=health,
+            graduation_auditor=graduation,
+            manifesto_reviewer=manifesto,
+            max_calls=int(os.environ.get("JARVIS_HIVE_REM_MAX_CALLS", "50")),
+        )
+        result = await council.run_session()
+        logger.info(
+            "[HiveService] REM council complete: %d threads, %d/%d calls, escalate=%s",
+            len(result.threads_created), result.calls_used, result.calls_budget, result.should_escalate,
+        )
+
+        if result.should_escalate and result.escalation_thread_id:
+            decision = self._fsm.decide(CognitiveEvent.COUNCIL_ESCALATION)
+            if not decision.noop:
+                self._fsm.apply_last_decision()
+                await self._relay.project_cognitive_transition(
+                    from_state=decision.from_state.value,
+                    to_state=decision.to_state.value,
+                    reason_code=decision.reason_code,
+                )
+                self._flow_thread_ids.add(result.escalation_thread_id)
+                asyncio.create_task(self._run_debate_round(result.escalation_thread_id))
+        else:
+            decision = self._fsm.decide(CognitiveEvent.COUNCIL_COMPLETE)
+            if not decision.noop:
+                self._fsm.apply_last_decision()
+                await self._relay.project_cognitive_transition(
+                    from_state=decision.from_state.value,
+                    to_state=decision.to_state.value,
+                    reason_code=decision.reason_code,
+                )
+
+    # ------------------------------------------------------------------
     # REM polling
     # ------------------------------------------------------------------
 
@@ -423,6 +473,7 @@ class HiveService:
                     reason_code=decision.reason_code,
                 )
                 logger.info("REM cycle triggered after %.0fs idle", idle_seconds)
+                await self._run_rem_council()
 
     # ------------------------------------------------------------------
     # Helpers
