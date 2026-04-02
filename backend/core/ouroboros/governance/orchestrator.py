@@ -1583,6 +1583,27 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] SecurityReviewer not available", exc_info=True)
 
+        # ---- Diff-Aware Similarity Gate (Sub-project C) ----
+        if best_candidate is not None:
+            try:
+                from backend.core.ouroboros.governance.similarity_gate import check_similarity
+                _src_content = ""
+                if ctx.target_files:
+                    _src_path = self._config.project_root / ctx.target_files[0]
+                    if _src_path.exists():
+                        _src_content = _src_path.read_text(encoding="utf-8", errors="replace")
+                if _src_content:
+                    _sim_reason = check_similarity(best_candidate, _src_content)
+                    if _sim_reason is not None:
+                        logger.info(
+                            "[Orchestrator] GATE similarity escalation: %s [%s]",
+                            _sim_reason, ctx.op_id,
+                        )
+                        if risk_tier is not RiskTier.APPROVAL_REQUIRED:
+                            risk_tier = RiskTier.APPROVAL_REQUIRED
+            except Exception:
+                logger.debug("[Orchestrator] Similarity gate skipped", exc_info=True)
+
         # Autonomy tier gate: frozen at submit() to prevent TrustGraduator race.
         # "observe" → force APPROVAL_REQUIRED regardless of risk_tier.
         _frozen_tier = getattr(ctx, "frozen_autonomy_tier", "governed")
