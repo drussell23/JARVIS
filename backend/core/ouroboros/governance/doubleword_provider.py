@@ -121,13 +121,19 @@ class DoublewordProvider:
         return bool(self._api_key)
 
     async def _get_session(self) -> Any:
-        """Lazy-init persistent aiohttp session."""
+        """Lazy-init persistent aiohttp session.
+
+        NOTE: Content-Type is NOT set at session level. The session default
+        ``application/json`` was overriding the multipart boundary generated
+        by aiohttp.FormData during file uploads, causing Doubleword to reject
+        the request with "Invalid boundary for multipart/form-data".
+        Each request sets its own Content-Type as needed.
+        """
         if self._session is None or self._session.closed:
             import aiohttp
             self._session = aiohttp.ClientSession(
                 headers={
                     "Authorization": f"Bearer {self._api_key}",
-                    "Content-Type": "application/json",
                 },
                 timeout=aiohttp.ClientTimeout(total=30),
             )
@@ -369,6 +375,7 @@ class DoublewordProvider:
                     "endpoint": "/v1/chat/completions",
                     "completion_window": _DW_COMPLETION_WINDOW,
                 },
+                headers={"Content-Type": "application/json"},
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
