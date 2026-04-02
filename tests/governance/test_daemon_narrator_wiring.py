@@ -83,3 +83,85 @@ async def test_emit_decision_without_target_files():
         reason_code="success",
     )
     assert "target_files" not in emitted[0].payload
+
+
+# ---------------------------------------------------------------------------
+# Task 4: VoiceNarrator routing + narration templates
+# ---------------------------------------------------------------------------
+
+def test_map_phase_duplication():
+    """reason_code=duplication → 'duplication_blocked'."""
+    from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+    from backend.core.ouroboros.governance.comm_protocol import CommMessage, MessageType
+    msg = CommMessage(
+        msg_type=MessageType.DECISION,
+        op_id="op-1",
+        seq=1,
+        causal_parent_seq=None,
+        payload={"outcome": "blocked", "reason_code": "duplication"},
+    )
+    assert VoiceNarrator._map_phase(msg) == "duplication_blocked"
+
+
+def test_map_phase_similarity():
+    """reason_code=similarity_escalation → 'similarity_escalated'."""
+    from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+    from backend.core.ouroboros.governance.comm_protocol import CommMessage, MessageType
+    msg = CommMessage(
+        msg_type=MessageType.DECISION,
+        op_id="op-1",
+        seq=1,
+        causal_parent_seq=None,
+        payload={"outcome": "escalated", "reason_code": "similarity_escalation"},
+    )
+    assert VoiceNarrator._map_phase(msg) == "similarity_escalated"
+
+
+def test_map_phase_verify_regression():
+    """root_cause starting with 'verify_regression' → 'verify_regression'."""
+    from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+    from backend.core.ouroboros.governance.comm_protocol import CommMessage, MessageType
+    msg = CommMessage(
+        msg_type=MessageType.POSTMORTEM,
+        op_id="op-1",
+        seq=1,
+        causal_parent_seq=None,
+        payload={"root_cause": "verify_regression: pass_rate=0.85", "failed_phase": "VERIFY"},
+    )
+    assert VoiceNarrator._map_phase(msg) == "verify_regression"
+
+
+def test_map_phase_generic_decision_unchanged():
+    """Existing outcome routing still works for non-gate decisions."""
+    from backend.core.ouroboros.governance.comms.voice_narrator import VoiceNarrator
+    from backend.core.ouroboros.governance.comm_protocol import CommMessage, MessageType
+    msg = CommMessage(
+        msg_type=MessageType.DECISION,
+        op_id="op-1",
+        seq=1,
+        causal_parent_seq=None,
+        payload={"outcome": "applied", "reason_code": "success"},
+    )
+    assert VoiceNarrator._map_phase(msg) == "applied"
+
+
+def test_narration_template_duplication():
+    """duplication_blocked template renders with file context."""
+    from backend.core.ouroboros.governance.comms.narrator_script import format_narration
+    result = format_narration("duplication_blocked", {"file": "module.py", "op_id": "op-1"})
+    assert result is not None
+    assert "module.py" in result
+    assert "duplicat" in result.lower()
+
+
+def test_narration_template_verify():
+    """verify_regression template renders with file and root_cause."""
+    from backend.core.ouroboros.governance.comms.narrator_script import format_narration
+    result = format_narration("verify_regression", {
+        "file": "module.py",
+        "root_cause": "pass_rate=0.85 < threshold=1.00",
+        "op_id": "op-1",
+    })
+    assert result is not None
+    assert "module.py" in result
+    assert "pass_rate" in result

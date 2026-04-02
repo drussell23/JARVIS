@@ -162,8 +162,16 @@ class VoiceNarrator:
         if msg.msg_type == MessageType.INTENT:
             return "signal_detected"
         elif msg.msg_type == MessageType.POSTMORTEM:
+            root_cause = msg.payload.get("root_cause", "")
+            if isinstance(root_cause, str) and root_cause.startswith("verify_regression"):
+                return "verify_regression"
             return "postmortem"
         elif msg.msg_type == MessageType.DECISION:
+            reason = msg.payload.get("reason_code", "")
+            if reason == "duplication":
+                return "duplication_blocked"
+            if reason == "similarity_escalation":
+                return "similarity_escalated"
             outcome = msg.payload.get("outcome", "")
             if outcome in ("applied", "validated"):
                 return "applied"

@@ -53,6 +53,18 @@ SCRIPTS: Dict[str, str] = {
         "Heads up -- this change to {file} in {repo} affects "
         "{affected_count} file{s} in {other_repos}."
     ),
+    "duplication_blocked": (
+        "I blocked a code change for {file}. "
+        "The generated code duplicated existing logic."
+    ),
+    "similarity_escalated": (
+        "A code change for {file} has high overlap with existing code. "
+        "Escalating for your review."
+    ),
+    "verify_regression": (
+        "I rolled back a change to {file}. "
+        "Post-apply verification failed: {root_cause}."
+    ),
 }
 
 _FALLBACK = "Pipeline update for op {op_id}: phase {phase}."
@@ -71,6 +83,9 @@ _REQUIRED_KEYS: Dict[str, tuple] = {
     "postmortem":                 ("root_cause",),
     "observe_error":              ("file", "error_summary"),
     "cross_repo_impact":          ("file", "repo", "affected_count", "other_repos"),
+    "duplication_blocked":   ("file",),
+    "similarity_escalated":  ("file",),
+    "verify_regression":     ("file", "root_cause"),
 }
 
 # Values that indicate a field was never populated with real data.
