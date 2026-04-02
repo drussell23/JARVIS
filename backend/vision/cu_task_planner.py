@@ -1,5 +1,8 @@
 # [Ouroboros] Modified by Karen (op=cu-smoke-177) at 2026-04-02 00:58 UTC
 # [Ouroboros] Modified by Ouroboros (op=ouro-adv-A-1) at 2026-04-02 01:09 UTC
+# [Ouroboros] Modified by Ouroboros (op=ouro-codegen) at 2026-04-02 01:15 UTC
+# Reason: Add search-bar-when-active anti-pattern to _filter_messaging_antipatterns
+
 # Reason: Pattern A: precise message input targeting with visual anchors
 
 # Reason: Add precise element descriptions for chat app input fields
@@ -658,6 +661,34 @@ class CUTaskPlanner:
                     )
                     # Skip the contact-name type AND the return that follows it
                     i += 2
+                    continue
+
+# [Ouroboros] Pattern 3: Search bar click when conversation is active.
+            # If the goal context says the app is already open and a step clicks
+            # "search", followed by typing a short name, the planner is
+            # unnecessarily searching for a contact whose conversation is
+            # already visible. Strip the search + type steps.
+            if (
+                step.action == "click"
+                and step.target
+                and "search" in step.target.lower()
+                and i + 1 < len(steps)
+                and steps[i + 1].action == "type"
+                and steps[i + 1].text
+            ):
+                next_text = steps[i + 1].text.strip()
+                is_name_like = (
+                    len(next_text.split()) <= 2
+                    and not any(c in next_text for c in ".!?,;:@#$")
+                    and len(next_text) < 30
+                )
+                if is_name_like:
+                    logger.warning(
+                        "[CUTaskPlanner] BLOCKED search-for-active-contact anti-pattern: "
+                        "would have searched for %r when conversation may already be open",
+                        next_text,
+                    )
+                    i += 2  # Skip search click + name type
                     continue
 
             filtered.append(step)
