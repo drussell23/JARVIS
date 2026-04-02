@@ -1,0 +1,145 @@
+<h2>Hierarchical Conversation Protocol — Message Schema</h2>
+<p class="subtitle">Two message tiers: Specialist Logs (deterministic telemetry) and Persona Reasoning (Trinity debate voices)</p>
+
+<div class="split" style="gap: 1.5rem; margin-bottom: 2rem;">
+  <!-- Agent Log Schema -->
+  <div class="mockup">
+    <div class="mockup-header" style="background: #0f172a; color: #38bdf8;">TIER 1: Agent Log (Specialist Telemetry)</div>
+    <div class="mockup-body" style="background: #020617; padding: 1.2rem; font-family: 'SF Mono', monospace; font-size: 0.8rem; line-height: 1.6;">
+      <pre style="color: #94a3b8; margin: 0; white-space: pre-wrap;">{
+  <span style="color:#38bdf8">"type"</span>: <span style="color:#fbbf24">"agent_log"</span>,
+  <span style="color:#38bdf8">"thread_id"</span>: <span style="color:#fbbf24">"thr_a1b2c3"</span>,
+  <span style="color:#38bdf8">"agent_name"</span>: <span style="color:#fbbf24">"health_monitor_agent"</span>,
+  <span style="color:#38bdf8">"trinity_parent"</span>: <span style="color:#fbbf24">"jarvis"</span>,
+  <span style="color:#38bdf8">"severity"</span>: <span style="color:#fbbf24">"warning"</span>,
+  <span style="color:#38bdf8">"category"</span>: <span style="color:#fbbf24">"memory_pressure"</span>,
+  <span style="color:#38bdf8">"payload"</span>: {
+    <span style="color:#38bdf8">"metric"</span>: <span style="color:#fbbf24">"ram_percent"</span>,
+    <span style="color:#38bdf8">"value"</span>: <span style="color:#4ade80">87.3</span>,
+    <span style="color:#38bdf8">"threshold"</span>: <span style="color:#4ade80">85.0</span>,
+    <span style="color:#38bdf8">"trend"</span>: <span style="color:#fbbf24">"rising"</span>
+  },
+  <span style="color:#38bdf8">"ts"</span>: <span style="color:#fbbf24">"2026-04-02T07:15:33Z"</span>,
+  <span style="color:#38bdf8">"monotonic_ns"</span>: <span style="color:#4ade80">1775159733000000000</span>
+}</pre>
+    </div>
+  </div>
+
+  <!-- Persona Reasoning Schema -->
+  <div class="mockup">
+    <div class="mockup-header" style="background: #1e1b4b; color: #a78bfa;">TIER 2: Persona Reasoning (Trinity Voice)</div>
+    <div class="mockup-body" style="background: #020617; padding: 1.2rem; font-family: 'SF Mono', monospace; font-size: 0.8rem; line-height: 1.6;">
+      <pre style="color: #94a3b8; margin: 0; white-space: pre-wrap;">{
+  <span style="color:#a78bfa">"type"</span>: <span style="color:#fbbf24">"persona_reasoning"</span>,
+  <span style="color:#a78bfa">"thread_id"</span>: <span style="color:#fbbf24">"thr_a1b2c3"</span>,
+  <span style="color:#a78bfa">"persona"</span>: <span style="color:#fbbf24">"j_prime"</span>,
+  <span style="color:#a78bfa">"role"</span>: <span style="color:#fbbf24">"mind"</span>,
+  <span style="color:#a78bfa">"intent"</span>: <span style="color:#fbbf24">"propose"</span>,
+  <span style="color:#a78bfa">"references"</span>: [<span style="color:#fbbf24">"msg_log_001"</span>, <span style="color:#fbbf24">"msg_log_002"</span>],
+  <span style="color:#a78bfa">"manifesto_principle"</span>: <span style="color:#fbbf24">"§3 Spinal Cord"</span>,
+  <span style="color:#a78bfa">"reasoning"</span>: <span style="color:#fbbf24">"Memory pressure is rising
+  due to the vision loop's frame buffer
+  not releasing stale SHM segments.
+  Propose: add TTL-based eviction to
+  FramePipeline with 30s max age."</span>,
+  <span style="color:#a78bfa">"confidence"</span>: <span style="color:#4ade80">0.87</span>,
+  <span style="color:#a78bfa">"model_used"</span>: <span style="color:#fbbf24">"Qwen/Qwen3.5-397B..."</span>,
+  <span style="color:#a78bfa">"token_cost"</span>: <span style="color:#4ade80">1847</span>,
+  <span style="color:#a78bfa">"ts"</span>: <span style="color:#fbbf24">"2026-04-02T07:15:41Z"</span>
+}</pre>
+    </div>
+  </div>
+</div>
+
+<h3>Thread Lifecycle on the HUD</h3>
+<p class="subtitle">How a single thread flows from telemetry to PR</p>
+
+<div class="mockup" style="margin-bottom: 2rem;">
+  <div class="mockup-header">Thread: thr_a1b2c3 — "Memory Pressure in Vision Loop"</div>
+  <div class="mockup-body" style="background: #0a0a0f; padding: 1.5rem;">
+
+    <!-- Thread status bar -->
+    <div style="display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1.5rem; padding: 0.6rem 1rem; background: rgba(249,115,22,0.1); border: 1px solid rgba(249,115,22,0.3); border-radius: 8px;">
+      <span style="background: #f97316; color: #000; padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: bold;">DEBATING</span>
+      <span style="color: #64748b; font-size: 0.8rem;">Cognitive State: FLOW &nbsp;|&nbsp; Model: 397B &nbsp;|&nbsp; Tokens: 4,291 &nbsp;|&nbsp; Timeout: 8m 22s remaining</span>
+    </div>
+
+    <!-- Agent Log entry -->
+    <div style="display: flex; gap: 0.8rem; margin-bottom: 1rem; padding: 0.8rem; background: rgba(56,189,248,0.05); border-left: 3px solid #38bdf8; border-radius: 0 8px 8px 0;">
+      <div style="min-width: 36px; height: 36px; background: #0c4a6e; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: #38bdf8;">HM</div>
+      <div>
+        <div style="color: #64748b; font-size: 0.75rem;">health_monitor_agent <span style="opacity: 0.5">→ JARVIS</span> &nbsp; <span style="color: #fbbf24;">⚠ warning</span> &nbsp; 7:15:33</div>
+        <div style="color: #94a3b8; font-size: 0.85rem; margin-top: 4px;">RAM at <strong style="color:#f97316">87.3%</strong> (threshold: 85%). Trend: rising. Source: vision loop frame buffer.</div>
+      </div>
+    </div>
+
+    <!-- Another Agent Log -->
+    <div style="display: flex; gap: 0.8rem; margin-bottom: 1rem; padding: 0.8rem; background: rgba(56,189,248,0.05); border-left: 3px solid #38bdf8; border-radius: 0 8px 8px 0;">
+      <div style="min-width: 36px; height: 36px; background: #0c4a6e; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 0.7rem; color: #38bdf8;">VA</div>
+      <div>
+        <div style="color: #64748b; font-size: 0.75rem;">vision_agent <span style="opacity: 0.5">→ JARVIS</span> &nbsp; <span style="color: #94a3b8;">info</span> &nbsp; 7:15:34</div>
+        <div style="color: #94a3b8; font-size: 0.85rem; margin-top: 4px;">FramePipeline SHM segments: 47 active, 12 stale (>60s age). No eviction policy configured.</div>
+      </div>
+    </div>
+
+    <!-- Persona: JARVIS (Body) -->
+    <div style="display: flex; gap: 0.8rem; margin-bottom: 1rem; padding: 1rem; background: rgba(34,211,238,0.08); border-left: 3px solid #22d3ee; border-radius: 0 8px 8px 0;">
+      <div style="min-width: 42px; height: 42px; background: linear-gradient(135deg, #0891b2, #06b6d4); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: bold; color: #fff;">J</div>
+      <div>
+        <div style="color: #22d3ee; font-size: 0.85rem; font-weight: 600;">JARVIS <span style="font-weight: 400; color: #64748b; font-size: 0.75rem;">The Body / Senses</span> &nbsp; 7:15:36</div>
+        <div style="color: #e2e8f0; font-size: 0.9rem; margin-top: 6px; line-height: 1.5;">I'm seeing sustained memory pressure from the vision loop. The FramePipeline has 47 active SHM segments with 12 stale entries that aren't being evicted. This started 18 minutes ago when the vision loop was re-enabled after the TCC fix.</div>
+        <div style="color: #64748b; font-size: 0.75rem; margin-top: 6px;">References: <span style="color: #38bdf8">health_monitor_agent</span>, <span style="color: #38bdf8">vision_agent</span></div>
+      </div>
+    </div>
+
+    <!-- Persona: J-Prime (Mind) -->
+    <div style="display: flex; gap: 0.8rem; margin-bottom: 1rem; padding: 1rem; background: rgba(167,139,250,0.08); border-left: 3px solid #a78bfa; border-radius: 0 8px 8px 0;">
+      <div style="min-width: 42px; height: 42px; background: linear-gradient(135deg, #7c3aed, #8b5cf6); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: bold; color: #fff;">JP</div>
+      <div>
+        <div style="color: #a78bfa; font-size: 0.85rem; font-weight: 600;">J-Prime <span style="font-weight: 400; color: #64748b; font-size: 0.75rem;">The Mind / Cognition</span> &nbsp; 7:15:41</div>
+        <div style="color: #e2e8f0; font-size: 0.9rem; margin-top: 6px; line-height: 1.5;">Root cause: FramePipeline in SHM mode has no TTL eviction. The zero-alloc retina downsample path writes segments but never marks them for cleanup. <strong>Proposal:</strong> Add TTL-based eviction (30s max age) to FramePipeline._shm_cleanup() with a background sweep every 5s. Per Manifesto §3, this is a deterministic fix — no agentic routing needed.</div>
+        <div style="color: #64748b; font-size: 0.75rem; margin-top: 6px;">Confidence: <span style="color: #4ade80">0.87</span> &nbsp;|&nbsp; Principle: §3 Spinal Cord &nbsp;|&nbsp; Tokens: 1,847</div>
+      </div>
+    </div>
+
+    <!-- Persona: Reactor (Immune System) -->
+    <div style="display: flex; gap: 0.8rem; margin-bottom: 1rem; padding: 1rem; background: rgba(239,68,68,0.08); border-left: 3px solid #ef4444; border-radius: 0 8px 8px 0;">
+      <div style="min-width: 42px; height: 42px; background: linear-gradient(135deg, #dc2626, #ef4444); border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: bold; color: #fff;">RC</div>
+      <div>
+        <div style="color: #ef4444; font-size: 0.85rem; font-weight: 600;">Reactor Core <span style="font-weight: 400; color: #64748b; font-size: 0.75rem;">The Immune System / Sandbox</span> &nbsp; 7:15:44</div>
+        <div style="color: #e2e8f0; font-size: 0.9rem; margin-top: 6px; line-height: 1.5;"><strong>Safety review:</strong> TTL eviction is low-risk — it only touches SHM segments owned by the vision process. No cross-domain access. No file I/O outside /tmp. AST scan: clean. <span style="color: #4ade80">&#x2705; Approved for Ouroboros synthesis.</span></div>
+        <div style="color: #64748b; font-size: 0.75rem; margin-top: 6px;">Iron Gate: PASS &nbsp;|&nbsp; Risk: LOW &nbsp;|&nbsp; Tokens: 923</div>
+      </div>
+    </div>
+
+    <!-- Consensus indicator -->
+    <div style="text-align: center; padding: 1rem; margin-top: 0.5rem; background: rgba(74,222,128,0.08); border: 1px solid rgba(74,222,128,0.3); border-radius: 8px;">
+      <span style="color: #4ade80; font-weight: bold; font-size: 0.9rem;">&#x1F91D; CONSENSUS REACHED</span>
+      <span style="color: #64748b; font-size: 0.8rem; display: block; margin-top: 4px;">Thread advancing to EXECUTING → Ouroboros Daemon receives scoped context payload</span>
+    </div>
+  </div>
+</div>
+
+<h3>Message Intent Types</h3>
+<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+  <div style="background: rgba(56,189,248,0.05); border: 1px solid rgba(56,189,248,0.2); border-radius: 10px; padding: 1rem;">
+    <h4 style="color: #38bdf8; margin-top: 0;">Agent Log Intents</h4>
+    <ul style="color: #94a3b8; font-size: 0.85rem; line-height: 1.8; padding-left: 1.2rem;">
+      <li><code>metric</code> — threshold breach / anomaly</li>
+      <li><code>observation</code> — pattern or state change</li>
+      <li><code>error</code> — failure report</li>
+      <li><code>graduation</code> — tool reached count >= 3</li>
+    </ul>
+  </div>
+  <div style="background: rgba(167,139,250,0.05); border: 1px solid rgba(167,139,250,0.2); border-radius: 10px; padding: 1rem;">
+    <h4 style="color: #a78bfa; margin-top: 0;">Persona Reasoning Intents</h4>
+    <ul style="color: #94a3b8; font-size: 0.85rem; line-height: 1.8; padding-left: 1.2rem;">
+      <li><code>observe</code> — synthesize specialist logs</li>
+      <li><code>propose</code> — suggest a solution</li>
+      <li><code>challenge</code> — raise an objection</li>
+      <li><code>support</code> — endorse a proposal</li>
+      <li><code>validate</code> — safety/Iron Gate review</li>
+      <li><code>consensus</code> — declare agreement</li>
+    </ul>
+  </div>
+</div>
