@@ -93,7 +93,7 @@ class DaemonNarrator:
         say_fn: Optional[Callable[..., Any]] = None,
         rate_limit_s: float = 60.0,
         enabled: bool = True,
-        voice: str = "Karen",
+        voice: str = "Samantha",
     ) -> None:
         self._say_fn = say_fn
         self.rate_limit_s = rate_limit_s
