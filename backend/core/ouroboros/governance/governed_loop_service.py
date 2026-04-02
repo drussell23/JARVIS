@@ -685,9 +685,11 @@ class GovernedLoopService:
         prime_client: Any = None,
         config: Optional[GovernedLoopConfig] = None,
         active_brain_set: FrozenSet[str] = frozenset(),
+        say_fn: Optional[Any] = None,
     ) -> None:
         self._stack = stack
         self._prime_client = prime_client
+        self._say_fn = say_fn
         self._config = config if config is not None else GovernedLoopConfig.from_env()
         self._state = ServiceState.INACTIVE
         self._started_at: Optional[float] = None
