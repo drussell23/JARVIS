@@ -183,7 +183,7 @@ async def main() -> None:
 
     # The orchestrator processes envelopes asynchronously via the intake
     # router's dispatch loop. Give it time to process.
-    max_wait = 360  # 6 minutes max (Doubleword batch API 397B can take 2-4 min)
+    max_wait = 600  # 10 minutes max (Doubleword batch API 397B takes 3-6 min for full_content)
     poll_interval = 5
     elapsed = 0
     last_status = ""
