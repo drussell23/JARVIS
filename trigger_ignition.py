@@ -261,7 +261,14 @@ async def _ignite_inner() -> None:
         log.warning("  PrimeClient init failed (%s: %s) — falling back to Claude", type(exc).__name__, exc)
         prime_client = None
 
-    gls = GovernedLoopService(stack=stack, prime_client=prime_client, config=loop_config)
+    _say_fn = None
+    try:
+        from backend.core.supervisor.unified_voice_orchestrator import safe_say
+        _say_fn = safe_say
+    except ImportError:
+        log.debug("safe_say not available — GLS narrators will be silent")
+
+    gls = GovernedLoopService(stack=stack, prime_client=prime_client, config=loop_config, say_fn=_say_fn)
     await gls.start()
     log.info("  GLS state   : %s", gls.state.name)
     log.info("  GLS health  : %s", gls.health())
