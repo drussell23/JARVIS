@@ -132,16 +132,97 @@ async def main() -> None:
     print("  Graduation threshold: 3 failures with same signature")
     print()
 
-    # The real bug: cu_task_planner.py has 3 DUPLICATE copies of the
-    # "search bar click" anti-pattern (lines 672-752). Ouroboros should
-    # detect this duplication and clean it up.
-    target_file = ROOT / "backend" / "vision" / "cu_task_planner.py"
+    # Use a small dedicated target file so Doubleword 397B can generate
+    # full_content within the generation timeout (~2 min for 60 lines).
+    # The full cu_task_planner.py (800+ lines) requires 32K output tokens
+    # which takes 5-10min via batch API — too slow for a smoke test.
+    target_file = ROOT / "backend" / "vision" / "cu_retry_handler.py"
+
+    # Create the target file if it doesn't exist — it has a known gap
+    # that the 397B should fix (missing exponential backoff).
+    if not target_file.exists():
+        target_file.write_text('''\
+"""CU Retry Handler — manages retry logic for CU step execution failures.
+
+Provides configurable retry with delay between attempts. Used by
+CUStepExecutor when a step fails (e.g., element not found, click missed).
+"""
+import asyncio
+import logging
+import time
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Default retry configuration
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY_S = 1.0
+
+
+class CURetryHandler:
+    """Handles retry logic for CU step execution.
+
+    Current limitation: uses fixed delay between retries.
+    TODO: Add exponential backoff with jitter to avoid thundering herd
+    when multiple CU tasks retry simultaneously.
+    """
+
+    def __init__(
+        self,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_delay_s: float = DEFAULT_RETRY_DELAY_S,
+    ) -> None:
+        self._max_retries = max_retries
+        self._retry_delay_s = retry_delay_s
+        self._total_retries = 0
+        self._total_successes = 0
+
+    async def execute_with_retry(self, step_fn, step_description: str = "") -> bool:
+        """Execute a step function with retry on failure.
+
+        Returns True if the step eventually succeeded, False if all retries exhausted.
+        """
+        for attempt in range(1, self._max_retries + 1):
+            try:
+                result = await step_fn()
+                if result:
+                    self._total_successes += 1
+                    return True
+            except Exception as exc:
+                logger.warning(
+                    "[CURetry] Step '%s' failed (attempt %d/%d): %s",
+                    step_description, attempt, self._max_retries, exc,
+                )
+
+            if attempt < self._max_retries:
+                # BUG: Fixed delay — should use exponential backoff
+                await asyncio.sleep(self._retry_delay_s)
+                self._total_retries += 1
+
+        logger.error(
+            "[CURetry] Step '%s' failed after %d attempts",
+            step_description, self._max_retries,
+        )
+        return False
+
+    @property
+    def stats(self) -> dict:
+        """Return retry statistics."""
+        return {
+            "total_retries": self._total_retries,
+            "total_successes": self._total_successes,
+        }
+''')
+        print(f"  Created target file: {target_file.name}")
+
     source_before = target_file.read_text()
     line_count = len(source_before.splitlines())
     print(f"  Target: {target_file.name} ({line_count} lines)")
     print()
 
-    # Feed 3 messaging failures with same signature to trigger graduation
+    # Feed 3 CU failures with same signature to trigger graduation.
+    # The error describes the retry handler's fixed-delay bug so the
+    # 397B knows what to fix.
     for i in range(3):
         record = CUExecutionRecord(
             goal="send message to Alice via Messages app",
@@ -149,7 +230,7 @@ async def main() -> None:
             steps_completed=2,
             steps_total=5,
             elapsed_s=3.0 + i * 0.5,
-            error="target not found: search bar click led to wrong contact",
+            error="retry delay too aggressive: all 3 retries fired within 3s, thundering herd on UI element",
             is_messaging=True,
             contact="Alice",
             app="messages",
