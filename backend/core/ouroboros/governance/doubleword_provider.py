@@ -116,6 +116,11 @@ class DoublewordProvider:
         self._session: Optional[Any] = None  # aiohttp.ClientSession (lazy)
 
     @property
+    def provider_name(self) -> str:
+        """Human-readable name for CandidateProvider protocol."""
+        return "doubleword-397b"
+
+    @property
     def is_available(self) -> bool:
         """Check if Doubleword is configured."""
         return bool(self._api_key)
@@ -329,6 +334,24 @@ class DoublewordProvider:
         if result is None:
             return self._empty_result(t0, "Batch retrieval failed")
         return result
+
+    # ------------------------------------------------------------------
+    # plan() — CandidateProvider protocol (used by ContextExpander)
+    # ------------------------------------------------------------------
+
+    async def plan(self, prompt: str, deadline: Any = None) -> str:
+        """Send a lightweight planning prompt via the batch API.
+
+        Used by ContextExpander for context expansion rounds. Returns
+        raw string response. On failure, raises so the caller can skip
+        the expansion round gracefully (ContextExpander expects this).
+        """
+        result = await self.prompt_only(
+            prompt=prompt,
+            caller_id="ouroboros_plan",
+            max_tokens=4000,
+        )
+        return result or ""
 
     # ------------------------------------------------------------------
     # Batch API stages (all deterministic — Tier 0 protocol)
