@@ -69,9 +69,9 @@ _CODEGEN_SYSTEM_PROMPT = (
 )
 
 # ── Phase 2B: size/security constants ────────────────────────────────────
-_MAX_TARGET_FILE_CHARS = 12000     # full content below this (increased from 6000)
-_TARGET_FILE_HEAD_CHARS = 8000     # head kept on truncation
-_TARGET_FILE_TAIL_CHARS = 2000     # tail kept on truncation
+_MAX_TARGET_FILE_CHARS = int(os.environ.get("JARVIS_CODEGEN_MAX_FILE_CHARS", "65536"))
+_TARGET_FILE_HEAD_CHARS = int(os.environ.get("JARVIS_CODEGEN_HEAD_CHARS", "52000"))
+_TARGET_FILE_TAIL_CHARS = int(os.environ.get("JARVIS_CODEGEN_TAIL_CHARS", "8000"))
 _MAX_IMPORT_CONTEXT_CHARS = 1500   # total across all discovered import files
 _MAX_TEST_CONTEXT_CHARS = 1500     # total across all discovered test files
 _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
@@ -129,8 +129,13 @@ def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -
         return ""
     if len(content) <= max_chars:
         return content
-    head = content[:_TARGET_FILE_HEAD_CHARS]
-    tail = content[-_TARGET_FILE_TAIL_CHARS:]
+    # Clamp: head_len uses configured HEAD but cannot exceed content-1 or 80% of budget.
+    # tail_len uses configured TAIL but cannot exceed remaining content after head.
+    # This prevents overlap when max_chars is tuned down while HEAD/TAIL stay large.
+    head_len = min(_TARGET_FILE_HEAD_CHARS, max_chars * 4 // 5, len(content) - 1)
+    tail_len = min(_TARGET_FILE_TAIL_CHARS, len(content) - head_len)
+    head = content[:head_len]
+    tail = content[-tail_len:] if tail_len > 0 else ""
     omitted_bytes = len(content.encode()) - len(head.encode()) - len(tail.encode())
     omitted_lines = content.count("\n") - head.count("\n") - tail.count("\n")
     marker = f"\n[TRUNCATED: {omitted_bytes} bytes, {omitted_lines} lines omitted]\n"
