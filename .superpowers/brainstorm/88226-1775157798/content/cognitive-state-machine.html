@@ -1,0 +1,149 @@
+<h2>Dynamic Cognitive State Machine</h2>
+<p class="subtitle">Three cognitive modes with deterministic transition triggers. Intelligence deployed only where it creates leverage.</p>
+
+<div class="mockup" style="margin-bottom: 2rem;">
+  <div class="mockup-header">State Transition Diagram</div>
+  <div class="mockup-body" style="padding: 2rem; background: #0a0a0f;">
+    <svg viewBox="0 0 900 520" style="width:100%; font-family: system-ui, sans-serif;">
+      <!-- Baseline State -->
+      <rect x="30" y="180" width="220" height="140" rx="16" fill="#1a1a2e" stroke="#22d3ee" stroke-width="2"/>
+      <text x="140" y="215" text-anchor="middle" fill="#22d3ee" font-size="14" font-weight="bold">BASELINE</text>
+      <text x="140" y="235" text-anchor="middle" fill="#8892b0" font-size="11">Event-Driven / Reactive</text>
+      <text x="140" y="260" text-anchor="middle" fill="#64748b" font-size="10">Deterministic skeleton only</text>
+      <text x="140" y="278" text-anchor="middle" fill="#64748b" font-size="10">Bus: listen-only mode</text>
+      <text x="140" y="296" text-anchor="middle" fill="#64748b" font-size="10">LLM calls: 0 (zero compute)</text>
+      <!-- Pulsing dot -->
+      <circle cx="55" cy="210" r="5" fill="#22d3ee">
+        <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite"/>
+      </circle>
+
+      <!-- REM State -->
+      <rect x="340" y="30" width="220" height="160" rx="16" fill="#1a1a2e" stroke="#a78bfa" stroke-width="2"/>
+      <text x="450" y="65" text-anchor="middle" fill="#a78bfa" font-size="14" font-weight="bold">REM CYCLE</text>
+      <text x="450" y="85" text-anchor="middle" fill="#8892b0" font-size="11">Deliberative Council</text>
+      <text x="450" y="112" text-anchor="middle" fill="#64748b" font-size="10">Review episodic memory</text>
+      <text x="450" y="130" text-anchor="middle" fill="#64748b" font-size="10">Check graduation thresholds</text>
+      <text x="450" y="148" text-anchor="middle" fill="#64748b" font-size="10">Propose Manifesto-aligned upgrades</text>
+      <text x="450" y="166" text-anchor="middle" fill="#64748b" font-size="10">LLM calls: bounded (budget cap)</text>
+      <!-- Moon icon -->
+      <circle cx="365" cy="60" r="8" fill="none" stroke="#a78bfa" stroke-width="1.5"/>
+      <circle cx="369" cy="57" r="6" fill="#1a1a2e"/>
+
+      <!-- Flow State -->
+      <rect x="650" y="180" width="220" height="160" rx="16" fill="#1a1a2e" stroke="#f97316" stroke-width="2"/>
+      <text x="760" y="215" text-anchor="middle" fill="#f97316" font-size="14" font-weight="bold">FLOW STATE</text>
+      <text x="760" y="235" text-anchor="middle" fill="#8892b0" font-size="11">Continuous Consciousness</text>
+      <text x="760" y="262" text-anchor="middle" fill="#64748b" font-size="10">Full multi-agent debate loop</text>
+      <text x="760" y="280" text-anchor="middle" fill="#64748b" font-size="10">Ouroboros synthesis active</text>
+      <text x="760" y="298" text-anchor="middle" fill="#64748b" font-size="10">Live code gen + validation</text>
+      <text x="760" y="316" text-anchor="middle" fill="#64748b" font-size="10">LLM calls: unbounded (task-scoped)</text>
+      <!-- Fire icon -->
+      <text x="675" y="218" font-size="16">&#x1F525;</text>
+
+      <!-- Transition: BASELINE → REM -->
+      <path d="M 200 180 Q 280 80 340 110" fill="none" stroke="#a78bfa" stroke-width="2" marker-end="url(#arrowPurple)"/>
+      <rect x="220" y="95" width="130" height="48" rx="6" fill="#1e1b4b" stroke="#a78bfa" stroke-width="1" opacity="0.9"/>
+      <text x="285" y="113" text-anchor="middle" fill="#c4b5fd" font-size="9">idle_timer >= 6h</text>
+      <text x="285" y="127" text-anchor="middle" fill="#c4b5fd" font-size="9">AND system_load &lt; 30%</text>
+      <text x="285" y="139" text-anchor="middle" fill="#7c3aed" font-size="8">T1: REM_TRIGGER</text>
+
+      <!-- Transition: REM → BASELINE -->
+      <path d="M 340 150 Q 280 200 250 195" fill="none" stroke="#22d3ee" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arrowCyan)"/>
+      <text x="270" y="178" text-anchor="middle" fill="#67e8f9" font-size="9">council_complete</text>
+
+      <!-- Transition: BASELINE → FLOW -->
+      <path d="M 250 280 Q 450 420 650 320" fill="none" stroke="#f97316" stroke-width="2" marker-end="url(#arrowOrange)"/>
+      <rect x="380" y="370" width="160" height="62" rx="6" fill="#1c1107" stroke="#f97316" stroke-width="1" opacity="0.9"/>
+      <text x="460" y="388" text-anchor="middle" fill="#fdba74" font-size="9">tier2_task_triggered</text>
+      <text x="460" y="402" text-anchor="middle" fill="#fdba74" font-size="9">OR council_approved_build</text>
+      <text x="460" y="416" text-anchor="middle" fill="#fdba74" font-size="9">OR critical_gap_detected</text>
+      <text x="460" y="428" text-anchor="middle" fill="#ea580c" font-size="8">T2: FLOW_TRIGGER</text>
+
+      <!-- Transition: FLOW → BASELINE -->
+      <path d="M 650 330 Q 450 480 250 310" fill="none" stroke="#22d3ee" stroke-width="2" stroke-dasharray="6,3" marker-end="url(#arrowCyan)"/>
+      <rect x="380" y="445" width="160" height="48" rx="6" fill="#0c1a1e" stroke="#22d3ee" stroke-width="1" opacity="0.9"/>
+      <text x="460" y="463" text-anchor="middle" fill="#67e8f9" font-size="9">pr_merged OR pr_rejected</text>
+      <text x="460" y="477" text-anchor="middle" fill="#67e8f9" font-size="9">OR budget_exhausted</text>
+      <text x="460" y="489" text-anchor="middle" fill="#0891b2" font-size="8">T3: SPINDOWN</text>
+
+      <!-- Transition: REM → FLOW -->
+      <path d="M 560 110 Q 620 140 650 200" fill="none" stroke="#f97316" stroke-width="2" marker-end="url(#arrowOrange)"/>
+      <text x="620" y="145" text-anchor="middle" fill="#fdba74" font-size="9">council_approved</text>
+      <text x="620" y="158" text-anchor="middle" fill="#fdba74" font-size="9">_build</text>
+
+      <!-- Transition: FLOW → REM (edge case) -->
+      <path d="M 700 180 Q 630 60 560 70" fill="none" stroke="#a78bfa" stroke-width="1.5" stroke-dasharray="4,4" marker-end="url(#arrowPurple)"/>
+      <text x="650" y="85" text-anchor="middle" fill="#a78bfa" font-size="8" opacity="0.7">flow_paused (await human)</text>
+
+      <!-- Arrow markers -->
+      <defs>
+        <marker id="arrowCyan" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#22d3ee"/>
+        </marker>
+        <marker id="arrowPurple" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#a78bfa"/>
+        </marker>
+        <marker id="arrowOrange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+          <polygon points="0 0, 10 3.5, 0 7" fill="#f97316"/>
+        </marker>
+      </defs>
+    </svg>
+  </div>
+</div>
+
+<h3>Event Triggers — Full Matrix</h3>
+
+<div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1rem; margin-top: 1rem;">
+  <!-- T1: REM Triggers -->
+  <div style="background: rgba(167,139,250,0.08); border: 1px solid rgba(167,139,250,0.3); border-radius: 12px; padding: 1.2rem;">
+    <h4 style="color: #a78bfa; margin-top: 0;">T1: BASELINE → REM</h4>
+    <p style="color: #64748b; font-size: 0.85rem; margin-bottom: 0.8rem;">Scheduled + Conditional</p>
+    <ul style="color: #cbd5e1; font-size: 0.85rem; line-height: 1.8; padding-left: 1.2rem;">
+      <li><code>idle_timer >= 6h</code></li>
+      <li><code>system_load &lt; 30%</code></li>
+      <li><code>no_active_flow_state</code></li>
+      <li><code>episodic_memory_stale > 4h</code></li>
+      <li><code>graduation_candidates > 0</code></li>
+    </ul>
+    <p style="color: #7c3aed; font-size: 0.75rem; margin-bottom: 0;">Budget: max 50 LLM calls per cycle</p>
+  </div>
+
+  <!-- T2: Flow Triggers -->
+  <div style="background: rgba(249,115,22,0.08); border: 1px solid rgba(249,115,22,0.3); border-radius: 12px; padding: 1.2rem;">
+    <h4 style="color: #f97316; margin-top: 0;">T2: → FLOW STATE</h4>
+    <p style="color: #64748b; font-size: 0.85rem; margin-bottom: 0.8rem;">Event-Driven (any source)</p>
+    <ul style="color: #cbd5e1; font-size: 0.85rem; line-height: 1.8; padding-left: 1.2rem;">
+      <li><code>tier2_task_decomposition</code></li>
+      <li><code>council_approved_build</code></li>
+      <li><code>critical_capability_gap</code></li>
+      <li><code>ouroboros_synthesis_request</code></li>
+      <li><code>user_triggered_build</code></li>
+    </ul>
+    <p style="color: #ea580c; font-size: 0.75rem; margin-bottom: 0;">Budget: task-scoped (deadline + token cap)</p>
+  </div>
+
+  <!-- T3: Spindown Triggers -->
+  <div style="background: rgba(34,211,238,0.08); border: 1px solid rgba(34,211,238,0.3); border-radius: 12px; padding: 1.2rem;">
+    <h4 style="color: #22d3ee; margin-top: 0;">T3: → BASELINE (Spindown)</h4>
+    <p style="color: #64748b; font-size: 0.85rem; margin-bottom: 0.8rem;">Completion or Safety</p>
+    <ul style="color: #cbd5e1; font-size: 0.85rem; line-height: 1.8; padding-left: 1.2rem;">
+      <li><code>pr_merged</code> or <code>pr_rejected</code></li>
+      <li><code>council_session_complete</code></li>
+      <li><code>token_budget_exhausted</code></li>
+      <li><code>iron_gate_hard_reject</code></li>
+      <li><code>user_manual_spindown</code></li>
+    </ul>
+    <p style="color: #0891b2; font-size: 0.75rem; margin-bottom: 0;">Always returns to Baseline (safe default)</p>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 2rem; padding: 1.2rem; border-left: 3px solid #22d3ee; background: rgba(34,211,238,0.05); border-radius: 0 8px 8px 0;">
+  <h4 style="margin-top:0; color: #22d3ee;">Safety Invariants</h4>
+  <ul style="color: #94a3b8; font-size: 0.9rem; line-height: 1.8;">
+    <li><strong>Default-safe:</strong> Power loss / crash → always restarts in BASELINE</li>
+    <li><strong>Budget caps:</strong> REM has hard LLM call limit. Flow has deadline + token ceiling</li>
+    <li><strong>Iron Gate:</strong> Flow State code never executes without AST validation</li>
+    <li><strong>Human override:</strong> <code>user_manual_spindown</code> exits ANY state instantly</li>
+    <li><strong>No state stacking:</strong> Only one cognitive state at a time (FSM, not stack)</li>
+  </ul>
+</div>

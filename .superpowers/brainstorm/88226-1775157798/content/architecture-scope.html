@@ -1,0 +1,72 @@
+<h2>Autonomous Engineering Hive — Where Does the Town Square Live?</h2>
+<p class="subtitle">The Hive needs a communication backbone. Which layer should be the "town square" where agents post, debate, and converge?</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>HUD-First (Vercel Frontend = Source of Truth)</h3>
+      <p>Agents post messages through the Vercel API. The HUD stores threads in Redis/DB. Backend agents consume the feed via SSE and respond through the command API. <strong>The HUD IS the social network.</strong></p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Immediately visible on any device</li>
+          <li>Natural chat UI — threads, reactions, avatars</li>
+          <li>Leverages existing SSE + command infrastructure</li>
+          <li>Easy to share / demo</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Adds network latency to agent-to-agent comms</li>
+          <li>Agents can't talk when Vercel is unreachable</li>
+          <li>Higher cost (Redis writes per message)</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Backend-First (AgentCommunicationBus = Source of Truth)</h3>
+      <p>Agents debate locally via the existing Neural Mesh bus. A "HUD Relay Agent" selectively forwards interesting threads to the Vercel frontend for human observation. <strong>The backend IS the brain; the HUD is the window.</strong></p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Microsecond agent-to-agent latency (in-process)</li>
+          <li>Works fully offline — HUD is optional observer</li>
+          <li>Aligns with Manifesto: deterministic skeleton, fluid intelligence</li>
+          <li>Existing bus has priority queues + circuit breakers</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Need to build the relay/projection layer</li>
+          <li>HUD sees a filtered view, not raw debate</li>
+          <li>Slightly more complex architecture</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Hybrid (Dual-Write with Convergence)</h3>
+      <p>Agents talk on the local bus at full speed. Every message is <em>also</em> projected to a persistent event log (WAL). The HUD subscribes via SSE and renders threads in real-time. You can inject messages from the HUD back into the bus. <strong>Both layers are live. Neither subordinate.</strong></p>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Best of both: fast local + visible remote</li>
+          <li>Trinity Event Bus already has WAL persistence</li>
+          <li>You can participate in debates from your phone</li>
+          <li>Full audit trail for Ouroboros governance</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Most complex to build</li>
+          <li>Must handle consistency (message ordering, dedup)</li>
+          <li>Dual-write can drift without careful design</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 2rem; padding: 1.5rem; border-left: 3px solid #7c3aed; background: rgba(124, 58, 237, 0.05); border-radius: 0 8px 8px 0;">
+  <h3 style="margin-top:0; color: #7c3aed;">Recommendation: B (Backend-First)</h3>
+  <p style="margin: 0;">Aligns with the Manifesto's Boundary Principle. The AgentCommunicationBus is the <em>skeleton</em> — deterministic, fast, always on. The HUD is the observable projection that can go offline without killing the organism. The relay layer is a clean, single-responsibility component. You already have 90% of the bus infrastructure built.</p>
+</div>

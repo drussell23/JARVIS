@@ -29,7 +29,6 @@ Requires:
 import asyncio
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -42,32 +41,14 @@ try:
 except ImportError:
     pass
 
-_VOICE = os.environ.get("OUROBOROS_NARRATOR_VOICE", "Samantha")
+# Disable all voice output — terminal only. Prevents overlapping TTS
+# from the smoke test's own narration AND the pipeline's VoiceNarrator.
+os.environ["JARVIS_VOICE_ENABLED"] = "0"
 
 
 async def _samantha(text: str) -> None:
-    """Ouroboros voice (Samantha)."""
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".aiff", delete=False) as tmp:
-            tmp_path = tmp.name
-        proc = await asyncio.create_subprocess_exec(
-            "say", "-v", _VOICE, "-o", tmp_path, text,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(proc.communicate(), timeout=15)
-        play = await asyncio.create_subprocess_exec(
-            "afplay", tmp_path,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(play.communicate(), timeout=15)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-    except Exception:
-        pass
+    """Print narration to terminal (voice disabled for smoke test)."""
+    print(f"  [Samantha] {text}")
 
 
 async def main() -> None:
