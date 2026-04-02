@@ -417,6 +417,13 @@ class CandidateGenerator:
             _is_cross_repo = getattr(context, "cross_repo", False)
             _qualifies = _complexity in _TIER0_COMPLEXITY_CLASSES or _is_cross_repo
 
+            # When Doubleword IS the primary provider, ALL tasks qualify for
+            # tier0 async submission — the complexity gate only applies when
+            # tier0 is a supplementary optimization alongside a real primary.
+            _dw_is_only_provider = (self._primary is self._tier0 or self._fallback is self._tier0)
+            if _dw_is_only_provider:
+                _qualifies = True
+
             if not _qualifies:
                 logger.debug(
                     "[CandidateGenerator] Tier 0 skipped: complexity=%r, "
@@ -462,6 +469,39 @@ class CandidateGenerator:
                         "falling through to Tier 1",
                         t0_exc,
                     )
+
+        # Async-first: if Doubleword is both tier0 AND the primary/fallback,
+        # await the background poll instead of calling generate() synchronously.
+        # Doubleword's batch API is designed for async — synchronous use always
+        # times out because the batch queue + model warm-up takes 2-4 minutes.
+        _dw_poll_task = self._background_polls.get(_op_id)
+        _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
+        _dw_is_fallback = (self._tier0 is not None and self._fallback is self._tier0)
+
+        if _dw_poll_task is not None and (_dw_is_primary or _dw_is_fallback):
+            logger.info(
+                "[CandidateGenerator] Awaiting async Doubleword batch (primary=%s, fallback=%s)",
+                _dw_is_primary, _dw_is_fallback,
+            )
+            remaining = self._remaining_seconds(deadline)
+            try:
+                await asyncio.wait_for(asyncio.shield(_dw_poll_task), timeout=remaining)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning("[CandidateGenerator] Doubleword async poll timed out")
+            except Exception as exc:
+                logger.warning("[CandidateGenerator] Doubleword async poll error: %s", exc)
+
+            # Check if result is now available
+            _completed = self._completed_batches.pop(_op_id, None)
+            if _completed is not None and _completed.result is not None:
+                _result = _completed.result
+                if len(_result.candidates) > 0:
+                    logger.info(
+                        "[CandidateGenerator] Doubleword async result: %d candidates",
+                        len(_result.candidates),
+                    )
+                    return _result
+            logger.warning("[CandidateGenerator] Doubleword async poll completed but no usable candidates")
 
         # Tier 1 + Tier 2: Primary (J-Prime) → Fallback (Claude)
         state = self.fsm.state
