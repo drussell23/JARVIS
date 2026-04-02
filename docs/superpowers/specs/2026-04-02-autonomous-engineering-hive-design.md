@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-02
 **Author:** Derek J. Russell + Claude Opus 4.6
-**Status:** Draft — pending user review
+**Status:** Approved — implementation ready
 **Manifesto Version:** Symbiotic AI-Native Manifesto v4
 
 ## Overview
@@ -41,13 +41,13 @@ A 3-state FSM governing the Hive's cognitive intensity. The organism shifts mode
 | **T2b: COUNCIL_ESCALATION** | REM → FLOW | `council_approved_build` |
 | **T3: SPINDOWN** | FLOW → BASELINE | `pr_merged` OR `pr_rejected` OR `token_budget_exhausted` OR `iron_gate_hard_reject` OR `user_manual_spindown` OR **`debate_timeout(X min)` OR `debate_token_threshold(Y tokens)`** |
 | **T3b: COUNCIL_COMPLETE** | REM → BASELINE | `council_session_complete` |
-| **T4: FLOW_PAUSE** | FLOW → REM | `flow_paused_await_human` (edge case: human review requested mid-flow) |
+| **T4: FLOW_PAUSE** | FLOW → REM | `flow_paused_await_human` — triggered when `JARVIS_HIVE_OUROBOROS_MODE=confirm` and thread reaches CONSENSUS. Thread waits for human approval on HUD before Ouroboros handoff. See §6 Policy Switch. |
 
 ### Safety Invariants
 
 - **Default-safe:** Power loss / crash always restarts in BASELINE.
 - **Budget caps:** REM has hard LLM call limit. FLOW has deadline + token ceiling.
-- **Debate timeout:** If agents fail to converge within X minutes or Y tokens, FLOW aborts autonomously with `FAILURE_TO_CONVERGE` error logged.
+- **Debate timeout:** If agents fail to converge within X minutes or Y tokens, FLOW aborts autonomously with `FAILURE_TO_CONVERGE` error logged. X and Y are configured via `JARVIS_HIVE_FLOW_DEBATE_TIMEOUT_M` and `JARVIS_HIVE_FLOW_TOKEN_CEILING` (see §9).
 - **Iron Gate:** FLOW state code never executes without AST validation.
 - **Human override:** `user_manual_spindown` exits ANY state instantly.
 - **No state stacking:** Only one cognitive state at a time (FSM, not stack).
@@ -72,10 +72,10 @@ OPEN → DEBATING → CONSENSUS → EXECUTING → RESOLVED
 
 - **OPEN:** Created by a triggering event (specialist log, user request, REM discovery). No LLM calls yet.
 - **DEBATING:** Trinity Personas are actively reasoning. FLOW state active. Token meter running.
-- **CONSENSUS:** All three Personas have converged on a solution. Thread history frozen as Ouroboros context payload.
+- **CONSENSUS:** Reactor Core approved a proposal via `validate(approve)`. Prerequisites: at least one `observe` from JARVIS and one `propose` from J-Prime must exist in the thread before Reactor can validate. Thread history frozen as Ouroboros context payload.
 - **EXECUTING:** Ouroboros pipeline running. `linked_op_id` joins thread to operation.
 - **RESOLVED:** PR opened/merged, or execution complete. Thread archived.
-- **STALE:** Debate timeout hit without consensus. `FAILURE_TO_CONVERGE` logged. Returns to BASELINE.
+- **STALE:** Debate timeout hit without Reactor approval. `FAILURE_TO_CONVERGE` logged. Returns to BASELINE.
 
 ### Context Isolation
 
@@ -156,7 +156,8 @@ class PersonaReasoningMessage:
     message_id: str                   # "msg_{ulid}"
     persona: Literal["jarvis", "j_prime", "reactor"]
     role: Literal["body", "mind", "immune_system"]
-    intent: PersonaIntent             # observe | propose | challenge | support | validate | consensus
+    intent: PersonaIntent             # observe | propose | challenge | support | validate
+    validate_verdict: Optional[Literal["approve", "reject"]] = None  # Only set when intent=validate (Reactor only)
     references: list[str]             # message_ids of agent_logs being synthesized
     manifesto_principle: Optional[str] # Which Manifesto section justifies reasoning
     reasoning: str                    # The actual reasoning text
@@ -167,12 +168,13 @@ class PersonaReasoningMessage:
 ```
 
 **Persona Reasoning Intents:**
-- `observe` — synthesize specialist logs into a coherent picture
-- `propose` — suggest a solution or improvement
-- `challenge` — raise an objection or identify a risk
-- `support` — endorse a proposal with additional evidence
-- `validate` — safety/Iron Gate review (Reactor's primary role)
-- `consensus` — declare agreement, trigger thread state transition
+- `observe` — synthesize specialist logs into a coherent picture (JARVIS primary)
+- `propose` — suggest a solution or improvement (J-Prime primary)
+- `challenge` — raise an objection or identify a risk (any Persona)
+- `support` — endorse a proposal with additional evidence (any Persona)
+- `validate` — safety/Iron Gate review with `approve` or `reject` verdict (Reactor only — this is the consensus gate)
+
+**Note:** The `consensus` intent from earlier drafts is removed. Thread consensus is a **state transition** triggered by Reactor's `validate(approve)`, not a separate message type. This prevents re-introducing a "three-way vote" in the schema.
 
 ### Trinity Persona Roles
 
@@ -248,10 +250,10 @@ Added to the existing event stream (no new connections):
 
 New `BaseNeuralMeshAgent` subclass that bridges the bus to the HUD:
 
-- Subscribes to `hive.*` topics on `AgentCommunicationBus`
+- Subscribes to `hive.*` topics on `AgentCommunicationBus` via wildcard (`hive.#`) — single subscription, not per-thread
 - Filters/batches messages (don't flood SSE with every heartbeat)
-- Projects to Vercel SSE via existing `/api/command` POST or direct Redis XADD
-- Projects to IPC (8742) for native HUD
+- **v1 projection path:** IPC (8742) only — the brainstem already bridges IPC→Vercel SSE via `command_sender.py`. Hive events flow through the same pipe as existing events, using the new event types (`agent_log`, `persona_reasoning`, `thread_lifecycle`, `cognitive_transition`). No direct Redis XADD in v1.
+- **Future (v2):** Direct Redis XADD for lower-latency cloud projection if IPC relay becomes a bottleneck.
 - Maintains message ordering guarantees via monotonic sequence numbers
 
 ### Native HUD (SwiftUI)
@@ -287,18 +289,25 @@ New `BaseNeuralMeshAgent` subclass that bridges the bus to the HUD:
 
 ### Handoff Mechanism: Direct Injection (A)
 
-When a thread reaches CONSENSUS:
+When a thread reaches CONSENSUS (Reactor's `validate(approve)`):
 
-1. Thread manager serializes consensus into `OperationContext`:
-   - `description`: consensus summary from the `consensus` message
-   - `target_files`: files referenced in the debate
-   - `context_expansion`: full thread history (Tier 1 + Tier 2 messages)
-   - `trace_ids`: thread_id for audit trail linkage
+1. Thread manager serializes consensus into `OperationContext` using existing fields:
+   - `description` ← consensus summary (Reactor's validate message `.reasoning`)
+   - `target_files` ← tuple of file paths referenced across all thread messages
+   - `strategic_memory_prompt` ← serialized thread history (Tier 1 + Tier 2 messages as JSON). This field exists, accepts arbitrary text, and is injected into the codegen prompt by `_build_codegen_prompt()`
+   - `causal_trace_id` ← `thread_id` (links Ouroboros op back to the Hive debate for audit)
+   - `correlation_id` ← `thread_id` (enables cross-operation correlation in telemetry)
+   - `human_instructions` ← Manifesto principles cited in the thread (injected alongside OUROBOROS.md hierarchy)
+   - `frozen_autonomy_tier` ← `"governed"` (inherits from GovernedLoopService default)
+   - Hash chain: `OperationContext.create()` computes `context_hash` from all fields; `advance()` extends the chain. No special handling needed — the existing `_compute_hash()` covers new field values.
+   - `asdict()`: all mapped fields are already in the frozen dataclass; no schema extension required for v1.
 2. Submits to `GovernedLoopService.submit()` via existing intake path
-3. Thread transitions to EXECUTING, `linked_op_id` set
+3. Thread transitions to EXECUTING, `linked_op_id` ← `ctx.op_id`
 4. Bus emits `thread_lifecycle: executing → {thread_id, linked_op_id}`
 5. Ouroboros runs normal pipeline: CLASSIFY→ROUTE→CONTEXT_EXPANSION→GENERATE→VALIDATE→GATE→APPLY→VERIFY→COMPLETE
 6. On completion, thread transitions to RESOLVED with `linked_pr_url`
+
+**Future extension (not v1):** If thread metadata outgrows `strategic_memory_prompt`, add a dedicated `hive_metadata: Optional[HiveHandoffContext]` field to `OperationContext` with proper `_compute_hash` / `asdict` updates.
 
 ### Policy Switch
 
@@ -366,6 +375,8 @@ HUD Relay Agent
 | `JARVIS-Apple/JARVISHUD/Services/HiveStore.swift` | @Observable store for hive events |
 | `jarvis-cloud/app/dashboard/hive/page.tsx` | Web dashboard Hive view |
 | `jarvis-cloud/app/api/stream/[deviceId]/route.ts` | Extended with new event types |
+
+**Note:** `JARVIS-Apple/` and `jarvis-cloud/` live in separate repos/directories. This file list is program-wide tracking; implementation plans for those targets will reference their actual repo paths.
 
 ---
 
