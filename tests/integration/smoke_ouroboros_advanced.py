@@ -148,7 +148,7 @@ with 12 spaces (it goes inside the while loop).
     generated_code = await provider.prompt_only(
         prompt=prompt,
         caller_id="ouroboros_advanced_codegen",
-        max_tokens=3000,
+        max_tokens=20000,
     )
 
     elapsed = time.monotonic() - t0
