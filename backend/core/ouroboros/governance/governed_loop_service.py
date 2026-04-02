@@ -2299,6 +2299,7 @@ class GovernedLoopService:
             # SKIP if Doubleword was promoted to primary — Doubleword didn't fail
             # the probe; the original PrimeProvider did. FSM should stay PRIMARY_READY.
             _doubleword_is_primary = (tier0 is not None and effective_primary is tier0)
+            self._doubleword_is_primary = _doubleword_is_primary
             if primary is not None and not _primary_probe_ok and not _doubleword_is_primary and self._generator is not None:
                 try:
                     self._generator.fsm.record_primary_failure()
@@ -2454,11 +2455,21 @@ class GovernedLoopService:
             )
 
         # Build orchestrator
+        # When Doubleword is primary, disable context expansion — its batch API
+        # is too slow for plan() calls (~2-4 min). Sub-project B provides full
+        # file context + AST index, making expansion less critical.
+        _dw_primary = getattr(self, "_doubleword_is_primary", False)
+        _ctx_expansion = self._config.context_expansion_enabled if hasattr(self._config, "context_expansion_enabled") else True
+        if _dw_primary:
+            _ctx_expansion = False
+            logger.info("[GovernedLoop] Context expansion disabled (Doubleword primary — batch API too slow for plan())")
+
         orch_config = OrchestratorConfig(
             project_root=self._config.project_root,
             repo_registry=repo_registry,
             generation_timeout_s=self._config.generation_timeout_s,
             context_expansion_timeout_s=self._config.context_expansion_timeout_s,
+            context_expansion_enabled=_ctx_expansion,
             approval_timeout_s=self._config.approval_timeout_s,
             message_bus=self._saga_bus,
             repair_engine=_repair_engine,
