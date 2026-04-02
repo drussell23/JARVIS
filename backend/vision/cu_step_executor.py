@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=ouro-adv-B-1) at 2026-04-02 01:09 UTC
+# Reason: Pattern B: document osascript paste fix (pyautogui modifier drop under CoreAudio load)
+
 """
 CU Step Executor -- 3-Layer Cascade for JARVIS Computer Use
 
@@ -172,6 +175,12 @@ def _execute_action_impl(
 
 def _clipboard_type(text: str) -> None:
     """Type text via clipboard (pbcopy + osascript Cmd+V) for reliability.
+
+    [Ouroboros Pattern B Fix] Uses osascript System Events for Cmd+V
+    instead of pyautogui.hotkey because pyautogui drops the Command
+    modifier under CoreAudio IOWorkLoop overload (HALC_ProxyIOContext),
+    causing only "v" to be typed. osascript goes through the native
+    macOS Accessibility event path which never drops modifiers.
 
     Uses clipboard paste because pyautogui.typewrite doesn't support
     unicode characters or special chars reliably on macOS.
