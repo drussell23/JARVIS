@@ -612,6 +612,20 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] TodoScannerSensor skipped: %s", exc)
 
+        # ---- CUExecutionSensor (Pillar 6: Vision Neuroplasticity) ----
+        # Event-driven sensor — records fed by ActionDispatcher after CU execution.
+        # Singleton re-wiring: CUExecutionSensor.__init__ accepts router= on
+        # re-init (if already constructed by get_cu_execution_sensor() elsewhere).
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.cu_execution_sensor import (
+                CUExecutionSensor,
+            )
+            _cu_sensor = CUExecutionSensor(router=self._router, repo="jarvis")
+            self._sensors.append(_cu_sensor)
+            logger.info("[IntakeLayer] CUExecutionSensor wired (vision neuroplasticity active)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] CUExecutionSensor skipped: %s", exc)
+
         # ---- ReactorEventConsumer (P3) ----
         self._reactor_consumer = None
         try:
