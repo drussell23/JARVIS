@@ -57,6 +57,17 @@ async def main() -> None:
     print("=" * 72)
     print()
 
+    # Verify critical env vars are loaded
+    _dw_key = os.environ.get("DOUBLEWORD_API_KEY", "")
+    print(f"  DOUBLEWORD_API_KEY: {'SET (' + str(len(_dw_key)) + ' chars)' if _dw_key else 'NOT SET'}")
+    print(f"  DOUBLEWORD_MAX_TOKENS: {os.environ.get('DOUBLEWORD_MAX_TOKENS', '10000 (default)')}")
+    print(f"  JARVIS_GENERATION_TIMEOUT_S: {os.environ.get('JARVIS_GENERATION_TIMEOUT_S', '60 (default)')}")
+    print()
+
+    if not _dw_key:
+        print("  [FAIL] DOUBLEWORD_API_KEY not set. Load .env or export it.")
+        sys.exit(1)
+
     await _samantha(
         "Ouroboros advanced smoke test activated. "
         "Booting full governance pipeline in HUD mode."

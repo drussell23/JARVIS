@@ -2296,7 +2296,10 @@ class GovernedLoopService:
             # Sync FSM to reflect actual startup probe result.
             # Without this, the FSM stays at PRIMARY_READY even when the startup
             # probe failed, making the FALLBACK_ACTIVE branch in start() unreachable.
-            if primary is not None and not _primary_probe_ok and self._generator is not None:
+            # SKIP if Doubleword was promoted to primary — Doubleword didn't fail
+            # the probe; the original PrimeProvider did. FSM should stay PRIMARY_READY.
+            _doubleword_is_primary = (tier0 is not None and effective_primary is tier0)
+            if primary is not None and not _primary_probe_ok and not _doubleword_is_primary and self._generator is not None:
                 try:
                     self._generator.fsm.record_primary_failure()
                 except Exception:
