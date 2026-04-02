@@ -2269,21 +2269,15 @@ class GovernedLoopService:
 
         # Build CandidateGenerator (needs at least one provider)
         # When J-Prime (primary) is unhealthy at startup and Doubleword (tier0)
-        # is available, promote Doubleword into the synchronous failback chain
-        # so GENERATE can actually produce code. Doubleword.generate() blocks
-        # until the batch completes — it's a valid synchronous provider.
+        # is available, promote Doubleword to PRIMARY so GENERATE doesn't waste
+        # time on J-Prime timeouts. Doubleword.generate() blocks until the batch
+        # completes — it's a valid synchronous provider.
         if tier0 is not None and not _primary_probe_ok:
-            if primary is None:
-                primary = tier0
-                logger.info("[GovernedLoop] Promoting DoublewordProvider to primary (J-Prime unavailable)")
-            elif fallback is None:
-                fallback = tier0
-                logger.info("[GovernedLoop] Promoting DoublewordProvider to fallback (Claude unavailable)")
-            else:
-                # Both primary and fallback exist but primary is unhealthy.
-                # Replace fallback with Doubleword if Claude key is likely invalid.
-                fallback = tier0
-                logger.info("[GovernedLoop] Promoting DoublewordProvider to fallback (primary unhealthy)")
+            # Doubleword becomes primary; demote J-Prime to fallback (for recovery)
+            _demoted = primary
+            primary = tier0
+            fallback = _demoted or fallback  # Keep J-Prime as fallback if it exists
+            logger.info("[GovernedLoop] Promoting DoublewordProvider to PRIMARY (J-Prime unhealthy)")
 
         if primary is not None or fallback is not None:
             # If only one provider, use it as both (FSM still works)
