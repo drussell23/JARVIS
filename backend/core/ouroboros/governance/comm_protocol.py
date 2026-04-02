@@ -285,6 +285,7 @@ class CommProtocol:
         outcome: str,
         reason_code: str,
         diff_summary: Optional[str] = None,
+        target_files: Optional[List[str]] = None,
     ) -> None:
         """Emit a DECISION message (phase 4).  Causal parent links to previous."""
         causal_parent = self._prev_seq(op_id)
@@ -295,6 +296,8 @@ class CommProtocol:
         }
         if diff_summary is not None:
             payload["diff_summary"] = diff_summary
+        if target_files is not None:
+            payload["target_files"] = target_files
         msg = CommMessage(
             msg_type=MessageType.DECISION,
             op_id=op_id,
@@ -310,6 +313,7 @@ class CommProtocol:
         root_cause: str,
         failed_phase: Optional[str],
         next_safe_action: Optional[str] = None,
+        target_files: Optional[List[str]] = None,
     ) -> None:
         """Emit a POSTMORTEM message (phase 5).  Causal parent links to previous."""
         causal_parent = self._prev_seq(op_id)
@@ -320,6 +324,8 @@ class CommProtocol:
         }
         if next_safe_action is not None:
             payload["next_safe_action"] = next_safe_action
+        if target_files is not None:
+            payload["target_files"] = target_files
         msg = CommMessage(
             msg_type=MessageType.POSTMORTEM,
             op_id=op_id,
