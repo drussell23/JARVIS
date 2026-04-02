@@ -296,7 +296,7 @@ class DoublewordProvider:
 
     async def generate(
         self,
-        ctx: OperationContext,
+        context: OperationContext,
         deadline: Any = None,
         *,
         prompt_override: Optional[str] = None,
@@ -305,13 +305,13 @@ class DoublewordProvider:
 
         Parameters
         ----------
-        ctx:
+        context:
             OperationContext with target files and description.
         deadline:
             datetime deadline from orchestrator (used to cap poll time).
             Conforms to CandidateProvider protocol.
         prompt_override:
-            Optional prompt to use instead of building from ctx.
+            Optional prompt to use instead of building from context.
 
         Returns GenerationResult with provider_used="doubleword".
         Falls through to empty result on failure (caller handles fallback).
@@ -326,11 +326,11 @@ class DoublewordProvider:
             )
 
         t0 = time.monotonic()
-        pending = await self.submit_batch(ctx, prompt_override=prompt_override)
+        pending = await self.submit_batch(context, prompt_override=prompt_override)
         if pending is None:
             return self._empty_result(t0, "Batch submission failed")
 
-        result = await self.poll_and_retrieve(pending, ctx)
+        result = await self.poll_and_retrieve(pending, context)
         if result is None:
             return self._empty_result(t0, "Batch retrieval failed")
         return result
