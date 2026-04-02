@@ -4541,7 +4541,36 @@ async def lifespan(app: FastAPI):  # type: ignore[misc]
 
     create_safe_task(_init_agent_runtime_bg(), name="agent_runtime_init")
 
+    # ── HUD Governance Boot (Sub-project E) ──────────────────────────
+    if HUD_MODE and os.environ.get("JARVIS_HUD_GOVERNANCE_ENABLED", "1").strip().lower() not in ("0", "false", "no"):
+        try:
+            from backend.core.ouroboros.governance.hud_governance_boot import (
+                start_hud_governance,
+            )
+            app.state.hud_gov_ctx = await start_hud_governance(
+                project_root=Path.cwd(),
+            )
+            if app.state.hud_gov_ctx.is_active:
+                logger.info("[HUD] Ouroboros governance ACTIVE — full pipeline operational")
+            else:
+                logger.warning("[HUD] Ouroboros governance DEGRADED — partial pipeline")
+        except Exception as exc:
+            logger.warning("[HUD] Governance boot failed (CU still operational): %s", exc)
+            app.state.hud_gov_ctx = None
+
     yield
+
+    # ── HUD Governance Shutdown (Sub-project E) ──────────────────────
+    _gov_ctx = getattr(app.state, "hud_gov_ctx", None)
+    if _gov_ctx is not None:
+        try:
+            from backend.core.ouroboros.governance.hud_governance_boot import (
+                stop_hud_governance,
+            )
+            await stop_hud_governance(_gov_ctx)
+            logger.info("[HUD] Governance shutdown complete")
+        except Exception as exc:
+            logger.debug("[HUD] Governance shutdown error: %s", exc)
 
     # Cleanup
     logger.info("🛑 Shutting down JARVIS backend...")
