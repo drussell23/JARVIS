@@ -31,12 +31,17 @@ _TARGET_FILE_TAIL_CHARS = int(os.environ.get("JARVIS_CODEGEN_TAIL_CHARS", "8000"
 
 ```python
 def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -> str:
-    content = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
     if len(content) <= max_chars:
         return content
-    # Clamp head+tail to not exceed content length or max_chars
-    head_len = min(_TARGET_FILE_HEAD_CHARS, max_chars * 4 // 5, len(content) // 2)
-    tail_len = min(_TARGET_FILE_TAIL_CHARS, max_chars - head_len, len(content) - head_len)
+    # Clamp: head_len uses configured HEAD but cannot exceed content-1 or 80% of budget.
+    # tail_len uses configured TAIL but cannot exceed remaining content after head.
+    # This prevents overlap when max_chars is tuned down while HEAD/TAIL stay large.
+    head_len = min(_TARGET_FILE_HEAD_CHARS, max_chars * 4 // 5, len(content) - 1)
+    tail_len = min(_TARGET_FILE_TAIL_CHARS, len(content) - head_len)
     head = content[:head_len]
     tail = content[-tail_len:] if tail_len > 0 else ""
     omitted_bytes = len(content.encode()) - len(head.encode()) - len(tail.encode())
@@ -44,6 +49,8 @@ def _read_with_truncation(path: Path, max_chars: int = _MAX_TARGET_FILE_CHARS) -
     marker = f"\n[TRUNCATED: {omitted_bytes} bytes, {omitted_lines} lines omitted]\n"
     return head + marker + tail
 ```
+
+Note: The previous `len(content) // 2` guard over-clamped when the file was only slightly larger than `max_chars`. The corrected formula uses `len(content) - 1` for head and `len(content) - head_len` for tail, maximizing coverage while preventing overlap.
 
 Import/test context budgets (`_MAX_IMPORT_CONTEXT_CHARS`, `_MAX_TEST_CONTEXT_CHARS`) stay as-is — they're supplementary.
 
@@ -102,7 +109,7 @@ Add `_build_function_index(content: str, file_path: str) -> str`:
 Add `_build_recent_file_history(path: Path, repo_root: Path) -> str`:
 
 1. Check `(repo_root / ".git").exists()`. If not, return empty string. No subprocess, no crash.
-2. Resolve path relative to repo_root using `path.relative_to(repo_root)`.
+2. Resolve path relative to repo_root using `path.relative_to(repo_root)`. Catch `ValueError` (path not under repo_root) and return empty string.
 3. Run `git log --oneline -5 -- <relative_path>` with:
    - `cwd=repo_root`
    - `timeout=3` seconds (prevent CI/sandbox hangs)
