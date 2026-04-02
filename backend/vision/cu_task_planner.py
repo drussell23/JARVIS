@@ -2,6 +2,9 @@
 # [Ouroboros] Modified by Ouroboros (op=ouro-adv-A-1) at 2026-04-02 01:09 UTC
 # [Ouroboros] Modified by Ouroboros (op=ouro-codegen) at 2026-04-02 01:15 UTC
 # [Ouroboros] Modified by Ouroboros (op=ouro-codegen) at 2026-04-02 02:28 UTC
+# [Ouroboros] Modified by Ouroboros (op=ouro-codegen) at 2026-04-02 18:56 UTC
+# Reason: Add search-bar-when-active anti-pattern to _filter_messaging_antipatterns
+
 # Reason: Add search-bar-when-active anti-pattern to _filter_messaging_antipatterns
 
 # Reason: Add search-bar-when-active anti-pattern to _filter_messaging_antipatterns
@@ -697,6 +700,34 @@ class CUTaskPlanner:
 # Detect "click search → type name" pattern.
             # If a click step targets "search" followed by typing a short name,
             # the planner is unnecessarily searching for an active contact.
+            if (
+                step.action == "click"
+                and step.target
+                and "search" in step.target.lower()
+                and i + 1 < len(steps)
+                and steps[i + 1].action == "type"
+                and steps[i + 1].text
+            ):
+                next_text = steps[i + 1].text.strip()
+                is_name_like = (
+                    len(next_text.split()) <= 2
+                    and not any(c in next_text for c in ".!?,;:@#$")
+                    and len(next_text) < 30
+                )
+                if is_name_like:
+                    logger.warning(
+                        "[CUTaskPlanner] BLOCKED search-for-active-contact anti-pattern: "
+                        "would have searched for %r when conversation may already be open",
+                        next_text,
+                    )
+                    i += 2  # Skip search click + name type
+                    continue
+
+# [Ouroboros] Pattern 3: Search bar click when conversation is active.
+            # If the goal context says the app is already open and a step clicks
+            # "search", followed by typing a short name, the planner is
+            # unnecessarily searching for a contact whose conversation is
+            # already visible. Strip the search + type steps.
             if (
                 step.action == "click"
                 and step.target
