@@ -66,3 +66,21 @@ def test_truncation_osError_returns_empty(tmp_path):
     from backend.core.ouroboros.governance.providers import _read_with_truncation
     result = _read_with_truncation(tmp_path / "nonexistent.py")
     assert result == ""
+
+
+# ---------------------------------------------------------------------------
+# Task 2: Anti-duplication system prompt
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_contains_anti_duplication():
+    """System prompt must contain anti-duplication instructions."""
+    from backend.core.ouroboros.governance.providers import _CODEGEN_SYSTEM_PROMPT
+    assert "ANTI-DUPLICATION" in _CODEGEN_SYSTEM_PROMPT
+    assert "do not generate" in _CODEGEN_SYSTEM_PROMPT.lower()
+    assert "2b.1-noop" in _CODEGEN_SYSTEM_PROMPT
+
+
+def test_system_prompt_contains_minimal_edit_guidance():
+    """Anti-duplication must include minimal-edit language to avoid over-refusal."""
+    from backend.core.ouroboros.governance.providers import _CODEGEN_SYSTEM_PROMPT
+    assert "minimal edit" in _CODEGEN_SYSTEM_PROMPT.lower() or "preserve existing" in _CODEGEN_SYSTEM_PROMPT.lower()

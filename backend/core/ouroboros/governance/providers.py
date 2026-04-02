@@ -60,7 +60,15 @@ _CODEGEN_SYSTEM_PROMPT = (
     "Do NOT reconstruct context lines from your training data or memory of what the "
     "file 'should' contain. Copy them exactly from the provided source. "
     "If the requested change is already present in the source file, return "
-    '{"schema_version": "2b.1-noop", "reason": "<why already done>"} instead of a diff.'
+    '{"schema_version": "2b.1-noop", "reason": "<why already done>"} instead of a diff. '
+    # Anti-duplication mandate — prevents blind re-implementation of existing logic
+    "ANTI-DUPLICATION RULES: Before generating code, review the entire source snapshot "
+    "and the structural index (if provided). Do NOT generate functions, methods, or logic "
+    "blocks that duplicate or substantially overlap with code already present in the source. "
+    "If you are asked to add a feature that is already implemented, return a 2b.1-noop "
+    "response explaining it exists. When adding new code, match the existing code style "
+    "and patterns from the source snapshot. Make minimal edits — preserve existing behavior "
+    "and do not refactor code outside the scope of the requested change. "
     + (
         " " + os.environ["JARVIS_CODEGEN_SYSTEM_PROMPT_EXTRA"]
         if os.environ.get("JARVIS_CODEGEN_SYSTEM_PROMPT_EXTRA")
