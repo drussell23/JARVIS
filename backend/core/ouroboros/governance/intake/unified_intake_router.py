@@ -39,6 +39,7 @@ _PRIORITY_MAP: Dict[str, int] = {
     "exploration": 4,
     "roadmap": 4,
     "capability_gap": 5,
+    "cu_execution": 5,
     "runtime_health": 6,
 }
 
