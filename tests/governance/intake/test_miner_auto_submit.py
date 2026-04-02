@@ -11,7 +11,10 @@ from unittest.mock import MagicMock
 async def test_high_confidence_candidate_still_requires_human_ack(tmp_path):
     """CC well above threshold → confidence high → requires_human_ack=True (AC2)."""
     from backend.core.ouroboros.governance.intake.sensors.opportunity_miner_sensor import OpportunityMinerSensor
-    src = tmp_path / "complex.py"
+    # File must be at depth >= 2 from repo_root to pass _is_production_code filter
+    pkg = tmp_path / "backend" / "core"
+    pkg.mkdir(parents=True)
+    src = pkg / "complex.py"
     lines = ["def foo(x):\n"] + [f"    if x == {i}: return {i}\n" for i in range(30)] + ["    return -1\n"]
     src.write_text("".join(lines))
 
@@ -36,7 +39,10 @@ async def test_high_confidence_candidate_still_requires_human_ack(tmp_path):
 async def test_low_confidence_candidate_requires_human_ack(tmp_path):
     """CC just above threshold → confidence low → requires_human_ack=True (AC2)."""
     from backend.core.ouroboros.governance.intake.sensors.opportunity_miner_sensor import OpportunityMinerSensor
-    src = tmp_path / "mild.py"
+    # File must be at depth >= 2 from repo_root to pass _is_production_code filter
+    pkg = tmp_path / "backend" / "core"
+    pkg.mkdir(parents=True, exist_ok=True)
+    src = pkg / "mild.py"
     lines = ["def foo(x):\n"] + [f"    if x == {i}: return {i}\n" for i in range(6)] + ["    return -1\n"]
     src.write_text("".join(lines))
 

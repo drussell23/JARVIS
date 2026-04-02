@@ -44,11 +44,20 @@ async def test_low_confidence_requires_human_ack():
 
 
 async def test_empty_target_files_returns_error():
+    """Empty target_files triggers EnvelopeValidationError from make_envelope.
+
+    The production VoiceCommandSensor no longer pre-validates target_files
+    (runtime tasks like browse/search have none), but make_envelope enforces
+    that target_files must be non-empty at the schema level.
+    """
+    import pytest
+    from backend.core.ouroboros.governance.intake.intent_envelope import EnvelopeValidationError
+
     router = MagicMock()
     router.ingest = AsyncMock()
     sensor = VoiceCommandSensor(router=router, repo="jarvis")
-    result = await sensor.handle_voice_command(_payload(target_files=[]))
-    assert result == "error"
+    with pytest.raises(EnvelopeValidationError, match="target_files must be non-empty"):
+        await sensor.handle_voice_command(_payload(target_files=[]))
     router.ingest.assert_not_called()
 
 

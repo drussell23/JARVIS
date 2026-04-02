@@ -16,7 +16,7 @@ def test_intake_layer_config_defaults(tmp_path):
     assert config.backlog_scan_interval_s > 0
     assert config.miner_complexity_threshold > 0
     assert config.a_narrator_enabled is True
-    assert config.miner_scan_paths == ["backend/", "tests/"]
+    assert config.miner_scan_paths == ["backend/"]
 
 
 def test_intake_layer_config_from_env_bool(monkeypatch):
