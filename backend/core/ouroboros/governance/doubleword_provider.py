@@ -268,6 +268,13 @@ class DoublewordProvider:
             _src = pending.prompt[:500] if pending.prompt else ""
             _src_hash = _hl.sha256(_src.encode()).hexdigest()[:16]
 
+            # Log raw response preview for debugging parse failures
+            _preview = content[:200].replace("\n", "\\n") if content else "(empty)"
+            logger.info(
+                "[DoublewordProvider] Batch %s response preview (%d chars): %s",
+                pending.batch_id, len(content), _preview,
+            )
+
             return _parse_generation_response(
                 raw=content,
                 provider_name="doubleword",

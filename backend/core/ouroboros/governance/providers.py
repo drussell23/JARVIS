@@ -1191,21 +1191,94 @@ async def _emit_content_failure_to_reactor(payload: dict) -> None:
 
 
 def _extract_json_block(raw: str) -> str:
-    """Extract JSON from raw text, handling markdown fences.
+    """Extract JSON from raw model output, handling common wrapping formats.
 
-    Tries direct parse first, then looks for ```json ... ``` blocks.
+    The 397B (Qwen3.5) and other reasoning models often wrap JSON in:
+    - <think>...</think> reasoning blocks before the actual JSON
+    - ```json ... ``` markdown fences
+    - Leading/trailing text, explanations, or newlines
+    - Multiple JSON objects (picks the one with schema_version)
+
+    Extraction priority:
+    1. Direct JSON parse (raw starts with {)
+    2. Strip <think>...</think> blocks, then try again
+    3. Markdown ```json ... ``` fences
+    4. Find the outermost { ... } containing "schema_version"
+    5. Find ANY outermost { ... } pair
+    6. Return stripped raw (caller handles parse error)
     """
-    # Try direct parse first
     stripped = raw.strip()
+
+    # 1. Direct parse — raw is already clean JSON
     if stripped.startswith("{"):
         return stripped
 
-    # Look for markdown JSON fences
-    match = re.search(r"```(?:json)?\s*\n(\{.*?\})\s*\n```", raw, re.DOTALL)
-    if match:
-        return match.group(1)
+    # 2. Strip <think>...</think> blocks (Qwen3.5 reasoning format)
+    cleaned = re.sub(r"<think>.*?</think>", "", stripped, flags=re.DOTALL).strip()
+    if cleaned.startswith("{"):
+        return cleaned
 
-    return stripped
+    # 3. Markdown JSON fences (greedy to capture full JSON)
+    match = re.search(r"```(?:json)?\s*\n?(\{.*\})\s*\n?```", cleaned, re.DOTALL)
+    if match:
+        return match.group(1).strip()
+
+    # 4. Find { ... } block containing "schema_version" (most likely the right one)
+    schema_match = re.search(r'(\{[^{}]*"schema_version".*\})', cleaned, re.DOTALL)
+    if schema_match:
+        candidate = schema_match.group(1)
+        # Verify it's balanced — find the matching closing brace
+        balanced = _find_balanced_json(cleaned, cleaned.index('"schema_version"'))
+        if balanced:
+            return balanced
+
+    # 5. Find ANY outermost { ... } pair
+    first_brace = cleaned.find("{")
+    if first_brace >= 0:
+        balanced = _find_balanced_json(cleaned, first_brace)
+        if balanced:
+            return balanced
+
+    # 6. Fallback — return cleaned text
+    return cleaned
+
+
+def _find_balanced_json(text: str, start_search: int) -> Optional[str]:
+    """Find a balanced JSON object starting from or before start_search.
+
+    Walks backward from start_search to find the opening {, then forward
+    to find the matching closing }. Handles nested braces and strings.
+    """
+    # Find the opening { at or before start_search
+    open_pos = text.rfind("{", 0, start_search + 1)
+    if open_pos < 0:
+        open_pos = text.find("{", start_search)
+    if open_pos < 0:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(open_pos, len(text)):
+        c = text[i]
+        if escape:
+            escape = False
+            continue
+        if c == "\\":
+            escape = True
+            continue
+        if c == '"' and not escape:
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_pos:i + 1]
+    return None
 
 
 def _parse_tool_call_response(raw: str) -> Optional["ToolCall"]:
