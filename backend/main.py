@@ -231,6 +231,7 @@ if _sys.version_info < (3, 10):
 import multiprocessing
 import os
 import sys
+from pathlib import Path
 
 # Canonicalize the backend entrypoint so legacy ``main`` imports and
 # package-qualified ``backend.main`` imports share one module instance.
