@@ -100,3 +100,59 @@ async def test_success_records_do_not_trigger_graduation(fresh_cu_sensor):
 
     assert sensor._total_envelopes_emitted == 0
     mock_router.ingest.assert_not_called()
+
+
+from backend.core.ouroboros.governance.intake.intake_layer_service import (
+    IntakeLayerConfig,
+    IntakeLayerService,
+)
+
+
+@pytest.mark.asyncio
+async def test_e2e_cu_graduation_through_intake_layer(tmp_path, fresh_cu_sensor):
+    """Full E2E: CU failures → sensor graduation → router.ingest().
+
+    This proves the spinal cord is connected: ActionDispatcher feeds
+    CUExecutionSensor, which emits to the router wired by IntakeLayerService.
+    """
+    gls = MagicMock()
+    gls.submit = AsyncMock()
+    config = IntakeLayerConfig(project_root=tmp_path)
+    svc = IntakeLayerService(gls=gls, config=config, say_fn=None)
+
+    await svc.start()
+
+    try:
+        # Spy on the router's ingest method
+        original_ingest = svc._router.ingest
+        ingest_calls = []
+
+        async def spy_ingest(envelope):
+            ingest_calls.append(envelope)
+            return await original_ingest(envelope)
+
+        svc._router.ingest = spy_ingest
+
+        # Get the singleton sensor (now wired by IntakeLayerService)
+        sensor = CUExecutionSensor()
+        assert sensor._router is not None, "Pre-condition: sensor must have router"
+
+        # Feed 3 identical failures to cross graduation threshold
+        for _ in range(3):
+            await sensor.record(_make_failure_record())
+
+        # Verify envelope was emitted and reached the router
+        assert sensor._total_envelopes_emitted >= 1, (
+            "Sensor did not emit any envelopes after 3 failures"
+        )
+        assert len(ingest_calls) >= 1, (
+            "Router.ingest was never called — envelope dropped between sensor and router"
+        )
+
+        # Verify envelope metadata
+        envelope = ingest_calls[0]
+        assert envelope.source == "cu_execution"
+        assert envelope.repo == "jarvis"
+        assert envelope.urgency == "normal"
+    finally:
+        await svc.stop()
