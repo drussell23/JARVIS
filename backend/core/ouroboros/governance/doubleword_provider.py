@@ -164,7 +164,14 @@ class DoublewordProvider:
             return None
 
         from backend.core.ouroboros.governance.providers import _build_codegen_prompt
-        prompt = prompt_override or _build_codegen_prompt(ctx)
+        # Always use full_content schema (2b.1) — the 397B can't reliably
+        # produce verbatim context lines for unified diffs (2b.1-diff).
+        prompt = prompt_override or _build_codegen_prompt(
+            ctx,
+            repo_root=self._repo_root,
+            repo_roots=self._repo_roots or None,
+            force_full_content=True,
+        )
         operation_id = getattr(ctx, "operation_id", f"dw-{int(time.time())}")
 
         jsonl_line = json.dumps({
