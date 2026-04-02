@@ -354,7 +354,7 @@ class DoublewordProvider:
                 data=data,
                 headers={"Authorization": f"Bearer {self._api_key}"},
             ) as resp:
-                if resp.status != 200:
+                if resp.status >= 300:
                     body = await resp.text()
                     logger.error("[DoublewordProvider] File upload failed: %s %s", resp.status, body[:500])
                     return None
@@ -377,7 +377,7 @@ class DoublewordProvider:
                 },
                 headers={"Content-Type": "application/json"},
             ) as resp:
-                if resp.status != 200:
+                if resp.status >= 300:
                     body = await resp.text()
                     logger.error("[DoublewordProvider] Batch create failed: %s %s", resp.status, body[:500])
                     return None
@@ -397,7 +397,7 @@ class DoublewordProvider:
                 async with session.get(
                     f"{self._base_url}/batches/{batch_id}",
                 ) as resp:
-                    if resp.status != 200:
+                    if resp.status >= 300:
                         logger.warning("[DoublewordProvider] Poll error: %s", resp.status)
                         await asyncio.sleep(_DW_POLL_INTERVAL_S)
                         continue
@@ -437,7 +437,7 @@ class DoublewordProvider:
             async with session.get(
                 f"{self._base_url}/files/{output_file_id}/content",
             ) as resp:
-                if resp.status != 200:
+                if resp.status >= 300:
                     logger.error("[DoublewordProvider] Retrieve failed: %s", resp.status)
                     return ("", None)
                 raw = await resp.text()
