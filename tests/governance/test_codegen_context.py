@@ -233,3 +233,101 @@ def test_recent_file_history_capped_length(tmp_path):
     result = _build_recent_file_history(f, tmp_path)
     # Header + content should be bounded
     assert len(result) <= 600  # small buffer for header
+
+
+# ---------------------------------------------------------------------------
+# Task 5: Prompt assembly integration
+# ---------------------------------------------------------------------------
+
+def test_prompt_assembly_includes_index_and_history(tmp_path):
+    """Full codegen prompt should contain structural index and recent history."""
+    import subprocess
+    from backend.core.ouroboros.governance.providers import (
+        _build_codegen_prompt,
+        _CODEGEN_SYSTEM_PROMPT,
+    )
+
+    # Set up a git repo with a Python file
+    subprocess.run(["git", "init"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@test.com"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, capture_output=True)
+    target = tmp_path / "module.py"
+    target.write_text(textwrap.dedent('''\
+        """Test module."""
+
+        def existing_function(x: int) -> bool:
+            """Already implemented."""
+            return x > 0
+
+        class Handler:
+            def process(self, data: list) -> None:
+                """Process data."""
+                pass
+    '''))
+    subprocess.run(["git", "add", "module.py"], cwd=tmp_path, capture_output=True)
+    subprocess.run(["git", "commit", "-m", "add module"], cwd=tmp_path, capture_output=True)
+
+    # Build a minimal OperationContext mock
+    from unittest.mock import MagicMock
+    ctx = MagicMock()
+    ctx.op_id = "test-op-001"
+    ctx.description = "Add a new feature"
+    ctx.target_files = ["module.py"]
+    ctx.human_instructions = ""
+    ctx.strategic_memory_prompt = ""
+    ctx.expanded_context_files = ()
+    ctx.cross_repo = False
+    ctx.repo_scope = set()
+    ctx.telemetry = None
+
+    prompt = _build_codegen_prompt(
+        ctx=ctx,
+        repo_root=tmp_path,
+        repo_roots=None,
+    )
+
+    # Structural index should be present
+    assert "Structural Index" in prompt
+    assert "existing_function" in prompt
+    assert "Handler" in prompt
+    assert "process" in prompt
+
+    # Recent history should be present
+    assert "Recent Changes" in prompt
+    assert "add module" in prompt
+
+    # Source snapshot should contain the full file (no truncation for this small file)
+    assert "def existing_function" in prompt
+    assert "[TRUNCATED" not in prompt
+
+    # Anti-duplication should be in system prompt (separate constant)
+    assert "ANTI-DUPLICATION" in _CODEGEN_SYSTEM_PROMPT
+
+
+def test_prompt_no_truncation_32kb_file(tmp_path):
+    """A 32KB file should NOT be truncated with default 64KB budget."""
+    from backend.core.ouroboros.governance.providers import _build_codegen_prompt
+    from unittest.mock import MagicMock
+
+    target = tmp_path / "big.py"
+    # Generate a ~32KB Python file
+    lines = [f"def func_{i}():\n    return {i}\n" for i in range(800)]
+    target.write_text("\n".join(lines))
+
+    ctx = MagicMock()
+    ctx.op_id = "test-op-002"
+    ctx.description = "Modify big file"
+    ctx.target_files = ["big.py"]
+    ctx.human_instructions = ""
+    ctx.strategic_memory_prompt = ""
+    ctx.expanded_context_files = ()
+    ctx.cross_repo = False
+    ctx.repo_scope = set()
+    ctx.telemetry = None
+
+    prompt = _build_codegen_prompt(
+        ctx=ctx,
+        repo_root=tmp_path,
+        repo_roots=None,
+    )
+    assert "[TRUNCATED" not in prompt, "32KB file should not be truncated with 64KB budget"

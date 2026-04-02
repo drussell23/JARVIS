@@ -986,6 +986,26 @@ Rules:
         strategic_memory_prompt = ""
     if strategic_memory_prompt.strip():
         parts.append(strategic_memory_prompt)
+
+    # ── 4a. Structural index + recent history (Sub-project B: The Eyes) ──
+    if ctx.target_files:
+        _primary_target = ctx.target_files[0]
+        _primary_abs = (
+            Path(_primary_target) if Path(_primary_target).is_absolute()
+            else (effective_single_repo_root / _primary_target)
+        )
+        if _primary_abs.exists() and _primary_abs.suffix == ".py":
+            try:
+                _primary_content = _primary_abs.read_text(encoding="utf-8", errors="replace")
+                _func_idx = _build_function_index(_primary_content, str(_primary_abs))
+                if _func_idx:
+                    parts.append(_func_idx)
+            except OSError:
+                pass
+        _history = _build_recent_file_history(_primary_abs, effective_single_repo_root)
+        if _history:
+            parts.append(_history)
+
     parts += [
         f"## Source Snapshot\n\n{file_block}",
         context_block,
