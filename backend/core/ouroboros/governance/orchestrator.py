@@ -1835,6 +1835,56 @@ class GovernedOrchestrator:
             {"op_id": ctx.op_id},
         )
         ctx = await self._run_benchmark(ctx, [])
+
+        # ---- Verify Gate: enforce regression thresholds (Sub-project C) ----
+        _verify_error = None
+        try:
+            from backend.core.ouroboros.governance.verify_gate import (
+                enforce_verify_thresholds,
+                rollback_files,
+            )
+            _br = getattr(ctx, "benchmark_result", None)
+            if _br is not None:
+                _baseline_cov = None
+                _snapshots = getattr(ctx, "pre_apply_snapshots", {})
+                if isinstance(_snapshots, dict):
+                    _baseline_cov = _snapshots.get("_coverage_baseline")
+                _verify_error = enforce_verify_thresholds(_br, baseline_coverage=_baseline_cov)
+        except Exception as exc:
+            logger.debug("[Orchestrator] Verify gate skipped: %s", exc)
+
+        if _verify_error is not None:
+            logger.warning(
+                "[Orchestrator] VERIFY regression gate fired: %s [%s]",
+                _verify_error, ctx.op_id,
+            )
+            # Rollback files
+            try:
+                _snapshots = getattr(ctx, "pre_apply_snapshots", {})
+                if _snapshots:
+                    rollback_files(
+                        pre_apply_snapshots=_snapshots,
+                        target_files=list(ctx.target_files),
+                        repo_root=self._config.project_root,
+                    )
+            except Exception as exc:
+                logger.error("[Orchestrator] Verify rollback failed: %s", exc)
+
+            if _serpent: _serpent.update_phase("POSTMORTEM")
+            ctx = ctx.advance(
+                OperationPhase.POSTMORTEM,
+                terminal_reason_code="verify_regression",
+                rollback_occurred=True,
+            )
+            await self._record_ledger(
+                ctx,
+                OperationState.FAILED,
+                {"reason": "verify_regression", "detail": _verify_error, "rollback_occurred": True},
+            )
+            self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply, rolled_back=True)
+            await self._publish_outcome(ctx, OperationState.FAILED, "verify_regression")
+            return ctx
+
         if _serpent: _serpent.update_phase("COMPLETE")
         ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
         self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
