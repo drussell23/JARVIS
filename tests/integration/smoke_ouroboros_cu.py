@@ -151,6 +151,10 @@ async def main() -> None:
         print(f"    Pattern count: {count}")
         if count >= 3:
             print(f"    >>> GRADUATION THRESHOLD REACHED <<<")
+            await _samantha(
+                f"Graduation threshold reached. {count} failures detected "
+                f"for pattern: messaging target miss. Initiating self-healing."
+            )
         print()
 
     stats = sensor.get_stats()
@@ -200,6 +204,8 @@ Return ONLY a JSON object with:
 }}
 """
 
+    await _samantha("Routing failure analysis to Doubleword 397 billion parameter brain. Generating code fix.")
+
     print("  Calling Doubleword (Qwen/Qwen3.5-397B-A17B-FP8)...")
     print("  This uses the batch API — may take 1-5 minutes...")
     print()
@@ -243,6 +249,8 @@ Return ONLY a JSON object with:
     # ------------------------------------------------------------------
     # Step 4: Apply the fix to a SANDBOX copy with Ouroboros signature
     # ------------------------------------------------------------------
+    await _samantha("Analysis complete. Applying fix to the CU task planner.")
+
     print("--- Phase 3: Applying Fix with Ouroboros Signature ---")
     print()
 
@@ -302,6 +310,11 @@ Return ONLY a JSON object with:
     for line in first_lines:
         if "[Ouroboros]" in line:
             print(f"  SIGNATURE: {line.strip()}")
+
+    await _samantha(
+        "Fix applied and signed. The CU task planner now has enhanced target "
+        "descriptions for message input fields. Check the diff in your editor."
+    )
 
     print()
     print("=" * 70)

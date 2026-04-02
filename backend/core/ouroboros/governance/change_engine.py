@@ -96,18 +96,18 @@ def _inject_ouroboros_signature(
     ext = Path(target_path).suffix.lower()
     if ext in (".py", ".pyi", ".sh", ".yaml", ".yml", ".toml"):
         sig = (
-            f"# [Ouroboros] Modified by Karen (op={op_id[:12]}) at {ts}\n"
+            f"# [Ouroboros] Modified by Ouroboros (op={op_id[:12]}) at {ts}\n"
             f"# Reason: {goal_short}\n"
         )
     elif ext in (".js", ".ts", ".jsx", ".tsx", ".swift", ".java", ".c", ".cpp", ".go", ".rs"):
         sig = (
-            f"// [Ouroboros] Modified by Karen (op={op_id[:12]}) at {ts}\n"
+            f"// [Ouroboros] Modified by Ouroboros (op={op_id[:12]}) at {ts}\n"
             f"// Reason: {goal_short}\n"
         )
     else:
         # Unknown extension — use hash-style comment
         sig = (
-            f"# [Ouroboros] Modified by Karen (op={op_id[:12]}) at {ts}\n"
+            f"# [Ouroboros] Modified by Ouroboros (op={op_id[:12]}) at {ts}\n"
             f"# Reason: {goal_short}\n"
         )
 
