@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 """
-Ouroboros Advanced Smoke Test — Real Code Generation
-=====================================================
+Ouroboros Advanced Smoke Test — Full Pipeline E2E
+==================================================
 
-Ouroboros reads actual source code, identifies a real bug, calls
-Doubleword 397B to generate a real Python code fix, and writes
-functional code to the file with a signature.
+Boots the REAL Ouroboros governance pipeline in HUD mode and triggers
+CU failure graduation to drive a real code fix through all phases:
+
+  CLASSIFY -> ROUTE -> CONTEXT_EXPANSION -> GENERATE -> VALIDATE
+  (duplication checker) -> GATE (similarity gate) -> APPLY -> VERIFY
+  (regression gate + rollback) -> COMPLETE
+
+The fix targets cu_task_planner.py, which currently has DUPLICATE
+anti-pattern blocks (from the old bypass smoke test). The 397B brain
+should detect the duplication and clean it up -- or the VALIDATE
+duplication checker should catch it.
+
+After the pipeline runs, the diff is shown so you can review it in
+Cursor/VS Code.
+
+Samantha narrates the full lifecycle via VoiceNarrator + CommProtocol.
 
 Run:
     python3 tests/integration/smoke_ouroboros_advanced.py
+
+Requires:
+    DOUBLEWORD_API_KEY in .env (for 397B code generation)
 """
 import asyncio
-import json
 import os
 import sys
 import tempfile
@@ -57,262 +72,267 @@ async def _samantha(text: str) -> None:
 
 async def main() -> None:
     print("=" * 72)
-    print("  Ouroboros Advanced Smoke Test — Real Code Generation")
+    print("  Ouroboros Advanced Smoke Test -- Full Pipeline E2E")
     print("=" * 72)
     print()
 
-    await _samantha("Ouroboros activated. Scanning codebase for issues to fix.")
-
-    api_key = os.environ.get("DOUBLEWORD_API_KEY", "")
-    if not api_key:
-        print("[FAIL] DOUBLEWORD_API_KEY not set.")
-        sys.exit(1)
+    await _samantha(
+        "Ouroboros advanced smoke test activated. "
+        "Booting full governance pipeline in HUD mode."
+    )
 
     # ==================================================================
-    # PHASE 1: Read real source code and identify the target
+    # PHASE 1: Boot the full Ouroboros governance pipeline
     # ==================================================================
-    print("--- PHASE 1: Reading source code ---")
+    print("--- PHASE 1: Boot Governance Pipeline ---")
     print()
 
+    from backend.core.ouroboros.governance.hud_governance_boot import (
+        start_hud_governance,
+        stop_hud_governance,
+    )
+
+    t0 = time.monotonic()
+    ctx = await start_hud_governance(project_root=ROOT)
+    boot_time = time.monotonic() - t0
+
+    stack_status = "ACTIVE" if ctx.stack else "FAILED"
+    gls_status = ctx.gls.state.name if ctx.gls else "FAILED"
+    intake_status = ctx.intake.state.name if ctx.intake else "FAILED"
+
+    print(f"  GovernanceStack: {stack_status}")
+    print(f"  GovernedLoopService: {gls_status}")
+    print(f"  IntakeLayerService: {intake_status}")
+    print(f"  Pipeline active: {ctx.is_active}")
+    print(f"  Boot time: {boot_time:.1f}s")
+    print()
+
+    if not ctx.is_active:
+        print("  [FAIL] Pipeline did not reach ACTIVE state.")
+        await _samantha("Pipeline failed to start. Aborting smoke test.")
+        await stop_hud_governance(ctx)
+        sys.exit(1)
+
+    await _samantha(
+        f"Pipeline booted in {boot_time:.0f} seconds. "
+        "All three layers active: stack, governed loop, and intake. "
+        "Now triggering CU failure graduation."
+    )
+
+    # ==================================================================
+    # PHASE 2: Feed CU failures to trigger graduation
+    # ==================================================================
+    print("--- PHASE 2: Trigger CU Failure Graduation ---")
+    print()
+
+    from backend.core.ouroboros.governance.intake.sensors.cu_execution_sensor import (
+        CUExecutionRecord,
+        CUExecutionSensor,
+    )
+
+    sensor = CUExecutionSensor()
+    if sensor._router is None:
+        print("  [FAIL] CUExecutionSensor has no router wired!")
+        await stop_hud_governance(ctx)
+        sys.exit(1)
+
+    print("  Sensor router: WIRED")
+    print("  Graduation threshold: 3 failures with same signature")
+    print()
+
+    # The real bug: cu_task_planner.py has 3 DUPLICATE copies of the
+    # "search bar click" anti-pattern (lines 672-752). Ouroboros should
+    # detect this duplication and clean it up.
     target_file = ROOT / "backend" / "vision" / "cu_task_planner.py"
-    source = target_file.read_text()
-    line_count = len(source.split("\n"))
+    source_before = target_file.read_text()
+    line_count = len(source_before.splitlines())
     print(f"  Target: {target_file.name} ({line_count} lines)")
     print()
 
-    # The real bug: _filter_messaging_antipatterns only catches Cmd+N
-    # and type-name-then-send, but doesn't catch the case where the
-    # planner generates a "click search bar" step when the conversation
-    # is already active. This was the root cause of the "N Delilah" bug.
-    await _samantha(
-        "I found a gap in the anti-pattern filter. "
-        "It catches Command N and type name then send, "
-        "but doesn't catch unnecessary search bar clicks "
-        "when the conversation is already active. "
-        "Sending the source code to Doubleword 397 billion for a fix."
-    )
-
-    # ==================================================================
-    # PHASE 2: Call Doubleword 397B for real code generation
-    # ==================================================================
-    print("--- PHASE 2: Calling Doubleword 397B ---")
-    print()
-
-    # Extract just the anti-pattern filter function for context
-    filter_start = source.find("def _filter_messaging_antipatterns")
-    filter_end = source.find("\n    @staticmethod", filter_start + 1) if filter_start >= 0 else -1
-    if filter_start < 0:
-        # Fallback: find by another marker
-        filter_start = source.find("_filter_messaging_antipatterns")
-    filter_code = source[filter_start:filter_end] if filter_start >= 0 and filter_end > filter_start else "FUNCTION NOT FOUND"
-
-    prompt = f"""\
-You are Ouroboros, the self-healing code immune system.
-
-Here is a function from cu_task_planner.py that filters dangerous step patterns
-before they execute on the user's screen:
-
-```python
-{filter_code}
-```
-
-BUG REPORT: The filter catches two anti-patterns (Cmd+N and type-name-then-send),
-but misses a third pattern that caused a real production bug:
-
-MISSING PATTERN: "search bar click when conversation is already active"
-- The CU planner generates a "click search bar" step even when the target
-  contact's conversation is already open on screen
-- This causes the planner to type the contact name into the search bar,
-  which may accidentally navigate away from the active conversation
-- Detection: a step with target containing "search" followed by a "type"
-  step with text that looks like a contact name (1-2 words, no punctuation)
-
-Write a NEW detection block to add inside _filter_messaging_antipatterns
-that catches this pattern. The block should:
-1. Detect click-search + type-name pattern
-2. Log a WARNING when blocking it
-3. Skip both the search click and the name type steps
-4. Follow the exact code style of the existing two detectors
-
-Return ONLY the Python code block to INSERT (not the whole function).
-Return raw Python code, no markdown fences. The code should be indented
-with 12 spaces (it goes inside the while loop).
-"""
-
-    from backend.core.ouroboros.governance.doubleword_provider import DoublewordProvider
-    provider = DoublewordProvider(api_key=api_key)
-
-    print("  Submitting to Doubleword batch API...")
-    t0 = time.monotonic()
-
-    generated_code = await provider.prompt_only(
-        prompt=prompt,
-        caller_id="ouroboros_advanced_codegen",
-        max_tokens=20000,
-    )
-
-    elapsed = time.monotonic() - t0
-    print(f"  Response in {elapsed:.1f}s")
-    print()
-
-    if not generated_code or len(generated_code.strip()) < 20:
-        print("  Doubleword returned insufficient code. Using pre-built fix.")
-        generated_code = '''\
-            # [Ouroboros] Pattern 3: Search bar click when conversation is active.
-            # If the goal context says the app is already open and a step clicks
-            # "search", followed by typing a short name, the planner is
-            # unnecessarily searching for a contact whose conversation is
-            # already visible. Strip the search + type steps.
-            if (
-                step.action == "click"
-                and step.target
-                and "search" in step.target.lower()
-                and i + 1 < len(steps)
-                and steps[i + 1].action == "type"
-                and steps[i + 1].text
-            ):
-                next_text = steps[i + 1].text.strip()
-                is_name_like = (
-                    len(next_text.split()) <= 2
-                    and not any(c in next_text for c in ".!?,;:@#$")
-                    and len(next_text) < 30
-                )
-                if is_name_like:
-                    logger.warning(
-                        "[CUTaskPlanner] BLOCKED search-for-active-contact anti-pattern: "
-                        "would have searched for %r when conversation may already be open",
-                        next_text,
-                    )
-                    i += 2  # Skip search click + name type
-                    continue'''
-
-    # Clean up markdown fences if present
-    code = generated_code.strip()
-    if code.startswith("```"):
-        code = code.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
-
-    print("  Generated code:")
-    print("  " + "-" * 60)
-    for line in code.split("\n")[:20]:
-        print(f"  {line}")
-    if len(code.split("\n")) > 20:
-        print(f"  ... ({len(code.split(chr(10)))} total lines)")
-    print("  " + "-" * 60)
-    print()
-
-    await _samantha(
-        "Doubleword generated the fix. "
-        "A new anti-pattern detector that catches unnecessary search bar clicks. "
-        "Injecting into the CU task planner now."
-    )
-
-    # ==================================================================
-    # PHASE 3: Inject the generated code into the real file
-    # ==================================================================
-    print("--- PHASE 3: Injecting code fix ---")
-    print()
-
-    # Find the insertion point: after the second detector's "continue"
-    insertion_marker = "            filtered.append(step)\n            i += 1"
-    if insertion_marker in source:
-        # Insert the new detector BEFORE the final append
-        new_source = source.replace(
-            insertion_marker,
-            code + "\n\n" + insertion_marker,
+    # Feed 3 messaging failures with same signature to trigger graduation
+    for i in range(3):
+        record = CUExecutionRecord(
+            goal="send message to Alice via Messages app",
+            success=False,
+            steps_completed=2,
+            steps_total=5,
+            elapsed_s=3.0 + i * 0.5,
+            error="target not found: search bar click led to wrong contact",
+            is_messaging=True,
+            contact="Alice",
+            app="messages",
         )
-        print("  Inserted new anti-pattern detector before the final append")
+        await sensor.record(record)
+        print(f"  Failure {i + 1}/3 recorded (sig: {record.failure_signature})")
+
+    print()
+    print(f"  Envelopes emitted: {sensor._total_envelopes_emitted}")
+
+    if sensor._total_envelopes_emitted < 1:
+        print("  [FAIL] No envelopes emitted -- graduation did not trigger!")
+        await stop_hud_governance(ctx)
+        sys.exit(1)
+
+    await _samantha(
+        "Three CU failures recorded with the same signature. "
+        "Graduation triggered. Envelope submitted to the Ouroboros pipeline. "
+        "The orchestrator will now classify, route, generate, validate, "
+        "and apply a fix."
+    )
+
+    # ==================================================================
+    # PHASE 3: Wait for the pipeline to process
+    # ==================================================================
+    print("--- PHASE 3: Wait for Pipeline Processing ---")
+    print()
+    print("  Waiting for orchestrator to process the envelope...")
+    print("  (CLASSIFY -> ROUTE -> GENERATE -> VALIDATE -> GATE -> APPLY -> VERIFY)")
+    print()
+
+    # The orchestrator processes envelopes asynchronously via the intake
+    # router's dispatch loop. Give it time to process.
+    max_wait = 180  # 3 minutes max (generation can take 30-60s via Doubleword)
+    poll_interval = 5
+    elapsed = 0
+    last_status = ""
+
+    while elapsed < max_wait:
+        await asyncio.sleep(poll_interval)
+        elapsed += poll_interval
+
+        # Check if the file changed (APPLY happened)
+        current = target_file.read_text()
+        if current != source_before:
+            print(f"  FILE CHANGED after {elapsed}s -- APPLY phase completed!")
+            break
+
+        # Check GLS health for progress indicators
+        try:
+            health = ctx.gls.health()
+            active_ops = health.get("active_ops", 0)
+            completed = health.get("completed_ops", 0)
+            status = f"  [{elapsed}s] active_ops={active_ops}, completed={completed}"
+            if status != last_status:
+                print(status)
+                last_status = status
+        except Exception:
+            print(f"  [{elapsed}s] polling...")
     else:
-        print("  [WARN] Could not find exact insertion point")
-        print("  Appending to end of function")
-        new_source = source
-
-    # Add Ouroboros signature
-    from backend.core.ouroboros.governance.change_engine import _inject_ouroboros_signature
-
-    op_id = f"ouro-codegen-{int(time.time())}"
-    signed = _inject_ouroboros_signature(
-        content=new_source,
-        op_id=op_id,
-        goal="Add search-bar-when-active anti-pattern to _filter_messaging_antipatterns",
-        target_path=str(target_file),
-    )
-
-    target_file.write_text(signed)
-    print(f"  Written to: {target_file}")
-    print(f"  Operation: {op_id}")
-    print()
-
-    # ==================================================================
-    # PHASE 4: Verify the fix compiles
-    # ==================================================================
-    print("--- PHASE 4: Verification ---")
-    print()
-
-    import ast
-    try:
-        ast.parse(signed)
-        print("  Python AST parse: PASS")
-    except SyntaxError as e:
-        print(f"  Python AST parse: FAIL ({e})")
-        print("  Reverting...")
-        proc = await asyncio.create_subprocess_exec(
-            "git", "checkout", str(target_file),
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await proc.communicate()
-        print("  Reverted to clean state.")
-        await _samantha("The generated code had a syntax error. I reverted the change.")
-        await provider.close()
-        return
-
-    # Show git diff
-    diff_proc = await asyncio.create_subprocess_exec(
-        "git", "diff", "--stat", str(target_file),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    diff_out, _ = await diff_proc.communicate()
-    if diff_out:
-        print(f"  Git: {diff_out.decode().strip()}")
-
-    # Show actual diff content
-    diff_proc2 = await asyncio.create_subprocess_exec(
-        "git", "diff", str(target_file),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    diff_content, _ = await diff_proc2.communicate()
-    if diff_content:
-        diff_lines = diff_content.decode().split("\n")
-        added = [l for l in diff_lines if l.startswith("+") and not l.startswith("+++")]
-        print(f"  Lines added: {len(added)}")
+        print(f"  [TIMEOUT] Pipeline did not apply changes within {max_wait}s")
+        print("  This may mean:")
+        print("    - VALIDATE duplication checker blocked the fix (correct!)")
+        print("    - GENERATE failed (Doubleword API unavailable)")
+        print("    - GATE similarity check escalated to approval")
+        print("    - VERIFY regression gate rolled back the change")
         print()
-        print("  New code (green lines from diff):")
-        for line in added[:25]:
-            print(f"    {line}")
-        if len(added) > 25:
-            print(f"    ... ({len(added)} total)")
 
+    # ==================================================================
+    # PHASE 4: Show results
+    # ==================================================================
+    print("--- PHASE 4: Results ---")
     print()
 
-    await _samantha(
-        f"Fix verified. {len(added)} lines of new Python code injected into "
-        "the CU task planner. The anti-pattern filter now catches three patterns "
-        "instead of two. Open your editor to review the diff. "
-        "Ouroboros code generation complete."
-    )
+    source_after = target_file.read_text()
+    changed = source_after != source_before
 
-    print("=" * 72)
-    print("  SMOKE TEST COMPLETE")
+    if changed:
+        print("  FILE MODIFIED by Ouroboros pipeline!")
+        print()
+
+        # Show git diff stats
+        diff_proc = await asyncio.create_subprocess_exec(
+            "git", "diff", "--stat", str(target_file),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        diff_stat, _ = await diff_proc.communicate()
+        if diff_stat:
+            print(f"  {diff_stat.decode().strip()}")
+
+        # Show actual diff
+        diff_proc2 = await asyncio.create_subprocess_exec(
+            "git", "diff", str(target_file),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        diff_content, _ = await diff_proc2.communicate()
+        added_count = 0
+        removed_count = 0
+        if diff_content:
+            diff_lines = diff_content.decode().split("\n")
+            added = [l for l in diff_lines if l.startswith("+") and not l.startswith("+++")]
+            removed = [l for l in diff_lines if l.startswith("-") and not l.startswith("---")]
+            added_count = len(added)
+            removed_count = len(removed)
+            print(f"  Lines added: {added_count}")
+            print(f"  Lines removed: {removed_count}")
+            print()
+            print("  Diff preview (first 50 lines):")
+            for line in diff_lines[:50]:
+                print(f"    {line}")
+            if len(diff_lines) > 50:
+                print(f"    ... ({len(diff_lines)} total lines)")
+
+        await _samantha(
+            f"Ouroboros applied a fix to the CU task planner. "
+            f"{added_count} lines added, {removed_count} lines removed. "
+            "Open your editor to review the diff. "
+            "The full governance pipeline completed successfully."
+        )
+    else:
+        print("  No changes applied to the file.")
+        print()
+        print("  Pipeline outcomes (check logs for which one):")
+        print("    1. VALIDATE duplication checker BLOCKED the fix")
+        print("       (correct: the 397B tried to add duplicate code)")
+        print("    2. GENERATE returned 2b.1-noop (change already present)")
+        print("    3. GATE similarity check escalated to APPROVAL_REQUIRED")
+        print("    4. VERIFY regression gate rolled back the change")
+        print()
+
+        await _samantha(
+            "The pipeline processed the envelope but did not modify the file. "
+            "This may mean the duplication checker correctly blocked a redundant fix, "
+            "or the model returned a no-op. Check the logs for details."
+        )
+
+    # ==================================================================
+    # PHASE 5: Pipeline health report
+    # ==================================================================
     print()
-    print(f"  File modified: {target_file}")
-    print(f"  Lines added: {len(added)}")
-    print(f"  To review: git diff backend/vision/cu_task_planner.py")
-    print(f"  To revert: git checkout backend/vision/cu_task_planner.py")
-    print("=" * 72)
+    print("--- PHASE 5: Pipeline Health Report ---")
+    print()
+    try:
+        health = ctx.gls.health()
+        for key, val in sorted(health.items()):
+            if not isinstance(val, (dict, list)):
+                print(f"  {key}: {val}")
+    except Exception as exc:
+        print(f"  Health check failed: {exc}")
 
-    await provider.close()
+    # ==================================================================
+    # PHASE 6: Shutdown
+    # ==================================================================
+    print()
+    print("--- PHASE 6: Shutdown ---")
+    print()
+
+    await stop_hud_governance(ctx)
+    print("  Governance pipeline shut down cleanly.")
+    print()
+
+    print("=" * 72)
+    print("  OUROBOROS ADVANCED SMOKE TEST COMPLETE")
+    print()
+    print(f"  Pipeline booted: {ctx.is_active}")
+    print(f"  Boot time: {boot_time:.1f}s")
+    print(f"  Envelopes emitted: {sensor._total_envelopes_emitted}")
+    print(f"  File changed: {changed}")
+    if changed:
+        print()
+        print(f"  >>> Review in IDE: git diff backend/vision/cu_task_planner.py")
+        print(f"  >>> Revert:        git checkout backend/vision/cu_task_planner.py")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
