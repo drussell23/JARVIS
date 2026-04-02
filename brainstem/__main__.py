@@ -16,6 +16,10 @@ Ports:
 
 Legacy mode: set JARVIS_BRAINSTEM_LEGACY=true to use the old
 lightweight brainstem (brainstem.main) instead.
+
+Dual-process: when running alongside supervisor (8010), set separate
+ledger dirs to avoid lock contention:
+  OUROBOROS_LEDGER_DIR=~/.jarvis/ouroboros/ledger-hud/ python3 -m brainstem
 """
 import os
 import sys
