@@ -87,19 +87,21 @@ After this change:
 ```
 VERIFY → _run_benchmark → _enforce_verify_thresholds
   → pass: COMPLETE
-  → fail: rollback via pre_apply_snapshots → CANCELLED (reason="verify_regression")
+  → fail: rollback via pre_apply_snapshots → POSTMORTEM (reason="verify_regression")
 ```
+
+**Phase transition constraint:** `PHASE_TRANSITIONS` in `op_context.py` only allows VERIFY → {COMPLETE, POSTMORTEM}. CANCELLED is illegal from VERIFY. Use `OperationPhase.POSTMORTEM` with `terminal_reason_code="verify_regression"` and `rollback_occurred=True`, which matches how other post-APPLY failures are modeled. Implementation must add POSTMORTEM as a valid VERIFY outcome (it already is in the transition table).
 
 #### Threshold Table
 
 | Metric | Threshold | Env Var | Default | Behavior |
 |--------|-----------|---------|---------|----------|
-| `pass_rate` | `>= min` | `JARVIS_VERIFY_MIN_PASS_RATE` | `1.0` | CANCELLED |
-| `coverage_pct` | `>= baseline - max_drop` | `JARVIS_VERIFY_COVERAGE_DROP_MAX` | `5.0` | CANCELLED |
-| `complexity_delta` | `<= max` | `JARVIS_VERIFY_MAX_COMPLEXITY_DELTA` | `2.0` | CANCELLED |
-| `lint_violations` | `<= max` | `JARVIS_VERIFY_MAX_LINT_VIOLATIONS` | `5` | CANCELLED |
-| `timed_out` | `False` | — | — | CANCELLED |
-| `error` | `None` | — | — | CANCELLED |
+| `pass_rate` | `>= min` | `JARVIS_VERIFY_MIN_PASS_RATE` | `1.0` | POSTMORTEM |
+| `coverage_pct` | `>= baseline - max_drop` | `JARVIS_VERIFY_COVERAGE_DROP_MAX` | `5.0` | POSTMORTEM |
+| `complexity_delta` | `<= max` | `JARVIS_VERIFY_MAX_COMPLEXITY_DELTA` | `2.0` | POSTMORTEM |
+| `lint_violations` | `<= max` | `JARVIS_VERIFY_MAX_LINT_VIOLATIONS` | `5` | POSTMORTEM |
+| `timed_out` | `False` | — | — | POSTMORTEM |
+| `error` | `None` | — | — | POSTMORTEM |
 
 **Edge case: `pass_rate` when 0 tests collected:** If pytest reports 0 tests collected, `pass_rate` is undefined. Treat as `1.0` (no tests to regress). If pytest fails to run at all, `error` is set → hard fail.
 
@@ -107,22 +109,27 @@ VERIFY → _run_benchmark → _enforce_verify_thresholds
 
 PatchBenchmarker snapshots complexity before APPLY (via `pre_apply_snapshots`) but not coverage. Two options:
 
-**Option chosen: Reuse VALIDATE coverage when available.** If PythonAdapter's pytest run during VALIDATE produced a coverage report (it already runs `pytest`), capture that pass_rate and coverage_pct as the baseline on `ctx`. This avoids duplicating a full pytest+cov run.
+**Reality check:** PythonAdapter in VALIDATE runs pytest with `--json-report`, NOT coverage flags. There is no coverage data produced during VALIDATE today.
 
-If no VALIDATE coverage is available (e.g., VALIDATE used a different test subset, or coverage tool missing), skip coverage regression check — the gate is best-effort, not mandatory.
+**Option chosen: Pre-APPLY coverage snapshot.** Before APPLY, run a lightweight coverage check on target files: `pytest --cov=<target_module> --cov-report=json -q --no-header <test_files>` with a short timeout. Store the resulting `coverage_pct` on `ctx` via `pre_apply_snapshots["_coverage_baseline"]`. This mirrors how complexity uses `pre_apply_snapshots` for before/after comparison.
 
-**Storage:** Add `ctx.with_pre_apply_metrics(pass_rate=..., coverage_pct=...)` (or extend `pre_apply_snapshots` dict with `"_metrics"` key) to carry baseline through APPLY.
+If coverage tool is missing, pytest fails, or timeout hits, skip coverage regression check — the gate is best-effort, not mandatory. This is a single additional pytest run bounded by `JARVIS_VERIFY_BASELINE_TIMEOUT_S` (default 30s).
+
+**Storage:** Extend `pre_apply_snapshots` dict with `"_coverage_baseline": float` key to carry baseline through APPLY.
 
 #### Rollback Mechanism
 
 On threshold failure:
 1. Read `ctx.pre_apply_snapshots` (dict of `{rel_path: original_content_str}`)
-2. For each file, write `original_content` back to disk
-3. Verify restoration via SHA256 hash comparison
-4. Advance to `OperationPhase.CANCELLED` with `terminal_reason_code="verify_regression"`
-5. Record in ledger as `OperationState.FAILED` with `rollback_occurred=True`
+2. For each file in snapshots, write `original_content` back to disk
+3. For each `target_file` NOT in `pre_apply_snapshots` (new files created by the patch), delete the file if it exists on disk
+4. Verify restoration via SHA256 hash comparison
+5. Advance to `OperationPhase.POSTMORTEM` with `terminal_reason_code="verify_regression"` and `rollback_occurred=True`
+6. Record in ledger as `OperationState.FAILED` with `rollback_occurred=True`
 
-This reuses the same `pre_apply_snapshots` that complexity baselines use. No new rollback infrastructure needed.
+This reuses the same `pre_apply_snapshots` that complexity baselines use. The new-file cleanup (step 3) prevents orphaned files from patches that created new modules.
+
+**Known limitation:** If an infra hook ran successfully between APPLY and VERIFY (e.g., `pip install`), file rollback does NOT undo the infra side effect. Paired infra rollback is future scope.
 
 #### Telemetry
 
