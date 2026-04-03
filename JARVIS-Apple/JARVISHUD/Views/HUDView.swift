@@ -73,7 +73,7 @@ struct HUDView: View {
 
     var body: some View {
         ZStack {
-            // Screen lock animation overlay (ClickThroughWindow)
+            // Screen lock animation overlay
             if showScreenLockAnimation {
                 ScreenLockAnimationView(countdown: $screenLockCountdown)
                     .transition(.opacity)

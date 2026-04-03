@@ -24,8 +24,9 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
     // and feeding JARVIS's own voice back as a command.
     private var isTTSSpeaking = false
 
-    private var overlayWindow: ClickThroughWindow?
-    private var hudVisible = false
+    private var borderWindow: LivingBorderWindow?
+    private var panel: JARVISPanel?
+    private var panelVisible = false
     private var statusItem: NSStatusItem?
     private var statusMenu: NSMenu?
     private var subs = Set<AnyCancellable>()
@@ -51,6 +52,36 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             BrainstemLauncher.shared.hiveStore = self.hiveStore
             BrainstemLauncher.shared.start()
             self.appState.boot()
+
+            // Living Border + Panel setup — border always visible, panel hidden until summoned
+            self.setupWindows()
+
+            // Global keyboard shortcut: Cmd+Shift+J toggles panel
+            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                if event.modifierFlags.contains([.command, .shift]) && event.characters?.lowercased() == "j" {
+                    Task { @MainActor in self?.togglePanel() }
+                    return nil  // Consume the event
+                }
+                return event
+            }
+
+            // Wire border color to Hive cognitive state
+            Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                guard let self else { return }
+                Task { @MainActor in
+                    let state: BorderState
+                    if self.appState.pythonBridge.connectionStatus == .disconnected {
+                        state = .offline
+                    } else {
+                        switch self.hiveStore.cognitiveState {
+                        case .flow: state = .flow
+                        case .rem: state = .rem
+                        default: state = .baseline
+                        }
+                    }
+                    self.borderWindow?.updateState(state)
+                }
+            }
 
             // Smoke test: verify screenshot capture works from Swift
             Task {
@@ -90,6 +121,23 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         wakeWord.onCommand = { [weak self] command in
             guard let self else { return }
             print("[JARVIS] Voice command: \"\(command)\"")
+
+            // Panel control voice commands
+            let lower = command.lowercased().trimmingCharacters(in: .whitespaces)
+
+            if lower.contains("show yourself") || lower.contains("show panel") || lower.contains("appear") {
+                Task { @MainActor in self.showHUD() }
+                return
+            }
+            if lower.contains("hide") || lower.contains("dismiss") || lower.contains("go away") || lower.contains("disappear") {
+                Task { @MainActor in self.hideHUD() }
+                return
+            }
+
+            // Show panel for any other command (organism responds visually)
+            Task { @MainActor in
+                if !self.panelVisible { self.showHUD() }
+            }
 
             guard BrainstemLauncher.shared.isRunning else {
                 print("[JARVIS] Backend not running — cannot execute command")
@@ -311,7 +359,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         cmd.target = self
         menu.addItem(cmd)
 
-        let toggle = NSMenuItem(title: "Show HUD", action: #selector(toggleHUD), keyEquivalent: "j")
+        let toggle = NSMenuItem(title: "Show JARVIS", action: #selector(toggleHUD), keyEquivalent: "j")
         toggle.keyEquivalentModifierMask = [.command, .shift]
         toggle.target = self
         toggle.tag = 200
@@ -362,7 +410,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         }
     }
 
-    @objc private func toggleHUD() { if hudVisible { hideHUD() } else { showHUD() } }
+    @objc private func toggleHUD() { togglePanel() }
     @objc private func quitApp() { BrainstemLauncher.shared.stop(); ScreenCaptureService.shared.stopStream(); appState.pythonBridge.shutdown(); NSApp.terminate(nil) }
 
     // MARK: - Icon
@@ -413,37 +461,38 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         }
     }
 
-    // MARK: - HUD Overlay
+    // MARK: - Living Border + Panel
 
-    private func ensureOverlayWindow() {
-        guard overlayWindow == nil, let screen = NSScreen.main else { return }
-        let win = ClickThroughWindow(contentRect: screen.frame,
-            styleMask: [.borderless, .fullSizeContentView], backing: .buffered, defer: false)
-        win.setFrame(screen.frame, display: true)
-        let hudView = HUDView(hiveStore: hiveStore).environmentObject(appState)
-        let hosting = ClickThroughHostingView(rootView: hudView)
-        hosting.layer?.backgroundColor = .clear
-        win.contentView = hosting; win.alphaValue = 0; overlayWindow = win
+    private func setupWindows() {
+        // Border window — always on, always breathing
+        if borderWindow == nil {
+            borderWindow = LivingBorderWindow()
+        }
+
+        // Panel — created once, shown/hidden on demand
+        if panel == nil {
+            let hudView = HUDView(hiveStore: hiveStore)
+                .environmentObject(appState)
+            panel = JARVISPanel(contentView: AnyView(hudView))
+        }
     }
 
     private func showHUD() {
-        ensureOverlayWindow()
-        guard let win = overlayWindow, !hudVisible else { return }
-        hudVisible = true; win.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.3; win.animator().alphaValue = 1.0 }
-        statusMenu?.item(withTag: 200)?.title = "Hide HUD"
+        setupWindows()
+        guard let panel, !panelVisible else { return }
+        panelVisible = true
+        panel.showPanel()
+        statusMenu?.item(withTag: 200)?.title = "Hide JARVIS"
     }
 
     private func hideHUD() {
-        guard let win = overlayWindow, hudVisible else { return }
-        hudVisible = false
-        let fadeDuration = 0.3
-        NSAnimationContext.runAnimationGroup({ $0.duration = fadeDuration; win.animator().alphaValue = 0 })
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(fadeDuration))
-            guard let self, !self.hudVisible, self.overlayWindow === win else { return }
-            self.overlayWindow?.orderOut(nil)
-        }
-        statusMenu?.item(withTag: 200)?.title = "Show HUD"
+        guard let panel, panelVisible else { return }
+        panelVisible = false
+        panel.hidePanel()
+        statusMenu?.item(withTag: 200)?.title = "Show JARVIS"
+    }
+
+    func togglePanel() {
+        if panelVisible { hideHUD() } else { showHUD() }
     }
 }
