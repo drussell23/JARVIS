@@ -140,7 +140,7 @@ class DoublewordProvider:
                 headers={
                     "Authorization": f"Bearer {self._api_key}",
                 },
-                timeout=aiohttp.ClientTimeout(total=30),
+                timeout=aiohttp.ClientTimeout(total=120),
             )
         return self._session
 
@@ -416,8 +416,8 @@ class DoublewordProvider:
                     return None
                 result = await resp.json()
                 return result.get("id")
-        except Exception:
-            logger.exception("[DoublewordProvider] File upload error")
+        except Exception as exc:
+            logger.warning("[DoublewordProvider] File upload error: %s: %s", type(exc).__name__, exc)
             return None
 
     async def _create_batch(self, input_file_id: str) -> Optional[str]:
