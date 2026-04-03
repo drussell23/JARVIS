@@ -181,7 +181,7 @@ class DoublewordProvider:
             "body": {
                 "model": self._model,
                 "messages": [
-                    {"role": "system", "content": "You are a code generation assistant for the Trinity AI ecosystem. Return valid JSON matching the requested schema."},
+                    {"role": "system", "content": "You are a code generation assistant. You MUST respond with ONLY a valid JSON object. No explanations, no markdown, no natural language — ONLY the JSON object matching the schema described in the user prompt. Start your response with { and end with }."},
                     {"role": "user", "content": prompt},
                 ],
                 "max_tokens": self._max_tokens,
@@ -281,6 +281,21 @@ class DoublewordProvider:
                 "[DoublewordProvider] Batch %s response preview (%d chars): %s",
                 pending.batch_id, len(content), _preview,
             )
+
+            # Auto-fix: if the 397B returned natural language instead of JSON,
+            # try to extract any JSON block that might be embedded deeper in the
+            # response. If truly no JSON exists, _parse_generation_response will
+            # raise and the caller handles the failure.
+            from backend.core.ouroboros.governance.providers import _extract_json_block
+            _extracted = _extract_json_block(content)
+            if _extracted and not _extracted.lstrip().startswith("{"):
+                logger.warning(
+                    "[DoublewordProvider] 397B returned natural language instead of JSON "
+                    "(batch %s). Response starts with: %s",
+                    pending.batch_id, _extracted[:100].replace("\n", " "),
+                )
+                # Return None — caller treats as "no candidates" and retries
+                return None
 
             return _parse_generation_response(
                 raw=content,
