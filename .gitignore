@@ -61,6 +61,9 @@ temp/
 
 # Large model files
 models/
+# Exception: Allow Swift Models directories (not ML model files)
+!JARVIS-Apple/**/Models/
+!JARVIS-Apple/**/Models/**
 *.gguf
 *.ggml
 *.bin
