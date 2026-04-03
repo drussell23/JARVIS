@@ -16,6 +16,7 @@ struct JARVISHUDApp: App {
 @MainActor
 class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelegate {
     let appState = AppState()
+    let hiveStore = HiveStore()
     let wakeWord = WakeWordListener()
     private let tts = AVSpeechSynthesizer()
 
@@ -47,6 +48,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 guard let self = self else { return }
                 self.appState.pythonBridge.onBackendReady()
             }
+            BrainstemLauncher.shared.hiveStore = self.hiveStore
             BrainstemLauncher.shared.start()
             self.appState.boot()
 
@@ -418,7 +420,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         let win = ClickThroughWindow(contentRect: screen.frame,
             styleMask: [.borderless, .fullSizeContentView], backing: .buffered, defer: false)
         win.setFrame(screen.frame, display: true)
-        let hudView = HUDView(onQuit: { [weak self] in
+        let hudView = HUDView(hiveStore: hiveStore, onQuit: { [weak self] in
             Task { @MainActor in self?.hideHUD() }
         }).environmentObject(appState)
         let hosting = ClickThroughHostingView(rootView: hudView)

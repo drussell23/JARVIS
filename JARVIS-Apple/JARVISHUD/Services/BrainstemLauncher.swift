@@ -24,6 +24,10 @@ final class BrainstemLauncher {
     /// HTTP port for the backend in HUD mode (separate from supervisor's 8010).
     let httpPort: UInt16 = 8011
 
+    /// Hive event store — receives agent_log, persona_reasoning, thread_lifecycle,
+    /// cognitive_transition events from the brainstem IPC stream.
+    var hiveStore: HiveStore?
+
     /// Called when the backend IPC is connected and ready for commands.
     /// AppState sets this to announce "JARVIS Online" and complete the loading screen.
     var onReady: (() -> Void)?
@@ -321,6 +325,9 @@ final class BrainstemLauncher {
                 Task { @MainActor in
                     self.connection = conn
 
+                    // Start receiving events from the brainstem
+                    self.startReceiveLoop(conn)
+
                     // Notify HUD that JARVIS is online and ready for commands
                     self.onReady?()
 
@@ -360,6 +367,74 @@ final class BrainstemLauncher {
         }
 
         conn.start(queue: ipcQueue)
+    }
+
+    // MARK: - IPC Receive Loop
+
+    /// Buffer for partial JSON lines received over TCP.
+    private var receiveBuffer = Data()
+
+    /// Recursively receive data from the brainstem IPC connection.
+    /// Parses newline-delimited JSON and dispatches Hive events to HiveStore.
+    private func startReceiveLoop(_ conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] data, _, isComplete, error in
+            guard let self = self else { return }
+
+            if let data = data, !data.isEmpty {
+                Task { @MainActor in
+                    self.receiveBuffer.append(data)
+                    self.processReceiveBuffer()
+                }
+            }
+
+            if isComplete {
+                print("[Brainstem] IPC connection closed by peer")
+                return
+            }
+
+            if let error = error {
+                print("[Brainstem] IPC receive error: \(error)")
+                return
+            }
+
+            // Continue receiving
+            self.startReceiveLoop(conn)
+        }
+    }
+
+    /// Process complete newline-delimited JSON lines from the receive buffer.
+    private func processReceiveBuffer() {
+        while let newlineIndex = receiveBuffer.firstIndex(of: 0x0A) {
+            let lineData = receiveBuffer[receiveBuffer.startIndex..<newlineIndex]
+            receiveBuffer = Data(receiveBuffer[receiveBuffer.index(after: newlineIndex)...])
+
+            guard !lineData.isEmpty else { continue }
+
+            do {
+                guard let json = try JSONSerialization.jsonObject(with: lineData) as? [String: Any],
+                      let eventType = json["event_type"] as? String else {
+                    continue
+                }
+
+                let dataDict = json["data"] as? [String: Any] ?? [:]
+
+                // Route Hive events to HiveStore — don't pass to AppState
+                let hiveEventTypes: Set<String> = [
+                    "agent_log", "persona_reasoning",
+                    "thread_lifecycle", "cognitive_transition",
+                ]
+                if hiveEventTypes.contains(eventType) {
+                    hiveStore?.handleEvent(eventType: eventType, data: dataDict)
+                    continue
+                }
+
+                // Other events can be handled here in the future
+                print("[Brainstem] Received IPC event: \(eventType)")
+            } catch {
+                // Skip malformed lines silently
+                continue
+            }
+        }
     }
 
     /// Whether the brainstem is currently running.
