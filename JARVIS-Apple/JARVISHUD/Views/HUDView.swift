@@ -10,6 +10,12 @@ import SwiftUI
 
 // HUDState and TranscriptMessage are defined in AppState.swift
 
+/// Tab selection for the main HUD content area
+enum HUDTab: String, CaseIterable {
+    case chat = "Chat"
+    case hive = "Hive"
+}
+
 /// Voice interaction state
 enum VoiceState {
     case inactive
@@ -45,6 +51,8 @@ struct HUDView: View {
     @State private var visionCommandText: String = ""  // Vision command input
     @State private var visionAnalyzing: Bool = false  // Vision analysis in progress
     @State private var visionResult: String? = nil  // Last vision result
+    @State private var hudTab: HUDTab = .chat  // Segmented tab selection
+    var hiveStore: HiveStore  // Hive event store (injected from App)
     var onQuit: (() -> Void)? = nil  // Callback to quit HUD
 
     // Use shared PythonBridge from AppState (persisted from LoadingHUDView)
@@ -147,60 +155,79 @@ struct HUDView: View {
                 .padding(.horizontal, 60)
                 .padding(.bottom, 10)
 
-                // Transcript section - Scrollable (matching web app)
-                ScrollView {
-                    TranscriptView(messages: transcriptMessages)
-                        .padding(.vertical, 20)
-                }
-                .frame(height: 250)
-                .frame(maxWidth: 1000)
-                .padding(.horizontal, 60)
-                .padding(.bottom, 20)
-
-                // Bottom: Command input (matching web app styling)
-                HStack(spacing: 12) {
-                    TextField("Type a command to JARVIS...", text: $commandText, onCommit: sendCommand)
-                        .textFieldStyle(PlainTextFieldStyle())
-                        .font(.system(size: 14, design: .default))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 14)
-                        .background(Color.clear)
-
-                    Button(action: sendCommand) {
-                        Text("SEND")
-                            .font(.system(size: 13, weight: .bold, design: .monospaced))
-                            .foregroundColor(.black)
-                            .padding(.horizontal, 24)
-                            .padding(.vertical, 12)
-                            .background(
-                                RoundedRectangle(cornerRadius: 25)
-                                    .fill(
-                                        LinearGradient(
-                                            colors: [Color(red: 0, green: 1, blue: 0.255), Color(red: 0, green: 0.667, blue: 0.180)],
-                                            startPoint: .topLeading,
-                                            endPoint: .bottomTrailing
-                                        )
-                                    )
-                                    .shadow(color: Color.jarvisGreenGlow(opacity: 0.4), radius: 20)
-                            )
+                // Segmented tab control: Chat / Hive
+                Picker("", selection: $hudTab) {
+                    ForEach(HUDTab.allCases, id: \.self) { tab in
+                        Text(tab.rawValue).tag(tab)
                     }
-                    .buttonStyle(PlainButtonStyle())
-                    .disabled(commandText.isEmpty)
                 }
-                .frame(maxWidth: 800)
-                .padding(8)
-                .background(
-                    RoundedRectangle(cornerRadius: 50)
-                        .fill(Color.black.opacity(0.3))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 50)
-                                .stroke(Color.jarvisGreen.opacity(0.2), lineWidth: 1)
-                        )
-                        .shadow(color: Color.jarvisGreen.opacity(0.1), radius: 20)
-                )
-                .padding(.horizontal, 60)
-                .padding(.bottom, 40)
+                .pickerStyle(.segmented)
+                .padding(.horizontal, 20)
+                .frame(maxWidth: 200)
+
+                // Content swap based on selected tab
+                if hudTab == .chat {
+                    // Transcript section - Scrollable (matching web app)
+                    ScrollView {
+                        TranscriptView(messages: transcriptMessages)
+                            .padding(.vertical, 20)
+                    }
+                    .frame(height: 250)
+                    .frame(maxWidth: 1000)
+                    .padding(.horizontal, 60)
+                    .padding(.bottom, 20)
+
+                    // Bottom: Command input (matching web app styling)
+                    HStack(spacing: 12) {
+                        TextField("Type a command to JARVIS...", text: $commandText, onCommit: sendCommand)
+                            .textFieldStyle(PlainTextFieldStyle())
+                            .font(.system(size: 14, design: .default))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 20)
+                            .padding(.vertical, 14)
+                            .background(Color.clear)
+
+                        Button(action: sendCommand) {
+                            Text("SEND")
+                                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                                .foregroundColor(.black)
+                                .padding(.horizontal, 24)
+                                .padding(.vertical, 12)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 25)
+                                        .fill(
+                                            LinearGradient(
+                                                colors: [Color(red: 0, green: 1, blue: 0.255), Color(red: 0, green: 0.667, blue: 0.180)],
+                                                startPoint: .topLeading,
+                                                endPoint: .bottomTrailing
+                                            )
+                                        )
+                                        .shadow(color: Color.jarvisGreenGlow(opacity: 0.4), radius: 20)
+                                )
+                        }
+                        .buttonStyle(PlainButtonStyle())
+                        .disabled(commandText.isEmpty)
+                    }
+                    .frame(maxWidth: 800)
+                    .padding(8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 50)
+                            .fill(Color.black.opacity(0.3))
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 50)
+                                    .stroke(Color.jarvisGreen.opacity(0.2), lineWidth: 1)
+                            )
+                            .shadow(color: Color.jarvisGreen.opacity(0.1), radius: 20)
+                    )
+                    .padding(.horizontal, 60)
+                    .padding(.bottom, 40)
+                } else {
+                    HiveView(hiveStore: hiveStore)
+                        .frame(height: 250)
+                        .frame(maxWidth: 1000)
+                        .padding(.horizontal, 60)
+                        .padding(.bottom, 40)
+                }
             }
 
             // 👁️ Floating Vision Button - Bottom Right Corner
@@ -755,5 +782,5 @@ struct VisionCommandPrompt: View {
 }
 
 #Preview {
-    HUDView()
+    HUDView(hiveStore: HiveStore())
 }

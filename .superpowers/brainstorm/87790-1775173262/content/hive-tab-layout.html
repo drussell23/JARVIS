@@ -1,0 +1,125 @@
+<h2>HiveView — Where Does the Tab Live?</h2>
+<p class="subtitle">The existing HUD is a full-screen transparent overlay with Arc Reactor, transcript, and command input. Where does the Hive tab fit?</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Segmented Control in Header</h3>
+      <p>A small "Chat | Hive" toggle at the top of the HUD, below the J.A.R.V.I.S. title. Swaps the main content area between transcript and Hive feed. Arc Reactor stays visible in both modes.</p>
+      <div class="mockup" style="margin-top: 1rem;">
+        <div class="mockup-header">Layout Preview</div>
+        <div class="mockup-body" style="background: #0a0a0f; padding: 1rem; text-align: center;">
+          <div style="color: #22d3ee; font-size: 0.9rem; font-weight: bold; margin-bottom: 0.5rem;">J.A.R.V.I.S.</div>
+          <div style="display: inline-flex; background: rgba(255,255,255,0.08); border-radius: 8px; padding: 2px; gap: 2px; margin-bottom: 1rem;">
+            <span style="background: rgba(34,211,238,0.2); color: #22d3ee; padding: 4px 16px; border-radius: 6px; font-size: 0.75rem;">Chat</span>
+            <span style="color: #64748b; padding: 4px 16px; font-size: 0.75rem;">Hive</span>
+          </div>
+          <div style="color: #f97316; font-size: 2rem; margin: 0.5rem 0;">⬡</div>
+          <div style="color: #64748b; font-size: 0.75rem;">[ Arc Reactor ]</div>
+          <div style="background: rgba(255,255,255,0.05); border-radius: 8px; margin-top: 0.5rem; padding: 0.8rem; text-align: left;">
+            <div style="color: #94a3b8; font-size: 0.75rem;">Thread list or transcript here...</div>
+          </div>
+        </div>
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Minimal UI change — just a toggle</li>
+          <li>Arc Reactor stays as visual anchor</li>
+          <li>One-tap switch between modes</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Content area is shared — can't see both</li>
+          <li>Hive threads compete with Arc Reactor for vertical space</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Side Panel (Slide-In)</h3>
+      <p>The Hive feed slides in from the right edge of the screen as a panel overlay. The main HUD (Arc Reactor + transcript) stays visible underneath. Toggle via a "Hive" button in the menu bar or keyboard shortcut.</p>
+      <div class="mockup" style="margin-top: 1rem;">
+        <div class="mockup-header">Layout Preview</div>
+        <div class="mockup-body" style="background: #0a0a0f; padding: 1rem; display: flex; gap: 0.5rem;">
+          <div style="flex: 1; text-align: center;">
+            <div style="color: #22d3ee; font-size: 0.9rem; font-weight: bold;">J.A.R.V.I.S.</div>
+            <div style="color: #f97316; font-size: 2rem; margin: 0.5rem 0;">⬡</div>
+            <div style="color: #64748b; font-size: 0.7rem;">[ Main HUD ]</div>
+          </div>
+          <div style="width: 45%; background: rgba(167,139,250,0.08); border-left: 2px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 0.8rem;">
+            <div style="color: #a78bfa; font-size: 0.8rem; font-weight: bold; margin-bottom: 0.5rem;">Hive Feed</div>
+            <div style="display: flex; align-items: center; gap: 0.3rem; margin-bottom: 0.5rem;">
+              <span style="background: #f97316; color: #000; padding: 1px 6px; border-radius: 3px; font-size: 0.6rem;">FLOW</span>
+              <span style="color: #64748b; font-size: 0.65rem;">1 active thread</span>
+            </div>
+            <div style="background: rgba(255,255,255,0.05); border-radius: 6px; padding: 0.5rem; margin-bottom: 0.3rem;">
+              <div style="color: #22d3ee; font-size: 0.65rem;">JARVIS: RAM pressure rising...</div>
+            </div>
+            <div style="background: rgba(255,255,255,0.05); border-radius: 6px; padding: 0.5rem;">
+              <div style="color: #a78bfa; font-size: 0.65rem;">J-Prime: Add TTL eviction...</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>See both HUD and Hive simultaneously</li>
+          <li>Non-destructive — slides in/out</li>
+          <li>Matches PiP concept from Phase 2 spec</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>More complex layout (overlay + panel)</li>
+          <li>May feel cramped on smaller displays</li>
+          <li>Click-through behavior with panels needs care</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Separate Window</h3>
+      <p>The Hive lives in its own floating window, independent of the main HUD overlay. Toggle via menu bar or <code>⌘⇧H</code>. Can be positioned anywhere, resized, minimized independently.</p>
+      <div class="mockup" style="margin-top: 1rem;">
+        <div class="mockup-header">Layout Preview</div>
+        <div class="mockup-body" style="background: #0a0a0f; padding: 1rem; display: flex; gap: 1rem;">
+          <div style="flex: 1; border: 1px solid rgba(34,211,238,0.2); border-radius: 8px; padding: 0.8rem; text-align: center;">
+            <div style="color: #22d3ee; font-size: 0.8rem;">Main HUD Window</div>
+            <div style="color: #f97316; font-size: 1.5rem; margin: 0.3rem;">⬡</div>
+            <div style="color: #64748b; font-size: 0.65rem;">Transcript + Commands</div>
+          </div>
+          <div style="flex: 1; border: 1px solid rgba(167,139,250,0.3); border-radius: 8px; padding: 0.8rem;">
+            <div style="color: #a78bfa; font-size: 0.8rem; font-weight: bold; margin-bottom: 0.5rem;">Hive Window</div>
+            <div style="background: rgba(255,255,255,0.05); border-radius: 6px; padding: 0.5rem; margin-bottom: 0.3rem;">
+              <div style="color: #94a3b8; font-size: 0.65rem;">Thread: Memory Pressure</div>
+            </div>
+            <div style="background: rgba(255,255,255,0.05); border-radius: 6px; padding: 0.5rem;">
+              <div style="color: #94a3b8; font-size: 0.65rem;">Thread: Manifesto Review</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Full independence — resize, reposition, minimize</li>
+          <li>Maximum screen real estate for Hive content</li>
+          <li>Cleanest separation of concerns</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Two windows to manage</li>
+          <li>Need to handle click-through for both</li>
+          <li>More complex window management code</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 2rem; padding: 1.2rem; border-left: 3px solid #a78bfa; background: rgba(167,139,250,0.05); border-radius: 0 8px 8px 0;">
+  <h4 style="margin-top:0; color: #a78bfa;">Recommendation: A (Segmented Control)</h4>
+  <p style="margin: 0; color: #94a3b8;">Simplest to build, follows the approved Phase 1 design ("dedicated tab"), and the existing HUD already has a single-window pattern with ClickThroughWindow. Adding a segmented control is a minimal change. B and C can be Phase 2 enhancements if you want simultaneous viewing later.</p>
+</div>
