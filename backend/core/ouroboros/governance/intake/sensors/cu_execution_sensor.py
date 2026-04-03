@@ -256,8 +256,11 @@ class CUExecutionSensor:
             f"Goal: '{latest.goal[:80]}'"
         )
 
-        # Target the CU planner and executor for fixes
+        # Target CU retry handler first (small file, fast generation),
+        # then planner and executor. The orchestrator uses the first file
+        # as primary target for code generation.
         target_files = (
+            "backend/vision/cu_retry_handler.py",
             "backend/vision/cu_task_planner.py",
             "backend/vision/cu_step_executor.py",
         )
