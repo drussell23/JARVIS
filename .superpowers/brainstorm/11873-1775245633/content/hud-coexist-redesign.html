@@ -1,0 +1,653 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JARVIS HUD — Desktop Coexistence Redesign</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Outfit:wght@300;400;500;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: 'Outfit', sans-serif;
+    background: #1a1a2e;
+    color: #e0e0e0;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  h1 {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.4rem;
+    color: #4ade80;
+    letter-spacing: 2px;
+    margin-bottom: 0.5rem;
+  }
+
+  h2 {
+    font-family: 'Outfit', sans-serif;
+    font-size: 1.1rem;
+    color: #94a3b8;
+    font-weight: 400;
+    margin-bottom: 2rem;
+  }
+
+  .container { max-width: 1200px; margin: 0 auto; padding: 2rem; }
+
+  /* Desktop mockup */
+  .desktop-mock {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #0f172a 100%);
+    border-radius: 12px;
+    border: 1px solid rgba(255,255,255,0.08);
+    overflow: hidden;
+    position: relative;
+    margin-bottom: 2rem;
+    min-height: 500px;
+  }
+
+  .desktop-titlebar {
+    height: 28px;
+    background: rgba(0,0,0,0.4);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+
+  .traffic-light {
+    width: 10px; height: 10px; border-radius: 50%;
+  }
+  .tl-red { background: #ff5f57; }
+  .tl-yellow { background: #febc2e; }
+  .tl-green { background: #28c840; }
+
+  .desktop-titlebar span {
+    font-size: 11px; color: #64748b; margin-left: 8px;
+    font-family: -apple-system, sans-serif;
+  }
+
+  .desktop-content {
+    display: flex;
+    height: 472px;
+  }
+
+  /* Fake desktop area */
+  .fake-desktop {
+    flex: 1;
+    padding: 20px;
+    background:
+      radial-gradient(ellipse at 30% 40%, rgba(56,189,248,0.03) 0%, transparent 50%),
+      radial-gradient(ellipse at 70% 60%, rgba(167,139,250,0.03) 0%, transparent 50%);
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    align-content: flex-start;
+  }
+
+  .fake-app {
+    width: 80px;
+    text-align: center;
+  }
+  .fake-app-icon {
+    width: 48px; height: 48px; border-radius: 10px;
+    margin: 0 auto 4px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+  }
+  .fake-app-label {
+    font-size: 10px; color: #94a3b8;
+  }
+
+  /* ===== OPTION A: RIGHT SIDEBAR ===== */
+  .jarvis-sidebar {
+    width: 320px;
+    background: rgba(0,0,0,0.6);
+    backdrop-filter: blur(20px);
+    border-left: 1px solid rgba(74,222,128,0.15);
+    display: flex;
+    flex-direction: column;
+    position: relative;
+  }
+
+  .jarvis-sidebar::before {
+    content: '';
+    position: absolute;
+    left: -1px;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: linear-gradient(to bottom, rgba(74,222,128,0.4), rgba(74,222,128,0.05), rgba(74,222,128,0.4));
+  }
+
+  .sidebar-header {
+    padding: 12px 16px;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .mini-reactor {
+    width: 18px; height: 18px; border-radius: 50%;
+    background: radial-gradient(circle, #4ade80, #166534 50%, transparent 70%);
+    box-shadow: 0 0 8px rgba(74,222,128,0.4);
+    animation: pulse 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { box-shadow: 0 0 8px rgba(74,222,128,0.4); }
+    50% { box-shadow: 0 0 14px rgba(74,222,128,0.6); }
+  }
+
+  .sidebar-title {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 12px;
+    font-weight: 600;
+    color: #4ade80;
+    letter-spacing: 2px;
+  }
+
+  .sidebar-status {
+    font-size: 9px;
+    color: #4ade80;
+    opacity: 0.5;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .sidebar-tabs {
+    display: flex;
+    padding: 0 16px;
+    gap: 0;
+    border-bottom: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .sidebar-tab {
+    flex: 1;
+    text-align: center;
+    padding: 8px;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    color: #64748b;
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+  }
+
+  .sidebar-tab.active {
+    color: #4ade80;
+    border-bottom-color: #4ade80;
+  }
+
+  .sidebar-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 12px 16px;
+  }
+
+  /* Chat messages */
+  .chat-msg {
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    border-radius: 8px;
+    font-size: 12px;
+    line-height: 1.5;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .chat-msg.jarvis {
+    background: rgba(74,222,128,0.06);
+    border-left: 2px solid rgba(74,222,128,0.3);
+  }
+  .chat-msg.jarvis .sender { color: #4ade80; font-weight: 600; font-size: 10px; }
+
+  .chat-msg.user {
+    background: rgba(96,165,250,0.06);
+    border-left: 2px solid rgba(96,165,250,0.3);
+  }
+  .chat-msg.user .sender { color: #60a5fa; font-weight: 600; font-size: 10px; }
+
+  .chat-msg .text { color: #cbd5e1; margin-top: 2px; }
+
+  /* Hive messages */
+  .hive-state-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    background: rgba(249,115,22,0.08);
+    border: 1px solid rgba(249,115,22,0.2);
+    border-radius: 6px;
+    margin-bottom: 10px;
+  }
+
+  .hive-state-dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #f97316;
+    animation: pulse-orange 2s ease-in-out infinite;
+  }
+
+  @keyframes pulse-orange {
+    0%, 100% { box-shadow: 0 0 4px rgba(249,115,22,0.3); }
+    50% { box-shadow: 0 0 8px rgba(249,115,22,0.5); }
+  }
+
+  .hive-state-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 10px;
+    color: #f97316;
+    font-weight: 600;
+  }
+
+  .hive-thread {
+    background: rgba(255,255,255,0.02);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 8px;
+    margin-bottom: 8px;
+    overflow: hidden;
+  }
+
+  .hive-thread-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 10px;
+    cursor: pointer;
+  }
+
+  .hive-thread-header:hover { background: rgba(255,255,255,0.02); }
+
+  .thread-badge {
+    font-size: 8px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 700;
+    padding: 2px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+  .badge-debating { background: rgba(249,115,22,0.2); color: #f97316; }
+  .badge-consensus { background: rgba(74,222,128,0.2); color: #4ade80; }
+
+  .thread-title {
+    font-size: 11px;
+    color: #e2e8f0;
+    flex: 1;
+  }
+
+  .thread-msgs {
+    padding: 4px 10px 10px;
+    border-top: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .persona-msg {
+    display: flex;
+    gap: 8px;
+    padding: 6px 0;
+  }
+
+  .persona-badge {
+    width: 24px; height: 24px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    font-weight: 700;
+    color: #fff;
+    flex-shrink: 0;
+  }
+
+  .persona-jarvis { background: linear-gradient(135deg, #0891b2, #06b6d4); }
+  .persona-jprime { background: linear-gradient(135deg, #7c3aed, #8b5cf6); }
+  .persona-reactor { background: linear-gradient(135deg, #dc2626, #ef4444); }
+
+  .persona-text {
+    font-size: 10px;
+    line-height: 1.5;
+    color: #94a3b8;
+  }
+
+  .persona-name {
+    font-weight: 600;
+    font-size: 10px;
+    margin-bottom: 1px;
+  }
+
+  .persona-name.jarvis { color: #22d3ee; }
+  .persona-name.jprime { color: #a78bfa; }
+  .persona-name.reactor { color: #ef4444; }
+
+  /* Command input */
+  .sidebar-input {
+    padding: 10px 16px;
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .input-row {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+  }
+
+  .input-field {
+    flex: 1;
+    background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 18px;
+    padding: 6px 14px;
+    color: #94a3b8;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .send-btn {
+    background: linear-gradient(135deg, #4ade80, #22c55e);
+    color: #000;
+    border: none;
+    border-radius: 18px;
+    padding: 6px 14px;
+    font-size: 10px;
+    font-weight: 700;
+    font-family: 'JetBrains Mono', monospace;
+    cursor: pointer;
+  }
+
+  /* Voice indicator */
+  .voice-bar {
+    padding: 4px 16px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+
+  .voice-bar span {
+    font-size: 9px;
+    color: rgba(74,222,128,0.4);
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  /* Labels */
+  .option-label {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: rgba(74,222,128,0.15);
+    color: #4ade80;
+    padding: 4px 12px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-family: 'JetBrains Mono', monospace;
+    font-weight: 600;
+    z-index: 10;
+  }
+
+  .option-description {
+    padding: 1rem 1.5rem;
+    background: rgba(0,0,0,0.3);
+    border-top: 1px solid rgba(255,255,255,0.05);
+    font-size: 13px;
+    color: #94a3b8;
+    line-height: 1.6;
+  }
+
+  .option-description strong { color: #e2e8f0; }
+
+  .pros-list {
+    display: flex;
+    gap: 1rem;
+    margin-top: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .pro-item {
+    font-size: 11px;
+    color: #4ade80;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .pro-item::before { content: '+ '; opacity: 0.5; }
+
+  .section-gap { height: 2rem; }
+
+  /* Resize handle */
+  .resize-handle {
+    width: 4px;
+    cursor: col-resize;
+    background: transparent;
+    position: relative;
+  }
+  .resize-handle:hover { background: rgba(74,222,128,0.2); }
+  .resize-handle::after {
+    content: '⋮';
+    position: absolute;
+    top: 50%;
+    left: -3px;
+    color: #4ade80;
+    opacity: 0.3;
+    font-size: 14px;
+  }
+
+  .recommendation {
+    margin-top: 2rem;
+    padding: 1.2rem;
+    border-left: 3px solid #4ade80;
+    background: rgba(74,222,128,0.05);
+    border-radius: 0 8px 8px 0;
+  }
+
+  .recommendation h3 {
+    color: #4ade80;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    margin-bottom: 0.5rem;
+  }
+
+  .recommendation p {
+    font-size: 13px;
+    color: #94a3b8;
+    line-height: 1.6;
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>JARVIS HUD — Desktop Coexistence</h1>
+  <h2>The HUD lives alongside your workspace, never blocking it</h2>
+
+  <!-- OPTION A: Right Sidebar -->
+  <div class="desktop-mock">
+    <div class="option-label">Option A — Right Sidebar Panel</div>
+    <div class="desktop-titlebar">
+      <div class="traffic-light tl-red"></div>
+      <div class="traffic-light tl-yellow"></div>
+      <div class="traffic-light tl-green"></div>
+      <span>Derek's MacBook Pro — Desktop</span>
+    </div>
+    <div class="desktop-content">
+      <div class="fake-desktop">
+        <div class="fake-app">
+          <div class="fake-app-icon" style="background: #2563eb;">📁</div>
+          <div class="fake-app-label">Documents</div>
+        </div>
+        <div class="fake-app">
+          <div class="fake-app-icon" style="background: #7c3aed;">💻</div>
+          <div class="fake-app-label">Terminal</div>
+        </div>
+        <div class="fake-app">
+          <div class="fake-app-icon" style="background: #dc2626;">🌐</div>
+          <div class="fake-app-label">Chrome</div>
+        </div>
+        <div class="fake-app">
+          <div class="fake-app-icon" style="background: #0891b2;">📝</div>
+          <div class="fake-app-label">VS Code</div>
+        </div>
+        <div style="width: 100%; text-align: center; color: #334155; font-size: 12px; margin-top: 120px;">
+          Your desktop — fully usable, no overlay blocking anything
+        </div>
+      </div>
+      <div class="resize-handle"></div>
+      <div class="jarvis-sidebar">
+        <div class="sidebar-header">
+          <div class="mini-reactor"></div>
+          <div>
+            <div class="sidebar-title">JARVIS</div>
+            <div class="sidebar-status">● ONLINE</div>
+          </div>
+        </div>
+        <div class="voice-bar">
+          <span>🎤 Say "Hey JARVIS"</span>
+        </div>
+        <div class="sidebar-tabs">
+          <div class="sidebar-tab active">Chat</div>
+          <div class="sidebar-tab">Hive</div>
+        </div>
+        <div class="sidebar-content">
+          <div class="chat-msg jarvis">
+            <div class="sender">JARVIS</div>
+            <div class="text">Good morning, Derek. All systems nominal. RAM at 62%, vision loop at 57.6fps.</div>
+          </div>
+          <div class="chat-msg user">
+            <div class="sender">You</div>
+            <div class="text">Check the Hive status</div>
+          </div>
+          <div class="chat-msg jarvis">
+            <div class="sender">JARVIS</div>
+            <div class="text">Hive is in BASELINE. Last REM council ran 4h ago — all systems healthy. No active debates.</div>
+          </div>
+        </div>
+        <div class="sidebar-input">
+          <div class="input-row">
+            <div class="input-field">Type a command...</div>
+            <button class="send-btn">SEND</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="option-description">
+      <strong>Right Sidebar Panel</strong> — JARVIS docks to the right edge of your screen like macOS Notification Center.
+      Resizable width. Your desktop and apps remain fully usable on the left. Drag the edge to resize.
+      Toggle visibility with ⌘⇧J. Stays on top of other windows but only occupies its column.
+      <div class="pros-list">
+        <span class="pro-item">Desktop fully usable</span>
+        <span class="pro-item">Always visible</span>
+        <span class="pro-item">Resizable</span>
+        <span class="pro-item">Natural macOS pattern</span>
+      </div>
+    </div>
+  </div>
+
+  <div class="section-gap"></div>
+
+  <!-- OPTION A with Hive tab -->
+  <div class="desktop-mock">
+    <div class="option-label">Option A — Hive Tab Active</div>
+    <div class="desktop-titlebar">
+      <div class="traffic-light tl-red"></div>
+      <div class="traffic-light tl-yellow"></div>
+      <div class="traffic-light tl-green"></div>
+      <span>Derek's MacBook Pro — Desktop</span>
+    </div>
+    <div class="desktop-content">
+      <div class="fake-desktop">
+        <div class="fake-app">
+          <div class="fake-app-icon" style="background: #2563eb;">📁</div>
+          <div class="fake-app-label">Documents</div>
+        </div>
+        <div class="fake-app">
+          <div class="fake-app-icon" style="background: #7c3aed;">💻</div>
+          <div class="fake-app-label">Terminal</div>
+        </div>
+        <div style="width: 100%; text-align: center; color: #334155; font-size: 12px; margin-top: 150px;">
+          Work while the Hive debates in the sidebar →
+        </div>
+      </div>
+      <div class="resize-handle"></div>
+      <div class="jarvis-sidebar">
+        <div class="sidebar-header">
+          <div class="mini-reactor"></div>
+          <div>
+            <div class="sidebar-title">JARVIS</div>
+            <div class="sidebar-status">● ONLINE</div>
+          </div>
+        </div>
+        <div class="voice-bar">
+          <span>🎤 Say "Hey JARVIS"</span>
+        </div>
+        <div class="sidebar-tabs">
+          <div class="sidebar-tab">Chat</div>
+          <div class="sidebar-tab active" style="color: #a78bfa; border-bottom-color: #a78bfa;">Hive</div>
+        </div>
+        <div class="sidebar-content">
+          <div class="hive-state-bar">
+            <div class="hive-state-dot"></div>
+            <div class="hive-state-label">FLOW STATE</div>
+            <span style="font-size: 9px; color: #64748b; font-family: 'JetBrains Mono', monospace;">1 active</span>
+          </div>
+
+          <div class="hive-thread">
+            <div class="hive-thread-header">
+              <span class="thread-badge badge-debating">DEBATING</span>
+              <span class="thread-title">Memory Pressure in Vision Loop</span>
+            </div>
+            <div class="thread-msgs">
+              <div class="persona-msg">
+                <div class="persona-badge persona-jarvis">J</div>
+                <div>
+                  <div class="persona-name jarvis">JARVIS</div>
+                  <div class="persona-text">RAM at 87.3% and climbing. 12 stale SHM segments in FramePipeline.</div>
+                </div>
+              </div>
+              <div class="persona-msg">
+                <div class="persona-badge persona-jprime">JP</div>
+                <div>
+                  <div class="persona-name jprime">J-Prime</div>
+                  <div class="persona-text">Add TTL eviction to FramePipeline with 30s max age. Deterministic fix per §3.</div>
+                </div>
+              </div>
+              <div class="persona-msg">
+                <div class="persona-badge persona-reactor">RC</div>
+                <div>
+                  <div class="persona-name reactor">Reactor Core</div>
+                  <div class="persona-text">AST clean. Low risk. ✅ Approved for synthesis.</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="hive-thread">
+            <div class="hive-thread-header">
+              <span class="thread-badge badge-consensus">RESOLVED</span>
+              <span class="thread-title">Stale Tool Pruning</span>
+            </div>
+          </div>
+        </div>
+        <div class="sidebar-input">
+          <div class="input-row">
+            <div class="input-field">Type a command...</div>
+            <button class="send-btn">SEND</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="option-description">
+      <strong>Hive feed in the sidebar</strong> — Watch Trinity agents debate while you work.
+      The FLOW state indicator glows orange. Thread cards expand to show the full debate.
+      Your desktop stays completely usable on the left.
+    </div>
+  </div>
+
+  <div class="recommendation">
+    <h3>Recommendation: Right Sidebar Panel</h3>
+    <p>
+      This is the natural macOS pattern — Notification Center, Finder sidebar, Xcode inspectors all work this way.
+      JARVIS occupies a fixed column on the right edge, your apps use the remaining space.
+      Toggle with ⌘⇧J. Resizable. Stays on top but never blocks.
+      The existing compact header, Chat/Hive tabs, and all SwiftUI components work as-is — we just change the
+      window from a full-screen overlay to a right-anchored panel.
+    </p>
+  </div>
+</div>
+</body>
+</html>

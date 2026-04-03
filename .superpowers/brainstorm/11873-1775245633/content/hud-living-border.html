@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>JARVIS — Living Border</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Geist+Mono:wght@300;400;500;600&family=Instrument+Sans:wght@400;500;600;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #08080f;
+    color: #e0e0e0;
+    font-family: 'Instrument Sans', sans-serif;
+    overflow-x: hidden;
+  }
+
+  .page-title {
+    text-align: center;
+    padding: 3rem 2rem 0.5rem;
+    font-size: 1.6rem;
+    font-weight: 300;
+    color: #4ade80;
+    letter-spacing: 6px;
+    font-family: 'Geist Mono', monospace;
+  }
+
+  .page-sub {
+    text-align: center;
+    color: #334155;
+    font-size: 0.85rem;
+    padding-bottom: 2.5rem;
+    max-width: 500px;
+    margin: 0 auto;
+    line-height: 1.6;
+  }
+
+  .section {
+    max-width: 1000px;
+    margin: 0 auto 3rem;
+    padding: 0 2rem;
+  }
+
+  .label {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.65rem;
+    color: #4ade80;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+    opacity: 0.5;
+    margin-bottom: 0.5rem;
+  }
+
+  .title {
+    font-size: 1.2rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    margin-bottom: 0.3rem;
+  }
+
+  .desc {
+    color: #475569;
+    font-size: 0.82rem;
+    line-height: 1.7;
+    margin-bottom: 1.5rem;
+    max-width: 700px;
+  }
+
+  /* ============================================ */
+  /* THE SCREEN MOCKUP WITH LIVING BORDER         */
+  /* ============================================ */
+
+  .monitor {
+    position: relative;
+    border-radius: 14px;
+    overflow: hidden;
+  }
+
+  /* THE LIVING BORDER — wraps the entire screen */
+  .living-border {
+    position: absolute;
+    inset: 0;
+    border-radius: 14px;
+    pointer-events: none;
+    z-index: 10;
+  }
+
+  /* Green breathing border — BASELINE state */
+  .living-border.baseline {
+    box-shadow:
+      inset 0 0 1px 1px rgba(74,222,128,0.15),
+      inset 0 0 4px 1px rgba(74,222,128,0.08),
+      inset 0 0 15px 2px rgba(74,222,128,0.04);
+    animation: border-breathe-green 4s ease-in-out infinite;
+  }
+
+  @keyframes border-breathe-green {
+    0%, 100% {
+      box-shadow:
+        inset 0 0 1px 1px rgba(74,222,128,0.1),
+        inset 0 0 4px 1px rgba(74,222,128,0.05),
+        inset 0 0 12px 2px rgba(74,222,128,0.02);
+    }
+    50% {
+      box-shadow:
+        inset 0 0 2px 1px rgba(74,222,128,0.2),
+        inset 0 0 8px 2px rgba(74,222,128,0.1),
+        inset 0 0 20px 3px rgba(74,222,128,0.05);
+    }
+  }
+
+  /* Purple pulsing border — REM state */
+  .living-border.rem {
+    box-shadow:
+      inset 0 0 2px 1px rgba(167,139,250,0.2),
+      inset 0 0 6px 2px rgba(167,139,250,0.1),
+      inset 0 0 18px 3px rgba(167,139,250,0.05);
+    animation: border-breathe-purple 3s ease-in-out infinite;
+  }
+
+  @keyframes border-breathe-purple {
+    0%, 100% {
+      box-shadow:
+        inset 0 0 1px 1px rgba(167,139,250,0.12),
+        inset 0 0 4px 1px rgba(167,139,250,0.06),
+        inset 0 0 12px 2px rgba(167,139,250,0.03);
+    }
+    50% {
+      box-shadow:
+        inset 0 0 2px 1px rgba(167,139,250,0.25),
+        inset 0 0 10px 2px rgba(167,139,250,0.12),
+        inset 0 0 25px 4px rgba(167,139,250,0.06);
+    }
+  }
+
+  /* Orange fire border — FLOW state */
+  .living-border.flow {
+    box-shadow:
+      inset 0 0 2px 1px rgba(249,115,22,0.25),
+      inset 0 0 8px 2px rgba(249,115,22,0.12),
+      inset 0 0 20px 3px rgba(249,115,22,0.06);
+    animation: border-breathe-orange 2s ease-in-out infinite;
+  }
+
+  @keyframes border-breathe-orange {
+    0%, 100% {
+      box-shadow:
+        inset 0 0 2px 1px rgba(249,115,22,0.15),
+        inset 0 0 6px 1px rgba(249,115,22,0.08),
+        inset 0 0 15px 2px rgba(249,115,22,0.04);
+    }
+    50% {
+      box-shadow:
+        inset 0 0 3px 1px rgba(249,115,22,0.3),
+        inset 0 0 12px 3px rgba(249,115,22,0.15),
+        inset 0 0 30px 5px rgba(249,115,22,0.08);
+    }
+  }
+
+  /* Error/alert — red */
+  .living-border.error {
+    box-shadow:
+      inset 0 0 3px 1px rgba(239,68,68,0.3),
+      inset 0 0 10px 2px rgba(239,68,68,0.15),
+      inset 0 0 25px 4px rgba(239,68,68,0.08);
+    animation: border-breathe-red 1.5s ease-in-out infinite;
+  }
+
+  @keyframes border-breathe-red {
+    0%, 100% {
+      box-shadow:
+        inset 0 0 2px 1px rgba(239,68,68,0.2),
+        inset 0 0 6px 1px rgba(239,68,68,0.1),
+        inset 0 0 15px 2px rgba(239,68,68,0.05);
+    }
+    50% {
+      box-shadow:
+        inset 0 0 4px 2px rgba(239,68,68,0.35),
+        inset 0 0 15px 3px rgba(239,68,68,0.18),
+        inset 0 0 35px 6px rgba(239,68,68,0.1);
+    }
+  }
+
+  /* Offline — dim gray, barely visible */
+  .living-border.offline {
+    box-shadow:
+      inset 0 0 1px 1px rgba(100,116,139,0.08),
+      inset 0 0 3px 1px rgba(100,116,139,0.04);
+    animation: none;
+  }
+
+  /* Screen interior */
+  .screen-inner {
+    background: #0f172a;
+    min-height: 440px;
+    position: relative;
+  }
+
+  .screen-menubar {
+    height: 26px;
+    background: rgba(0,0,0,0.5);
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    gap: 6px;
+  }
+  .mb-dot { width: 10px; height: 10px; border-radius: 50%; }
+  .mb-r { background: #ff5f57; }
+  .mb-y { background: #febc2e; }
+  .mb-g { background: #28c840; }
+  .mb-text {
+    font-size: 11px;
+    color: #475569;
+    margin-left: auto;
+    font-family: -apple-system, sans-serif;
+  }
+
+  .screen-desktop {
+    padding: 30px;
+    min-height: 414px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background:
+      radial-gradient(ellipse at 30% 40%, rgba(30,58,138,0.06) 0%, transparent 50%),
+      radial-gradient(ellipse at 70% 60%, rgba(88,28,135,0.04) 0%, transparent 50%);
+  }
+
+  .desktop-text {
+    text-align: center;
+    color: #1e293b;
+  }
+  .desktop-text .emoji { font-size: 3rem; margin-bottom: 0.5rem; }
+  .desktop-text .line1 { font-size: 0.85rem; margin-bottom: 0.3rem; color: #334155; }
+  .desktop-text .line2 { font-size: 0.7rem; color: #1e293b; }
+
+  /* State badge overlay */
+  .state-badge {
+    position: absolute;
+    bottom: 14px;
+    left: 14px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    letter-spacing: 1px;
+    padding: 4px 10px;
+    border-radius: 6px;
+    backdrop-filter: blur(10px);
+  }
+
+  .state-badge .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+  }
+
+  .state-badge.s-baseline {
+    color: rgba(74,222,128,0.5);
+    background: rgba(74,222,128,0.06);
+    border: 1px solid rgba(74,222,128,0.1);
+  }
+  .state-badge.s-baseline .dot { background: #4ade80; }
+
+  .state-badge.s-rem {
+    color: rgba(167,139,250,0.6);
+    background: rgba(167,139,250,0.06);
+    border: 1px solid rgba(167,139,250,0.1);
+  }
+  .state-badge.s-rem .dot { background: #a78bfa; }
+
+  .state-badge.s-flow {
+    color: rgba(249,115,22,0.6);
+    background: rgba(249,115,22,0.06);
+    border: 1px solid rgba(249,115,22,0.1);
+  }
+  .state-badge.s-flow .dot { background: #f97316; }
+
+  .state-badge.s-error {
+    color: rgba(239,68,68,0.6);
+    background: rgba(239,68,68,0.06);
+    border: 1px solid rgba(239,68,68,0.1);
+  }
+  .state-badge.s-error .dot { background: #ef4444; }
+
+  /* Speed comparison */
+  .speed-label {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: #334155;
+    position: absolute;
+    bottom: 14px;
+    right: 14px;
+    letter-spacing: 1px;
+  }
+
+  /* Grid for all states */
+  .states-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1.5rem;
+    margin-top: 1.5rem;
+  }
+
+  .state-card {
+    position: relative;
+  }
+
+  .state-card-label {
+    font-family: 'Geist Mono', monospace;
+    font-size: 0.6rem;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    margin-bottom: 0.5rem;
+  }
+
+  /* Behavior section */
+  .behaviors {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1rem;
+    margin-top: 2rem;
+  }
+
+  .behavior {
+    padding: 1rem 1.2rem;
+    background: rgba(255,255,255,0.015);
+    border: 1px solid rgba(255,255,255,0.04);
+    border-radius: 10px;
+  }
+
+  .behavior-title {
+    font-family: 'Geist Mono', monospace;
+    font-size: 10px;
+    font-weight: 600;
+    color: #94a3b8;
+    letter-spacing: 1px;
+    margin-bottom: 4px;
+  }
+
+  .behavior-desc {
+    font-size: 11px;
+    color: #475569;
+    line-height: 1.6;
+  }
+
+  .behavior-trigger {
+    font-family: 'Geist Mono', monospace;
+    font-size: 9px;
+    color: #4ade80;
+    background: rgba(74,222,128,0.06);
+    padding: 2px 8px;
+    border-radius: 4px;
+    display: inline-block;
+    margin-top: 6px;
+  }
+
+  .final-note {
+    max-width: 1000px;
+    margin: 3rem auto;
+    padding: 1.5rem 2rem;
+    border-left: 3px solid #4ade80;
+    background: rgba(74,222,128,0.03);
+    border-radius: 0 10px 10px 0;
+  }
+
+  .final-note h3 {
+    font-family: 'Geist Mono', monospace;
+    font-size: 12px;
+    color: #4ade80;
+    letter-spacing: 2px;
+    margin-bottom: 0.5rem;
+  }
+
+  .final-note p {
+    font-size: 13px;
+    color: #64748b;
+    line-height: 1.7;
+  }
+</style>
+</head>
+<body>
+
+<div class="page-title">LIVING BORDER</div>
+<div class="page-sub">
+  JARVIS breathes around your entire screen — a subtle ambient glow that tells you it's alive without touching your workspace.
+  Like Apple Intelligence's Siri glow, but for the whole display.
+</div>
+
+<!-- ALL FOUR STATES -->
+<div class="section">
+  <div class="label">The Four States</div>
+  <div class="title">The border IS JARVIS — its color is its heartbeat</div>
+  <div class="desc">
+    A soft glow wraps your entire screen edge. It breathes. The color and intensity tell you
+    exactly what JARVIS is doing — without a single pixel of UI on your desktop. Your screen
+    is 100% yours. The border is JARVIS.
+  </div>
+
+  <div class="states-grid">
+    <!-- BASELINE -->
+    <div class="state-card">
+      <div class="state-card-label" style="color: #4ade80;">● Baseline — All Quiet</div>
+      <div class="monitor">
+        <div class="living-border baseline"></div>
+        <div class="screen-inner">
+          <div class="screen-menubar">
+            <div class="mb-dot mb-r"></div>
+            <div class="mb-dot mb-y"></div>
+            <div class="mb-dot mb-g"></div>
+            <div class="mb-text">11:44 AM</div>
+          </div>
+          <div class="screen-desktop">
+            <div class="desktop-text">
+              <div class="emoji">🖥️</div>
+              <div class="line1">Your desktop — fully clear</div>
+              <div class="line2">Soft green breath = JARVIS is alive and watching</div>
+            </div>
+          </div>
+          <div class="state-badge s-baseline"><div class="dot"></div> BASELINE</div>
+          <div class="speed-label">breathes every 4s</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- REM -->
+    <div class="state-card">
+      <div class="state-card-label" style="color: #a78bfa;">☽ REM Cycle — Council Reviewing</div>
+      <div class="monitor">
+        <div class="living-border rem"></div>
+        <div class="screen-inner">
+          <div class="screen-menubar">
+            <div class="mb-dot mb-r"></div>
+            <div class="mb-dot mb-y"></div>
+            <div class="mb-dot mb-g"></div>
+            <div class="mb-text">3:00 AM</div>
+          </div>
+          <div class="screen-desktop">
+            <div class="desktop-text">
+              <div class="emoji">🌙</div>
+              <div class="line1">System idle — REM council active</div>
+              <div class="line2">Purple glow = agents reviewing health, tools, compliance</div>
+            </div>
+          </div>
+          <div class="state-badge s-rem"><div class="dot"></div> REM CYCLE</div>
+          <div class="speed-label">pulses every 3s</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- FLOW -->
+    <div class="state-card">
+      <div class="state-card-label" style="color: #f97316;">🔥 Flow State — Agents Debating</div>
+      <div class="monitor">
+        <div class="living-border flow"></div>
+        <div class="screen-inner">
+          <div class="screen-menubar">
+            <div class="mb-dot mb-r"></div>
+            <div class="mb-dot mb-y"></div>
+            <div class="mb-dot mb-g"></div>
+            <div class="mb-text">2:15 PM</div>
+          </div>
+          <div class="screen-desktop">
+            <div class="desktop-text">
+              <div class="emoji">⚡</div>
+              <div class="line1">Trinity debate in progress</div>
+              <div class="line2">Orange fire = JARVIS, J-Prime, Reactor actively reasoning</div>
+            </div>
+          </div>
+          <div class="state-badge s-flow"><div class="dot"></div> FLOW STATE</div>
+          <div class="speed-label">pulses every 2s</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ERROR -->
+    <div class="state-card">
+      <div class="state-card-label" style="color: #ef4444;">⚠ Alert — Needs Attention</div>
+      <div class="monitor">
+        <div class="living-border error"></div>
+        <div class="screen-inner">
+          <div class="screen-menubar">
+            <div class="mb-dot mb-r"></div>
+            <div class="mb-dot mb-y"></div>
+            <div class="mb-dot mb-g"></div>
+            <div class="mb-text">9:30 AM</div>
+          </div>
+          <div class="screen-desktop">
+            <div class="desktop-text">
+              <div class="emoji">🚨</div>
+              <div class="line1">Critical system alert</div>
+              <div class="line2">Red pulse = something needs your attention</div>
+            </div>
+          </div>
+          <div class="state-badge s-error"><div class="dot"></div> ALERT</div>
+          <div class="speed-label">pulses every 1.5s</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- HOW IT WORKS -->
+<div class="section">
+  <div class="label">Interaction Model</div>
+  <div class="title">Summoning JARVIS</div>
+  <div class="desc">
+    The border is always there — ambient, alive, never blocking. When you need JARVIS,
+    summon the panel. When you're done, dismiss it. The border stays.
+  </div>
+
+  <div class="behaviors">
+    <div class="behavior">
+      <div class="behavior-title">ALWAYS ON</div>
+      <div class="behavior-desc">The living border runs in a tiny borderless window at screen level — zero pixels of your workspace used. Just an ambient glow around the edges.</div>
+      <div class="behavior-trigger">macOS window at .screenSaver level</div>
+    </div>
+    <div class="behavior">
+      <div class="behavior-title">SUMMON PANEL</div>
+      <div class="behavior-desc">Say "Hey JARVIS", press ⌘⇧J, or hover the right edge for 0.5s. The chat/hive panel slides in from the right. Desktop pushes left.</div>
+      <div class="behavior-trigger">"Hey JARVIS" / ⌘⇧J / edge hover</div>
+    </div>
+    <div class="behavior">
+      <div class="behavior-title">DISMISS PANEL</div>
+      <div class="behavior-desc">Press ⌘⇧J again, click outside the panel, or say "dismiss." Panel slides out. Border stays breathing. Desktop returns to full width.</div>
+      <div class="behavior-trigger">⌘⇧J / click outside / "dismiss"</div>
+    </div>
+    <div class="behavior">
+      <div class="behavior-title">HEARTBEAT SPEED</div>
+      <div class="behavior-desc">The breathing speed tells you how active JARVIS is. Baseline: slow 4s breath. REM: 3s. Flow: fast 2s pulse. Alert: rapid 1.5s.</div>
+      <div class="behavior-trigger">speed = cognitive intensity</div>
+    </div>
+  </div>
+</div>
+
+<div class="final-note">
+  <h3>THE PHILOSOPHY</h3>
+  <p>
+    JARVIS doesn't need a window to exist. It lives in the light around your screen —
+    breathing, watching, thinking. You glance at the edge and know its state.
+    Green breath: all quiet. Purple pulse: reviewing. Orange fire: debating.
+    Red: needs you. The border IS the interface. The panel is just for when you
+    want to talk.
+  </p>
+</div>
+
+</body>
+</html>
