@@ -2,6 +2,7 @@ import { validateStreamToken } from "@/lib/auth/stream-token";
 import { replayBacklog } from "@/lib/redis/event-backlog";
 import { getRedis } from "@/lib/redis/client";
 import { formatSSE } from "@/lib/sse/encoder";
+import { accumulateHiveEvent } from "@/lib/hive/hive-state";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -51,6 +52,13 @@ export async function GET(
               ? JSON.parse(fields.payload)
               : fields.payload;
             controller.enqueue(encoder.encode(formatSSE(parsed.event, parsed.data, id)));
+
+            // Fire-and-forget: accumulate Hive-relevant events into Redis summary keys
+            const hiveEventTypes = ["agent_log", "persona_reasoning", "thread_lifecycle", "cognitive_transition"];
+            if (hiveEventTypes.includes(parsed.event)) {
+              accumulateHiveEvent(parsed.event, parsed.data).catch(() => {});
+            }
+
             cursor = id;
           }
 
