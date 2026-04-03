@@ -52,10 +52,7 @@ struct HUDView: View {
     @State private var visionAnalyzing: Bool = false  // Vision analysis in progress
     @State private var visionResult: String? = nil  // Last vision result
     @State private var hudTab: HUDTab = .chat  // Segmented tab selection
-    @AppStorage("hudCollapsed") private var isCollapsed: Bool = false
-    @State private var hasAutoCollapsed: Bool = false
     var hiveStore: HiveStore  // Hive event store (injected from App)
-    var onQuit: (() -> Void)? = nil  // Callback to quit HUD
 
     // Use shared PythonBridge from AppState (persisted from LoadingHUDView)
     @EnvironmentObject var appState: AppState
@@ -76,19 +73,14 @@ struct HUDView: View {
 
     var body: some View {
         ZStack {
-            // FULLY TRANSPARENT GLASS - NO BLUR
-            // Pure transparency so desktop shows through completely
-            Color.clear
-                .ignoresSafeArea()
-
-            // 🔒 Screen Lock Animation Overlay
+            // Screen lock animation overlay (ClickThroughWindow)
             if showScreenLockAnimation {
                 ScreenLockAnimationView(countdown: $screenLockCountdown)
                     .transition(.opacity)
                     .zIndex(1000)  // Above everything
             }
 
-            // 👁️ Vision Command Prompt Overlay
+            // Vision command prompt overlay
             if showVisionPrompt {
                 VisionCommandPrompt(
                     commandText: $visionCommandText,
@@ -102,137 +94,40 @@ struct HUDView: View {
             }
 
             VStack(spacing: 0) {
+                // Always-visible compact header
+                CompactHeaderBar(
+                    hudState: hudState,
+                    connectionStatus: pythonBridge.connectionStatus,
+                    detailedState: pythonBridge.detailedConnectionState,
+                    serverVersion: pythonBridge.serverVersion,
+                    hudTab: $hudTab
+                )
 
-                if !isCollapsed {
-                    // EXPANDED MODE: Full hero layout
-
-                    // Top section: J.A.R.V.I.S. title
-                    VStack(spacing: 8) {
-                        Text("J.A.R.V.I.S.")
-                            .font(.system(size: 72, weight: .bold, design: .monospaced))
-                            .tracking(20) // Letter spacing
-                            .foregroundColor(.jarvisGreen)
-                            .shadow(color: Color.jarvisGreenGlow(opacity: 0.8), radius: 20)
-                            .shadow(color: Color.jarvisGreenGlow(opacity: 0.6), radius: 40)
-
-                        Text("JUST A RATHER VERY INTELLIGENT SYSTEM")
-                            .font(.system(size: 12, weight: .medium, design: .monospaced))
-                            .tracking(4)
-                            .foregroundColor(.jarvisGreen)
-                            .shadow(color: Color.jarvisGreenGlow(opacity: 0.6), radius: 10)
+                // Slim voice status line
+                if voiceStatus.state != .inactive {
+                    HStack(spacing: 4) {
+                        Text(voiceStatusIcon)
+                            .font(.system(size: 10))
+                        Text(voiceStatus.message)
+                            .font(.system(size: 10, weight: .medium, design: .monospaced))
+                            .foregroundColor(.jarvisGreen.opacity(0.5))
+                            .lineLimit(1)
                     }
-                    .padding(.top, 60)
-
-                    Spacer()
-
-                    // Center: Arc Reactor (matches web app 420px container)
-                    ArcReactorView(state: hudState, onQuit: onQuit)
-                        .frame(width: 440, height: 440)
-                        .onTapGesture(count: 2) {
-                            withAnimation(.spring(duration: 0.4)) {
-                                isCollapsed = true
-                            }
-                        }
-
-                    Spacer()
-
-                    // Status message below reactor
-                    VStack(spacing: 8) {
-                        Text(statusText)
-                            .font(.system(size: 14, weight: .bold, design: .monospaced))
-                            .tracking(3)
-                            .foregroundColor(.jarvisGreen)
-                            .shadow(color: Color.jarvisGreenGlow(opacity: 0.6), radius: 10)
-
-                        // Detailed connection state from Universal Client
-                        if !pythonBridge.detailedConnectionState.isEmpty && pythonBridge.detailedConnectionState != statusText {
-                            HStack(spacing: 6) {
-                                ConnectionStateIndicator(state: pythonBridge.connectionStatus)
-
-                                Text(pythonBridge.detailedConnectionState)
-                                    .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                    .foregroundColor(.white.opacity(0.5))
-                                    .tracking(1)
-                            }
-                        }
-
-                        // Server version and capabilities (when connected)
-                        if pythonBridge.connectionStatus == .connected, !pythonBridge.serverVersion.isEmpty, pythonBridge.serverVersion != "unknown" {
-                            Text("v\(pythonBridge.serverVersion) \u{2022} \(pythonBridge.serverCapabilities.joined(separator: ", "))")
-                                .font(.system(size: 9, weight: .regular, design: .monospaced))
-                                .foregroundColor(.white.opacity(0.3))
-                                .tracking(1)
-                        }
-                    }
-                    .padding(.bottom, 30)
-
-                    // Voice Status Indicator (matching web app "Say 'Hey JARVIS'" banner)
-                    VoiceStatusBanner(
-                        voiceStatus: voiceStatus,
-                        currentTranscript: currentTranscript
-                    )
-                    .padding(.horizontal, 60)
-                    .padding(.bottom, 10)
-
-                    // Collapse hint
-                    Text("Double-click reactor or \u{2318}\u{21E7}R to collapse")
-                        .font(.system(size: 9, weight: .regular, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.15))
-                        .padding(.bottom, 4)
-
-                    // Segmented tab control: Chat / Hive
-                    Picker("", selection: $hudTab) {
-                        ForEach(HUDTab.allCases, id: \.self) { tab in
-                            Text(tab.rawValue).tag(tab)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .padding(.horizontal, 20)
-                    .frame(maxWidth: 200)
-
-                } else {
-                    // COLLAPSED MODE: Compact header
-
-                    CompactHeaderBar(
-                        hudState: hudState,
-                        connectionStatus: pythonBridge.connectionStatus,
-                        detailedState: pythonBridge.detailedConnectionState,
-                        serverVersion: pythonBridge.serverVersion,
-                        hudTab: $hudTab,
-                        onExpandReactor: {
-                            withAnimation(.spring(duration: 0.4)) {
-                                isCollapsed = false
-                            }
-                        }
-                    )
-
-                    // Slim voice status line
-                    if voiceStatus.state != .inactive {
-                        HStack(spacing: 4) {
-                            Text(voiceStatusIcon)
-                                .font(.system(size: 10))
-                            Text(voiceStatus.message)
-                                .font(.system(size: 10, weight: .medium, design: .monospaced))
-                                .foregroundColor(.jarvisGreen.opacity(0.5))
-                                .lineLimit(1)
-                        }
-                        .padding(.vertical, 2)
-                    }
+                    .padding(.vertical, 2)
                 }
 
-                // Content swap based on selected tab (shared by both modes)
+                // Content area (fills all available space)
                 if hudTab == .chat {
-                    // Transcript section - Scrollable (matching web app)
+                    // Transcript section - Scrollable
                     ScrollView {
                         TranscriptView(messages: transcriptMessages)
                             .padding(.vertical, 20)
                     }
-                    .layoutPriority(1)
-                    .frame(maxWidth: 1000)
-                    .padding(.horizontal, isCollapsed ? 20 : 60)
-                    .padding(.bottom, 20)
+                    .layoutPriority(1)  // Fill available space, no fixed height
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 8)
 
-                    // Bottom: Command input (matching web app styling)
+                    // Command input
                     HStack(spacing: 12) {
                         TextField("Type a command to JARVIS...", text: $commandText, onCommit: sendCommand)
                             .textFieldStyle(PlainTextFieldStyle())
@@ -263,7 +158,6 @@ struct HUDView: View {
                         .buttonStyle(PlainButtonStyle())
                         .disabled(commandText.isEmpty)
                     }
-                    .frame(maxWidth: 800)
                     .padding(8)
                     .background(
                         RoundedRectangle(cornerRadius: 50)
@@ -274,18 +168,17 @@ struct HUDView: View {
                             )
                             .shadow(color: Color.jarvisGreen.opacity(0.1), radius: 20)
                     )
-                    .padding(.horizontal, isCollapsed ? 20 : 60)
-                    .padding(.bottom, 40)
+                    .padding(.horizontal, 20)
+                    .padding(.bottom, 16)
                 } else {
                     HiveView(hiveStore: hiveStore)
                         .layoutPriority(1)
-                        .frame(maxWidth: 1000)
-                        .padding(.horizontal, isCollapsed ? 20 : 60)
-                        .padding(.bottom, 40)
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 16)
                 }
             }
 
-            // 👁️ Floating Vision Button - Bottom Right Corner
+            // Floating Vision Button - Bottom Right Corner
             VStack {
                 Spacer()
                 HStack {
@@ -315,37 +208,17 @@ struct HUDView: View {
                     }
                     .buttonStyle(PlainButtonStyle())
                     .help("Open Vision Analysis")
-                    .padding(.trailing, 40)
-                    .padding(.bottom, 40)
+                    .padding(.trailing, 20)
+                    .padding(.bottom, 20)
                 }
             }
             .zIndex(500)  // Above main content, below overlays
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(
-            Button("") {
-                withAnimation(.spring(duration: 0.4)) {
-                    isCollapsed.toggle()
-                }
-            }
-            .keyboardShortcut("r", modifiers: [.command, .shift])
-            .opacity(0)
-            .frame(width: 0, height: 0)
-        )
+        .background(Color.clear)  // Frosted glass shows through from NSVisualEffectView
         .onAppear {
             print("\u{2705} HUDView appeared - using shared PythonBridge")
             print("   Connection status: \(pythonBridge.connectionStatus)")
             updateStatusFromConnection()
-
-            // Auto-collapse after boot animation completes
-            if !hasAutoCollapsed && !isCollapsed {
-                hasAutoCollapsed = true
-                DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                    withAnimation(.spring(duration: 0.4)) {
-                        isCollapsed = true
-                    }
-                }
-            }
         }
         .onChange(of: pythonBridge.connectionStatus) { newStatus in
             updateStatusFromConnection()

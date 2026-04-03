@@ -10,13 +10,12 @@ struct CompactHeaderBar: View {
     let detailedState: String
     let serverVersion: String
     @Binding var hudTab: HUDTab
-    var onExpandReactor: () -> Void
 
     var body: some View {
         HStack(spacing: 0) {
             // Left: Mini reactor + JARVIS name
             HStack(spacing: 10) {
-                // Mini reactor dot (20px) — double-tap to expand
+                // Mini reactor dot (20px)
                 Circle()
                     .fill(
                         RadialGradient(
@@ -35,9 +34,6 @@ struct CompactHeaderBar: View {
                             .opacity(pulseOpacity)
                             .animation(.easeInOut(duration: 1.5).repeatForever(autoreverses: true), value: pulseOpacity)
                     )
-                    .onTapGesture(count: 2) {
-                        onExpandReactor()
-                    }
 
                 Text("JARVIS")
                     .font(.system(size: 14, weight: .bold, design: .monospaced))

@@ -420,9 +420,7 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         let win = ClickThroughWindow(contentRect: screen.frame,
             styleMask: [.borderless, .fullSizeContentView], backing: .buffered, defer: false)
         win.setFrame(screen.frame, display: true)
-        let hudView = HUDView(hiveStore: hiveStore, onQuit: { [weak self] in
-            Task { @MainActor in self?.hideHUD() }
-        }).environmentObject(appState)
+        let hudView = HUDView(hiveStore: hiveStore).environmentObject(appState)
         let hosting = ClickThroughHostingView(rootView: hudView)
         hosting.layer?.backgroundColor = .clear
         win.contentView = hosting; win.alphaValue = 0; overlayWindow = win
