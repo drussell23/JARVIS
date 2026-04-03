@@ -512,8 +512,22 @@ class DoublewordProvider:
 
                         if choices:
                             message = choices[0].get("message", {})
-                            # Extract content, NOT reasoning_content
+                            # Extract content — for reasoning models like Qwen3.5,
+                            # the actual answer may be in 'content' or 'reasoning_content'.
+                            # Try 'content' first; if empty, fall back to 'reasoning_content'.
                             content = message.get("content", "")
+                            if not content:
+                                content = message.get("reasoning_content", "")
+                                if content:
+                                    logger.info(
+                                        "[DoublewordProvider] Using reasoning_content "
+                                        "(content was empty) for op=%s",
+                                        operation_id,
+                                    )
+                            logger.debug(
+                                "[DoublewordProvider] Response keys: %s, content_len=%d",
+                                list(message.keys()), len(content),
+                            )
                             return (content, usage)
                 except json.JSONDecodeError:
                     continue
