@@ -189,7 +189,7 @@ class DoublewordProvider:
                 # Qwen3.5 reasoning models: disable thinking mode so output
                 # goes to 'content' field instead of being consumed by internal
                 # reasoning. Without this, content is empty (all tokens used for thinking).
-                "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         })
 
@@ -617,7 +617,7 @@ class DoublewordProvider:
             "max_tokens": effective_max_tokens,
             "temperature": _DW_TEMPERATURE,
             # Qwen3.5: disable thinking mode so output goes to 'content'
-            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+            "chat_template_kwargs": {"enable_thinking": False},
         }
         if response_format is not None:
             body["response_format"] = response_format
