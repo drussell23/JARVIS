@@ -6,9 +6,9 @@ import SwiftUI
 
 struct CompactHeaderBar: View {
     let hudState: HUDState
-    let statusText: String
+    let connectionStatus: ConnectionStatus
+    let detailedState: String
     let serverVersion: String
-    let isConnected: Bool
     @Binding var hudTab: HUDTab
     var onExpandReactor: () -> Void
 
@@ -44,16 +44,15 @@ struct CompactHeaderBar: View {
                     .foregroundColor(.jarvisGreen)
                     .tracking(2)
 
-                // Status badge
-                if isConnected {
-                    Text("v\(serverVersion) ONLINE")
+                // Connection status indicator
+                HStack(spacing: 4) {
+                    Circle()
+                        .fill(statusDotColor)
+                        .frame(width: 6, height: 6)
+
+                    Text(statusLabel)
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.3))
-                        .tracking(1)
-                } else {
-                    Text(statusText)
-                        .font(.system(size: 9, weight: .medium, design: .monospaced))
-                        .foregroundColor(.orange.opacity(0.6))
+                        .foregroundColor(statusLabelColor)
                         .tracking(1)
                         .lineLimit(1)
                 }
@@ -80,6 +79,42 @@ struct CompactHeaderBar: View {
                 .frame(height: 1),
             alignment: .bottom
         )
+    }
+
+    // MARK: - Connection Status Display
+
+    private var statusDotColor: Color {
+        switch connectionStatus {
+        case .connected: return .green
+        case .connecting: return .yellow
+        case .disconnected: return .gray
+        case .error: return .red
+        }
+    }
+
+    private var statusLabel: String {
+        switch connectionStatus {
+        case .connected:
+            if !serverVersion.isEmpty && serverVersion != "unknown" {
+                return "v\(serverVersion) ONLINE"
+            }
+            return "ONLINE"
+        case .connecting:
+            return "CONNECTING..."
+        case .disconnected:
+            return "OFFLINE"
+        case .error:
+            return "ERROR"
+        }
+    }
+
+    private var statusLabelColor: Color {
+        switch connectionStatus {
+        case .connected: return .green.opacity(0.7)
+        case .connecting: return .yellow.opacity(0.7)
+        case .disconnected: return .gray.opacity(0.5)
+        case .error: return .red.opacity(0.7)
+        }
     }
 
     // MARK: - Reactor Colors

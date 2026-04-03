@@ -195,9 +195,9 @@ struct HUDView: View {
 
                     CompactHeaderBar(
                         hudState: hudState,
-                        statusText: statusText,
+                        connectionStatus: pythonBridge.connectionStatus,
+                        detailedState: pythonBridge.detailedConnectionState,
                         serverVersion: pythonBridge.serverVersion,
-                        isConnected: pythonBridge.connectionStatus == .connected,
                         hudTab: $hudTab,
                         onExpandReactor: {
                             withAnimation(.spring(duration: 0.4)) {
