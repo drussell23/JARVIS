@@ -67,6 +67,7 @@ targets:
         CURRENT_PROJECT_VERSION: 1
         SWIFT_VERSION: "6.0"
         CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: T27T6WH789
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         GENERATE_INFOPLIST_FILE: "YES"
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "JARVIS needs microphone access for voice commands — say Hey JARVIS to activate"
