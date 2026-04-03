@@ -1,0 +1,173 @@
+<h2>HUD Redesign — Reclaim Screen Real Estate</h2>
+<p class="subtitle">The current layout wastes 60% on title + reactor. Here are 3 approaches to fix it.</p>
+
+<div class="options">
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Compact Header + Mini Reactor</h3>
+      <p>Shrink the title to a single-line header bar. Shrink the reactor to a small status indicator. Content gets 70%+ of the screen.</p>
+      <div class="mockup" style="margin-top: 1rem;">
+        <div class="mockup-header">Compact Layout</div>
+        <div class="mockup-body" style="background: #0a0a0f; padding: 0; min-height: 400px; display: flex; flex-direction: column;">
+          <!-- Compact header bar -->
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 12px 20px; border-bottom: 1px solid rgba(74,222,128,0.1);">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <!-- Mini reactor (24px) -->
+              <div style="width: 24px; height: 24px; border-radius: 50%; background: radial-gradient(circle, #4ade80 0%, #166534 60%, transparent 70%); box-shadow: 0 0 8px rgba(74,222,128,0.4);"></div>
+              <span style="color: #4ade80; font-size: 14px; font-weight: bold; font-family: monospace; letter-spacing: 3px;">J.A.R.V.I.S.</span>
+              <span style="color: rgba(255,255,255,0.3); font-size: 9px; font-family: monospace;">v3.1 ONLINE</span>
+            </div>
+            <div style="display: flex; align-items: center; gap: 8px;">
+              <!-- Tab control -->
+              <div style="display: flex; background: rgba(255,255,255,0.06); border-radius: 6px; padding: 2px;">
+                <span style="background: rgba(74,222,128,0.15); color: #4ade80; padding: 3px 12px; border-radius: 4px; font-size: 11px; font-family: monospace;">Chat</span>
+                <span style="color: #64748b; padding: 3px 12px; font-size: 11px; font-family: monospace;">Hive</span>
+              </div>
+            </div>
+          </div>
+          <!-- Voice status (slim) -->
+          <div style="padding: 6px 20px; background: rgba(74,222,128,0.03); border-bottom: 1px solid rgba(74,222,128,0.05);">
+            <span style="color: rgba(74,222,128,0.5); font-size: 10px; font-family: monospace;">🎤 Say "Hey JARVIS"</span>
+          </div>
+          <!-- Content area (HUGE) -->
+          <div style="flex: 1; padding: 16px 20px; min-height: 260px;">
+            <div style="color: #94a3b8; font-size: 12px; font-family: monospace; padding: 8px; background: rgba(255,255,255,0.03); border-radius: 6px; margin-bottom: 8px;">
+              <span style="color: #4ade80;">JARVIS:</span> Good morning, Derek. All systems nominal.
+            </div>
+            <div style="color: #94a3b8; font-size: 12px; font-family: monospace; padding: 8px; background: rgba(255,255,255,0.03); border-radius: 6px; margin-bottom: 8px;">
+              <span style="color: #60a5fa;">You:</span> Check the vision loop status
+            </div>
+            <div style="color: #94a3b8; font-size: 12px; font-family: monospace; padding: 8px; background: rgba(255,255,255,0.03); border-radius: 6px;">
+              <span style="color: #4ade80;">JARVIS:</span> Vision loop running at 57.6fps, 96% efficiency. SHM segments: 12 active.
+            </div>
+          </div>
+          <!-- Command input -->
+          <div style="padding: 10px 20px; border-top: 1px solid rgba(255,255,255,0.05);">
+            <div style="display: flex; gap: 8px; align-items: center;">
+              <div style="flex: 1; padding: 8px 14px; border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; color: #64748b; font-size: 12px;">Type a command...</div>
+              <div style="background: linear-gradient(135deg, #4ade80, #22c55e); color: #000; padding: 6px 16px; border-radius: 20px; font-size: 11px; font-weight: bold; font-family: monospace;">SEND</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Maximum content space (~75% of screen)</li>
+          <li>Clean, professional — like a real IDE/terminal</li>
+          <li>Reactor becomes a subtle status light</li>
+          <li>Tab control integrated into header</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Loses the dramatic "Iron Man HUD" feel</li>
+          <li>Arc Reactor fans might miss the big animation</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Sidebar Reactor + Full-Height Content</h3>
+      <p>Move the reactor to the left edge as a vertical status strip. Title becomes a small header. Content takes the full height.</p>
+      <div class="mockup" style="margin-top: 1rem;">
+        <div class="mockup-header">Sidebar Layout</div>
+        <div class="mockup-body" style="background: #0a0a0f; padding: 0; min-height: 400px; display: flex;">
+          <!-- Left sidebar with reactor -->
+          <div style="width: 60px; border-right: 1px solid rgba(74,222,128,0.1); display: flex; flex-direction: column; align-items: center; padding: 16px 0; gap: 16px;">
+            <div style="width: 40px; height: 40px; border-radius: 50%; background: radial-gradient(circle, #4ade80 0%, #166534 50%, #0a1a0a 70%); box-shadow: 0 0 12px rgba(74,222,128,0.3); border: 1px solid rgba(74,222,128,0.3);"></div>
+            <div style="writing-mode: vertical-lr; color: rgba(74,222,128,0.4); font-size: 8px; font-family: monospace; letter-spacing: 2px;">JARVIS</div>
+            <div style="flex: 1;"></div>
+            <div style="width: 6px; height: 6px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 6px rgba(74,222,128,0.5);"></div>
+          </div>
+          <!-- Main content -->
+          <div style="flex: 1; display: flex; flex-direction: column;">
+            <div style="display: flex; justify-content: space-between; align-items: center; padding: 10px 16px; border-bottom: 1px solid rgba(255,255,255,0.05);">
+              <div style="display: flex; gap: 4px; background: rgba(255,255,255,0.06); border-radius: 6px; padding: 2px;">
+                <span style="background: rgba(74,222,128,0.15); color: #4ade80; padding: 3px 12px; border-radius: 4px; font-size: 11px; font-family: monospace;">Chat</span>
+                <span style="color: #64748b; padding: 3px 12px; font-size: 11px; font-family: monospace;">Hive</span>
+              </div>
+              <span style="color: rgba(255,255,255,0.2); font-size: 9px; font-family: monospace;">🎤 "Hey JARVIS"</span>
+            </div>
+            <div style="flex: 1; padding: 12px 16px; min-height: 280px;">
+              <div style="color: #94a3b8; font-size: 12px; font-family: monospace; padding: 8px; background: rgba(255,255,255,0.03); border-radius: 6px; margin-bottom: 6px;">
+                <span style="color: #4ade80;">JARVIS:</span> Good morning. All systems nominal.
+              </div>
+              <div style="color: #94a3b8; font-size: 12px; font-family: monospace; padding: 8px; background: rgba(255,255,255,0.03); border-radius: 6px;">
+                <span style="color: #60a5fa;">You:</span> What's the Hive status?
+              </div>
+            </div>
+            <div style="padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.05);">
+              <div style="display: flex; gap: 8px;">
+                <div style="flex: 1; padding: 8px 14px; border: 1px solid rgba(255,255,255,0.1); border-radius: 20px; color: #64748b; font-size: 12px;">Type a command...</div>
+                <div style="background: linear-gradient(135deg, #4ade80, #22c55e); color: #000; padding: 6px 16px; border-radius: 20px; font-size: 11px; font-weight: bold;">SEND</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Reactor stays visible as a living status indicator</li>
+          <li>Full-height content area</li>
+          <li>Unique look — not just another terminal</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Sidebar eats horizontal width</li>
+          <li>More complex layout change</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Collapsible Reactor (Toggle)</h3>
+      <p>Keep the dramatic reactor + title as the "hero" view, but add a collapse toggle. When collapsed, it shrinks to a compact header (like Option A). Double-click the reactor or press a key to expand/collapse.</p>
+      <div class="mockup" style="margin-top: 1rem;">
+        <div class="mockup-header">Collapsed State (working mode)</div>
+        <div class="mockup-body" style="background: #0a0a0f; padding: 0; min-height: 200px; display: flex; flex-direction: column;">
+          <div style="display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid rgba(74,222,128,0.1);">
+            <div style="display: flex; align-items: center; gap: 10px;">
+              <div style="width: 20px; height: 20px; border-radius: 50%; background: radial-gradient(circle, #4ade80 0%, #166534 60%); box-shadow: 0 0 6px rgba(74,222,128,0.4); cursor: pointer;" title="Double-click to expand"></div>
+              <span style="color: #4ade80; font-size: 13px; font-weight: bold; font-family: monospace; letter-spacing: 2px;">JARVIS</span>
+            </div>
+            <div style="display: flex; gap: 6px; background: rgba(255,255,255,0.06); border-radius: 6px; padding: 2px;">
+              <span style="background: rgba(74,222,128,0.15); color: #4ade80; padding: 3px 10px; border-radius: 4px; font-size: 10px;">Chat</span>
+              <span style="color: #64748b; padding: 3px 10px; font-size: 10px;">Hive</span>
+            </div>
+          </div>
+          <div style="flex: 1; padding: 10px 20px; color: #64748b; font-size: 11px; text-align: center; min-height: 100px; display: flex; align-items: center; justify-content: center;">[ Full content area — transcript or Hive feed ]</div>
+        </div>
+      </div>
+      <div style="height: 8px;"></div>
+      <div class="mockup">
+        <div class="mockup-header">Expanded State (hero mode)</div>
+        <div class="mockup-body" style="background: #0a0a0f; padding: 20px; text-align: center; min-height: 200px;">
+          <div style="color: #4ade80; font-size: 28px; font-weight: bold; font-family: monospace; letter-spacing: 8px; text-shadow: 0 0 20px rgba(74,222,128,0.5);">J.A.R.V.I.S.</div>
+          <div style="color: rgba(74,222,128,0.5); font-size: 8px; letter-spacing: 3px; font-family: monospace; margin-top: 4px;">JUST A RATHER VERY INTELLIGENT SYSTEM</div>
+          <div style="margin: 16px auto; width: 120px; height: 120px; border-radius: 50%; background: radial-gradient(circle, #4ade80 0%, #166534 30%, #0a1a0a 60%, transparent 70%); box-shadow: 0 0 30px rgba(74,222,128,0.3);"></div>
+          <div style="color: rgba(255,255,255,0.3); font-size: 9px; font-family: monospace;">Double-click reactor or press ⌘⇧R to collapse</div>
+        </div>
+      </div>
+      <div class="pros-cons">
+        <div class="pros"><h4>Pros</h4><ul>
+          <li>Best of both — dramatic demo + practical work mode</li>
+          <li>User controls when to see the reactor</li>
+          <li>Perfect for demos and screenshots</li>
+        </ul></div>
+        <div class="cons"><h4>Cons</h4><ul>
+          <li>Two states to maintain</li>
+          <li>Animation between states adds complexity</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section" style="margin-top: 2rem; padding: 1.2rem; border-left: 3px solid #4ade80; background: rgba(74,222,128,0.05); border-radius: 0 8px 8px 0;">
+  <h4 style="margin-top:0; color: #4ade80;">Recommendation: A (Compact Header)</h4>
+  <p style="margin: 0; color: #94a3b8;">Cleanest, most professional. The reactor as a small status light still communicates system state without eating screen real estate. This is how real professional tools (terminal, IDE, dashboards) work — content is king, chrome is minimal. You can always add the toggle (C) later as an enhancement.</p>
+</div>

@@ -14,6 +14,7 @@
 		2522BF54B9B8951CD6B796B7 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2445A32150108499C49E55C8 /* Assets.xcassets */; };
 		2DBBC321399F2814B57E803B /* JARVISWatchApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD88BEB46021CA8E341A9460 /* JARVISWatchApp.swift */; };
 		2F9DD0FD134CECE6BB8C8562 /* JARVISKit in Frameworks */ = {isa = PBXBuildFile; productRef = F5E69E21A5404E28DA729815 /* JARVISKit */; };
+		4E11F20BF61331B7C669DA94 /* CompactHeaderBar.swift in Sources */ = {isa = PBXBuildFile; fileRef = BE156A6B63F5362F9FD12522 /* CompactHeaderBar.swift */; };
 		57B50BAE6FB2347BD92BA512 /* PhoneSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = CE05089C690A3B7B63861CF9 /* PhoneSessionManager.swift */; };
 		644F315E21A6FF607A2E238F /* ClickThroughWindow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59B809F2B04897D040BBE2CB /* ClickThroughWindow.swift */; };
 		6A6DE9BC09C7393AC5D3BFDA /* JARVISHUDApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7F9345DF8825258B0773BAA5 /* JARVISHUDApp.swift */; };
@@ -75,6 +76,7 @@
 		A6A777442955E499D4E22D3B /* BrainstemLauncher.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrainstemLauncher.swift; sourceTree = "<group>"; };
 		AF2D1789D766C67E4B4A3D2A /* JARVISHUD.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = JARVISHUD.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B91850E89902256710524BEA /* LoadingHUDView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LoadingHUDView.swift; sourceTree = "<group>"; };
+		BE156A6B63F5362F9FD12522 /* CompactHeaderBar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompactHeaderBar.swift; sourceTree = "<group>"; };
 		C953EA1271F55784A7D1004B /* JARVISColors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JARVISColors.swift; sourceTree = "<group>"; };
 		C9D88CC846B569E93300279D /* Assets 2.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = "Assets 2.xcassets"; sourceTree = "<group>"; };
 		CE05089C690A3B7B63861CF9 /* PhoneSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneSessionManager.swift; sourceTree = "<group>"; };
@@ -157,6 +159,7 @@
 				6C63F894E57C0794BF52C3F0 /* ClickThroughHostingView.swift */,
 				59B809F2B04897D040BBE2CB /* ClickThroughWindow.swift */,
 				37EC52A931B080037F0A8B22 /* CognitiveStateBar.swift */,
+				BE156A6B63F5362F9FD12522 /* CompactHeaderBar.swift */,
 				65BEAB93C18B642877CB83C9 /* HiveMessageRow.swift */,
 				3DD3D29E041FE7A95F16A2DD /* HiveThreadCard.swift */,
 				9AA0EEB915FE35B80EF20332 /* HiveView.swift */,
@@ -477,6 +480,7 @@
 				947B0C2CACC0D367EDE7AF88 /* ClickThroughHostingView.swift in Sources */,
 				644F315E21A6FF607A2E238F /* ClickThroughWindow.swift in Sources */,
 				A63B5E1267F63190B03CBC6F /* CognitiveStateBar.swift in Sources */,
+				4E11F20BF61331B7C669DA94 /* CompactHeaderBar.swift in Sources */,
 				9FC588C57049591237CF032F /* HUDView.swift in Sources */,
 				7FE1D191F843B69BAC681AA5 /* HiveMessageRow.swift in Sources */,
 				06D502DFC999554F266755F0 /* HiveModels.swift in Sources */,
