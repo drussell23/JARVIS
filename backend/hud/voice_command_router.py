@@ -42,11 +42,12 @@ Return: {{"category": "...", "needs_vision": true/false, "needs_tools": true/fal
 class VoiceCommandRouter:
     """Routes voice commands through Ouroboros for intelligent execution."""
 
-    def __init__(self, doubleword: Any) -> None:
+    def __init__(self, doubleword: Any, narrate_fn: Optional[Any] = None) -> None:
         self._dw = doubleword
+        self._narrate_fn = narrate_fn
         self._applescript = AppleScriptExecutor()
         self._query = QueryExecutor(doubleword)
-        self._tool_orchestrator = ToolUseOrchestrator(doubleword)
+        self._tool_orchestrator = ToolUseOrchestrator(doubleword, narrate_fn=narrate_fn)
 
     async def route(self, command: str, screenshot_b64: Optional[str] = None) -> CommandResult:
         """Classify and route a voice command."""

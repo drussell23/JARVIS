@@ -2053,7 +2053,14 @@ async def parallel_lifespan(app: FastAPI):
                                     voice_router = getattr(app.state, "voice_router", None)
                                     if voice_router is None:
                                         dw = DoublewordProvider()
-                                        voice_router = VoiceCommandRouter(doubleword=dw)
+                                        # Pass _hud_tts as narrate_fn so the organism
+                                        # speaks its actions in real-time as it executes.
+                                        # Per Manifesto §7: all autonomous decisions are
+                                        # broadcast — the organism narrates what it does.
+                                        voice_router = VoiceCommandRouter(
+                                            doubleword=dw,
+                                            narrate_fn=_hud_tts,
+                                        )
                                         app.state.voice_router = voice_router
 
                                     # Screenshot from Swift HUD (base64 string, passed through

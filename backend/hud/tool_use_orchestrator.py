@@ -51,10 +51,14 @@ class ToolUseOrchestrator:
         doubleword: Any,
         max_iterations: int = _DEFAULT_MAX_ITER,
         timeout_s: float = _DEFAULT_TIMEOUT,
+        narrate_fn: Optional[Any] = None,
     ) -> None:
         self._dw = doubleword
         self._max_iter = max_iterations
         self._timeout = timeout_s
+        # Narration callback: async fn(text) → speaks what JARVIS is doing
+        # This is how the organism communicates its actions to the user in real-time.
+        self._narrate_fn = narrate_fn
         # Vision analyzer: uses Doubleword 235B to describe what's on screen
         self._vision_analyzer = self._make_vision_analyzer()
 
@@ -194,6 +198,9 @@ class ToolUseOrchestrator:
                 logger.info("[ToolUse] Step %d: %s(%s) → %s",
                             steps_completed, call.name, json.dumps(call.args)[:80], status)
 
+                # Narrate what just happened — the organism speaks its actions
+                await self._narrate_action(call, result)
+
         # Max iterations reached
         return CommandResult(
             success=steps_completed > 0, category="composite",
@@ -201,6 +208,65 @@ class ToolUseOrchestrator:
             response_text=f"Completed {steps_completed} steps (max iterations reached).",
             error=None if steps_completed > 0 else "Max iterations without completing goal",
         )
+
+    async def _narrate_action(self, call: ToolCall, result: Any) -> None:
+        """Narrate what JARVIS just did — the organism speaks truthfully.
+
+        Only narrates meaningful actions (not wait, not take_screenshot).
+        Uses natural language, not technical jargon.
+        """
+        if self._narrate_fn is None:
+            return
+
+        narration = None
+
+        if call.name == "open_app":
+            app = call.args.get("app_name", "the app")
+            if result.success:
+                narration = f"Opening {app}."
+            else:
+                narration = f"I couldn't find {app}."
+
+        elif call.name == "open_url":
+            url = call.args.get("url", "")
+            # Extract domain for natural speech
+            domain = url.replace("https://", "").replace("http://", "").split("/")[0]
+            if result.success:
+                narration = f"Navigating to {domain}."
+            else:
+                narration = f"Couldn't open {domain}."
+
+        elif call.name == "take_screenshot":
+            if result.success and "Page not found" in result.output:
+                narration = "That page wasn't found. Let me try another approach."
+            elif result.success and "error" in result.output.lower():
+                narration = "I see an error on screen. Adjusting."
+
+        elif call.name == "vision_click":
+            target = call.args.get("target", "the element")
+            if result.success:
+                narration = f"Clicking {target}."
+
+        elif call.name == "vision_type":
+            if result.success:
+                narration = "Typing."
+
+        elif call.name == "press_key":
+            pass  # Silent — key presses are boring to narrate
+
+        elif call.name == "run_applescript":
+            pass  # Silent — internal automation
+
+        elif call.name == "bash":
+            if result.success:
+                narration = "Running a command."
+
+        # Only speak if we have something meaningful to say
+        if narration:
+            try:
+                await self._narrate_fn(narration)
+            except Exception:
+                pass  # TTS failure should never block execution
 
     def _parse_response(self, raw: str) -> dict:
         """Parse model response — try JSON, handle markdown fences, fallback."""
