@@ -163,8 +163,19 @@ def validate_tool_call(call: ToolCall) -> Tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-async def execute_tool(call: ToolCall, screenshot_b64: Optional[str] = None) -> ToolResult:
-    """Execute a validated tool call. Caller MUST validate first via validate_tool_call."""
+async def execute_tool(
+    call: ToolCall,
+    screenshot_b64: Optional[str] = None,
+    vision_analyzer: Optional[Any] = None,
+) -> ToolResult:
+    """Execute a validated tool call. Caller MUST validate first via validate_tool_call.
+
+    Args:
+        call: The tool call to execute.
+        screenshot_b64: Current screenshot (base64) for vision tools.
+        vision_analyzer: Async callable(prompt, image_b64) -> str for screen analysis.
+                         Typically Doubleword 235B vision model.
+    """
     try:
         if call.name == "open_app":
             return await _exec_open_app(call)
@@ -179,8 +190,7 @@ async def execute_tool(call: ToolCall, screenshot_b64: Optional[str] = None) -> 
         elif call.name == "bash":
             return await _exec_bash(call)
         elif call.name == "take_screenshot":
-            return ToolResult(call_id=call.call_id, name=call.name, success=True,
-                              output="Screenshot captured. Describe what you see to decide next action.")
+            return await _exec_take_screenshot(call, vision_analyzer)
         elif call.name in ("vision_click", "vision_type"):
             return ToolResult(call_id=call.call_id, name=call.name, success=True,
                               output=f"Vision action '{call.name}' dispatched to VLA pipeline.")
@@ -239,6 +249,52 @@ async def _exec_wait(call: ToolCall) -> ToolResult:
     await asyncio.sleep(seconds)
     return ToolResult(call_id=call.call_id, name=call.name, success=True,
                       output=f"Waited {seconds}s")
+
+
+async def _exec_take_screenshot(call: ToolCall, vision_analyzer: Optional[Any] = None) -> ToolResult:
+    """Capture a fresh screenshot and analyze it using the 235B vision model.
+
+    The organism SEES the screen — it doesn't just take a picture.
+    The vision model describes what's visible so the 397B can reason
+    about what to do next (e.g., detect "Page not found" and adapt).
+    """
+    import os
+
+    # Read the live frame from the Swift HUD's ScreenCaptureService
+    frame_path = "/tmp/jarvis_live_frame.jpg"
+    screenshot_b64 = None
+
+    try:
+        if os.path.exists(frame_path):
+            import base64
+            with open(frame_path, "rb") as f:
+                screenshot_b64 = base64.b64encode(f.read()).decode("utf-8")
+            logger.info("[CUExec] Screenshot captured from live frame (%d KB)", len(screenshot_b64) // 1024)
+        else:
+            return ToolResult(call_id=call.call_id, name=call.name, success=False,
+                              output="", error="No live frame available — screen capture not running")
+    except Exception as exc:
+        return ToolResult(call_id=call.call_id, name=call.name, success=False,
+                          output="", error=f"Screenshot capture failed: {exc}")
+
+    # Analyze with 235B vision model if available
+    if vision_analyzer and screenshot_b64:
+        try:
+            description = await vision_analyzer(
+                "Describe what you see on this screen in detail. Include: "
+                "what app is open, what page/content is showing, any error messages, "
+                "buttons, text fields, and navigation elements visible. "
+                "If there are error messages like 'Page not found' or '404', say so clearly.",
+                screenshot_b64,
+            )
+            return ToolResult(call_id=call.call_id, name=call.name, success=True,
+                              output=f"Screen analysis: {description}")
+        except Exception as exc:
+            logger.warning("[CUExec] Vision analysis failed: %s — returning raw capture", exc)
+
+    # Fallback: return that screenshot was captured but not analyzed
+    return ToolResult(call_id=call.call_id, name=call.name, success=True,
+                      output="Screenshot captured. Screen content could not be analyzed (vision model unavailable).")
 
 
 async def _exec_bash(call: ToolCall) -> ToolResult:

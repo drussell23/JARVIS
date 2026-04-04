@@ -55,6 +55,36 @@ class ToolUseOrchestrator:
         self._dw = doubleword
         self._max_iter = max_iterations
         self._timeout = timeout_s
+        # Vision analyzer: uses Doubleword 235B to describe what's on screen
+        self._vision_analyzer = self._make_vision_analyzer()
+
+    def _make_vision_analyzer(self):
+        """Create a vision analyzer closure that calls Doubleword 235B."""
+        _VISION_MODEL = os.environ.get(
+            "JARVIS_VISION_ANALYSIS_MODEL",
+            "Qwen/Qwen3-VL-235B-A22B-Instruct-FP8",
+        )
+
+        async def analyze(prompt: str, image_b64: str) -> str:
+            """Analyze a screenshot using the 235B vision model."""
+            # Build a vision prompt with the image
+            vision_prompt = (
+                f"{prompt}\n\n"
+                f"[Screenshot attached as base64 JPEG — analyze the visual content]"
+            )
+            try:
+                result = await self._dw.prompt_only(
+                    vision_prompt,
+                    model=_VISION_MODEL,
+                    caller_id="vision_screen_analysis",
+                    max_tokens=1000,
+                )
+                return result.strip() if result else "Could not analyze screenshot."
+            except Exception as exc:
+                logger.warning("[ToolUse] Vision analysis failed: %s", exc)
+                return f"Vision analysis error: {exc}"
+
+        return analyze
 
     async def execute(self, goal: str, screenshot_b64: Optional[str] = None) -> CommandResult:
         """Execute a goal using the 397B tool-use loop."""
@@ -62,17 +92,25 @@ class ToolUseOrchestrator:
         tool_list = json.dumps(list(TOOL_SCHEMAS.values()), indent=2)
 
         system_prompt = (
-            "You are JARVIS, an AI organism controlling a MacBook. "
+            "You are JARVIS, an AI organism controlling a MacBook Pro. "
             "You have tools to interact with the Mac. Use them to accomplish the goal.\n\n"
+            "The user is Derek J. Russell. When they say 'my profile' or 'my account', "
+            "use their name to find the right page.\n\n"
             "Available tools:\n" + tool_list + "\n\n"
             "To call a tool, respond with JSON: {\"tool_calls\": [{\"name\": \"...\", \"args\": {...}}]}\n"
             "When the task is complete, respond with: {\"done\": true, \"summary\": \"what you did\"}\n"
             "If you cannot complete the task, respond with: {\"done\": true, \"summary\": \"why it failed\", \"error\": \"reason\"}\n\n"
             "Rules:\n"
             "- Call ONE tool at a time, wait for the result before deciding next action\n"
-            "- After each tool result, decide if you need more actions or if you're done\n"
+            "- After each action that changes the screen (open_url, vision_click, etc.), "
+            "call take_screenshot to VERIFY the result — check if the page loaded correctly, "
+            "if you see error messages like 'Page not found', or if you're on the right page\n"
+            "- If you see an error (404, Page not found), try a different approach "
+            "(e.g., search for the person's name instead of guessing a URL)\n"
             "- Be efficient — don't call unnecessary tools\n"
-            "- If a tool fails, try an alternative approach"
+            "- If a tool fails, try an alternative approach\n"
+            "- For 'my LinkedIn profile': try linkedin.com/in/derek-j-russell first, "
+            "if 404, search LinkedIn for 'Derek J Russell'"
         )
 
         conversation = f"Goal: {goal}"
@@ -141,8 +179,11 @@ class ToolUseOrchestrator:
                     conversation += f"\n\nTool '{call.name}' was BLOCKED by safety gate: {reason}. Try a different approach."
                     continue
 
-                # Execute
-                result = await execute_tool(call)
+                # Execute — pass vision analyzer for take_screenshot tool
+                result = await execute_tool(
+                    call,
+                    vision_analyzer=self._vision_analyzer,
+                )
                 steps_completed += 1
 
                 # Add result to conversation
