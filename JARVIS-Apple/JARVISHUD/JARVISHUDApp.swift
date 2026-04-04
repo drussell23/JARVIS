@@ -144,10 +144,8 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 return
             }
 
-            // Show panel for any other command (organism responds visually)
-            Task { @MainActor in
-                if !self.panelVisible { self.showHUD() }
-            }
+            // Panel does NOT auto-show for commands — the organism responds
+            // via voice only. Panel is only for explicit "show yourself" / Cmd+Shift+J.
 
             guard BrainstemLauncher.shared.isRunning else {
                 print("[JARVIS] Backend not running — cannot execute command")
