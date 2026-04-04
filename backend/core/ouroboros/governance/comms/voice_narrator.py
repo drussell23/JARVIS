@@ -32,7 +32,11 @@ _NARRATE_QUEUE_MAXSIZE = 50
 
 
 class VoiceNarrator:
-    """CommProtocol transport that narrates pipeline events via safe_say()."""
+    """CommProtocol transport that narrates pipeline events via safe_say().
+
+    Respects OUROBOROS_NARRATOR_ENABLED env var (shared with DaemonNarrator).
+    When disabled, on_message() returns immediately without speech.
+    """
 
     def __init__(
         self,
@@ -41,12 +45,16 @@ class VoiceNarrator:
         source: str = "intent_engine",
         voice: str = "Karen",
     ) -> None:
+        import os
+        self._enabled = os.environ.get("OUROBOROS_NARRATOR_ENABLED", "true").lower() in ("true", "1", "yes")
         self._say_fn = say_fn
         self._debounce_s = debounce_s
         self._source = source
         self._voice = voice
         self._last_narration: float = float("-inf")  # monotonic; -inf so first msg always passes
         self._narrated_ids: OrderedDict[str, None] = OrderedDict()  # bounded LRU for idempotency
+        if not self._enabled:
+            logger.info("[VoiceNarrator] DISABLED via OUROBOROS_NARRATOR_ENABLED=false")
         # P2-1: internal bounded queue + lazy drain worker
         self._narrate_queue: "asyncio.Queue[CommMessage]" = asyncio.Queue(
             maxsize=_NARRATE_QUEUE_MAXSIZE
@@ -61,6 +69,9 @@ class VoiceNarrator:
         Returns immediately so downstream transports are not stalled by TTS.
         If the queue is full, the oldest pending message is shed (DROP_OLDEST).
         """
+        if not self._enabled:
+            return
+
         if msg.msg_type not in _NARRATE_TYPES:
             return
 
