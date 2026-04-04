@@ -136,16 +136,14 @@ class DoublewordProvider:
         """
         if self._session is None or self._session.closed:
             import aiohttp
-            # NOTE: Do NOT pass ClientTimeout to the session constructor.
-            # In aiohttp 3.9+, ClientTimeout() requires a running event loop
-            # (it uses asyncio.get_event_loop() internally for ceil()).
-            # Creating a session with timeout outside a task context raises:
-            #   "Timeout context manager should be used inside a task"
-            # Instead, pass timeout per-request in _upload_file, _create_batch, etc.
+            # CRITICAL: aiohttp 3.9+ requires ClientSession to be created
+            # inside a running event loop task. The default timeout parameter
+            # triggers "Timeout context manager should be used inside a task".
+            # Solution: create with connector only, no timeout object at all.
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
             self._session = aiohttp.ClientSession(
-                headers={
-                    "Authorization": f"Bearer {self._api_key}",
-                },
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                connector=connector,
             )
         return self._session
 
@@ -414,12 +412,10 @@ class DoublewordProvider:
         data.add_field("purpose", "batch")
 
         try:
-            import aiohttp as _aio
             async with session.post(
                 f"{self._base_url}/files",
                 data=data,
                 headers={"Authorization": f"Bearer {self._api_key}"},
-                timeout=_aio.ClientTimeout(total=120),
             ) as resp:
                 if resp.status >= 300:
                     body = await resp.text()
