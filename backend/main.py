@@ -2045,38 +2045,20 @@ async def parallel_lifespan(app: FastAPI):
 
                             if goal:
                                 try:
-                                    from backend.vision.jarvis_cu import JarvisCU
-                                    import numpy as np
-                                    import base64
-                                    from PIL import Image
-                                    import io
+                                    # Route through Ouroboros VoiceCommandRouter — all intelligence
+                                    # lives in the Python backend. The Swift HUD is a dumb pipe.
+                                    from backend.hud.voice_command_router import VoiceCommandRouter
+                                    from backend.core.ouroboros.governance.doubleword_provider import DoublewordProvider
 
-                                    cu = getattr(app.state, "jarvis_cu", None)
-                                    if cu is None:
-                                        # No FramePipeline — Python/uvicorn is headless,
-                                        # SCK won't deliver frames without a GUI RunLoop.
-                                        # The Swift HUD sends screenshots via IPC instead.
-                                        cu = JarvisCU()
-                                        app.state.jarvis_cu = cu
+                                    voice_router = getattr(app.state, "voice_router", None)
+                                    if voice_router is None:
+                                        dw = DoublewordProvider()
+                                        voice_router = VoiceCommandRouter(doubleword=dw)
+                                        app.state.voice_router = voice_router
 
-                                    # Screenshot comes from the Swift HUD via IPC payload.
-                                    # Python child processes do NOT inherit Screen Recording
-                                    # permission — CGDisplayCreateImage and screencapture both
-                                    # return None/fail. Only the JARVISHUD process (Swift) can
-                                    # capture the screen via SCK/CoreGraphics.
-                                    initial_frame = None
+                                    # Screenshot from Swift HUD (base64 string, passed through
+                                    # to VLA executor if the router needs vision).
                                     screenshot_b64 = payload.get("screenshot")
-                                    if screenshot_b64:
-                                        try:
-                                            img_bytes = base64.b64decode(screenshot_b64)
-                                            img = Image.open(io.BytesIO(img_bytes))
-                                            initial_frame = np.array(img.convert("RGB"))
-                                            logger.info("[HUD] Screenshot from HUD: %dx%d", initial_frame.shape[1], initial_frame.shape[0])
-                                        except Exception as dec_err:
-                                            logger.warning("[HUD] Screenshot decode failed: %s", dec_err)
-
-                                    if initial_frame is None:
-                                        logger.warning("[HUD] No screenshot — planner will see black frames")
 
                                     # --- Detect messaging context for Ouroboros telemetry ---
                                     _is_messaging = "message" in goal.lower() and "saying" in goal.lower()
@@ -2101,33 +2083,44 @@ async def parallel_lifespan(app: FastAPI):
                                         else:
                                             await _hud_tts(f"On it. Executing: {goal[:60]}")
 
-                                    logger.info("[HUD] VLA executing: %s", goal[:80])
-                                    result = await cu.run(goal, initial_frame=initial_frame)
-                                    logger.info("[HUD] VLA result: %s", result)
+                                    # Route through Ouroboros — classifier decides execution path
+                                    logger.info("[HUD] VoiceRouter executing: %s", goal[:80])
+                                    result = await voice_router.route(
+                                        command=goal,
+                                        screenshot_b64=screenshot_b64,
+                                    )
+
+                                    logger.info(
+                                        "[HUD] Voice result: %s (category=%s, steps=%d/%d)",
+                                        "success" if result.success else "failed",
+                                        result.category, result.steps_completed, result.steps_total,
+                                    )
+                                    if result.response_text:
+                                        logger.info("[HUD] Response: %s", result.response_text[:200])
 
                                     # --- TTS: Narrate result ---
                                     if _tts_enabled:
-                                        if result and result.get("success"):
+                                        if result.success:
                                             if _is_messaging and _msg_contact_match:
                                                 _cn = _msg_contact_match.group(1)
                                                 _an = app_context or "the app"
                                                 await _hud_tts(f"Done. Your message to {_cn} has been sent on {_an}.")
+                                            elif result.response_text:
+                                                await _hud_tts(result.response_text[:200])
                                             else:
-                                                _elapsed = result.get("elapsed_s", 0)
-                                                await _hud_tts(f"Done. Completed in {_elapsed:.1f} seconds.")
-                                        elif result:
-                                            _completed = result.get("steps_completed", 0)
-                                            _total = result.get("steps_total", 0)
+                                                await _hud_tts(f"Done. Completed {result.steps_completed} steps.")
+                                        else:
                                             if _is_messaging and _msg_contact_match:
                                                 _cn = _msg_contact_match.group(1)
                                                 await _hud_tts(
                                                     f"I had trouble sending that message to {_cn}. "
-                                                    f"Got through {_completed} of {_total} steps."
+                                                    f"Got through {result.steps_completed} of {result.steps_total} steps."
                                                 )
                                             else:
                                                 await _hud_tts(
-                                                    f"Action incomplete. Finished {_completed} of {_total} steps."
+                                                    f"Action incomplete. Finished {result.steps_completed} of {result.steps_total} steps."
                                                 )
+
                                     # --- Ouroboros: Feed CU telemetry to CUExecutionSensor ---
                                     try:
                                         from backend.core.ouroboros.governance.intake.sensors.cu_execution_sensor import (
@@ -2136,15 +2129,15 @@ async def parallel_lifespan(app: FastAPI):
                                         _cu_contact = _msg_contact_match.group(1) if _msg_contact_match else None
                                         _cu_rec = CUExecutionRecord(
                                             goal=goal,
-                                            success=bool(result.get("success")) if result else False,
-                                            steps_completed=result.get("steps_completed", 0) if result else 0,
-                                            steps_total=result.get("steps_total", 0) if result else 0,
-                                            elapsed_s=result.get("elapsed_s", 0) if result else 0,
-                                            error=result.get("error") if result else "cu.run returned None",
+                                            success=result.success,
+                                            steps_completed=result.steps_completed,
+                                            steps_total=result.steps_total,
+                                            elapsed_s=0,
+                                            error=result.error,
                                             is_messaging=_is_messaging,
                                             contact=_cu_contact,
                                             app=app_context,
-                                            layers_used=result.get("layers_used", {}) if result else {},
+                                            layers_used={},
                                         )
                                         await get_cu_execution_sensor().record(_cu_rec)
                                     except Exception as _ouro_err:
