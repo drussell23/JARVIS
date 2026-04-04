@@ -105,12 +105,10 @@ class ToolUseOrchestrator:
             "- After each action that changes the screen (open_url, vision_click, etc.), "
             "call take_screenshot to VERIFY the result — check if the page loaded correctly, "
             "if you see error messages like 'Page not found', or if you're on the right page\n"
-            "- If you see an error (404, Page not found), try a different approach "
-            "(e.g., search for the person's name instead of guessing a URL)\n"
+            "- If you see an error (404, Page not found, wrong page), "
+            "reason about what went wrong and try a different approach\n"
             "- Be efficient — don't call unnecessary tools\n"
-            "- If a tool fails, try an alternative approach\n"
-            "- For 'my LinkedIn profile': try linkedin.com/in/derek-j-russell first, "
-            "if 404, search LinkedIn for 'Derek J Russell'"
+            "- If a tool fails, adapt and try an alternative approach"
         )
 
         conversation = f"Goal: {goal}"
