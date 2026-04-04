@@ -62,8 +62,8 @@ class LivingBorderWindow: NSWindow {
         // Window properties — completely invisible to interaction
         self.isOpaque = false
         self.backgroundColor = .clear
-        self.hasShadow = false
-        self.level = .screenSaver  // Above everything but doesn't capture input
+        self.hasShadow = true  // Enable so CALayer shadows render the glow
+        self.level = .floating  // Above normal windows but below modal panels
         self.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         self.ignoresMouseEvents = true  // CRITICAL: passes ALL events through
         self.titlebarAppearsTransparent = true
@@ -73,6 +73,7 @@ class LivingBorderWindow: NSWindow {
         let view = NSView(frame: screen.frame)
         view.wantsLayer = true
         view.layer?.backgroundColor = .clear
+        view.layer?.masksToBounds = false  // Allow glow to render outside bounds
         self.contentView = view
 
         setupBorderLayers()
@@ -86,25 +87,25 @@ class LivingBorderWindow: NSWindow {
         guard let view = contentView, let layer = view.layer else { return }
         let bounds = view.bounds
 
-        // Outer glow layer (soft, wide)
+        // Outer glow layer (soft, wide — the ambient breathing effect)
         let glow = CAShapeLayer()
-        glow.path = CGPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), cornerWidth: 0, cornerHeight: 0, transform: nil)
+        glow.path = CGPath(rect: bounds.insetBy(dx: -2, dy: -2), transform: nil)
         glow.fillColor = nil
-        glow.strokeColor = currentState.color.withAlphaComponent(currentState.glowIntensity * 0.5).cgColor
-        glow.lineWidth = 8
+        glow.strokeColor = currentState.color.withAlphaComponent(0.3).cgColor
+        glow.lineWidth = 12
         glow.shadowColor = currentState.color.cgColor
-        glow.shadowRadius = 15
-        glow.shadowOpacity = Float(currentState.glowIntensity)
+        glow.shadowRadius = 25
+        glow.shadowOpacity = 0.6
         glow.shadowOffset = .zero
         layer.addSublayer(glow)
         glowLayer = glow
 
-        // Inner border layer (sharp, thin)
+        // Inner border layer (sharp, visible edge line)
         let border = CAShapeLayer()
-        border.path = CGPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), cornerWidth: 0, cornerHeight: 0, transform: nil)
+        border.path = CGPath(rect: bounds, transform: nil)
         border.fillColor = nil
-        border.strokeColor = currentState.color.withAlphaComponent(currentState.glowIntensity).cgColor
-        border.lineWidth = 2
+        border.strokeColor = currentState.color.withAlphaComponent(0.5).cgColor
+        border.lineWidth = 3
         layer.addSublayer(border)
         borderLayer = border
 
