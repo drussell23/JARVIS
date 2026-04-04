@@ -153,63 +153,27 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 return
             }
 
-            // Don't speak premature confirmation — let the backend respond
-            // with actual results instead of claiming success before execution.
+            // ============================================================
+            // DUMB PIPE: Swift HUD is the mouth and ears, NOT the brain.
+            // Send the raw command + screenshot to the brainstem and let
+            // Ouroboros handle everything: app discovery, navigation,
+            // multi-step tasks, VLA, reasoning — the full pipeline.
+            // No Tier 0 logic in Swift. No app name resolution.
+            // No hardcoded routing. The organism figures it out.
+            // ============================================================
 
-            // Tier 0: If an app launch is detected, open it immediately from Swift
-            let appName = Self.extractAppName(command)
-            if let app = appName {
-                let resolvedApp = Self.resolveAppName(app)
-                print("[JARVIS] Tier 0: launching '\(resolvedApp)' via macOS open")
-                let proc = Process()
-                proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                proc.arguments = ["-a", resolvedApp]
-                try? proc.run()
-                proc.waitUntilExit()
-                if proc.terminationStatus != 0 {
-                    // Fallback: try the original name
-                    print("[JARVIS] Tier 0: '\(resolvedApp)' failed, trying '\(app)'")
-                    let proc2 = Process()
-                    proc2.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                    proc2.arguments = ["-a", app]
-                    try? proc2.run()
-                    proc2.waitUntilExit()
-                    print("[JARVIS] Tier 0: '\(app)' \(proc2.terminationStatus == 0 ? "launched" : "failed")")
-                } else {
-                    print("[JARVIS] Tier 0: '\(resolvedApp)' launched")
-                }
-            }
-
-            // Route everything to the local backend via IPC
-            let remainder = appName != nil ? Self.extractRemainder(command) : nil
-            let goal = remainder ?? command
-            print("[JARVIS] IPC: \(goal)")
-
-            var actionPayload: [String: Any] = [
-                "goal": goal,
-                "source": "local_fast_path",
-            ]
-            if let app = appName {
-                actionPayload["app_context"] = app
-            }
+            print("[JARVIS] → Brainstem: \(command)")
 
             Task {
-                // If an app was launched, switch to it and wait for it to render
-                if let targetApp = appName {
-                    let script = "tell application \"\(targetApp)\" to activate"
-                    let proc = Process()
-                    proc.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-                    proc.arguments = ["-e", script]
-                    try? proc.run()
-                    proc.waitUntilExit()
-                    print("[JARVIS] VLA: activated \(targetApp)")
-                    try? await Task.sleep(for: .seconds(3))
-                }
+                var actionPayload: [String: Any] = [
+                    "goal": command,
+                    "source": "voice_command",
+                ]
 
-                // Fresh screenshot for the VLA planner
+                // Attach a fresh screenshot so the backend can see what's on screen
                 if let b64 = await ScreenCaptureService.shared.captureFresh() {
                     actionPayload["screenshot"] = b64
-                    print("[JARVIS] VLA: screenshot (\(b64.count / 1024)KB)")
+                    print("[JARVIS] Screenshot attached (\(b64.count / 1024)KB)")
                 }
 
                 BrainstemLauncher.shared.sendEvent(
@@ -319,90 +283,9 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
         return regex.firstMatch(in: command, range: range) != nil
     }
 
-    /// Extract app name from "open WhatsApp and ..." or "open WhatsApp"
-    private static func extractAppName(_ command: String) -> String? {
-        let patterns = [
-            #"^(?:open|launch|start)\s+(?:the\s+)?(.+?)\s+and\s+.+"#,
-            #"^(?:open|launch|start)\s+(?:the\s+)?(.+?)(?:\s+app)?$"#,
-        ]
-        for pattern in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { continue }
-            let range = NSRange(command.startIndex..., in: command)
-            if let match = regex.firstMatch(in: command, range: range),
-               let appRange = Range(match.range(at: 1), in: command) {
-                return String(command[appRange])
-            }
-        }
-        return nil
-    }
-
-    /// Dynamically resolve app names by searching macOS application directories.
-    /// No hardcoded aliases — the organism discovers what's installed.
-    /// Searches /Applications, ~/Applications, and /System/Applications
-    /// for fuzzy matches against the user's spoken app name.
-    private static func resolveAppName(_ name: String) -> String {
-        let searchDirs = [
-            "/Applications",
-            NSHomeDirectory() + "/Applications",
-            "/System/Applications",
-            "/System/Applications/Utilities",
-        ]
-        let query = name.lowercased()
-        var bestMatch: String? = nil
-        var bestScore: Int = 0
-
-        for dir in searchDirs {
-            guard let contents = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
-            for item in contents where item.hasSuffix(".app") {
-                let appName = String(item.dropLast(4)) // Remove ".app"
-                let appLower = appName.lowercased()
-
-                // Exact match (case-insensitive)
-                if appLower == query {
-                    return appName
-                }
-
-                // Contains match: "chrome" matches "Google Chrome"
-                if appLower.contains(query) {
-                    let score = 100 - (appLower.count - query.count) // Prefer shorter names
-                    if score > bestScore {
-                        bestScore = score
-                        bestMatch = appName
-                    }
-                }
-
-                // Word match: "code" matches "Visual Studio Code"
-                let words = appLower.split(separator: " ").map(String.init)
-                if words.contains(query) {
-                    let score = 90
-                    if score > bestScore {
-                        bestScore = score
-                        bestMatch = appName
-                    }
-                }
-            }
-        }
-
-        if let match = bestMatch {
-            print("[JARVIS] App resolved: '\(name)' → '\(match)' (score: \(bestScore))")
-            return match
-        }
-
-        // No match found — return as-is and let macOS try
-        return name
-    }
-
-    /// Extract remainder after "open <app> and ..." → "..."
-    private static func extractRemainder(_ command: String) -> String? {
-        let pattern = #"^(?:open|launch|start)\s+(?:the\s+)?.+?\s+and\s+(.+)$"#
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return nil }
-        let range = NSRange(command.startIndex..., in: command)
-        if let match = regex.firstMatch(in: command, range: range),
-           let remRange = Range(match.range(at: 1), in: command) {
-            return String(command[remRange])
-        }
-        return nil
-    }
+    // No app resolution, no command parsing, no Tier 0 logic in Swift.
+    // The HUD is a dumb pipe — all intelligence lives in the Python
+    // brainstem where Ouroboros + VLA handle everything per the Manifesto.
 
     // MARK: - Menu Bar
 
