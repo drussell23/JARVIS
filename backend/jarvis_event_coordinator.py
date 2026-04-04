@@ -299,7 +299,7 @@ class JARVISEventCoordinator:
         """Announce JARVIS is ready"""
         if self.voice_system:
             # Generate ready message
-            response = f"All systems operational, {self.user_name}. How may I assist you?"
+            response = f"Backend ready, {self.user_name}. Standing by."
             
             # Publish response event
             VoiceEvents.response_generated(

@@ -153,7 +153,8 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
                 return
             }
 
-            self.speak("On it.")
+            // Don't speak premature confirmation — let the backend respond
+            // with actual results instead of claiming success before execution.
 
             // Tier 0: If an app launch is detected, open it immediately from Swift
             let appName = Self.extractAppName(command)

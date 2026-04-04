@@ -30,38 +30,51 @@ logger = logging.getLogger("Ouroboros.DaemonNarrator")
 # Templates use {key} placeholders drawn from the event payload.
 # ---------------------------------------------------------------------------
 
+# NARRATOR HONESTY POLICY: Templates must only state verified facts.
+# Never claim success without confirmation. Use "attempting", "proposed",
+# "detected" — not "implemented", "applied", "fixed".
+# The narrator reports what happened, not what it hopes happened.
+
 _EVENT_TEMPLATES: Dict[str, Tuple[str, str]] = {
     "rem.epoch_start": (
         "rem",
-        "Entering REM Sleep. Scanning the organism.",
+        "Starting system review.",
     ),
     "rem.epoch_complete": (
         "rem",
-        "REM complete. Found {findings_count} issues. {envelopes_submitted} patches submitted.",
+        "Review complete. {findings_count} findings logged.",
     ),
     "synthesis.complete": (
         "synthesis",
-        "Roadmap analysis complete. {hypothesis_count} capability gaps identified.",
+        "Analysis complete. {hypothesis_count} areas flagged for review.",
     ),
     "saga.started": (
         "saga",
-        "Designing {title}. {step_count} implementation steps.",
+        "Planning changes for {title}.",
     ),
     "saga.complete": (
         "saga",
-        "Feature implemented: {title}. PR ready for review.",
+        "Changes for {title} proposed. Awaiting your review.",
     ),
     "saga.aborted": (
         "saga",
-        "Saga aborted: {reason}.",
+        "Stopped work on {title}. Reason: {reason}.",
     ),
     "governance.patch_applied": (
         "patch",
-        "Patch applied: {description}.",
+        "Proposed change: {description}. Pending validation.",
+    ),
+    "governance.patch_verified": (
+        "patch",
+        "Change verified: {description}. Tests passed.",
+    ),
+    "governance.patch_failed": (
+        "patch",
+        "Change failed validation: {description}.",
     ),
     "vital.warn": (
         "vital",
-        "Boot scan: {warning_count} warnings. REM will address them.",
+        "Boot check: {warning_count} issues detected.",
     ),
 }
 

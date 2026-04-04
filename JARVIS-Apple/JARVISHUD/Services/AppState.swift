@@ -162,7 +162,7 @@ class PythonBridge: ObservableObject {
 
         if !hasGreeted {
             hasGreeted = true
-            onSpeak?("JARVIS Online. All systems ready.", .normal)
+            onSpeak?("JARVIS Online. Backend connected.", .normal)
         }
     }
 
