@@ -56,11 +56,21 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // Living Border + Panel setup — border always visible, panel hidden until summoned
             self.setupWindows()
 
-            // Global keyboard shortcut: Cmd+Shift+J toggles panel
-            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                if event.modifierFlags.contains([.command, .shift]) && event.characters?.lowercased() == "j" {
+            // Global keyboard shortcut: Cmd+Shift+J toggles panel (system-wide)
+            // addGlobalMonitor catches keys even when another app is focused.
+            // Requires Accessibility permission (already granted for Ghost Hands).
+            NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                if flags == [.command, .shift] && event.charactersIgnoringModifiers?.lowercased() == "j" {
                     Task { @MainActor in self?.togglePanel() }
-                    return nil  // Consume the event
+                }
+            }
+            // Also add local monitor for when JARVIS panel itself is focused
+            NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+                if flags == [.command, .shift] && event.charactersIgnoringModifiers?.lowercased() == "j" {
+                    Task { @MainActor in self?.togglePanel() }
+                    return nil
                 }
                 return event
             }
