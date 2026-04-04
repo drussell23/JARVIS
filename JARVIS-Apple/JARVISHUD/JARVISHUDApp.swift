@@ -159,13 +159,25 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             // Tier 0: If an app launch is detected, open it immediately from Swift
             let appName = Self.extractAppName(command)
             if let app = appName {
-                print("[JARVIS] Tier 0: launching '\(app)' via macOS open")
+                let resolvedApp = Self.resolveAppName(app)
+                print("[JARVIS] Tier 0: launching '\(resolvedApp)' via macOS open")
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-                proc.arguments = ["-a", app]
+                proc.arguments = ["-a", resolvedApp]
                 try? proc.run()
                 proc.waitUntilExit()
-                print("[JARVIS] Tier 0: '\(app)' \(proc.terminationStatus == 0 ? "launched" : "failed")")
+                if proc.terminationStatus != 0 {
+                    // Fallback: try the original name
+                    print("[JARVIS] Tier 0: '\(resolvedApp)' failed, trying '\(app)'")
+                    let proc2 = Process()
+                    proc2.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+                    proc2.arguments = ["-a", app]
+                    try? proc2.run()
+                    proc2.waitUntilExit()
+                    print("[JARVIS] Tier 0: '\(app)' \(proc2.terminationStatus == 0 ? "launched" : "failed")")
+                } else {
+                    print("[JARVIS] Tier 0: '\(resolvedApp)' launched")
+                }
             }
 
             // Route everything to the local backend via IPC
@@ -322,6 +334,62 @@ class HUDAppDelegate: NSObject, NSApplicationDelegate, AVSpeechSynthesizerDelega
             }
         }
         return nil
+    }
+
+    /// Dynamically resolve app names by searching macOS application directories.
+    /// No hardcoded aliases — the organism discovers what's installed.
+    /// Searches /Applications, ~/Applications, and /System/Applications
+    /// for fuzzy matches against the user's spoken app name.
+    private static func resolveAppName(_ name: String) -> String {
+        let searchDirs = [
+            "/Applications",
+            NSHomeDirectory() + "/Applications",
+            "/System/Applications",
+            "/System/Applications/Utilities",
+        ]
+        let query = name.lowercased()
+        var bestMatch: String? = nil
+        var bestScore: Int = 0
+
+        for dir in searchDirs {
+            guard let contents = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
+            for item in contents where item.hasSuffix(".app") {
+                let appName = String(item.dropLast(4)) // Remove ".app"
+                let appLower = appName.lowercased()
+
+                // Exact match (case-insensitive)
+                if appLower == query {
+                    return appName
+                }
+
+                // Contains match: "chrome" matches "Google Chrome"
+                if appLower.contains(query) {
+                    let score = 100 - (appLower.count - query.count) // Prefer shorter names
+                    if score > bestScore {
+                        bestScore = score
+                        bestMatch = appName
+                    }
+                }
+
+                // Word match: "code" matches "Visual Studio Code"
+                let words = appLower.split(separator: " ").map(String.init)
+                if words.contains(query) {
+                    let score = 90
+                    if score > bestScore {
+                        bestScore = score
+                        bestMatch = appName
+                    }
+                }
+            }
+        }
+
+        if let match = bestMatch {
+            print("[JARVIS] App resolved: '\(name)' → '\(match)' (score: \(bestScore))")
+            return match
+        }
+
+        // No match found — return as-is and let macOS try
+        return name
     }
 
     /// Extract remainder after "open <app> and ..." → "..."
