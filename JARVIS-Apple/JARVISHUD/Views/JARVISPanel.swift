@@ -63,6 +63,10 @@ class JARVISPanel: NSPanel {
 
         self.contentView = visualEffect
         hostingView = hosting
+
+        // Start hidden — only shown when summoned via voice or ⌘⇧J
+        self.orderOut(nil)
+        self.alphaValue = 0
     }
 
     // MARK: - Panel Behavior
