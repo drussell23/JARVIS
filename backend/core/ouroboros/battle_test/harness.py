@@ -112,8 +112,8 @@ class BattleTestHarness:
         self._idle_watchdog = IdleWatchdog(timeout_s=config.idle_timeout_s)
         self._session_recorder = SessionRecorder(session_id=self._session_id)
 
-        # Stop signals
-        self._shutdown_event = asyncio.Event()
+        # Stop signals — created lazily in run() to avoid event-loop mismatch on Python 3.9
+        self._shutdown_event: Optional[asyncio.Event] = None
         self._stop_reason: str = "unknown"
         self._started_at: float = 0.0
 
@@ -143,6 +143,10 @@ class BattleTestHarness:
     async def run(self) -> None:
         """Main lifecycle method: boot, wait for stop signal, shutdown, report."""
         self._started_at = time.time()
+        # Create events inside the running loop (Python 3.9 compat)
+        self._shutdown_event = asyncio.Event()
+        self._cost_tracker.budget_event = asyncio.Event()
+        self._idle_watchdog.idle_event = asyncio.Event()
         try:
             # Boot sequence
             await self.boot_oracle()
@@ -225,12 +229,14 @@ class BattleTestHarness:
     async def boot_governance_stack(self) -> None:
         """Create GovernanceConfig and call create_governance_stack()."""
         try:
+            import argparse
             from backend.core.ouroboros.governance.integration import (
                 GovernanceConfig,
                 create_governance_stack,
             )
 
-            gov_config = GovernanceConfig()
+            args = argparse.Namespace(skip_governance=False, governance_mode="governed")
+            gov_config = GovernanceConfig.from_env_and_args(args)
             self._governance_stack = await create_governance_stack(
                 gov_config,
                 oracle=self._oracle,
@@ -301,7 +307,11 @@ class BattleTestHarness:
             )
 
             intake_config = IntakeLayerConfig(project_root=self._config.repo_path)
-            self._intake_service = IntakeLayerService(config=intake_config)
+            self._intake_service = IntakeLayerService(
+                gls=self._governed_loop_service,
+                config=intake_config,
+                say_fn=None,
+            )
             await self._intake_service.start()
             logger.info("IntakeLayerService booted")
         except Exception as exc:

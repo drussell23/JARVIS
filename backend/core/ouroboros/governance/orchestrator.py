@@ -234,7 +234,11 @@ class GovernedOrchestrator:
                 CompositeScoreFunction, ScoreHistory,
             )
             self._rsi_score_function = CompositeScoreFunction()
-            self._rsi_score_history = ScoreHistory()
+            _rsi_dir = Path(os.environ.get(
+                "JARVIS_SELF_EVOLUTION_DIR",
+                str(Path.home() / ".jarvis" / "ouroboros" / "evolution"),
+            ))
+            self._rsi_score_history = ScoreHistory(persistence_dir=_rsi_dir)
         except Exception:
             logger.debug("RSI: CompositeScoreFunction not available", exc_info=True)
 
