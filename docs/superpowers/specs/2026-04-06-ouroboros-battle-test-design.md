@@ -15,14 +15,14 @@ A standalone script that boots the full Ouroboros governance brain — without t
 ## What This Is
 
 A headless Ouroboros daemon (`scripts/ouroboros_battle_test.py`) that:
-1. Boots 17 of 18 LIVE Ouroboros components (everything except vision)
+1. Boots all components started by `GovernedLoopService` + `IntakeLayerService` for this headless profile (everything except vision, voice output, TUI, and HUD)
 2. Creates an accumulation branch for all changes
-3. Lets the 13+ intake sensors find real improvement opportunities
+3. Lets intake sensors find real improvement opportunities
 4. Runs operations through the full 10-phase governed pipeline
-5. Auto-applies SAFE_AUTO operations, queues APPROVAL_REQUIRED for review
+5. Auto-applies SAFE_AUTO operations, writes APPROVAL_REQUIRED to a review queue file
 6. Tracks RSI convergence data (composite scores, transition probabilities)
-7. Stops when: cost cap hit ($0.50/day) OR SIGINT (Ctrl+C) OR idle (no work found for 10 minutes)
-8. Prints terminal summary and generates a Jupyter analysis notebook
+7. Stops when: session budget exhausted ($0.50) OR SIGINT (Ctrl+C) OR idle (no work found for 10 minutes)
+8. Prints terminal summary and generates a Jupyter analysis notebook (or Markdown fallback if jupyter/matplotlib not installed)
 
 ## What This Is NOT
 
@@ -88,20 +88,23 @@ scripts/ouroboros_battle_test.py
     |       |
     |       +-- TheOracle (GraphRAG codebase index)
     |       |
-    |       +-- IntakeLayerService (13+ sensors)
-    |       |       +-- TestFailureSensor
-    |       |       +-- OpportunityMinerSensor
-    |       |       +-- CapabilityGapSensor
-    |       |       +-- BacklogSensor
-    |       |       +-- ScheduledTriggerSensor
-    |       |       +-- RuntimeHealthSensor
-    |       |       +-- PerformanceRegressionSensor
-    |       |       +-- DocStalenessSensor
-    |       |       +-- GitHubIssueSensor
-    |       |       +-- ProactiveExplorationSensor
-    |       |       +-- CrossRepoDriftSensor
-    |       |       +-- TodoScannerSensor
-    |       |       +-- CUExecutionSensor
+    |       +-- IntakeLayerService (sensors — headless profile)
+    |       |       +-- TestFailureSensor            [ENABLED]
+    |       |       +-- OpportunityMinerSensor       [ENABLED]
+    |       |       +-- CapabilityGapSensor          [ENABLED]
+    |       |       +-- BacklogSensor                [ENABLED]
+    |       |       +-- ScheduledTriggerSensor       [ENABLED]
+    |       |       +-- RuntimeHealthSensor          [ENABLED]
+    |       |       +-- WebIntelligenceSensor        [ENABLED]
+    |       |       +-- PerformanceRegressionSensor  [ENABLED]
+    |       |       +-- DocStalenessSensor           [ENABLED]
+    |       |       +-- GitHubIssueSensor            [ENABLED]
+    |       |       +-- ProactiveExplorationSensor   [ENABLED]
+    |       |       +-- TodoScannerSensor            [ENABLED]
+    |       |       +-- VoiceCommandSensor           [DISABLED — no mic input in headless]
+    |       |       +-- CUExecutionSensor            [DISABLED — no screen in headless]
+    |       |       +-- CrossRepoDriftSensor         [DISABLED — single-repo registry for v1]
+    |       |       +-- ReactorEventConsumer         [DISABLED — no Reactor in v1]
     |       |
     |       +-- GraduationOrchestrator (ephemeral -> permanent)
     |       |       +-- EphemeralUsageTracker (adaptive Bayesian threshold)
@@ -131,8 +134,9 @@ The top-level orchestrator. Single class, single file. Responsibilities:
 
 Lightweight wrapper that monitors cumulative Doubleword API spend during the session.
 - Reads cost from BrainSelector.record_cost() or response.cost_usd attributes
-- When cumulative cost >= daily cap ($0.50 default): set a flag that the GovernedLoopService checks before starting new operations
-- Persisted to session JSON so restarts don't lose track
+- When cumulative cost >= session budget ($0.50 default): sets `budget_exhausted` asyncio.Event that the harness awaits
+- **Budget semantics:** Per-session, not calendar-day. Each invocation of `ouroboros_battle_test.py` gets a fresh budget. No timezone ambiguity. Persisted to session JSON so a crash-and-restart within the same session resumes the existing budget.
+- **Integration hook:** If `GovernedLoopService` has no pre-dequeue budget check, the harness injects a callback via the `pre_operation_gate` hook (if available) or patches `_can_accept_operation()` at construction time. This is the one allowed minimal core touch — documented in the implementation plan if discovery shows it's needed.
 
 ### 3. BranchManager
 
@@ -181,47 +185,64 @@ Generates a pre-populated Jupyter notebook from session data:
 
 Output: `notebooks/ouroboros_battle_test_analysis.ipynb`
 
+**Optional dependencies:** `jupyter`, `matplotlib`, `seaborn`. If not installed, the generator falls back to a Markdown report at `~/.jarvis/ouroboros/battle-test/{session_id}/report.md` with the same data in text/table format.
+
 ---
+
+## Git Preconditions
+
+Before creating the accumulation branch:
+1. **Working tree must be clean** (`git status --porcelain` is empty). If dirty, abort with message: "Commit or stash your changes before running the battle test."
+2. **Must be on `main` branch** (or configurable base branch via `--base-branch`). Accumulation branch is created from HEAD of the base branch.
+3. **Branch must not already exist.** If `ouroboros/battle-test-{id}` exists, append a counter suffix.
+4. **No rebase/merge assumptions.** The accumulation branch is disposable. Review via `git diff main..branch`, then merge or delete.
 
 ## Boot Sequence
 
 ```
 1. Parse CLI args
 2. Validate environment (API keys, repo paths)
-3. Create accumulation branch
-4. Initialize TheOracle (index JARVIS codebase) [~10-30s]
-5. Create GovernanceStack (risk engine, policy engine, ledger, change engine) [~5s]
-6. Create GovernedLoopService (orchestrator, providers, brain selector) [~5s]
-7. Initialize JARVIS-level tiers (advisor, emergency, predictive, intelligence, personality, judgment) [~5s]
-8. Start IntakeLayerService (13 sensors begin scanning) [~5s]
-9. Start GraduationOrchestrator [~2s]
-10. Print "Ouroboros is alive. Watching JARVIS repo. Cost cap: $0.50/day."
-11. Enter main loop
+3. Validate git preconditions (clean tree, on base branch)
+4. Create accumulation branch
+5. Initialize TheOracle (index JARVIS codebase) [~10-30s]
+6. Create GovernanceStack (risk engine, policy engine, ledger, change engine) [~5s]
+7. Create GovernedLoopService (orchestrator, providers, brain selector) [~5s]
+8. Initialize JARVIS-level tiers (advisor, emergency, predictive, intelligence, personality, judgment) [~5s]
+9. Start IntakeLayerService (headless sensor profile — disable voice/CU/cross-repo/reactor sensors) [~5s]
+10. Start GraduationOrchestrator [~2s]
+11. Print "Ouroboros is alive. Watching JARVIS repo. Session budget: $0.50."
+12. Enter event-driven main loop
 ```
 
 Total boot: ~30-60 seconds (dominated by Oracle indexing).
 
 ## Main Loop
 
+The system is **event-driven**, not polling. Sensors push IntentEnvelopes into the intake router, which dispatches to GovernedLoopService asynchronously. The harness waits for shutdown signals:
+
 ```python
-while not shutdown_requested:
-    if cost_tracker.budget_exhausted():
-        print("Cost cap reached. Pausing for review.")
-        break
-    
-    # Sensors feed IntentEnvelopes into the intake router
-    # IntakeRouter dispatches to GovernedLoopService
-    # GovernedLoopService runs the 10-phase pipeline
-    # SAFE_AUTO operations auto-apply to accumulation branch
-    # APPROVAL_REQUIRED operations are logged but skipped (headless)
-    
-    # Check idle timeout
-    if time_since_last_operation > idle_timeout:
-        print("No work found for 10 minutes. Stopping.")
-        break
-    
-    await asyncio.sleep(1)  # Yield to event loop
+# Three asyncio.Events — first one to fire stops the session
+shutdown_event = asyncio.Event()      # SIGINT handler sets this
+budget_event = asyncio.Event()        # CostTracker sets when budget exhausted
+idle_event = asyncio.Event()          # IdleWatchdog sets after idle_timeout
+
+# Register SIGINT
+loop.add_signal_handler(signal.SIGINT, shutdown_event.set)
+
+# Sensors feed IntentEnvelopes into the intake router (event-driven)
+# IntakeRouter dispatches to GovernedLoopService
+# GovernedLoopService runs the 10-phase pipeline
+# SAFE_AUTO operations auto-apply to accumulation branch
+# APPROVAL_REQUIRED operations written to review queue JSONL
+
+# Wait for any stop condition
+done, _ = await asyncio.wait(
+    [shutdown_event.wait(), budget_event.wait(), idle_event.wait()],
+    return_when=asyncio.FIRST_COMPLETED,
+)
 ```
+
+**IdleWatchdog:** A background task that resets a timer on every `COMPLETE`/`FAILED` operation callback. If no operation completes for `idle_timeout` seconds (default 600), it fires `idle_event`.
 
 ## Shutdown Sequence
 
@@ -282,7 +303,7 @@ python3 scripts/ouroboros_battle_test.py \
   Completed:     28  (82.4%)
   Failed:        4   (11.8%)
   Cancelled:     2   (5.9%)
-  Skipped (approval): 6
+  Queued (approval):  6  (see review_queue.jsonl)
 
   CONVERGENCE
   -----------
@@ -339,7 +360,7 @@ python3 scripts/ouroboros_battle_test.py \
 | Docker lifecycle | Not containerized for battle test |
 | GCP VM lifecycle | Local-only test |
 
-All 17 of 18 LIVE components are active. The narration and dashboard events still fire internally — they just write to logs/JSON instead of screens/speakers.
+All components started by `GovernedLoopService` and `IntakeLayerService` are active for this headless profile. The narration and dashboard events still fire internally — they write to logs/JSON instead of screens/speakers. Sensors that require I/O hardware (voice, vision) or multi-repo infrastructure (cross-repo drift, reactor events) are disabled via config, not removed.
 
 ---
 
@@ -352,13 +373,14 @@ All 17 of 18 LIVE components are active. The narration and dashboard events stil
 | `scripts/battle_test_notebook_generator.py` | Generates pre-populated Jupyter notebook |
 | `notebooks/ouroboros_battle_test_analysis.ipynb` | Generated analysis notebook (gitignored template) |
 
-### Modified Files
-None. The battle test script imports existing components — it doesn't modify them.
+### Modified Files (minimal, if needed)
+The battle test script imports existing components and avoids core changes. However, if discovery during implementation reveals that `GovernedLoopService` has no pre-dequeue hook for the budget gate, **one small addition** is allowed: a `pre_operation_gate` callback on GLS that the harness sets at construction. This will be documented explicitly in the implementation plan if needed. No other core modifications.
 
 ### Output Files (runtime, not committed)
 | File | Purpose |
 |---|---|
 | `~/.jarvis/ouroboros/battle-test/{session_id}/summary.json` | Session stats |
+| `~/.jarvis/ouroboros/battle-test/{session_id}/review_queue.jsonl` | APPROVAL_REQUIRED operations (not invisible — reviewable) |
 | `~/.jarvis/ouroboros/evolution/composite_scores.jsonl` | Score history |
 | `~/.jarvis/ouroboros/evolution/transition_probabilities.json` | Technique data |
 | `~/.jarvis/ouroboros/ledger/` | Operation ledger entries |
@@ -374,7 +396,7 @@ The battle test succeeds if:
 4. At least one SAFE_AUTO change is auto-applied to the accumulation branch
 5. Composite scores are recorded and the convergence tracker produces a report
 6. The generated notebook renders and shows real data
-7. The accumulation branch contains valid, compilable code changes
+7. The accumulation branch passes `pytest` on touched files and introduces no new lint errors (not just "compilable" — verifiably correct for a Python monorepo)
 
 The battle test proves the organism works if:
 1. Convergence state is IMPROVING or LOGARITHMIC after 20+ operations
