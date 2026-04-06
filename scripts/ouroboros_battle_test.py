@@ -81,6 +81,22 @@ def main() -> None:
     args = parser.parse_args()
 
     # ------------------------------------------------------------------
+    # Load .env files (project root and backend/) if keys not already set
+    # ------------------------------------------------------------------
+    _env_file = _PROJECT_ROOT / ".env"
+    _backend_env = _PROJECT_ROOT / "backend" / ".env"
+    for env_path in (_env_file, _backend_env):
+        if env_path.exists():
+            for line in env_path.read_text().splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                key = key.strip()
+                value = value.strip().strip("'\"")
+                os.environ.setdefault(key, value)
+
+    # ------------------------------------------------------------------
     # Validate environment
     # ------------------------------------------------------------------
     if not os.environ.get("DOUBLEWORD_API_KEY") and not os.environ.get("ANTHROPIC_API_KEY"):
