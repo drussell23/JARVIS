@@ -1,8 +1,14 @@
 # governance/contracts/inventory_handshake_contract.py
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
+import asyncio
+import asyncio
 from enum import Enum
+
+# Suppress urllib3 LibreSSL warning specifically for this module context
+warnings.filterwarnings("ignore", category=Warning, message=".*urllib3 v2 only supports OpenSSL.*")
 from typing import FrozenSet, Mapping, Sequence, Protocol
 from abc import ABC, abstractmethod
 
