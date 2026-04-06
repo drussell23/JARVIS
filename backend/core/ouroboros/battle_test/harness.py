@@ -261,6 +261,10 @@ class BattleTestHarness:
                 stack=self._governance_stack,
                 config=gls_config,
             )
+            # Inject pre-booted Oracle to prevent double ChromaDB initialization
+            # (concurrent PersistentClient instances cause SQLite segfault)
+            if self._oracle is not None:
+                self._governed_loop_service._oracle = self._oracle
             await self._governed_loop_service.start()
             logger.info("GovernedLoopService booted")
         except Exception as exc:
@@ -434,8 +438,13 @@ class BattleTestHarness:
             except Exception as exc:
                 logger.warning("GovernanceStack stop failed: %s", exc)
 
-        # 6. Oracle (no async stop — just release reference)
-        self._oracle = None
+        # 6. Oracle
+        if self._oracle is not None:
+            try:
+                await self._oracle.shutdown()
+            except Exception as exc:
+                logger.warning("Oracle shutdown failed: %s", exc)
+            self._oracle = None
 
         # Save cost tracker state
         try:

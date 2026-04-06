@@ -3172,15 +3172,28 @@ class GovernedLoopService:
         Non-blocking: start() never awaits this. Fault-isolated: any exception in
         initialization sets self._oracle = None, logs a structured warning, and exits
         the task without impacting service state or any operation's terminal phase.
+
+        If self._oracle is already set (injected by an external harness or the
+        governance stack), skip initialization entirely — reuse the existing instance.
+        This prevents double-initialization of ChromaDB's PersistentClient which
+        causes a SQLite lock contention segfault (SIGSEGV at 0x0) when two clients
+        target the same persistence directory concurrently.
         """
         try:
-            if TheOracle is None:
+            # Reuse injected Oracle if already available (e.g. from battle test harness)
+            if self._oracle is not None:
+                logger.info(
+                    "[GovernedLoop] Oracle already injected (%s nodes), skipping re-init",
+                    self._oracle.get_metrics().get("total_nodes", "?"),
+                )
+            elif TheOracle is None:
                 raise ImportError("TheOracle not available")
-            oracle = TheOracle()
-            await oracle.initialize()
-            self._oracle = oracle
+            else:
+                oracle = TheOracle()
+                await oracle.initialize()
+                self._oracle = oracle
             if self._stack is not None:
-                self._stack.oracle = oracle
+                self._stack.oracle = self._oracle
             logger.info(
                 "[GovernedLoop] Oracle indexed %s nodes across all repos",
                 oracle.get_metrics().get("total_nodes", "?"),
