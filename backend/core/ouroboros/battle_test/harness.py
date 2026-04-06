@@ -167,6 +167,9 @@ class BattleTestHarness:
             # Start idle watchdog
             await self._idle_watchdog.start()
 
+            # Start GLS activity monitor — pokes watchdog when operations are in-flight
+            self._activity_monitor_task = asyncio.ensure_future(self._monitor_gls_activity())
+
             # Register signal handlers
             try:
                 loop = asyncio.get_running_loop()
@@ -346,6 +349,35 @@ class BattleTestHarness:
             logger.warning("Signal handlers not supported on this platform")
 
     # ------------------------------------------------------------------
+    # GLS Activity Monitor
+    # ------------------------------------------------------------------
+
+    async def _monitor_gls_activity(self) -> None:
+        """Background task: pokes idle watchdog whenever GLS has in-flight ops.
+
+        The Doubleword batch API can take minutes per operation. Without this,
+        the idle watchdog fires while batches are still in flight. This monitor
+        checks every 5 seconds whether the GLS has active operations and pokes
+        the watchdog if so — keeping the session alive during long batches.
+        """
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                if self._governed_loop_service is not None:
+                    try:
+                        active = getattr(self._governed_loop_service, "_active_ops", set())
+                        if active:
+                            self._idle_watchdog.poke()
+                            logger.debug(
+                                "[ActivityMonitor] %d ops in flight, poked watchdog",
+                                len(active),
+                            )
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
+
+    # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
 
@@ -356,6 +388,17 @@ class BattleTestHarness:
         not prevent the remaining components from being cleaned up.
         """
         logger.info("Shutting down session %s ...", self._session_id)
+
+        # 0. Activity monitor
+        try:
+            if hasattr(self, "_activity_monitor_task") and self._activity_monitor_task:
+                self._activity_monitor_task.cancel()
+                try:
+                    await self._activity_monitor_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
 
         # 1. Idle watchdog
         try:
