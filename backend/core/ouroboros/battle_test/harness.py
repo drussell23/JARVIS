@@ -1,0 +1,481 @@
+"""BattleTestHarness -- orchestrates Ouroboros boot, event-driven session loop, and shutdown.
+
+The harness is the centerpiece of the battle test runner.  It boots the full
+Ouroboros brain in headless mode, waits for one of three stop signals
+(shutdown, budget, idle), then tears everything down and generates a summary
+report.
+
+All imports of real Ouroboros components are performed lazily *inside* method
+bodies so that this module is importable even when the full stack has missing
+dependencies.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import signal
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from backend.core.ouroboros.battle_test.cost_tracker import CostTracker
+from backend.core.ouroboros.battle_test.idle_watchdog import IdleWatchdog
+from backend.core.ouroboros.battle_test.session_recorder import SessionRecorder
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# HarnessConfig
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HarnessConfig:
+    """Configuration for the BattleTestHarness.
+
+    Parameters
+    ----------
+    repo_path:
+        Path to the repository root.
+    cost_cap_usd:
+        Maximum API spend for the session.
+    idle_timeout_s:
+        Seconds of inactivity before the session is stopped.
+    branch_prefix:
+        Prefix for the accumulation branch name.
+    session_dir:
+        Directory for session artifacts.  Auto-generated when ``None``.
+    notebook_output_dir:
+        Directory for the generated notebook.  Defaults to ``"notebooks"``.
+    """
+
+    repo_path: Path = field(default_factory=lambda: Path("."))
+    cost_cap_usd: float = 0.50
+    idle_timeout_s: float = 600.0
+    branch_prefix: str = "ouroboros/battle-test"
+    session_dir: Optional[Path] = None
+    notebook_output_dir: Optional[Path] = None
+
+    @classmethod
+    def from_env(cls) -> HarnessConfig:
+        """Build a HarnessConfig from environment variables.
+
+        Reads:
+        - ``OUROBOROS_BATTLE_COST_CAP``
+        - ``OUROBOROS_BATTLE_IDLE_TIMEOUT``
+        - ``OUROBOROS_BATTLE_BRANCH_PREFIX``
+        - ``JARVIS_REPO_PATH``
+        """
+        return cls(
+            repo_path=Path(os.environ.get("JARVIS_REPO_PATH", ".")),
+            cost_cap_usd=float(os.environ.get("OUROBOROS_BATTLE_COST_CAP", "0.50")),
+            idle_timeout_s=float(os.environ.get("OUROBOROS_BATTLE_IDLE_TIMEOUT", "600.0")),
+            branch_prefix=os.environ.get("OUROBOROS_BATTLE_BRANCH_PREFIX", "ouroboros/battle-test"),
+        )
+
+
+# ---------------------------------------------------------------------------
+# BattleTestHarness
+# ---------------------------------------------------------------------------
+
+
+class BattleTestHarness:
+    """Orchestrates the full Ouroboros boot, event-driven session loop, and shutdown.
+
+    Parameters
+    ----------
+    config:
+        A :class:`HarnessConfig` instance.
+    """
+
+    def __init__(self, config: HarnessConfig) -> None:
+        self._config = config
+
+        # Session identity
+        ts = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d-%H%M%S")
+        self._session_id = f"bt-{ts}"
+
+        # Session directories
+        self._session_dir = config.session_dir or Path(f".ouroboros/sessions/{self._session_id}")
+        self._notebook_output_dir = config.notebook_output_dir or Path("notebooks")
+
+        # Battle-test utilities
+        self._cost_tracker = CostTracker(
+            budget_usd=config.cost_cap_usd,
+            persist_path=self._session_dir / "cost_tracker.json",
+        )
+        self._idle_watchdog = IdleWatchdog(timeout_s=config.idle_timeout_s)
+        self._session_recorder = SessionRecorder(session_id=self._session_id)
+
+        # Stop signals
+        self._shutdown_event = asyncio.Event()
+        self._stop_reason: str = "unknown"
+        self._started_at: float = 0.0
+
+        # Component references (populated during boot)
+        self._oracle: Any = None
+        self._governance_stack: Any = None
+        self._governed_loop_service: Any = None
+        self._predictive_engine: Any = None
+        self._branch_manager: Any = None
+        self._branch_name: Optional[str] = None
+        self._intake_service: Any = None
+        self._graduation_orchestrator: Any = None
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def session_id(self) -> str:
+        """Unique session identifier in ``bt-YYYY-MM-DD-HHMMSS`` format."""
+        return self._session_id
+
+    # ------------------------------------------------------------------
+    # Main lifecycle
+    # ------------------------------------------------------------------
+
+    async def run(self) -> None:
+        """Main lifecycle method: boot, wait for stop signal, shutdown, report."""
+        self._started_at = time.time()
+        try:
+            # Boot sequence
+            await self.boot_oracle()
+            await self.boot_governance_stack()
+            await self.boot_governed_loop_service()
+            await self.boot_jarvis_tiers()
+            self._branch_name = await self.create_branch()
+            await self.boot_intake()
+            await self.boot_graduation()
+
+            logger.info(
+                "Ouroboros is alive — session %s | budget=$%.2f | idle=%ds",
+                self._session_id,
+                self._config.cost_cap_usd,
+                int(self._config.idle_timeout_s),
+            )
+
+            # Start idle watchdog
+            await self._idle_watchdog.start()
+
+            # Register signal handlers
+            try:
+                loop = asyncio.get_running_loop()
+                self.register_signal_handlers(loop)
+            except Exception:  # noqa: BLE001
+                pass
+
+            # Wait for first stop signal
+            shutdown_waiter = asyncio.ensure_future(self._shutdown_event.wait())
+            budget_waiter = asyncio.ensure_future(self._cost_tracker.budget_event.wait())
+            idle_waiter = asyncio.ensure_future(self._idle_watchdog.idle_event.wait())
+
+            done, pending = await asyncio.wait(
+                [shutdown_waiter, budget_waiter, idle_waiter],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            # Cancel the pending waiters
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+            # Determine stop reason
+            if shutdown_waiter in done:
+                self._stop_reason = "shutdown_signal"
+            elif budget_waiter in done:
+                self._stop_reason = "budget_exhausted"
+            elif idle_waiter in done:
+                self._stop_reason = "idle_timeout"
+            else:
+                self._stop_reason = "unknown"
+
+            logger.info("Session %s stopping: %s", self._session_id, self._stop_reason)
+
+        except Exception as exc:
+            logger.error("Session %s boot failed: %s", self._session_id, exc)
+            self._stop_reason = f"boot_failure: {exc}"
+        finally:
+            await self._shutdown_components()
+            await self._generate_report()
+
+    # ------------------------------------------------------------------
+    # Boot methods (all overridable for test mocking)
+    # ------------------------------------------------------------------
+
+    async def boot_oracle(self) -> None:
+        """Import and initialize TheOracle."""
+        try:
+            from backend.core.ouroboros.oracle import TheOracle
+
+            self._oracle = TheOracle()
+            await self._oracle.initialize()
+            logger.info("Oracle booted")
+        except Exception as exc:
+            logger.warning("Oracle failed to boot: %s", exc)
+
+    async def boot_governance_stack(self) -> None:
+        """Create GovernanceConfig and call create_governance_stack()."""
+        try:
+            from backend.core.ouroboros.governance.integration import (
+                GovernanceConfig,
+                create_governance_stack,
+            )
+
+            gov_config = GovernanceConfig()
+            self._governance_stack = await create_governance_stack(
+                gov_config,
+                oracle=self._oracle,
+            )
+            logger.info("Governance stack booted")
+        except Exception as exc:
+            logger.warning("Governance stack failed to boot: %s", exc)
+
+    async def boot_governed_loop_service(self) -> None:
+        """Create GovernedLoopConfig, GovernedLoopService, and start()."""
+        try:
+            from backend.core.ouroboros.governance.governed_loop_service import (
+                GovernedLoopConfig,
+                GovernedLoopService,
+            )
+
+            gls_config = GovernedLoopConfig(project_root=self._config.repo_path)
+            self._governed_loop_service = GovernedLoopService(
+                stack=self._governance_stack,
+                config=gls_config,
+            )
+            await self._governed_loop_service.start()
+            logger.info("GovernedLoopService booted")
+        except Exception as exc:
+            logger.warning("GovernedLoopService failed to boot: %s", exc)
+
+    async def boot_jarvis_tiers(self) -> None:
+        """Import and start PredictiveRegressionEngine (Tier 3).
+
+        Tiers 1, 2, 5, 6, 7 activate lazily via orchestrator imports;
+        no explicit boot is needed for them.
+        """
+        try:
+            from backend.core.ouroboros.governance.predictive_engine import (
+                PredictiveRegressionEngine,
+            )
+
+            self._predictive_engine = PredictiveRegressionEngine(
+                project_root=self._config.repo_path,
+            )
+            await self._predictive_engine.start()
+            logger.info("PredictiveRegressionEngine (Tier 3) booted")
+        except Exception as exc:
+            logger.warning("PredictiveRegressionEngine failed to boot: %s", exc)
+
+    async def create_branch(self) -> str:
+        """Create the accumulation branch using BranchManager."""
+        try:
+            from backend.core.ouroboros.battle_test.branch_manager import BranchManager
+
+            self._branch_manager = BranchManager(
+                repo_path=self._config.repo_path,
+                branch_prefix=self._config.branch_prefix,
+            )
+            branch_name = self._branch_manager.create_branch()
+            logger.info("Accumulation branch created: %s", branch_name)
+            return branch_name
+        except Exception as exc:
+            logger.warning("Branch creation failed: %s", exc)
+            return f"{self._config.branch_prefix}/failed"
+
+    async def boot_intake(self) -> None:
+        """Create IntakeLayerConfig, IntakeLayerService, and start()."""
+        try:
+            from backend.core.ouroboros.governance.intake.intake_layer_service import (
+                IntakeLayerConfig,
+                IntakeLayerService,
+            )
+
+            intake_config = IntakeLayerConfig(project_root=self._config.repo_path)
+            self._intake_service = IntakeLayerService(config=intake_config)
+            await self._intake_service.start()
+            logger.info("IntakeLayerService booted")
+        except Exception as exc:
+            logger.warning("IntakeLayerService failed to boot: %s", exc)
+
+    async def boot_graduation(self) -> None:
+        """Create GraduationOrchestrator."""
+        try:
+            from backend.core.ouroboros.governance.graduation_orchestrator import (
+                GraduationOrchestrator,
+            )
+
+            self._graduation_orchestrator = GraduationOrchestrator()
+            logger.info("GraduationOrchestrator booted")
+        except Exception as exc:
+            logger.warning("GraduationOrchestrator failed to boot: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Signal handlers
+    # ------------------------------------------------------------------
+
+    def register_signal_handlers(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Register SIGINT/SIGTERM handlers to trigger clean shutdown.
+
+        Catches ``NotImplementedError`` on Windows where
+        ``loop.add_signal_handler`` is not supported.
+        """
+        try:
+            loop.add_signal_handler(signal.SIGINT, self._shutdown_event.set)
+            loop.add_signal_handler(signal.SIGTERM, self._shutdown_event.set)
+        except NotImplementedError:
+            logger.warning("Signal handlers not supported on this platform")
+
+    # ------------------------------------------------------------------
+    # Shutdown
+    # ------------------------------------------------------------------
+
+    async def _shutdown_components(self) -> None:
+        """Stop all components in reverse boot order.
+
+        Each stop call is wrapped in try/except so that one failure does
+        not prevent the remaining components from being cleaned up.
+        """
+        logger.info("Shutting down session %s ...", self._session_id)
+
+        # 1. Idle watchdog
+        try:
+            self._idle_watchdog.stop()
+        except Exception as exc:
+            logger.warning("IdleWatchdog stop failed: %s", exc)
+
+        # 2. Intake
+        if self._intake_service is not None:
+            try:
+                await self._intake_service.stop()
+            except Exception as exc:
+                logger.warning("IntakeLayerService stop failed: %s", exc)
+
+        # 3. Predictive engine
+        if self._predictive_engine is not None:
+            try:
+                self._predictive_engine.stop()
+            except Exception as exc:
+                logger.warning("PredictiveRegressionEngine stop failed: %s", exc)
+
+        # 4. Governed loop service
+        if self._governed_loop_service is not None:
+            try:
+                await self._governed_loop_service.stop()
+            except Exception as exc:
+                logger.warning("GovernedLoopService stop failed: %s", exc)
+
+        # 5. Governance stack
+        if self._governance_stack is not None:
+            try:
+                await self._governance_stack.stop()
+            except Exception as exc:
+                logger.warning("GovernanceStack stop failed: %s", exc)
+
+        # 6. Oracle (no async stop — just release reference)
+        self._oracle = None
+
+        # Save cost tracker state
+        try:
+            self._cost_tracker.save()
+        except Exception as exc:
+            logger.warning("CostTracker save failed: %s", exc)
+
+        logger.info("Shutdown complete for session %s", self._session_id)
+
+    # ------------------------------------------------------------------
+    # Report generation
+    # ------------------------------------------------------------------
+
+    async def _generate_report(self) -> None:
+        """Generate the session summary report and optional notebook."""
+        duration_s = time.time() - self._started_at if self._started_at else 0.0
+
+        # --- Convergence data ---
+        convergence_state = "INSUFFICIENT_DATA"
+        convergence_slope = 0.0
+        convergence_r2 = 0.0
+
+        try:
+            from backend.core.ouroboros.governance.composite_score import ScoreHistory
+            from backend.core.ouroboros.governance.convergence_tracker import ConvergenceTracker
+
+            score_history = ScoreHistory(persistence_dir=self._session_dir)
+            tracker = ConvergenceTracker()
+            scores = score_history.get_composite_values()
+            if scores:
+                report = tracker.analyze(scores)
+                convergence_state = report.state.value if hasattr(report.state, "value") else str(report.state)
+                convergence_slope = report.slope
+                convergence_r2 = report.r_squared_log
+        except Exception as exc:
+            logger.warning("Convergence analysis failed: %s", exc)
+
+        # --- Branch stats ---
+        branch_stats: dict = {
+            "commits": 0,
+            "files_changed": 0,
+            "insertions": 0,
+            "deletions": 0,
+        }
+        try:
+            if self._branch_manager is not None:
+                branch_stats = self._branch_manager.get_diff_stats()
+        except Exception as exc:
+            logger.warning("Branch stats retrieval failed: %s", exc)
+
+        # --- Save session summary JSON ---
+        try:
+            self._session_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = self._session_recorder.save_summary(
+                output_dir=self._session_dir,
+                stop_reason=self._stop_reason,
+                duration_s=duration_s,
+                cost_total=self._cost_tracker.total_spent,
+                cost_breakdown=self._cost_tracker.breakdown,
+                branch_stats=branch_stats,
+                convergence_state=convergence_state,
+                convergence_slope=convergence_slope,
+                convergence_r2=convergence_r2,
+            )
+            logger.info("Summary written to %s", summary_path)
+        except Exception as exc:
+            logger.warning("Failed to save session summary: %s", exc)
+
+        # --- Terminal summary ---
+        try:
+            terminal_summary = self._session_recorder.format_terminal_summary(
+                stop_reason=self._stop_reason,
+                duration_s=duration_s,
+                cost_total=self._cost_tracker.total_spent,
+                cost_breakdown=self._cost_tracker.breakdown,
+                branch_name=self._branch_name or "N/A",
+                branch_stats=branch_stats,
+                convergence_state=convergence_state,
+                convergence_slope=convergence_slope,
+                convergence_r2=convergence_r2,
+            )
+            print(terminal_summary)
+        except Exception as exc:
+            logger.warning("Failed to format terminal summary: %s", exc)
+
+        # --- Notebook ---
+        try:
+            from backend.core.ouroboros.battle_test.notebook_generator import NotebookGenerator
+
+            summary_json_path = self._session_dir / "summary.json"
+            if summary_json_path.exists():
+                nb_gen = NotebookGenerator(summary_path=summary_json_path)
+                nb_path = nb_gen.generate(output_dir=self._notebook_output_dir)
+                logger.info("Notebook generated at %s", nb_path)
+        except Exception as exc:
+            logger.warning("Notebook generation failed: %s", exc)
