@@ -19,7 +19,7 @@ pydub==0.25.1
 pyaudio==0.2.14
 gtts==2.5.4
 pyttsx3==2.90
-speechbrain==0.5.16  # Advanced STT with noise robustness and fine-tuning
+speechbrain==1.1.0  # Advanced STT with noise robustness and fine-tuning
 torchaudio==2.1.2  # Required by SpeechBrain
 psutil==5.9.6  # Resource monitoring for STT routing
 
