@@ -70,6 +70,12 @@ class OperationState(Enum):
     PENDING_TIER0 = "pending_tier0"
     TIER0_COMPLETE = "tier0_complete"
 
+    # RSI Convergence Framework states (v0.2.0)
+    SCORE_COMPUTED = "score_computed"
+    CONVERGENCE_CHECKED = "convergence_checked"
+    PRE_SCORED = "pre_scored"
+    VINDICATION_CHECKED = "vindication_checked"
+
 
 # ---------------------------------------------------------------------------
 # Data classes

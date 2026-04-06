@@ -39,7 +39,7 @@ _DEFAULT_WEIGHTS: Tuple[float, ...] = (0.40, 0.20, 0.15, 0.10, 0.15)
 
 _PERSISTENCE_DIR = Path(
     os.environ.get(
-        "OUROBOROS_RSI_SCORE_DIR",
+        "JARVIS_SELF_EVOLUTION_DIR",
         str(Path.home() / ".jarvis" / "ouroboros" / "evolution"),
     )
 )
