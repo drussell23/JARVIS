@@ -1702,12 +1702,18 @@ def _parse_generation_response(
                     f"{pfx}_schema_invalid:candidate_{i}_missing_{field}"
                 )
 
-        # Extra fields
+        # Extra fields — strip instead of rejecting.
+        # Models (especially Doubleword 397B) sometimes add metadata fields
+        # like 'provider_metadata' inside candidates. The required fields are
+        # validated above; extra keys are harmless and can be discarded.
         extra_cand = set(cand.keys()) - _CANDIDATE_KEYS
         if extra_cand:
-            raise RuntimeError(
-                f"{pfx}_schema_invalid:candidate_{i}_unexpected_keys:{','.join(sorted(extra_cand))}"
+            logger.debug(
+                "candidate_%d: stripping unexpected keys %s (not a rejection — required fields present)",
+                i, sorted(extra_cand),
             )
+            for _ek in extra_cand:
+                del cand[_ek]
 
         # AST check for Python files
         file_path: str = cand["file_path"]
