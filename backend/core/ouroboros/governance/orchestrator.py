@@ -917,7 +917,10 @@ class GovernedOrchestrator:
 
             # P1: Code metrics feedback — objective quality signals
             for _tf in ctx.target_files[:3]:
-                _metrics = CodeMetricsAnalyzer.analyze(self._config.project_root / _tf)
+                _tf_path = self._config.project_root / _tf
+                if _tf_path.is_dir() or not _tf_path.suffix:
+                    continue  # Skip directories — only analyze files
+                _metrics = CodeMetricsAnalyzer.analyze(_tf_path)
                 if _metrics:
                     _mf = CodeMetricsAnalyzer.format_for_prompt(_metrics)
                     if _mf:
