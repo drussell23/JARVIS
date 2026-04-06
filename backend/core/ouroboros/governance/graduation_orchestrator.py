@@ -180,16 +180,32 @@ class EphemeralUsageTracker:
             if gcid in self._graduated:
                 return None
 
+            raw_goal_hash = hashlib.sha256(goal.encode()).hexdigest()[:12]
             record = EphemeralUsageRecord(
-                goal=goal, goal_hash=gcid, code_hash=code_hash,
+                goal=goal, goal_hash=raw_goal_hash, code_hash=code_hash,
                 execution_outcome=outcome, elapsed_s=elapsed_s,
             )
             self._data.setdefault(gcid, []).append(record)
             self._save()
 
-            success_count = sum(1 for r in self._data[gcid] if r.execution_outcome == "success")
-            if success_count >= self._threshold and gcid not in self._threshold_fired:
+            records = self._data[gcid]
+            success_count = sum(1 for r in records if r.execution_outcome == "success")
+            failure_count = len(records) - success_count
+            unique_goals = len({r.goal_hash for r in records})
+            total_uses = len(records)
+
+            adaptive = compute_adaptive_threshold(
+                successes=success_count, failures=failure_count,
+                unique_goals=unique_goals, total_uses=total_uses,
+            )
+            if success_count >= adaptive.threshold and gcid not in self._threshold_fired:
                 self._threshold_fired.add(gcid)
+                logger.info(
+                    "[AdaptiveGraduation] Threshold met for %s: %d/%d "
+                    "(p=%.2f, diversity=%.2f, threshold=%d)",
+                    gcid, success_count, total_uses,
+                    adaptive.p_success, adaptive.diversity, adaptive.threshold,
+                )
                 return gcid
             return None
 
