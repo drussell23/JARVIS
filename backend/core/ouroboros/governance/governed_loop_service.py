@@ -3196,7 +3196,7 @@ class GovernedLoopService:
                 self._stack.oracle = self._oracle
             logger.info(
                 "[GovernedLoop] Oracle indexed %s nodes across all repos",
-                oracle.get_metrics().get("total_nodes", "?"),
+                self._oracle.get_metrics().get("total_nodes", "?"),
             )
         except asyncio.CancelledError:
             return
