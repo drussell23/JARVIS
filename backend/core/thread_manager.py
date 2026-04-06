@@ -1566,7 +1566,13 @@ def shutdown_third_party_threads(timeout: float = 5.0) -> Dict[str, Any]:
     stats["torch_threads_before"] = len(pytorch_threads)
     
     # Phase 1: PyTorch cleanup
+    # Only clean up torch if it was actually imported during this process.
+    # Importing torch unconditionally triggers torio → FFmpeg dlopen chain
+    # which fails with OSError on systems without FFmpeg libs installed.
+    # A headless governance daemon that never uses ML should not pay this cost.
     try:
+        if "torch" not in sys.modules:
+            raise ImportError("torch was never imported — nothing to clean up")
         import torch
 
         # NOTE: Do NOT call set_num_threads or set_num_interop_threads during shutdown.
