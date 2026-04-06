@@ -20,6 +20,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -46,6 +47,42 @@ _STOP_WORDS = frozenset({
     "is", "it", "my", "me", "of", "with", "from", "by", "this", "that",
     "some", "any", "all", "about", "up", "please", "can", "you",
 })
+
+_ADAPTIVE_MIN_THRESHOLD = int(os.environ.get("OUROBOROS_ADAPTIVE_GRAD_MIN", "2"))
+_ADAPTIVE_CONFIDENCE = float(os.environ.get("OUROBOROS_ADAPTIVE_GRAD_CONFIDENCE", "2.0"))
+
+
+@dataclass(frozen=True)
+class AdaptiveThresholdResult:
+    threshold: int
+    p_success: float     # Beta posterior mean
+    diversity: float     # Goal diversity ratio [0, 1]
+    effective_p: float   # p_success adjusted by diversity
+
+
+def compute_adaptive_threshold(
+    successes: int, failures: int, unique_goals: int, total_uses: int
+) -> AdaptiveThresholdResult:
+    """Compute Bayesian adaptive graduation threshold.
+
+    Uses Beta(1+s, 1+f) posterior for success probability, adjusted by goal
+    diversity to determine how many successes are required before graduation.
+    """
+    p_success = (1 + successes) / (2 + successes + failures)
+    diversity = min(1.0, unique_goals / total_uses) if total_uses > 0 else 0.0
+    effective_p = p_success * (0.5 + 0.5 * diversity)
+
+    if effective_p > 0:
+        threshold = max(_ADAPTIVE_MIN_THRESHOLD, math.ceil(_ADAPTIVE_CONFIDENCE / effective_p))
+    else:
+        threshold = max(_ADAPTIVE_MIN_THRESHOLD, math.ceil(_ADAPTIVE_CONFIDENCE / 0.1))
+
+    return AdaptiveThresholdResult(
+        threshold=threshold,
+        p_success=round(p_success, 4),
+        diversity=round(diversity, 4),
+        effective_p=round(effective_p, 4),
+    )
 
 
 class GraduationPhase(str, Enum):
