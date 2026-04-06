@@ -224,6 +224,32 @@ class GovernedOrchestrator:
         self._pre_action_narrator: Optional[Any] = None  # set via set_pre_action_narrator()
         self._exploration_fleet: Optional[Any] = None  # set via set_exploration_fleet()
 
+        # RSI Convergence Framework — lazy initialization
+        self._rsi_score_function = None
+        self._rsi_score_history = None
+        self._rsi_convergence_tracker = None
+        self._rsi_transition_tracker = None
+        try:
+            from backend.core.ouroboros.governance.composite_score import (
+                CompositeScoreFunction, ScoreHistory,
+            )
+            self._rsi_score_function = CompositeScoreFunction()
+            self._rsi_score_history = ScoreHistory()
+        except Exception:
+            logger.debug("RSI: CompositeScoreFunction not available", exc_info=True)
+
+        try:
+            from backend.core.ouroboros.governance.convergence_tracker import ConvergenceTracker
+            self._rsi_convergence_tracker = ConvergenceTracker()
+        except Exception:
+            logger.debug("RSI: ConvergenceTracker not available", exc_info=True)
+
+        try:
+            from backend.core.ouroboros.governance.transition_tracker import TransitionProbabilityTracker
+            self._rsi_transition_tracker = TransitionProbabilityTracker()
+        except Exception:
+            logger.debug("RSI: TransitionProbabilityTracker not available", exc_info=True)
+
     def set_reasoning_bridge(self, bridge: Any) -> None:
         """Attach a ReasoningChainBridge for pre-CLASSIFY reasoning."""
         self._reasoning_bridge = bridge
@@ -1941,6 +1967,25 @@ class GovernedOrchestrator:
             except Exception:
                 pass
 
+        # ── RSI Convergence: compute composite score ──────────────────
+        if self._rsi_score_function is not None:
+            try:
+                _score = self._rsi_score_function.compute(
+                    op_id=ctx.op_id,
+                    test_pass_rate_before=getattr(ctx, "test_pass_rate_before", 0.0),
+                    test_pass_rate_after=1.0 if getattr(ctx, "validation_passed", False) else 0.0,
+                    coverage_before=getattr(ctx, "coverage_before", 0.0),
+                    coverage_after=getattr(ctx, "coverage_after", 0.0),
+                    complexity_before=getattr(ctx, "complexity_before", 0.0),
+                    complexity_after=getattr(ctx, "complexity_after", 0.0),
+                    lint_before=getattr(ctx, "lint_before", 0),
+                    lint_after=getattr(ctx, "lint_after", 0),
+                    blast_radius_total=getattr(ctx, "blast_radius_total", 0),
+                )
+                logger.info("[RSI Score] op=%s composite=%.4f", ctx.op_id, _score.composite)
+            except Exception:
+                logger.debug("RSI score computation failed", exc_info=True)
+
         # ── Ouroboros Serpent: stop animation ──
         if _serpent:
             try:
@@ -2087,6 +2132,37 @@ class GovernedOrchestrator:
                         )
                     except Exception:
                         pass
+
+        # ── RSI Convergence: check convergence state ──────────────────
+        if self._rsi_score_history is not None and self._rsi_convergence_tracker is not None:
+            try:
+                composites = self._rsi_score_history.get_composite_values()
+                if len(composites) >= 5:
+                    _report = self._rsi_convergence_tracker.analyze(composites)
+                    logger.info(
+                        "[RSI Convergence] state=%s slope=%.4f r2_log=%.2f recommendation=%s",
+                        _report.state.value, _report.slope,
+                        _report.r_squared_log, _report.recommendation,
+                    )
+            except Exception:
+                logger.debug("RSI convergence check failed", exc_info=True)
+
+        # ── RSI Convergence: record technique outcomes ────────────────
+        if self._rsi_transition_tracker is not None:
+            try:
+                from backend.core.ouroboros.governance.transition_tracker import TechniqueOutcome
+                _techniques = getattr(ctx, "techniques_applied", [])
+                _domain = getattr(ctx, "domain", "unknown")
+                _complexity = getattr(ctx, "task_complexity", "unknown")
+                _composite = getattr(ctx, "composite_score", 0.5)
+                for _tech in _techniques:
+                    self._rsi_transition_tracker.record(TechniqueOutcome(
+                        technique=_tech, domain=_domain, complexity=_complexity,
+                        success=(final_state.value in ("applied", "complete")),
+                        composite_score=_composite, op_id=ctx.op_id,
+                    ))
+            except Exception:
+                logger.debug("RSI transition tracking failed", exc_info=True)
 
     async def _run_benchmark(
         self,
