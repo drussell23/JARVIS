@@ -2,39 +2,38 @@
 
 ## Executive Summary
 
-- **Workflow**: Dependabot Auto-Fix & Auto-Merge
-- **Run Number**: #289
-- **Branch**: `dependabot/pip/backend/python-multipart-0.0.24`
-- **Commit**: `b03ef2f98ef194f145000cccb95b4cb7c643a087`
+- **Workflow**: PR Automation & Validation
+- **Run Number**: #2796
+- **Branch**: `fix/ci/dependabot-auto-fix-auto-merge-run289-20260406-100818`
+- **Commit**: `8f67507a1794483c630dc0034cec30bc3b221a46`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-06T09:18:30Z
-- **Triggered By**: @dependabot[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24026294146)
+- **Timestamp**: 2026-04-06T10:08:59Z
+- **Triggered By**: @cubic-dev-ai[bot]
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24027817351)
 
 ## Failure Overview
 
-Total Failed Jobs: **2**
+Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Auto-Fix Issues | test_failure | high | 168s |
-| 2 | Auto-Merge Safe Updates | test_failure | high | 581s |
+| 1 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
-### 1. Auto-Fix Issues
+### 1. Validate PR Title
 
 **Status**: ❌ failure
-**Category**: Test Failure
+**Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-06T09:18:36Z
-**Completed**: 2026-04-06T09:21:24Z
-**Duration**: 168 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24026294146/job/70065395686)
+**Started**: 2026-04-06T10:09:02Z
+**Completed**: 2026-04-06T10:09:07Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24027817351/job/70070021470)
 
 #### Failed Steps
 
-- **Step 5**: Auto-fix Python code
+- **Step 2**: Validate Conventional Commits
 
 #### Error Analysis
 
@@ -43,63 +42,23 @@ Total Failed Jobs: **2**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 37: `2026-04-06T09:21:19.5465963Z Rewriting backend/api/audio_error_fallback.py`
-    - Line 87: `2026-04-06T09:21:21.2739270Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 97: `2026-04-06T09:21:21.4096734Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 30: `2026-04-06T10:09:04.9914303Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 42: `2026-04-06T10:09:05.6751318Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: Depe`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 97: `2026-04-06T09:21:21.4096734Z ##[warning]The process '/usr/bin/git' failed with exit code 128`
+    - Line 58: `2026-04-06T10:09:05.7336320Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+
+- Pattern: `timeout|timed out`
+  - Occurrences: 1
+  - Sample matches:
+    - Line 34: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
 1. Consider increasing timeout values or optimizing slow operations
-
----
-
-### 2. Auto-Merge Safe Updates
-
-**Status**: ❌ failure
-**Category**: Test Failure
-**Severity**: HIGH
-**Started**: 2026-04-06T09:49:31Z
-**Completed**: 2026-04-06T09:59:12Z
-**Duration**: 581 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24026294146/job/70065657786)
-
-#### Failed Steps
-
-- **Step 3**: Wait for checks to complete
-
-#### Error Analysis
-
-**Detected Error Patterns:**
-
-- Pattern: `ERROR|Error|error`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 79: `2026-04-06T09:59:11.0650081Z ##[error]Process completed with exit code 1.`
-
-- Pattern: `FAIL|Failed|failed`
-  - Occurrences: 8
-  - Sample matches:
-    - Line 22: `2026-04-06T09:59:11.0404819Z Mock Testing (Safe): completed (failure)`
-    - Line 25: `2026-04-06T09:59:11.0406149Z Validate PR Title: completed (failure)`
-    - Line 45: `2026-04-06T09:59:11.0417444Z Validate PR Title: completed (failure)`
-
-- Pattern: `WARN|Warning|warning`
-  - Occurrences: 1
-  - Sample matches:
-    - Line 98: `2026-04-06T09:59:11.1238122Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
-
-#### Suggested Fixes
-
-1. Review the logs above for specific error messages
+2. Check service availability and network connectivity
 
 ---
 
@@ -119,5 +78,5 @@ Total Failed Jobs: **2**
 
 ---
 
-📊 *Report generated on 2026-04-06T10:08:18.843931*
+📊 *Report generated on 2026-04-06T10:10:43.269999*
 🤖 *JARVIS CI/CD Auto-PR Manager*
