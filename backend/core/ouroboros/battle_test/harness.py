@@ -163,6 +163,20 @@ class BattleTestHarness:
                 self._config.cost_cap_usd,
                 int(self._config.idle_timeout_s),
             )
+            print(
+                f"\n\033[1m\033[36m"
+                f"  ╔══════════════════════════════════════════════════════════╗\n"
+                f"  ║         OUROBOROS BATTLE TEST — ORGANISM ALIVE          ║\n"
+                f"  ╠══════════════════════════════════════════════════════════╣\n"
+                f"  ║  Session:  {self._session_id:<45}║\n"
+                f"  ║  Branch:   {(self._branch_name or 'N/A'):<45}║\n"
+                f"  ║  Budget:   ${self._config.cost_cap_usd:<44.2f}║\n"
+                f"  ║  Idle:     {int(self._config.idle_timeout_s)}s{'':<43}║\n"
+                f"  ║  Brain:    Doubleword 397B (PRIMARY){'':<20}║\n"
+                f"  ╚══════════════════════════════════════════════════════════╝\n"
+                f"\033[0m"
+                f"  Press Ctrl+C to stop.\n"
+            )
 
             # Start idle watchdog
             await self._idle_watchdog.start()
@@ -244,6 +258,16 @@ class BattleTestHarness:
                 gov_config,
                 oracle=self._oracle,
             )
+            # Inject BattleDiffTransport for live colored diffs in CLI
+            try:
+                from backend.core.ouroboros.battle_test.diff_display import BattleDiffTransport
+                if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
+                    diff_transport = BattleDiffTransport(repo_path=self._config.repo_path)
+                    self._governance_stack.comm._transports.append(diff_transport)
+                    logger.info("BattleDiffTransport wired (live colored diffs in CLI)")
+            except Exception as exc:
+                logger.debug("BattleDiffTransport not available: %s", exc)
+
             logger.info("Governance stack booted")
         except Exception as exc:
             logger.warning("Governance stack failed to boot: %s", exc)
