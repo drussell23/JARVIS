@@ -20,14 +20,15 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import json
 import logging
 import os
 import statistics
 import time
 from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass
-from typing import Dict, List
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -493,3 +494,232 @@ class PredictiveThrottle:
         if ratio > self._variance_spike_ratio:
             return 0.2
         return 1.0
+
+
+# ===========================================================================
+# Component 7: EndpointState + RateLimitService
+# ===========================================================================
+
+_FALLBACK_CONFIG = EndpointConfig(name="fallback", rpm=30, burst=2, timeout_s=30.0)
+
+_LATENCY_HISTORY_FILENAME = "rate_limit_latency.json"
+
+
+class EndpointState:
+    """Bundles all per-endpoint rate-limiting components."""
+
+    def __init__(self, config: EndpointConfig, store: RateLimitStore) -> None:
+        self.config: EndpointConfig = config
+        key = config.name
+        self.bucket: TokenBucket = TokenBucket(
+            key=key, store=store, rpm=config.rpm, burst=config.burst
+        )
+        self.breaker: CircuitBreaker = CircuitBreaker(
+            failure_threshold=3,
+            recovery_timeout_s=config.timeout_s,
+        )
+        self.throttle: PredictiveThrottle = PredictiveThrottle(
+            timeout_s=config.timeout_s,
+        )
+        self.latency_ring: LatencyRing = LatencyRing(capacity=50)
+        self.throttle_event: asyncio.Event = asyncio.Event()
+        self._current_multiplier: float = 1.0
+
+
+class RateLimitService:
+    """Top-level service orchestrating all rate-limiting components.
+
+    Parameters
+    ----------
+    profiles:
+        Provider profiles; defaults to ``DEFAULT_PROFILES``.
+    store:
+        Token-bucket persistence store; defaults to ``MemoryRateLimitStore``.
+    persistence_dir:
+        If provided, latency history is saved/loaded from a JSON file
+        in this directory between restarts.
+    """
+
+    def __init__(
+        self,
+        profiles: Optional[Dict[str, ProviderProfile]] = None,
+        store: Optional[RateLimitStore] = None,
+        persistence_dir: Optional[str] = None,
+    ) -> None:
+        self._profiles: Dict[str, ProviderProfile] = (
+            profiles if profiles is not None else DEFAULT_PROFILES
+        )
+        self._store: RateLimitStore = store if store is not None else MemoryRateLimitStore()
+        self._persistence_dir: Optional[str] = persistence_dir
+        self._endpoints: Dict[str, EndpointState] = {}
+        self._load_latency_history()
+
+    # -- internal helpers ---------------------------------------------------
+
+    def _endpoint_key(self, provider: str, endpoint: str) -> str:
+        return f"{provider}::{endpoint}"
+
+    def _resolve_config(self, provider: str, endpoint: str) -> EndpointConfig:
+        """Look up EndpointConfig; fall back to _FALLBACK_CONFIG if unknown."""
+        profile = self._profiles.get(provider)
+        if profile is not None:
+            cfg = profile.endpoints.get(endpoint)
+            if cfg is not None:
+                return cfg
+        return _FALLBACK_CONFIG
+
+    def _get_endpoint(self, provider: str, endpoint: str) -> EndpointState:
+        """Get or create an EndpointState for the given provider/endpoint."""
+        key = self._endpoint_key(provider, endpoint)
+        if key not in self._endpoints:
+            config = self._resolve_config(provider, endpoint)
+            # Use a unique bucket key so different endpoints don't share tokens
+            unique_store_key = key
+            # We need a fresh TokenBucket tied to the unique key; reuse store
+            state = EndpointState(
+                config=EndpointConfig(
+                    name=unique_store_key,
+                    rpm=config.rpm,
+                    tpm=config.tpm,
+                    burst=config.burst,
+                    timeout_s=config.timeout_s,
+                    retry_after_default_s=config.retry_after_default_s,
+                ),
+                store=self._store,
+            )
+            self._endpoints[key] = state
+        return self._endpoints[key]
+
+    # -- public API ---------------------------------------------------------
+
+    async def acquire(self, provider: str, endpoint: str) -> float:
+        """Check circuit breaker, acquire a token.
+
+        Returns
+        -------
+        float
+            Seconds waited for the token (0.0 if immediate).
+
+        Raises
+        ------
+        CircuitBreakerOpen
+            If the circuit breaker for this endpoint is OPEN.
+        """
+        state = self._get_endpoint(provider, endpoint)
+        state.breaker.check()  # raises CircuitBreakerOpen if OPEN
+        wait = await state.bucket.acquire()
+        return wait
+
+    def record(
+        self,
+        provider: str,
+        endpoint: str,
+        latency_s: float,
+        status: int,
+    ) -> None:
+        """Record a completed API call and update all components.
+
+        Parameters
+        ----------
+        provider:
+            Provider name (e.g. "doubleword").
+        endpoint:
+            Endpoint name (e.g. "batches_poll").
+        latency_s:
+            Observed round-trip latency in seconds.
+        status:
+            HTTP response status code.
+        """
+        state = self._get_endpoint(provider, endpoint)
+
+        # 1. Update latency ring
+        state.latency_ring.push(latency_s)
+
+        # 2. Update circuit breaker
+        if CircuitBreaker.is_retriable_failure(status):
+            state.breaker.record_failure()
+        else:
+            state.breaker.record_success()
+
+        # 3. Recompute throttle multiplier
+        new_multiplier = state.throttle.compute(state.latency_ring)
+
+        # 4. Apply to bucket
+        state.bucket.set_throttle(new_multiplier)
+
+        # 5. Fire throttle_event if multiplier changed by more than 5%
+        old = state._current_multiplier
+        if abs(new_multiplier - old) / max(old, 0.01) > 0.05:
+            state._current_multiplier = new_multiplier
+            state.throttle_event.set()
+        else:
+            state._current_multiplier = new_multiplier
+
+    def get_endpoint_state(self, provider: str, endpoint: str) -> Dict:
+        """Return a snapshot dict of current endpoint state.
+
+        Keys
+        ----
+        breaker_state : str
+            "CLOSED", "OPEN", or "HALF_OPEN".
+        throttle_multiplier : float
+            Current throttle multiplier applied to the token bucket.
+        latency_count : int
+            Number of latency observations in the ring.
+        throttle_changed : bool
+            True if the throttle_event is set (cleared after reading).
+        effective_rpm : float
+            Effective requests-per-minute = config.rpm * multiplier.
+        """
+        state = self._get_endpoint(provider, endpoint)
+        changed = state.throttle_event.is_set()
+        if changed:
+            state.throttle_event.clear()
+        return {
+            "breaker_state": state.breaker.state.value,
+            "throttle_multiplier": state._current_multiplier,
+            "latency_count": len(state.latency_ring),
+            "throttle_changed": changed,
+            "effective_rpm": state.config.rpm * state._current_multiplier,
+        }
+
+    def save(self) -> None:
+        """Persist latency ring history to disk (if persistence_dir is set)."""
+        if self._persistence_dir is None:
+            return
+        data: Dict[str, List[float]] = {}
+        for key, state in self._endpoints.items():
+            data[key] = state.latency_ring.values()
+        path = os.path.join(self._persistence_dir, _LATENCY_HISTORY_FILENAME)
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            logger.info("RateLimitService: persisted latency history to %s", path)
+        except OSError as exc:
+            logger.warning("RateLimitService: failed to save latency history: %s", exc)
+
+    def _load_latency_history(self) -> None:
+        """Load and seed latency rings from disk (if persistence_dir is set)."""
+        if self._persistence_dir is None:
+            return
+        path = os.path.join(self._persistence_dir, _LATENCY_HISTORY_FILENAME)
+        if not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data: Dict[str, List[float]] = json.load(fh)
+            for key, latencies in data.items():
+                if not latencies:
+                    continue
+                # Reconstruct provider/endpoint from the composite key
+                if "::" in key:
+                    provider, endpoint = key.split("::", 1)
+                else:
+                    continue
+                state = self._get_endpoint(provider, endpoint)
+                state.latency_ring.seed(latencies)
+                logger.info(
+                    "RateLimitService: seeded %d latencies for %s", len(latencies), key
+                )
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            logger.warning("RateLimitService: failed to load latency history: %s", exc)

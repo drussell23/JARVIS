@@ -430,3 +430,96 @@ class TestPredictiveThrottle:
             ring.push(100.0)
         result = pt.compute(ring)
         assert 0.05 <= result <= 1.0
+
+
+# ---------------------------------------------------------------------------
+# Component 7: RateLimitService (EndpointState + RateLimitService)
+# ---------------------------------------------------------------------------
+
+
+from backend.core.ouroboros.governance.rate_limiter import (  # noqa: E402
+    EndpointState,
+    RateLimitService,
+    CircuitBreakerOpen,
+)
+
+
+class TestRateLimitService:
+    @pytest.mark.asyncio
+    async def test_service_acquire_and_record(self):
+        """Basic acquire + record flow works without errors."""
+        svc = RateLimitService()
+        # acquire from a known provider/endpoint
+        wait = await svc.acquire("doubleword", "batches_poll")
+        assert wait >= 0.0
+        # record a successful response
+        svc.record("doubleword", "batches_poll", latency_s=0.2, status=200)
+        state = svc.get_endpoint_state("doubleword", "batches_poll")
+        assert state["breaker_state"] == "CLOSED"
+        assert state["latency_count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_service_circuit_breaker_trips(self):
+        """3 consecutive retriable failures trip the circuit breaker."""
+        svc = RateLimitService()
+        for _ in range(3):
+            svc.record("doubleword", "files_upload", latency_s=0.5, status=500)
+        # Next acquire should raise CircuitBreakerOpen
+        with pytest.raises(CircuitBreakerOpen):
+            await svc.acquire("doubleword", "files_upload")
+
+    @pytest.mark.asyncio
+    async def test_service_unknown_endpoint_uses_defaults(self):
+        """Accessing an unknown provider/endpoint uses fallback config."""
+        svc = RateLimitService()
+        # Should not raise
+        wait = await svc.acquire("unknown_provider", "unknown_endpoint")
+        assert wait >= 0.0
+        state = svc.get_endpoint_state("unknown_provider", "unknown_endpoint")
+        assert state["breaker_state"] == "CLOSED"
+
+    @pytest.mark.asyncio
+    async def test_service_throttle_updates_on_high_latency(self):
+        """After 10 low + 10 high latencies, throttle multiplier drops below 1.0."""
+        svc = RateLimitService()
+        provider, endpoint = "doubleword", "batches_create"
+        # Establish a stable baseline (first 10 form the EWMA baseline)
+        for _ in range(10):
+            svc.record(provider, endpoint, latency_s=0.5, status=200)
+        # Now push latencies much higher than baseline
+        for _ in range(10):
+            svc.record(provider, endpoint, latency_s=15.0, status=200)
+        state = svc.get_endpoint_state(provider, endpoint)
+        assert state["throttle_multiplier"] < 1.0
+
+    @pytest.mark.asyncio
+    async def test_service_backpressure_event_fires(self):
+        """A variance spike sets throttle_changed on the endpoint state."""
+        svc = RateLimitService()
+        provider, endpoint = "doubleword", "batches_retrieve"
+        # Stable background
+        for _ in range(20):
+            svc.record(provider, endpoint, latency_s=1.0, status=200)
+        # Wild variance spike — should cause throttle_changed flag
+        for v in [10.0, 30.0, 50.0, 20.0, 40.0]:
+            svc.record(provider, endpoint, latency_s=v, status=200)
+        state = svc.get_endpoint_state(provider, endpoint)
+        assert state["throttle_changed"] is True
+
+    @pytest.mark.asyncio
+    async def test_service_persistence(self, tmp_path):
+        """save() + reload preserves latency history (latency_count)."""
+        svc = RateLimitService(persistence_dir=str(tmp_path))
+        provider, endpoint = "claude", "messages"
+        for i in range(5):
+            svc.record(provider, endpoint, latency_s=float(i + 1), status=200)
+        state_before = svc.get_endpoint_state(provider, endpoint)
+        assert state_before["latency_count"] == 5
+
+        svc.save()
+
+        # Create a new service instance pointing at same dir — should reload
+        svc2 = RateLimitService(persistence_dir=str(tmp_path))
+        # Trigger endpoint creation by querying state
+        state_after = svc2.get_endpoint_state(provider, endpoint)
+        assert state_after["latency_count"] == 5
