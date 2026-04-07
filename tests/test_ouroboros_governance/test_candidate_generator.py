@@ -23,6 +23,7 @@ from backend.core.ouroboros.governance.candidate_generator import (
     CandidateProvider,
     FailbackState,
     FailbackStateMachine,
+    FailureMode,
 )
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -202,34 +203,36 @@ class TestFailbackStateMachine:
         fsm.record_probe_success()    # probe 2 -> PRIMARY_READY
         assert fsm.state is FailbackState.PRIMARY_READY
 
-    def test_fallback_failure_transitions_to_queue_only(self) -> None:
-        """FALLBACK_ACTIVE -> QUEUE_ONLY on fallback failure."""
+    def test_fallback_transient_failure_stays_fallback_active(self) -> None:
+        """Transient fallback failures (TIMEOUT) don't go to QUEUE_ONLY."""
         fsm = FailbackStateMachine()
         fsm.record_primary_failure()   # -> FALLBACK_ACTIVE
-        fsm.record_fallback_failure()  # -> QUEUE_ONLY
+        fsm.record_fallback_failure(mode=FailureMode.TIMEOUT)
+        assert fsm.state is FailbackState.FALLBACK_ACTIVE
+
+    def test_fallback_permanent_failure_transitions_to_queue_only(self) -> None:
+        """Permanent fallback failures (CONNECTION_ERROR) go to QUEUE_ONLY."""
+        fsm = FailbackStateMachine()
+        fsm.record_primary_failure()   # -> FALLBACK_ACTIVE
+        fsm.record_fallback_failure(mode=FailureMode.CONNECTION_ERROR)
         assert fsm.state is FailbackState.QUEUE_ONLY
 
-    def test_probe_success_from_queue_only_does_not_recover(self) -> None:
-        """QUEUE_ONLY is sticky -- probe success alone should not change state.
+    def test_probe_success_from_queue_only_auto_recovers(self) -> None:
+        """QUEUE_ONLY auto-recovers to FALLBACK_ACTIVE on probe success.
 
-        But if the probe from primary succeeds, it should at least allow
-        moving towards FALLBACK_ACTIVE, since the primary is recovering.
-        The spec says record_probe_success only works from FALLBACK_ACTIVE
-        and PRIMARY_DEGRADED, so from QUEUE_ONLY it should be a no-op
-        unless explicitly handled.
+        When a health probe succeeds, the primary is alive again and the
+        system should exit the dead-end state to resume generation.
         """
         fsm = FailbackStateMachine()
         fsm.record_primary_failure()
-        fsm.record_fallback_failure()
+        fsm.record_fallback_failure(mode=FailureMode.CONNECTION_ERROR)
         assert fsm.state is FailbackState.QUEUE_ONLY
 
-        # Probe success should transition QUEUE_ONLY back toward recovery
-        # since the primary is showing signs of life
+        # Probe success should pull us out of QUEUE_ONLY.
+        # The probe transitions QUEUE_ONLY → FALLBACK_ACTIVE, then
+        # immediately counts as first probe → PRIMARY_DEGRADED.
         fsm.record_probe_success()
-        # Per the spec, record_probe_success from FALLBACK_ACTIVE -> PRIMARY_DEGRADED
-        # From QUEUE_ONLY, there's no defined transition, so state stays QUEUE_ONLY
-        # unless the implementation explicitly handles it
-        assert fsm.state is FailbackState.QUEUE_ONLY
+        assert fsm.state is FailbackState.PRIMARY_DEGRADED
 
     def test_multiple_primary_failures_are_idempotent(self) -> None:
         """Repeated primary failures don't change state beyond FALLBACK_ACTIVE."""
@@ -375,7 +378,9 @@ class TestCandidateGenerator:
 
         with pytest.raises(RuntimeError, match="all_providers_exhausted"):
             await gen.generate(ctx, deadline)
-        assert gen.fsm.state is FailbackState.QUEUE_ONLY
+        # Transient failures (RuntimeError classified as TIMEOUT) stay
+        # FALLBACK_ACTIVE — only permanent failures go to QUEUE_ONLY.
+        assert gen.fsm.state is FailbackState.FALLBACK_ACTIVE
 
     # -- QUEUE_ONLY raises immediately --
 
@@ -387,7 +392,7 @@ class TestCandidateGenerator:
         fallback = _make_mock_provider(name="fallback")
         gen = CandidateGenerator(primary=primary, fallback=fallback)
         gen.fsm.record_primary_failure()
-        gen.fsm.record_fallback_failure()
+        gen.fsm.record_fallback_failure(mode=FailureMode.CONNECTION_ERROR)
         assert gen.fsm.state is FailbackState.QUEUE_ONLY
 
         deadline = _make_deadline(10.0)
