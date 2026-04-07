@@ -162,8 +162,22 @@ class DoublewordProvider:
         the request with "Invalid boundary for multipart/form-data".
         Each request sets its own Content-Type as needed.
         """
-        if self._session is None or self._session.closed:
+        _needs_new = (
+            self._session is None
+            or self._session.closed
+            # aiohttp connector can be poisoned by CancelledError during
+            # connection attempts.  session.closed doesn't always reflect
+            # this, so check the connector directly.
+            or getattr(self._session.connector, "_closed", False)
+        )
+        if _needs_new:
             import aiohttp
+            # Close the old session cleanly if it exists
+            if self._session is not None and not self._session.closed:
+                try:
+                    await self._session.close()
+                except Exception:
+                    pass
             # CRITICAL: aiohttp 3.9+ requires ClientSession to be created
             # inside a running event loop task. The default timeout parameter
             # triggers "Timeout context manager should be used inside a task".
