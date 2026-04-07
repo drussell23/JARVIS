@@ -105,6 +105,7 @@ class DoublewordProvider:
         max_tokens: int = _DW_MAX_TOKENS,
         repo_root: Optional[Path] = None,
         repo_roots: Optional[Dict[str, Path]] = None,
+        rate_limiter: Optional[Any] = None,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -114,6 +115,7 @@ class DoublewordProvider:
         self._repo_roots = repo_roots or {}
         self._stats = DoublewordStats()
         self._session: Optional[Any] = None  # aiohttp.ClientSession (lazy)
+        self._rate_limiter = rate_limiter
 
     @property
     def provider_name(self) -> str:
@@ -411,12 +413,22 @@ class DoublewordProvider:
         )
         data.add_field("purpose", "batch")
 
+        _rl_t0 = time.monotonic()
+        if self._rate_limiter is not None:
+            try:
+                await self._rate_limiter.acquire("doubleword", "files_upload")
+            except Exception:
+                raise  # Let CircuitBreakerOpen propagate
+
         try:
             async with session.post(
                 f"{self._base_url}/files",
                 data=data,
                 headers={"Authorization": f"Bearer {self._api_key}"},
             ) as resp:
+                if self._rate_limiter is not None:
+                    self._rate_limiter.record("doubleword", "files_upload",
+                                              latency_s=time.monotonic() - _rl_t0, status=resp.status)
                 if resp.status >= 300:
                     body = await resp.text()
                     logger.error("[DoublewordProvider] File upload failed: %s %s", resp.status, body[:500])
@@ -430,6 +442,13 @@ class DoublewordProvider:
     async def _create_batch(self, input_file_id: str) -> Optional[str]:
         """Stage 2: Create batch job."""
         session = await self._get_session()
+        _rl_t0 = time.monotonic()
+        if self._rate_limiter is not None:
+            try:
+                await self._rate_limiter.acquire("doubleword", "batches_create")
+            except Exception:
+                raise  # Let CircuitBreakerOpen propagate
+
         try:
             async with session.post(
                 f"{self._base_url}/batches",
@@ -440,6 +459,9 @@ class DoublewordProvider:
                 },
                 headers={"Content-Type": "application/json"},
             ) as resp:
+                if self._rate_limiter is not None:
+                    self._rate_limiter.record("doubleword", "batches_create",
+                                              latency_s=time.monotonic() - _rl_t0, status=resp.status)
                 if resp.status >= 300:
                     body = await resp.text()
                     logger.error("[DoublewordProvider] Batch create failed: %s %s", resp.status, body[:500])
@@ -457,9 +479,19 @@ class DoublewordProvider:
 
         while time.monotonic() < deadline:
             try:
+                _rl_t0 = time.monotonic()
+                if self._rate_limiter is not None:
+                    try:
+                        await self._rate_limiter.acquire("doubleword", "batches_poll")
+                    except Exception:
+                        raise  # Let CircuitBreakerOpen propagate
+
                 async with session.get(
                     f"{self._base_url}/batches/{batch_id}",
                 ) as resp:
+                    if self._rate_limiter is not None:
+                        self._rate_limiter.record("doubleword", "batches_poll",
+                                                  latency_s=time.monotonic() - _rl_t0, status=resp.status)
                     if resp.status >= 300:
                         logger.warning("[DoublewordProvider] Poll error: %s", resp.status)
                         await asyncio.sleep(_DW_POLL_INTERVAL_S)
@@ -496,10 +528,20 @@ class DoublewordProvider:
     ) -> Tuple[str, Optional[Dict[str, Any]]]:
         """Stage 4: Retrieve and parse batch output. Returns (content, usage)."""
         session = await self._get_session()
+        _rl_t0 = time.monotonic()
+        if self._rate_limiter is not None:
+            try:
+                await self._rate_limiter.acquire("doubleword", "batches_retrieve")
+            except Exception:
+                raise  # Let CircuitBreakerOpen propagate
+
         try:
             async with session.get(
                 f"{self._base_url}/files/{output_file_id}/content",
             ) as resp:
+                if self._rate_limiter is not None:
+                    self._rate_limiter.record("doubleword", "batches_retrieve",
+                                              latency_s=time.monotonic() - _rl_t0, status=resp.status)
                 if resp.status >= 300:
                     logger.error("[DoublewordProvider] Retrieve failed: %s", resp.status)
                     return ("", None)

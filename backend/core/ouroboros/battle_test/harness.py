@@ -289,6 +289,15 @@ class BattleTestHarness:
             # (concurrent PersistentClient instances cause SQLite segfault)
             if self._oracle is not None:
                 self._governed_loop_service._oracle = self._oracle
+
+            try:
+                from backend.core.ouroboros.governance.rate_limiter import RateLimitService
+                self._rate_limiter = RateLimitService()
+                logger.info("RateLimitService booted")
+            except Exception as exc:
+                self._rate_limiter = None
+                logger.warning("RateLimitService failed: %s", exc)
+
             await self._governed_loop_service.start()
             logger.info("GovernedLoopService booted")
         except Exception as exc:
@@ -469,6 +478,13 @@ class BattleTestHarness:
             except Exception as exc:
                 logger.warning("Oracle shutdown failed: %s", exc)
             self._oracle = None
+
+        # Save rate limiter state
+        if hasattr(self, '_rate_limiter') and self._rate_limiter is not None:
+            try:
+                self._rate_limiter.save()
+            except Exception:
+                pass
 
         # Save cost tracker state
         try:
