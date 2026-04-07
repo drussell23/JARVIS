@@ -251,7 +251,7 @@ $$\boxed{\;E_3 = 4\;}$$
 
 $$E_4 = 0 \cdot 1 \;+\; 1.0 \cdot (E_4 + 1) \;\;\Longrightarrow\;\; 0 = 1 \quad \text{(contradiction)}$$
 
-$$\boxed{\;E_4 = \infty \quad \text{($p_4$ cannot reach $p_1$ yet)}\;}$$
+$$\boxed{\;E_4 = \infty \quad (p_4 \text{ cannot reach } p_1 \text{ yet})\;}$$
 
 &nbsp;
 
@@ -458,7 +458,7 @@ $$a \;\;\geq\;\; S(p_i) \cdot b$$
 
 **This is exactly the $\star$ Key Inequality from Step D, equation $(4)$.**
 
-$$\tag*{$\blacksquare$}$$
+$$\blacksquare$$
 
 > **Conclusion.** &ensp; $S(p_i) \leq S(p_{i+1})$. &ensp; By induction:
 >
