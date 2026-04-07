@@ -16,6 +16,7 @@ from pathlib import Path
 # Register additional fixture modules
 pytest_plugins = [
     "tests.conftest_gmd_ferrari",
+    "tests.ouroboros_pytest_plugin",
 ]
 
 # Add project root to Python path
