@@ -318,6 +318,44 @@ class BattleTestHarness:
 
             await self._governed_loop_service.start()
             logger.info("GovernedLoopService booted")
+
+            # Boot Trinity Consciousness and inject into GLS for Venom integration.
+            # The orchestrator looks for _consciousness_bridge on the GLS instance
+            # (same injection pattern as unified_supervisor.py line 87693).
+            try:
+                from backend.core.ouroboros.governance.consciousness_bridge import (
+                    ConsciousnessBridge,
+                )
+                from backend.core.ouroboros.consciousness.consciousness_service import (
+                    TrinityConsciousness,
+                )
+                from backend.core.ouroboros.consciousness.health_cortex import HealthCortex
+                from backend.core.ouroboros.consciousness.memory_engine import MemoryEngine
+                from backend.core.ouroboros.consciousness.prophecy_engine import ProphecyEngine
+
+                _memory = MemoryEngine()
+                _cortex = HealthCortex()
+                _prophecy = ProphecyEngine(memory_engine=_memory)
+
+                _consciousness = TrinityConsciousness(
+                    health_cortex=_cortex,
+                    memory_engine=_memory,
+                    dream_engine=None,      # DreamEngine needs GPU, skip in battle test
+                    prophecy_engine=_prophecy,
+                    config=None,
+                )
+                await asyncio.wait_for(
+                    asyncio.shield(_consciousness.start()), timeout=10.0,
+                )
+                _cb = ConsciousnessBridge(consciousness=_consciousness)
+                self._governed_loop_service._consciousness_bridge = _cb
+                logger.info(
+                    "Trinity Consciousness booted (memory=%s, prophecy=%s)",
+                    "active", "active",
+                )
+            except Exception as exc:
+                logger.warning("Trinity Consciousness failed to boot: %s", exc)
+
         except Exception as exc:
             logger.warning("GovernedLoopService failed to boot: %s", exc)
 
