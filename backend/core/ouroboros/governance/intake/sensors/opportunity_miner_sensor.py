@@ -259,6 +259,89 @@ class OpportunityMinerSensor:
     def stop(self) -> None:
         self._running = False
 
+    # ------------------------------------------------------------------
+    # Event-driven path (Manifesto §3: zero polling, pure reflex)
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_bus(self, event_bus: Any) -> None:
+        """Subscribe to file system events for instant complexity detection."""
+        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        logger.info("OpportunityMinerSensor: subscribed to fs.changed.* events")
+
+    async def _on_fs_event(self, event: Any) -> None:
+        """React to file change — analyze only the changed file."""
+        payload = event.payload
+        if payload.get("extension") != ".py":
+            return
+        if payload.get("is_test_file", False):
+            return
+        if event.topic == "fs.changed.deleted":
+            self._seen_file_paths.discard(payload.get("relative_path", ""))
+            return
+        try:
+            await self.scan_file(Path(payload["path"]))
+        except Exception:
+            logger.debug("OpportunityMinerSensor: event-driven scan error", exc_info=True)
+
+    async def scan_file(self, py_file: Path) -> Optional[StaticCandidate]:
+        """Analyze a single file for cyclomatic complexity."""
+        try:
+            rel = str(py_file.relative_to(self._repo_root))
+        except ValueError:
+            return None
+        if rel in self._seen_file_paths:
+            return None
+        if not self._is_production_code(py_file, self._repo_root):
+            return None
+
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            return None
+
+        cc = _cyclomatic_complexity(tree)
+        if cc < self._threshold:
+            return None
+
+        static_score = min(1.0, cc / (self._threshold * 2))
+        candidate = StaticCandidate(
+            file_path=rel,
+            cyclomatic_complexity=cc,
+            static_evidence_score=static_score,
+        )
+
+        envelope = make_envelope(
+            source="ai_miner",
+            description=f"High complexity detected in {rel} (CC={cc})",
+            target_files=(rel,),
+            repo=self._repo,
+            confidence=max(0.1, static_score),
+            urgency="low",
+            evidence={
+                "cyclomatic_complexity": cc,
+                "static_evidence_score": static_score,
+                "signature": rel,
+            },
+            requires_human_ack=True,
+        )
+        try:
+            result = await self._router.ingest(envelope)
+            if result in ("enqueued", "pending_ack"):
+                self._seen_file_paths.add(rel)
+                logger.info(
+                    "OpportunityMinerSensor: queued %s (CC=%d, result=%s)",
+                    rel, cc, result,
+                )
+                return candidate
+        except Exception:
+            logger.debug("OpportunityMinerSensor: ingest failed for %s", rel, exc_info=True)
+        return None
+
+    # ------------------------------------------------------------------
+    # Poll fallback (safety net when event spine is unavailable)
+    # ------------------------------------------------------------------
+
     async def _poll_loop(self) -> None:
         while self._running:
             try:

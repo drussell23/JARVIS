@@ -104,6 +104,63 @@ class TodoScannerSensor:
         if self._task and not self._task.done():
             self._task.cancel()
 
+    # ------------------------------------------------------------------
+    # Event-driven path (Manifesto §3: zero polling, pure reflex)
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_bus(self, event_bus: Any) -> None:
+        """Subscribe to file system events for instant TODO detection."""
+        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        logger.info("[TodoScanner] Subscribed to fs.changed.* events")
+
+    async def _on_fs_event(self, event: Any) -> None:
+        """React to file change — scan only the changed file."""
+        payload = event.payload
+        if payload.get("extension") != ".py":
+            return
+        if event.topic == "fs.changed.deleted":
+            return
+        file_path = Path(payload["path"])
+        if any(skip in file_path.parts for skip in _SKIP_DIRS):
+            return
+        try:
+            await self.scan_file(file_path)
+        except Exception:
+            logger.debug("[TodoScanner] Event-driven scan error", exc_info=True)
+
+    async def scan_file(self, py_file: Path) -> List[TodoItem]:
+        """Scan a single file for TODO markers and emit high-priority items."""
+        items: List[TodoItem] = []
+        try:
+            content = py_file.read_text(errors="replace")
+            for line_num, line in enumerate(content.split("\n"), 1):
+                match = _MARKER_PATTERN.search(line)
+                if match:
+                    marker = match.group(1).upper()
+                    text = match.group(2).strip()
+                    urgency, priority = _MARKERS.get(marker, ("low", 0.1))
+                    auto = self._is_auto_resolvable(marker, text)
+
+                    rel_path = str(py_file.relative_to(self._root))
+                    items.append(TodoItem(
+                        file_path=rel_path,
+                        line_number=line_num,
+                        marker=marker,
+                        text=text[:200],
+                        urgency=urgency,
+                        priority=priority,
+                        auto_resolvable=auto,
+                    ))
+        except Exception:
+            return items
+
+        await self._emit_items(items)
+        return items
+
+    # ------------------------------------------------------------------
+    # Poll fallback (safety net when event spine is unavailable)
+    # ------------------------------------------------------------------
+
     async def _poll_loop(self) -> None:
         await asyncio.sleep(180)  # Delay after boot
         while self._running:
@@ -128,7 +185,6 @@ class TodoScannerSensor:
                 continue
 
             for py_file in full_dir.rglob("*.py"):
-                # Skip excluded directories
                 if any(skip in py_file.parts for skip in _SKIP_DIRS):
                     continue
 
@@ -140,8 +196,6 @@ class TodoScannerSensor:
                             marker = match.group(1).upper()
                             text = match.group(2).strip()
                             urgency, priority = _MARKERS.get(marker, ("low", 0.1))
-
-                            # Determine if auto-resolvable
                             auto = self._is_auto_resolvable(marker, text)
 
                             rel_path = str(py_file.relative_to(self._root))
@@ -157,7 +211,15 @@ class TodoScannerSensor:
                 except Exception:
                     pass
 
-        # Emit high-priority items as IntentEnvelopes
+        await self._emit_items(items)
+        return items
+
+    # ------------------------------------------------------------------
+    # Shared emission logic
+    # ------------------------------------------------------------------
+
+    async def _emit_items(self, items: List[TodoItem]) -> int:
+        """Emit high-priority items as IntentEnvelopes. Returns count emitted."""
         emitted = 0
         for item in items:
             if item.urgency not in ("high",):
@@ -205,7 +267,7 @@ class TodoScannerSensor:
                 ", ".join(f"{k}={v}" for k, v in sorted(by_marker.items())),
                 emitted,
             )
-        return items
+        return emitted
 
     @staticmethod
     def _is_auto_resolvable(marker: str, text: str) -> bool:

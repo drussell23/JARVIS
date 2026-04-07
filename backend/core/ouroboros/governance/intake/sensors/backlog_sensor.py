@@ -138,6 +138,30 @@ class BacklogSensor:
     def stop(self) -> None:
         self._running = False
 
+    # ------------------------------------------------------------------
+    # Event-driven path (Manifesto §3: zero polling, pure reflex)
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_bus(self, event_bus: Any) -> None:
+        """Subscribe to file system events for instant backlog detection."""
+        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        logger.info("BacklogSensor: subscribed to fs.changed.* events")
+
+    async def _on_fs_event(self, event: Any) -> None:
+        """React to file change — rescan if backlog.json was modified."""
+        rel_path = event.payload.get("relative_path", "")
+        if not rel_path.endswith("backlog.json"):
+            return
+        logger.debug("BacklogSensor: backlog.json changed, rescanning")
+        try:
+            await self.scan_once()
+        except Exception:
+            logger.debug("BacklogSensor: event-driven scan error", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Poll fallback (safety net when event spine is unavailable)
+    # ------------------------------------------------------------------
+
     async def _poll_loop(self) -> None:
         while self._running:
             try:

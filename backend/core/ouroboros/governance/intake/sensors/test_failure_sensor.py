@@ -104,6 +104,46 @@ class TestFailureSensor:
         if self._watcher is not None:
             self._watcher.stop()
 
+    # ------------------------------------------------------------------
+    # Event-driven path (Manifesto §3: zero polling, pure reflex)
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_bus(self, event_bus: Any) -> None:
+        """Subscribe to file system events — debounced pytest trigger."""
+        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        self._debounce_task: Optional[asyncio.Task] = None
+        logger.info("TestFailureSensor: subscribed to fs.changed.* events")
+
+    async def _on_fs_event(self, event: Any) -> None:
+        """React to Python file changes — debounce then run pytest."""
+        if event.payload.get("extension") != ".py":
+            return
+        # Debounce: cancel previous pending run, schedule a new one in 2s.
+        # This prevents running pytest on every keystroke during rapid edits.
+        if self._debounce_task is not None and not self._debounce_task.done():
+            self._debounce_task.cancel()
+        self._debounce_task = asyncio.create_task(
+            self._debounced_pytest_run(),
+            name="test_failure_debounced_run",
+        )
+
+    async def _debounced_pytest_run(self) -> None:
+        """Wait 2s for edits to settle, then trigger a pytest run."""
+        try:
+            await asyncio.sleep(2.0)
+            if self._watcher is not None:
+                signals = await self._watcher.poll_once()
+                if signals:
+                    await self.handle_signals(signals)
+        except asyncio.CancelledError:
+            pass  # Newer edit arrived — debounce reset
+        except Exception:
+            logger.debug("TestFailureSensor: debounced run error", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Poll fallback (safety net when event spine is unavailable)
+    # ------------------------------------------------------------------
+
     async def _poll_loop(self) -> None:
         while self._running and self._watcher is not None:
             try:

@@ -639,6 +639,46 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] ReactorEventConsumer skipped: %s", exc)
 
+        # ---- Event Spine: FileWatchGuard → TrinityEventBus → Sensors ----
+        # Replaces poll-based detection with sub-second event-driven intake.
+        # Manifesto §3: "Zero polling. Pure reflex."
+        self._fs_bridge: Any = None
+        try:
+            from backend.core.ouroboros.governance.intake.fs_event_bridge import (
+                FileSystemEventBridge,
+            )
+            from backend.core.trinity_event_bus import get_trinity_event_bus
+
+            _event_bus = await get_trinity_event_bus()
+            self._fs_bridge = FileSystemEventBridge(
+                project_root=self._config.project_root,
+                event_bus=_event_bus,
+            )
+            await self._fs_bridge.start()
+
+            # Subscribe each event-capable sensor to the bus
+            _subscribed = 0
+            for sensor in self._sensors:
+                if hasattr(sensor, "subscribe_to_bus"):
+                    try:
+                        await sensor.subscribe_to_bus(_event_bus)
+                        _subscribed += 1
+                    except Exception as exc:
+                        logger.debug(
+                            "[IntakeLayer] Sensor bus subscription failed: %s", exc
+                        )
+
+            logger.info(
+                "[IntakeLayer] Event Spine active: FileWatch → TrinityEventBus → "
+                "%d/%d sensors subscribed",
+                _subscribed, len(self._sensors),
+            )
+        except Exception as exc:
+            logger.warning(
+                "[IntakeLayer] Event Spine failed to start, sensors will use "
+                "polling fallback: %s", exc,
+            )
+
         router = self._router
         assert router is not None
         await router.start()
@@ -655,6 +695,13 @@ class IntakeLayerService:
 
     async def _teardown(self) -> None:
         """Best-effort cleanup after failed start."""
+        # Stop FileSystemEventBridge first (stops file watcher)
+        if hasattr(self, "_fs_bridge") and self._fs_bridge is not None:
+            try:
+                await self._fs_bridge.stop()
+            except Exception:
+                pass
+            self._fs_bridge = None
         for sensor in self._sensors:
             try:
                 result = sensor.stop()
