@@ -67,7 +67,7 @@ This document specifies six improvements that give Ouroboros a mathematically gr
 > 1. Initialize $p \in P$ as the system's current program.
 > 2. Repeat until stopping criterion is satisfied:
 >    - Generate $p' \in P$ using $p$.
->    - If $S(p') < S(p)$, replace $p \leftarrow p'$.
+>    - If $S(p') \lt S(p)$, replace $p \leftarrow p'$.
 
 A total order over a finite set is isomorphic to a score function — programs can always be ranked.
 
@@ -88,22 +88,22 @@ This makes the RSI process a **homogeneous Markov chain**:
 | Markov concept | RSI meaning |
 |:---|:---|
 | **States** | Programs in $P$ |
-| **Transition** $p_i \to p_j$ | $p_i$ generates $p_j$ **and** $S(p_j) < S(p_i)$ &ensp; *(accepted)* |
+| **Transition** $p_i \to p_j$ | $p_i$ generates $p_j$ **and** $S(p_j) \lt S(p_i)$ &ensp; *(accepted)* |
 | **Self-loop** $p_i \to p_i$ | $p_i$ generates $p_j$ but $S(p_j) \geq S(p_i)$ &ensp; *(rejected)* |
-| **Absorbing state** | The optimal program $p^*$ — once reached, never left |
+| **Absorbing state** | The optimal program $p^{\ast}$ — once reached, never left |
 
 #### 2.2.2 Transition Rule
 
 From program $p_i$ with generation weights $w_i$ :
 
 $$
-T(p_i \to p_j) = \begin{cases} w_i[j] & \text{if } S(p_j) < S(p_i) \quad \textit{(accept: improve)} \\[6pt] 0 & \text{if } S(p_j) \geq S(p_i) \quad \textit{(reject)} \end{cases}
+T(p_i \to p_j) = \begin{cases} w_i[j] & \text{if } S(p_j) \lt S(p_i) \quad \text{(accept)} \\ 0 & \text{if } S(p_j) \geq S(p_i) \quad \text{(reject)} \end{cases}
 $$
 
 The self-loop absorbs all rejected mass:
 
 $$
-T(p_i \to p_i) = \sum_{\{k \;:\; S(p_k) \,\geq\, S(p_i)\}} w_i[k]
+T(p_i \to p_i) = \sum_{k\, :\, S(p_k) \geq S(p_i)} w_i[k]
 $$
 
 In words: transitions to *worse-or-equal* programs are collapsed into a self-loop.
@@ -127,9 +127,9 @@ In words: transitions to *worse-or-equal* programs are collapsed into a self-loo
 
 | Step | Current | Generates | Compare | Decision | Result |
 |:---:|:---:|:---:|:---|:---:|:---|
-| 1 | $p_3$ | $p_4$ | $S(p_4)=4 > S(p_3)=3$ | reject | stay at $p_3$ |
-| 2 | $p_3$ | $p_2$ | $S(p_2)=2 < S(p_3)=3$ | accept | move to $p_2$ |
-| 3 | $p_2$ | $p_1$ | $S(p_1)=1 < S(p_2)=2$ | accept | move to $p_1$ |
+| 1 | $p_3$ | $p_4$ | $S(p_4)=4 \gt S(p_3)=3$ | reject | stay at $p_3$ |
+| 2 | $p_3$ | $p_2$ | $S(p_2)=2 \lt S(p_3)=3$ | accept | move to $p_2$ |
+| 3 | $p_2$ | $p_1$ | $S(p_1)=1 \lt S(p_2)=2$ | accept | move to $p_1$ |
 | 4 | $p_1$ | — | absorbing state | done | — |
 
 The replacement rule transforms raw generation probabilities into the actual transition matrix — rejected transitions become self-loops.
@@ -144,7 +144,7 @@ Wang's central contribution: showing how to **construct** a consistent score fun
 
 > **Definition (Consistency).** A score function $S$ is **consistent** if for all $p, p' \in P$ :
 >
-> $$S(p) > S(p') \;\;\Longrightarrow\;\; \mathbb{E}[\text{steps}(p \to p^*)] \;>\; \mathbb{E}[\text{steps}(p' \to p^*)]$$
+$$S(p) \gt S(p') \quad\Longrightarrow\quad \mathbb{E}[\text{steps}(p \to p^{\ast})] \gt \mathbb{E}[\text{steps}(p' \to p^{\ast})]$$
 >
 > where $\mathbb{E}[\text{steps}]$ is computed under the RSI process that $S$ *itself* defines.
 
@@ -187,7 +187,7 @@ This is self-referential: the score must agree with the process it induces.
 | Graph nodes | Programs in $P$ |
 | Edge weights | Generation probabilities $w_i[j]$ |
 | Shortest path distance | Expected hitting time $\mathbb{E}[\text{steps}]$ |
-| Settling a node | Assigning a finite score $S(p_i) < \infty$ |
+| Settling a node | Assigning a finite score $S(p_i) \lt \infty$ |
 | Relaxing neighbors | Updating transitions when new node settles |
 | Priority queue extract-min | $\arg\min\{\,\mathbb{E}(p) : S(p) = \infty\,\}$ |
 | Complexity $O(n \log n + m)$ | Same: $O(n \log n + m)$ |
@@ -223,7 +223,7 @@ How each row is computed:
 
 **For $p_2$** — let $E_2$ = expected steps:
 
-$$E_2 = 0.75 \cdot 1 \;+\; 0.25 \cdot (E_2 + 1)$$
+$$E_2 = 0.75 \cdot 1  +  0.25 \cdot (E_2 + 1)$$
 
 > *Reach $p_1$ in 1 step with prob 0.75, or self-loop and retry with prob 0.25.*
 
@@ -233,25 +233,25 @@ $$E_2 - 0.25\,E_2 = 1.00$$
 
 $$0.75\,E_2 = 1.00$$
 
-$$\boxed{\;E_2 = \frac{4}{3} \approx 1.333\;}$$
+$$\boxed{E_2 = \frac{4}{3} \approx 1.333}$$
 
 &nbsp;
 
 **For $p_3$** — let $E_3$ = expected steps:
 
-$$E_3 = 0.25 \cdot 1 \;+\; 0.75 \cdot (E_3 + 1)$$
+$$E_3 = 0.25 \cdot 1  +  0.75 \cdot (E_3 + 1)$$
 
 $$0.25\,E_3 = 1.00$$
 
-$$\boxed{\;E_3 = 4\;}$$
+$$\boxed{E_3 = 4}$$
 
 &nbsp;
 
 **For $p_4$** — let $E_4$ = expected steps:
 
-$$E_4 = 0 \cdot 1 \;+\; 1.0 \cdot (E_4 + 1) \;\;\Longrightarrow\;\; 0 = 1 \quad \text{(contradiction)}$$
+$$E_4 = 0 \cdot 1  +  1.0 \cdot (E_4 + 1)  \quad\Longrightarrow\quad  0 = 1 \quad \text{(contradiction)}$$
 
-$$\boxed{\;E_4 = \infty \quad (p_4 \text{ cannot reach } p_1 \text{ yet})\;}$$
+$$\boxed{E_4 = \infty \quad (p_4 \text{ cannot reach } p_1 \text{ yet})}$$
 
 &nbsp;
 
@@ -278,27 +278,27 @@ Updated transition matrix $T^{(1)}$:
 
 **Recompute $E_3$** &ensp; ($p_3$ can now reach $p_1$ directly *or* via $p_2$):
 
-$$E_3 = \underbrace{0.25 \cdot \bigl(S(p_1) + 1\bigr)}_{\text{generate } p_1} \;+\; \underbrace{0.25 \cdot \bigl(S(p_2) + 1\bigr)}_{\text{generate } p_2} \;+\; \underbrace{0.50 \cdot (E_3 + 1)}_{\text{self-loop}}$$
+$$E_3 = \underbrace{0.25 \cdot \left(S(p_1) + 1\right)}_{\text{generate } p_1}  +  \underbrace{0.25 \cdot \left(S(p_2) + 1\right)}_{\text{generate } p_2}  +  \underbrace{0.50 \cdot (E_3 + 1)}_{\text{self-loop}}$$
 
-$$E_3 = 0.25\!\cdot\!1 \;+\; 0.25\!\cdot\!\tfrac{7}{3} \;+\; 0.50\,(E_3 + 1)$$
+$$E_3 = 0.25 \cdot 1 + 0.25 \cdot \tfrac{7}{3} + 0.50(E_3 + 1)$$
 
 $$E_3 = \tfrac{1}{4} + \tfrac{7}{12} + \tfrac{1}{2}\,E_3 + \tfrac{1}{2}$$
 
 $$\tfrac{1}{2}\,E_3 = \tfrac{3}{12} + \tfrac{7}{12} + \tfrac{6}{12} = \tfrac{16}{12} = \tfrac{4}{3}$$
 
-$$\boxed{\;E_3 = \frac{8}{3} \approx 2.667\;}$$
+$$\boxed{E_3 = \frac{8}{3} \approx 2.667}$$
 
 &nbsp;
 
 **Recompute $E_4$** &ensp; ($p_4$ can now reach $p_2$, and through $p_2$ reach $p_1$):
 
-$$E_4 = 0.58 \cdot \bigl(S(p_2) + 1\bigr) \;+\; 0.42 \cdot (E_4 + 1)$$
+$$E_4 = 0.58 \cdot \left(S(p_2) + 1\right)  +  0.42 \cdot (E_4 + 1)$$
 
 $$E_4 = 0.58 \cdot \tfrac{7}{3} + 0.42\,E_4 + 0.42$$
 
 $$0.58\,E_4 = \tfrac{4.06}{3} + 0.42 = 1.353 + 0.42 = 1.773$$
 
-$$\boxed{\;E_4 \approx 3.057\;}$$
+$$\boxed{E_4 \approx 3.057}$$
 
 &nbsp;
 
@@ -312,7 +312,7 @@ By the same procedure, $S(p_4)$ is computed last.
 
 ##### Summary of Construction
 
-$$S(p_1) = 0 \;\;\leq\;\; S(p_2) = \frac{4}{3} \;\;\leq\;\; S(p_3) = \frac{8}{3} \;\;\leq\;\; S(p_4) \approx 3.06$$
+$$S(p_1) = 0  \leq  S(p_2) = \frac{4}{3}  \leq  S(p_3) = \frac{8}{3}  \leq  S(p_4) \approx 3.06$$
 
 > **Properties verified:**
 > - Scores are nondecreasing. &ensp; $\checkmark$
@@ -329,7 +329,7 @@ This is the paper's central theorem. It guarantees the Dijkstra-like constructio
 >
 > Let $p_i$ be the $i$-th program added to the Markov chain by the construction in Section 2.3. Then:
 >
-> $$S(p_1) \;\leq\; S(p_2) \;\leq\; \cdots \;\leq\; S(p_n)$$
+> $$S(p_1)  \leq  S(p_2)  \leq  \cdots  \leq  S(p_n)$$
 
 ---
 
@@ -345,7 +345,7 @@ since $S(p_2)$ is an expected number of steps, which is always non-negative. The
 
 ##### Inductive Hypothesis
 
-Assume $S(p_j) \leq S(p_{j+1})$ holds for all $j < i$.
+Assume $S(p_j) \leq S(p_{j+1})$ holds for all $j \lt i$.
 
 &nbsp;
 
@@ -375,12 +375,12 @@ From $p_{i+1}$ under the step-$i$ chain, each round has two outcomes:
 
 | Event | Probability | Cost |
 |:---|:---:|:---|
-| Generate $p_k$ with $k < i$ (in chain, finite score) — transition to $p_k$ | $\displaystyle\sum_{k < i} q_{i+1,k}$ | $S(p_k) + 1$ |
-| Generate a program with index $\geq i$ (score $\infty$, rejected) — stay put | $1 - \displaystyle\sum_{k < i} q_{i+1,k}$ | $E + 1$ |
+| Generate $p_k$ with $k \lt i$ (in chain, finite score) — transition to $p_k$ | $\displaystyle\sum_{k \lt i} q_{i+1,k}$ | $S(p_k) + 1$ |
+| Generate a program with index $\geq i$ (score $\infty$, rejected) — stay put | $1 - \displaystyle\sum_{k \lt i} q_{i+1,k}$ | $E + 1$ |
 
 This gives:
 
-$$\tag{1} E \;=\; \Bigl(1 - \sum_{k<i} q_{i+1,k}\Bigr)(E + 1) \;+\; \sum_{k<i} q_{i+1,k}\bigl(S(p_k) + 1\bigr)$$
+$$\tag{1} E  =  \left(1 - \sum_{k \lt i} q_{i+1,k}\right)(E + 1)  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$$
 
 ---
 
@@ -388,25 +388,25 @@ $$\tag{1} E \;=\; \Bigl(1 - \sum_{k<i} q_{i+1,k}\Bigr)(E + 1) \;+\; \sum_{k<i} q
 
 Expand equation $(1)$:
 
-$$E \;=\; E + 1 \;-\; \Bigl(\sum_{k<i} q_{i+1,k}\Bigr) E \;-\; \sum_{k<i} q_{i+1,k} \;+\; \sum_{k<i} q_{i+1,k}\bigl(S(p_k) + 1\bigr)$$
+$$E  =  E + 1  -  \left(\sum_{k \lt i} q_{i+1,k}\right) E  -  \sum_{k \lt i} q_{i+1,k}  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$$
 
 Collect all $E$ terms on the left:
 
-$$\tag{2} E \cdot \sum_{k<i} q_{i+1,k} \;=\; 1 \;-\; \sum_{k<i} q_{i+1,k} \;+\; \sum_{k<i} q_{i+1,k}\bigl(S(p_k) + 1\bigr)$$
+$$\tag{2} E \cdot \sum_{k \lt i} q_{i+1,k}  =  1  -  \sum_{k \lt i} q_{i+1,k}  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$$
 
 Define two shorthand variables:
 
-> $$b \;\;\triangleq\;\; \sum_{k<i} q_{i+1,k}$$
+> $$b  \triangleq  \sum_{k \lt i} q_{i+1,k}$$
 >
 > *Total probability of generating an already-scored program.*
 
-> $$a \;\;\triangleq\;\; 1 - b \;+\; \sum_{k<i} q_{i+1,k}\bigl(S(p_k) + 1\bigr)$$
+> $$a  \triangleq  1 - b  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$$
 >
 > *Numerator of the expected-steps formula.*
 
 Therefore:
 
-$$\tag{3} \boxed{\; E \;=\; \frac{a}{b} \;}$$
+$$\tag{3} \boxed{ E  =  \frac{a}{b} }$$
 
 ---
 
@@ -414,11 +414,11 @@ $$\tag{3} \boxed{\; E \;=\; \frac{a}{b} \;}$$
 
 By the greedy construction, $p_i$ was chosen at step $i$ as the $\infty$-scored program with the **minimum** expected steps. Since $p_{i+1}$ was also $\infty$-scored at step $i$:
 
-$$S(p_i) \;\leq\; E \;=\; \frac{a}{b}$$
+$$S(p_i)  \leq  E  =  \frac{a}{b}$$
 
-Multiplying both sides by $b > 0$ :
+Multiplying both sides by $b \gt 0$ :
 
-$$\tag{4} \boxed{\; a \;\geq\; S(p_i) \cdot b \;}  \qquad \star\;\textit{Key Inequality}$$
+$$\tag{4} \boxed{ a \geq S(p_i) \cdot b } \qquad \star \textit{ Key Inequality}$$
 
 > This is the **linchpin** of the entire proof.
 > Everything that follows shows this inequality implies the desired result.
@@ -429,11 +429,11 @@ $$\tag{4} \boxed{\; a \;\geq\; S(p_i) \cdot b \;}  \qquad \star\;\textit{Key Ine
 
 At step $i+1$, program $p_i$ has been added with score $S(p_i)$. Now $p_{i+1}$ can transition to $p_1, \ldots, p_{i-1}$ **and also to $p_i$**. The updated recurrence:
 
-$$S(p_{i+1}) = \underbrace{\Bigl(1 - \sum_{k<i} q_{i+1,k} - q_{i+1,i}\Bigr)\bigl(S(p_{i+1}) + 1\bigr)}_{\text{self-loop}} + \underbrace{\sum_{k<i} q_{i+1,k}\bigl(S(p_k) + 1\bigr)}_{\text{to } p_1 \ldots p_{i-1}} + \underbrace{q_{i+1,i}\bigl(S(p_i) + 1\bigr)}_{\textbf{new: to } p_i}$$
+$$S(p_{i+1}) = \underbrace{\left(1 - \sum_{k \lt i} q_{i+1,k} - q_{i+1,i}\right)\left(S(p_{i+1}) + 1\right)}_{\text{self-loop}} + \underbrace{\sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)}_{\text{to } p_1 \ldots p_{i-1}} + \underbrace{q_{i+1,i}\left(S(p_i) + 1\right)}_{\textbf{new: to } p_i}$$
 
 Solving (same algebra as Step C, with the additional $q_{i+1,i}$ term):
 
-$$\tag{5} \boxed{\; S(p_{i+1}) \;=\; \frac{a \;+\; q_{i+1,i} \cdot S(p_i)}{b \;+\; q_{i+1,i}} \;}$$
+$$\tag{5} \boxed{ S(p_{i+1})  =  \frac{a  +  q_{i+1,i} \cdot S(p_i)}{b  +  q_{i+1,i}} }$$
 
 where $a$ and $b$ are the same quantities from Step C.
 
@@ -446,15 +446,15 @@ where $a$ and $b$ are the same quantities from Step C.
 
 We need to show:
 
-$$\frac{a + q_{i+1,i} \cdot S(p_i)}{b + q_{i+1,i}} \;\;\geq\;\; S(p_i)$$
+$$\frac{a + q_{i+1,i} \cdot S(p_i)}{b + q_{i+1,i}}  \geq  S(p_i)$$
 
-Multiply both sides by $(b + q_{i+1,i}) > 0$ :
+Multiply both sides by $(b + q_{i+1,i}) \gt 0$ :
 
-$$a + q_{i+1,i} \cdot S(p_i) \;\;\geq\;\; S(p_i) \cdot b \;+\; S(p_i) \cdot q_{i+1,i}$$
+$$a + q_{i+1,i} \cdot S(p_i)  \geq  S(p_i) \cdot b  +  S(p_i) \cdot q_{i+1,i}$$
 
 The $q_{i+1,i} \cdot S(p_i)$ terms appear on both sides — cancel them:
 
-$$a \;\;\geq\;\; S(p_i) \cdot b$$
+$$a  \geq  S(p_i) \cdot b$$
 
 **This is exactly the $\star$ Key Inequality from Step D, equation $(4)$.**
 
@@ -462,7 +462,7 @@ $$\blacksquare$$
 
 > **Conclusion.** &ensp; $S(p_i) \leq S(p_{i+1})$. &ensp; By induction:
 >
-> $$S(p_1) \;\leq\; S(p_2) \;\leq\; \cdots \;\leq\; S(p_n) \qquad \square$$
+> $$S(p_1)  \leq  S(p_2)  \leq  \cdots  \leq  S(p_n) \qquad \square$$
 
 ---
 
@@ -470,11 +470,11 @@ $$\blacksquare$$
 
 Equation $(5)$ reveals a clean geometric picture. Since $S(p_{i+1})$ is a weighted average:
 
-$$S(p_{i+1}) = \frac{b}{b + q_{i+1,i}} \cdot \underbrace{\frac{a}{b}}_{E} \;\;+\;\; \frac{q_{i+1,i}}{b + q_{i+1,i}} \cdot S(p_i)$$
+$$S(p_{i+1}) = \frac{b}{b + q_{i+1,i}} \cdot \underbrace{\frac{a}{b}}_{E} + \frac{q_{i+1,i}}{b + q_{i+1,i}} \cdot S(p_i)$$
 
 this is a **convex combination**, so the result lies between the two values:
 
-$$S(p_i) \;\;\leq\;\; S(p_{i+1}) \;\;\leq\;\; E$$
+$$S(p_i)  \leq  S(p_{i+1})  \leq  E$$
 
 > **In plain English.** &ensp; Adding $p_i$ as an intermediate node can only *help*
 > $p_{i+1}$ (by opening a new pathway to $p_1$), but it can never help so much
@@ -521,7 +521,7 @@ $$S(p_i) \;\;\leq\;\; S(p_{i+1}) \;\;\leq\;\; E$$
 > **1. &ensp; Circularity (the paper acknowledges this).**
 >
 > Computing $S$ requires knowing all transition probabilities *and* the
-> optimal program $p^*$ in advance. The paper admits: *"the score function
+> optimal program $p^{\ast}$ in advance. The paper admits: *"the score function
 > is precomputed, which takes more time than enumerate every program to
 > find the optimal."* The $O(\log n)$ runtime of the RSI procedure is real,
 > but the setup cost is $O(n)$ or worse.
@@ -1161,14 +1161,14 @@ This is deliberate: the convergence framework measures and governs the agentic c
 | $P = \{p_1, \ldots, p_n\}$ | Finite program space, ordered by score |
 | $S(p_i)$ | Score of the $i$-th program added (= expected steps to $p_1$) |
 | $q_{i+1,k}$ | Raw probability that $p_{i+1}$ generates $p_k$ |
-| $b = \displaystyle\sum_{k<i} q_{i+1,k}$ | Total probability of generating an already-scored program |
-| $a = 1 - b + \displaystyle\sum_{k<i} q_{i+1,k}(S(p_k)+1)$ | Numerator of the expected-steps formula |
+| $b = \displaystyle\sum_{k \lt i} q_{i+1,k}$ | Total probability of generating an already-scored program |
+| $a = 1 - b + \displaystyle\sum_{k \lt i} q_{i+1,k}(S(p_k)+1)$ | Numerator of the expected-steps formula |
 | $E = \dfrac{a}{b}$ | Expected steps from $p_{i+1}$ to $p_1$ at step $i$ **(before** $p_i$ **is available)** |
 | $S(p_{i+1}) = \dfrac{a + q_{i+1,i} \cdot S(p_i)}{b + q_{i+1,i}}$ | Expected steps at step $i+1$ **(after** $p_i$ **is available)** |
 
 **Key inequality chain** &ensp; (follows from $a \geq S(p_i) \cdot b$, the greedy selection guarantee):
 
-$$S(p_i) \;\;\leq\;\; S(p_{i+1}) \;\;\leq\;\; E$$
+$$S(p_i)  \leq  S(p_{i+1})  \leq  E$$
 
 ### 12.1 Sigmoid Normalization
 
