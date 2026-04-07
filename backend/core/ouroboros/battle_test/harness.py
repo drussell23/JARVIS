@@ -197,6 +197,9 @@ class BattleTestHarness:
             # Start GLS activity monitor — pokes watchdog when operations are in-flight
             self._activity_monitor_task = asyncio.ensure_future(self._monitor_gls_activity())
 
+            # Start provider cost monitor — feeds real API spend into CostTracker
+            self._cost_monitor_task = asyncio.ensure_future(self._monitor_provider_costs())
+
             # Register signal handlers
             try:
                 loop = asyncio.get_running_loop()
@@ -428,6 +431,71 @@ class BattleTestHarness:
             pass
 
     # ------------------------------------------------------------------
+    # Provider Cost Monitor
+    # ------------------------------------------------------------------
+
+    async def _monitor_provider_costs(self) -> None:
+        """Background task: polls provider stats and feeds costs into CostTracker.
+
+        Runs every 5 seconds. Computes *incremental* cost since the last poll
+        and calls CostTracker.record() so the battle test's --cost-cap flag
+        actually triggers budget_event when real API spend is reached.
+        """
+        _last_dw_cost: float = 0.0
+        _last_claude_cost: float = 0.0
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                gls = self._governed_loop_service
+                if gls is None:
+                    continue
+
+                # DoubleWord: read cumulative cost from get_stats()
+                dw = getattr(gls, "doubleword_provider", None)
+                if dw is not None:
+                    try:
+                        stats = dw.get_stats()
+                        total = stats.get("total_cost_usd", 0.0)
+                        delta = total - _last_dw_cost
+                        if delta > 0:
+                            self._cost_tracker.record("doubleword", delta)
+                            _last_dw_cost = total
+                    except Exception:
+                        pass
+
+                # Claude: read cumulative daily spend
+                gen = getattr(gls, "_generator", None)
+                if gen is not None:
+                    fallback = getattr(gen, "_fallback", None)
+                    if fallback is not None and getattr(fallback, "provider_name", "") == "claude-api":
+                        try:
+                            total = getattr(fallback, "_daily_spend", 0.0)
+                            delta = total - _last_claude_cost
+                            if delta > 0:
+                                self._cost_tracker.record("claude", delta)
+                                _last_claude_cost = total
+                        except Exception:
+                            pass
+
+                    # Also check primary (Claude could be primary if DW was demoted)
+                    primary = getattr(gen, "_primary", None)
+                    if (
+                        primary is not None
+                        and primary is not fallback
+                        and getattr(primary, "provider_name", "") == "claude-api"
+                    ):
+                        try:
+                            total = getattr(primary, "_daily_spend", 0.0)
+                            delta = total - _last_claude_cost
+                            if delta > 0:
+                                self._cost_tracker.record("claude", delta)
+                                _last_claude_cost = total
+                        except Exception:
+                            pass
+        except asyncio.CancelledError:
+            pass
+
+    # ------------------------------------------------------------------
     # Shutdown
     # ------------------------------------------------------------------
 
@@ -445,6 +513,17 @@ class BattleTestHarness:
                 self._activity_monitor_task.cancel()
                 try:
                     await self._activity_monitor_task
+                except asyncio.CancelledError:
+                    pass
+        except Exception:
+            pass
+
+        # 0b. Cost monitor
+        try:
+            if hasattr(self, "_cost_monitor_task") and self._cost_monitor_task:
+                self._cost_monitor_task.cancel()
+                try:
+                    await self._cost_monitor_task
                 except asyncio.CancelledError:
                     pass
         except Exception:

@@ -50,6 +50,8 @@ _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "12
 # Pricing (March 2026)
 _DW_INPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_INPUT_COST_PER_M", "0.10"))
 _DW_OUTPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_OUTPUT_COST_PER_M", "0.40"))
+_DW_MAX_COST_PER_OP = float(os.environ.get("DOUBLEWORD_MAX_COST_PER_OP", "0.10"))
+_DW_DAILY_BUDGET = float(os.environ.get("DOUBLEWORD_DAILY_BUDGET", "5.00"))
 
 
 class DoublewordInfraError(Exception):
@@ -122,6 +124,8 @@ class DoublewordProvider:
         repo_root: Optional[Path] = None,
         repo_roots: Optional[Dict[str, Path]] = None,
         rate_limiter: Optional[Any] = None,
+        max_cost_per_op: float = _DW_MAX_COST_PER_OP,
+        daily_budget: float = _DW_DAILY_BUDGET,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -133,6 +137,11 @@ class DoublewordProvider:
         self._session: Optional[Any] = None  # aiohttp.ClientSession (lazy)
         self._rate_limiter = rate_limiter
         self._last_error_status: int = 0  # HTTP status from last failure (0 = non-HTTP)
+        # Cost gating (matches ClaudeProvider pattern)
+        self._max_cost_per_op = max_cost_per_op
+        self._daily_budget = daily_budget
+        self._daily_spend: float = 0.0
+        self._budget_reset_date = time.strftime("%Y-%m-%d", time.gmtime())
 
     @property
     def provider_name(self) -> str:
@@ -177,6 +186,36 @@ class DoublewordProvider:
         )
 
     # ------------------------------------------------------------------
+    # Cost gating (matches ClaudeProvider pattern)
+    # ------------------------------------------------------------------
+
+    def _maybe_reset_daily_budget(self) -> None:
+        """Reset daily spend if the UTC day has changed."""
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        if today > self._budget_reset_date:
+            self._daily_spend = 0.0
+            self._budget_reset_date = today
+
+    def _check_budget(self) -> None:
+        """Raise if daily budget is exhausted. Called before each generation."""
+        self._maybe_reset_daily_budget()
+        if self._daily_spend >= self._daily_budget:
+            raise DoublewordInfraError(
+                f"doubleword_budget_exhausted: daily spend ${self._daily_spend:.4f} "
+                f">= budget ${self._daily_budget:.2f}",
+                status_code=0,
+            )
+
+    def _record_cost(self, cost: float) -> None:
+        """Record cost from a completed batch and check per-op limit."""
+        self._daily_spend += cost
+        if cost > self._max_cost_per_op:
+            logger.warning(
+                "[DoublewordProvider] Op cost $%.4f exceeds max_cost_per_op $%.2f",
+                cost, self._max_cost_per_op,
+            )
+
+    # ------------------------------------------------------------------
     # Async decoupled API: submit_batch() + poll_and_retrieve()
     # ------------------------------------------------------------------
 
@@ -194,6 +233,7 @@ class DoublewordProvider:
         """
         if not self.is_available:
             return None
+        self._check_budget()
 
         from backend.core.ouroboros.governance.providers import _build_codegen_prompt
         # Always use full_content schema (2b.1) — the 397B can't reliably
@@ -294,6 +334,7 @@ class DoublewordProvider:
                     + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
                 )
                 self._stats.total_cost_usd += cost
+                self._record_cost(cost)
 
             if not content:
                 self._stats.empty_content_retries += 1
@@ -683,6 +724,7 @@ class DoublewordProvider:
             raise ValueError(
                 "DOUBLEWORD_API_KEY is not set — cannot call prompt_only()"
             )
+        self._check_budget()
 
         await self._get_session()
 
@@ -760,6 +802,7 @@ class DoublewordProvider:
                     + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
                 )
                 self._stats.total_cost_usd += cost
+                self._record_cost(cost)
 
             if not content:
                 self._stats.empty_content_retries += 1
