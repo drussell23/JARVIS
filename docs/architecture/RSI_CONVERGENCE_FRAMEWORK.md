@@ -268,11 +268,15 @@ E_3 = 0.25 \cdot 1  +  0.75 \cdot (E_3 + 1)
 **For $p_4$** — let $E_4$ = expected steps:
 
 ```math
-E_4 = 0 \cdot 1  +  1.0 \cdot (E_4 + 1)  \quad\Longrightarrow\quad  0 = 1 \quad \text{(contradiction)}
+\begin{aligned}
+E_4 &= 0 \cdot 1  +  1.0 \cdot (E_4 + 1)  \quad\Longrightarrow\quad  0 = 1 \quad \text{(contradiction)}
+\end{aligned}
 ```
 
 ```math
+\begin{aligned}
 \boxed{E_4 = \infty \quad (p_4 \text{ cannot reach } p_1 \text{ yet})}
+\end{aligned}
 ```
 
 &nbsp;
@@ -313,7 +317,9 @@ E_3 = \tfrac{1}{4} + \tfrac{7}{12} + \tfrac{1}{2}\,E_3 + \tfrac{1}{2}
 ```
 
 ```math
-\tfrac{1}{2}\,E_3 = \tfrac{3}{12} + \tfrac{7}{12} + \tfrac{6}{12} = \tfrac{16}{12} = \tfrac{4}{3}
+\begin{aligned}
+\tfrac{1}{2}\,E_3 &= \tfrac{3}{12} + \tfrac{7}{12} + \tfrac{6}{12} = \tfrac{16}{12} = \tfrac{4}{3}
+\end{aligned}
 ```
 
 ```math
@@ -325,7 +331,9 @@ E_3 = \tfrac{1}{4} + \tfrac{7}{12} + \tfrac{1}{2}\,E_3 + \tfrac{1}{2}
 **Recompute $E_4$** &ensp; ($p_4$ can now reach $p_2$, and through $p_2$ reach $p_1$):
 
 ```math
-E_4 = 0.58 \cdot \left(S(p_2) + 1\right)  +  0.42 \cdot (E_4 + 1)
+\begin{aligned}
+E_4 &= 0.58 \cdot \left(S(p_2) + 1\right)  +  0.42 \cdot (E_4 + 1)
+\end{aligned}
 ```
 
 ```math
@@ -333,7 +341,9 @@ E_4 = 0.58 \cdot \tfrac{7}{3} + 0.42\,E_4 + 0.42
 ```
 
 ```math
-0.58\,E_4 = \tfrac{4.06}{3} + 0.42 = 1.353 + 0.42 = 1.773
+\begin{aligned}
+0.58\,E_4 &= \tfrac{4.06}{3} + 0.42 = 1.353 + 0.42 = 1.773
+\end{aligned}
 ```
 
 ```math
@@ -427,7 +437,9 @@ From $p_{i+1}$ under the step-$i$ chain, each round has two outcomes:
 This gives:
 
 ```math
-E = \left(1 - \sum_{k \lt i} q_{i+1,k}\right)(E + 1) + \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right) \tag{1}
+\begin{aligned}
+E &= \left(1 - \sum_{k \lt i} q_{i+1,k}\right)(E + 1) + \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)
+\end{aligned} \tag{1}
 ```
 
 ---
@@ -443,7 +455,9 @@ Expand equation $(1)$:
 Collect all $E$ terms on the left:
 
 ```math
-E \cdot \sum_{k \lt i} q_{i+1,k} = 1 - \sum_{k \lt i} q_{i+1,k} + \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right) \tag{2}
+\begin{aligned}
+E \cdot \sum_{k \lt i} q_{i+1,k} &= 1 - \sum_{k \lt i} q_{i+1,k} + \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)
+\end{aligned} \tag{2}
 ```
 
 Define two shorthand variables:
@@ -459,7 +473,9 @@ Define two shorthand variables:
 Therefore:
 
 ```math
-\boxed{ E  =  \frac{a}{b} } \tag{3}
+\begin{aligned}
+\boxed{ E  =  \frac{a}{b} }
+\end{aligned} \tag{3}
 ```
 
 ---
@@ -475,7 +491,9 @@ S(p_i)  \leq  E  =  \frac{a}{b}
 Multiplying both sides by $b \gt 0$ :
 
 ```math
-\boxed{ a \geq S(p_i) \cdot b } \qquad \star \textit{ Key Inequality} \tag{4}
+\begin{aligned}
+\boxed{ a \geq S(p_i) \cdot b } \qquad \star \textit{ Key Inequality}
+\end{aligned} \tag{4}
 ```
 
 > This is the **linchpin** of the entire proof.
@@ -494,7 +512,9 @@ At step $i+1$, program $p_i$ has been added with score $S(p_i)$. Now $p_{i+1}$ c
 Solving (same algebra as Step C, with the additional $q_{i+1,i}$ term):
 
 ```math
-\boxed{ S(p_{i+1})  =  \frac{a  +  q_{i+1,i} \cdot S(p_i)}{b  +  q_{i+1,i}} } \tag{5}
+\begin{aligned}
+\boxed{ S(p_{i+1})  =  \frac{a  +  q_{i+1,i} \cdot S(p_i)}{b  +  q_{i+1,i}} }
+\end{aligned} \tag{5}
 ```
 
 where $a$ and $b$ are the same quantities from Step C.
@@ -509,13 +529,17 @@ where $a$ and $b$ are the same quantities from Step C.
 We need to show:
 
 ```math
-\frac{a + q_{i+1,i} \cdot S(p_i)}{b + q_{i+1,i}}  \geq  S(p_i)
+\begin{aligned}
+\frac{a + q_{i+1,i} \cdot S(p_i)}{b + q_{i+1,i}}  &\geq  S(p_i)
+\end{aligned}
 ```
 
 Multiply both sides by $(b + q_{i+1,i}) \gt 0$ :
 
 ```math
-a + q_{i+1,i} \cdot S(p_i) \geq S(p_i) \cdot b + S(p_i) \cdot q_{i+1,i}
+\begin{aligned}
+a + q_{i+1,i} \cdot S(p_i) &\geq S(p_i) \cdot b + S(p_i) \cdot q_{i+1,i}
+\end{aligned}
 ```
 
 The $q_{i+1,i} \cdot S(p_i)$ terms appear on both sides — cancel them:
@@ -541,7 +565,9 @@ a  \geq  S(p_i) \cdot b
 Equation $(5)$ reveals a clean geometric picture. Since $S(p_{i+1})$ is a weighted average:
 
 ```math
-S(p_{i+1}) = \frac{b}{b + q_{i+1,i}} \cdot \underbrace{\frac{a}{b}}_{E} + \frac{q_{i+1,i}}{b + q_{i+1,i}} \cdot S(p_i)
+\begin{aligned}
+S(p_{i+1}) &= \frac{b}{b + q_{i+1,i}} \cdot \underbrace{\frac{a}{b}}_{E} + \frac{q_{i+1,i}}{b + q_{i+1,i}} \cdot S(p_i)
+\end{aligned}
 ```
 
 this is a **convex combination**, so the result lies between the two values:
