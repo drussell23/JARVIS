@@ -49,290 +49,642 @@ This document specifies six improvements that give Ouroboros a mathematically gr
 
 ## 2. Wang's RSI Formulation — Full Mathematical Treatment
 
+> **Reading guide.** This section is structured for study. Definitions are boxed in
+> blockquotes. Theorems and proofs use labeled steps you can reference by number.
+> Key equations are isolated on their own lines. Margin annotations (`←`) call
+> out the intuition behind formal steps.
+
+---
+
 ### 2.1 Core Definition
 
-**Definition 1 (RSI System)**: Given a finite set of programs _P_ and a score function _S_ over _P_:
-1. Initialize _p_ from _P_ as the system's current program.
-2. Repeat until criterion satisfied: generate _p' ∈ P_ using _p_.
-3. If _p'_ is better than _p_ according to _S_, replace _p_ by _p'_.
+> **Definition 1 (RSI System).**
+>
+> Given:
+> - A finite set of programs **P**
+> - A score function **S : P → R**  (lower is better)
+>
+> Procedure:
+> 1. Initialize *p* from **P** as the system's current program.
+> 2. Repeat until stopping criterion is satisfied:
+>    - Generate *p'* ∈ **P** using *p*.
+>    - If *S(p') < S(p)*, replace *p* ← *p'*.
 
-A total order over a finite set is isomorphic to a score function: programs can always be ranked. Lower score = better program (closer to optimal).
+A total order over a finite set is isomorphic to a score function — programs can always be ranked. The convention throughout is:
 
-### 2.2 Markov Chain Formulation
+> **Lower score = better program = closer to optimal.**
 
-Wang makes a simplifying assumption: **the way a program generates a new program is independent of history**. Each program _p_ defines a fixed probabilistic distribution over _P_ for what it produces next. This independence assumption makes the RSI process a **homogeneous Markov chain** where:
+---
 
-- **States** = programs in _P_
-- **Transition probability** from _p_i_ to _p_j_ = probability that _p_i_ generates _p_j_, subject to the replacement rule (only transition if _S(p_j) < S(p_i)_)
-- The optimal program _p*_ is an **absorbing state** (once reached, never left — it has the lowest score)
+### 2.2 The Markov Chain Formulation
 
-**Concrete example.** Consider _P = {p₁, p₂, p₃, p₄}_ with _S(pᵢ) = i_. Each program's generation distribution is a weight vector _wᵢ_ over _P_:
+#### 2.2.1 The Independence Assumption
+
+Wang introduces a simplifying assumption:
+
+> **Markov Property.** The way a program generates a new program is
+> *independent of the history*. Each program *p* defines a fixed
+> probabilistic distribution over **P** for what it produces next.
+
+This makes the RSI process a **homogeneous Markov chain**:
+
+| Markov concept | RSI meaning |
+|:---|:---|
+| **States** | Programs in **P** |
+| **Transition  *pᵢ → pⱼ*** | *pᵢ* generates *pⱼ* **and** *S(pⱼ) < S(pᵢ)* (accepted) |
+| **Self-loop  *pᵢ → pᵢ*** | *pᵢ* generates *pⱼ* but *S(pⱼ) ≥ S(pᵢ)* (rejected — stay put) |
+| **Absorbing state** | The optimal program *p** — once reached, never left |
+
+#### 2.2.2 Transition Rule
+
+From program *pᵢ* with generation weights *wᵢ* :
 
 ```
-w₁ = [0.97, 0.01, 0.01, 0.01]   (p₁ almost always generates itself)
-w₂ = [0.75, 0.00, 0.25, 0.00]   (p₂ generates p₁ or p₃)
-w₃ = [0.25, 0.25, 0.25, 0.25]   (p₃ generates uniformly)
-w₄ = [0.00, 0.58, 0.00, 0.42]   (p₄ generates p₂ or itself)
+                 ⎧  wᵢ[j]                        if S(pⱼ) < S(pᵢ)      ← accept: improve
+  T(pᵢ → pⱼ) =  ⎨
+                 ⎩  0                              if S(pⱼ) ≥ S(pᵢ)     ← reject
+```
+```
+  T(pᵢ → pᵢ) =  Σ  wᵢ[k]   for all k where S(pₖ) ≥ S(pᵢ)            ← self-loop: stay
 ```
 
-Starting from _p₃_: First, _p₃_ generates _p₄_. Since _S(p₄) = 4 > S(p₃) = 3_, the current program is **not** updated (p₄ is worse). Then _p₃_ generates _p₂_. Since _S(p₂) = 2 < S(p₃) = 3_, the current program updates to _p₂_. Next, _p₂_ generates _p₁_. Since _S(p₁) = 1 < S(p₂) = 2_, we update to _p₁_. Since _p₁_ has the lowest score (rank 1), no future program can improve on it — it is the absorbing state.
+In words: transitions to *worse-or-equal* programs are collapsed into a self-loop.
 
-The replacement rule modifies the raw generation probabilities into the Markov chain's actual transition matrix: transitions to worse programs are redirected as self-loops (staying at the current program).
+#### 2.2.3 Concrete Example
+
+> **Setup.** Let **P** = {p₁, p₂, p₃, p₄} with S(pᵢ) = i.
+> Each program's raw generation distribution (weight vector over **P**):
+
+| Program | w₁ | w₂ | w₃ | w₄ | Description |
+|:---|:---:|:---:|:---:|:---:|:---|
+| **p₁** | 0.97 | 0.01 | 0.01 | 0.01 | Almost always regenerates itself |
+| **p₂** | 0.75 | 0.00 | 0.25 | 0.00 | Generates p₁ or p₃ |
+| **p₃** | 0.25 | 0.25 | 0.25 | 0.25 | Generates uniformly |
+| **p₄** | 0.00 | 0.58 | 0.00 | 0.42 | Generates p₂ or itself |
+
+**Trace starting from p₃ :**
+
+```
+  Step 1:   p₃  generates  p₄     S(p₄)=4 > S(p₃)=3     ✗ reject     stay at p₃
+  Step 2:   p₃  generates  p₂     S(p₂)=2 < S(p₃)=3     ✓ accept     move to p₂
+  Step 3:   p₂  generates  p₁     S(p₁)=1 < S(p₂)=2     ✓ accept     move to p₁
+  Step 4:   p₁  is optimal        absorbing state         ■ done
+```
+
+The replacement rule transforms raw generation probabilities into the Markov chain's actual transition matrix — rejected transitions become self-loops.
+
+---
 
 ### 2.3 Score Function Construction — The Dijkstra-Like Algorithm
 
-Wang's central contribution is showing how to construct a **consistent** score function as the expected number of steps to reach the optimal program. The algorithm is analogous to Dijkstra's shortest-path algorithm:
+Wang's central contribution: showing how to **construct** a consistent score function, defined as the expected number of steps to reach the optimal program.
 
-#### 2.3.1 Definition of Consistency
+#### 2.3.1 Consistency (Self-Referential Definition)
 
-A score function _S_ is **consistent** if for all _p, p' ∈ P_: _S(p) > S(p')_ implies that the expected number of steps to reach the optimal program from _p_ is greater than from _p'_, following the RSI process defined by _S_ itself.
+> **Definition (Consistency).** A score function *S* is **consistent** if
+> for all *p, p' ∈ P* :
+>
+>     S(p) > S(p')   ⟹   E_steps(p → p*) > E_steps(p' → p*)
+>
+> where *E_steps* is computed under the RSI process that *S itself defines*.
 
-This is a self-referential definition — the score function must agree with the process it induces.
+This is self-referential: the score must agree with the process it induces. Wang's construction achieves this.
 
-#### 2.3.2 Construction Algorithm
+#### 2.3.2 The Algorithm
 
-1. **Initialize**: Fix _p₁_ as the optimal program. Set _S(p₁) = 0_. Set _S(pᵢ) = ∞_ for all _i ≥ 2_. Build the initial Markov chain with only _p₁_ as an absorbing state.
+> **Algorithm: Score Function Construction**
+>
+> ```
+> INPUT :  Programs P = {p₁, ..., pₙ}, generation weights {w₁, ..., wₙ}
+> OUTPUT:  Consistent score function S
+>
+> 1.  INITIALIZE
+>       Fix p₁ as the optimal program.
+>       Set S(p₁) ← 0
+>       Set S(pᵢ) ← ∞   for all i ≥ 2
+>       Build initial Markov chain: only p₁ (absorbing state)
+>
+> 2.  ITERATE  for i = 2, 3, ..., n :
+>       (a)  For every program p with S(p) = ∞ :
+>              Compute E(p) = expected steps to reach p₁
+>              under the CURRENT Markov chain
+>              (only p₁, ..., p_{i-1} have finite scores)
+>
+>       (b)  Select pᵢ = argmin { E(p) : S(p) = ∞ }       ← greedy choice
+>
+>       (c)  Set S(pᵢ) ← E(pᵢ)
+>
+>       (d)  UPDATE the Markov chain:
+>              pᵢ now has a finite score, so other programs
+>              can transition THROUGH pᵢ (their self-loops
+>              to pᵢ become accepting transitions)
+>
+> 3.  TERMINATE  when all programs have finite scores.
+> ```
 
-2. **Iterate**: At each step _i_ (for _i = 2, 3, ..., n_):
-   - For every program _p_ with _S(p) = ∞_, compute the expected number of steps to reach _p₁_ under the **current** Markov chain (which includes only _p₁, ..., p_{i-1}_ with finite scores).
-   - Select the program _pᵢ_ with the **minimum** expected hitting time among all ∞-scored programs.
-   - Set _S(pᵢ)_ = that minimum expected hitting time.
-   - **Update the Markov chain**: Adding _pᵢ_ with a finite score changes the transition structure — other programs can now transition through _pᵢ_ as an intermediate state (since _pᵢ_ now has a finite score, transitions to _pᵢ_ become "accepting" transitions rather than self-loops).
+**Dijkstra parallel:**
 
-3. **Terminate**: When all programs have finite scores.
+| Dijkstra | This Algorithm |
+|:---|:---|
+| Graph nodes | Programs |
+| Edge weights | Generation probabilities |
+| Shortest path distance | Expected hitting time |
+| Settling a node | Assigning a finite score |
+| Relaxing neighbors | Updating transitions when new node settles |
+| Priority queue | Select min expected steps among ∞-scored programs |
+| Complexity: O(n log n + m) | Same: O(n log n + m) |
 
-This is directly analogous to Dijkstra: the "distance" is expected steps rather than path weight, and "relaxation" happens when adding a new intermediate node changes the expected hitting times of remaining nodes.
+#### 2.3.3 Worked Example (Step by Step)
 
-#### 2.3.3 Worked Example
+Using **P** = {p₁, p₂, p₃, p₄} with generation weights from Section 2.2.
 
-Using the same _P = {p₁, p₂, p₃, p₄}_ with generation weights from Section 2.2.
+---
 
-**Step 0 — Initialize:**
-- _S(p₁) = 0_, _S(p₂) = S(p₃) = S(p₄) = ∞_
-- Initial transition matrix (only _p₁_ has finite score; transitions to ∞-scored programs become self-loops):
-
-```
-     p₁    p₂    p₃    p₄
-p₁ [ 1     0     0     0  ]    ← absorbing
-p₂ [ 0.75  0.25  0     0  ]    ← can reach p₁ (prob 0.75) or self-loop (0 + 0.25 + 0)
-p₃ [ 0.25  0.25  0.50  0  ]    ← note: p₂,p₃,p₄ transitions become self-loops (0.25+0.25+0.25 stay → 0.75 raw, but only 0.25 goes to worse-or-equal)
-p₄ [ 0     0     0     1  ]    ← can't reach any finite-scored program except... wait
-```
-
-Actually, the transition matrix is computed as follows: from _pᵢ_, the probability of transitioning to _pⱼ_ is _wᵢ[j]_ if _S(pⱼ) < S(pᵢ)_, and the probability of staying at _pᵢ_ is the sum of _wᵢ[k]_ for all _k_ where _S(pₖ) ≥ S(pᵢ)_.
-
-At Step 0, only _S(p₁) = 0_ is finite. So:
-- From _p₂_: prob of going to _p₁_ = _w₂[1]_ = 0.75. Prob of self-loop = 0 + 0.25 + 0 = 0.25. _(p₂, p₃, p₄ have ∞ scores)_
-- From _p₃_: prob of going to _p₁_ = _w₃[1]_ = 0.25. Prob of self-loop = 0.25 + 0.25 + 0.25 = 0.75.
-- From _p₄_: prob of going to _p₁_ = _w₄[1]_ = 0.00. Prob of self-loop = 0.58 + 0 + 0.42 = 1.0.
-
-```
-     p₁    p₂    p₃    p₄
-p₁ [ 1     0     0     0  ]
-p₂ [ 0.75  0.25  0     0  ]
-p₃ [ 0.25  0     0.75  0  ]
-p₄ [ 0     0     0     1  ]
-```
-
-**Step 1 — Compute expected steps to _p₁_ for each ∞-scored program:**
-
-- From _p₂_: Let _E₂_ = expected steps. At each step, with prob 0.75 we reach _p₁_ (done in 1 step), with prob 0.25 we self-loop (try again). So _E₂_ = 0.75 · 1 + 0.25 · (_E₂_ + 1). Solving: _E₂_ = 1/0.75 = **4/3**.
-
-- From _p₃_: _E₃_ = 0.25 · 1 + 0.75 · (_E₃_ + 1). Solving: _E₃_ = 1/0.25 = **4**.
-
-- From _p₄_: _E₄_ = 0 · 1 + 1.0 · (_E₄_ + 1). This gives _0 = 1_, which is undefined — **_p₄_ cannot reach _p₁_ under the current chain**. _E₄_ = ∞.
-
-Minimum is _E₂_ = 4/3, so set **_S(p₂) = 4/3_**. Add _p₂_ to the chain.
-
-**Step 2 — Update the chain with _p₂_ (now _S(p₂) = 4/3_ is finite):**
-
-Transition matrix updates — programs can now transition to _p₂_ (since it has a finite score lower than theirs):
+**STEP 0 — Initialize**
 
 ```
-     p₁    p₂    p₃    p₄
-p₁ [ 1     0     0     0  ]
-p₂ [ 0.75  0.25  0     0  ]
-p₃ [ 0.25  0.25  0.50  0  ]    ← p₃ can now go to p₂ (w₃[2]=0.25)
-p₄ [ 0     0.58  0     0.42]   ← p₄ can now go to p₂ (w₄[2]=0.58)
+  S(p₁) = 0          S(p₂) = ∞          S(p₃) = ∞          S(p₄) = ∞
 ```
 
-Recompute expected steps:
-- From _p₃_: _E₃_ = 0.25·(0 + 1) + 0.25·(4/3 + 1) + 0.50·(_E₃_ + 1). Solving: _E₃_ · 0.50 = 0.25 + 0.25 · 7/3 + 0.50 = 0.25 + 7/12 + 0.50 = **8/3** / 1 → _E₃_ = **8/3**.
-
-- From _p₄_: _E₄_ = 0.58·(4/3 + 1) + 0.42·(_E₄_ + 1). Solving: _E₄_ · 0.58 = 0.58 · 7/3 + 0.42 → _E₄_ ≈ **3.057**.
-
-Minimum is _E₃_ = 8/3 ≈ 2.667, so set **_S(p₃) = 8/3_**. By similar procedure, _S(p₄)_ is computed last.
-
-**Properties of the construction:**
-1. Programs are added in **nondecreasing score order**: _S(p₁) = 0 ≤ S(p₂) = 4/3 ≤ S(p₃) = 8/3 ≤ S(p₄)_.
-2. The score equals the expected steps to reach _p₁_ under the Markov chain defined by the score function itself — so the score is **self-consistent**.
-3. The algorithm runs in **_O(n log n + m)_** time, analogous to Dijkstra with a priority queue, where _n_ = |P| and _m_ = total number of non-zero generation probabilities.
-
-### 2.4 The Main Proof — Nondecreasing Scores (Full Detail)
-
-This is the paper's central theorem. It guarantees the Dijkstra-like construction produces a valid, consistent score function.
-
-#### 2.4.1 Theorem Statement
-
-Let _pᵢ_ be the _i_-th program added to the Markov chain by the construction in Section 2.3. Then _S(p₁) ≤ S(p₂) ≤ ... ≤ S(pₙ)_ for all feasible _i_.
-
-#### 2.4.2 Proof by Induction
-
-**Base case (_i = 1_):** _S(p₁) = 0_ and _S(p₂) ≥ 0_ because _S(p₂)_ is an expected number of steps, which is non-negative. So _S(p₁) ≤ S(p₂)_. ✓
-
-**Inductive hypothesis:** Assume _S(pⱼ) ≤ S(p_{j+1})_ holds for all _j < i_.
-
-**Inductive step:** We need to show _S(pᵢ) ≤ S(p_{i+1})_.
-
-**Step A — Define _E_ (the "old-chain" expected steps for _p_{i+1}_):**
-
-Let _E_ be the expected number of steps from _p_{i+1}_ to reach _p₁_, under the Markov chain at step _i_ (i.e., **before** _p_{i+1}_ is assigned its score — only _p₁, ..., pᵢ_ have finite scores at this point, but we're computing _E_ before _pᵢ_ itself was added too... actually, _E_ is computed at step _i_ where _p₁,...,p_{i-1}_ have finite scores and _pᵢ$ was just selected).
-
-Let me be precise: At step _i_, programs _p₁, ..., p_{i-1}_ have finite scores. The algorithm selects _pᵢ_ as the ∞-scored program with minimum expected steps. So _S(pᵢ) ≤ E_ where _E_ is the expected steps for any other ∞-scored program (including _p_{i+1}_) at step _i_.
-
-Let _q_{i+1,k}_ denote the probability that _p_{i+1}_ generates _pₖ_.
-
-_E_ satisfies the recurrence:
+Only p₁ has a finite score. The transition matrix at this stage:
 
 ```
-E = (1 - Σ_{k<i} q_{i+1,k}) · (E + 1) + Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)
+       │  p₁     p₂     p₃     p₄
+  ─────┼──────────────────────────────
+   p₁  │  1      0      0      0        ← absorbing (optimal)
+   p₂  │  0.75   0.25   0      0        ← w₂[1]=0.75 to p₁; rest self-loops
+   p₃  │  0.25   0      0.75   0        ← w₃[1]=0.25 to p₁; rest self-loops
+   p₄  │  0      0      0      1        ← w₄[1]=0.00 to p₁; stuck!
 ```
 
-**Interpretation:** From _p_{i+1}_ under the step-_i_ chain:
-- With probability _Σ_{k<i} q_{i+1,k}_, it generates some _pₖ_ with _k < i_ (a program already in the chain with finite score). We transition to _pₖ_, which takes _S(pₖ)_ more steps to reach _p₁_, plus 1 for the current generation step. Total: _S(pₖ) + 1_.
-- With probability _(1 - Σ_{k<i} q_{i+1,k})_, it generates a program with index _≥ i_ (score ∞ in the current chain). Since this program is no better, the current program doesn't update — we stay at _p_{i+1}_ and try again. Total: _E + 1_ (one wasted step, then we're back to the same situation).
+How each row is computed:
+- **p₂ →** prob to p₁ = w₂[1] = 0.75 (accept: S(p₁) < S(p₂)). Self-loop = w₂[2]+w₂[3]+w₂[4] = 0+0.25+0 = 0.25.
+- **p₃ →** prob to p₁ = w₃[1] = 0.25. Self-loop = w₃[2]+w₃[3]+w₃[4] = 0.25+0.25+0.25 = 0.75.
+- **p₄ →** prob to p₁ = w₄[1] = 0.00. Self-loop = w₄[2]+w₄[3]+w₄[4] = 0.58+0+0.42 = 1.00.
 
-**Step B — Solve for _E_:**
+---
 
-Expanding the recurrence:
+**STEP 1 — Compute expected steps to p₁ for each ∞-scored program**
 
-```
-E = E + 1 - (Σ_{k<i} q_{i+1,k}) · E - (Σ_{k<i} q_{i+1,k}) + Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)
-```
-
-Collecting _E_ terms:
+For **p₂** : Let E₂ = expected steps from p₂ to p₁.
 
 ```
-E · (Σ_{k<i} q_{i+1,k}) = 1 - Σ_{k<i} q_{i+1,k} + Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)
+  E₂  =  0.75 · 1  +  0.25 · (E₂ + 1)                   ← reach p₁ in 1 step, or self-loop and retry
+  E₂  =  0.75  +  0.25·E₂  +  0.25
+  E₂ − 0.25·E₂  =  1.00
+  0.75·E₂  =  1.00
+
+                   E₂  =  4/3  ≈  1.333
 ```
 
-Define:
-- **_b = Σ_{k<i} q_{i+1,k}_** (total probability of generating an already-scored program)
-- **_a = 1 - b + Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)_** (the numerator)
-
-Then:
+For **p₃** : Let E₃ = expected steps from p₃ to p₁.
 
 ```
-E = a / b
+  E₃  =  0.25 · 1  +  0.75 · (E₃ + 1)
+  E₃  =  0.25  +  0.75·E₃  +  0.75
+  0.25·E₃  =  1.00
+
+                   E₃  =  4  
 ```
 
-**Step C — Establish _S(pᵢ) ≤ E_:**
-
-By the greedy construction, at step _i_ the algorithm chose _pᵢ_ as the ∞-scored program with the **minimum** expected steps to _p₁_. Since _p_{i+1}_ was also ∞-scored at step _i_ (it hasn't been selected yet), its expected steps _E_ must be at least as large:
+For **p₄** : Let E₄ = expected steps from p₄ to p₁.
 
 ```
-S(pᵢ) ≤ E  ⟹  S(pᵢ) ≤ a/b  ⟹  a ≥ S(pᵢ) · b
+  E₄  =  0 · 1  +  1.0 · (E₄ + 1)
+  E₄  =  E₄ + 1
+  0  =  1                                                 ← contradiction!
+
+                   E₄  =  ∞                               ← p₄ cannot reach p₁ yet
 ```
 
-This inequality is the linchpin of the entire proof.
-
-**Step D — Compute _S(p_{i+1})_ (the "new-chain" expected steps):**
-
-At step _i+1_, program _pᵢ_ has been added to the chain with score _S(pᵢ)_. Now _p_{i+1}_ can transition not only to _p₁, ..., p_{i-1}_ but also to _pᵢ_. The updated recurrence is:
+Select the minimum: **E₂ = 4/3** is smallest.
 
 ```
-S(p_{i+1}) = (1 - Σ_{k<i} q_{i+1,k} - q_{i+1,i}) · (S(p_{i+1}) + 1)
-           + Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)
-           + q_{i+1,i} · (S(pᵢ) + 1)
+  ┌──────────────────────────────────────┐
+  │   Set   S(p₂)  =  4/3               │
+  │   Add p₂ to the Markov chain.       │
+  └──────────────────────────────────────┘
 ```
 
-The new term _q_{i+1,i} · (S(pᵢ) + 1)_ accounts for the probability of generating _pᵢ_ (which now has a finite score and can be transitioned to).
+---
 
-Solving (same algebra as Step B, with the extra term):
+**STEP 2 — Update chain (p₂ now has finite score)**
 
-```
-S(p_{i+1}) = (a + q_{i+1,i} · S(pᵢ)) / (b + q_{i+1,i})
-```
+Now that S(p₂) = 4/3, other programs with S > 4/3 can transition *to* p₂.
 
-where _a_ and _b_ are the same quantities defined in Step B.
-
-**Step E — Prove the inequality _S(p_{i+1}) ≥ S(pᵢ)_:**
-
-We need:
+Updated transition matrix:
 
 ```
-(a + q_{i+1,i} · S(pᵢ)) / (b + q_{i+1,i})  ≥  S(pᵢ)
+       │  p₁     p₂     p₃     p₄
+  ─────┼──────────────────────────────
+   p₁  │  1      0      0      0
+   p₂  │  0.75   0.25   0      0        ← unchanged (p₂ already processed)
+   p₃  │  0.25   0.25   0.50   0        ← NEW: w₃[2]=0.25 to p₂ now accepted
+   p₄  │  0      0.58   0      0.42     ← NEW: w₄[2]=0.58 to p₂ now accepted
 ```
 
-Multiply both sides by _(b + q_{i+1,i})_ (positive):
+Recompute expected steps for remaining ∞-scored programs:
+
+For **p₃** (can now reach p₁ directly *or* via p₂):
 
 ```
-a + q_{i+1,i} · S(pᵢ)  ≥  S(pᵢ) · b + S(pᵢ) · q_{i+1,i}
+  E₃  =  0.25 · (S(p₁) + 1)                              ← generate p₁: 0 + 1 step
+       +  0.25 · (S(p₂) + 1)                              ← generate p₂: 4/3 + 1 steps
+       +  0.50 · (E₃ + 1)                                 ← self-loop: retry
+
+  E₃  =  0.25·(1)  +  0.25·(7/3)  +  0.50·(E₃ + 1)
+  E₃  =  0.25  +  7/12  +  0.50·E₃  +  0.50
+  0.50·E₃  =  0.25  +  7/12  +  0.50
+  0.50·E₃  =  3/12  +  7/12  +  6/12
+  0.50·E₃  =  16/12  =  4/3
+
+                   E₃  =  8/3  ≈  2.667
 ```
 
-The _q_{i+1,i} · S(pᵢ)_ terms cancel:
+For **p₄** (can now reach p₂, and through p₂ reach p₁):
 
 ```
-a  ≥  S(pᵢ) · b
+  E₄  =  0.58 · (S(p₂) + 1)  +  0.42 · (E₄ + 1)
+  E₄  =  0.58 · (7/3)  +  0.42·E₄  +  0.42
+  0.58·E₄  =  4.06/3  +  0.42
+  0.58·E₄  =  1.353  +  0.42  =  1.773
+
+                   E₄  ≈  3.057
 ```
 
-**This is exactly the inequality established in Step C.** ∎
-
-#### 2.4.3 Geometric Intuition
-
-The formula _S(p_{i+1}) = (a + q_{i+1,i} · S(pᵢ)) / (b + q_{i+1,i})_ is a **weighted average** between:
-- _E = a/b_ (the old expected steps, without _pᵢ_ as an intermediate), weighted by _b_
-- _S(pᵢ)_ (the expected steps from _pᵢ_), weighted by _q_{i+1,i}_
-
-Since _E ≥ S(pᵢ)_ and this is a convex combination, the result lies between _S(pᵢ)_ and _E_:
+Select the minimum: **E₃ = 8/3** is smallest.
 
 ```
-S(pᵢ)  ≤  S(p_{i+1})  ≤  E
+  ┌──────────────────────────────────────┐
+  │   Set   S(p₃)  =  8/3               │
+  │   Add p₃ to the Markov chain.       │
+  └──────────────────────────────────────┘
 ```
 
-Adding _pᵢ_ as an intermediate can only **help** _p_{i+1}_ (by providing a new pathway to _p₁_), but never enough to make _p_{i+1}_ better than _pᵢ_ itself. This mirrors Dijkstra's algorithm: settling a new node can only reduce (or maintain) distances to unsettled nodes, and the settled node's distance is always ≤ the next node settled.
+By the same procedure, S(p₄) is computed last.
+
+---
+
+**Summary of construction:**
+
+```
+  ┌──────────────────────────────────────────────────────────────┐
+  │                                                              │
+  │   S(p₁)  =  0       ≤       ← optimal (by definition)       │
+  │   S(p₂)  =  4/3     ≤       ← 1.33 expected steps           │
+  │   S(p₃)  =  8/3     ≤       ← 2.67 expected steps           │
+  │   S(p₄)  ≈  3.06            ← 3.06 expected steps           │
+  │                                                              │
+  │   Scores are nondecreasing.  ✓                               │
+  │   Scores equal expected steps to p₁ under the induced        │
+  │   Markov chain.  ✓  (self-consistent)                        │
+  │                                                              │
+  │   Complexity:  O(n log n + m)                                │
+  │     n = |P| = 4,   m = nonzero generation probabilities      │
+  │                                                              │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 2.4 The Main Proof — Nondecreasing Scores
+
+This is the paper's central theorem. It guarantees the Dijkstra-like construction always produces a valid, consistent score function.
+
+---
+
+> **Theorem (Nondecreasing Scores).**
+> Let *pᵢ* be the *i*-th program added to the Markov chain
+> by the construction in Section 2.3. Then:
+>
+>     S(p₁)  ≤  S(p₂)  ≤  ...  ≤  S(pₙ)
+
+---
+
+#### 2.4.1 Proof by Induction
+
+##### Base Case  ( i = 1 )
+
+```
+  S(p₁) = 0      and      S(p₂) ≥ 0                      ← S(p₂) is an expected number of steps
+                                                              which is always non-negative
+  ∴   S(p₁) ≤ S(p₂)   ✓
+```
+
+##### Inductive Hypothesis
+
+Assume S(pⱼ) ≤ S(pⱼ₊₁) holds for all j < i.
+
+##### Inductive Step
+
+**Goal:** Show S(pᵢ) ≤ S(pᵢ₊₁).
+
+We proceed in five clearly labeled steps.
+
+---
+
+**STEP A.  Define the key quantities.**
+
+Let *E* = expected number of steps from pᵢ₊₁ to reach p₁, computed under the Markov chain **at step *i***, where programs p₁, ..., pᵢ₋₁ have finite scores.
+
+> Note: At step *i*, the algorithm has just selected pᵢ as the ∞-scored
+> program with the *minimum* expected steps. So for any other ∞-scored
+> program (including pᵢ₊₁), its expected steps *E* satisfies **S(pᵢ) ≤ E**.
+
+Let *q*ᵢ₊₁,ₖ = probability that pᵢ₊₁ generates pₖ  (the raw generation weight).
+
+---
+
+**STEP B.  Write the recurrence for *E*.**
+
+From pᵢ₊₁ under the step-*i* chain, two things can happen each round:
+
+```
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │  With prob  Σ_{k<i} q_{i+1,k}  :                                  │
+  │    pᵢ₊₁ generates some pₖ with k < i                              │
+  │    (already in the chain, finite score)                            │
+  │    ⟹  transition to pₖ, then S(pₖ) more steps to p₁              │
+  │    ⟹  cost = S(pₖ) + 1                                            │
+  │                                                                     │
+  │  With prob  1 − Σ_{k<i} q_{i+1,k}  :                              │
+  │    pᵢ₊₁ generates a program with index ≥ i                        │
+  │    (score ∞, rejected — no improvement)                            │
+  │    ⟹  stay at pᵢ₊₁, try again                                     │
+  │    ⟹  cost = E + 1                                                 │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+This gives the recurrence:
+
+```
+  E  =  (1 − Σ_{k<i} q_{i+1,k}) · (E + 1)  +  Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)
+```
+
+---
+
+**STEP C.  Solve for *E*.**
+
+Expand:
+
+```
+  E  =  E + 1
+       − (Σ_{k<i} q_{i+1,k}) · E
+       − (Σ_{k<i} q_{i+1,k})
+       + Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)
+```
+
+Move all *E* terms to the left:
+
+```
+  E · (Σ_{k<i} q_{i+1,k})  =  1  −  Σ_{k<i} q_{i+1,k}  +  Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)
+```
+
+Define two shorthand variables:
+
+```
+  ┌───────────────────────────────────────────────────────────────────┐
+  │                                                                   │
+  │   b  =  Σ_{k<i}  q_{i+1,k}                                      │
+  │          ↑                                                        │
+  │          total probability of generating                          │
+  │          an already-scored program                                │
+  │                                                                   │
+  │   a  =  1 − b  +  Σ_{k<i}  q_{i+1,k} · (S(pₖ) + 1)            │
+  │          ↑                                                        │
+  │          numerator of the expected-steps formula                  │
+  │                                                                   │
+  └───────────────────────────────────────────────────────────────────┘
+```
+
+Therefore:
+
+```
+                         a
+                 E   =  ───
+                         b
+```
+
+---
+
+**STEP D.  Establish the key inequality:  a ≥ S(pᵢ) · b**
+
+By the greedy construction, pᵢ was chosen at step *i* as the ∞-scored program with the **minimum** expected steps. Since pᵢ₊₁ was also ∞-scored at step *i*, its expected steps *E* must be at least as large:
+
+```
+                     S(pᵢ)  ≤  E
+
+                              a
+               ⟹    S(pᵢ)  ≤  ─
+                              b
+
+               ⟹    a  ≥  S(pᵢ) · b                   ★ KEY INEQUALITY
+```
+
+> This inequality is the **linchpin** of the entire proof. Everything
+> that follows is just showing that it implies the desired result.
+
+---
+
+**STEP E.  Compute S(pᵢ₊₁) under the updated chain.**
+
+At step *i+1*, program pᵢ has been added to the chain with score S(pᵢ). Now pᵢ₊₁ can transition not only to p₁, ..., pᵢ₋₁ but **also to pᵢ**. The updated recurrence:
+
+```
+  S(pᵢ₊₁)  =  (1 − Σ_{k<i} q_{i+1,k} − q_{i+1,i}) · (S(pᵢ₊₁) + 1)      ← self-loop
+             +  Σ_{k<i} q_{i+1,k} · (S(pₖ) + 1)                            ← to p₁...pᵢ₋₁
+             +  q_{i+1,i} · (S(pᵢ) + 1)                                     ← NEW: to pᵢ
+```
+
+Solving (same algebra as Step C, with the extra *q*ᵢ₊₁,ᵢ term):
+
+```
+                    a  +  q_{i+1,i} · S(pᵢ)
+  S(pᵢ₊₁)   =    ──────────────────────────
+                    b  +  q_{i+1,i}
+```
+
+where *a* and *b* are the same quantities from Step C.
+
+> **Observation.** This is a **weighted average** of *E* = a/b and *S(pᵢ)*,
+> with weights *b* and *q*ᵢ₊₁,ᵢ respectively.
+
+---
+
+**STEP F.  Prove S(pᵢ₊₁) ≥ S(pᵢ).**
+
+We need to show:
+
+```
+     a + q_{i+1,i} · S(pᵢ)
+    ────────────────────────   ≥   S(pᵢ)
+     b + q_{i+1,i}
+```
+
+Multiply both sides by (*b* + *q*ᵢ₊₁,ᵢ), which is positive:
+
+```
+     a + q_{i+1,i} · S(pᵢ)   ≥   S(pᵢ) · b  +  S(pᵢ) · q_{i+1,i}
+```
+
+The *q*ᵢ₊₁,ᵢ · S(pᵢ) terms appear on both sides — cancel them:
+
+```
+     a   ≥   S(pᵢ) · b
+```
+
+**This is exactly the ★ KEY INEQUALITY from Step D.**
+
+```
+  ┌─────────────────────────────────────────────────┐
+  │                                                  │
+  │   ∴   S(pᵢ)  ≤  S(pᵢ₊₁)                       │
+  │                                                  │
+  │   By induction, S(p₁) ≤ S(p₂) ≤ ... ≤ S(pₙ)   │
+  │                                                  │
+  │                                         ∎  QED   │
+  └─────────────────────────────────────────────────┘
+```
+
+---
+
+#### 2.4.2 Geometric Intuition
+
+The closed-form for S(pᵢ₊₁) reveals a clean geometric picture:
+
+```
+                    a  +  q_{i+1,i} · S(pᵢ)
+  S(pᵢ₊₁)   =    ──────────────────────────        (weighted average)
+                    b  +  q_{i+1,i}
+```
+
+This is a **convex combination** of two values:
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │   S(pᵢ)       ◄──────── S(pᵢ₊₁) ────────►        E = a/b      │
+  │   (lower)       sits somewhere here               (higher)      │
+  │                                                                  │
+  │   Weight:        q_{i+1,i}                         b             │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+Since E ≥ S(pᵢ) and this is a convex combination:
+
+```
+                S(pᵢ)   ≤   S(pᵢ₊₁)   ≤   E
+```
+
+**In plain English:** Adding pᵢ as an intermediate node can only *help* pᵢ₊₁ (by opening a new pathway to p₁), but it can never help so much that pᵢ₊₁ becomes better than pᵢ itself.
+
+This mirrors Dijkstra: settling a new node can reduce distances to unsettled nodes, but the settled node's distance is always ≤ any node settled after it.
+
+---
 
 ### 2.5 Key Results
 
-1. **Existence**: For any finite _P_ with the Markov property, a consistent score function exists (proven constructively by the algorithm in Section 2.3).
-2. **Computability**: The score can be computed in _O(n log n + m)_ time (_n_ = programs, _m_ = total non-zero transition probabilities), using a priority queue analogous to Dijkstra.
-3. **Nondecreasing Scores**: Programs are added in nondecreasing score order — proven by induction in Section 2.4.
-4. **Consistency**: The score function equals the expected number of steps to reach the optimal program under the process defined by that score function — follows directly from the nondecreasing property.
-5. **Logarithmic Convergence (Empirical)**: Simulations with _n = 2^l_ for _l = 1, ..., 20_ show expected steps grow linearly with _l_ = _log₂(n)_. Linear regression of expected steps vs. _l_ yields R² = 0.983. Rank of the uniform-generating starting program vs. _n_ also shows R² = 1.0.
-6. **Exponential Rank Improvement (Empirical)**: In simulations with _n = 2²⁰_, 100 runs show that program ranks improve exponentially (on a log scale) at each step before converging to the global optimum.
+#### Proven Results
+
+| # | Result | Proof |
+|:---:|:---|:---|
+| 1 | **Existence** — For any finite **P** with the Markov property, a consistent score function exists. | Constructive: the algorithm in Section 2.3 produces one. |
+| 2 | **Computability** — The score can be computed in **O(n log n + m)** time. | Dijkstra with priority queue; *n* = \|**P**\|, *m* = nonzero transition probabilities. |
+| 3 | **Nondecreasing Scores** — Programs are added in nondecreasing score order. | Induction proof in Section 2.4. |
+| 4 | **Consistency** — The score equals expected steps to optimal under the process it defines. | Follows from nondecreasing property + construction. |
+
+#### Empirical Results (Simulation Only — Not Proven)
+
+| # | Result | Evidence |
+|:---:|:---|:---|
+| 5 | **Logarithmic Convergence** — Expected steps to optimal grow as O(log n). | Simulations with n = 2^l for l = 1,...,20. Linear regression of steps vs. l: R² = 0.983. |
+| 6 | **Exponential Rank Improvement** — Ranks improve exponentially per step before convergence. | 100 runs with n = 2²⁰. Log-scale rank drops linearly with step count (Figure 3). |
+
+---
 
 ### 2.6 Accuracy Assessment
 
 #### 2.6.1 What Is Mathematically Sound
 
-- **The proof is correct.** The induction in Section 2.4, the recurrence equations, and the final algebraic step all check out. There are no errors in the mathematical reasoning.
-- **The Dijkstra analogy is valid.** The greedy construction genuinely mirrors shortest-path computation. The nondecreasing property is the analog of Dijkstra's key invariant (settled distances never decrease). This is well-established algorithmic territory.
-- **The Markov chain formulation is well-defined.** Given the Markov assumption, the framework is rigorous and the existence of a consistent score function is properly demonstrated via constructive proof.
-- **The simulation methodology is reasonable.** The experimental setup (random subsets, weighted distributions, 10 repeats per configuration) is standard for this type of empirical study.
+| Claim | Verdict | Notes |
+|:---|:---:|:---|
+| Induction proof (Section 2.4) | **Correct** | All recurrence equations, algebraic manipulations, and the final cancellation step check out. |
+| Dijkstra analogy | **Valid** | Nondecreasing property is the exact analog of Dijkstra's invariant. Well-established algorithmic territory. |
+| Markov chain formulation | **Well-defined** | Given the Markov assumption, the framework is rigorous. Existence is properly demonstrated via constructive proof. |
+| Simulation methodology | **Reasonable** | Standard setup: random subsets, weighted distributions, 10 repeats per config. |
 
 #### 2.6.2 Limitations and Weaknesses
 
-1. **Circularity of the score function (acknowledged by the paper).** Computing _S_ requires knowing all transition probabilities _and_ the optimal program _p*_ in advance. The paper admits: "the score function is precomputed, which takes more time than enumerate every program to find the optimal." The logarithmic runtime of the RSI _procedure_ is real, but the setup cost is _O(n)_ or worse — so you've already done more work than brute-force search to set up the conditions for fast search.
+> **1. Circularity (the paper acknowledges this).**
+>
+> Computing S requires knowing all transition probabilities *and* the
+> optimal program p* in advance. The paper admits: *"the score function
+> is precomputed, which takes more time than enumerate every program to
+> find the optimal."* The logarithmic runtime of the RSI procedure is
+> real, but the setup cost is O(n) or worse — you've already done more
+> work than brute-force search.
 
-2. **The Markov assumption is very restrictive.** Real self-improving systems learn from experience — their generation distributions should change based on what they've tried before. Dropping this assumption invalidates the entire framework. The paper acknowledges this as future work ("one may expand the model by embedding histories").
+> **2. The Markov assumption is very restrictive.**
+>
+> Real self-improving systems learn from experience — their generation
+> distributions change based on what they've tried before. Dropping this
+> assumption invalidates the entire framework. The paper acknowledges
+> this as future work.
 
-3. **Finite program space.** Real program spaces are countably infinite (or uncountable if parameterized). The proof relies fundamentally on finiteness to guarantee termination and well-defined expected hitting times. Extension to infinite spaces would require measure-theoretic machinery not present in the paper.
+> **3. Finite program space.**
+>
+> Real program spaces are countably infinite (or uncountable if
+> parameterized). The proof relies fundamentally on finiteness to
+> guarantee termination and well-defined expected hitting times.
+> Extension to infinite spaces would require measure-theoretic machinery
+> not present in the paper.
 
-4. **Logarithmic convergence is empirical, not proven.** The _O(log n)_ result comes only from simulation (Figures 2-3), not from a theorem. The paper does not provide a theoretical bound on convergence speed. The R² = 0.983 is suggestive but not a proof.
+> **4. Logarithmic convergence is empirical, not proven.**
+>
+> The O(log n) result comes only from simulation, not from a theorem.
+> R² = 0.983 is suggestive but not a proof. The paper does not provide
+> a theoretical convergence bound.
 
-5. **Simulation setup is narrow.** The first program generates uniformly, others generate over random subsets with random weights. This is a specific class of transition structures. The logarithmic scaling might not hold for adversarial or highly structured transition matrices.
+> **5. Narrow simulation setup.**
+>
+> The first program generates uniformly; others generate over random
+> subsets with random weights. The logarithmic scaling might not hold
+> for adversarial or highly structured transition matrices.
 
-6. **The consistency requirement is non-trivial in practice.** Wang constructs a consistent score function, but practical score functions (benchmarks, loss functions, test pass rates) almost certainly won't satisfy the consistency property. The paper does not address how robust the procedure is to inconsistent or noisy scores — it explicitly flags this as an open problem in Section 5.
+> **6. Consistency is non-trivial in practice.**
+>
+> Wang constructs a consistent score function, but practical score
+> functions (benchmarks, test pass rates, loss functions) almost
+> certainly won't satisfy consistency. The paper flags robustness
+> to inconsistent or noisy scores as an open problem.
 
 #### 2.6.3 Overall Verdict
 
-The math is **correct but the result is weaker than it appears at first glance**. Wang proves:
-
-> _"If you already know the optimal program and all transition probabilities, you can construct a score function that makes the RSI procedure well-defined and the scores monotonically nondecreasing."_
-
-This is a valid **existence proof** for a class of RSI systems. The practical gap is that the hard part of RSI — not knowing the optimal program or the transition structure — is assumed away. The paper is honest about this (Section 5), pointing to oracle score functions and Vingean reflection as open problems.
-
-The key takeaway for applied work is the **structural insight**: RSI can be modeled as Markov chain optimization with a Dijkstra-like score construction, and the greedy "always accept improvements" strategy is provably sound under these assumptions. The logarithmic scaling, if it generalizes, means efficient RSI is at least _possible in principle_ — a non-trivial claim given that naive enumeration is linear in _|P|_.
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │  THE MATH IS CORRECT.                                           │
+  │  THE RESULT IS WEAKER THAN IT APPEARS.                          │
+  │                                                                  │
+  │  Wang proves:                                                    │
+  │  "If you already know the optimal program and all transition     │
+  │   probabilities, you can construct a score function that makes   │
+  │   the RSI procedure well-defined and scores nondecreasing."     │
+  │                                                                  │
+  │  This is a valid EXISTENCE PROOF — not a practical algorithm.   │
+  │  The hard part of RSI (not knowing the optimal or the           │
+  │  transition structure) is assumed away.                          │
+  │                                                                  │
+  │  KEY TAKEAWAY FOR APPLIED WORK:                                 │
+  │  RSI can be modeled as Markov chain optimization with a         │
+  │  Dijkstra-like score construction. The greedy "always accept    │
+  │  improvements" strategy is provably sound. If the logarithmic   │
+  │  scaling generalizes, efficient RSI is possible in principle    │
+  │  — a non-trivial claim given naive enumeration is O(|P|).      │
+  │                                                                  │
+  └──────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -914,19 +1266,36 @@ This is deliberate: the convergence framework measures and governs the agentic c
 
 ### 12.0 Summary of Wang's Proof Notation
 
-Quick reference for the notation used in the full proof (Section 2.4):
+> Quick reference for the notation used in the full proof (Section 2.4).
+> See Section 2.4 Steps A-F for derivations.
 
-| Symbol | Meaning |
-|---|---|
-| _P = {p₁, ..., pₙ}_ | Finite program space, ordered by score |
-| _S(pᵢ)_ | Score of the _i_-th program added (= expected steps to _p₁_) |
-| _q_{i+1,k}_ | Raw probability that _p_{i+1}_ generates _pₖ_ |
-| _b = Σ_{k<i} q_{i+1,k}_ | Total probability of generating an already-scored program |
-| _a = 1 - b + Σ_{k<i} q_{i+1,k}·(S(pₖ)+1)_ | Numerator of the expected-steps formula |
-| _E = a/b_ | Expected steps from _p_{i+1}_ to _p₁_ at step _i_ (before _pᵢ_ is available) |
-| _S(p_{i+1}) = (a + q_{i+1,i}·S(pᵢ)) / (b + q_{i+1,i})_ | Expected steps after _pᵢ_ becomes available |
+```
+  SYMBOL                                      MEANING
+  ──────                                      ───────
+  P = {p₁, ..., pₙ}                          Finite program space, ordered by score
 
-**Key inequality chain:** _S(pᵢ) ≤ S(p_{i+1}) ≤ E_, which follows from _a ≥ S(pᵢ)·b_ (greedy selection guarantee).
+  S(pᵢ)                                      Score of the i-th program added
+                                              (= expected steps to reach p₁)
+
+  q_{i+1,k}                                  Raw probability that pᵢ₊₁ generates pₖ
+
+  b = Σ_{k<i} q_{i+1,k}                      Total prob of generating an already-scored program
+
+  a = 1 − b + Σ_{k<i} q_{i+1,k}·(S(pₖ)+1)  Numerator of the expected-steps formula
+
+  E = a / b                                   Expected steps from pᵢ₊₁ to p₁
+                                              at step i (BEFORE pᵢ is available)
+
+  S(pᵢ₊₁) = (a + q_{i+1,i}·S(pᵢ))          Expected steps from pᵢ₊₁ to p₁
+           / (b + q_{i+1,i})                  at step i+1 (AFTER pᵢ is available)
+
+
+  KEY INEQUALITY CHAIN:
+
+        S(pᵢ)   ≤   S(pᵢ₊₁)   ≤   E
+
+  Follows from:   a ≥ S(pᵢ)·b    (greedy selection guarantee, Step D)
+```
 
 ### 12.1 Sigmoid Normalization
 
