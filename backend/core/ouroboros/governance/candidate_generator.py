@@ -296,17 +296,39 @@ class FailbackStateMachine:
                 mode.name, self._consecutive_failures, eta_s,
             )
 
-    def record_fallback_failure(self) -> None:
+    def record_fallback_failure(
+        self, mode: FailureMode = FailureMode.TIMEOUT,
+    ) -> None:
         """Record a fallback provider failure.
 
-        FALLBACK_ACTIVE -> QUEUE_ONLY.
+        FALLBACK_ACTIVE -> QUEUE_ONLY for permanent failures.
+        For transient failures (TIMEOUT, RATE_LIMITED), stays in
+        FALLBACK_ACTIVE so the system can retry on the next operation
+        instead of permanently giving up.
         """
-        if self._state is FailbackState.FALLBACK_ACTIVE:
-            self._state = FailbackState.QUEUE_ONLY
-            self._reset_probe_counters()
-            logger.error(
-                "[FailbackFSM] Fallback failure -> QUEUE_ONLY (all providers exhausted)"
+        if self._state is not FailbackState.FALLBACK_ACTIVE:
+            return
+
+        if mode in (FailureMode.TIMEOUT, FailureMode.RATE_LIMITED,
+                    FailureMode.SERVER_ERROR):
+            # Transient: DON'T go to QUEUE_ONLY. The next operation will
+            # re-evaluate should_attempt_primary() and may succeed.
+            logger.warning(
+                "[FailbackFSM] Fallback transient failure (mode=%s) — "
+                "staying FALLBACK_ACTIVE (recoverable)",
+                mode.name,
             )
+            return
+
+        # Permanent failure (CONNECTION_ERROR, auth, unknown) → QUEUE_ONLY
+        self._state = FailbackState.QUEUE_ONLY
+        self._queue_only_at: float = time.monotonic()
+        self._reset_probe_counters()
+        logger.error(
+            "[FailbackFSM] Fallback failure (mode=%s) -> QUEUE_ONLY "
+            "(all providers exhausted)",
+            mode.name,
+        )
 
     def record_probe_success(self) -> None:
         """Record a successful health probe of the primary provider.
@@ -315,12 +337,23 @@ class FailbackStateMachine:
         PRIMARY_DEGRADED stays until required_probes AND dwell_time_s met,
         then -> PRIMARY_READY.
         PRIMARY_READY -> no-op.
-        QUEUE_ONLY -> no-op.
+        QUEUE_ONLY -> FALLBACK_ACTIVE (auto-recovery: a successful probe
+        means the primary is alive again, so we should exit the dead-end).
         """
         if self._state is FailbackState.PRIMARY_READY:
             return
         if self._state is FailbackState.QUEUE_ONLY:
-            return
+            # Auto-recovery: primary is alive → exit dead-end
+            self._state = FailbackState.FALLBACK_ACTIVE
+            self._reset_probe_counters()
+            elapsed = time.monotonic() - getattr(self, "_queue_only_at", 0.0)
+            logger.info(
+                "[FailbackFSM] QUEUE_ONLY auto-recovery: probe succeeded "
+                "after %.1fs — transitioning to FALLBACK_ACTIVE",
+                elapsed,
+            )
+            # Fall through to the FALLBACK_ACTIVE handler below
+            # so the first probe is counted toward PRIMARY_DEGRADED.
 
         now = time.monotonic()
 
@@ -1044,12 +1077,12 @@ class CandidateGenerator:
                     timeout=remaining,
                 )
         except (Exception, asyncio.CancelledError) as exc:
+            mode = FailbackStateMachine.classify_exception(exc)
             logger.error(
-                "[CandidateGenerator] Fallback also failed (%s: %s)",
-                type(exc).__name__,
-                exc,
+                "[CandidateGenerator] Fallback also failed (mode=%s, %s: %s)",
+                mode.name, type(exc).__name__, exc,
             )
-            self.fsm.record_fallback_failure()
+            self.fsm.record_fallback_failure(mode=mode)
             raise RuntimeError("all_providers_exhausted") from exc
 
     @staticmethod
