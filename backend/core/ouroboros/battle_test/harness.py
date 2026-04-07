@@ -296,7 +296,9 @@ class BattleTestHarness:
                 GovernedLoopService,
             )
 
-            gls_config = GovernedLoopConfig(project_root=self._config.repo_path)
+            gls_config = GovernedLoopConfig.from_env(
+                project_root=self._config.repo_path,
+            )
             self._governed_loop_service = GovernedLoopService(
                 stack=self._governance_stack,
                 config=gls_config,
