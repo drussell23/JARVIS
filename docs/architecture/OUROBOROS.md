@@ -316,6 +316,234 @@ goal class.
 
 ---
 
+## Venom: Agentic Execution Layer
+
+The Ouroboros pipeline was originally a one-shot code generator: send a prompt,
+get a patch back. **Venom** transforms it into a multi-turn agentic loop where
+the provider can **read files, search code, run tests, and revise its output**
+across multiple turns -- the same capability that makes Claude Code powerful.
+
+Named after the Marvel symbiote, Venom is the **nervous system** that gives
+Ouroboros fluid, adaptive intelligence within the deterministic governance
+skeleton.
+
+### ToolLoopCoordinator
+
+**Source**: `backend/core/ouroboros/governance/tool_executor.py`
+
+The core multi-turn agentic executor. Each iteration:
+1. Provider generates a response (may include tool calls)
+2. `parse_fn` extracts `ToolCall` objects from the response
+3. `GoverningToolPolicy.evaluate()` checks each call against repo containment rules
+4. `AsyncProcessToolBackend.execute()` runs approved tools in subprocess sandboxes
+5. Tool results are appended to the conversation and sent back to the provider
+6. Loop continues until the provider produces a final answer (no tool calls)
+
+**Available Tools (L1)**:
+
+| Tool | Purpose | Policy Gate |
+|------|---------|-------------|
+| `read_file` | Read repository files | Path must be within repo root |
+| `search_code` | Grep-style pattern search | No `..` in glob patterns |
+| `list_symbols` | Extract classes/functions from Python modules | Path within repo root |
+| `run_tests` | Run pytest on specific test files | Requires `JARVIS_TOOL_RUN_TESTS_ALLOWED=true` |
+| `get_callers` | Find call sites of functions | Path within repo root |
+| `bash` | Sandboxed shell execution (Phase C) | Policy-gated |
+| `web_fetch` | HTTP content retrieval (Phase D) | Policy-gated |
+
+**Configuration**:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `JARVIS_GOVERNED_TOOL_USE_ENABLED` | `false` | Master switch for Venom tool loop |
+| `JARVIS_GOVERNED_TOOL_MAX_ROUNDS` | `5` | Max tool iterations per generation |
+| `JARVIS_GOVERNED_TOOL_TIMEOUT_S` | `30` | Per-tool execution timeout |
+| `JARVIS_GOVERNED_TOOL_MAX_CONCURRENT` | `2` | Concurrent tool executions |
+| `JARVIS_TOOL_RUN_TESTS_ALLOWED` | `false` | Allow run_tests tool |
+| `JARVIS_TOOL_OUTPUT_CAP_BYTES` | `4096` | Max tool output size in prompt |
+
+**Provider Integration**: Both `ClaudeProvider` and `PrimeProvider` accept a
+`tool_loop: Optional[ToolLoopCoordinator]` parameter. When provided, their
+`generate()` method delegates to `tool_loop.run()` instead of making a single
+API call. The coordinator handles deadline enforcement, token budget management,
+and audit trail recording via `ToolExecutionRecord` objects.
+
+### L2 Self-Repair Engine
+
+**Source**: `backend/core/ouroboros/governance/repair_engine.py`
+
+When L1 validation fails (tests don't pass), the L2 repair engine takes over
+with an iterative convergence loop:
+
+```
+L2_INIT → L2_GENERATE_PATCH → L2_RUN_VALIDATION → L2_CLASSIFY_FAILURE
+     ↑                                                      |
+     |                                                      v
+     +------------ L2_BUILD_REPAIR_PROMPT ←---- L2_DECIDE_RETRY
+                                                      |
+                                              (max iters or converged)
+                                                      v
+                                              L2_CONVERGED / L2_STOPPED
+```
+
+Each iteration:
+1. **Generate patch** with failure context (error messages, failing tests)
+2. **Run validation** in sandbox (pytest on affected files)
+3. **Classify failure** (syntax, test, environment, flaky)
+4. **Evaluate progress** (new failures? same failures? oscillation?)
+5. **Decide retry** (progress streak? class-specific retry budget?)
+6. **Build repair prompt** with specific failure analysis
+
+Kill conditions: deadline exhaustion, timebox (120s), max iterations (5),
+no-progress streak (2), oscillation detection (signature hash matching).
+
+**Configuration**:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `JARVIS_L2_ENABLED` | `false` | Master switch for L2 repair |
+| `JARVIS_L2_MAX_ITERS` | `5` | Max repair iterations |
+| `JARVIS_L2_TIMEBOX_S` | `120` | Total wall-clock budget |
+| `JARVIS_L2_ITER_TEST_TIMEOUT_S` | `60` | Per-iteration test timeout |
+| `JARVIS_L2_MAX_DIFF_LINES` | `150` | Max diff size per iteration |
+| `JARVIS_L2_MAX_FILES_CHANGED` | `3` | Max files per repair patch |
+
+### How Venom Works with Ouroboros
+
+```
+Ouroboros GENERATE phase
+    ├── Provider.generate() called with tool_loop attached
+    │   └── ToolLoopCoordinator.run()
+    │       ├── Turn 1: Model reads target files (read_file tool)
+    │       ├── Turn 2: Model searches for related code (search_code)
+    │       ├── Turn 3: Model generates patch with full context
+    │       └── Turn 4: Model runs tests to verify (run_tests)
+    │
+    ├── VALIDATE phase: run tests on candidate patch
+    │
+    └── If validation fails → L2 Repair Engine activates
+        ├── Iteration 1: Analyze failure, generate fix
+        ├── Iteration 2: Test fix, classify remaining failures
+        ├── Iteration 3: Revise based on specific test errors
+        └── ... up to 5 iterations or convergence
+```
+
+---
+
+## Trinity Consciousness: The Metacognition Layer
+
+**Source**: `backend/core/ouroboros/consciousness/`
+
+Trinity Consciousness is **Zone 6.11** -- the self-awareness layer that gives
+Ouroboros episodic memory, failure prediction, and adaptive risk assessment.
+It is the **soul** of the organism (Manifesto Section 4: "The Synthetic Soul").
+
+### Architecture: 4 Engines + 3 Awareness Fusion
+
+```
+┌─────────────────────────────────────────────────┐
+│              Trinity Consciousness               │
+│                                                  │
+│  Core Engines:                                   │
+│  ├── HealthCortex (30s health polling)           │
+│  ├── MemoryEngine (episodic outcomes, 168h TTL)  │
+│  ├── DreamEngine (idle-time improvement plans)   │
+│  └── ProphecyEngine (regression prediction)      │
+│                                                  │
+│  Awareness Fusion:                               │
+│  ├── CAI (Contextual Awareness Intelligence)     │
+│  ├── SAI (Situational Awareness Intelligence)    │
+│  └── UAE (Unified Awareness Engine)              │
+│                                                  │
+│  Integration:                                    │
+│  └── ConsciousnessBridge (5 methods → pipeline)  │
+└─────────────────────────────────────────────────┘
+```
+
+### ConsciousnessBridge Integration Points
+
+| Method | Phase | What it does |
+|--------|-------|-------------|
+| `assess_regression_risk()` | CLASSIFY | Queries ProphecyEngine + MemoryEngine. Elevates risk to HIGH if target files have success_rate < 0.5 |
+| `get_fragile_file_context()` | GENERATE RETRY | Returns markdown context about historically fragile files for prompt injection |
+| `is_system_healthy_for_exploration()` | Intake gating | Returns (healthy, reason) from HealthCortex for ProactiveDriveService |
+| `record_operation_outcome()` | POST-APPLY | Feeds op_id, files, success/failure back into MemoryEngine for cross-session learning |
+| `assess_operation_awareness()` | PRE-GENERATE | Returns UAE OperationAwareness: risk, confidence, suggested provider tier, thinking budget, prompt injection |
+
+### Core Engines
+
+**MemoryEngine** (`memory_engine.py`, 680 lines):
+- Ingests terminal operation outcomes (APPLIED, FAILED, ROLLED_BACK)
+- Builds `FileReputation`: success_rate, fragility_score, co_failures per file
+- Persists to `~/.jarvis/ouroboros/consciousness/` (insights.jsonl, file_reputations.json)
+- TTL-based decay: 168 hours default
+
+**ProphecyEngine** (`prophecy_engine.py`, 402 lines):
+- Heuristic-only failure predictor (no LLM)
+- Risk score: `(1-success_rate)*0.3 + fragility*0.3 + dependents/20*0.2 + 0.1`
+- Risk levels: LOW (<0.3), MEDIUM (<0.6), HIGH (<0.8), CRITICAL (>=0.8)
+- Confidence capped at 0.6 (heuristic-only)
+
+**HealthCortex** (`health_cortex.py`, 668 lines):
+- Polls JARVIS, PRIME, Reactor health every 30s
+- Rolling HealthTrend (720 snapshots = 6 hours)
+- Output: TrinityHealthSnapshot with overall_score, resource pressure
+
+**DreamEngine** (`dream_engine.py`, 731 lines):
+- Pre-computes ImprovementBlueprint during idle time (>300s)
+- Daily budget: 120 minutes
+- Blueprints keyed on (repo_sha, policy_hash)
+
+### Awareness Fusion Engines
+
+**CAI (Contextual Awareness)** (`contextual_awareness.py`, 879 lines):
+- Discovers hotspots, coupling, drift from MemoryEngine data
+- Background analysis every 300s
+- Output: ContextAssessment with relevant insights, complexity estimate
+
+**SAI (Situational Awareness)** (`situational_awareness.py`, 1333 lines):
+- Tracks temporal patterns and causal chains
+- Detects post-deploy cascades, time-correlated behaviors
+- Output: SituationAssessment with timing advice, risk modifiers
+
+**UAE (Unified Awareness)** (`unified_awareness.py`, 1232 lines):
+- Fuses CAI + SAI into holistic state
+- Output: `OperationAwareness` with suggested_provider_tier, thinking_budget, prompt_injection
+- Awareness levels: DORMANT, OBSERVING, ATTENTIVE, FOCUSED, HYPERAWARE
+
+### The Complete Loop
+
+```
+Trinity Consciousness (soul — WHY evolve?)
+    │  MemoryEngine: "tests/test_utils.py has failed 60% of the time"
+    │  ProphecyEngine: "HIGH regression risk for this file"
+    │  UAE: "FOCUSED awareness, suggest extended thinking budget"
+    │
+    ▼
+Ouroboros Pipeline (skeleton — WHAT to do, safely)
+    │  CLASSIFY: risk elevated to HIGH based on file reputation
+    │  ROUTE: UAE suggests tier1 (Claude) for extended reasoning
+    │  EXPAND: Oracle enriches context with related files
+    │
+    ▼
+Venom Agentic Loop (nervous system — HOW to do it)
+    │  Turn 1: read_file(tests/test_utils.py) → understands the test
+    │  Turn 2: search_code("def widget_") → finds the function
+    │  Turn 3: generates fix with full context
+    │  Turn 4: run_tests(tests/test_utils.py) → verifies fix
+    │  L2 Repair: if tests fail, classify error, revise, retry (5x)
+    │
+    ▼
+Code Applied, Tests Pass, Operation COMPLETE
+    │
+    ▼
+Trinity Consciousness (learns from outcome)
+    │  MemoryEngine: records success → file reputation improves
+    │  Next time: ProphecyEngine predicts LOWER risk for this file
+```
+
+---
+
 ## Multi-Repo Support
 
 Ouroboros operates across three repositories simultaneously:
