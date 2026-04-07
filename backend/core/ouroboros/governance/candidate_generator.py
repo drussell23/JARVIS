@@ -615,6 +615,8 @@ class CandidateGenerator:
         self._completed_batches: dict[str, Any] = {}
         # Background polling tasks (kept to prevent GC)
         self._background_polls: dict[str, asyncio.Task[Any]] = {}
+        # Cap concurrent background polls to avoid connector exhaustion
+        self._max_background_polls: int = 3
 
     async def generate(
         self,
@@ -720,12 +722,26 @@ class CandidateGenerator:
                                 "cross_repo": _is_cross_repo,
                             },
                         )
-                        # Fire background poll — result stored when ready
-                        task = asyncio.create_task(
-                            self._background_poll_tier0(pending, context),
-                            name=f"dw-poll-{pending.batch_id[:12]}",
-                        )
-                        self._background_polls[_op_id] = task
+                        # Fire background poll — result stored when ready.
+                        # Cap concurrent polls to avoid connector exhaustion.
+                        # Prune completed tasks first.
+                        self._background_polls = {
+                            k: t for k, t in self._background_polls.items()
+                            if not t.done()
+                        }
+                        if len(self._background_polls) >= self._max_background_polls:
+                            logger.info(
+                                "[CandidateGenerator] Skipping background poll — "
+                                "%d/%d already in flight",
+                                len(self._background_polls),
+                                self._max_background_polls,
+                            )
+                        else:
+                            task = asyncio.create_task(
+                                self._background_poll_tier0(pending, context),
+                                name=f"dw-poll-{pending.batch_id[:12]}",
+                            )
+                            self._background_polls[_op_id] = task
                     else:
                         logger.info(
                             "[CandidateGenerator] Tier 0 batch submission failed, "

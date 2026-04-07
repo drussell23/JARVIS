@@ -554,11 +554,15 @@ class DoublewordProvider:
 
     async def _poll_batch(self, batch_id: str) -> Optional[str]:
         """Stage 3: Poll until batch completes. Returns output_file_id or None."""
-        session = await self._get_session()
         deadline = time.monotonic() + _DW_MAX_WAIT_S
 
         while time.monotonic() < deadline:
             try:
+                # Re-acquire session each iteration: if the connector was
+                # poisoned by a CancelledError on a prior iteration,
+                # _get_session() detects session.closed and creates a fresh one.
+                session = await self._get_session()
+
                 _rl_t0 = time.monotonic()
                 if self._rate_limiter is not None:
                     try:
