@@ -698,7 +698,7 @@ def _build_codegen_prompt(
             file_sections.append(f"## File: {raw_path}\n[BLOCKED: {exc}]\n")
             continue
 
-        content = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+        content = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.is_file() else ""
         source_hash = _file_source_hash(content)
         size_bytes = len(content.encode())
         line_count = content.count("\n")
@@ -2026,7 +2026,7 @@ class PrimeProvider:
             source_path = context.target_files[0]
             abs_path = (repo_root / source_path) if repo_root else Path(source_path)
             try:
-                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.is_file() else ""
                 source_hash = _file_source_hash(content_bytes)
             except OSError:
                 pass
@@ -2337,7 +2337,7 @@ class ClaudeProvider:
         if source_path:
             abs_path = (repo_root / source_path) if repo_root else Path(source_path)
             try:
-                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else ""
+                content_bytes = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.is_file() else ""
                 source_hash = _file_source_hash(content_bytes)
             except OSError:
                 pass
