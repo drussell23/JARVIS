@@ -297,17 +297,95 @@ J-Prime brain inventory against `brain_selection_policy.yaml`:
 
 ---
 
+## Adaptive Failback & Predictive Recovery
+
+**Source**: `backend/core/ouroboros/governance/candidate_generator.py`
+
+The `CandidateGenerator` uses a `FailbackStateMachine` enhanced with
+**failure-mode classification** and **exponential backoff recovery prediction**.
+
+### FailbackStateMachine States
+
+```
+PRIMARY_READY ----[failure]----> FALLBACK_ACTIVE
+     ^                               |    |
+     |                               |    +--[permanent failure]--> QUEUE_ONLY
+     |                       [probe success]                           |
+     |                               |                        [probe success]
+     |                               v                                 |
+     +---[N probes + dwell]--- PRIMARY_DEGRADED  <---------------------+
+```
+
+### Failure Mode Classification
+
+Exceptions are classified by `FailbackStateMachine.classify_exception()`:
+
+| Mode | Recovery Base | Max | Triggers |
+|------|-------------|-----|----------|
+| `RATE_LIMITED` | 15s | 120s | HTTP 429, `CircuitBreakerOpen` |
+| `TIMEOUT` | 45s | 300s | `asyncio.TimeoutError`, connection timeout |
+| `SERVER_ERROR` | 60s | 600s | HTTP 500/502/503 |
+| `CONNECTION_ERROR` | 120s | 900s | Host unreachable, DNS failure |
+| `CONTENT_FAILURE` | 0s | 0s | Bad model output (no infra penalty) |
+
+### Recovery Prediction
+
+```
+recovery_eta = last_failure_at + base_s * 2^(consecutive_failures - 1)
+```
+
+Capped at `max_s`. The `should_attempt_primary()` method returns `True`
+when the recovery window has elapsed, enabling the system to eagerly
+return to the cheap provider.
+
+### Self-Healing: QUEUE_ONLY Auto-Recovery
+
+- **Transient failures** (TIMEOUT, RATE_LIMITED, SERVER_ERROR) stay in
+  `FALLBACK_ACTIVE` — the next operation retries both providers
+- **Permanent failures** (CONNECTION_ERROR on both) → `QUEUE_ONLY`
+- `QUEUE_ONLY` **auto-recovers** when a health probe succeeds
+
+### DoublewordProvider Resilience
+
+| Feature | Implementation |
+|---------|---------------|
+| Per-request timeouts | `ClientTimeout(total=120s, connect=30s)` on every HTTP call |
+| Connector recovery | Detects poisoned aiohttp connector (`_closed=True`), creates fresh session |
+| Session re-acquire | `_poll_batch()` gets fresh session each iteration |
+| Concurrent poll cap | Max 3 background poll tasks to prevent connector saturation |
+| RateLimitService | Circuit breaker + token bucket + predictive throttle (wired at boot) |
+| Cost gating | `DOUBLEWORD_MAX_COST_PER_OP=$0.10`, `DOUBLEWORD_DAILY_BUDGET=$5.00` |
+
+---
+
 ## Environment Variables
+
+### Provider Keys
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `DOUBLEWORD_API_KEY` | (none) | Enables Tier 0 Doubleword routing |
 | `DOUBLEWORD_BASE_URL` | `https://api.doubleword.ai/v1` | Doubleword API endpoint |
-| `DOUBLEWORD_MODEL` | `Qwen/Qwen3.5-35B-A3B-FP8` | Default Doubleword model |
+| `DOUBLEWORD_MODEL` | `Qwen/Qwen3.5-397B-A17B-FP8` | Default Doubleword model |
+| `DOUBLEWORD_MAX_COST_PER_OP` | `0.10` | Per-operation cost cap (USD) |
+| `DOUBLEWORD_DAILY_BUDGET` | `5.00` | Daily budget (USD) |
+| `DOUBLEWORD_CONNECT_TIMEOUT_S` | `30` | TCP connect timeout (seconds) |
+| `DOUBLEWORD_REQUEST_TIMEOUT_S` | `120` | Total request timeout (seconds) |
 | `ANTHROPIC_API_KEY` | (required) | Enables Tier 1 Claude API |
-| `CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Default Claude model |
-| `OUROBOROS_GCP_DAILY_BUDGET` | `0.50` | Daily cost gate budget (USD) |
-| `OUROBOROS_COST_STATE_PATH` | `~/.jarvis/ouroboros/cost_state.json` | Cost tracker file |
+| `JARVIS_GOVERNED_CLAUDE_MODEL` | `claude-sonnet-4-20250514` | Claude model |
+| `JARVIS_GOVERNED_CLAUDE_MAX_COST_PER_OP` | `0.50` | Claude per-op cost cap |
+| `JARVIS_GOVERNED_CLAUDE_DAILY_BUDGET` | `10.00` | Claude daily budget |
+
+### Routing & Recovery
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `OUROBOROS_TIER0_BUDGET_FRACTION` | `0.50` | Fraction of deadline for Tier 0 |
+| `OUROBOROS_TIER0_MAX_WAIT_S` | `90` | Absolute max Tier 0 wait |
+| `OUROBOROS_TIER1_MIN_RESERVE_S` | `45` | Minimum reserved for Tier 1 |
+| `OUROBOROS_PRIMARY_BUDGET_FRACTION` | `0.65` | Primary's share within Tier 1 |
+| `OUROBOROS_FALLBACK_MIN_RESERVE_S` | `20` | Minimum reserved for fallback |
+| `OUROBOROS_GCP_DAILY_BUDGET` | `0.50` | GCP daily cost gate budget (USD) |
 | `OUROBOROS_SAI_DOWNGRADE_THRESHOLD` | `0.6` | SAI backpressure downgrade trigger |
 | `PRIME_LOCAL_TIMEOUT` | `30` | Local inference timeout (seconds) |
 | `PRIME_GCP_TIMEOUT` | `120` | GCP inference timeout (seconds) |
@@ -323,6 +401,9 @@ J-Prime brain inventory against `brain_selection_policy.yaml`:
 | `backend/core/prime_client.py` | HTTP client to J-Prime with circuit breakers |
 | `backend/core/ouroboros/governance/brain_selector.py` | 3-layer deterministic brain gate |
 | `backend/core/ouroboros/governance/route_decision_service.py` | CAI/SAI intelligence-aware routing |
+| `backend/core/ouroboros/governance/candidate_generator.py` | Adaptive failback FSM, FailureMode, recovery prediction |
+| `backend/core/ouroboros/governance/doubleword_provider.py` | DoublewordProvider (Tier 0 batch API) |
+| `backend/core/ouroboros/governance/rate_limiter.py` | RateLimitService, circuit breaker, token bucket |
 | `backend/core/interactive_brain_router.py` | Interactive task brain routing |
 | `backend/core/ouroboros/governance/brain_selection_policy.yaml` | Hot-reloadable routing policy |
 | `backend/core/ouroboros/governance/providers.py` | PrimeProvider + ClaudeProvider adapters |

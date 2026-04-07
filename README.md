@@ -55,6 +55,9 @@ When the organism hits a **capability gap**, it must synthesize a **just-in-time
 
 - **Ephemeral tools** — one-off generated code or scripts run in the **sandbox** (Reactor Core), then discarded.
 - **Persistent assimilation** — if the same ephemeral capability is exercised successfully and **repeated** (e.g. graduation threshold such as **count ≥ 3**), **GraduationOrchestrator** proposes **permanent** integration: tests, validation, and a **secure Git PR** into the OS DNA.
+- **Unified Event Spine** — a `FileWatchGuard` (watchdog) watches the repo root and publishes file change events to `TrinityEventBus`. Intake sensors react to code changes, test results, and git commits in **sub-second time** instead of polling. The event spine bridges `GapSignalBus`, `EventEmitter`, and `EventChannelServer` into a single topic-based pub-sub system (MQTT-style wildcards, priority queues, WAL persistence, cross-repo transport).
+- **Adaptive provider routing** — DoubleWord 397B ($0.10/$0.40 per M tokens) is always tried first. When it fails, the `FailbackStateMachine` classifies the failure mode (rate limit, timeout, connection error) and predicts recovery time via exponential backoff. Claude ($3/$15 per M) is used only during predicted downtime. The system eagerly returns to the cheap provider when recovery is likely. `QUEUE_ONLY` auto-recovers when a health probe succeeds.
+- **Battle Test Runner** — `scripts/ouroboros_battle_test.py` boots the full stack as a headless daemon with real API cost tracking ($0.50 default cap), adaptive idle timeout, and structured test results via a pytest plugin.
 
 **7. Absolute observability (systemic transparency)**  
 Autonomous decisions must be **visible**. A **TelemetryBus** (and related emitters) broadcasts decisions, state transitions, and errors into **live dashboards** and, where appropriate, **voice narration** — the circulatory and reporting layer of the symbiote.
