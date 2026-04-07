@@ -100,6 +100,44 @@ class CrossRepoDriftSensor:
         if self._task and not self._task.done():
             self._task.cancel()
 
+    # ------------------------------------------------------------------
+    # Event-driven path (Manifesto §3: zero polling, pure reflex)
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_bus(self, event_bus: Any) -> None:
+        """Subscribe to file system events for instant drift detection."""
+        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        logger.info("[DriftSensor] Subscribed to fs.changed.* events")
+
+    async def _on_fs_event(self, event: Any) -> None:
+        """React to git commit or contract file changes."""
+        rel_path = event.payload.get("relative_path", "")
+
+        # Git commit event → check if contract files changed
+        if rel_path.endswith("git_events.json") and ".jarvis" in rel_path:
+            import json
+            try:
+                data = json.loads(Path(event.payload["path"]).read_text())
+                changed = data.get("changed_files", [])
+                # Check if any changed file is a contract file we track
+                if any(f in self._baselines for f in changed):
+                    logger.debug("[DriftSensor] Contract file changed in commit, rescanning")
+                    await self.scan_once()
+            except Exception:
+                logger.debug("[DriftSensor] Failed to read git event", exc_info=True)
+            return
+
+        # Direct contract file change → rescan
+        if rel_path in self._baselines:
+            try:
+                await self.scan_once()
+            except Exception:
+                logger.debug("[DriftSensor] Event-driven scan error", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Poll fallback
+    # ------------------------------------------------------------------
+
     async def _poll_loop(self) -> None:
         await asyncio.sleep(300.0)  # Let repos settle after boot
         while self._running:

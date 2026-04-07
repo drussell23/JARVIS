@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""
+JARVIS Post-Commit Hook — Event Spine Integration (Phase 3)
+============================================================
+
+Writes structured commit metadata to ``.jarvis/git_events.json`` after
+every commit.  The FileSystemEventBridge detects this file change and
+publishes ``fs.changed.modified`` to TrinityEventBus, where sensors
+(DocStaleness, CrossRepoDrift) react in sub-second time.
+
+This hook has ZERO runtime dependencies on the JARVIS backend — it uses
+only stdlib + git.  The async integration happens on the consumer side.
+
+Install::
+
+    python3 scripts/install_hooks.py install
+
+Disable via env var::
+
+    JARVIS_POST_COMMIT_HOOK_DISABLED=1 git commit -m "..."
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import tempfile
+import time
+from pathlib import Path
+
+
+def main() -> None:
+    if os.environ.get("JARVIS_POST_COMMIT_HOOK_DISABLED", "").strip() in ("1", "true"):
+        return
+
+    repo_root = Path(
+        subprocess.check_output(
+            ["git", "rev-parse", "--show-toplevel"],
+            text=True,
+        ).strip()
+    )
+    jarvis_dir = repo_root / ".jarvis"
+    jarvis_dir.mkdir(parents=True, exist_ok=True)
+
+    # Gather commit metadata
+    try:
+        commit_hash = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True,
+        ).strip()
+    except Exception:
+        commit_hash = "unknown"
+
+    try:
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True,
+        ).strip()
+    except Exception:
+        branch = "unknown"
+
+    try:
+        author = subprocess.check_output(
+            ["git", "log", "-1", "--format=%an"], text=True,
+        ).strip()
+    except Exception:
+        author = "unknown"
+
+    try:
+        message = subprocess.check_output(
+            ["git", "log", "-1", "--format=%s"], text=True,
+        ).strip()
+    except Exception:
+        message = ""
+
+    try:
+        changed_files = subprocess.check_output(
+            ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+            text=True,
+        ).strip().split("\n")
+        changed_files = [f for f in changed_files if f]
+    except Exception:
+        changed_files = []
+
+    event = {
+        "schema_version": 1,
+        "event": "commit",
+        "timestamp": time.time(),
+        "commit_hash": commit_hash,
+        "branch": branch,
+        "author": author,
+        "changed_files": changed_files,
+        "message_first_line": message[:200],
+        "py_files_changed": [f for f in changed_files if f.endswith(".py")],
+        "doc_files_changed": [
+            f for f in changed_files
+            if f.endswith((".md", ".rst", ".txt"))
+        ],
+    }
+
+    # Atomic write
+    output_path = jarvis_dir / "git_events.json"
+    try:
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(jarvis_dir), suffix=".tmp", prefix=".git_events_",
+        )
+        with os.fdopen(fd, "w") as f:
+            json.dump(event, f, indent=2)
+        os.replace(tmp_path, str(output_path))
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()

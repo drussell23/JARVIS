@@ -141,6 +141,9 @@ class GapSignalBus:
 
         If the queue is already at capacity the event is dropped and a WARNING
         is logged so operators can tune ``maxsize`` or consumer throughput.
+
+        Phase 4 Event Spine: also bridges the event to TrinityEventBus for
+        cross-repo visibility (fire-and-forget, non-fatal).
         """
         try:
             self._queue.put_nowait(event)
@@ -153,6 +156,40 @@ class GapSignalBus:
                 event.source,
                 event.goal,
             )
+
+        # Bridge to TrinityEventBus for unified event spine
+        self._bridge_to_spine(event)
+
+    def _bridge_to_spine(self, event: CapabilityGapEvent) -> None:
+        """Forward gap event to TrinityEventBus (fire-and-forget)."""
+        try:
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return
+            # Schedule async publish from sync context
+            import asyncio as _aio
+            try:
+                loop = _aio.get_running_loop()
+            except RuntimeError:
+                return  # No event loop — skip bridge
+            loop.call_soon_threadsafe(
+                _aio.ensure_future,
+                bus.publish_raw(
+                    topic="gap.detected",
+                    data={
+                        "goal": event.goal,
+                        "task_type": event.task_type,
+                        "target_app": event.target_app,
+                        "source": event.source,
+                        "domain_id": event.domain_id,
+                        "dedupe_key": event.dedupe_key,
+                    },
+                    persist=True,
+                ),
+            )
+        except Exception:
+            pass  # Bridge failures are non-fatal
 
     # ------------------------------------------------------------------
     # Consumer side

@@ -137,6 +137,29 @@ class EventEmitter:
         # Always update cursor, even if no subscribers or if handlers failed
         self._last_event_id = event.event_id
 
+        # Phase 4 Event Spine: bridge to TrinityEventBus for unified visibility
+        await self._bridge_to_spine(event)
+
+    async def _bridge_to_spine(self, event: EventEnvelope) -> None:
+        """Forward autonomy event to TrinityEventBus (non-fatal)."""
+        try:
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is None:
+                return
+            key = (
+                event.event_type.value
+                if isinstance(event.event_type, EventType)
+                else str(event.event_type)
+            )
+            await bus.publish_raw(
+                topic=f"autonomy.{key}",
+                data=event.payload if hasattr(event, "payload") else {},
+                persist=False,  # High-volume autonomy events skip WAL
+            )
+        except Exception:
+            pass  # Bridge failures are non-fatal
+
     # ------------------------------------------------------------------
     # last_event_id
     # ------------------------------------------------------------------

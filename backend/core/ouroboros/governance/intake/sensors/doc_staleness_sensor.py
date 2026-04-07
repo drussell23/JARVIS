@@ -92,6 +92,44 @@ class DocStalenessSensor:
 
     def stop(self) -> None:
         self._running = False
+
+    # ------------------------------------------------------------------
+    # Event-driven path (Manifesto §3: zero polling, pure reflex)
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_bus(self, event_bus: Any) -> None:
+        """Subscribe to file system events for instant staleness detection."""
+        await event_bus.subscribe("fs.changed.*", self._on_fs_event)
+        logger.info("[DocSensor] Subscribed to fs.changed.* events")
+
+    async def _on_fs_event(self, event: Any) -> None:
+        """React to file changes — rescan on git commit or .py change."""
+        rel_path = event.payload.get("relative_path", "")
+
+        # Git commit event → rescan changed Python files
+        if rel_path.endswith("git_events.json") and ".jarvis" in rel_path:
+            await self._on_git_event(event)
+            return
+
+        # Direct .py file change → rescan that file
+        if event.payload.get("extension") == ".py":
+            if event.topic != "fs.changed.deleted":
+                try:
+                    await self.scan_once()  # Full rescan (simple, correct)
+                except Exception:
+                    logger.debug("[DocSensor] Event-driven scan error", exc_info=True)
+
+    async def _on_git_event(self, event: Any) -> None:
+        """React to git commit — rescan if Python files changed."""
+        import json
+        try:
+            data = json.loads(Path(event.payload["path"]).read_text())
+            py_files = data.get("py_files_changed", [])
+            if py_files:
+                logger.debug("[DocSensor] Git commit changed %d .py files, rescanning", len(py_files))
+                await self.scan_once()
+        except Exception:
+            logger.debug("[DocSensor] Failed to read git event", exc_info=True)
         if self._task and not self._task.done():
             self._task.cancel()
 

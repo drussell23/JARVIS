@@ -285,6 +285,25 @@ class EventChannelServer:
         except Exception:
             logger.debug("[EventChannel] Route failed", exc_info=True)
 
+        # Phase 4 Event Spine: bridge to TrinityEventBus for cross-repo visibility
+        try:
+            from backend.core.trinity_event_bus import get_event_bus_if_exists
+            bus = get_event_bus_if_exists()
+            if bus is not None:
+                await bus.publish_raw(
+                    topic=f"webhook.{event.source}",
+                    data={
+                        "source": event.source,
+                        "event_type": event.event_type,
+                        "urgency": urgency,
+                        "description": description,
+                        "payload_keys": list(event.payload.keys())[:10],
+                    },
+                    persist=True,
+                )
+        except Exception:
+            pass  # Bridge failures are non-fatal
+
     def _classify_event(
         self, event: ChannelEvent,
     ) -> Tuple[str, str, Tuple[str, ...], str]:

@@ -68,7 +68,7 @@ def get_source_hooks_dir() -> Path:
     return Path(__file__).resolve().parent / "hooks"
 
 
-HOOKS_TO_INSTALL = ["pre-commit", "commit-msg"]
+HOOKS_TO_INSTALL = ["pre-commit", "commit-msg", "post-commit"]
 
 
 def backup_hook(hooks_dir: Path, hook_name: str) -> bool:
