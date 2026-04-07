@@ -97,7 +97,7 @@ This makes the RSI process a **homogeneous Markov chain**:
 From program $p_i$ with generation weights $w_i$ :
 
 ```math
-T(p_i \to p_j) = \begin{cases} w_i[j] & \text{if } S(p_j) < S(p_i) \quad \text{(accept)} \\ 0 & \text{if } S(p_j) \geq S(p_i) \quad \text{(reject)} \end{cases}
+T(p_i \to p_j) = \begin{cases} w_i[j] & \text{if } S(p_j) \lt S(p_i) \quad \text{(accept)} \\ 0 & \text{if } S(p_j) \geq S(p_i) \quad \text{(reject)} \end{cases}
 ```
 
 The self-loop absorbs all rejected mass:
@@ -144,7 +144,7 @@ Wang's central contribution: showing how to **construct** a consistent score fun
 
 > **Definition (Consistency).** A score function $S$ is **consistent** if for all $p, p' \in P$ :
 >
-> $S(p) > S(p') \quad\Longrightarrow\quad \mathbb{E}[\text{steps}(p \to p^{\ast})] > \mathbb{E}[\text{steps}(p' \to p^{\ast})]$
+> $S(p) \gt S(p') \quad\Longrightarrow\quad \mathbb{E}[\text{steps}(p \to p^{\ast})] \gt \mathbb{E}[\text{steps}(p' \to p^{\ast})]$
 >
 > where $\mathbb{E}[\text{steps}]$ is computed under the RSI process that $S$ *itself* defines.
 
@@ -427,7 +427,7 @@ From $p_{i+1}$ under the step-$i$ chain, each round has two outcomes:
 This gives:
 
 ```math
-\tag{1} E = \left(1 - \sum_{k < i} q_{i+1,k}\right)(E + 1) + \sum_{k < i} q_{i+1,k}\left(S(p_k) + 1\right)
+E = \left(1 - \sum_{k \lt i} q_{i+1,k}\right)(E + 1) + \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right) \tag{1}
 ```
 
 ---
@@ -437,29 +437,29 @@ This gives:
 Expand equation $(1)$:
 
 ```math
-\begin{aligned} E = E + 1 &- \left(\sum_{k < i} q_{i+1,k}\right) E - \sum_{k < i} q_{i+1,k} \\ &+ \sum_{k < i} q_{i+1,k}\left(S(p_k) + 1\right) \end{aligned}
+\begin{aligned} E = E + 1 &- \left(\sum_{k \lt i} q_{i+1,k}\right) E - \sum_{k \lt i} q_{i+1,k} \\ &+ \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right) \end{aligned}
 ```
 
 Collect all $E$ terms on the left:
 
 ```math
-\tag{2} E \cdot \sum_{k < i} q_{i+1,k} = 1 - \sum_{k < i} q_{i+1,k} + \sum_{k < i} q_{i+1,k}\left(S(p_k) + 1\right)
+E \cdot \sum_{k \lt i} q_{i+1,k} = 1 - \sum_{k \lt i} q_{i+1,k} + \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right) \tag{2}
 ```
 
 Define two shorthand variables:
 
-> $b  \triangleq  \sum_{k < i} q_{i+1,k}$
+> $b  \triangleq  \sum_{k \lt i} q_{i+1,k}$
 >
 > *Total probability of generating an already-scored program.*
 
-> $a  \triangleq  1 - b  +  \sum_{k < i} q_{i+1,k}\left(S(p_k) + 1\right)$
+> $a  \triangleq  1 - b  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$
 >
 > *Numerator of the expected-steps formula.*
 
 Therefore:
 
 ```math
-\tag{3} \boxed{ E  =  \frac{a}{b} }
+\boxed{ E  =  \frac{a}{b} } \tag{3}
 ```
 
 ---
@@ -475,7 +475,7 @@ S(p_i)  \leq  E  =  \frac{a}{b}
 Multiplying both sides by $b \gt 0$ :
 
 ```math
-\tag{4} \boxed{ a \geq S(p_i) \cdot b } \qquad \star \textit{ Key Inequality}
+\boxed{ a \geq S(p_i) \cdot b } \qquad \star \textit{ Key Inequality} \tag{4}
 ```
 
 > This is the **linchpin** of the entire proof.
@@ -488,13 +488,13 @@ Multiplying both sides by $b \gt 0$ :
 At step $i+1$, program $p_i$ has been added with score $S(p_i)$. Now $p_{i+1}$ can transition to $p_1, \ldots, p_{i-1}$ **and also to $p_i$**. The updated recurrence:
 
 ```math
-\begin{aligned} S(p_{i+1}) = &\underbrace{\left(1 - \sum_{k < i} q_{i+1,k} - q_{i+1,i}\right)\left(S(p_{i+1}) + 1\right)}_{\text{self-loop}} \\ +\; &\underbrace{\sum_{k < i} q_{i+1,k}\left(S(p_k) + 1\right)}_{\text{to } p_1 \ldots p_{i-1}} \\ +\; &\underbrace{q_{i+1,i}\left(S(p_i) + 1\right)}_{\text{new: to } p_i} \end{aligned}
+\begin{aligned} S(p_{i+1}) = &\underbrace{\left(1 - \sum_{k \lt i} q_{i+1,k} - q_{i+1,i}\right)\left(S(p_{i+1}) + 1\right)}_{\text{self-loop}} \\ +\; &\underbrace{\sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)}_{\text{to } p_1 \ldots p_{i-1}} \\ +\; &\underbrace{q_{i+1,i}\left(S(p_i) + 1\right)}_{\text{new: to } p_i} \end{aligned}
 ```
 
 Solving (same algebra as Step C, with the additional $q_{i+1,i}$ term):
 
 ```math
-\tag{5} \boxed{ S(p_{i+1})  =  \frac{a  +  q_{i+1,i} \cdot S(p_i)}{b  +  q_{i+1,i}} }
+\boxed{ S(p_{i+1})  =  \frac{a  +  q_{i+1,i} \cdot S(p_i)}{b  +  q_{i+1,i}} } \tag{5}
 ```
 
 where $a$ and $b$ are the same quantities from Step C.
@@ -512,7 +512,7 @@ We need to show:
 \frac{a + q_{i+1,i} \cdot S(p_i)}{b + q_{i+1,i}}  \geq  S(p_i)
 ```
 
-Multiply both sides by $(b + q_{i+1,i}) > 0$ :
+Multiply both sides by $(b + q_{i+1,i}) \gt 0$ :
 
 ```math
 a + q_{i+1,i} \cdot S(p_i) \geq S(p_i) \cdot b + S(p_i) \cdot q_{i+1,i}
