@@ -477,6 +477,28 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] Consciousness regression check failed", exc_info=True)
 
+        # ---- Goal Memory injection (cross-session learning via ChromaDB) ----
+        _goal_memory_bridge = None
+        _gls_for_gmb = getattr(self._stack, "governed_loop_service", None)
+        if _gls_for_gmb is not None:
+            _goal_memory_bridge = getattr(_gls_for_gmb, "_goal_memory_bridge", None)
+        if _goal_memory_bridge is not None:
+            try:
+                _goal_ctx = await _goal_memory_bridge.get_relevant_context(
+                    description=ctx.description,
+                    target_files=ctx.target_files,
+                )
+                if _goal_ctx:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_existing + "\n\n" + _goal_ctx,
+                        strategic_memory_digest=ctx.strategic_memory_digest,
+                    )
+            except Exception:
+                logger.debug("[Orchestrator] Goal memory injection failed", exc_info=True)
+
         # ---- Policy engine check (declarative YAML rules) ----
         # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
         # explicit deny rules in policy files can override the risk engine.
