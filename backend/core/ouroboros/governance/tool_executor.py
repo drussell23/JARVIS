@@ -25,10 +25,13 @@ import dataclasses as _dc
 import enum
 import hashlib
 import json
+import logging
 import os
 import re
 import subprocess
 import time
+
+logger = logging.getLogger(__name__)
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, FrozenSet, List, Mapping, Optional, Protocol, Tuple, runtime_checkable
@@ -865,7 +868,21 @@ class ToolLoopCoordinator:
         current_prompt = prompt
         repo_root = self._policy.repo_root_for(repo)
 
-        for round_index in range(self._max_rounds):
+        # Deadline-based loop: iterate until the provider produces a final
+        # answer (no tool call) or the deadline expires. max_rounds is a
+        # safety ceiling, not the primary termination condition.
+        round_index = -1
+        while True:
+            round_index += 1
+
+            # Safety ceiling — prevent infinite loops even if deadline is far
+            if round_index >= self._max_rounds:
+                logger.warning(
+                    "[ToolLoop] Safety ceiling reached (%d rounds), returning last response",
+                    self._max_rounds,
+                )
+                break
+
             raw: str = await generate_fn(current_prompt)
             tc = parse_fn(raw)
             if tc is None:
@@ -938,4 +955,7 @@ class ToolLoopCoordinator:
             if len(current_prompt) > _MAX_PROMPT_CHARS:
                 raise RuntimeError(f"tool_loop_budget_exceeded:{len(current_prompt)}")
 
-        raise RuntimeError(f"tool_loop_max_rounds_exceeded:{self._max_rounds}")
+        # Safety ceiling reached — return last raw response instead of raising.
+        # The provider may have produced useful output in the final round.
+        self._last_records = list(records)
+        return raw, records

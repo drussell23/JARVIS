@@ -4,16 +4,29 @@ Queries ChromaDB-backed episodic and semantic memory for relevant context
 before code generation, and records operation outcomes after completion.
 This gives Ouroboros persistent cross-session goal awareness.
 
+Also maintains a **thought log** (`.jarvis/ouroboros_thoughts.jsonl`) that
+records the organism's reasoning process in human-readable form. This serves
+as the "conversation thread" the user can follow — Ouroboros explaining its
+decisions, what it remembers, and what it predicts.
+
 Boundary Principle (Manifesto §4 — The Synthetic Soul):
   Deterministic: Query format, similarity thresholds, prompt injection.
   Agentic: What the provider *does* with the memory context.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+_THOUGHT_LOG_PATH = Path(
+    os.environ.get("JARVIS_THOUGHT_LOG_PATH", ".jarvis/ouroboros_thoughts.jsonl")
+)
 
 
 class GoalMemoryBridge:
@@ -87,6 +100,17 @@ class GoalMemoryBridge:
                 return ""
 
             context = "\n".join(lines)
+
+            # Log thought so user can follow Ouroboros' memory retrieval
+            self.log_thought(
+                op_id="pre-generate",
+                phase="MEMORY_RECALL",
+                thought=(
+                    f"I found {len(results)} relevant memories for: {description[:100]}. "
+                    f"Using past experience to guide this generation."
+                ),
+                memories_used=len(results),
+            )
             logger.info(
                 "[GoalMemory] Injecting %d memories (query=%.60s...)",
                 len(results), query,
@@ -142,5 +166,49 @@ class GoalMemoryBridge:
                 },
             )
             logger.debug("[GoalMemory] Recorded outcome for op=%s", op_id)
+
+            # Log thought for user visibility
+            self.log_thought(
+                op_id=op_id,
+                phase="POST_APPLY",
+                thought=(
+                    f"{'Succeeded' if success else 'Failed'}: {description[:200]}. "
+                    f"{'I will remember this for next time.' if success else f'Failure: {failure_reason[:100]}. I will learn from this.'}"
+                ),
+            )
         except Exception:
             logger.debug("[GoalMemory] Record failed", exc_info=True)
+
+    # ------------------------------------------------------------------
+    # Thought Log — visible conversation thread for the user
+    # ------------------------------------------------------------------
+
+    def log_thought(
+        self,
+        op_id: str,
+        phase: str,
+        thought: str,
+        memories_used: int = 0,
+    ) -> None:
+        """Append a reasoning step to the thought log.
+
+        The thought log at ``.jarvis/ouroboros_thoughts.jsonl`` is a
+        human-readable JSONL file that shows Ouroboros' reasoning process
+        — what it remembers, what it predicts, what it decides, and why.
+        This is the "conversation thread" the user follows.
+        """
+        entry = {
+            "timestamp": time.time(),
+            "op_id": op_id,
+            "phase": phase,
+            "thought": thought,
+            "memories_used": memories_used,
+        }
+        try:
+            _THOUGHT_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with _THOUGHT_LOG_PATH.open("a") as f:
+                f.write(json.dumps(entry) + "\n")
+            # Also log to stdout so battle test -v shows it
+            logger.info("[Ouroboros Thought] [%s] %s", phase, thought)
+        except Exception:
+            pass  # Thought logging is non-critical

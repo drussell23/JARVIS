@@ -68,20 +68,46 @@ _BLOCKED_PREFIXES = (
 # ---------------------------------------------------------------------------
 
 _DEFAULT_ALLOWLIST: FrozenSet[str] = frozenset({
-    "python3", "python", "pip", "pip3",
-    "pytest", "mypy", "ruff", "black", "isort",
-    "git", "grep", "find", "ls", "cat", "head", "tail", "wc",
-    "echo", "printf", "date", "whoami", "pwd",
-    "npm", "npx", "node",
-    "make", "cmake",
-    "cargo", "rustc",
-    "go", "gofmt",
-    "curl", "wget",  # allowed for fetching (not piped to sh)
-    "jq", "sed", "awk", "sort", "uniq", "tr", "cut",
-    "diff", "patch",
-    "tar", "zip", "unzip", "gzip", "gunzip",
-    "du", "df", "free", "top", "ps",
-    "env", "printenv", "which", "type",
+    # Python ecosystem
+    "python3", "python", "pip", "pip3", "pipx", "poetry", "pdm", "uv",
+    "pytest", "mypy", "ruff", "black", "isort", "flake8", "pylint",
+    "pydoc", "sphinx-build", "coverage", "tox", "nox",
+    # JavaScript / Node
+    "npm", "npx", "node", "yarn", "pnpm", "bun", "deno", "tsx", "tsc",
+    # Git & version control
+    "git", "gh", "hub",
+    # Build systems
+    "make", "cmake", "ninja", "meson",
+    "cargo", "rustc", "rustfmt", "clippy",
+    "go", "gofmt", "golint",
+    "swift", "swiftc", "xcodebuild",
+    "gcc", "g++", "clang", "clang++",
+    # Shell utilities (read-only / analysis)
+    "grep", "rg", "ag", "find", "fd", "fzf",
+    "ls", "tree", "exa", "bat",
+    "cat", "head", "tail", "less", "more", "wc", "nl",
+    "echo", "printf", "date", "whoami", "pwd", "hostname", "uname",
+    "stat", "file", "md5", "shasum", "sha256sum", "base64",
+    # Text processing
+    "jq", "yq", "sed", "awk", "sort", "uniq", "tr", "cut", "paste",
+    "diff", "colordiff", "patch", "comm",
+    # Networking (fetch, not piped to sh — blocked by _BLOCKED_PREFIXES)
+    "curl", "wget", "httpie", "http",
+    "dig", "nslookup", "host", "ping", "traceroute",
+    # Archives
+    "tar", "zip", "unzip", "gzip", "gunzip", "bzip2", "xz", "zstd",
+    # System info (read-only)
+    "du", "df", "free", "top", "htop", "ps", "lsof", "netstat", "ss",
+    "env", "printenv", "which", "type", "whereis",
+    "sysctl", "vm_stat", "ioreg",
+    # Docker (inspect, not mutate — rm/kill blocked by prefix rules)
+    "docker", "docker-compose",
+    # Database CLIs (read-only inspection)
+    "sqlite3", "psql", "redis-cli",
+    # Misc developer tools
+    "jinja2", "cookiecutter", "pre-commit",
+    "terraform", "kubectl", "helm",
+    "ffmpeg", "ffprobe", "magick", "convert",
 })
 
 
