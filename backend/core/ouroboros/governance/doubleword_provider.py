@@ -44,6 +44,8 @@ _DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "10000"))
 _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "15"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
+_DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "30"))
+_DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "120"))
 
 # Pricing (March 2026)
 _DW_INPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_INPUT_COST_PER_M", "0.10"))
@@ -142,12 +144,22 @@ class DoublewordProvider:
             # inside a running event loop task. The default timeout parameter
             # triggers "Timeout context manager should be used inside a task".
             # Solution: create with connector only, no timeout object at all.
+            # Per-request timeouts are applied via _request_timeout() instead.
             connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
             self._session = aiohttp.ClientSession(
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 connector=connector,
             )
         return self._session
+
+    @staticmethod
+    def _request_timeout() -> "aiohttp.ClientTimeout":
+        """Per-request timeout safe to use inside aiohttp 3.9+ tasks."""
+        import aiohttp
+        return aiohttp.ClientTimeout(
+            total=_DW_REQUEST_TIMEOUT_S,
+            connect=_DW_CONNECT_TIMEOUT_S,
+        )
 
     # ------------------------------------------------------------------
     # Async decoupled API: submit_batch() + poll_and_retrieve()
@@ -425,6 +437,7 @@ class DoublewordProvider:
                 f"{self._base_url}/files",
                 data=data,
                 headers={"Authorization": f"Bearer {self._api_key}"},
+                timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
                     self._rate_limiter.record("doubleword", "files_upload",
@@ -458,6 +471,7 @@ class DoublewordProvider:
                     "completion_window": _DW_COMPLETION_WINDOW,
                 },
                 headers={"Content-Type": "application/json"},
+                timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
                     self._rate_limiter.record("doubleword", "batches_create",
@@ -488,6 +502,7 @@ class DoublewordProvider:
 
                 async with session.get(
                     f"{self._base_url}/batches/{batch_id}",
+                    timeout=self._request_timeout(),
                 ) as resp:
                     if self._rate_limiter is not None:
                         self._rate_limiter.record("doubleword", "batches_poll",
@@ -538,6 +553,7 @@ class DoublewordProvider:
         try:
             async with session.get(
                 f"{self._base_url}/files/{output_file_id}/content",
+                timeout=self._request_timeout(),
             ) as resp:
                 if self._rate_limiter is not None:
                     self._rate_limiter.record("doubleword", "batches_retrieve",
@@ -760,7 +776,7 @@ class DoublewordProvider:
             return False
         try:
             session = await self._get_session()
-            async with session.get(f"{self._base_url}/models") as resp:
+            async with session.get(f"{self._base_url}/models", timeout=self._request_timeout()) as resp:
                 return resp.status == 200
         except Exception:
             return False
