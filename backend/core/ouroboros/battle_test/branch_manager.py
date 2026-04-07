@@ -123,7 +123,9 @@ class BranchManager:
             f"Risk: {risk_tier}\n"
             f"Composite Score: {composite_score:.4f}\n"
             f"Technique: {technique}\n"
-            f"Auto-applied: true"
+            f"Auto-applied: true\n"
+            f"\n"
+            f"Co-Authored-By: Ouroboros Self-Development Engine <ouroboros@jarvis.trinity>"
         )
         self._git("commit", "-m", message)
 

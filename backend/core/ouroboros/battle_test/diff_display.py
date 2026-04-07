@@ -149,7 +149,7 @@ def _show_file_diff(repo_path: Path, file_path: str) -> None:
         print(f"  {_DIM}{file_path} (diff unavailable){_RESET}")
 
 
-def print_phase_update(op_id: str, phase: str, elapsed_s: float = 0.0) -> None:
+def print_phase_update(op_id: str, phase: str, elapsed_s: float = 0.0, detail: str = "") -> None:
     """Print a compact phase transition line."""
     short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
     phases_display = {
@@ -166,7 +166,52 @@ def print_phase_update(op_id: str, phase: str, elapsed_s: float = 0.0) -> None:
     }
     phase_str = phases_display.get(phase.upper(), phase)
     elapsed_str = f" ({elapsed_s:.0f}s)" if elapsed_s > 0 else ""
-    print(f"  {_DIM}op:{short_id}{_RESET} {phase_str}{elapsed_str}", flush=True)
+    detail_str = f" {_DIM}{detail}{_RESET}" if detail else ""
+    print(f"  {_DIM}op:{short_id}{_RESET} {phase_str}{elapsed_str}{detail_str}", flush=True)
+
+
+def print_file_write(op_id: str, file_path: str, action: str = "writing") -> None:
+    """Print when Ouroboros is writing to a specific file."""
+    short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
+    icon = f"{_GREEN}>{_RESET}" if action == "writing" else f"{_YELLOW}~{_RESET}"
+    print(f"  {_DIM}op:{short_id}{_RESET} {icon} {_WHITE}{file_path}{_RESET}", flush=True)
+
+
+def print_ouroboros_signature() -> None:
+    """Print the Ouroboros attribution line after a successful commit."""
+    print(f"  {_DIM}Co-Authored-By: Ouroboros Self-Development Engine{_RESET}", flush=True)
+
+
+def print_breaker_event(provider: str, endpoint: str, state: str, detail: str = "") -> None:
+    """Print circuit breaker state change."""
+    if state.upper() == "OPEN":
+        color = _RED
+    elif state.upper() == "HALF_OPEN":
+        color = _YELLOW
+    else:
+        color = _GREEN
+    detail_str = f" ({detail})" if detail else ""
+    print(
+        f"  {_BOLD}[BREAKER]{_RESET} {provider}:{endpoint} "
+        f"{color}{state.upper()}{_RESET}{detail_str}",
+        flush=True,
+    )
+
+
+def print_throttle_event(provider: str, endpoint: str, multiplier: float) -> None:
+    """Print throttle change event."""
+    pct = int(multiplier * 100)
+    if pct < 30:
+        color = _RED
+    elif pct < 70:
+        color = _YELLOW
+    else:
+        color = _GREEN
+    print(
+        f"  {_BOLD}[THROTTLE]{_RESET} {provider}:{endpoint} "
+        f"rate -> {color}{pct}%{_RESET}",
+        flush=True,
+    )
 
 
 class BattleDiffTransport:
@@ -181,7 +226,7 @@ class BattleDiffTransport:
         self._op_start_times: Dict[str, float] = {}
 
     async def send(self, msg: Any) -> None:
-        """Handle a CommMessage. Shows headers on INTENT, diffs on DECISION."""
+        """Handle a CommMessage. Shows headers, phases, file writes, diffs."""
         try:
             payload = msg.payload if hasattr(msg, "payload") else {}
             op_id = msg.op_id if hasattr(msg, "op_id") else ""
@@ -194,13 +239,27 @@ class BattleDiffTransport:
                     goal=payload.get("goal", ""),
                     target_files=payload.get("target_files", []),
                     risk_tier=payload.get("risk_tier", ""),
+                    sensor=payload.get("sensor", ""),
                 )
 
             elif msg_type == "HEARTBEAT":
                 phase = payload.get("phase", "")
                 if phase and ":" not in phase:  # Skip FSM internal states
                     elapsed = time.time() - self._op_start_times.get(op_id, time.time())
-                    print_phase_update(op_id, phase, elapsed)
+                    # Extract detail from payload for richer display
+                    detail = ""
+                    if "target_file" in payload:
+                        detail = payload["target_file"]
+                    elif "model" in payload:
+                        detail = f"model={payload['model']}"
+                    print_phase_update(op_id, phase, elapsed, detail)
+
+            elif msg_type == "PLAN":
+                # PLAN messages contain file-level details during GENERATE/APPLY
+                target_file = payload.get("target_file", "")
+                action = payload.get("action", "writing")
+                if target_file:
+                    print_file_write(op_id, target_file, action)
 
             elif msg_type == "DECISION":
                 outcome = payload.get("outcome", "")
@@ -215,6 +274,9 @@ class BattleDiffTransport:
                     duration_s=elapsed,
                     repo_path=self._repo_path,
                 )
+                # Ouroboros signature on successful operations
+                if outcome in ("completed", "applied", "auto_approved"):
+                    print_ouroboros_signature()
 
         except Exception:
             pass  # Never crash the pipeline for display issues
