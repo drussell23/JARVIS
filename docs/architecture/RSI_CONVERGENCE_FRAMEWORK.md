@@ -200,7 +200,9 @@ Using $P = \{p_1, p_2, p_3, p_4\}$ with generation weights from Section 2.2.
 
 ##### Step 0 — Initialize
 
-$$S(p_1) = 0, \qquad S(p_2) = \infty, \qquad S(p_3) = \infty, \qquad S(p_4) = \infty$$
+$$
+S(p_1) = 0, \quad S(p_2) = \infty, \quad S(p_3) = \infty, \quad S(p_4) = \infty
+$$
 
 Only $p_1$ has a finite score. Transition matrix $T^{(0)}$:
 
@@ -278,7 +280,14 @@ Updated transition matrix $T^{(1)}$:
 
 **Recompute $E_3$** &ensp; ($p_3$ can now reach $p_1$ directly *or* via $p_2$):
 
-$$E_3 = \underbrace{0.25 \cdot \left(S(p_1) + 1\right)}_{\text{generate } p_1}  +  \underbrace{0.25 \cdot \left(S(p_2) + 1\right)}_{\text{generate } p_2}  +  \underbrace{0.50 \cdot (E_3 + 1)}_{\text{self-loop}}$$
+$$
+\begin{aligned}
+E_3 =
+&\underbrace{0.25 \cdot \left(S(p_1) + 1\right)}_{\text{generate } p_1}
++ \underbrace{0.25 \cdot \left(S(p_2) + 1\right)}_{\text{generate } p_2} \\
++\; &\underbrace{0.50 \cdot (E_3 + 1)}_{\text{self-loop}}
+\end{aligned}
+$$
 
 $$E_3 = 0.25 \cdot 1 + 0.25 \cdot \tfrac{7}{3} + 0.50(E_3 + 1)$$
 
@@ -312,7 +321,11 @@ By the same procedure, $S(p_4)$ is computed last.
 
 ##### Summary of Construction
 
-$$S(p_1) = 0  \leq  S(p_2) = \frac{4}{3}  \leq  S(p_3) = \frac{8}{3}  \leq  S(p_4) \approx 3.06$$
+$$
+S(p_1) = 0 \leq S(p_2) = \tfrac{4}{3}
+\leq S(p_3) = \tfrac{8}{3}
+\leq S(p_4) \approx 3.06
+$$
 
 > **Properties verified:**
 > - Scores are nondecreasing. &ensp; $\checkmark$
@@ -380,7 +393,11 @@ From $p_{i+1}$ under the step-$i$ chain, each round has two outcomes:
 
 This gives:
 
-$$\tag{1} E  =  \left(1 - \sum_{k \lt i} q_{i+1,k}\right)(E + 1)  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$$
+$$
+\tag{1}
+E = \left(1 - \sum_{k \lt i} q_{i+1,k}\right)(E + 1)
++ \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)
+$$
 
 ---
 
@@ -388,11 +405,23 @@ $$\tag{1} E  =  \left(1 - \sum_{k \lt i} q_{i+1,k}\right)(E + 1)  +  \sum_{k \lt
 
 Expand equation $(1)$:
 
-$$E  =  E + 1  -  \left(\sum_{k \lt i} q_{i+1,k}\right) E  -  \sum_{k \lt i} q_{i+1,k}  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$$
+$$
+\begin{aligned}
+E = E + 1
+&- \left(\sum_{k \lt i} q_{i+1,k}\right) E
+- \sum_{k \lt i} q_{i+1,k} \\
+&+ \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)
+\end{aligned}
+$$
 
 Collect all $E$ terms on the left:
 
-$$\tag{2} E \cdot \sum_{k \lt i} q_{i+1,k}  =  1  -  \sum_{k \lt i} q_{i+1,k}  +  \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)$$
+$$
+\tag{2}
+E \cdot \sum_{k \lt i} q_{i+1,k}
+= 1 - \sum_{k \lt i} q_{i+1,k}
++ \sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)
+$$
 
 Define two shorthand variables:
 
@@ -429,7 +458,14 @@ $$\tag{4} \boxed{ a \geq S(p_i) \cdot b } \qquad \star \textit{ Key Inequality}$
 
 At step $i+1$, program $p_i$ has been added with score $S(p_i)$. Now $p_{i+1}$ can transition to $p_1, \ldots, p_{i-1}$ **and also to $p_i$**. The updated recurrence:
 
-$$S(p_{i+1}) = \underbrace{\left(1 - \sum_{k \lt i} q_{i+1,k} - q_{i+1,i}\right)\left(S(p_{i+1}) + 1\right)}_{\text{self-loop}} + \underbrace{\sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)}_{\text{to } p_1 \ldots p_{i-1}} + \underbrace{q_{i+1,i}\left(S(p_i) + 1\right)}_{\textbf{new: to } p_i}$$
+$$
+\begin{aligned}
+S(p_{i+1}) =
+&\underbrace{\left(1 - \sum_{k \lt i} q_{i+1,k} - q_{i+1,i}\right)\left(S(p_{i+1}) + 1\right)}_{\text{self-loop}} \\
++\; &\underbrace{\sum_{k \lt i} q_{i+1,k}\left(S(p_k) + 1\right)}_{\text{to } p_1 \ldots p_{i-1}} \\
++\; &\underbrace{q_{i+1,i}\left(S(p_i) + 1\right)}_{\text{new: to } p_i}
+\end{aligned}
+$$
 
 Solving (same algebra as Step C, with the additional $q_{i+1,i}$ term):
 
@@ -450,7 +486,9 @@ $$\frac{a + q_{i+1,i} \cdot S(p_i)}{b + q_{i+1,i}}  \geq  S(p_i)$$
 
 Multiply both sides by $(b + q_{i+1,i}) \gt 0$ :
 
-$$a + q_{i+1,i} \cdot S(p_i)  \geq  S(p_i) \cdot b  +  S(p_i) \cdot q_{i+1,i}$$
+$$
+a + q_{i+1,i} \cdot S(p_i) \geq S(p_i) \cdot b + S(p_i) \cdot q_{i+1,i}
+$$
 
 The $q_{i+1,i} \cdot S(p_i)$ terms appear on both sides — cancel them:
 
@@ -470,7 +508,10 @@ $$\blacksquare$$
 
 Equation $(5)$ reveals a clean geometric picture. Since $S(p_{i+1})$ is a weighted average:
 
-$$S(p_{i+1}) = \frac{b}{b + q_{i+1,i}} \cdot \underbrace{\frac{a}{b}}_{E} + \frac{q_{i+1,i}}{b + q_{i+1,i}} \cdot S(p_i)$$
+$$
+S(p_{i+1}) = \frac{b}{b + q_{i+1,i}} \cdot \underbrace{\frac{a}{b}}_{E}
++ \frac{q_{i+1,i}}{b + q_{i+1,i}} \cdot S(p_i)
+$$
 
 this is a **convex combination**, so the result lies between the two values:
 
