@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime, timezone
 from enum import Enum, auto
@@ -63,6 +64,23 @@ from backend.core.ouroboros.governance.op_context import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Deadline budget allocation — deterministic split (Manifesto §5)
+# ---------------------------------------------------------------------------
+# The skeleton (deterministic budget) decides how time is partitioned across
+# tiers; the nervous system (agentic providers) works within its allocation.
+# This prevents any single tier from starving downstream fallbacks.
+#
+# Tier 0 (DoubleWord batch): gets a capped fraction, MUST leave Tier 1 reserve.
+# Tier 1 primary (J-Prime): gets a capped fraction, MUST leave fallback reserve.
+# Tier 1 fallback (Claude): gets whatever remains — guaranteed minimum.
+
+_TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.50"))
+_TIER0_MAX_WAIT_S = float(os.environ.get("OUROBOROS_TIER0_MAX_WAIT_S", "90"))
+_TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "45"))
+_PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
+_FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "20"))
 
 # ---------------------------------------------------------------------------
 # Content failure classification
@@ -168,6 +186,33 @@ class FailbackState(Enum):
     QUEUE_ONLY = auto()
 
 
+class FailureMode(Enum):
+    """Classification of provider failure for recovery prediction.
+
+    Different failure modes have vastly different recovery profiles:
+    rate limits clear in seconds, connection errors take minutes to hours.
+    The FSM uses this to predict when the primary will be available again,
+    minimizing expensive fallback spend (Manifesto §5 — deterministic routing).
+    """
+
+    RATE_LIMITED = auto()       # 429, CircuitBreakerOpen — seconds to recover
+    TIMEOUT = auto()            # Request/connection timeout — minutes
+    SERVER_ERROR = auto()       # 500/502/503 — minutes
+    CONNECTION_ERROR = auto()   # Can't reach host — minutes to hours
+    CONTENT_FAILURE = auto()    # Bad output, infra healthy — no penalty
+
+
+# Mode-specific recovery parameters for exponential backoff.
+# base_s * 2^(consecutive_failures - 1), capped at max_s.
+_RECOVERY_PARAMS: dict[FailureMode, dict[str, float]] = {
+    FailureMode.RATE_LIMITED:    {"base_s": 15.0,  "max_s": 120.0},
+    FailureMode.TIMEOUT:         {"base_s": 45.0,  "max_s": 300.0},
+    FailureMode.SERVER_ERROR:    {"base_s": 60.0,  "max_s": 600.0},
+    FailureMode.CONNECTION_ERROR: {"base_s": 120.0, "max_s": 900.0},
+    FailureMode.CONTENT_FAILURE: {"base_s": 0.0,   "max_s": 0.0},
+}
+
+
 # ---------------------------------------------------------------------------
 # FailbackStateMachine
 # ---------------------------------------------------------------------------
@@ -201,16 +246,30 @@ class FailbackStateMachine:
         self._consecutive_probes: int = 0
         self._first_probe_at: Optional[float] = None  # monotonic timestamp
         self.content_failure_count: int = 0  # content/model failures (not infra)
+        # Adaptive recovery tracking (Manifesto §5 — deterministic routing)
+        self._failure_mode: Optional[FailureMode] = None
+        self._consecutive_failures: int = 0
+        self._last_failure_at: float = 0.0   # monotonic
+        self._last_success_at: float = 0.0   # monotonic
 
     @property
     def state(self) -> FailbackState:
         """Current FSM state."""
         return self._state
 
-    def record_primary_failure(self) -> None:
-        """Record a primary provider failure.
+    def record_primary_failure(
+        self, mode: FailureMode = FailureMode.TIMEOUT,
+    ) -> None:
+        """Record a primary provider failure with failure mode classification.
 
         Transitions immediately to FALLBACK_ACTIVE from any non-QUEUE_ONLY state.
+        Tracks failure mode for recovery prediction (Manifesto §5).
+
+        Parameters
+        ----------
+        mode:
+            Classification of the failure. Defaults to TIMEOUT for backward
+            compatibility with existing callers.
         """
         if self._state is FailbackState.QUEUE_ONLY:
             return
@@ -220,9 +279,21 @@ class FailbackStateMachine:
             FailbackState.PRIMARY_DEGRADED,
         ):
             self._state = FailbackState.FALLBACK_ACTIVE
+            # Track failure mode for adaptive recovery — do NOT reset these
+            # in _reset_probe_counters; they persist across probe cycles.
+            self._failure_mode = mode
+            self._consecutive_failures += 1
+            self._last_failure_at = time.monotonic()
             self._reset_probe_counters()
+            params = _RECOVERY_PARAMS.get(mode, _RECOVERY_PARAMS[FailureMode.TIMEOUT])
+            eta_s = min(
+                params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
+                params["max_s"],
+            )
             logger.warning(
-                "[FailbackFSM] Primary failure -> FALLBACK_ACTIVE"
+                "[FailbackFSM] Primary failure (mode=%s, consecutive=%d, "
+                "recovery_eta=+%.0fs) -> FALLBACK_ACTIVE",
+                mode.name, self._consecutive_failures, eta_s,
             )
 
     def record_fallback_failure(self) -> None:
@@ -308,12 +379,163 @@ class FailbackStateMachine:
         # All criteria met
         self._state = FailbackState.PRIMARY_READY
         self._reset_probe_counters()
+        self._reset_failure_tracking()
         logger.info("[FailbackFSM] Promoted -> PRIMARY_READY")
 
     def _reset_probe_counters(self) -> None:
         """Reset probe tracking state."""
         self._consecutive_probes = 0
         self._first_probe_at = None
+
+    def _reset_failure_tracking(self) -> None:
+        """Reset adaptive recovery state on successful recovery."""
+        self._consecutive_failures = 0
+        self._failure_mode = None
+        self._last_success_at = time.monotonic()
+
+    def record_primary_success(self) -> None:
+        """Record a successful primary generation (explicit recovery signal).
+
+        Called when the primary provider successfully generates candidates
+        after a period of failure. Resets all failure tracking so subsequent
+        failures start fresh with base-level backoff.
+        """
+        if self._consecutive_failures > 0:
+            recovery_duration = time.monotonic() - self._last_failure_at
+            logger.info(
+                "[FailbackFSM] Primary recovered (was %s, %d consecutive failures, "
+                "recovery took %.1fs)",
+                self._failure_mode.name if self._failure_mode else "UNKNOWN",
+                self._consecutive_failures,
+                recovery_duration,
+            )
+        self._reset_failure_tracking()
+
+    # ------------------------------------------------------------------
+    # Recovery prediction (deterministic — Manifesto §5)
+    # ------------------------------------------------------------------
+
+    def recovery_eta(self) -> float:
+        """Predicted monotonic timestamp when primary will be available.
+
+        Uses mode-specific exponential backoff:
+        ``last_failure_at + base_s * 2^(consecutive_failures - 1)``,
+        capped at ``max_s``.
+
+        Returns 0.0 if no failures recorded (primary is healthy).
+        """
+        if self._consecutive_failures == 0 or self._failure_mode is None:
+            return 0.0
+        if self._failure_mode is FailureMode.CONTENT_FAILURE:
+            return time.monotonic()  # instant — no infra penalty
+        params = _RECOVERY_PARAMS.get(
+            self._failure_mode, _RECOVERY_PARAMS[FailureMode.TIMEOUT],
+        )
+        delay = min(
+            params["base_s"] * (2 ** max(self._consecutive_failures - 1, 0)),
+            params["max_s"],
+        )
+        return self._last_failure_at + delay
+
+    def should_attempt_primary(self) -> bool:
+        """Should we try the primary (cheap) provider?
+
+        Returns True if the primary is healthy or the predicted recovery
+        window has elapsed. This enables cost-aware routing: always prefer
+        the cheap provider when it's likely available.
+        """
+        if self._state is FailbackState.PRIMARY_READY:
+            return True
+        if self._consecutive_failures == 0:
+            return True
+        return time.monotonic() >= self.recovery_eta()
+
+    def recommended_probe_interval(self) -> float:
+        """Adaptive probe interval based on distance to recovery ETA.
+
+        - Far from ETA (>60s away): 60s (relax — no point hammering)
+        - Near ETA (<30s away): 10s (ramp up — catch recovery fast)
+        - Past ETA: 5s (aggressive — recovery is imminent)
+        - Primary healthy: 30s (normal cadence)
+
+        Returns seconds to sleep before next health probe.
+        """
+        if self._state is FailbackState.PRIMARY_READY:
+            return 30.0
+        if self._consecutive_failures == 0:
+            return 30.0
+
+        eta = self.recovery_eta()
+        distance = eta - time.monotonic()
+
+        if distance > 60.0:
+            return 60.0   # Deep backoff — relax probes
+        elif distance > 30.0:
+            return 20.0   # Approaching — moderate
+        elif distance > 0.0:
+            return 10.0   # Close — ramp up
+        else:
+            return 5.0    # Past ETA — aggressive probe
+
+    @staticmethod
+    def classify_exception(exc: BaseException) -> FailureMode:
+        """Classify an exception into a failure mode for recovery prediction.
+
+        Uses string-based type checking to avoid hard dependency on aiohttp.
+        """
+        # Content failures first (don't penalize infra)
+        if _is_content_failure(exc):
+            return FailureMode.CONTENT_FAILURE
+
+        exc_type = type(exc).__name__
+        msg = str(exc).lower()
+
+        # DoublewordInfraError carries a status code
+        if exc_type == "DoublewordInfraError":
+            status = getattr(exc, "status_code", 0)
+            if status == 429:
+                return FailureMode.RATE_LIMITED
+            if status in (500, 502, 503):
+                return FailureMode.SERVER_ERROR
+            # status 0 or other — fall through to message analysis
+
+        # Rate limiting signals
+        if exc_type == "CircuitBreakerOpen":
+            return FailureMode.RATE_LIMITED
+        if "429" in msg or "rate" in msg or "too many" in msg:
+            return FailureMode.RATE_LIMITED
+
+        # Connection errors
+        if isinstance(exc, ConnectionError):
+            return FailureMode.CONNECTION_ERROR
+        if any(kw in msg for kw in ("connection", "refused", "dns", "unreachable")):
+            return FailureMode.CONNECTION_ERROR
+        if exc_type in (
+            "ClientConnectionError", "ServerDisconnectedError",
+            "ClientConnectorError",
+        ):
+            return FailureMode.CONNECTION_ERROR
+
+        # Server errors
+        if any(code in msg for code in ("500", "502", "503")):
+            return FailureMode.SERVER_ERROR
+        if exc_type == "ClientResponseError":
+            status = getattr(exc, "status", 0)
+            if status in (500, 502, 503):
+                return FailureMode.SERVER_ERROR
+            if status == 429:
+                return FailureMode.RATE_LIMITED
+
+        # Timeouts
+        if isinstance(exc, (asyncio.TimeoutError,)):
+            return FailureMode.TIMEOUT
+        if "timeout" in msg:
+            return FailureMode.TIMEOUT
+        if exc_type in ("ServerTimeoutError", "ConnectionTimeoutError"):
+            return FailureMode.TIMEOUT
+
+        # Conservative default
+        return FailureMode.TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -424,11 +646,26 @@ class CandidateGenerator:
             if _dw_is_only_provider:
                 _qualifies = True
 
+            # Skip Tier 0 submission if DW is in deep CONNECTION_ERROR backoff
+            # (host unreachable — no point submitting). For RATE_LIMITED/TIMEOUT,
+            # still submit — the batch may succeed after rate limit clears.
+            _in_deep_backoff = (
+                self.fsm._failure_mode is FailureMode.CONNECTION_ERROR
+                and not self.fsm.should_attempt_primary()
+            )
+
             if not _qualifies:
                 logger.debug(
                     "[CandidateGenerator] Tier 0 skipped: complexity=%r, "
                     "cross_repo=%s — routing to Tier 1",
                     _complexity, _is_cross_repo,
+                )
+            elif _in_deep_backoff:
+                logger.info(
+                    "[CandidateGenerator] Tier 0 skipped: DW in CONNECTION_ERROR "
+                    "backoff (failures=%d, ETA=%.0fs)",
+                    self.fsm._consecutive_failures,
+                    max(0, self.fsm.recovery_eta() - time.monotonic()),
                 )
             else:
                 # Async submit: fast path (<2s), then background poll
@@ -478,18 +715,42 @@ class CandidateGenerator:
         _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
         _dw_is_fallback = (self._tier0 is not None and self._fallback is self._tier0)
 
+        _tier0_timed_out = False
+
         if _dw_poll_task is not None and (_dw_is_primary or _dw_is_fallback):
-            logger.info(
-                "[CandidateGenerator] Awaiting async Doubleword batch (primary=%s, fallback=%s)",
-                _dw_is_primary, _dw_is_fallback,
-            )
+            # Budget allocation: Tier 0 gets a capped fraction, Tier 1 gets
+            # a guaranteed reserve (Manifesto §5 — deterministic routing).
             remaining = self._remaining_seconds(deadline)
+            tier0_budget = self._compute_tier0_budget(remaining)
+            tier1_reserve = remaining - tier0_budget
+
+            logger.info(
+                "[CandidateGenerator] Deadline budget: total=%.1fs → "
+                "Tier0=%.1fs (%.0f%%), Tier1=%.1fs reserve "
+                "(primary=%s, fallback=%s)",
+                remaining, tier0_budget,
+                (tier0_budget / remaining * 100) if remaining > 0 else 0,
+                tier1_reserve, _dw_is_primary, _dw_is_fallback,
+            )
+
             try:
-                await asyncio.wait_for(asyncio.shield(_dw_poll_task), timeout=remaining)
+                await asyncio.wait_for(
+                    asyncio.shield(_dw_poll_task), timeout=tier0_budget,
+                )
             except (asyncio.TimeoutError, asyncio.CancelledError):
-                logger.warning("[CandidateGenerator] Doubleword async poll timed out")
+                _tier0_timed_out = True
+                logger.warning(
+                    "[CandidateGenerator] Doubleword async poll exhausted "
+                    "Tier 0 budget (%.1fs). Tier 1 reserve: %.1fs",
+                    tier0_budget, self._remaining_seconds(deadline),
+                )
             except Exception as exc:
-                logger.warning("[CandidateGenerator] Doubleword async poll error: %s", exc)
+                _tier0_timed_out = True
+                logger.warning(
+                    "[CandidateGenerator] Doubleword async poll error: %s. "
+                    "Tier 1 reserve: %.1fs",
+                    exc, self._remaining_seconds(deadline),
+                )
 
             # Check if result is now available
             _completed = self._completed_batches.pop(_op_id, None)
@@ -501,7 +762,18 @@ class CandidateGenerator:
                         len(_result.candidates),
                     )
                     return _result
-            logger.warning("[CandidateGenerator] Doubleword async poll completed but no usable candidates")
+
+            if _tier0_timed_out:
+                logger.info(
+                    "[CandidateGenerator] Tier 0 exhausted, cascading to Tier 1 "
+                    "(%.1fs remaining)",
+                    self._remaining_seconds(deadline),
+                )
+            else:
+                logger.warning(
+                    "[CandidateGenerator] Doubleword poll completed but "
+                    "no usable candidates — cascading to Tier 1",
+                )
 
         # Tier 1 + Tier 2: Primary (J-Prime) → Fallback (Claude)
         state = self.fsm.state
@@ -509,10 +781,40 @@ class CandidateGenerator:
         if state is FailbackState.QUEUE_ONLY:
             raise RuntimeError("all_providers_exhausted")
 
+        # If Doubleword IS the primary and already timed out, skip primary to
+        # avoid re-submitting a redundant batch. Go straight to fallback.
+        # (Manifesto §3: disciplined concurrency — no wasteful retries)
+        if _tier0_timed_out and _dw_is_primary:
+            logger.info(
+                "[CandidateGenerator] Tier 0 IS primary — skipping redundant "
+                "primary.generate(), routing directly to fallback (%.1fs left)",
+                self._remaining_seconds(deadline),
+            )
+            return await self._call_fallback(context, deadline)
+
         if state is FailbackState.PRIMARY_READY:
             return await self._try_primary_then_fallback(context, deadline)
 
-        # FALLBACK_ACTIVE or PRIMARY_DEGRADED: use fallback directly
+        # FALLBACK_ACTIVE or PRIMARY_DEGRADED: adaptive recovery routing.
+        # Try primary again if recovery window elapsed (cost-save), otherwise
+        # use the expensive fallback.
+        if self.fsm.should_attempt_primary():
+            logger.info(
+                "[CandidateGenerator] Recovery window elapsed (mode=%s, "
+                "failures=%d), re-attempting primary "
+                "(cost-save: $0.10/$0.40 vs $3.00/$15.00 per M)",
+                self.fsm._failure_mode.name if self.fsm._failure_mode else "NONE",
+                self.fsm._consecutive_failures,
+            )
+            return await self._try_primary_then_fallback(context, deadline)
+
+        eta_s = max(0, self.fsm.recovery_eta() - time.monotonic())
+        logger.info(
+            "[CandidateGenerator] Primary in backoff (mode=%s, ETA=%.0fs), "
+            "using fallback",
+            self.fsm._failure_mode.name if self.fsm._failure_mode else "NONE",
+            eta_s,
+        )
         return await self._call_fallback(context, deadline)
 
     async def _background_poll_tier0(
@@ -680,14 +982,19 @@ class CandidateGenerator:
         ``asyncio.wait_for`` cancellation of the primary call.
         """
         try:
-            return await self._call_primary(context, deadline)
+            result = await self._call_primary(context, deadline)
+            # Primary succeeded — record recovery if we were in a failure state
+            if self.fsm._consecutive_failures > 0:
+                self.fsm.record_primary_success()
+            return result
         except (Exception, asyncio.CancelledError) as exc:
+            mode = FailbackStateMachine.classify_exception(exc)
             logger.warning(
-                "[CandidateGenerator] Primary failed (%s: %s), falling back",
-                type(exc).__name__,
-                exc,
+                "[CandidateGenerator] Primary failed (mode=%s, %s: %s), "
+                "falling back",
+                mode.name, type(exc).__name__, exc,
             )
-            if _is_content_failure(exc):
+            if mode is FailureMode.CONTENT_FAILURE:
                 # Content failure: model produced bad output, but primary infra is healthy.
                 # Do NOT penalise the FSM — only count for observability.
                 self.fsm.content_failure_count += 1
@@ -696,7 +1003,7 @@ class CandidateGenerator:
                     self.fsm.content_failure_count,
                 )
             else:
-                self.fsm.record_primary_failure()
+                self.fsm.record_primary_failure(mode=mode)
             return await self._call_fallback(context, deadline)
 
     async def _call_primary(
@@ -704,12 +1011,23 @@ class CandidateGenerator:
         context: OperationContext,
         deadline: datetime,
     ) -> GenerationResult:
-        """Call primary provider with concurrency and deadline enforcement."""
+        """Call primary provider with concurrency and budget-capped deadline.
+
+        The primary gets at most ``_PRIMARY_BUDGET_FRACTION`` of the
+        remaining time, guaranteeing ``_FALLBACK_MIN_RESERVE_S`` for the
+        fallback provider if the primary hangs until timeout.
+        """
         remaining = self._remaining_seconds(deadline)
+        primary_budget = self._compute_primary_budget(remaining)
+        logger.debug(
+            "[CandidateGenerator] Primary budget: %.1fs of %.1fs remaining "
+            "(fallback reserve: %.1fs)",
+            primary_budget, remaining, remaining - primary_budget,
+        )
         async with self._primary_sem:
             return await asyncio.wait_for(
                 self._primary.generate(context, deadline),
-                timeout=remaining,
+                timeout=primary_budget,
             )
 
     async def _call_fallback(
@@ -745,3 +1063,44 @@ class CandidateGenerator:
         now = datetime.now(tz=timezone.utc)
         remaining = (deadline - now).total_seconds()
         return max(remaining, 0.0)
+
+    # ------------------------------------------------------------------
+    # Deadline budget allocation (deterministic — Manifesto §5)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_tier0_budget(total_s: float) -> float:
+        """Deterministic Tier 0 (DoubleWord) budget with Tier 1 reserve.
+
+        Invariants:
+          - tier0_budget <= total_s * _TIER0_BUDGET_FRACTION
+          - tier0_budget <= _TIER0_MAX_WAIT_S
+          - total_s - tier0_budget >= _TIER1_MIN_RESERVE_S (when possible)
+        """
+        if total_s <= 0:
+            return 0.0
+        # Reserve Tier 1 budget first (defensive — Tier 1 must always get a chance)
+        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * 0.5)
+        budget = min(
+            total_s * _TIER0_BUDGET_FRACTION,
+            _TIER0_MAX_WAIT_S,
+            total_s - tier1_reserve,
+        )
+        return max(budget, 0.0)
+
+    @staticmethod
+    def _compute_primary_budget(total_s: float) -> float:
+        """Deterministic Tier 1 primary budget with fallback reserve.
+
+        Invariants:
+          - primary_budget <= total_s * _PRIMARY_BUDGET_FRACTION
+          - total_s - primary_budget >= _FALLBACK_MIN_RESERVE_S (when possible)
+        """
+        if total_s <= 0:
+            return 0.0
+        fb_reserve = min(_FALLBACK_MIN_RESERVE_S, total_s * 0.35)
+        budget = min(
+            total_s * _PRIMARY_BUDGET_FRACTION,
+            total_s - fb_reserve,
+        )
+        return max(budget, 0.0)

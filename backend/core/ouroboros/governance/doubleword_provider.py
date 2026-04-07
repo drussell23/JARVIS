@@ -52,6 +52,20 @@ _DW_INPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_INPUT_COST_PER_M", "0.10
 _DW_OUTPUT_COST_PER_M = float(os.environ.get("DOUBLEWORD_OUTPUT_COST_PER_M", "0.40"))
 
 
+class DoublewordInfraError(Exception):
+    """Infrastructure failure from DoublewordProvider.
+
+    Propagated to the CandidateGenerator's FailbackStateMachine so it can
+    classify the failure mode (rate limit vs timeout vs connection error)
+    and predict recovery timing.  The ``status_code`` field carries the
+    HTTP status (429, 500, etc.) or 0 for non-HTTP failures.
+    """
+
+    def __init__(self, reason: str, status_code: int = 0) -> None:
+        super().__init__(reason)
+        self.status_code = status_code
+
+
 @dataclass
 class DoublewordStats:
     """Cumulative stats for observability (Pillar 7)."""
@@ -118,6 +132,7 @@ class DoublewordProvider:
         self._stats = DoublewordStats()
         self._session: Optional[Any] = None  # aiohttp.ClientSession (lazy)
         self._rate_limiter = rate_limiter
+        self._last_error_status: int = 0  # HTTP status from last failure (0 = non-HTTP)
 
     @property
     def provider_name(self) -> str:
@@ -380,13 +395,19 @@ class DoublewordProvider:
             )
 
         t0 = time.monotonic()
+        self._last_error_status = 0  # reset before attempt
+
         pending = await self.submit_batch(context, prompt_override=prompt_override)
         if pending is None:
-            return self._empty_result(t0, "Batch submission failed")
+            raise DoublewordInfraError(
+                "Batch submission failed", status_code=self._last_error_status,
+            )
 
         result = await self.poll_and_retrieve(pending, context)
         if result is None:
-            return self._empty_result(t0, "Batch retrieval failed")
+            raise DoublewordInfraError(
+                "Batch retrieval failed", status_code=self._last_error_status,
+            )
         return result
 
     # ------------------------------------------------------------------
@@ -443,12 +464,14 @@ class DoublewordProvider:
                     self._rate_limiter.record("doubleword", "files_upload",
                                               latency_s=time.monotonic() - _rl_t0, status=resp.status)
                 if resp.status >= 300:
+                    self._last_error_status = resp.status
                     body = await resp.text()
                     logger.error("[DoublewordProvider] File upload failed: %s %s", resp.status, body[:500])
                     return None
                 result = await resp.json()
                 return result.get("id")
         except Exception as exc:
+            self._last_error_status = 0  # non-HTTP failure
             logger.warning("[DoublewordProvider] File upload error: %s: %s", type(exc).__name__, exc)
             return None
 
@@ -477,12 +500,14 @@ class DoublewordProvider:
                     self._rate_limiter.record("doubleword", "batches_create",
                                               latency_s=time.monotonic() - _rl_t0, status=resp.status)
                 if resp.status >= 300:
+                    self._last_error_status = resp.status
                     body = await resp.text()
                     logger.error("[DoublewordProvider] Batch create failed: %s %s", resp.status, body[:500])
                     return None
                 result = await resp.json()
                 return result.get("id")
         except Exception:
+            self._last_error_status = 0
             logger.exception("[DoublewordProvider] Batch create error")
             return None
 
@@ -508,6 +533,7 @@ class DoublewordProvider:
                         self._rate_limiter.record("doubleword", "batches_poll",
                                                   latency_s=time.monotonic() - _rl_t0, status=resp.status)
                     if resp.status >= 300:
+                        self._last_error_status = resp.status
                         logger.warning("[DoublewordProvider] Poll error: %s", resp.status)
                         await asyncio.sleep(_DW_POLL_INTERVAL_S)
                         continue
@@ -559,6 +585,7 @@ class DoublewordProvider:
                     self._rate_limiter.record("doubleword", "batches_retrieve",
                                               latency_s=time.monotonic() - _rl_t0, status=resp.status)
                 if resp.status >= 300:
+                    self._last_error_status = resp.status
                     logger.error("[DoublewordProvider] Retrieve failed: %s", resp.status)
                     return ("", None)
                 raw = await resp.text()

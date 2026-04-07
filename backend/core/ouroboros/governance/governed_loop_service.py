@@ -2252,10 +2252,15 @@ class GovernedLoopService:
                 from backend.core.ouroboros.governance.doubleword_provider import (
                     DoublewordProvider,
                 )
+                from backend.core.ouroboros.governance.rate_limiter import (
+                    RateLimitService,
+                )
+                _dw_rate_limiter = RateLimitService()
                 tier0 = DoublewordProvider(
                     api_key=_dw_api_key,
                     repo_root=self._config.project_root,
                     repo_roots=repo_roots_map,
+                    rate_limiter=_dw_rate_limiter,
                 )
                 self._doubleword_ref = tier0
                 logger.info(
@@ -3092,10 +3097,21 @@ class GovernedLoopService:
     # ------------------------------------------------------------------
 
     async def _health_probe_loop(self) -> None:
-        """Periodically probe provider health and update FSM state."""
+        """Periodically probe provider health and update FSM state.
+
+        Probe interval adapts based on recovery ETA: aggressive near
+        predicted recovery, relaxed during deep backoff (Manifesto §5).
+        """
         while True:
             try:
-                await asyncio.sleep(self._config.health_probe_interval_s)
+                # Adaptive interval: use FSM's recommendation, capped at 2x base
+                base_interval = self._config.health_probe_interval_s
+                if self._generator is not None:
+                    adaptive = self._generator.fsm.recommended_probe_interval()
+                    interval = max(5.0, min(adaptive, base_interval * 2))
+                else:
+                    interval = base_interval
+                await asyncio.sleep(interval)
                 if self._generator is not None:
                     provider = getattr(self._generator, "_primary", None)
                     if provider is not None:
@@ -3111,25 +3127,30 @@ class GovernedLoopService:
                                     pass
                             else:
                                 try:
-                                    self._generator.fsm.record_primary_failure()
+                                    self._generator.fsm.record_probe_failure()
                                 except Exception:
                                     pass
                         except Exception:
                             try:
-                                self._generator.fsm.record_primary_failure()
+                                self._generator.fsm.record_probe_failure()
                             except Exception:
                                 pass
                         # C+ L1: Emit health probe result to SafetyNet (L3)
                         if self._event_emitter is not None:
                             try:
+                                _fsm = self._generator.fsm
+                                _fm = _fsm._failure_mode
+                                _eta = max(0, _fsm.recovery_eta() - time.monotonic()) if not ok else 0
                                 await self._event_emitter.emit(AutonomyEventEnvelope(
                                     source_layer="L1",
                                     event_type=AutonomyEventType.HEALTH_PROBE_RESULT,
                                     payload={
-                                        "provider": "gcp-jprime",
+                                        "provider": getattr(provider, "provider_name", "unknown"),
                                         "success": ok,
                                         "latency_ms": 0,
-                                        "consecutive_failures": 0,
+                                        "consecutive_failures": _fsm._consecutive_failures,
+                                        "failure_mode": _fm.name if _fm else None,
+                                        "recovery_eta_s": round(_eta, 1),
                                     },
                                 ))
                             except Exception:
