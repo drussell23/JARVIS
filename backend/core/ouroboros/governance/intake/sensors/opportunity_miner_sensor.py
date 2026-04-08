@@ -1,37 +1,97 @@
 """
-OpportunityMinerSensor (Sensor D) — Static complexity analysis → observe-only.
+OpportunityMinerSensor (Sensor D) — Multi-strategy code intelligence scanner.
 
 Safety invariant (AC2): ALL miner-generated envelopes require human
 acknowledgment before execution.  AI-discovered opportunities must
 always be human-approved — auto-submit does NOT apply to this sensor.
 
-Static evidence: AST cyclomatic complexity above threshold.
+Analysis strategies (run in rotation):
+  1. Cyclomatic Complexity (CC) — branch-heavy files that need simplification
+  2. Function Length — oversized functions that violate SRP
+  3. Cognitive Complexity — deeply nested, hard-to-reason-about code
+  4. Duplication Density — files with repetitive patterns (DRY violations)
+  5. Import Fan-Out — files coupled to too many modules (coupling smell)
+  6. TODO/FIXME Density — files with known technical debt markers
+
+Diversity mechanisms:
+  - Per-module rotation: scans a different package subtree each cycle
+  - Cooldown tracking: recently-queued files are suppressed for N cycles
+  - Weighted random sampling: not always top-N, introduces exploration
+  - Strategy rotation: different analysis lens each scan
 
 Confidence formula:
-    confidence = static_evidence_score (full weight)
+    confidence = analysis_evidence_score (full weight)
     Used for envelope prioritisation; does NOT affect requires_human_ack.
 """
 from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import logging
 import os
+import random
+import re
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from backend.core.ouroboros.governance.intake.intent_envelope import make_envelope
 
 logger = logging.getLogger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Analysis result types
+# ---------------------------------------------------------------------------
+
 @dataclass
 class StaticCandidate:
     file_path: str
     cyclomatic_complexity: int
     static_evidence_score: float
+    # Extended analysis fields
+    strategy: str = "complexity"
+    analysis_detail: str = ""
 
+
+@dataclass
+class _FileAnalysis:
+    """Full multi-dimensional analysis of a single Python file."""
+    file_path: str
+    cyclomatic_complexity: int = 0
+    max_function_length: int = 0
+    cognitive_complexity: int = 0
+    duplicate_block_count: int = 0
+    import_fan_out: int = 0
+    todo_fixme_count: int = 0
+    total_lines: int = 0
+
+    @property
+    def composite_score(self) -> float:
+        """Weighted composite across all dimensions (0.0–1.0 scale)."""
+        # Each dimension normalized to 0–1, then weighted
+        cc_norm = min(1.0, self.cyclomatic_complexity / 300.0)
+        fn_norm = min(1.0, self.max_function_length / 200.0)
+        cog_norm = min(1.0, self.cognitive_complexity / 100.0)
+        dup_norm = min(1.0, self.duplicate_block_count / 10.0)
+        import_norm = min(1.0, self.import_fan_out / 30.0)
+        todo_norm = min(1.0, self.todo_fixme_count / 15.0)
+
+        return (
+            0.25 * cc_norm
+            + 0.20 * fn_norm
+            + 0.20 * cog_norm
+            + 0.15 * dup_norm
+            + 0.10 * import_norm
+            + 0.10 * todo_norm
+        )
+
+
+# ---------------------------------------------------------------------------
+# Analysis functions
+# ---------------------------------------------------------------------------
 
 def _cyclomatic_complexity(tree: ast.AST) -> int:
     """Count branching nodes (if/elif/for/while/with/try/except/and/or)."""
@@ -46,8 +106,114 @@ def _cyclomatic_complexity(tree: ast.AST) -> int:
     return count
 
 
+def _max_function_length(tree: ast.AST) -> int:
+    """Longest function/method body in lines."""
+    max_len = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if hasattr(node, "end_lineno") and node.end_lineno and node.lineno:
+                length = node.end_lineno - node.lineno + 1
+                max_len = max(max_len, length)
+    return max_len
+
+
+def _cognitive_complexity(tree: ast.AST) -> int:
+    """Simplified cognitive complexity: nesting depth * branch count.
+
+    True cognitive complexity (Sonar-style) requires tracking nesting
+    increments per scope. This approximation counts branches weighted
+    by their nesting depth, which catches the worst offenders.
+    """
+    score = 0
+
+    def _walk(node: ast.AST, depth: int) -> None:
+        nonlocal score
+        _NESTING = (ast.If, ast.For, ast.While, ast.With, ast.ExceptHandler)
+        _INCREMENT = (ast.If, ast.For, ast.While, ast.With, ast.ExceptHandler, ast.BoolOp)
+        child_depth = depth
+        if isinstance(node, _NESTING):
+            child_depth = depth + 1
+        if isinstance(node, _INCREMENT):
+            score += 1 + depth  # base increment + nesting penalty
+        for child in ast.iter_child_nodes(node):
+            _walk(child, child_depth)
+
+    _walk(tree, 0)
+    return score
+
+
+def _duplicate_block_count(source: str) -> int:
+    """Count near-duplicate code blocks (simplified line-hash approach).
+
+    Hashes consecutive 4-line windows; counts how many hashes appear >1 time.
+    This catches copy-pasted blocks without expensive AST comparison.
+    """
+    lines = [ln.strip() for ln in source.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    if len(lines) < 4:
+        return 0
+
+    window_hashes: Dict[str, int] = defaultdict(int)
+    for i in range(len(lines) - 3):
+        window = "\n".join(lines[i:i + 4])
+        h = hashlib.md5(window.encode(), usedforsecurity=False).hexdigest()
+        window_hashes[h] += 1
+
+    return sum(1 for count in window_hashes.values() if count > 1)
+
+
+def _import_fan_out(tree: ast.AST) -> int:
+    """Count distinct modules imported (both `import X` and `from X import Y`)."""
+    modules: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                modules.add(alias.name.split(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                modules.add(node.module.split(".")[0])
+    return len(modules)
+
+
+def _todo_fixme_count(source: str) -> int:
+    """Count TODO, FIXME, HACK, XXX markers in comments."""
+    return len(re.findall(r"#\s*(?:TODO|FIXME|HACK|XXX)\b", source, re.IGNORECASE))
+
+
+def _analyze_file(file_path: str, source: str, tree: ast.AST) -> _FileAnalysis:
+    """Run all analysis dimensions on a parsed file."""
+    return _FileAnalysis(
+        file_path=file_path,
+        cyclomatic_complexity=_cyclomatic_complexity(tree),
+        max_function_length=_max_function_length(tree),
+        cognitive_complexity=_cognitive_complexity(tree),
+        duplicate_block_count=_duplicate_block_count(source),
+        import_fan_out=_import_fan_out(tree),
+        todo_fixme_count=_todo_fixme_count(source),
+        total_lines=len(source.splitlines()),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Strategy definitions
+# ---------------------------------------------------------------------------
+
+_STRATEGIES: List[Tuple[str, str, str]] = [
+    # (strategy_name, sort_field, description_template)
+    ("complexity", "cyclomatic_complexity", "High cyclomatic complexity in {path} (CC={value})"),
+    ("long_functions", "max_function_length", "Oversized function in {path} (max {value} lines)"),
+    ("cognitive_load", "cognitive_complexity", "High cognitive complexity in {path} (score={value})"),
+    ("duplication", "duplicate_block_count", "Code duplication detected in {path} ({value} duplicate blocks)"),
+    ("coupling", "import_fan_out", "High import fan-out in {path} ({value} modules imported)"),
+    ("tech_debt", "todo_fixme_count", "Technical debt markers in {path} ({value} TODO/FIXME)"),
+]
+
+
+# ---------------------------------------------------------------------------
+# OpportunityMinerSensor
+# ---------------------------------------------------------------------------
+
 class OpportunityMinerSensor:
-    """Scans Python files for high cyclomatic complexity and produces envelopes.
+    """Multi-strategy code intelligence scanner with diversity mechanisms.
 
     Parameters
     ----------
@@ -58,11 +224,13 @@ class OpportunityMinerSensor:
     scan_paths:
         List of paths (relative to repo_root) to scan recursively for .py files.
     complexity_threshold:
-        Minimum cyclomatic complexity to produce an envelope.
+        Minimum cyclomatic complexity to produce an envelope (legacy compat).
     repo:
         Repository name.
     poll_interval_s:
         Seconds between scans in background mode.
+    max_candidates_per_scan:
+        Cap on candidates per scan cycle (0 = no cap).
     """
 
     def __init__(
@@ -83,16 +251,34 @@ class OpportunityMinerSensor:
         self._poll_interval_s = poll_interval_s
         self._running = False
         self._seen_file_paths: set[str] = set()
-        # Per-scan cap: only queue the N most complex files. 0 = no cap.
-        # Prevents intake flooding on large codebases. Highest CC first
-        # ensures intelligence is deployed where it creates most leverage.
+
+        # Per-scan cap
         self._max_per_scan = max_candidates_per_scan or int(
             os.environ.get("JARVIS_MINER_MAX_PER_SCAN", "10")
         )
 
-    # v350.4: Third-party / non-project directory segments that must
-    # never be scanned. These are structural boundaries — scanning torch,
-    # numpy, or joblib source is not production governance.
+        # --- Diversity state ---
+        # Cooldown: file_path → cycle_number when it was last queued
+        self._cooldown_map: Dict[str, int] = {}
+        # Number of cycles before a file can be re-queued
+        self._cooldown_cycles: int = int(
+            os.environ.get("JARVIS_MINER_COOLDOWN_CYCLES", "5")
+        )
+        # Current scan cycle number
+        self._scan_cycle: int = 0
+        # Strategy rotation index
+        self._strategy_index: int = 0
+        # Module rotation: tracks which top-level packages have been scanned
+        self._module_scan_history: List[str] = []
+        # Full analysis cache (rebuilt each scan, not persisted)
+        self._analysis_cache: Dict[str, _FileAnalysis] = {}
+        # Exploration ratio: fraction of candidates chosen by weighted random
+        # instead of pure top-N. Higher = more diverse, lower = more focused.
+        self._explore_ratio: float = float(
+            os.environ.get("JARVIS_MINER_EXPLORE_RATIO", "0.4")
+        )
+
+    # v350.4: Third-party / non-project directory segments
     _NON_PROJECT_SEGMENTS = frozenset({
         "venv", ".venv", "env", ".env",
         "site-packages", "dist-packages",
@@ -103,54 +289,135 @@ class OpportunityMinerSensor:
     })
 
     def _is_production_code(self, py_file: Path, scan_root: Path) -> bool:
-        """Return True if the file is production code, not a loose script.
-
-        Structural heuristic with boundary enforcement:
-        1. Files inside third-party directories (venv, site-packages,
-           node_modules) are always excluded — they are not project code.
-        2. Depth is measured from the **repo root**. Files at depth <= 1
-           (e.g. ``backend/demo.py``) are skipped as loose scripts.
-        3. Files at depth >= 2 are production code inside sub-packages.
-
-        Special files (__init__.py, conftest.py) at any depth are admitted
-        (but still rejected if inside a third-party directory).
-        """
-        # Structural boundary: never scan third-party code
+        """Return True if the file is production code, not a loose script."""
         parts = py_file.relative_to(self._repo_root).parts if self._repo_root in py_file.parents else py_file.parts
         if self._NON_PROJECT_SEGMENTS.intersection(parts):
             return False
-
         name = py_file.name
-
-        # Test files are not production code regardless of directory.
-        # Standard Python convention: test_*.py and *_test.py are tests.
         if name.startswith("test_") or name.endswith("_test.py"):
             return False
-
-        # Scripts directory segments — utility/tooling, not production
         if "scripts" in parts:
             return False
-
         if name in ("__init__.py", "__main__.py", "conftest.py"):
             return True
         try:
             relative = py_file.relative_to(self._repo_root)
-            depth = len(relative.parts) - 1  # -1 for the filename itself
-            return depth >= 2  # e.g. backend/core/foo.py = depth 2
-                               #      backend/demo.py     = depth 1
+            depth = len(relative.parts) - 1
+            return depth >= 2
         except ValueError:
-            return True  # Not under repo_root — admit conservatively
+            return True
+
+    def _get_module_name(self, rel_path: str) -> str:
+        """Extract the top-level module (e.g., 'backend/core/foo.py' → 'backend.core')."""
+        parts = Path(rel_path).parts
+        if len(parts) >= 2:
+            return ".".join(parts[:2])
+        return parts[0] if parts else "unknown"
+
+    def _is_on_cooldown(self, rel_path: str) -> bool:
+        """Check if a file is within its cooldown window."""
+        if rel_path not in self._cooldown_map:
+            return False
+        cycles_since = self._scan_cycle - self._cooldown_map[rel_path]
+        return cycles_since < self._cooldown_cycles
+
+    def _select_diverse_candidates(
+        self,
+        analyses: List[_FileAnalysis],
+        sort_field: str,
+    ) -> List[_FileAnalysis]:
+        """Select candidates using exploit/explore strategy with module diversity.
+
+        - Top portion (1 - explore_ratio) chosen by strategy score (exploit)
+        - Bottom portion (explore_ratio) chosen by weighted random (explore)
+        - Module dedup: at most 2 files per top-level module
+        """
+        if not analyses:
+            return []
+
+        # Filter out cooled-down and already-seen files
+        eligible = [
+            a for a in analyses
+            if not self._is_on_cooldown(a.file_path)
+            and a.file_path not in self._seen_file_paths
+        ]
+        if not eligible:
+            # If all are on cooldown, relax cooldown constraint
+            eligible = [
+                a for a in analyses
+                if a.file_path not in self._seen_file_paths
+            ]
+        if not eligible:
+            return []
+
+        # Sort by the strategy's primary metric
+        eligible.sort(key=lambda a: getattr(a, sort_field, 0), reverse=True)
+
+        n_total = min(self._max_per_scan, len(eligible))
+        n_exploit = max(1, int(n_total * (1.0 - self._explore_ratio)))
+        n_explore = n_total - n_exploit
+
+        selected: List[_FileAnalysis] = []
+        module_counts: Dict[str, int] = defaultdict(int)
+        module_cap = 2  # max files per module
+
+        # Exploit: take top-N by strategy metric, with module diversity
+        for a in eligible:
+            if len(selected) >= n_exploit:
+                break
+            module = self._get_module_name(a.file_path)
+            if module_counts[module] >= module_cap:
+                continue
+            selected.append(a)
+            module_counts[module] += 1
+
+        # Explore: weighted random from remaining pool
+        remaining = [a for a in eligible if a not in selected]
+        if remaining and n_explore > 0:
+            # Weight by composite score so we're biased toward interesting
+            # files but not locked to the absolute top
+            weights = [max(0.01, a.composite_score) for a in remaining]
+            n_sample = min(n_explore, len(remaining))
+            try:
+                explored = random.choices(remaining, weights=weights, k=n_sample)
+                # Deduplicate (choices can repeat)
+                seen_in_explore: Set[str] = set()
+                for a in explored:
+                    if a.file_path not in seen_in_explore:
+                        module = self._get_module_name(a.file_path)
+                        if module_counts[module] < module_cap + 1:  # slightly relaxed for explore
+                            selected.append(a)
+                            seen_in_explore.add(a.file_path)
+                            module_counts[module] += 1
+            except (ValueError, IndexError):
+                pass
+
+        return selected[:self._max_per_scan]
 
     async def scan_once(self) -> List[StaticCandidate]:
-        """Run one static analysis scan. Returns candidates above threshold.
+        """Run one multi-strategy analysis scan with diversity mechanisms.
 
-        Only scans files that belong to Python packages — loose scripts,
-        demos, migration tools, and one-off fixes are automatically
-        excluded by structural detection (no hardcoded patterns).
+        Rotates through analysis strategies each cycle, applies cooldowns,
+        and uses exploit/explore selection for diverse coverage.
         """
-        candidates: List[StaticCandidate] = []
+        self._scan_cycle += 1
+
+        # Pick the strategy for this cycle (round-robin)
+        strategy_name, sort_field, desc_template = _STRATEGIES[
+            self._strategy_index % len(_STRATEGIES)
+        ]
+        self._strategy_index += 1
+
+        logger.info(
+            "OpportunityMinerSensor: cycle %d, strategy=%s, cooldown=%d files",
+            self._scan_cycle, strategy_name, len(self._cooldown_map),
+        )
+
+        # Phase 1: Full filesystem scan + multi-dimensional analysis
+        analyses: List[_FileAnalysis] = []
         scanned = 0
         skipped_non_package = 0
+        errors = 0
 
         for scan_path in self._scan_paths:
             root = self._repo_root / scan_path
@@ -158,10 +425,7 @@ class OpportunityMinerSensor:
                 continue
             for py_file in root.rglob("*.py"):
                 rel = str(py_file.relative_to(self._repo_root))
-                if rel in self._seen_file_paths:
-                    continue
 
-                # Structural filter: only scan production code, not loose scripts.
                 if not self._is_production_code(py_file, root):
                     skipped_non_package += 1
                     continue
@@ -171,59 +435,75 @@ class OpportunityMinerSensor:
                     source = py_file.read_text(encoding="utf-8")
                     tree = ast.parse(source)
                 except SyntaxError:
-                    logger.debug("OpportunityMinerSensor: syntax error in %s, skipping", rel)
+                    errors += 1
                     continue
-                except (OSError, UnicodeDecodeError) as exc:
-                    logger.debug("OpportunityMinerSensor: cannot read %s: %s", rel, exc)
-                    continue
-
-                cc = _cyclomatic_complexity(tree)
-                if cc < self._threshold:
+                except (OSError, UnicodeDecodeError):
+                    errors += 1
                     continue
 
-                # Static evidence score: normalize CC against threshold.
-                # Used for envelope prioritisation (not for ACK gating).
-                static_score = min(1.0, cc / (self._threshold * 2))
-                confidence = static_score
+                analysis = _analyze_file(rel, source, tree)
+                self._analysis_cache[rel] = analysis
 
-                candidate = StaticCandidate(
-                    file_path=rel,
-                    cyclomatic_complexity=cc,
-                    static_evidence_score=static_score,
-                )
-                candidates.append(candidate)
+                # Strategy-specific threshold gate
+                value = getattr(analysis, sort_field, 0)
+                if sort_field == "cyclomatic_complexity" and value < self._threshold:
+                    continue
+                elif sort_field == "max_function_length" and value < 80:
+                    continue
+                elif sort_field == "cognitive_complexity" and value < 50:
+                    continue
+                elif sort_field == "duplicate_block_count" and value < 3:
+                    continue
+                elif sort_field == "import_fan_out" and value < 15:
+                    continue
+                elif sort_field == "todo_fixme_count" and value < 3:
+                    continue
 
-        # Sort by CC descending — highest complexity first (most leverage).
-        candidates.sort(key=lambda c: c.cyclomatic_complexity, reverse=True)
+                analyses.append(analysis)
 
-        # Per-scan cap: only ingest the top N to prevent intake flooding.
-        if self._max_per_scan > 0 and len(candidates) > self._max_per_scan:
-            dropped = len(candidates) - self._max_per_scan
-            candidates = candidates[:self._max_per_scan]
-            logger.info(
-                "OpportunityMinerSensor: capped to top %d candidates "
-                "(dropped %d lower-CC files)",
-                self._max_per_scan, dropped,
-            )
+        # Phase 2: Diverse candidate selection
+        selected = self._select_diverse_candidates(analyses, sort_field)
 
-        # Ingest the prioritized candidates.
+        # Phase 3: Ingest selected candidates
         ingested: List[StaticCandidate] = []
-        for candidate in candidates:
-            rel = candidate.file_path
-            cc = candidate.cyclomatic_complexity
-            confidence = candidate.static_evidence_score
+        for analysis in selected:
+            rel = analysis.file_path
+            value = getattr(analysis, sort_field, 0)
+            confidence = analysis.composite_score
+
+            description = desc_template.format(path=rel, value=value)
+            # Add cross-strategy context
+            extra_signals = []
+            if analysis.cyclomatic_complexity >= self._threshold and strategy_name != "complexity":
+                extra_signals.append(f"CC={analysis.cyclomatic_complexity}")
+            if analysis.max_function_length >= 80 and strategy_name != "long_functions":
+                extra_signals.append(f"max_fn={analysis.max_function_length}L")
+            if analysis.todo_fixme_count >= 3 and strategy_name != "tech_debt":
+                extra_signals.append(f"{analysis.todo_fixme_count} TODOs")
+            if extra_signals:
+                description += f" [also: {', '.join(extra_signals)}]"
 
             envelope = make_envelope(
                 source="ai_miner",
-                description=f"High complexity detected in {rel} (CC={cc})",
+                description=description,
                 target_files=(rel,),
                 repo=self._repo,
                 confidence=max(0.1, confidence),
                 urgency="low",
                 evidence={
-                    "cyclomatic_complexity": cc,
-                    "static_evidence_score": confidence,
-                    "signature": rel,
+                    "strategy": strategy_name,
+                    "primary_metric": sort_field,
+                    "primary_value": value,
+                    "cyclomatic_complexity": analysis.cyclomatic_complexity,
+                    "max_function_length": analysis.max_function_length,
+                    "cognitive_complexity": analysis.cognitive_complexity,
+                    "duplicate_block_count": analysis.duplicate_block_count,
+                    "import_fan_out": analysis.import_fan_out,
+                    "todo_fixme_count": analysis.todo_fixme_count,
+                    "composite_score": round(analysis.composite_score, 4),
+                    "total_lines": analysis.total_lines,
+                    "scan_cycle": self._scan_cycle,
+                    "signature": f"{strategy_name}:{rel}",
                 },
                 requires_human_ack=True,  # AC2 safety invariant
             )
@@ -231,24 +511,49 @@ class OpportunityMinerSensor:
                 result = await self._router.ingest(envelope)
                 if result in ("enqueued", "pending_ack"):
                     self._seen_file_paths.add(rel)
-                    ingested.append(candidate)
+                    self._cooldown_map[rel] = self._scan_cycle
+                    ingested.append(StaticCandidate(
+                        file_path=rel,
+                        cyclomatic_complexity=analysis.cyclomatic_complexity,
+                        static_evidence_score=confidence,
+                        strategy=strategy_name,
+                        analysis_detail=description,
+                    ))
                     logger.info(
-                        "OpportunityMinerSensor: queued %s (CC=%d, result=%s)",
-                        rel, cc, result,
+                        "OpportunityMinerSensor: queued %s (strategy=%s, %s=%d, "
+                        "composite=%.3f, result=%s)",
+                        rel, strategy_name, sort_field, value,
+                        analysis.composite_score, result,
                     )
             except Exception:
                 logger.exception(
                     "OpportunityMinerSensor: ingest failed for %s", rel
                 )
 
-        if skipped_non_package > 0 or len(candidates) > 0:
-            logger.info(
-                "OpportunityMinerSensor: scanned %d files, "
-                "skipped %d non-package, found %d above threshold, "
-                "ingested %d (cap=%d)",
-                scanned, skipped_non_package, len(candidates),
-                len(ingested), self._max_per_scan,
-            )
+        # Prune old cooldowns (keep last N cycles)
+        max_history = self._cooldown_cycles * 2
+        if self._cooldown_map:
+            oldest_allowed = self._scan_cycle - max_history
+            self._cooldown_map = {
+                k: v for k, v in self._cooldown_map.items()
+                if v >= oldest_allowed
+            }
+
+        # Module coverage stats
+        modules_covered: Set[str] = set()
+        for c in ingested:
+            modules_covered.add(self._get_module_name(c.file_path))
+
+        logger.info(
+            "OpportunityMinerSensor: cycle %d complete — scanned %d files, "
+            "strategy=%s, candidates=%d, ingested=%d, modules=%s, "
+            "errors=%d, skipped=%d, cooldown_pool=%d, seen_total=%d",
+            self._scan_cycle, scanned, strategy_name,
+            len(analyses), len(ingested),
+            sorted(modules_covered) if modules_covered else "none",
+            errors, skipped_non_package,
+            len(self._cooldown_map), len(self._seen_file_paths),
+        )
         return ingested
 
     async def start(self) -> None:
@@ -277,6 +582,7 @@ class OpportunityMinerSensor:
             return
         if event.topic == "fs.changed.deleted":
             self._seen_file_paths.discard(payload.get("relative_path", ""))
+            self._cooldown_map.pop(payload.get("relative_path", ""), None)
             return
         try:
             await self.scan_file(Path(payload["path"]))
@@ -284,12 +590,14 @@ class OpportunityMinerSensor:
             logger.debug("OpportunityMinerSensor: event-driven scan error", exc_info=True)
 
     async def scan_file(self, py_file: Path) -> Optional[StaticCandidate]:
-        """Analyze a single file for cyclomatic complexity."""
+        """Analyze a single file for all dimensions (event-driven path)."""
         try:
             rel = str(py_file.relative_to(self._repo_root))
         except ValueError:
             return None
         if rel in self._seen_file_paths:
+            return None
+        if self._is_on_cooldown(rel):
             return None
         if not self._is_production_code(py_file, self._repo_root):
             return None
@@ -300,28 +608,49 @@ class OpportunityMinerSensor:
         except (SyntaxError, OSError, UnicodeDecodeError):
             return None
 
-        cc = _cyclomatic_complexity(tree)
-        if cc < self._threshold:
+        analysis = _analyze_file(rel, source, tree)
+        self._analysis_cache[rel] = analysis
+
+        # Gate on composite score for event-driven path
+        if analysis.composite_score < 0.3:
             return None
 
-        static_score = min(1.0, cc / (self._threshold * 2))
+        # Pick the most notable dimension for the description
+        dims = [
+            ("complexity", "cyclomatic_complexity", analysis.cyclomatic_complexity),
+            ("long_functions", "max_function_length", analysis.max_function_length),
+            ("cognitive_load", "cognitive_complexity", analysis.cognitive_complexity),
+        ]
+        dims.sort(key=lambda d: d[2], reverse=True)
+        best_strategy, best_field, best_value = dims[0]
+
         candidate = StaticCandidate(
             file_path=rel,
-            cyclomatic_complexity=cc,
-            static_evidence_score=static_score,
+            cyclomatic_complexity=analysis.cyclomatic_complexity,
+            static_evidence_score=analysis.composite_score,
+            strategy=best_strategy,
         )
 
         envelope = make_envelope(
             source="ai_miner",
-            description=f"High complexity detected in {rel} (CC={cc})",
+            description=f"Multi-signal analysis: {rel} (composite={analysis.composite_score:.3f}, {best_field}={best_value})",
             target_files=(rel,),
             repo=self._repo,
-            confidence=max(0.1, static_score),
+            confidence=max(0.1, analysis.composite_score),
             urgency="low",
             evidence={
-                "cyclomatic_complexity": cc,
-                "static_evidence_score": static_score,
-                "signature": rel,
+                "strategy": best_strategy,
+                "primary_metric": best_field,
+                "primary_value": best_value,
+                "cyclomatic_complexity": analysis.cyclomatic_complexity,
+                "max_function_length": analysis.max_function_length,
+                "cognitive_complexity": analysis.cognitive_complexity,
+                "duplicate_block_count": analysis.duplicate_block_count,
+                "import_fan_out": analysis.import_fan_out,
+                "todo_fixme_count": analysis.todo_fixme_count,
+                "composite_score": round(analysis.composite_score, 4),
+                "total_lines": analysis.total_lines,
+                "signature": f"{best_strategy}:{rel}",
             },
             requires_human_ack=True,
         )
@@ -329,9 +658,11 @@ class OpportunityMinerSensor:
             result = await self._router.ingest(envelope)
             if result in ("enqueued", "pending_ack"):
                 self._seen_file_paths.add(rel)
+                self._cooldown_map[rel] = self._scan_cycle
                 logger.info(
-                    "OpportunityMinerSensor: queued %s (CC=%d, result=%s)",
-                    rel, cc, result,
+                    "OpportunityMinerSensor: queued %s (event-driven, strategy=%s, "
+                    "composite=%.3f, result=%s)",
+                    rel, best_strategy, analysis.composite_score, result,
                 )
                 return candidate
         except Exception:
