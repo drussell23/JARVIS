@@ -51,14 +51,14 @@ For each intent, identify:
 
 Return JSON array of objects:
 [
-  {
+  {{
     "target_files": ["path/to/file.py"],
     "description": "...",
     "urgency": "normal",
     "confidence": 0.7,
     "principle": "which manifesto principle this serves",
     "rationale": "why this matters now"
-  }
+  }}
 ]
 
 Rules:
