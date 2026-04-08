@@ -396,6 +396,10 @@ class RepairEngine:
                 return _stopped("max_validation_runs_exhausted")
 
             iteration += 1
+            _logger.info(
+                "\U0001f527 [L2 Repair] Iteration %d/%d starting (%.0fs elapsed, %.0fs remaining)",
+                iteration, budget.max_iterations, elapsed, remaining_s,
+            )
 
             # ----------------------------------------------------------------
             # GENERATE
@@ -455,6 +459,11 @@ class RepairEngine:
             # ----------------------------------------------------------------
             # CONVERGED?
             # ----------------------------------------------------------------
+            _test_status = "\u2705 PASSED" if svr.passed else f"\u274c FAILED ({getattr(svr, 'failure_class', 'unknown')})"
+            _logger.info(
+                "\U0001f527 [L2 Repair] Iteration %d/%d tests: %s",
+                iteration, budget.max_iterations, _test_status,
+            )
             if svr.passed:
                 rec = RepairIterationRecord(
                     op_id=ctx.op_id,
@@ -469,6 +478,10 @@ class RepairEngine:
                 )
                 self._emit_record(ctx.op_id, rec)
                 records.append(rec)
+                _logger.info(
+                    "\U0001f527 [L2 Repair] \u2705 CONVERGED after %d iteration(s)! All tests pass.",
+                    iteration,
+                )
                 return RepairResult(
                     terminal="L2_CONVERGED",
                     candidate=current_candidate,
