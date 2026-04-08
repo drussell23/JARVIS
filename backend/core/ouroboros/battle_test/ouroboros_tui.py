@@ -230,6 +230,32 @@ class OuroborosConsole:
         """Show provider reasoning/thinking."""
         self._console.print(f"  [dim italic]\U0001f4ad {text}[/dim italic]")
 
+    # ── Streaming output ────────────────────────────────────
+
+    def show_streaming_token(self, token: str) -> None:
+        """Show a streaming token chunk (character-by-character generation).
+
+        Called by the provider's streaming callback for each token.
+        Prints without newline to create the character-by-character
+        effect — like Claude Code showing code as it's being written.
+        """
+        # Print token without newline, flush immediately
+        sys.stdout.write(token)
+        sys.stdout.flush()
+
+    def show_streaming_start(self, provider: str) -> None:
+        """Show that streaming generation is starting."""
+        badge = _PROVIDER_BADGES.get(provider, provider)
+        self._console.print(f"\n  \u2728 [dim]Generating via {badge}...[/dim]")
+        # Print indented prefix for the streaming content
+        sys.stdout.write("  \033[2m")
+        sys.stdout.flush()
+
+    def show_streaming_end(self) -> None:
+        """End the streaming output block."""
+        sys.stdout.write("\033[0m\n")
+        sys.stdout.flush()
+
     def show_generation_result(
         self,
         op_id: str,

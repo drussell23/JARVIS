@@ -852,6 +852,7 @@ class ToolLoopCoordinator:
         self._tool_timeout_s = tool_timeout_s
         self._last_records: List[ToolExecutionRecord] = []
         self._on_tool_call = on_tool_call  # Optional callback for real-time display
+        self.on_token: Optional[Callable[[str], None]] = None  # Streaming token callback
         # Cost optimization: providers can check this flag to use lower max_tokens
         # during tool rounds (model only needs ~200 tokens for a tool call JSON).
         self.is_tool_round: bool = False

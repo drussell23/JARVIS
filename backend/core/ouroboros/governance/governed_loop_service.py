@@ -2182,8 +2182,20 @@ class GovernedLoopService:
                 tool_timeout_s=self._config.tool_timeout_s,
                 on_tool_call=_on_tool_call_display,
             )
+
+            # Wire streaming token callback for real-time character-by-character output
+            def _on_streaming_token(token: str) -> None:
+                try:
+                    from backend.core.ouroboros.battle_test.ouroboros_tui import OuroborosConsole
+                    import sys as _sys
+                    _sys.stdout.write(token)
+                    _sys.stdout.flush()
+                except Exception:
+                    pass
+            _tool_coordinator.on_token = _on_streaming_token
+
             logger.info(
-                "[GovernedLoop] ToolLoopCoordinator wired: max_rounds=%d, timeout=%.1fs, concurrency=%d",
+                "[GovernedLoop] ToolLoopCoordinator wired: max_rounds=%d, timeout=%.1fs, concurrency=%d, streaming=ON",
                 self._config.max_tool_rounds,
                 self._config.tool_timeout_s,
                 self._config.max_concurrent_tools,

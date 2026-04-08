@@ -2276,25 +2276,69 @@ class ClaudeProvider:
                 },
             ]
 
-            msg = await asyncio.wait_for(
-                client.messages.create(
-                    model=self._model,
-                    max_tokens=_effective_max_tokens,
-                    temperature=0.2,
-                    system=_system_with_cache,
-                    messages=[{"role": "user", "content": user_content}],
-                ),
-                timeout=timeout_s,
-            )
-            _last_msg[0] = msg
-            raw_content = msg.content[0].text if msg.content else ""
-            input_tokens = getattr(msg.usage, "input_tokens", 0)
-            output_tokens = getattr(msg.usage, "output_tokens", 0)
-            # Check for cached token savings (90% cheaper)
-            try:
-                _cached_input = int(getattr(getattr(msg, "usage", None), "cache_read_input_tokens", 0) or 0)
-            except (TypeError, ValueError):
+            # Streaming: use stream() for token-by-token output via TUI callback.
+            # Falls back to create() if streaming unavailable or callback not set.
+            _stream_callback = None
+            if self._tool_loop is not None:
+                _stream_callback = getattr(self._tool_loop, "on_token", None)
+
+            if _stream_callback is not None:
+                # Streaming path: tokens appear in TUI as they're generated
+                raw_content = ""
+                input_tokens = 0
+                output_tokens = 0
                 _cached_input = 0
+                try:
+                    async with asyncio.timeout(timeout_s):
+                        async with client.messages.stream(
+                            model=self._model,
+                            max_tokens=_effective_max_tokens,
+                            temperature=0.2,
+                            system=_system_with_cache,
+                            messages=[{"role": "user", "content": user_content}],
+                        ) as stream:
+                            async for text in stream.text_stream:
+                                raw_content += text
+                                try:
+                                    _stream_callback(text)
+                                except Exception:
+                                    pass
+                            # Get final message for usage stats
+                            msg = await stream.get_final_message()
+                            _last_msg[0] = msg
+                            input_tokens = getattr(msg.usage, "input_tokens", 0)
+                            output_tokens = getattr(msg.usage, "output_tokens", 0)
+                            try:
+                                _cached_input = int(
+                                    getattr(msg.usage, "cache_read_input_tokens", 0) or 0
+                                )
+                            except (TypeError, ValueError):
+                                _cached_input = 0
+                except asyncio.TimeoutError:
+                    raise
+            else:
+                # Non-streaming fallback
+                msg = await asyncio.wait_for(
+                    client.messages.create(
+                        model=self._model,
+                        max_tokens=_effective_max_tokens,
+                        temperature=0.2,
+                        system=_system_with_cache,
+                        messages=[{"role": "user", "content": user_content}],
+                    ),
+                    timeout=timeout_s,
+                )
+                _last_msg[0] = msg
+                raw_content = msg.content[0].text if msg.content else ""
+                input_tokens = getattr(msg.usage, "input_tokens", 0)
+                output_tokens = getattr(msg.usage, "output_tokens", 0)
+                try:
+                    _cached_input = int(
+                        getattr(getattr(msg, "usage", None), "cache_read_input_tokens", 0) or 0
+                    )
+                except (TypeError, ValueError):
+                    _cached_input = 0
+
             if _cached_input > 0:
                 logger.info(
                     "[ClaudeProvider] \U0001f4b0 Prompt cache hit: %d cached tokens "

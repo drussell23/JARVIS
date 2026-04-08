@@ -530,6 +530,11 @@ class DoublewordProvider:
             if self._tool_loop is not None and getattr(self._tool_loop, "is_tool_round", False):
                 _eff_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
 
+            # Streaming callback for token-by-token TUI output
+            _stream_callback = None
+            if self._tool_loop is not None:
+                _stream_callback = getattr(self._tool_loop, "on_token", None)
+
             body = {
                 "model": self._model,
                 "messages": [
@@ -541,49 +546,97 @@ class DoublewordProvider:
                 "chat_template_kwargs": {"enable_thinking": False},
             }
 
-            async with session.post(
-                f"{self._base_url}/chat/completions",
-                json=body,
-                headers={"Content-Type": "application/json"},
-                timeout=self._request_timeout(),
-            ) as resp:
-                if resp.status >= 300:
-                    self._last_error_status = resp.status
-                    err_body = await resp.text()
-                    raise DoublewordInfraError(
-                        f"Chat completions failed: {resp.status} {err_body[:200]}",
-                        status_code=resp.status,
-                    )
+            if _stream_callback is not None:
+                # Streaming path: SSE for token-by-token output
+                body["stream"] = True
+                content = ""
+                input_tokens = 0
+                output_tokens = 0
 
-                data = await resp.json()
-                choices = data.get("choices", [])
-                usage = data.get("usage", {})
+                async with session.post(
+                    f"{self._base_url}/chat/completions",
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self._request_timeout(),
+                ) as resp:
+                    if resp.status >= 300:
+                        self._last_error_status = resp.status
+                        err_body = await resp.text()
+                        raise DoublewordInfraError(
+                            f"Chat completions (stream) failed: {resp.status} {err_body[:200]}",
+                            status_code=resp.status,
+                        )
 
-                if not choices:
-                    raise DoublewordInfraError("No choices in response", status_code=0)
+                    # Parse SSE stream
+                    async for line in resp.content:
+                        line_str = line.decode("utf-8", errors="replace").strip()
+                        if not line_str or not line_str.startswith("data: "):
+                            continue
+                        data_str = line_str[6:]  # Remove "data: " prefix
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            token = delta.get("content", "")
+                            if token:
+                                content += token
+                                try:
+                                    _stream_callback(token)
+                                except Exception:
+                                    pass
+                            # Capture usage from final chunk
+                            _usage = chunk.get("usage")
+                            if _usage:
+                                input_tokens = _usage.get("prompt_tokens", 0)
+                                output_tokens = _usage.get("completion_tokens", 0)
+                        except json.JSONDecodeError:
+                            continue
+            else:
+                # Non-streaming path
+                async with session.post(
+                    f"{self._base_url}/chat/completions",
+                    json=body,
+                    headers={"Content-Type": "application/json"},
+                    timeout=self._request_timeout(),
+                ) as resp:
+                    if resp.status >= 300:
+                        self._last_error_status = resp.status
+                        err_body = await resp.text()
+                        raise DoublewordInfraError(
+                            f"Chat completions failed: {resp.status} {err_body[:200]}",
+                            status_code=resp.status,
+                        )
 
-                content = choices[0].get("message", {}).get("content", "")
+                    data = await resp.json()
+                    choices = data.get("choices", [])
+                    usage = data.get("usage", {})
 
-                # Track cost
-                input_tokens = usage.get("prompt_tokens", 0)
-                output_tokens = usage.get("completion_tokens", 0)
-                cost = (
-                    input_tokens * _DW_INPUT_COST_PER_M / 1_000_000
-                    + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
+                    if not choices:
+                        raise DoublewordInfraError("No choices in response", status_code=0)
+
+                    content = choices[0].get("message", {}).get("content", "")
+                    input_tokens = usage.get("prompt_tokens", 0)
+                    output_tokens = usage.get("completion_tokens", 0)
+
+            # Track cost
+            cost = (
+                input_tokens * _DW_INPUT_COST_PER_M / 1_000_000
+                + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
+            )
+            self._stats.total_input_tokens += input_tokens
+            self._stats.total_output_tokens += output_tokens
+            self._stats.total_cost_usd += cost
+            self._record_cost(cost)
+            total_cost += cost
+
+            if total_cost >= self._max_cost_per_op:
+                raise DoublewordInfraError(
+                    f"doubleword_budget_exhausted_op:{total_cost:.4f}",
+                    status_code=0,
                 )
-                self._stats.total_input_tokens += input_tokens
-                self._stats.total_output_tokens += output_tokens
-                self._stats.total_cost_usd += cost
-                self._record_cost(cost)
-                total_cost += cost
 
-                if total_cost >= self._max_cost_per_op:
-                    raise DoublewordInfraError(
-                        f"doubleword_budget_exhausted_op:{total_cost:.4f}",
-                        status_code=0,
-                    )
-
-                return content
+            return content
 
         def _parse_tool_call_response(raw: str) -> Optional[Any]:
             """Parse a tool call from the model's response.
