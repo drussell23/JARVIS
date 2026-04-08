@@ -1953,8 +1953,10 @@ class GovernedOrchestrator:
 
         # Heartbeat: APPLY phase starting (Manifesto §7)
         try:
+            _apply_target = list(ctx.target_files)[0] if ctx.target_files else ""
             await self._stack.comm.emit_heartbeat(
-                op_id=ctx.op_id, phase="apply", progress_pct=80.0,
+                op_id=ctx.op_id, phase="APPLY", progress_pct=80.0,
+                target_file=_apply_target,
             )
         except Exception:
             pass

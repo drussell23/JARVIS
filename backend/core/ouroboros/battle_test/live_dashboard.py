@@ -587,11 +587,18 @@ class LiveDashboard:
         )
 
     def op_failed(self, op_id: str, reason: str, phase: str = "") -> None:
-        """Mark an operation as failed."""
+        """Mark an operation as failed and show failure panel."""
         op = self._active_ops.pop(op_id, None)
         short = op.short_id if op else op_id[:6]
         self._failed_count += 1
+        elapsed = time.time() - (op.started_at if op else time.time())
         phase_str = f" at {phase}" if phase else ""
+
+        # Show failure panel above dashboard
+        self.show_failure_panel(
+            op_id=op_id, reason=reason, phase=phase, duration_s=elapsed,
+        )
+
         self.add_event(
             "❌",
             f"[bold red]FAILED[/bold red]  op:{short}  {reason[:50]}{phase_str}",
@@ -983,6 +990,17 @@ class DashboardTransport:
                         duration_s=payload.get("generation_duration_s", 0.0),
                         tool_count=payload.get("tool_records", 0),
                     )
+                    # Show code preview above dashboard when candidate files present
+                    candidate_files = payload.get("candidate_files", [])
+                    if candidate_files or payload.get("candidate_preview"):
+                        self._db.show_code_preview(
+                            op_id=op_id,
+                            provider=provider,
+                            candidate_files=candidate_files,
+                            candidate_preview=payload.get("candidate_preview", ""),
+                            duration_s=payload.get("generation_duration_s", 0.0),
+                            tool_count=payload.get("tool_records", 0),
+                        )
 
                 # Validation
                 elif phase.upper() in ("VALIDATE", "VALIDATE_RETRY") and "test_passed" in payload:
@@ -1001,6 +1019,24 @@ class DashboardTransport:
                         max_iters=payload.get("l2_max_iters", 5),
                         status=payload.get("l2_status", ""),
                     )
+
+                # APPLY phase — show real-time diffs
+                elif phase.upper() == "APPLY" and payload.get("target_file"):
+                    self._db.show_diff(
+                        file_path=payload["target_file"],
+                        diff_text=payload.get("diff_text", ""),
+                        op_id=op_id,
+                    )
+
+                # Streaming code generation tokens
+                elif payload.get("streaming") == "start":
+                    provider = payload.get("provider", "unknown")
+                    self._op_providers[op_id] = provider
+                    self._db.show_streaming_start(provider=provider, op_id=op_id)
+                elif payload.get("streaming") == "token":
+                    self._db.show_streaming_token(payload.get("token", ""))
+                elif payload.get("streaming") == "end":
+                    self._db.show_streaming_end()
 
                 # IntentDiscovery sensor
                 elif payload.get("intent_discovery_cycle") is not None:
