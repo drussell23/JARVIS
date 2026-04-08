@@ -1091,12 +1091,30 @@ class GovernedOrchestrator:
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=self._config.generation_timeout_s
                 )
+                # Emit streaming=start so SerpentFlow can render the
+                # "synthesizing" header before tokens begin flowing.
+                # Provider is unknown at this point (chosen during adaptive failback).
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="generate", progress_pct=31.0,
+                        streaming="start", provider="",
+                    )
+                except Exception:
+                    pass
                 # Hard timeout — the deadline is advisory to the generator,
                 # but asyncio.wait_for is the Iron Gate (Manifesto §6).
                 generation = await asyncio.wait_for(
                     self._generator.generate(ctx, deadline),
                     timeout=self._config.generation_timeout_s + 5.0,
                 )
+                # Emit streaming=end to close the streaming block
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="generate", progress_pct=49.0,
+                        streaming="end",
+                    )
+                except Exception:
+                    pass
 
                 # is_noop=True means the model signalled the change is already present.
                 # Empty candidates is correct in this case — do not treat as a failure.

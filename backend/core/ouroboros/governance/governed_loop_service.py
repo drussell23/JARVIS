@@ -2281,14 +2281,11 @@ class GovernedLoopService:
             )
 
             # Wire streaming token callback for real-time character-by-character output.
-            # When SerpentFlow is active, streaming is handled via CommProtocol
-            # heartbeats → SerpentTransport → show_streaming_token().
-            # The _SUPPRESSED flag prevents double-rendering.
+            # SerpentFlow emits the "synthesizing" header via CommProtocol heartbeat
+            # (streaming=start), then tokens flow directly to stdout here.
+            # SerpentFlow doesn't use Rich Live, so stdout writes are safe.
             def _on_streaming_token(token: str) -> None:
                 try:
-                    from backend.core.ouroboros.governance.serpent_animation import _SUPPRESSED
-                    if _SUPPRESSED:
-                        return  # SerpentFlow handles streaming via CommProtocol
                     import sys as _sys
                     _sys.stdout.write(token)
                     _sys.stdout.flush()

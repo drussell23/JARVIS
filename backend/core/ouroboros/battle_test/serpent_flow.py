@@ -470,13 +470,17 @@ class SerpentFlow:
 
     def show_streaming_start(self, provider: str, op_id: str = "") -> None:
         """Begin streaming code generation — tokens will appear char-by-char."""
-        prov = _prov(provider)
         short = _short_id(op_id) if op_id else ""
         id_str = f"  [{_C['dim']}]op:{short}[/{_C['dim']}]" if short else ""
 
+        if provider:
+            prov = _prov(provider)
+            via_str = f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
+        else:
+            via_str = ""
+
         self.console.print(
-            f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}] │ "
-            f"via [{_C['provider']}]{prov}[/{_C['provider']}]{id_str}",
+            f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}] │{via_str}{id_str}",
             highlight=False,
         )
         self._streaming_active = True
