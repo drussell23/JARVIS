@@ -620,11 +620,19 @@ class DoublewordProvider:
                 pass
             return None
 
-        # Execute with or without tool loop
+        # Execute with or without tool loop.
+        # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper).
+        _complexity = getattr(context, "task_complexity", "")
+        _skip_tools = _complexity in ("trivial",)
+        if _skip_tools:
+            logger.info(
+                "[DoublewordProvider] \u26a1 Trivial task — skipping Venom tool loop (one-shot)",
+            )
+
         tool_records: tuple = ()
         raw: str = ""
 
-        if self._tool_loop is not None:
+        if self._tool_loop is not None and not _skip_tools:
             deadline_mono = time.monotonic() + max(
                 0.0,
                 (deadline - datetime.now(tz=timezone.utc)).total_seconds()

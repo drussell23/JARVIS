@@ -443,8 +443,12 @@ class GovernedOrchestrator:
                 description=ctx.description,
                 target_files=list(ctx.target_files),
             )
+            # Stamp complexity on context for downstream routing decisions
+            import dataclasses as _dc_stamp
+            ctx = _dc_stamp.replace(ctx, task_complexity=_complexity_result.complexity.value)
+
             logger.info(
-                "[Orchestrator] Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",
+                "[Orchestrator] \U0001f4ca Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",
                 _complexity_result.complexity.value,
                 _complexity_result.persistence.value,
                 _complexity_result.auto_approve_eligible,

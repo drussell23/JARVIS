@@ -77,9 +77,14 @@ _CODEGEN_SYSTEM_PROMPT = (
 )
 
 # ── Phase 2B: size/security constants ────────────────────────────────────
-_MAX_TARGET_FILE_CHARS = int(os.environ.get("JARVIS_CODEGEN_MAX_FILE_CHARS", "65536"))
-_TARGET_FILE_HEAD_CHARS = int(os.environ.get("JARVIS_CODEGEN_HEAD_CHARS", "52000"))
-_TARGET_FILE_TAIL_CHARS = int(os.environ.get("JARVIS_CODEGEN_TAIL_CHARS", "8000"))
+# Prompt compression: aggressive defaults to reduce token cost.
+# With Venom tool loop active, the model can read_file to see specific
+# sections — it doesn't need the entire 3000-line file in the prompt.
+# Old defaults: 65536/52000/8000 (huge, ~16K tokens per file).
+# New defaults: 20000/16000/4000 (~5K tokens per file — 3x reduction).
+_MAX_TARGET_FILE_CHARS = int(os.environ.get("JARVIS_CODEGEN_MAX_FILE_CHARS", "20000"))
+_TARGET_FILE_HEAD_CHARS = int(os.environ.get("JARVIS_CODEGEN_HEAD_CHARS", "16000"))
+_TARGET_FILE_TAIL_CHARS = int(os.environ.get("JARVIS_CODEGEN_TAIL_CHARS", "4000"))
 _MAX_IMPORT_CONTEXT_CHARS = 1500   # total across all discovered import files
 _MAX_TEST_CONTEXT_CHARS = 1500     # total across all discovered test files
 _MAX_IMPORT_FILES = 5              # hard cap on discovered import sources
@@ -2304,8 +2309,14 @@ class ClaudeProvider:
                 raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
             return raw_content
 
+        # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper)
+        _complexity = getattr(context, "task_complexity", "")
+        _skip_tools = _complexity in ("trivial",)
+        if _skip_tools:
+            logger.info("[ClaudeProvider] \u26a1 Trivial task — skipping Venom tool loop")
+
         tool_records: tuple = ()
-        if self._tool_loop is not None:
+        if self._tool_loop is not None and not _skip_tools:
             deadline_mono = (
                 time.monotonic()
                 + max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
