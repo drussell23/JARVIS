@@ -40,8 +40,8 @@ _DW_MODEL = os.environ.get(
     "DOUBLEWORD_MODEL", "Qwen/Qwen3.5-397B-A17B-FP8"
 )
 _DW_COMPLETION_WINDOW = os.environ.get("DOUBLEWORD_WINDOW", "1h")
-_DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "10000"))
-_DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "15"))
+_DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "16384"))
+_DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "5"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
 _DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "30"))

@@ -34,9 +34,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 import time
+import warnings
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -165,7 +167,11 @@ class LiveDashboard:
         self._console = Console(emoji=True, highlight=False)
         self._live: Optional[Live] = None
         self._refresh_task: Optional[asyncio.Task] = None
-        self._muted_handlers: List[logging.Handler] = []
+        # Terminal muting state (restored on stop)
+        self._muted_handlers: List[tuple] = []  # (logger, handler) pairs
+        self._original_stdout: Any = None
+        self._original_stderr: Any = None
+        self._original_showwarning: Any = None
 
     @property
     def console(self) -> Console:
@@ -173,27 +179,62 @@ class LiveDashboard:
 
     # ── Lifecycle ─────────────────────────────────────────────
 
-    def _mute_terminal_logging(self) -> None:
-        """Mute logging StreamHandlers that write to the terminal.
+    def _mute_terminal_output(self) -> None:
+        """Silence ALL terminal output that would corrupt Rich Live rendering.
 
-        Rich Live tracks cursor position via ANSI escapes.  Any raw
-        stderr/stdout write between refreshes corrupts that tracking and
-        causes the dashboard to re-render as stacked frames.  We mute
-        terminal handlers on start() and restore them on stop().
+        Rich Live tracks cursor position via ANSI escapes.  Any raw write
+        to stdout/stderr between refreshes breaks cursor tracking and
+        causes the dashboard to re-render as stacked frames.
+
+        We silence three output channels:
+        1. logging.StreamHandler on root AND all named loggers
+        2. Python warnings module (warnings.warn → stderr)
+        3. sys.stdout / sys.stderr (print statements, tracebacks)
+
+        Rich Live's own Console retains a reference to the original file
+        descriptor, so its rendering is unaffected by the redirect.
+        All state is restored in _unmute_terminal_output().
         """
-        root = logging.getLogger()
-        for handler in root.handlers[:]:
-            if isinstance(handler, logging.StreamHandler) and handler.stream in (
-                sys.stderr, sys.stdout,
-            ):
-                root.removeHandler(handler)
-                self._muted_handlers.append(handler)
+        # 1. Mute StreamHandlers on ALL loggers (root + named)
+        terminal_streams = (sys.stderr, sys.stdout)
+        for name in [None] + list(logging.Logger.manager.loggerDict):
+            lgr = logging.getLogger(name)
+            for handler in lgr.handlers[:]:
+                if isinstance(handler, logging.StreamHandler) and handler.stream in terminal_streams:
+                    lgr.removeHandler(handler)
+                    self._muted_handlers.append((lgr, handler))
 
-    def _unmute_terminal_logging(self) -> None:
-        """Restore previously muted terminal logging handlers."""
-        root = logging.getLogger()
-        for handler in self._muted_handlers:
-            root.addHandler(handler)
+        # 2. Suppress Python warnings (FutureWarning, DeprecationWarning, etc.)
+        self._original_showwarning = warnings.showwarning
+        warnings.showwarning = lambda *_a, **_kw: None
+
+        # 3. Redirect stdout/stderr to devnull so print() and tracebacks
+        #    don't corrupt the dashboard.  Rich Live's Console captured the
+        #    original fd at construction time, so its output is unaffected.
+        self._original_stdout = sys.stdout
+        self._original_stderr = sys.stderr
+        _devnull = open(os.devnull, "w")
+        sys.stdout = _devnull
+        sys.stderr = _devnull
+
+    def _unmute_terminal_output(self) -> None:
+        """Restore all terminal output channels silenced by _mute_terminal_output."""
+        # Restore stdout/stderr
+        if self._original_stdout is not None:
+            sys.stdout = self._original_stdout
+            self._original_stdout = None
+        if self._original_stderr is not None:
+            sys.stderr = self._original_stderr
+            self._original_stderr = None
+
+        # Restore warnings
+        if self._original_showwarning is not None:
+            warnings.showwarning = self._original_showwarning
+            self._original_showwarning = None
+
+        # Restore logging handlers
+        for lgr, handler in self._muted_handlers:
+            lgr.addHandler(handler)
         self._muted_handlers.clear()
 
     async def start(self) -> None:
@@ -201,7 +242,7 @@ class LiveDashboard:
         self._started_at = time.time()
         # Mute terminal logging — raw stderr writes corrupt Rich Live's
         # cursor tracking and cause stacked frame rendering.
-        self._mute_terminal_logging()
+        self._mute_terminal_output()
         self._live = Live(
             self._build_layout(),
             console=self._console,
@@ -227,7 +268,7 @@ class LiveDashboard:
                 self._live.stop()
             except Exception:
                 pass
-        self._unmute_terminal_logging()
+        self._unmute_terminal_output()
 
     async def _auto_refresh(self) -> None:
         """Background task to update the dashboard layout."""

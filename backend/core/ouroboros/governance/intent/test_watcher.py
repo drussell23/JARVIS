@@ -97,7 +97,7 @@ class TestWatcher:
         test_dir: str = "tests/",
         repo_path: Optional[str] = None,
         poll_interval_s: Optional[float] = None,
-        pytest_timeout_s: float = 120.0,
+        pytest_timeout_s: float = 30.0,
     ) -> None:
         self.repo = repo
         self.test_dir = test_dir

@@ -107,7 +107,7 @@ class OrchestratorConfig:
 
     project_root: Path
     repo_registry: Optional["RepoRegistry"] = None  # Forward ref avoids circular import; resolved at type-check time
-    generation_timeout_s: float = 120.0
+    generation_timeout_s: float = 180.0
     validation_timeout_s: float = 60.0
     approval_timeout_s: float = 600.0
     max_generate_retries: int = 1
