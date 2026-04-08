@@ -52,6 +52,7 @@ logger = logging.getLogger(__name__)
 _CHANNEL_PORT = int(os.environ.get("JARVIS_CHANNEL_PORT", "8099"))
 _CHANNEL_HOST = os.environ.get("JARVIS_CHANNEL_HOST", "127.0.0.1")
 _WEBHOOK_SECRET = os.environ.get("JARVIS_WEBHOOK_SECRET", "")
+_DW_WEBHOOK_SECRET = os.environ.get("DOUBLEWORD_WEBHOOK_SECRET", "")
 _MAX_PAYLOAD_BYTES = int(os.environ.get("JARVIS_CHANNEL_MAX_PAYLOAD", "262144"))
 _MAX_EVENTS_PER_MINUTE = int(os.environ.get("JARVIS_CHANNEL_RATE_LIMIT", "30"))
 _ENABLED = os.environ.get(
@@ -98,10 +99,12 @@ class EventChannelServer:
         router: Any,  # UnifiedIntakeRouter
         port: int = _CHANNEL_PORT,
         host: str = _CHANNEL_HOST,
+        batch_registry: Any = None,  # Optional[BatchFutureRegistry]
     ) -> None:
         self._router = router
         self._port = port
         self._host = host
+        self._batch_registry = batch_registry
         self._stats = ChannelStats()
         self._rate_tracker: Dict[str, List[float]] = {}
         self._server_task: Optional[asyncio.Task] = None
@@ -124,6 +127,7 @@ class EventChannelServer:
             app.router.add_post("/webhook/github", self._handle_github)
             app.router.add_post("/webhook/ci", self._handle_ci)
             app.router.add_post("/webhook/generic", self._handle_generic)
+            app.router.add_post("/webhook/doubleword", self._handle_doubleword)
             app.router.add_get("/channel/health", self._handle_health)
 
             runner = web.AppRunner(app)
@@ -232,6 +236,69 @@ class EventChannelServer:
         )
 
         await self._route_event(event)
+        return web.Response(status=200, text="OK")
+
+    async def _handle_doubleword(self, request: Any) -> Any:
+        """DoubleWord webhook — batch.completed / batch.failed (Standard Webhooks).
+
+        Resolves or rejects the corresponding asyncio.Future in the
+        BatchFutureRegistry so callers can await batch results with
+        zero polling (Manifesto §3).
+        """
+        from aiohttp import web
+        import base64
+
+        body = await self._read_bounded_body(request)
+        if body is None:
+            return web.Response(status=413, text="Payload too large")
+
+        # Standard Webhooks signature verification
+        if _DW_WEBHOOK_SECRET:
+            wh_id = request.headers.get("webhook-id", "")
+            wh_ts = request.headers.get("webhook-timestamp", "")
+            wh_sig = request.headers.get("webhook-signature", "")
+            try:
+                key = base64.b64decode(_DW_WEBHOOK_SECRET.removeprefix("whsec_"))
+                signed_content = f"{wh_id}.{wh_ts}.{body.decode()}".encode()
+                expected = base64.b64encode(
+                    hmac.new(key, signed_content, hashlib.sha256).digest()
+                ).decode()
+                valid = any(
+                    hmac.compare_digest(s[3:], expected)
+                    for s in wh_sig.split() if s.startswith("v1,")
+                )
+            except Exception:
+                valid = False
+            if not valid:
+                self._stats.events_rejected += 1
+                return web.Response(status=401, text="Invalid signature")
+
+        try:
+            payload = json.loads(body)
+        except json.JSONDecodeError:
+            return web.Response(status=400, text="Invalid JSON")
+
+        event_type = payload.get("type", "")
+        data = payload.get("data", {})
+        batch_id = data.get("batch_id", "")
+
+        if self._batch_registry is None:
+            logger.warning("[EventChannel] DW webhook received but no BatchFutureRegistry wired")
+            return web.Response(status=200, text="OK (no registry)")
+
+        if event_type == "batch.completed":
+            output_file_id = data.get("output_file_id", "")
+            resolved = self._batch_registry.resolve(batch_id, output_file_id)
+            logger.info("[EventChannel] DW batch.completed %s (resolved=%s)", batch_id, resolved)
+        elif event_type == "batch.failed":
+            reason = data.get("error", {}).get("message", "unknown")
+            self._batch_registry.reject(batch_id, reason)
+            logger.warning("[EventChannel] DW batch.failed %s: %s", batch_id, reason)
+        else:
+            logger.debug("[EventChannel] DW webhook unknown type: %s", event_type)
+
+        self._stats.total_events += 1
+        self._stats.last_event_at = time.time()
         return web.Response(status=200, text="OK")
 
     async def _handle_health(self, request: Any) -> Any:

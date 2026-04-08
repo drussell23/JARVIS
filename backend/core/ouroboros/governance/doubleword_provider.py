@@ -128,6 +128,7 @@ class DoublewordProvider:
         daily_budget: float = _DW_DAILY_BUDGET,
         tool_loop: Optional[Any] = None,
         realtime_enabled: bool = True,
+        batch_registry: Optional[Any] = None,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -140,15 +141,16 @@ class DoublewordProvider:
         self._rate_limiter = rate_limiter
         self._last_error_status: int = 0  # HTTP status from last failure (0 = non-HTTP)
         self._tool_loop = tool_loop
-        # Real-time mode: the 397B model takes 30-120s per real-time request
-        # because it's enormous. The batch API is optimized for throughput and
-        # typically completes faster (20-30s). Real-time is only viable for
-        # small prompts (tool rounds). For the full generation prompt, batch
-        # is the right mode. Default: disabled for 397B, can be enabled for
-        # smaller models via DOUBLEWORD_REALTIME_ENABLED=true.
+        self._batch_registry = batch_registry
+        # Real-time mode uses /v1/chat/completions with SSE streaming —
+        # zero polling, token-by-token output, Venom tool loop support.
+        # Battle testing shows batch (16-22s) and real-time (20-40s) have
+        # comparable latency, but real-time enables streaming + eliminates
+        # the polling loop (Manifesto §3: Zero polling. Pure reflex.).
+        # Default: ON. Opt out via DOUBLEWORD_REALTIME_ENABLED=false.
         self._realtime_enabled = (
             realtime_enabled
-            and os.environ.get("DOUBLEWORD_REALTIME_ENABLED", "false").lower() == "true"
+            and os.environ.get("DOUBLEWORD_REALTIME_ENABLED", "true").lower() != "false"
         )
         # Cost gating (matches ClaudeProvider pattern)
         self._max_cost_per_op = max_cost_per_op
@@ -334,7 +336,7 @@ class DoublewordProvider:
         t0 = pending.submitted_at
 
         try:
-            output_file_id = await self._poll_batch(pending.batch_id)
+            output_file_id = await self._await_batch_result(pending.batch_id)
             if not output_file_id:
                 self._stats.failed_batches += 1
                 logger.warning(
@@ -462,11 +464,23 @@ class DoublewordProvider:
                 generation_duration_s=0.0,
             )
 
-        # Real-time mode: use /v1/chat/completions for instant response + Venom tool loop
+        # Real-time mode: /v1/chat/completions with SSE streaming + Venom tool loop
+        # On 429/503, fall back to batch within DW (stay cheap) instead of
+        # cascading to the 150x more expensive Claude fallback.
         if self._realtime_enabled:
-            return await self._generate_realtime(context, deadline, prompt_override=prompt_override)
+            try:
+                return await self._generate_realtime(context, deadline, prompt_override=prompt_override)
+            except DoublewordInfraError as exc:
+                if exc.status_code in (429, 503):
+                    logger.info(
+                        "[DoublewordProvider] Real-time returned %d, falling back to batch",
+                        exc.status_code,
+                    )
+                    # Fall through to batch mode below
+                else:
+                    raise  # Non-retriable: propagate to CandidateGenerator FSM
 
-        # Batch mode: legacy 4-stage async batch API
+        # Batch mode: 4-stage async batch API (fallback from real-time, or explicit opt-in)
         t0 = time.monotonic()
         self._last_error_status = 0  # reset before attempt
 
@@ -863,15 +877,64 @@ class DoublewordProvider:
                     logger.error("[DoublewordProvider] Batch create failed: %s %s", resp.status, body[:500])
                     return None
                 result = await resp.json()
-                return result.get("id")
+                batch_id = result.get("id")
+                # Register webhook future (Tier 1) if registry is wired
+                if batch_id and self._batch_registry is not None:
+                    self._batch_registry.register(batch_id)
+                return batch_id
         except Exception:
             self._last_error_status = 0
             logger.exception("[DoublewordProvider] Batch create error")
             return None
 
-    async def _poll_batch(self, batch_id: str) -> Optional[str]:
-        """Stage 3: Poll until batch completes. Returns output_file_id or None."""
+    # ------------------------------------------------------------------
+    # Batch result awaiting: Tier 1 (webhook future) → Tier 2 (adaptive poll)
+    # ------------------------------------------------------------------
+
+    async def _await_batch_result(self, batch_id: str) -> Optional[str]:
+        """Wait for batch result via webhook future or adaptive poll fallback.
+
+        Tier 1: If a ``BatchFutureRegistry`` is wired and the batch has a
+        registered future, await it (zero polling — webhook resolves it).
+
+        Tier 2: Adaptive exponential backoff polling with jitter.
+        """
+        # Tier 1: webhook-driven (if registry wired)
+        registry = getattr(self, "_batch_registry", None)
+        if registry is not None:
+            try:
+                return await registry.wait(batch_id, timeout=_DW_MAX_WAIT_S)
+            except asyncio.TimeoutError:
+                logger.warning("[DoublewordProvider] Webhook wait timed out for %s", batch_id)
+                return None
+            except Exception:
+                pass  # No future registered or rejected — fall through to Tier 2
+
+        # Tier 2: adaptive backoff poll
+        return await self._adaptive_poll_batch(batch_id)
+
+    @staticmethod
+    def _next_poll_interval(attempt: int, *, network_error: bool = False) -> float:
+        """Compute next poll interval with exponential backoff + jitter.
+
+        Starting interval: 2s (normal) or 15s (network error).
+        Multiplier: 1.5x per attempt. Cap: 30s. Jitter: +/-25%.
+        """
+        import random
+        base = 15.0 if network_error else 2.0
+        interval = min(base * (1.5 ** attempt), 30.0)
+        jitter = interval * 0.25 * (2 * random.random() - 1)
+        return max(0.5, interval + jitter)
+
+    async def _adaptive_poll_batch(self, batch_id: str) -> Optional[str]:
+        """Stage 3: Adaptive backoff polling until batch completes.
+
+        Replaces the fixed 5s poll with exponential backoff + jitter.
+        Network-aware: connection errors trigger aggressive backoff.
+        Returns output_file_id or None on failure/timeout.
+        """
         deadline = time.monotonic() + _DW_MAX_WAIT_S
+        attempt = 0
 
         while time.monotonic() < deadline:
             try:
@@ -897,7 +960,8 @@ class DoublewordProvider:
                     if resp.status >= 300:
                         self._last_error_status = resp.status
                         logger.warning("[DoublewordProvider] Poll error: %s", resp.status)
-                        await asyncio.sleep(_DW_POLL_INTERVAL_S)
+                        await asyncio.sleep(self._next_poll_interval(attempt))
+                        attempt += 1
                         continue
                     data = await resp.json()
                     status = data.get("status", "unknown")
@@ -915,13 +979,20 @@ class DoublewordProvider:
                             batch_id, status,
                         )
                         return None
-                    # Still in_progress — keep polling
+                    # Still in_progress — adaptive backoff
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.debug("[DoublewordProvider] Poll exception", exc_info=True)
+            except Exception as exc:
+                _is_network = "connect" in str(exc).lower() or "timeout" in str(exc).lower()
+                logger.debug(
+                    "[DoublewordProvider] Poll attempt %d: %s (network=%s)",
+                    attempt, type(exc).__name__, _is_network,
+                )
+                if _is_network:
+                    attempt = max(attempt, 3)  # Jump to higher backoff for network errors
 
-            await asyncio.sleep(_DW_POLL_INTERVAL_S)
+            await asyncio.sleep(self._next_poll_interval(attempt))
+            attempt += 1
 
         logger.error("[DoublewordProvider] Batch %s timed out after %ds", batch_id, _DW_MAX_WAIT_S)
         return None
@@ -1098,7 +1169,7 @@ class DoublewordProvider:
                 batch_id, effective_model, caller_id,
             )
 
-            output_file_id = await self._poll_batch(batch_id)
+            output_file_id = await self._await_batch_result(batch_id)
             if not output_file_id:
                 self._stats.failed_batches += 1
                 logger.warning(
