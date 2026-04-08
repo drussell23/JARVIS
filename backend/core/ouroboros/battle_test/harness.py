@@ -499,19 +499,58 @@ class BattleTestHarness:
                 from backend.core.ouroboros.consciousness.types import ConsciousnessConfig
                 _c_config = ConsciousnessConfig.from_env()
 
-                # Stub DreamEngine — TrinityConsciousness.start() calls
-                # dream.start() without None guard, so we provide a no-op.
-                class _NoOpDream:
-                    async def start(self) -> None: pass
-                    async def stop(self) -> None: pass
-                    def get_blueprints(self, top_n: int = 5) -> list: return []
-                    def get_blueprint(self, bid: str): return None
-                    def discard_stale(self) -> int: return 0
+                # DreamEngine — uses DW (primary) + Claude (fallback) + J-Prime (legacy)
+                # Falls back to no-op stub if DreamEngine import fails.
+                _dream_instance: Any = None
+                try:
+                    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+                    from backend.core.ouroboros.consciousness.dream_metrics import DreamMetricsTracker
+
+                    _dw_ref = getattr(self._governed_loop_service, "_doubleword_ref", None)
+                    _dream_metrics = DreamMetricsTracker()
+
+                    # Lightweight stubs — battle test always considers user "idle"
+                    # and never yields to resource pressure.
+                    class _ActivityStub:
+                        def last_activity_s(self) -> float:
+                            return 9999.0  # Always idle
+                    class _GovernorStub:
+                        async def should_yield(self) -> bool:
+                            return False  # Never yield
+
+                    _dream_instance = DreamEngine(
+                        health_cortex=_cortex,
+                        memory_engine=_memory,
+                        activity_monitor=_ActivityStub(),
+                        resource_governor=_GovernorStub(),
+                        metrics_tracker=_dream_metrics,
+                        config=_c_config,
+                        jprime_url=os.environ.get("JPRIME_URL", ""),
+                        persistence_dir=_consciousness_dir / "dreams",
+                        comm=_comm,
+                        dw_provider=_dw_ref,
+                    )
+                    logger.info(
+                        "DreamEngine booted (dw=%s, jprime=%s)",
+                        "active" if _dw_ref else "none",
+                        "active" if os.environ.get("JPRIME_URL") else "none",
+                    )
+                except Exception as _dream_exc:
+                    logger.debug("DreamEngine boot failed, using stub: %s", _dream_exc)
+
+                if _dream_instance is None:
+                    class _NoOpDream:
+                        async def start(self) -> None: pass
+                        async def stop(self) -> None: pass
+                        def get_blueprints(self, top_n: int = 5) -> list: return []
+                        def get_blueprint(self, bid: str): return None
+                        def discard_stale(self) -> int: return 0
+                    _dream_instance = _NoOpDream()
 
                 _consciousness = TrinityConsciousness(
                     health_cortex=_cortex,
                     memory_engine=_memory,
-                    dream_engine=_NoOpDream(),
+                    dream_engine=_dream_instance,
                     prophecy_engine=_prophecy,
                     config=_c_config,
                 )

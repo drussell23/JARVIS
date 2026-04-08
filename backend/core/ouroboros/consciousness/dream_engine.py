@@ -164,6 +164,8 @@ class DreamEngine:
         jprime_url: str = "",
         persistence_dir: Optional[Path] = None,
         comm: Any = None,
+        dw_provider: Any = None,
+        claude_provider: Any = None,
     ) -> None:
         self._health_cortex = health_cortex
         self._memory_engine = memory_engine
@@ -173,6 +175,10 @@ class DreamEngine:
         self._config = config
         self._jprime_url: str = jprime_url
         self._comm = comm
+
+        # DW + Claude providers (preferred over raw J-Prime HTTP)
+        self._dw_provider = dw_provider
+        self._claude_provider = claude_provider
 
         # Persistence
         default_dir = (
@@ -489,8 +495,8 @@ class DreamEngine:
         prompt = self._build_dream_prompt(candidate)
         prompt = self._truncate_prompt(prompt)
 
-        # Send to J-Prime via direct HTTP (TC29)
-        result = await self._call_jprime(prompt)
+        # Send via DW (primary) → Claude (fallback) → J-Prime (legacy)
+        result = await self._call_inference(prompt)
 
         # Check preemption after HTTP (TC17)
         if self._check_preempted():
@@ -563,10 +569,76 @@ class DreamEngine:
             f"estimated_cost_usd, suggested_approach, risk_assessment."
         )
 
-    async def _call_jprime(self, prompt: str) -> Optional[Dict[str, Any]]:
-        """Send prompt to J-Prime via direct HTTP (TC29).
+    async def _call_inference(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """Send prompt via DW (primary) → Claude (fallback) → J-Prime (legacy).
 
-        Returns the parsed JSON response or None on any failure.
+        Tiered inference strategy:
+            1. DW 35B for light dreaming (cheap, fast)
+            2. Claude API as fallback (reliable, more expensive)
+            3. J-Prime direct HTTP as legacy fallback (TC29)
+
+        Returns parsed JSON response or None on any failure.
+        """
+        # Check preemption before any call (TC17)
+        if self._check_preempted():
+            return None
+
+        # Tier 1: Doubleword (35B for light dreaming — 30x cheaper than Claude)
+        if self._dw_provider is not None:
+            try:
+                _dw_model = os.environ.get(
+                    "JARVIS_DREAM_DW_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8"
+                )
+                raw = await self._dw_provider.prompt_only(
+                    prompt=prompt,
+                    model=_dw_model,
+                    caller_id="dream_engine",
+                    response_format={"type": "json_object"},
+                    max_tokens=DREAM_MAX_PROMPT_CHARS,
+                )
+                if self._check_preempted():
+                    return None
+                if raw:
+                    result = self._parse_json_response(raw)
+                    if result is not None:
+                        result["_inference_provider"] = "doubleword"
+                        result["_inference_model"] = _dw_model
+                        logger.debug("[DreamEngine] DW inference succeeded (model=%s)", _dw_model)
+                        return result
+                    logger.debug("[DreamEngine] DW returned non-JSON, trying next tier")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[DreamEngine] DW inference failed: %s", exc)
+
+        # Tier 2: Claude API (reliable, handles complex reasoning)
+        if self._claude_provider is not None:
+            try:
+                raw = await self._claude_provider.prompt_only(
+                    prompt=prompt,
+                    caller_id="dream_engine",
+                    response_format={"type": "json_object"},
+                    max_tokens=DREAM_MAX_PROMPT_CHARS,
+                )
+                if self._check_preempted():
+                    return None
+                if raw:
+                    result = self._parse_json_response(raw)
+                    if result is not None:
+                        result["_inference_provider"] = "claude"
+                        logger.debug("[DreamEngine] Claude inference succeeded")
+                        return result
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug("[DreamEngine] Claude inference failed: %s", exc)
+
+        # Tier 3: J-Prime direct HTTP (legacy fallback — TC29)
+        return await self._call_jprime_legacy(prompt)
+
+    async def _call_jprime_legacy(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """Legacy J-Prime direct HTTP fallback (TC29).
+
         Does NOT use PrimeClient or PrimeRouter — uses aiohttp directly
         so record_jprime_activity() is never triggered.
         """
@@ -585,7 +657,6 @@ class DreamEngine:
                 "source": "dream_engine",
             }
 
-            # Check preemption before sending (TC17)
             if self._check_preempted():
                 return None
 
@@ -595,7 +666,6 @@ class DreamEngine:
                     json=payload,
                     timeout=aiohttp.ClientTimeout(total=_JPRIME_TIMEOUT_S),
                 ) as resp:
-                    # Check preemption after response (TC17)
                     if self._check_preempted():
                         return None
                     if resp.status != 200:
@@ -603,13 +673,40 @@ class DreamEngine:
                             "[DreamEngine] J-Prime returned %d", resp.status,
                         )
                         return None
-                    return await resp.json()
+                    result = await resp.json()
+                    if result is not None:
+                        result["_inference_provider"] = "jprime"
+                    return result
 
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.debug("[DreamEngine] J-Prime HTTP call failed: %s", exc)
             return None
+
+    @staticmethod
+    def _parse_json_response(raw: str) -> Optional[Dict[str, Any]]:
+        """Parse a JSON response from any inference provider."""
+        import json as _json
+        text = raw.strip()
+        # Handle markdown-wrapped JSON
+        if text.startswith("```"):
+            lines = text.split("\n")
+            text = "\n".join(ln for ln in lines if not ln.strip().startswith("```"))
+        try:
+            data = _json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except _json.JSONDecodeError:
+            # Try to extract JSON object from text
+            start = text.find("{")
+            end = text.rfind("}")
+            if start >= 0 and end > start:
+                try:
+                    return _json.loads(text[start:end + 1])
+                except _json.JSONDecodeError:
+                    pass
+        return None
 
     def _parse_blueprint_result(
         self,
@@ -632,7 +729,7 @@ class DreamEngine:
                 repo_sha=candidate["repo_sha"],
                 computed_at_utc=datetime.now(timezone.utc).isoformat(),
                 ttl_hours=self._config.dream_blueprint_ttl_hours,
-                model_used=candidate.get("model_class", "unknown"),
+                model_used=result.get("_inference_model", candidate.get("model_class", "unknown")),
                 policy_hash=candidate["policy_hash"],
                 oracle_neighborhood=result.get("oracle_neighborhood", {}),
                 suggested_approach=result.get("suggested_approach", ""),

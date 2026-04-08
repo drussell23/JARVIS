@@ -69,6 +69,12 @@ from backend.core.ouroboros.integration import PerformanceRecord, TaskDifficulty
 
 logger = logging.getLogger("Ouroboros.Orchestrator")
 
+# Module-level buffer for LearningConsolidator periodic consolidation.
+# Outcomes accumulate here; once the threshold is reached, consolidate()
+# is called to generate new domain-level rules.
+_CONSOLIDATION_BUFFER: list = []
+_CONSOLIDATION_THRESHOLD: int = 10
+
 
 # ---------------------------------------------------------------------------
 # OrchestratorConfig
@@ -999,6 +1005,64 @@ class GovernedOrchestrator:
             pass
         except Exception:
             logger.debug("[Orchestrator] Self-evolution injection failed", exc_info=True)
+
+        # ── Self-Evolution P2: Module-level function analysis + auto-documentation gaps ──
+        try:
+            from backend.core.ouroboros.governance.self_evolution import (
+                ModuleLevelMutator, RepositoryAutoDocumentation,
+            )
+            _se2_blocks: List[str] = []
+
+            # ModuleLevelMutator: show function-level breakdown of target files
+            # so the generator can do surgical mutations instead of full rewrites
+            for _tf in ctx.target_files[:3]:
+                _tf_path = self._config.project_root / _tf
+                if not _tf_path.is_file() or _tf_path.suffix != ".py":
+                    continue
+                _funcs = ModuleLevelMutator.list_functions(_tf_path)
+                if _funcs:
+                    _complex = [f for f in _funcs if f["complexity"] > 5]
+                    if _complex:
+                        _func_info = ", ".join(
+                            f"{f['name']}(CC={f['complexity']}, L{f['start_line']}-{f['end_line']})"
+                            for f in sorted(_complex, key=lambda x: x["complexity"], reverse=True)[:5]
+                        )
+                        _se2_blocks.append(
+                            f"## Function-level analysis: {_tf}\n"
+                            f"Complex functions (surgical mutation targets): {_func_info}\n"
+                            f"Prefer modifying individual functions over full-file rewrites."
+                        )
+
+            # RepositoryAutoDocumentation: show doc gaps in target files
+            _auto_doc = RepositoryAutoDocumentation()
+            for _tf in ctx.target_files[:3]:
+                _tf_path = self._config.project_root / _tf
+                if _tf_path.is_file() and _tf_path.suffix == ".py":
+                    _auto_doc.scan_file(_tf_path)
+            _doc_prompt = _auto_doc.format_for_prompt(
+                [str(self._config.project_root / tf) for tf in ctx.target_files[:3]]
+            )
+            if _doc_prompt:
+                _se2_blocks.append(_doc_prompt)
+
+            if _se2_blocks:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                _se2_combined = "\n\n".join(_se2_blocks)
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=getattr(ctx, "strategic_intent_id", "") or "",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=_existing + "\n\n" + _se2_combined,
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.info(
+                    "[Orchestrator] Self-evolution P2: injected %d blocks "
+                    "(module analysis + doc gaps)",
+                    len(_se2_blocks),
+                )
+        except ImportError:
+            pass
+        except Exception:
+            logger.debug("[Orchestrator] Self-evolution P2 injection failed", exc_info=True)
 
         if _serpent: _serpent.update_phase("GENERATE")
         # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
@@ -2277,6 +2341,37 @@ class GovernedOrchestrator:
             # P2: Multi-version evolution tracking
             _evt = MultiVersionEvolutionTracker()
             _evt.record_operation(_is_success, len(ctx.target_files))
+
+            # P2: LearningConsolidator — periodic consolidation of outcomes into rules
+            # Accumulates outcomes and consolidates when enough data is available.
+            try:
+                from backend.core.ouroboros.governance.adaptive_learning import (
+                    LearningConsolidator,
+                )
+                _lc = LearningConsolidator()
+                _provider_name = ""
+                if ctx.generation is not None:
+                    _provider_name = ctx.generation.provider_name
+                _outcome_dict = {
+                    "domain_key": _se_domain,
+                    "success": _is_success,
+                    "error_pattern": error_pattern or "",
+                    "provider": _provider_name,
+                    "target_files": list(ctx.target_files),
+                }
+                # Buffer outcome in a module-level accumulator; consolidate
+                # when the buffer reaches threshold (10 outcomes).
+                _CONSOLIDATION_BUFFER.append(_outcome_dict)
+                if len(_CONSOLIDATION_BUFFER) >= _CONSOLIDATION_THRESHOLD:
+                    _new_rules = _lc.consolidate(list(_CONSOLIDATION_BUFFER))
+                    _CONSOLIDATION_BUFFER.clear()
+                    if _new_rules:
+                        logger.info(
+                            "[Orchestrator] LearningConsolidator: %d new rules from %d outcomes",
+                            len(_new_rules), _CONSOLIDATION_THRESHOLD,
+                        )
+            except Exception:
+                pass  # Consolidation is best-effort
 
         except Exception:
             pass  # Self-evolution feedback is best-effort
