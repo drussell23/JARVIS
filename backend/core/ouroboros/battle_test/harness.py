@@ -430,6 +430,12 @@ class BattleTestHarness:
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
                     self._governance_stack.comm._transports.append(_dash_transport)
                     logger.info("LiveDashboard wired (persistent Rich Live TUI)")
+                # Suppress serpent animation — it fights with Rich Live rendering
+                try:
+                    from backend.core.ouroboros.governance.serpent_animation import suppress as _suppress_serpent
+                    _suppress_serpent()
+                except Exception:
+                    pass
                 self._keyboard_handler = DashboardKeyboardHandler(
                     dashboard=self._live_dashboard,
                     shutdown_event=self._shutdown_event,
