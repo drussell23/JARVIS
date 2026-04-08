@@ -547,11 +547,14 @@ class DoublewordProvider:
             }
 
             if _stream_callback is not None:
-                # Streaming path: SSE for token-by-token output
+                # Streaming path: SSE for token-by-token output.
+                # Use a generous per-chunk timeout (30s between chunks)
+                # to detect stalled streams without killing slow generation.
                 body["stream"] = True
                 content = ""
                 input_tokens = 0
                 output_tokens = 0
+                _PER_CHUNK_TIMEOUT = 30.0  # seconds between SSE chunks
 
                 async with session.post(
                     f"{self._base_url}/chat/completions",
@@ -567,8 +570,17 @@ class DoublewordProvider:
                             status_code=resp.status,
                         )
 
-                    # Parse SSE stream
-                    async for line in resp.content:
+                    # Parse SSE stream with per-chunk timeout to detect stalled streams
+                    while True:
+                        try:
+                            line = await asyncio.wait_for(
+                                resp.content.readline(), timeout=_PER_CHUNK_TIMEOUT,
+                            )
+                        except asyncio.TimeoutError:
+                            logger.warning("[DoublewordProvider] SSE stream stalled (no data for %.0fs)", _PER_CHUNK_TIMEOUT)
+                            break
+                        if not line:
+                            break
                         line_str = line.decode("utf-8", errors="replace").strip()
                         if not line_str or not line_str.startswith("data: "):
                             continue

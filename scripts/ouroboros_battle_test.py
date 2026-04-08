@@ -264,6 +264,7 @@ def main() -> None:
         "anthropic._base_client", "anthropic._client",  # Anthropic SDK request/response dumps
         "httpcore", "httpx",  # HTTP transport internals
         "asyncio",  # event loop debug
+        "aiosqlite",  # SQLite debug queries
     ):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
