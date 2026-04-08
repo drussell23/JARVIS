@@ -615,7 +615,7 @@ class OuroborosTUITransport:
             elif msg_type == "DECISION":
                 outcome = payload.get("outcome", "")
                 elapsed = time.time() - self._tui._op_start_times.pop(op_id, time.time())
-                files = payload.get("files_changed", [])
+                files = payload.get("files_changed", payload.get("affected_files", []))
                 provider = self._current_provider.pop(op_id, "unknown")
 
                 if outcome in ("completed", "applied", "auto_approved"):

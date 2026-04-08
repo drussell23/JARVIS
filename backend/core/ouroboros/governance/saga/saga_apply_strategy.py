@@ -747,6 +747,12 @@ class SagaApplyStrategy:
                 else:
                     continue
             written.append(pf.path)
+            logger.info(
+                "[Saga-B+] \U0001f4be APPLY: %s (%s, %d bytes) [op=%s]",
+                pf.path, pf.op.name if hasattr(pf.op, "name") else pf.op,
+                len(new_bytes) if pf.op != FileOp.DELETE else 0,
+                ctx.op_id[:16] if hasattr(ctx, "op_id") else "",
+            )
         if not written:
             return
         await self._git(repo, ["add", "--"] + written)

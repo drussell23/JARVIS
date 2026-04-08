@@ -2169,10 +2169,18 @@ class GovernedLoopService:
             _policy  = _GTP(repo_roots=_rr)
             _backend = _AsyncBE(semaphore=asyncio.Semaphore(self._config.max_concurrent_tools))
             # Real-time tool call display callback (Manifesto §7: Absolute Observability)
+            # Fires twice per tool: once before execution (tool name + args) and
+            # once after execution (result preview + duration + status).
             def _on_tool_call_display(**kwargs: Any) -> None:
                 try:
-                    from backend.core.ouroboros.battle_test.diff_display import print_tool_call
-                    print_tool_call(**kwargs)
+                    from backend.core.ouroboros.battle_test.ouroboros_tui import OuroborosConsole
+                    # Try TUI first (Rich rendering), fall back to basic
+                    _tui_ref = getattr(self, "_tui_console_ref", None)
+                    if _tui_ref is not None:
+                        _tui_ref.show_tool_call(**kwargs)
+                    else:
+                        from backend.core.ouroboros.battle_test.diff_display import print_tool_call
+                        print_tool_call(**kwargs)
                 except Exception:
                     pass  # Display is non-critical
 

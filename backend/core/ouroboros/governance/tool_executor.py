@@ -977,6 +977,24 @@ class ToolLoopCoordinator:
                     status=tool_result.status,
                 ))
                 self._last_records = list(records)
+
+                # Notify callback with tool result for real-time display
+                if self._on_tool_call is not None:
+                    try:
+                        _result_preview = (tool_result.output or "")[:500]
+                        _dur_ms = (ended_ns - started_ns) / 1_000_000
+                        self._on_tool_call(
+                            op_id=op_id,
+                            tool_name=tc.name,
+                            args_summary=str(next(iter(tc.arguments.values()), ""))[:80] if tc.arguments else "",
+                            round_index=round_index,
+                            result_preview=_result_preview,
+                            duration_ms=_dur_ms,
+                            status="success" if not tool_result.error else "error",
+                        )
+                    except Exception:
+                        pass
+
                 current_prompt += _format_tool_result(tc, tool_result)
 
             if len(current_prompt) > _MAX_PROMPT_CHARS:

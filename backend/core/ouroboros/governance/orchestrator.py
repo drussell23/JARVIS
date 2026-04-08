@@ -1306,6 +1306,28 @@ class GovernedOrchestrator:
                     "model": getattr(generation, "model_id", ""),
                 })
 
+                # Heartbeat: validation result for TUI (Manifesto §7)
+                try:
+                    _val_msg = type("_Msg", (), {
+                        "payload": {
+                            "phase": "validate",
+                            "test_passed": validation.passed,
+                            "test_count": getattr(validation, "test_count", 0),
+                            "test_failures": getattr(validation, "failure_count", 0),
+                            "failure_class": validation.failure_class or "",
+                            "validation_output": str(getattr(validation, "output_preview", ""))[:300],
+                        },
+                        "op_id": ctx.op_id,
+                        "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                    })()
+                    for _t in getattr(self._stack.comm, "_transports", []):
+                        try:
+                            await _t.send(_val_msg)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
                 # Emit gate event for duplication blocks
                 if validation.failure_class == "duplication":
                     try:
