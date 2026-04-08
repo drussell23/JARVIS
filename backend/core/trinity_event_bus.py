@@ -726,12 +726,27 @@ class CrossRepoTransport:
                 break
 
             try:
-                # v2.8: Use asyncio's native non-blocking socket receive
+                # v2.9: Python 3.9 compat — sock_recvfrom is 3.11+.
+                # Use run_in_executor with socket.settimeout(1.0) as fallback.
                 try:
-                    data, addr = await asyncio.wait_for(
-                        loop.sock_recvfrom(sock, 65535),
-                        timeout=1.0  # 1 second timeout to check _running flag
-                    )
+                    if hasattr(loop, "sock_recvfrom"):
+                        # Python 3.11+: native async sock_recvfrom
+                        data, addr = await asyncio.wait_for(
+                            loop.sock_recvfrom(sock, 65535),
+                            timeout=1.0,
+                        )
+                    else:
+                        # Python 3.9-3.10: use blocking recvfrom in executor
+                        import socket as _socket_mod
+                        sock.settimeout(1.0)
+                        try:
+                            data, addr = await loop.run_in_executor(
+                                None, sock.recvfrom, 65535,
+                            )
+                        except _socket_mod.timeout:
+                            raise asyncio.TimeoutError()
+                        finally:
+                            sock.settimeout(0)  # restore non-blocking
                 except asyncio.TimeoutError:
                     # No data received within timeout - normal for UDP multicast
                     # Gradually decrease fail count on successful polls (recovery)
