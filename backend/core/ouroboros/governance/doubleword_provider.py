@@ -140,7 +140,16 @@ class DoublewordProvider:
         self._rate_limiter = rate_limiter
         self._last_error_status: int = 0  # HTTP status from last failure (0 = non-HTTP)
         self._tool_loop = tool_loop
-        self._realtime_enabled = realtime_enabled  # Use /v1/chat/completions instead of batch
+        # Real-time mode: the 397B model takes 30-120s per real-time request
+        # because it's enormous. The batch API is optimized for throughput and
+        # typically completes faster (20-30s). Real-time is only viable for
+        # small prompts (tool rounds). For the full generation prompt, batch
+        # is the right mode. Default: disabled for 397B, can be enabled for
+        # smaller models via DOUBLEWORD_REALTIME_ENABLED=true.
+        self._realtime_enabled = (
+            realtime_enabled
+            and os.environ.get("DOUBLEWORD_REALTIME_ENABLED", "false").lower() == "true"
+        )
         # Cost gating (matches ClaudeProvider pattern)
         self._max_cost_per_op = max_cost_per_op
         self._daily_budget = daily_budget

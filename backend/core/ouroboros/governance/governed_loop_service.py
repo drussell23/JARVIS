@@ -2278,9 +2278,13 @@ class GovernedLoopService:
                 )
                 _dw_rate_limiter = RateLimitService()
                 # Real-time mode: use /v1/chat/completions with Venom tool loop
-                # instead of batch API. Enabled by default when tool_loop is available.
+                # Real-time mode for DW: the 397B model takes 30-120s per real-time
+                # request due to its size. The batch API is optimized for throughput
+                # and typically completes in 20-30s. Real-time only makes sense for
+                # smaller DW models. Default: OFF for 397B. Claude handles Venom
+                # tool use as Tier 1 fallback (5-15s per call, ideal for multi-turn).
                 _dw_realtime = os.environ.get(
-                    "DOUBLEWORD_REALTIME_ENABLED", "true"
+                    "DOUBLEWORD_REALTIME_ENABLED", "false"
                 ).lower() == "true"
                 tier0 = DoublewordProvider(
                     api_key=_dw_api_key,
