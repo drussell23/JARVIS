@@ -1350,6 +1350,94 @@ class GovernedLoopService:
                     "[GovernedLoop] ContextMemoryLoader error (non-fatal): %s", _cml_exc
                 )
 
+            # ── Semantic Triage (DW 35B pre-analysis) ────────────────────────
+            # Cheap LLM-powered pre-scan: detects no-ops, redirects, and enriches
+            # context BEFORE the expensive generation pipeline runs.
+            _semantic_triage = getattr(self, "_semantic_triage", None)
+            if _semantic_triage is not None and getattr(_semantic_triage, "is_available", False):
+                try:
+                    from backend.core.ouroboros.governance.semantic_triage import (
+                        TriageDecision,
+                    )
+                    _triage_result = await _semantic_triage.triage(ctx)
+
+                    if _triage_result.decision == TriageDecision.NO_OP:
+                        # Change already present — skip generation entirely
+                        logger.info(
+                            "[GovernedLoop] Semantic triage: NO_OP for op=%s — %s",
+                            ctx.op_id[:12], _triage_result.no_op_reason,
+                        )
+                        duration = time.monotonic() - start_time
+                        result = OperationResult(
+                            op_id=ctx.op_id,
+                            terminal_phase=OperationPhase.COMPLETE,
+                            total_duration_s=duration,
+                            reason_code="semantic_triage_no_op",
+                            trigger_source=trigger_source,
+                            routing_reason=brain.routing_reason,
+                            terminal_class="NOOP",
+                        )
+                        self._completed_ops[dedupe_key] = result
+                        await self._emit_terminal_events(
+                            ctx=ctx, result=result,
+                            brain_id=brain.brain_id, model_name=brain.model_name,
+                        )
+                        return result
+
+                    elif _triage_result.decision == TriageDecision.REDIRECT:
+                        # Real problem is in different files — log and inject as
+                        # expanded context (OperationContext is immutable on target_files
+                        # after creation, so we add redirect targets to expansion list).
+                        if _triage_result.redirect_files:
+                            logger.info(
+                                "[GovernedLoop] Semantic triage: REDIRECT op=%s "
+                                "from %s → also consider %s",
+                                ctx.op_id[:12], ctx.target_files,
+                                _triage_result.redirect_files,
+                            )
+                            # Add redirect targets as expanded files so the
+                            # generation model receives their context too.
+                            _expanded = tuple(ctx.expanded_context_files or ()) + tuple(
+                                f for f in _triage_result.redirect_files
+                                if f not in ctx.target_files
+                            )
+                            ctx = ctx.with_expanded_files(_expanded)
+
+                    elif _triage_result.decision == TriageDecision.ENRICH:
+                        # Inject triage insights into human_instructions
+                        # (strategic_memory_context requires full L4 parameters;
+                        # human_instructions is a clean append-only field).
+                        _insights = _semantic_triage.format_for_prompt(_triage_result)
+                        if _insights:
+                            _existing = getattr(ctx, "human_instructions", "") or ""
+                            ctx = ctx.with_human_instructions(
+                                _existing + _insights,
+                            )
+                            logger.info(
+                                "[GovernedLoop] Semantic triage: ENRICH op=%s "
+                                "confidence=%.2f (%d chars injected)",
+                                ctx.op_id[:12], _triage_result.confidence,
+                                len(_insights),
+                            )
+
+                    # PROCEED and SKIP: continue normally (no action needed)
+                    if _triage_result.decision not in (
+                        TriageDecision.PROCEED, TriageDecision.SKIP,
+                    ):
+                        try:
+                            await self._stack.comm.emit_heartbeat(
+                                op_id=ctx.op_id,
+                                phase="semantic_triage",
+                                progress_pct=5.0,
+                            )
+                        except Exception:
+                            pass
+
+                except Exception as _triage_exc:
+                    logger.debug(
+                        "[GovernedLoop] Semantic triage error (non-fatal): %s", _triage_exc
+                    )
+
             # Connectivity preflight (spends from deadline budget)
             if self._generator is not None and self._ledger is not None:
                 early_exit = await self._preflight_check(ctx)
