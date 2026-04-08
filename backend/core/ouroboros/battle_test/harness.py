@@ -250,7 +250,7 @@ class BattleTestHarness:
                     )
 
                     async def _on_op_completed(event: Any) -> None:
-                        """Record completed operations into SessionRecorder."""
+                        """Record completed operations with cost data for notebook."""
                         try:
                             p = event.payload
                             status = "completed" if p.get("success") else "failed"
@@ -263,10 +263,25 @@ class BattleTestHarness:
                                 technique=p.get("provider", "unknown"),
                                 composite_score=0.0,
                                 elapsed_s=p.get("duration_s", 0.0),
+                                provider=p.get("provider", ""),
+                                cost_usd=p.get("cost_usd", 0.0),
+                                input_tokens=p.get("input_tokens", 0),
+                                output_tokens=p.get("output_tokens", 0),
+                                cached_tokens=p.get("cached_tokens", 0),
+                                tool_calls=p.get("tool_calls", 0),
+                                files_changed=len(p.get("affected_files", [])),
                             )
+                            # Show cost in TUI
+                            if hasattr(self, "_tui_console") and self._tui_console:
+                                self._tui_console.show_cost_update(
+                                    total=self._cost_tracker.total_spent,
+                                    remaining=self._cost_tracker.remaining,
+                                    breakdown=self._cost_tracker.breakdown,
+                                )
                             logger.debug(
-                                "SessionRecorder: recorded op=%s status=%s",
+                                "SessionRecorder: recorded op=%s status=%s provider=%s cost=$%.4f",
                                 p.get("op_id", "")[:16], status,
+                                p.get("provider", ""), p.get("cost_usd", 0.0),
                             )
                         except Exception:
                             pass  # Recording is non-critical

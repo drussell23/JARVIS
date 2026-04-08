@@ -852,6 +852,12 @@ class ToolLoopCoordinator:
         self._tool_timeout_s = tool_timeout_s
         self._last_records: List[ToolExecutionRecord] = []
         self._on_tool_call = on_tool_call  # Optional callback for real-time display
+        # Cost optimization: providers can check this flag to use lower max_tokens
+        # during tool rounds (model only needs ~200 tokens for a tool call JSON).
+        self.is_tool_round: bool = False
+        self._tool_round_max_tokens: int = int(
+            os.environ.get("JARVIS_TOOL_ROUND_MAX_TOKENS", "1024")
+        )
 
     async def run(
         self,
@@ -885,6 +891,8 @@ class ToolLoopCoordinator:
                 )
                 break
 
+            # Signal to provider: use lower max_tokens for tool rounds
+            self.is_tool_round = (round_index > 0)
             raw: str = await generate_fn(current_prompt)
             tc = parse_fn(raw)
             if tc is None:

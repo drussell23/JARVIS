@@ -525,13 +525,18 @@ class DoublewordProvider:
             nonlocal total_cost
             session = await self._get_session()
 
+            # Smart max_tokens: lower during Venom tool rounds (cost optimization)
+            _eff_max_tokens = self._max_tokens
+            if self._tool_loop is not None and getattr(self._tool_loop, "is_tool_round", False):
+                _eff_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
+
             body = {
                 "model": self._model,
                 "messages": [
                     {"role": "system", "content": _SYSTEM_PROMPT},
                     {"role": "user", "content": p},
                 ],
-                "max_tokens": self._max_tokens,
+                "max_tokens": _eff_max_tokens,
                 "temperature": _DW_TEMPERATURE,
                 "chat_template_kwargs": {"enable_thinking": False},
             }

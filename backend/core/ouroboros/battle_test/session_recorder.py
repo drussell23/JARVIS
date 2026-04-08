@@ -77,8 +77,15 @@ class SessionRecorder:
         technique: str,
         composite_score: float,
         elapsed_s: float,
+        provider: str = "",
+        cost_usd: float = 0.0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cached_tokens: int = 0,
+        tool_calls: int = 0,
+        files_changed: int = 0,
     ) -> None:
-        """Record a completed or queued operation.
+        """Record a completed or queued operation with cost data.
 
         Parameters
         ----------
@@ -95,6 +102,20 @@ class SessionRecorder:
             Composite RSI score for this operation (lower = better).
         elapsed_s:
             Wall-clock seconds from enqueue to terminal state.
+        provider:
+            Provider used (doubleword-397b, claude-api, etc.)
+        cost_usd:
+            Estimated cost for this operation in USD.
+        input_tokens:
+            Total input tokens consumed.
+        output_tokens:
+            Total output tokens generated.
+        cached_tokens:
+            Input tokens served from prompt cache (90% cheaper).
+        tool_calls:
+            Number of Venom tool calls during generation.
+        files_changed:
+            Number of files modified in APPLY phase.
         """
         entry: Dict[str, Any] = {
             "op_id": op_id,
@@ -104,6 +125,13 @@ class SessionRecorder:
             "composite_score": composite_score,
             "elapsed_s": elapsed_s,
             "recorded_at": time.time(),
+            "provider": provider,
+            "cost_usd": cost_usd,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "cached_tokens": cached_tokens,
+            "tool_calls": tool_calls,
+            "files_changed": files_changed,
         }
 
         self._operations.append(entry)

@@ -2252,6 +2252,12 @@ class ClaudeProvider:
             else:
                 user_content = p
 
+            # Smart max_tokens: during Venom tool rounds, the model only needs
+            # ~200-1024 tokens (tool call JSON). Full 8192 only for final patch.
+            _effective_max_tokens = min(self._max_tokens, 8192)
+            if self._tool_loop is not None and getattr(self._tool_loop, "is_tool_round", False):
+                _effective_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
+
             # Prompt caching: mark the system prompt as cacheable.
             # Anthropic caches identical system prompts across calls —
             # cached input tokens cost $0.30/M instead of $3.00/M (90% savings).
@@ -2268,7 +2274,7 @@ class ClaudeProvider:
             msg = await asyncio.wait_for(
                 client.messages.create(
                     model=self._model,
-                    max_tokens=min(self._max_tokens, 8192),
+                    max_tokens=_effective_max_tokens,
                     temperature=0.2,
                     system=_system_with_cache,
                     messages=[{"role": "user", "content": user_content}],
