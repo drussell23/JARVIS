@@ -272,8 +272,8 @@ class BattleTestHarness:
                                 files_changed=len(p.get("affected_files", [])),
                             )
                             # Show cost in TUI / dashboard
-                            if hasattr(self, "_live_dashboard") and self._live_dashboard:
-                                self._live_dashboard.update_cost(
+                            if hasattr(self, "_serpent_flow") and self._serpent_flow:
+                                self._serpent_flow.update_cost(
                                     total=self._cost_tracker.total_spent,
                                     remaining=self._cost_tracker.remaining,
                                     breakdown=self._cost_tracker.breakdown,
@@ -303,13 +303,13 @@ class BattleTestHarness:
                 logger.debug("SessionRecorder event subscription failed: %s", exc)
 
             # Start dashboard / TUI controls
-            if hasattr(self, "_live_dashboard") and self._live_dashboard is not None:
-                # Update dashboard with detected sensor count
+            if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
+                # Update flow with detected sensor count
                 _intake = self._intake_service
                 if _intake is not None:
                     n_sensors = len(getattr(_intake, "_sensors", []))
-                    self._live_dashboard.update_sensors(n_sensors)
-                await self._live_dashboard.start()
+                    self._serpent_flow.update_sensors(n_sensors)
+                await self._serpent_flow.start()
             elif hasattr(self, "_tui_console") and self._tui_console is not None:
                 self._tui_console.show_controls_bar()
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
@@ -410,41 +410,37 @@ class BattleTestHarness:
                 gov_config,
                 oracle=self._oracle,
             )
-            # Inject LiveDashboard for persistent at-a-glance TUI (preferred)
+            # Inject SerpentFlow — flowing organism CLI (preferred)
             # Falls back to scrolling OuroborosTUI, then basic diff transport.
-            self._live_dashboard = None
+            self._serpent_flow = None
             try:
-                from backend.core.ouroboros.battle_test.live_dashboard import (
-                    LiveDashboard,
-                    DashboardTransport,
-                    DashboardKeyboardHandler,
+                from backend.core.ouroboros.battle_test.serpent_flow import (
+                    SerpentFlow,
+                    SerpentTransport,
                 )
-                self._live_dashboard = LiveDashboard(
+                self._serpent_flow = SerpentFlow(
                     session_id=self._session_id,
                     branch_name=self._branch_name or "",
                     cost_cap_usd=self._config.cost_cap_usd,
                     idle_timeout_s=self._config.idle_timeout_s,
                     repo_path=self._config.repo_path,
                 )
-                _dash_transport = DashboardTransport(dashboard=self._live_dashboard)
+                _serpent_transport = SerpentTransport(flow=self._serpent_flow)
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
-                    self._governance_stack.comm._transports.append(_dash_transport)
-                    logger.info("LiveDashboard wired (persistent Rich Live TUI)")
-                # Suppress serpent animation — it fights with Rich Live rendering
+                    self._governance_stack.comm._transports.append(_serpent_transport)
+                    logger.info("SerpentFlow wired (flowing organism CLI)")
+                # Suppress raw stdout streaming — SerpentFlow handles it via CommProtocol
                 try:
                     from backend.core.ouroboros.governance.serpent_animation import suppress as _suppress_serpent
                     _suppress_serpent()
                 except Exception:
                     pass
-                self._keyboard_handler = DashboardKeyboardHandler(
-                    dashboard=self._live_dashboard,
-                    shutdown_event=self._shutdown_event,
-                )
+                self._keyboard_handler = None
                 # Also keep a reference for cost updates
                 self._tui_console = None
             except Exception as exc:
-                logger.debug("LiveDashboard not available, trying OuroborosTUI: %s", exc)
-                self._live_dashboard = None
+                logger.debug("SerpentFlow not available, trying OuroborosTUI: %s", exc)
+                self._serpent_flow = None
                 # Fallback to scrolling OuroborosTUI
                 try:
                     from backend.core.ouroboros.battle_test.ouroboros_tui import (
@@ -1013,15 +1009,15 @@ class BattleTestHarness:
         except Exception:
             pass
 
-        # 0b. Keyboard handler + LiveDashboard
+        # 0b. Keyboard handler + SerpentFlow
         try:
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
                 await self._keyboard_handler.stop()
         except Exception:
             pass
         try:
-            if hasattr(self, "_live_dashboard") and self._live_dashboard is not None:
-                await self._live_dashboard.stop()
+            if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
+                await self._serpent_flow.stop()
         except Exception:
             pass
 
