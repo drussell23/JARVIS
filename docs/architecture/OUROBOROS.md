@@ -105,7 +105,7 @@ Configuration (`OrchestratorConfig`):
 |-----------|---------|---------|
 | `project_root` | (required) | Root directory of target project |
 | `repo_registry` | None | Multi-repo registry (enables cross-repo sagas) |
-| `generation_timeout_s` | 120s | Max seconds per generation attempt |
+| `generation_timeout_s` | 180s | Max seconds per generation attempt (hard `asyncio.wait_for` + 5s grace) |
 | `validation_timeout_s` | 60s | Max seconds per validation attempt |
 | `approval_timeout_s` | 600s | Max seconds to wait for human approval |
 | `max_generate_retries` | 1 | Additional generation attempts after failure |
@@ -171,7 +171,7 @@ generator raises.
 
 | Provider | Wraps | Cost (per 1M tokens) | Features |
 |----------|-------|---------------------|----------|
-| `DoublewordProvider` | Doubleword batch API (397B MoE) | $0.10 / $0.40 | Cost-gated, daily budget, per-request timeouts, RateLimitService, circuit breaker |
+| `DoublewordProvider` | Doubleword batch + real-time API (397B MoE) | $0.10 / $0.40 | Cost-gated, daily budget, 16384 max_tokens, 5s poll interval, per-request timeouts, RateLimitService, circuit breaker |
 | `ClaudeProvider` | `anthropic.AsyncAnthropic` | $3.00 / $15.00 | Cost-gated, daily budget, tool-use support |
 | `PrimeProvider` | `PrimeClient.generate()` (GCP) | ~$1.20/hr VM | Fixed temperature 0.2, schema enforcement |
 
@@ -218,6 +218,8 @@ Tier 1 (Primary → Fallback):
   - If still in backoff: use fallback directly
   - Primary budget: 65% of remaining time
   - Fallback gets guaranteed 20s minimum
+  - Fallback hard cap: 60s max (`_FALLBACK_MAX_TIMEOUT_S`) — prevents
+    unreachable J-Prime from consuming the entire pipeline budget
 ```
 
 #### Deadline Budget Allocation
@@ -493,7 +495,7 @@ It is the **soul** of the organism (Manifesto Section 4: "The Synthetic Soul").
 - Rolling HealthTrend (720 snapshots = 6 hours)
 - Output: TrinityHealthSnapshot with overall_score, resource pressure
 
-**DreamEngine** (`dream_engine.py`, 731 lines):
+**DreamEngine** (`dream_engine.py`, 828 lines):
 - Pre-computes ImprovementBlueprint during idle time (>300s)
 - Daily budget: 120 minutes
 - Blueprints keyed on (repo_sha, policy_hash)
@@ -857,7 +859,7 @@ The session stops on whichever fires first:
 |----------|---------|---------|
 | `OUROBOROS_TIER0_BUDGET_FRACTION` | `0.50` | Fraction of deadline for Tier 0 |
 | `OUROBOROS_TIER0_MAX_WAIT_S` | `90` | Absolute max Tier 0 wait |
-| `OUROBOROS_TIER1_MIN_RESERVE_S` | `45` | Minimum reserved for Tier 1 |
+| `OUROBOROS_TIER1_MIN_RESERVE_S` | `25` | Minimum reserved for Tier 1 (reduced from 45 to avoid starving Tier 0) |
 | `OUROBOROS_PRIMARY_BUDGET_FRACTION` | `0.65` | Primary's share within Tier 1 |
 | `OUROBOROS_FALLBACK_MIN_RESERVE_S` | `20` | Minimum reserved for fallback |
 
@@ -911,6 +913,9 @@ The organism uses 6 layers of cost optimization to maximize operations per budge
 | `backend/core/ouroboros/governance/context_expander.py` | Pre-generation context expansion |
 | `backend/core/ouroboros/governance/change_engine.py` | Filesystem patch application |
 | `backend/core/ouroboros/governance/ledger.py` | Append-only operation ledger |
+| `backend/core/ouroboros/governance/comm_protocol.py` | 5-phase communication protocol (INTENT→PLAN→HEARTBEAT→DECISION→POSTMORTEM) |
+| `backend/core/ouroboros/governance/semantic_triage.py` | SemanticTriage pre-generation filter (NO_OP/REDIRECT/ENRICH/GENERATE) |
+| `backend/core/ouroboros/governance/serpent_animation.py` | ASCII Ouroboros animation (auto-suppressed by LiveDashboard) |
 | `backend/core/ouroboros/governance/preemption_fsm.py` | Durable preemption state machine |
 | `backend/core/ouroboros/governance/graduation_orchestrator.py` | Ephemeral -> permanent graduation |
 | `backend/core/ouroboros/oracle.py` | TheOracle GraphRAG knowledge graph |
@@ -937,6 +942,18 @@ The organism uses 6 layers of cost optimization to maximize operations per budge
 | `backend/core/ouroboros/governance/intake/sensors/opportunity_miner_sensor.py` | Cyclomatic complexity detection (incremental) |
 | `backend/core/ouroboros/governance/intake/sensors/doc_staleness_sensor.py` | Undocumented module detection |
 | `backend/core/ouroboros/governance/intake/sensors/cross_repo_drift_sensor.py` | Cross-repo contract drift |
+| `backend/core/ouroboros/governance/intake/sensors/github_issue_sensor.py` | GitHub issue polling across Trinity repos |
+| `backend/core/ouroboros/governance/intake/sensors/proactive_exploration_sensor.py` | Entropy-driven curiosity exploration |
+| `backend/core/ouroboros/governance/intake/sensors/intent_discovery_sensor.py` | Manifesto-driven proactive improvement synthesis |
+| `backend/core/ouroboros/governance/intake/sensors/cu_execution_sensor.py` | Compute unit execution tracking |
+| `backend/core/ouroboros/governance/intake/sensors/runtime_health_sensor.py` | Python EOL, package staleness, security audit |
+| `backend/core/ouroboros/governance/intake/sensors/web_intelligence_sensor.py` | PyPI CVE/advisory scanning |
+| `backend/core/ouroboros/governance/intake/sensors/performance_regression_sensor.py` | Latency drift and quality degradation |
+| `backend/core/ouroboros/governance/intake/sensors/voice_command_sensor.py` | Voice-triggered code changes |
+| `backend/core/ouroboros/governance/intake/sensors/capability_gap_sensor.py` | Shannon entropy gap detection |
+| `backend/core/ouroboros/governance/intake/sensors/scheduled_sensor.py` | Cron-based scheduled triggers |
+| `backend/core/ouroboros/governance/intent/test_watcher.py` | Pytest polling + stable failure detection (30s timeout) |
+| `backend/core/ouroboros/governance/intent/signals.py` | IntentSignal dataclass |
 | `backend/core/trinity_event_bus.py` | TrinityEventBus (unified pub-sub spine) |
 | `backend/core/resilience/file_watch_guard.py` | FileWatchGuard (watchdog wrapper) |
 | `tests/ouroboros_pytest_plugin.py` | pytest plugin -> .jarvis/test_results.json |
@@ -947,7 +964,8 @@ The organism uses 6 layers of cost optimization to maximize operations per budge
 | File | Purpose |
 |------|---------|
 | `scripts/ouroboros_battle_test.py` | CLI entry point |
-| `backend/core/ouroboros/battle_test/harness.py` | BattleTestHarness lifecycle |
+| `backend/core/ouroboros/battle_test/harness.py` | BattleTestHarness lifecycle (6-layer stack boot) |
+| `backend/core/ouroboros/battle_test/live_dashboard.py` | LiveDashboard TUI (1,233 lines) — persistent Rich Live terminal interface with DashboardTransport, streaming code, colored diffs, 3-channel terminal muting |
 | `backend/core/ouroboros/battle_test/cost_tracker.py` | CostTracker with budget_event |
 | `backend/core/ouroboros/battle_test/idle_watchdog.py` | IdleWatchdog with idle_event |
 
