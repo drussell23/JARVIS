@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -2238,6 +2239,7 @@ class ClaudeProvider:
         start = time.monotonic()
 
         _last_msg: list = [None]
+        _token_usage: Dict[str, int] = {"input": 0, "output": 0}
 
         async def _generate_raw(p: str) -> str:
             nonlocal total_cost
@@ -2350,6 +2352,8 @@ class ClaudeProvider:
             cost = self._estimate_cost(input_tokens, output_tokens, _cached_input)
             self._record_cost(cost)
             total_cost += cost
+            _token_usage["input"] += input_tokens
+            _token_usage["output"] += output_tokens
             if total_cost >= self._max_cost_per_op:
                 raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
             return raw_content
@@ -2450,9 +2454,18 @@ class ClaudeProvider:
             repo_root=repo_root,
         )
 
+        # Attach token usage
+        if _token_usage["input"] or _token_usage["output"]:
+            result = dataclasses.replace(
+                result,
+                total_input_tokens=_token_usage["input"],
+                total_output_tokens=_token_usage["output"],
+            )
+
         logger.info(
-            "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f",
+            "[ClaudeProvider] %d candidates in %.1fs (tool_rounds=%d), cost=$%.4f, %d+%d tokens",
             len(result.candidates), duration, tool_rounds, total_cost,
+            _token_usage["input"], _token_usage["output"],
         )
         return result.with_tool_records(tool_records)
 

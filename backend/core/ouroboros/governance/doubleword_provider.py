@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -403,7 +404,7 @@ class DoublewordProvider:
                 # Return None — caller treats as "no candidates" and retries
                 return None
 
-            return _parse_generation_response(
+            result = _parse_generation_response(
                 raw=content,
                 provider_name="doubleword",
                 duration_s=elapsed,
@@ -413,6 +414,14 @@ class DoublewordProvider:
                 repo_roots=self._repo_roots or None,
                 repo_root=self._repo_root,
             )
+            # Attach token usage from batch
+            if usage:
+                result = dataclasses.replace(
+                    result,
+                    total_input_tokens=input_tokens,
+                    total_output_tokens=output_tokens,
+                )
+            return result
 
         except asyncio.CancelledError:
             raise
@@ -543,6 +552,9 @@ class DoublewordProvider:
             "Start your response with { and end with }."
         )
 
+        # Mutable container to capture token usage from _generate_raw
+        _token_usage: Dict[str, int] = {"input": 0, "output": 0}
+
         async def _generate_raw(p: str) -> str:
             """Single chat completion call (used by tool_loop.run())."""
             nonlocal total_cost
@@ -653,6 +665,10 @@ class DoublewordProvider:
                     content = choices[0].get("message", {}).get("content", "")
                     input_tokens = usage.get("prompt_tokens", 0)
                     output_tokens = usage.get("completion_tokens", 0)
+
+            # Accumulate token usage for outer scope
+            _token_usage["input"] += input_tokens
+            _token_usage["output"] += output_tokens
 
             # Track cost
             cost = (
@@ -770,14 +786,18 @@ class DoublewordProvider:
             repo_root=self._repo_root,
         )
 
-        # Attach tool records if available
-        if tool_records and hasattr(result, "_replace"):
-            # GenerationResult may be a namedtuple or dataclass
-            pass  # tool_records stored on the ToolLoopCoordinator
+        # Attach token usage from _generate_raw
+        if _token_usage["input"] or _token_usage["output"]:
+            result = dataclasses.replace(
+                result,
+                total_input_tokens=_token_usage["input"],
+                total_output_tokens=_token_usage["output"],
+            )
 
         logger.info(
-            "[DoublewordProvider] RT: %d candidates in %.1fs ($%.4f, %d tool calls)",
+            "[DoublewordProvider] RT: %d candidates in %.1fs ($%.4f, %d tool calls, %d+%d tokens)",
             len(result.candidates), elapsed, total_cost, len(tool_records),
+            _token_usage["input"], _token_usage["output"],
         )
 
         return result

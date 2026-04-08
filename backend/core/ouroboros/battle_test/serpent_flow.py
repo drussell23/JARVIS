@@ -230,8 +230,8 @@ class SerpentFlow:
         """Phase transition — only log significant phases."""
         # Skip noisy transitions; the interesting ones have dedicated methods
         phase_upper = phase.upper()
-        if phase_upper in ("CLASSIFY", "ROUTE", "CONTEXT_EXPANSION"):
-            return  # These happen fast; don't clutter the flow
+        if phase_upper in ("CLASSIFY", "ROUTE", "CONTEXT_EXPANSION", "GENERATE", "VALIDATE"):
+            return  # Handled by dedicated methods (synthesizing/synthesized, immune check)
         short = _short_id(op_id)
 
         phase_map = {
@@ -293,18 +293,30 @@ class SerpentFlow:
     def op_generation(
         self, op_id: str, candidates: int, provider: str,
         duration_s: float = 0.0, tool_count: int = 0,
+        model_id: str = "", input_tokens: int = 0, output_tokens: int = 0,
     ) -> None:
-        """Generation completed — show summary."""
+        """Generation completed — show summary with model + token count."""
         short = _short_id(op_id)
         prov = _prov(provider)
         self._op_providers[op_id] = provider
 
+        # Model display: show model_id if available, otherwise provider name
+        model_str = model_id if model_id else prov
+
+        # Token count
+        total_tokens = input_tokens + output_tokens
+        if total_tokens > 0:
+            token_str = f" │ {total_tokens:,} tokens"
+        else:
+            token_str = ""
+
         tools_str = f" + 🔧 {tool_count} tools" if tool_count > 0 else ""
+
         self.console.print(
             f"[{_C['neural']}]🧬 synthesized[/{_C['neural']}] │ "
             f"{candidates} candidate{'s' if candidates != 1 else ''} via "
-            f"[{_C['provider']}]{prov}[/{_C['provider']}]"
-            f"{tools_str}"
+            f"[{_C['provider']}]{model_str}[/{_C['provider']}]"
+            f"{tools_str}{token_str}"
             f"  [{_C['dim']}]({duration_s:.1f}s)  op:{short}[/{_C['dim']}]",
             highlight=False,
         )
@@ -390,39 +402,34 @@ class SerpentFlow:
     def show_code_preview(
         self, op_id: str, provider: str, candidate_files: List[str],
         candidate_preview: str = "", duration_s: float = 0.0,
-        tool_count: int = 0,
+        tool_count: int = 0, candidate_rationales: Optional[List[str]] = None,
     ) -> None:
-        """Show generated code inline with syntax highlighting."""
-        if not candidate_preview:
+        """Show compact candidate summary — file paths + rationale, not raw content."""
+        c = self.console
+        if not candidate_files and not candidate_rationales:
             return
 
-        c = self.console
-
-        # Detect language
-        lang = "python"
-        if candidate_files:
-            lang = _detect_lang(candidate_files[0])
-
-        # Truncate if huge
-        preview = candidate_preview
-        truncated = False
-        if len(preview) > 2000:
-            preview = preview[:2000]
-            truncated = True
-
-        try:
-            syntax = Syntax(
-                preview, lang, theme="monokai",
-                line_numbers=False, word_wrap=True,
-                padding=(0, 2),
+        # Show each candidate as a compact card: file + rationale
+        files = candidate_files or []
+        rationales = candidate_rationales or []
+        for i, fp in enumerate(files):
+            if not fp:
+                continue
+            # Shorten long paths
+            display_path = fp
+            if len(fp) > 55:
+                parts = fp.split("/")
+                display_path = "/".join(parts[-2:])
+            rationale = rationales[i] if i < len(rationales) else ""
+            c.print(
+                f"          │ 📂 [{_C['file']}]{display_path}[/{_C['file']}]",
+                highlight=False,
             )
-            c.print(syntax)
-            if truncated:
-                c.print(f"          [{_C['dim']}]... +{len(candidate_preview) - 2000} chars truncated[/{_C['dim']}]")
-        except Exception:
-            c.print(f"          [{_C['dim']}]{preview[:500]}[/{_C['dim']}]")
-
-        c.print()
+            if rationale:
+                c.print(
+                    f"          │ [{_C['dim']}]{rationale[:75]}[/{_C['dim']}]",
+                    highlight=False,
+                )
 
     # ── Diff display (CC-style + organism personality) ─────────
 
@@ -477,7 +484,7 @@ class SerpentFlow:
     # ── Streaming output ──────────────────────────────────────
 
     def show_streaming_start(self, provider: str, op_id: str = "") -> None:
-        """Begin streaming code generation — tokens will appear char-by-char."""
+        """Begin streaming — show synthesizing header (tokens buffered silently)."""
         short = _short_id(op_id) if op_id else ""
         id_str = f"  [{_C['dim']}]op:{short}[/{_C['dim']}]" if short else ""
 
@@ -492,23 +499,14 @@ class SerpentFlow:
             highlight=False,
         )
         self._streaming_active = True
-        # Start dim text for streaming tokens
-        sys.stdout.write("          \033[2m")
-        sys.stdout.flush()
 
     def show_streaming_token(self, token: str) -> None:
-        """Print a streaming token — character-by-character code writing."""
-        if self._streaming_active:
-            sys.stdout.write(token)
-            sys.stdout.flush()
+        """No-op — tokens are buffered silently by the provider."""
+        pass
 
     def show_streaming_end(self) -> None:
         """End the streaming block."""
-        if self._streaming_active:
-            sys.stdout.write("\033[0m\n")
-            sys.stdout.flush()
-            self._streaming_active = False
-            self.console.print()
+        self._streaming_active = False
 
     # ── Operation completion ──────────────────────────────────
 
@@ -743,17 +741,19 @@ class SerpentTransport:
                         provider=provider,
                         duration_s=payload.get("generation_duration_s", 0.0),
                         tool_count=payload.get("tool_records", 0),
+                        model_id=payload.get("model_id", ""),
+                        input_tokens=payload.get("total_input_tokens", 0),
+                        output_tokens=payload.get("total_output_tokens", 0),
                     )
-                    # Show code preview when candidate files present
+                    # Show candidate summary (files + rationales)
                     candidate_files = payload.get("candidate_files", [])
-                    if candidate_files or payload.get("candidate_preview"):
+                    candidate_rationales = payload.get("candidate_rationales", [])
+                    if candidate_files or candidate_rationales:
                         self._flow.show_code_preview(
                             op_id=op_id,
                             provider=provider,
                             candidate_files=candidate_files,
-                            candidate_preview=payload.get("candidate_preview", ""),
-                            duration_s=payload.get("generation_duration_s", 0.0),
-                            tool_count=payload.get("tool_records", 0),
+                            candidate_rationales=candidate_rationales,
                         )
 
                 # Validation

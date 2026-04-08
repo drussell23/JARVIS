@@ -1138,11 +1138,18 @@ class GovernedOrchestrator:
                                 "phase": "generate",
                                 "candidates_count": len(generation.candidates),
                                 "provider": generation.provider_name,
+                                "model_id": getattr(generation, "model_id", ""),
                                 "generation_duration_s": generation.generation_duration_s,
                                 "tool_records": len(getattr(generation, "tool_execution_records", ()) or ()),
+                                "total_input_tokens": getattr(generation, "total_input_tokens", 0),
+                                "total_output_tokens": getattr(generation, "total_output_tokens", 0),
                                 # Include candidate file paths and preview for TUI display
                                 "candidate_files": [
                                     getattr(c, "file_path", "") for c in generation.candidates[:3]
+                                ],
+                                "candidate_rationales": [
+                                    (c.get("rationale", "") or "")[:80]
+                                    for c in generation.candidates[:3]
                                 ],
                                 "candidate_preview": (
                                     getattr(generation.candidates[0], "raw_content", "")[:500]

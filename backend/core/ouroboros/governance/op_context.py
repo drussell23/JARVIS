@@ -180,6 +180,9 @@ class GenerationResult:
     is_noop: bool = False   # True when model signals change already present
     # L1: audit records from tool-use loop (empty when tools disabled)
     tool_execution_records: Tuple[Any, ...] = ()
+    # Token usage (0 = not reported by provider)
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
 
     def with_tool_records(self, records: Tuple[Any, ...]) -> "GenerationResult":
         """Return a new GenerationResult with tool_execution_records set (called by provider after tool loop)."""

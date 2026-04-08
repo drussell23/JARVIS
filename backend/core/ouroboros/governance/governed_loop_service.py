@@ -2280,18 +2280,12 @@ class GovernedLoopService:
                 on_tool_call=_on_tool_call_display,
             )
 
-            # Wire streaming token callback for real-time character-by-character output.
-            # SerpentFlow emits the "synthesizing" header via CommProtocol heartbeat
-            # (streaming=start), then tokens flow directly to stdout here.
-            # SerpentFlow doesn't use Rich Live, so stdout writes are safe.
-            def _on_streaming_token(token: str) -> None:
-                try:
-                    import sys as _sys
-                    _sys.stdout.write(token)
-                    _sys.stdout.flush()
-                except Exception:
-                    pass
-            _tool_coordinator.on_token = _on_streaming_token
+            # Streaming token callback — SerpentFlow buffers tokens silently
+            # and shows periodic dots. No raw token dumping to stdout.
+            # The on_token hook is still wired so SerpentFlow can count tokens
+            # via CommProtocol heartbeats, but the actual display is handled
+            # by SerpentFlow's show_streaming_token (dots, not raw text).
+            _tool_coordinator.on_token = None  # SerpentFlow handles display via heartbeats
 
             logger.info(
                 "[GovernedLoop] ToolLoopCoordinator wired: max_rounds=%d, timeout=%.1fs, concurrency=%d, streaming=ON",

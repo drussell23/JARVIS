@@ -644,199 +644,198 @@ class CandidateGenerator:
         asyncio.TimeoutError
             If the deadline is already past and no provider can be tried.
         """
-        # Tier 0 (Doubleword batch) — async, non-blocking.
-        # Complexity gate: only invoke the batch API for tasks that justify
-        # the async latency cost. Simple tasks skip straight to Tier 1.
+        # ── Tier 0: DoubleWord 397B ──────────────────────────────
         #
-        # Flow: submit batch (fast, <2s) → fire background poll task →
-        #       fall through to Tier 1. If a previous Tier 0 result already
-        #       completed for this op, use it directly.
-        _TIER0_COMPLEXITY_CLASSES = frozenset({"heavy_code", "complex"})
+        # Manifesto §3: "Zero polling. Pure reflex."
+        # Manifesto §5: "Tier 0 (Deterministic Fast-Path)"
+        #
+        # Two modes based on DW real-time SSE availability:
+        #   RT enabled  → tier0.generate() → _generate_realtime (SSE stream)
+        #                 Zero polling. Token-by-token streaming. Pure reflex.
+        #                 Internal RT→batch fallback on 429/503 (stay cheap).
+        #   RT disabled → submit_batch() → background poll (legacy path)
+        #                 Used only when DOUBLEWORD_REALTIME_ENABLED=false.
+        #
+        # On any Tier 0 failure → cascade to Claude fallback (Tier 1).
+
         _op_id = getattr(context, "operation_id", "")
+        _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
+        _dw_is_fallback = (self._tier0 is not None and self._fallback is self._tier0)
+        _tier0_attempted = False
+
         if self._tier0 is not None and getattr(self._tier0, "is_available", False):
-            # Check if a previous async batch already completed for this op
-            _completed = self._completed_batches.pop(_op_id, None)
-            if _completed is not None:
-                _result = _completed.result
-                if _result is not None and len(_result.candidates) > 0:
-                    logger.info(
-                        "[CandidateGenerator] Tier 0 async result available: "
-                        "%d candidates (batch completed %.1fs ago)",
-                        len(_result.candidates),
-                        time.monotonic() - _completed.completed_at,
-                    )
-                    return _result
-
-            # Determine if this operation qualifies for Tier 0 routing
-            _complexity = ""
-            if context.routing is not None:
-                _complexity = getattr(context.routing, "task_complexity", "")
-            _is_cross_repo = getattr(context, "cross_repo", False)
-            _qualifies = _complexity in _TIER0_COMPLEXITY_CLASSES or _is_cross_repo
-
-            # When Doubleword IS the primary provider, ALL tasks qualify for
-            # tier0 async submission — the complexity gate only applies when
-            # tier0 is a supplementary optimization alongside a real primary.
-            _dw_is_only_provider = (self._primary is self._tier0 or self._fallback is self._tier0)
-            if _dw_is_only_provider:
-                _qualifies = True
-
-            # Skip Tier 0 submission if DW is in deep CONNECTION_ERROR backoff
-            # (host unreachable — no point submitting). For RATE_LIMITED/TIMEOUT,
-            # still submit — the batch may succeed after rate limit clears.
+            # Skip if DW is in deep CONNECTION_ERROR backoff
             _in_deep_backoff = (
                 self.fsm._failure_mode is FailureMode.CONNECTION_ERROR
                 and not self.fsm.should_attempt_primary()
             )
 
-            if not _qualifies:
-                logger.debug(
-                    "[CandidateGenerator] Tier 0 skipped: complexity=%r, "
-                    "cross_repo=%s — routing to Tier 1",
-                    _complexity, _is_cross_repo,
-                )
-            elif _in_deep_backoff:
+            if _in_deep_backoff:
                 logger.info(
                     "[CandidateGenerator] Tier 0 skipped: DW in CONNECTION_ERROR "
                     "backoff (failures=%d, ETA=%.0fs)",
                     self.fsm._consecutive_failures,
                     max(0, self.fsm.recovery_eta() - time.monotonic()),
                 )
-            else:
-                # Async submit: fast path (<2s), then background poll
+
+            elif getattr(self._tier0, "_realtime_enabled", False):
+                # ── Real-time SSE path (Manifesto §3: zero polling) ──
+                # Call tier0.generate() directly — hits _generate_realtime.
+                # Budget-capped via asyncio.wait_for; on timeout or failure,
+                # cascade to Claude fallback with guaranteed reserve time.
+                _tier0_attempted = True
+                remaining = self._remaining_seconds(deadline)
+                tier0_budget = self._compute_tier0_budget(remaining)
+                tier1_reserve = remaining - tier0_budget
+
+                logger.info(
+                    "[CandidateGenerator] Tier 0 RT: budget=%.1fs of %.1fs "
+                    "(Tier 1 reserve=%.1fs), model=%s",
+                    tier0_budget, remaining, tier1_reserve,
+                    getattr(self._tier0, "_model", "unknown"),
+                )
+
                 try:
-                    pending = await self._tier0.submit_batch(context)
-                    if pending is not None:
+                    result = await asyncio.wait_for(
+                        self._tier0.generate(context, deadline),
+                        timeout=tier0_budget,
+                    )
+                    if result is not None and len(result.candidates) > 0:
+                        # RT success — record recovery if coming back from failure
+                        if self.fsm._consecutive_failures > 0:
+                            self.fsm.record_primary_success()
                         logger.info(
-                            "[CandidateGenerator] Tier 0 batch %s submitted async "
-                            "(complexity=%s, cross_repo=%s) — falling through to Tier 1",
-                            pending.batch_id, _complexity, _is_cross_repo,
+                            "[CandidateGenerator] Tier 0 RT: %d candidates in %.1fs "
+                            "(zero polling)",
+                            len(result.candidates), result.generation_duration_s,
                         )
-                        # Record PENDING_TIER0 in ledger for audit trail
-                        await self._record_tier0_ledger(
-                            _op_id, "pending_tier0", {
-                                "batch_id": pending.batch_id,
-                                "file_id": pending.file_id,
-                                "model": getattr(self._tier0, "_model", "unknown"),
-                                "complexity": _complexity,
-                                "cross_repo": _is_cross_repo,
-                            },
-                        )
-                        # Fire background poll — result stored when ready.
-                        # Cap concurrent polls to avoid connector exhaustion.
-                        # Prune completed tasks first.
-                        self._background_polls = {
-                            k: t for k, t in self._background_polls.items()
-                            if not t.done()
-                        }
-                        if len(self._background_polls) >= self._max_background_polls:
-                            logger.info(
-                                "[CandidateGenerator] Skipping background poll — "
-                                "%d/%d already in flight",
-                                len(self._background_polls),
-                                self._max_background_polls,
-                            )
-                        else:
-                            task = asyncio.create_task(
-                                self._background_poll_tier0(pending, context),
-                                name=f"dw-poll-{pending.batch_id[:12]}",
-                            )
-                            self._background_polls[_op_id] = task
-                    else:
-                        logger.info(
-                            "[CandidateGenerator] Tier 0 batch submission failed, "
-                            "falling through to Tier 1"
-                        )
+                        return result
+                    # Empty result — fall through to Claude
+                    logger.info(
+                        "[CandidateGenerator] Tier 0 RT: no candidates — "
+                        "cascading to Tier 1 (%.1fs remaining)",
+                        self._remaining_seconds(deadline),
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[CandidateGenerator] Tier 0 RT: budget exhausted "
+                        "(%.1fs). Cascading to Tier 1 (%.1fs remaining)",
+                        tier0_budget, self._remaining_seconds(deadline),
+                    )
+                    self.fsm.record_primary_failure(mode=FailureMode.TIMEOUT)
                 except asyncio.CancelledError:
                     raise
-                except Exception as t0_exc:
+                except Exception as rt_exc:
+                    mode = FailbackStateMachine.classify_exception(rt_exc)
                     logger.warning(
-                        "[CandidateGenerator] Tier 0 submit failed (%s), "
-                        "falling through to Tier 1",
-                        t0_exc,
+                        "[CandidateGenerator] Tier 0 RT failed (mode=%s, %s: %s). "
+                        "Cascading to Tier 1 (%.1fs remaining)",
+                        mode.name, type(rt_exc).__name__, rt_exc,
+                        self._remaining_seconds(deadline),
                     )
+                    if mode is not FailureMode.CONTENT_FAILURE:
+                        self.fsm.record_primary_failure(mode=mode)
 
-        # Async-first: if Doubleword is both tier0 AND the primary/fallback,
-        # await the background poll instead of calling generate() synchronously.
-        # Doubleword's batch API is designed for async — synchronous use always
-        # times out because the batch queue + model warm-up takes 2-4 minutes.
-        _dw_poll_task = self._background_polls.get(_op_id)
-        _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
-        _dw_is_fallback = (self._tier0 is not None and self._fallback is self._tier0)
-
-        _tier0_timed_out = False
-
-        if _dw_poll_task is not None and (_dw_is_primary or _dw_is_fallback):
-            # Budget allocation: Tier 0 gets a capped fraction, Tier 1 gets
-            # a guaranteed reserve (Manifesto §5 — deterministic routing).
-            remaining = self._remaining_seconds(deadline)
-            tier0_budget = self._compute_tier0_budget(remaining)
-            tier1_reserve = remaining - tier0_budget
-
-            logger.info(
-                "[CandidateGenerator] Deadline budget: total=%.1fs → "
-                "Tier0=%.1fs (%.0f%%), Tier1=%.1fs reserve "
-                "(primary=%s, fallback=%s)",
-                remaining, tier0_budget,
-                (tier0_budget / remaining * 100) if remaining > 0 else 0,
-                tier1_reserve, _dw_is_primary, _dw_is_fallback,
-            )
-
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(_dw_poll_task), timeout=tier0_budget,
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                _tier0_timed_out = True
-                logger.warning(
-                    "[CandidateGenerator] Doubleword async poll exhausted "
-                    "Tier 0 budget (%.1fs). Tier 1 reserve: %.1fs",
-                    tier0_budget, self._remaining_seconds(deadline),
-                )
-            except Exception as exc:
-                _tier0_timed_out = True
-                logger.warning(
-                    "[CandidateGenerator] Doubleword async poll error: %s. "
-                    "Tier 1 reserve: %.1fs",
-                    exc, self._remaining_seconds(deadline),
-                )
-
-            # Check if result is now available
-            _completed = self._completed_batches.pop(_op_id, None)
-            if _completed is not None and _completed.result is not None:
-                _result = _completed.result
-                if len(_result.candidates) > 0:
-                    logger.info(
-                        "[CandidateGenerator] Doubleword async result: %d candidates",
-                        len(_result.candidates),
-                    )
-                    return _result
-
-            if _tier0_timed_out:
-                logger.info(
-                    "[CandidateGenerator] Tier 0 exhausted, cascading to Tier 1 "
-                    "(%.1fs remaining)",
-                    self._remaining_seconds(deadline),
-                )
             else:
-                logger.warning(
-                    "[CandidateGenerator] Doubleword poll completed but "
-                    "no usable candidates — cascading to Tier 1",
-                )
+                # ── Legacy batch path (DOUBLEWORD_REALTIME_ENABLED=false) ──
+                # submit_batch() → background poll → await result.
+                _TIER0_COMPLEXITY_CLASSES = frozenset({"heavy_code", "complex"})
+                _complexity = ""
+                if context.routing is not None:
+                    _complexity = getattr(context.routing, "task_complexity", "")
+                _is_cross_repo = getattr(context, "cross_repo", False)
+                _qualifies = _complexity in _TIER0_COMPLEXITY_CLASSES or _is_cross_repo
 
-        # Tier 1 + Tier 2: Primary (J-Prime) → Fallback (Claude)
+                _dw_is_only_provider = (
+                    self._primary is self._tier0 or self._fallback is self._tier0
+                )
+                if _dw_is_only_provider:
+                    _qualifies = True
+
+                if _qualifies:
+                    _tier0_attempted = True
+                    try:
+                        pending = await self._tier0.submit_batch(context)
+                        if pending is not None:
+                            logger.info(
+                                "[CandidateGenerator] Tier 0 batch %s submitted",
+                                pending.batch_id,
+                            )
+                            await self._record_tier0_ledger(
+                                _op_id, "pending_tier0", {
+                                    "batch_id": pending.batch_id,
+                                    "file_id": pending.file_id,
+                                    "model": getattr(self._tier0, "_model", "unknown"),
+                                },
+                            )
+                            self._background_polls = {
+                                k: t for k, t in self._background_polls.items()
+                                if not t.done()
+                            }
+                            if len(self._background_polls) < self._max_background_polls:
+                                task = asyncio.create_task(
+                                    self._background_poll_tier0(pending, context),
+                                    name=f"dw-poll-{pending.batch_id[:12]}",
+                                )
+                                self._background_polls[_op_id] = task
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as t0_exc:
+                        logger.warning(
+                            "[CandidateGenerator] Tier 0 batch submit failed: %s",
+                            t0_exc,
+                        )
+
+                # Await background poll if DW is primary/fallback
+                _dw_poll_task = self._background_polls.get(_op_id)
+                if _dw_poll_task is not None and (_dw_is_primary or _dw_is_fallback):
+                    remaining = self._remaining_seconds(deadline)
+                    tier0_budget = self._compute_tier0_budget(remaining)
+
+                    logger.info(
+                        "[CandidateGenerator] Awaiting batch poll: "
+                        "budget=%.1fs of %.1fs",
+                        tier0_budget, remaining,
+                    )
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(_dw_poll_task), timeout=tier0_budget,
+                        )
+                    except (asyncio.TimeoutError, asyncio.CancelledError):
+                        logger.warning(
+                            "[CandidateGenerator] Batch poll budget exhausted "
+                            "(%.1fs)", tier0_budget,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[CandidateGenerator] Batch poll error: %s", exc,
+                        )
+
+                    _completed = self._completed_batches.pop(_op_id, None)
+                    if _completed is not None and _completed.result is not None:
+                        _result = _completed.result
+                        if len(_result.candidates) > 0:
+                            logger.info(
+                                "[CandidateGenerator] Batch result: %d candidates",
+                                len(_result.candidates),
+                            )
+                            return _result
+
+        # ── Tier 1: Primary → Fallback cascade ───────────────────
+        #
+        # If Tier 0 was attempted and DW IS the primary, skip redundant
+        # primary.generate() call — go straight to Claude fallback.
+        # (Manifesto §3: no wasteful retries)
+
         state = self.fsm.state
 
         if state is FailbackState.QUEUE_ONLY:
             raise RuntimeError("all_providers_exhausted")
 
-        # If Doubleword IS the primary and already timed out, skip primary to
-        # avoid re-submitting a redundant batch. Go straight to fallback.
-        # (Manifesto §3: disciplined concurrency — no wasteful retries)
-        if _tier0_timed_out and _dw_is_primary:
+        if _tier0_attempted and _dw_is_primary:
             logger.info(
-                "[CandidateGenerator] Tier 0 IS primary — skipping redundant "
-                "primary.generate(), routing directly to fallback (%.1fs left)",
+                "[CandidateGenerator] Tier 0 IS primary — routing directly "
+                "to Claude fallback (%.1fs remaining)",
                 self._remaining_seconds(deadline),
             )
             return await self._call_fallback(context, deadline)
@@ -845,8 +844,6 @@ class CandidateGenerator:
             return await self._try_primary_then_fallback(context, deadline)
 
         # FALLBACK_ACTIVE or PRIMARY_DEGRADED: adaptive recovery routing.
-        # Try primary again if recovery window elapsed (cost-save), otherwise
-        # use the expensive fallback.
         if self.fsm.should_attempt_primary():
             logger.info(
                 "[CandidateGenerator] Recovery window elapsed (mode=%s, "
