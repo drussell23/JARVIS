@@ -739,3 +739,182 @@ class MultiVersionEvolutionTracker:
             self._epochs = [EvolutionEpoch(**e) for e in data]
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 9. REPOSITORY AUTO-DOCUMENTATION (Devin v3.0)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class DocGap:
+    """A detected documentation gap in a Python file."""
+    file_path: str
+    symbol_name: str
+    symbol_type: str  # "module" | "class" | "function"
+    line_number: int
+    has_docstring: bool
+    has_type_hints: bool
+
+
+class RepositoryAutoDocumentation:
+    """Detect and track documentation gaps across the codebase.
+
+    Scans Python files for missing docstrings on public modules, classes,
+    and functions. Produces a summary that can be injected into generation
+    prompts (as context) or used to create documentation-fix envelopes.
+
+    Boundary Principle:
+        Deterministic: AST scanning, gap detection, persistence.
+        Agentic: Documentation content generation (done by the pipeline).
+    """
+
+    def __init__(self, persistence_dir: Path = _PERSISTENCE_DIR) -> None:
+        self._persistence_dir = persistence_dir
+        self._gaps: Dict[str, List[DocGap]] = {}  # file → gaps
+        self._last_scan_at: float = 0.0
+        self._load()
+
+    def scan_file(self, file_path: Path) -> List[DocGap]:
+        """Scan a single Python file for documentation gaps."""
+        gaps: List[DocGap] = []
+        try:
+            source = file_path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            return gaps
+
+        rel = str(file_path)
+
+        # Module-level docstring
+        if not ast.get_docstring(tree):
+            gaps.append(DocGap(
+                file_path=rel, symbol_name="<module>",
+                symbol_type="module", line_number=1,
+                has_docstring=False, has_type_hints=True,
+            ))
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef):
+                if not node.name.startswith("_"):
+                    has_doc = ast.get_docstring(node) is not None
+                    if not has_doc:
+                        gaps.append(DocGap(
+                            file_path=rel, symbol_name=node.name,
+                            symbol_type="class", line_number=node.lineno,
+                            has_docstring=False, has_type_hints=True,
+                        ))
+
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name.startswith("_"):
+                    continue
+                has_doc = ast.get_docstring(node) is not None
+                # Check return annotation
+                has_ret = node.returns is not None
+                # Check arg annotations (skip self/cls)
+                args_to_check = node.args.args[1:] if node.args.args else []
+                has_hints = has_ret and all(
+                    a.annotation is not None for a in args_to_check
+                )
+                if not has_doc or not has_hints:
+                    gaps.append(DocGap(
+                        file_path=rel, symbol_name=node.name,
+                        symbol_type="function", line_number=node.lineno,
+                        has_docstring=has_doc, has_type_hints=has_hints,
+                    ))
+
+        self._gaps[rel] = gaps
+        return gaps
+
+    def scan_files(self, file_paths: List[Path]) -> Dict[str, List[DocGap]]:
+        """Scan multiple files and return all gaps."""
+        result: Dict[str, List[DocGap]] = {}
+        for fp in file_paths:
+            gaps = self.scan_file(fp)
+            if gaps:
+                result[str(fp)] = gaps
+        self._last_scan_at = time.time()
+        self._persist()
+        return result
+
+    def get_gaps_for_file(self, file_path: str) -> List[DocGap]:
+        """Return cached gaps for a file."""
+        return self._gaps.get(file_path, [])
+
+    def format_for_prompt(self, file_paths: List[str]) -> str:
+        """Format documentation gaps as context for generation prompts.
+
+        Injected into pre-GENERATE so the model is aware of doc debt
+        in the files it's about to modify.
+        """
+        lines: List[str] = []
+        for fp in file_paths:
+            gaps = self._gaps.get(fp, [])
+            if not gaps:
+                continue
+            missing_docs = [g for g in gaps if not g.has_docstring]
+            missing_hints = [g for g in gaps if not g.has_type_hints]
+            if missing_docs or missing_hints:
+                parts = []
+                if missing_docs:
+                    names = ", ".join(g.symbol_name for g in missing_docs[:5])
+                    parts.append(f"{len(missing_docs)} missing docstrings ({names})")
+                if missing_hints:
+                    names = ", ".join(g.symbol_name for g in missing_hints[:5])
+                    parts.append(f"{len(missing_hints)} missing type hints ({names})")
+                lines.append(f"- {fp}: {'; '.join(parts)}")
+
+        if not lines:
+            return ""
+        return (
+            "## Documentation Gaps in Target Files\n"
+            "When modifying these files, consider adding missing documentation:\n"
+            + "\n".join(lines)
+        )
+
+    def get_stats(self) -> Dict[str, Any]:
+        """Return summary statistics."""
+        total_gaps = sum(len(g) for g in self._gaps.values())
+        files_with_gaps = sum(1 for g in self._gaps.values() if g)
+        return {
+            "total_gaps": total_gaps,
+            "files_scanned": len(self._gaps),
+            "files_with_gaps": files_with_gaps,
+            "last_scan_at": self._last_scan_at,
+        }
+
+    def _persist(self) -> None:
+        try:
+            self._persistence_dir.mkdir(parents=True, exist_ok=True)
+            path = self._persistence_dir / "auto_documentation.json"
+            data = {
+                "last_scan_at": self._last_scan_at,
+                "gaps": {
+                    fp: [
+                        {
+                            "file_path": g.file_path,
+                            "symbol_name": g.symbol_name,
+                            "symbol_type": g.symbol_type,
+                            "line_number": g.line_number,
+                            "has_docstring": g.has_docstring,
+                            "has_type_hints": g.has_type_hints,
+                        }
+                        for g in gaps
+                    ]
+                    for fp, gaps in self._gaps.items()
+                },
+            }
+            path.write_text(json.dumps(data, indent=2))
+        except Exception:
+            pass
+
+    def _load(self) -> None:
+        try:
+            path = self._persistence_dir / "auto_documentation.json"
+            if not path.exists():
+                return
+            data = json.loads(path.read_text())
+            self._last_scan_at = data.get("last_scan_at", 0.0)
+            for fp, gap_list in data.get("gaps", {}).items():
+                self._gaps[fp] = [DocGap(**g) for g in gap_list]
+        except Exception:
+            pass

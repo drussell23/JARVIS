@@ -271,8 +271,14 @@ class BattleTestHarness:
                                 tool_calls=p.get("tool_calls", 0),
                                 files_changed=len(p.get("affected_files", [])),
                             )
-                            # Show cost in TUI
-                            if hasattr(self, "_tui_console") and self._tui_console:
+                            # Show cost in TUI / dashboard
+                            if hasattr(self, "_live_dashboard") and self._live_dashboard:
+                                self._live_dashboard.update_cost(
+                                    total=self._cost_tracker.total_spent,
+                                    remaining=self._cost_tracker.remaining,
+                                    breakdown=self._cost_tracker.breakdown,
+                                )
+                            elif hasattr(self, "_tui_console") and self._tui_console:
                                 self._tui_console.show_cost_update(
                                     total=self._cost_tracker.total_spent,
                                     remaining=self._cost_tracker.remaining,
@@ -296,8 +302,15 @@ class BattleTestHarness:
             except Exception as exc:
                 logger.debug("SessionRecorder event subscription failed: %s", exc)
 
-            # Show TUI controls bar and start keyboard handler
-            if hasattr(self, "_tui_console") and self._tui_console is not None:
+            # Start dashboard / TUI controls
+            if hasattr(self, "_live_dashboard") and self._live_dashboard is not None:
+                # Update dashboard with detected sensor count
+                _intake = self._intake_service
+                if _intake is not None:
+                    n_sensors = len(getattr(_intake, "_sensors", []))
+                    self._live_dashboard.update_sensors(n_sensors)
+                await self._live_dashboard.start()
+            elif hasattr(self, "_tui_console") and self._tui_console is not None:
                 self._tui_console.show_controls_bar()
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
                 await self._keyboard_handler.start()
@@ -342,7 +355,19 @@ class BattleTestHarness:
             elif budget_waiter in done:
                 self._stop_reason = "budget_exhausted"
             elif idle_waiter in done:
-                self._stop_reason = "idle_timeout"
+                diag = self._idle_watchdog.diagnostics
+                if diag and diag.reason == "all_ops_stale":
+                    self._stop_reason = "stale_ops_detected"
+                    logger.warning(
+                        "Session stopping: all in-flight ops were stale. "
+                        "Stale ops: %s",
+                        ", ".join(
+                            f"{s.op_id}({s.phase}, {s.elapsed_s:.0f}s)"
+                            for s in diag.stale_ops
+                        ) if diag.stale_ops else "none",
+                    )
+                else:
+                    self._stop_reason = "idle_timeout"
             else:
                 self._stop_reason = "unknown"
 
@@ -385,33 +410,60 @@ class BattleTestHarness:
                 gov_config,
                 oracle=self._oracle,
             )
-            # Inject OuroborosTUI for Claude Code-level interactive display
+            # Inject LiveDashboard for persistent at-a-glance TUI (preferred)
+            # Falls back to scrolling OuroborosTUI, then basic diff transport.
+            self._live_dashboard = None
             try:
-                from backend.core.ouroboros.battle_test.ouroboros_tui import (
-                    OuroborosConsole,
-                    OuroborosTUITransport,
-                    KeyboardHandler,
+                from backend.core.ouroboros.battle_test.live_dashboard import (
+                    LiveDashboard,
+                    DashboardTransport,
+                    DashboardKeyboardHandler,
                 )
-                self._tui_console = OuroborosConsole(repo_path=self._config.repo_path)
-                _tui_transport = OuroborosTUITransport(tui=self._tui_console)
+                self._live_dashboard = LiveDashboard(
+                    session_id=self._session_id,
+                    branch_name=self._branch_name or "",
+                    cost_cap_usd=self._config.cost_cap_usd,
+                    idle_timeout_s=self._config.idle_timeout_s,
+                    repo_path=self._config.repo_path,
+                )
+                _dash_transport = DashboardTransport(dashboard=self._live_dashboard)
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
-                    self._governance_stack.comm._transports.append(_tui_transport)
-                    logger.info("OuroborosTUI wired (Rich-powered interactive display)")
-                # Keyboard handler will be started after banner
-                self._keyboard_handler = KeyboardHandler(
-                    tui=self._tui_console,
+                    self._governance_stack.comm._transports.append(_dash_transport)
+                    logger.info("LiveDashboard wired (persistent Rich Live TUI)")
+                self._keyboard_handler = DashboardKeyboardHandler(
+                    dashboard=self._live_dashboard,
                     shutdown_event=self._shutdown_event,
                 )
+                # Also keep a reference for cost updates
+                self._tui_console = None
             except Exception as exc:
-                logger.debug("OuroborosTUI not available, falling back to basic: %s", exc)
-                # Fallback to basic diff transport
+                logger.debug("LiveDashboard not available, trying OuroborosTUI: %s", exc)
+                self._live_dashboard = None
+                # Fallback to scrolling OuroborosTUI
                 try:
-                    from backend.core.ouroboros.battle_test.diff_display import BattleDiffTransport
+                    from backend.core.ouroboros.battle_test.ouroboros_tui import (
+                        OuroborosConsole,
+                        OuroborosTUITransport,
+                        KeyboardHandler,
+                    )
+                    self._tui_console = OuroborosConsole(repo_path=self._config.repo_path)
+                    _tui_transport = OuroborosTUITransport(tui=self._tui_console)
                     if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
-                        diff_transport = BattleDiffTransport(repo_path=self._config.repo_path)
-                        self._governance_stack.comm._transports.append(diff_transport)
-                except Exception:
-                    pass
+                        self._governance_stack.comm._transports.append(_tui_transport)
+                        logger.info("OuroborosTUI wired (Rich scrolling fallback)")
+                    self._keyboard_handler = KeyboardHandler(
+                        tui=self._tui_console,
+                        shutdown_event=self._shutdown_event,
+                    )
+                except Exception as exc2:
+                    logger.debug("OuroborosTUI not available, using basic: %s", exc2)
+                    try:
+                        from backend.core.ouroboros.battle_test.diff_display import BattleDiffTransport
+                        if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
+                            diff_transport = BattleDiffTransport(repo_path=self._config.repo_path)
+                            self._governance_stack.comm._transports.append(diff_transport)
+                    except Exception:
+                        pass
 
             logger.info("Governance stack booted")
         except Exception as exc:
@@ -487,19 +539,58 @@ class BattleTestHarness:
                 from backend.core.ouroboros.consciousness.types import ConsciousnessConfig
                 _c_config = ConsciousnessConfig.from_env()
 
-                # Stub DreamEngine — TrinityConsciousness.start() calls
-                # dream.start() without None guard, so we provide a no-op.
-                class _NoOpDream:
-                    async def start(self) -> None: pass
-                    async def stop(self) -> None: pass
-                    def get_blueprints(self, top_n: int = 5) -> list: return []
-                    def get_blueprint(self, bid: str): return None
-                    def discard_stale(self) -> int: return 0
+                # DreamEngine — uses DW (primary) + Claude (fallback) + J-Prime (legacy)
+                # Falls back to no-op stub if DreamEngine import fails.
+                _dream_instance: Any = None
+                try:
+                    from backend.core.ouroboros.consciousness.dream_engine import DreamEngine
+                    from backend.core.ouroboros.consciousness.dream_metrics import DreamMetricsTracker
+
+                    _dw_ref = getattr(self._governed_loop_service, "_doubleword_ref", None)
+                    _dream_metrics = DreamMetricsTracker()
+
+                    # Lightweight stubs — battle test always considers user "idle"
+                    # and never yields to resource pressure.
+                    class _ActivityStub:
+                        def last_activity_s(self) -> float:
+                            return 9999.0  # Always idle
+                    class _GovernorStub:
+                        async def should_yield(self) -> bool:
+                            return False  # Never yield
+
+                    _dream_instance = DreamEngine(
+                        health_cortex=_cortex,
+                        memory_engine=_memory,
+                        activity_monitor=_ActivityStub(),
+                        resource_governor=_GovernorStub(),
+                        metrics_tracker=_dream_metrics,
+                        config=_c_config,
+                        jprime_url=os.environ.get("JPRIME_URL", ""),
+                        persistence_dir=_consciousness_dir / "dreams",
+                        comm=_comm,
+                        dw_provider=_dw_ref,
+                    )
+                    logger.info(
+                        "DreamEngine booted (dw=%s, jprime=%s)",
+                        "active" if _dw_ref else "none",
+                        "active" if os.environ.get("JPRIME_URL") else "none",
+                    )
+                except Exception as _dream_exc:
+                    logger.debug("DreamEngine boot failed, using stub: %s", _dream_exc)
+
+                if _dream_instance is None:
+                    class _NoOpDream:
+                        async def start(self) -> None: pass
+                        async def stop(self) -> None: pass
+                        def get_blueprints(self, top_n: int = 5) -> list: return []
+                        def get_blueprint(self, bid: str): return None
+                        def discard_stale(self) -> int: return 0
+                    _dream_instance = _NoOpDream()
 
                 _consciousness = TrinityConsciousness(
                     health_cortex=_cortex,
                     memory_engine=_memory,
-                    dream_engine=_NoOpDream(),
+                    dream_engine=_dream_instance,
                     prophecy_engine=_prophecy,
                     config=_c_config,
                 )
@@ -633,33 +724,200 @@ class BattleTestHarness:
             logger.warning("Signal handlers not supported on this platform")
 
     # ------------------------------------------------------------------
-    # GLS Activity Monitor
+    # GLS Activity Monitor (staleness-aware)
     # ------------------------------------------------------------------
 
-    async def _monitor_gls_activity(self) -> None:
-        """Background task: pokes idle watchdog whenever GLS has in-flight ops.
+    # Per-op staleness threshold: if an operation hasn't transitioned FSM
+    # state in this many seconds, it's considered stale. The watchdog is
+    # NOT poked for stale ops — if ALL ops are stale the idle timer fires.
+    _OP_STALE_THRESHOLD_S: float = float(
+        os.environ.get("OUROBOROS_OP_STALE_THRESHOLD_S", "600")
+    )
 
-        The Doubleword batch API can take minutes per operation. Without this,
-        the idle watchdog fires while batches are still in flight. This monitor
-        checks every 5 seconds whether the GLS has active operations and pokes
-        the watchdog if so — keeping the session alive during long batches.
+    # After this many seconds of zero phase transitions we forcibly cancel
+    # the stale op via GLS (if it exposes a cancel API). 0 = never cancel.
+    _OP_FORCE_CANCEL_S: float = float(
+        os.environ.get("OUROBOROS_OP_FORCE_CANCEL_S", "900")
+    )
+
+    async def _monitor_gls_activity(self) -> None:
+        """Background task: staleness-aware watchdog feeder.
+
+        Every 5 seconds, inspects each in-flight operation's FSM context to
+        determine whether it has made progress (phase transition) recently.
+
+        - If at least one op is progressing → poke the idle watchdog.
+        - If ALL ops are stale (no transitions beyond threshold) → stop
+          poking.  The idle watchdog will eventually fire and stop the session.
+        - If an op exceeds the force-cancel threshold → attempt cancellation
+          and log forensics so the session can move on.
+
+        This prevents a single hung operation from keeping the session alive
+        indefinitely while producing no useful work.
         """
+        # Track per-op first-seen-stale time for force-cancel escalation
+        _stale_since: dict[str, float] = {}
+
         try:
             while True:
                 await asyncio.sleep(5.0)
-                if self._governed_loop_service is not None:
-                    try:
-                        active = getattr(self._governed_loop_service, "_active_ops", set())
-                        if active:
-                            self._idle_watchdog.poke()
-                            logger.debug(
-                                "[ActivityMonitor] %d ops in flight, poked watchdog",
-                                len(active),
+                gls = self._governed_loop_service
+                if gls is None:
+                    continue
+
+                try:
+                    active_ops: set = getattr(gls, "_active_ops", set())
+                    if not active_ops:
+                        continue  # No ops — let the normal idle timer handle it
+
+                    fsm_contexts: dict = getattr(gls, "_fsm_contexts", {})
+                    now = datetime.now(tz=timezone.utc)
+                    now_mono = time.monotonic()
+
+                    progressing_count = 0
+                    stale_count = 0
+                    stale_details: list = []
+
+                    for dedupe_key in list(active_ops):
+                        # Find the matching FSM context (op_id may differ from dedupe_key)
+                        fsm_ctx = None
+                        for op_id, ctx in fsm_contexts.items():
+                            if op_id == dedupe_key or dedupe_key in op_id:
+                                fsm_ctx = ctx
+                                break
+
+                        if fsm_ctx is None:
+                            # No FSM context yet — op is still in early setup, count as progressing
+                            progressing_count += 1
+                            _stale_since.pop(dedupe_key, None)
+                            continue
+
+                        last_transition = getattr(fsm_ctx, "last_transition_at_utc", None)
+                        if last_transition is None:
+                            progressing_count += 1
+                            _stale_since.pop(dedupe_key, None)
+                            continue
+
+                        elapsed_s = (now - last_transition).total_seconds()
+
+                        if elapsed_s < self._OP_STALE_THRESHOLD_S:
+                            # Op is progressing normally
+                            progressing_count += 1
+                            _stale_since.pop(dedupe_key, None)
+                        else:
+                            # Op is stale
+                            stale_count += 1
+                            phase_name = getattr(
+                                getattr(fsm_ctx, "state", None), "name", "UNKNOWN"
                             )
-                    except Exception:
-                        pass
+
+                            if dedupe_key not in _stale_since:
+                                _stale_since[dedupe_key] = now_mono
+                                logger.warning(
+                                    "[ActivityMonitor] Op %s is STALE: "
+                                    "phase=%s, no transition for %.0fs (threshold=%.0fs)",
+                                    dedupe_key[:16], phase_name,
+                                    elapsed_s, self._OP_STALE_THRESHOLD_S,
+                                )
+
+                            stale_details.append({
+                                "op_id": dedupe_key[:16],
+                                "phase": phase_name,
+                                "elapsed_s": round(elapsed_s, 1),
+                                "last_transition_utc": str(last_transition),
+                            })
+
+                            # Force-cancel escalation
+                            stale_duration = now_mono - _stale_since[dedupe_key]
+                            if (
+                                self._OP_FORCE_CANCEL_S > 0
+                                and stale_duration >= self._OP_FORCE_CANCEL_S
+                            ):
+                                logger.error(
+                                    "[ActivityMonitor] FORCE-CANCELLING stale op %s "
+                                    "(stuck in %s for %.0fs, force-cancel threshold=%.0fs)",
+                                    dedupe_key[:16], phase_name,
+                                    elapsed_s, self._OP_FORCE_CANCEL_S,
+                                )
+                                await self._force_cancel_op(gls, dedupe_key)
+                                _stale_since.pop(dedupe_key, None)
+
+                    # Clean up tracking for ops that are no longer active
+                    for key in list(_stale_since):
+                        if key not in active_ops:
+                            _stale_since.pop(key, None)
+
+                    # Decision: poke or starve the watchdog
+                    if progressing_count > 0:
+                        self._idle_watchdog.poke()
+                        if stale_count > 0:
+                            logger.info(
+                                "[ActivityMonitor] %d progressing, %d stale — poked watchdog",
+                                progressing_count, stale_count,
+                            )
+                        else:
+                            logger.debug(
+                                "[ActivityMonitor] %d ops progressing, poked watchdog",
+                                progressing_count,
+                            )
+                    else:
+                        # ALL ops are stale — do NOT poke. If this persists,
+                        # the idle watchdog fires and stops the session.
+                        logger.warning(
+                            "[ActivityMonitor] ALL %d ops are stale — NOT poking watchdog "
+                            "(idle timer will fire in ≤%.0fs)",
+                            stale_count, self._config.idle_timeout_s,
+                        )
+                        # If stale for long enough, fire immediately with diagnostics
+                        from backend.core.ouroboros.battle_test.idle_watchdog import StaleOpInfo
+                        all_stale_long_enough = all(
+                            (now_mono - _stale_since.get(k, now_mono)) >= self._OP_STALE_THRESHOLD_S
+                            for k in active_ops
+                        )
+                        if all_stale_long_enough and stale_details:
+                            stale_infos = [
+                                StaleOpInfo(
+                                    op_id=d["op_id"],
+                                    phase=d["phase"],
+                                    elapsed_s=d["elapsed_s"],
+                                    last_transition_utc=d["last_transition_utc"],
+                                )
+                                for d in stale_details
+                            ]
+                            self._idle_watchdog.fire_stale(stale_infos)
+
+                except Exception as exc:
+                    logger.debug("[ActivityMonitor] Error in staleness check: %s", exc)
+
         except asyncio.CancelledError:
             pass
+
+    async def _force_cancel_op(self, gls: Any, dedupe_key: str) -> None:
+        """Best-effort cancellation of a stuck operation.
+
+        Removes the op from _active_ops and _fsm_contexts so the system
+        can move on. The orchestrator's own timeout should eventually clean
+        up the actual task, but this unblocks the harness immediately.
+        """
+        try:
+            active_ops: set = getattr(gls, "_active_ops", set())
+            active_ops.discard(dedupe_key)
+
+            fsm_contexts: dict = getattr(gls, "_fsm_contexts", {})
+            # Find and remove matching FSM context
+            to_remove = [
+                op_id for op_id in fsm_contexts
+                if op_id == dedupe_key or dedupe_key in op_id
+            ]
+            for op_id in to_remove:
+                fsm_contexts.pop(op_id, None)
+
+            logger.info(
+                "[ActivityMonitor] Force-cancelled op %s (removed from active_ops + fsm_contexts)",
+                dedupe_key[:16],
+            )
+        except Exception as exc:
+            logger.warning("[ActivityMonitor] Force-cancel failed for %s: %s", dedupe_key[:16], exc)
 
     # ------------------------------------------------------------------
     # Provider Cost Monitor
@@ -749,10 +1007,15 @@ class BattleTestHarness:
         except Exception:
             pass
 
-        # 0b. Keyboard handler
+        # 0b. Keyboard handler + LiveDashboard
         try:
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
                 await self._keyboard_handler.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_live_dashboard") and self._live_dashboard is not None:
+                await self._live_dashboard.stop()
         except Exception:
             pass
 

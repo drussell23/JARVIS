@@ -263,19 +263,27 @@ class CommProtocol:
         op_id: str,
         phase: str,
         progress_pct: float,
+        **extra: Any,
     ) -> None:
-        """Emit a HEARTBEAT message (phase 3).  Causal parent links to previous."""
+        """Emit a HEARTBEAT message (phase 3).  Causal parent links to previous.
+
+        Extra kwargs are merged into the payload so subsystems (triage,
+        sensors, dream engine) can attach metadata for the TUI dashboard.
+        """
         causal_parent = self._prev_seq(op_id)
         seq = self._next_seq(op_id)
+        payload = {
+            "phase": phase,
+            "progress_pct": progress_pct,
+        }
+        if extra:
+            payload.update(extra)
         msg = CommMessage(
             msg_type=MessageType.HEARTBEAT,
             op_id=op_id,
             seq=seq,
             causal_parent_seq=causal_parent,
-            payload={
-                "phase": phase,
-                "progress_pct": progress_pct,
-            },
+            payload=payload,
         )
         await self._emit(msg)
 

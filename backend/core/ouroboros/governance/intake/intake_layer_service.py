@@ -581,6 +581,28 @@ class IntakeLayerService:
         except Exception as exc:
             logger.debug("[IntakeLayer] ProactiveExplorationSensor skipped: %s", exc)
 
+        # ---- IntentDiscoverySensor (Manifesto §1: intent-driven exploration) ----
+        # Connects StrategicDirection + DreamEngine + Oracle + DW to explore
+        # the codebase with purpose, guided by the developer's vision.
+        try:
+            from backend.core.ouroboros.governance.intake.sensors.intent_discovery_sensor import (
+                IntentDiscoverySensor,
+            )
+            _intent_poll_s = float(
+                os.environ.get("JARVIS_INTENT_DISCOVERY_INTERVAL_S", "900")
+            )
+            _intent_sensor = IntentDiscoverySensor(
+                gls=self._gls,
+                router=self._router,
+                repo="jarvis",
+                project_root=self._config.project_root,
+                poll_interval_s=_intent_poll_s,
+            )
+            self._sensors.append(_intent_sensor)
+            logger.info("[IntakeLayer] IntentDiscoverySensor added (Manifesto-driven exploration)")
+        except Exception as exc:
+            logger.debug("[IntakeLayer] IntentDiscoverySensor skipped: %s", exc)
+
         # ---- CrossRepoDriftSensor (P3: Trinity contract integrity) ----
         try:
             from backend.core.ouroboros.governance.intake.sensors.cross_repo_drift_sensor import (
