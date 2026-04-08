@@ -408,10 +408,19 @@ class BattleTestHarness:
                 from backend.core.ouroboros.consciousness.types import ConsciousnessConfig
                 _c_config = ConsciousnessConfig.from_env()
 
+                # Stub DreamEngine — TrinityConsciousness.start() calls
+                # dream.start() without None guard, so we provide a no-op.
+                class _NoOpDream:
+                    async def start(self) -> None: pass
+                    async def stop(self) -> None: pass
+                    def get_blueprints(self, top_n: int = 5) -> list: return []
+                    def get_blueprint(self, bid: str): return None
+                    def discard_stale(self) -> int: return 0
+
                 _consciousness = TrinityConsciousness(
                     health_cortex=_cortex,
                     memory_engine=_memory,
-                    dream_engine=None,  # DreamEngine needs GPU/idle — skip in battle test
+                    dream_engine=_NoOpDream(),
                     prophecy_engine=_prophecy,
                     config=_c_config,
                 )
