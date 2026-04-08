@@ -369,9 +369,10 @@ class BattleTestHarness:
             await self._governed_loop_service.start()
             logger.info("GovernedLoopService booted")
 
-            # Boot Trinity Consciousness and inject into GLS for Venom integration.
-            # The orchestrator looks for _consciousness_bridge on the GLS instance
-            # (same injection pattern as unified_supervisor.py line 87693).
+            # Boot each subsystem independently — failure of one should not
+            # prevent others from starting (Manifesto §2: progressive awakening).
+
+            # --- Trinity Consciousness (memory + prediction + health) ---
             try:
                 from backend.core.ouroboros.governance.consciousness_bridge import (
                     ConsciousnessBridge,
@@ -390,7 +391,7 @@ class BattleTestHarness:
                 _consciousness = TrinityConsciousness(
                     health_cortex=_cortex,
                     memory_engine=_memory,
-                    dream_engine=None,      # DreamEngine needs GPU, skip in battle test
+                    dream_engine=None,
                     prophecy_engine=_prophecy,
                     config=None,
                 )
@@ -403,41 +404,40 @@ class BattleTestHarness:
                     "Trinity Consciousness booted (memory=%s, prophecy=%s)",
                     "active", "active",
                 )
-
-                # Boot Goal Memory Bridge (ChromaDB-backed cross-session learning)
-                try:
-                    from backend.core.ouroboros.governance.goal_memory_bridge import (
-                        GoalMemoryBridge,
-                    )
-                    from backend.intelligence.long_term_memory import (
-                        get_long_term_memory,
-                    )
-                    _ltm = await get_long_term_memory()
-                    _gmb = GoalMemoryBridge(memory_manager=_ltm)
-                    self._governed_loop_service._goal_memory_bridge = _gmb
-                    logger.info("Goal Memory Bridge booted (ChromaDB)")
-                except Exception as exc:
-                    logger.warning("Goal Memory Bridge failed: %s", exc)
-
-                # Boot Strategic Direction Service (reads Manifesto + arch docs)
-                try:
-                    from backend.core.ouroboros.governance.strategic_direction import (
-                        StrategicDirectionService,
-                    )
-                    _sds = StrategicDirectionService(
-                        project_root=self._config.repo_path,
-                    )
-                    await _sds.load()
-                    self._governed_loop_service._strategic_direction = _sds
-                    logger.info(
-                        "Strategic Direction loaded (%d principles, %d char digest)",
-                        len(_sds.principles), len(_sds.digest),
-                    )
-                except Exception as exc:
-                    logger.warning("Strategic Direction failed: %s", exc)
-
             except Exception as exc:
                 logger.warning("Trinity Consciousness failed to boot: %s", exc)
+
+            # --- Goal Memory Bridge (ChromaDB cross-session learning) ---
+            try:
+                from backend.core.ouroboros.governance.goal_memory_bridge import (
+                    GoalMemoryBridge,
+                )
+                from backend.intelligence.long_term_memory import (
+                    get_long_term_memory,
+                )
+                _ltm = await get_long_term_memory()
+                _gmb = GoalMemoryBridge(memory_manager=_ltm)
+                self._governed_loop_service._goal_memory_bridge = _gmb
+                logger.info("Goal Memory Bridge booted (ChromaDB)")
+            except Exception as exc:
+                logger.warning("Goal Memory Bridge failed: %s", exc)
+
+            # --- Strategic Direction (Manifesto → every prompt) ---
+            try:
+                from backend.core.ouroboros.governance.strategic_direction import (
+                    StrategicDirectionService,
+                )
+                _sds = StrategicDirectionService(
+                    project_root=self._config.repo_path,
+                )
+                await _sds.load()
+                self._governed_loop_service._strategic_direction = _sds
+                logger.info(
+                    "Strategic Direction loaded (%d principles, %d char digest)",
+                    len(_sds.principles), len(_sds.digest),
+                )
+            except Exception as exc:
+                logger.warning("Strategic Direction failed: %s", exc)
 
         except Exception as exc:
             logger.warning("GovernedLoopService failed to boot: %s", exc)
