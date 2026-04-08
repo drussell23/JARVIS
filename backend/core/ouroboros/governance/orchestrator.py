@@ -1091,7 +1091,12 @@ class GovernedOrchestrator:
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=self._config.generation_timeout_s
                 )
-                generation = await self._generator.generate(ctx, deadline)
+                # Hard timeout — the deadline is advisory to the generator,
+                # but asyncio.wait_for is the Iron Gate (Manifesto §6).
+                generation = await asyncio.wait_for(
+                    self._generator.generate(ctx, deadline),
+                    timeout=self._config.generation_timeout_s + 5.0,
+                )
 
                 # is_noop=True means the model signalled the change is already present.
                 # Empty candidates is correct in this case — do not treat as a failure.
