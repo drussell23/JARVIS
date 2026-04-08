@@ -1079,6 +1079,10 @@ class CandidateGenerator:
                 timeout=primary_budget,
             )
 
+    # Hard ceiling for fallback provider — fail fast when unreachable
+    # rather than burning the entire pipeline budget (Manifesto §6: Iron Gate).
+    _FALLBACK_MAX_TIMEOUT_S: float = 60.0
+
     async def _call_fallback(
         self,
         context: OperationContext,
@@ -1086,7 +1090,10 @@ class CandidateGenerator:
     ) -> GenerationResult:
         """Call fallback provider with concurrency and deadline enforcement."""
         try:
-            remaining = self._remaining_seconds(deadline)
+            remaining = min(
+                self._remaining_seconds(deadline),
+                self._FALLBACK_MAX_TIMEOUT_S,
+            )
             async with self._fallback_sem:
                 return await asyncio.wait_for(
                     self._fallback.generate(context, deadline),
