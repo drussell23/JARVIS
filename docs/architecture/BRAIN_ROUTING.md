@@ -31,6 +31,18 @@ Doubleword provides access to large open-weight models at dramatically lower
 cost than proprietary APIs.  The API is OpenAI-compatible, enabling drop-in
 use with existing client code.
 
+### Two Operating Modes
+
+| Mode | Endpoint | Venom Tool Loop | Use Case |
+|------|----------|----------------|----------|
+| **Real-time** (default) | `/v1/chat/completions` | Full multi-turn (read_file, bash, run_tests, web_search) | Complex tasks with tool use |
+| **Batch** (legacy) | `/v1/batches` (JSONL upload → poll → retrieve) | None (one-shot) | Background processing |
+
+Real-time mode is enabled by default (`DOUBLEWORD_REALTIME_ENABLED=true`).
+This gives DoubleWord the same Venom agentic capability as Claude — the 397B
+model reads code, searches patterns, runs tests, and revises across multiple
+turns — at **30-37x lower cost**.
+
 ### Available Models
 
 | Model | Parameters | Use Case |

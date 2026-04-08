@@ -870,6 +870,31 @@ The session stops on whichever fires first:
 | `JARVIS_INTENT_TEST_INTERVAL_S` | `300` | TestWatcher poll fallback interval |
 | `JARVIS_TODO_SCAN_INTERVAL_S` | `86400` | TodoScanner poll fallback interval |
 
+### Cost Optimization
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `DOUBLEWORD_REALTIME_ENABLED` | `true` | Use `/v1/chat/completions` instead of batch (enables Venom on DW) |
+| `JARVIS_TOOL_ROUND_MAX_TOKENS` | `1024` | max_tokens during Venom tool rounds (lower = cheaper) |
+| `JARVIS_CODEGEN_MAX_FILE_CHARS` | `20000` | Max source snapshot per file (was 65536, 3x reduction) |
+| `JARVIS_CODEGEN_HEAD_CHARS` | `16000` | Head portion of truncated files |
+| `JARVIS_CODEGEN_TAIL_CHARS` | `4000` | Tail portion of truncated files |
+
+### Cost Architecture
+
+The organism uses 6 layers of cost optimization to maximize operations per budget:
+
+| Layer | Mechanism | Savings |
+|-------|-----------|---------|
+| **DW real-time primary** | `/v1/chat/completions` at $0.10/$0.40/M instead of Claude $3/$15/M | 30-37x |
+| **Claude prompt caching** | `cache_control: {"type": "ephemeral"}` on system prompt | 90% input cost |
+| **Smart max_tokens** | 1024 during Venom tool rounds, 8192 only for final patch | ~75% output reduction |
+| **Prompt compression** | 20KB max per file (with Venom, model can `read_file` for details) | ~60% input reduction |
+| **Complexity routing** | TRIVIAL tasks skip Venom tool loop (one-shot, no tool overhead) | Skip 4-5 API calls |
+| **Adaptive provider routing** | FailbackFSM routes to cheapest available provider with recovery prediction | Dynamic |
+
+**Projected: 50-150+ operations per $0.50 budget** (vs 5-15 before optimization).
+
 ---
 
 ## File Reference
