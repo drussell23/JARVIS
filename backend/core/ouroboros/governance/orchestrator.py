@@ -1006,6 +1006,15 @@ class GovernedOrchestrator:
 
         for attempt in range(1 + self._config.max_generate_retries):
             try:
+                # Heartbeat: GENERATE phase starting (Manifesto §7: Absolute Observability)
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="generate",
+                        progress_pct=30.0 + attempt * 5.0,
+                    )
+                except Exception:
+                    pass
+
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
                     seconds=self._config.generation_timeout_s
                 )
@@ -1019,6 +1028,34 @@ class GovernedOrchestrator:
                 if generation is None or len(generation.candidates) == 0:
                     generation = None
                     raise RuntimeError("no_candidates_returned")
+
+                # Heartbeat: generation succeeded with candidates
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="generate",
+                        progress_pct=50.0,
+                    )
+                    # Also emit rich payload for BattleDiffTransport
+                    _gen_msg = type(
+                        "_Msg", (), {
+                            "payload": {
+                                "phase": "generate",
+                                "candidates_count": len(generation.candidates),
+                                "provider": generation.provider_name,
+                                "generation_duration_s": generation.generation_duration_s,
+                                "tool_records": len(getattr(generation, "tool_execution_records", ()) or ()),
+                            },
+                            "op_id": ctx.op_id,
+                            "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                        },
+                    )()
+                    for _t in getattr(self._stack.comm, "_transports", []):
+                        try:
+                            await _t.send(_gen_msg)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
 
                 # Success -- record reasoning trace + dialogue
                 if self._reasoning_narrator is not None:
@@ -1160,6 +1197,14 @@ class GovernedOrchestrator:
         # Store generation result in context
         if _serpent: _serpent.update_phase("VALIDATE")
         ctx = ctx.advance(OperationPhase.VALIDATE, generation=generation)
+
+        # Heartbeat: VALIDATE phase starting (Manifesto §7)
+        try:
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id, phase="validate", progress_pct=55.0,
+            )
+        except Exception:
+            pass
 
         # ── PreActionNarrator: voice WHAT before VALIDATE ──
         if self._pre_action_narrator is not None:
@@ -1621,6 +1666,14 @@ class GovernedOrchestrator:
         # Store compact validation result in context; full output is in ledger
         ctx = ctx.advance(OperationPhase.GATE, validation=best_validation)
 
+        # Heartbeat: GATE phase (Manifesto §7)
+        try:
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id, phase="gate", progress_pct=75.0,
+            )
+        except Exception:
+            pass
+
         if _serpent: _serpent.update_phase("GATE")
         # ---- Phase 5: GATE ----
         allowed, reason = self._stack.can_write(
@@ -1795,6 +1848,14 @@ class GovernedOrchestrator:
         # ---- Phase 7: APPLY ----
         ctx = ctx.advance(OperationPhase.APPLY)
 
+        # Heartbeat: APPLY phase starting (Manifesto §7)
+        try:
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id, phase="apply", progress_pct=80.0,
+            )
+        except Exception:
+            pass
+
         # Deploy gate: canary preflight before applying changes
         try:
             from backend.core.ouroboros.governance.deploy_gate import DeployGate
@@ -1931,6 +1992,15 @@ class GovernedOrchestrator:
         # ---- Phase 8: VERIFY ----
         if _serpent: _serpent.update_phase("VERIFY")
         ctx = ctx.advance(OperationPhase.VERIFY)
+
+        # Heartbeat: VERIFY phase starting (Manifesto §7)
+        try:
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id, phase="verify", progress_pct=92.0,
+            )
+        except Exception:
+            pass
+
         await self._record_ledger(
             ctx,
             OperationState.APPLIED,
@@ -1999,6 +2069,15 @@ class GovernedOrchestrator:
 
         if _serpent: _serpent.update_phase("COMPLETE")
         ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
+
+        # Heartbeat: COMPLETE (Manifesto §7)
+        try:
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id, phase="complete", progress_pct=100.0,
+            )
+        except Exception:
+            pass
+
         self._record_canary_for_ctx(ctx, True, time.monotonic() - _t_apply)
         await self._publish_outcome(ctx, OperationState.APPLIED)
         await self._persist_performance_record(ctx)

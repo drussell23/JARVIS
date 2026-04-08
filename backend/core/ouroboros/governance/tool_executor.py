@@ -844,12 +844,14 @@ class ToolLoopCoordinator:
         policy: ToolPolicy,
         max_rounds: int,
         tool_timeout_s: float,
+        on_tool_call: Optional[Callable] = None,
     ) -> None:
         self._backend = backend
         self._policy = policy
         self._max_rounds = max_rounds
         self._tool_timeout_s = tool_timeout_s
         self._last_records: List[ToolExecutionRecord] = []
+        self._on_tool_call = on_tool_call  # Optional callback for real-time display
 
     async def run(
         self,
@@ -916,6 +918,22 @@ class ToolLoopCoordinator:
                 self._last_records = list(records)
                 current_prompt += _format_denial(tc.name, policy_result)
             else:
+                # Notify callback for real-time display (Manifesto §7: Absolute Observability)
+                if self._on_tool_call is not None:
+                    try:
+                        _args_summary = ""
+                        if tc.arguments:
+                            _first_val = next(iter(tc.arguments.values()), "")
+                            _args_summary = str(_first_val)[:80]
+                        self._on_tool_call(
+                            op_id=op_id,
+                            tool_name=tc.name,
+                            args_summary=_args_summary,
+                            round_index=round_index,
+                        )
+                    except Exception:
+                        pass
+
                 started_ns = time.time_ns()
                 try:
                     tool_result = await self._backend.execute_async(tc, policy_ctx, per_tool_deadline)

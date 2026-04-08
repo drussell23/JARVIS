@@ -314,6 +314,74 @@ def print_boot_step(step: str, status: str = "ok") -> None:
     print(f"  {emoji} {_WHT}{step}{_R}", flush=True)
 
 
+def print_tool_call(op_id: str, tool_name: str, args_summary: str = "", round_idx: int = 0) -> None:
+    """Print a Venom tool call in real-time."""
+    short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
+    tool_icons = {
+        "read_file": "\U0001f4c4",      # page
+        "search_code": "\U0001f50d",     # magnifying glass
+        "run_tests": "\U0001f9ea",       # test tube
+        "bash": "\U0001f4bb",            # laptop
+        "web_search": "\U0001f310",      # globe
+        "web_fetch": "\U0001f310",       # globe
+        "list_symbols": "\U0001f3f7\ufe0f",  # label
+        "get_callers": "\U0001f517",     # link
+    }
+    icon = tool_icons.get(tool_name, "\U0001f527")  # wrench default
+    args_str = f" {_D}{args_summary[:80]}{_R}" if args_summary else ""
+    print(
+        f"  {icon} {_CYN}Turn {round_idx + 1}:{_R} {_B}{tool_name}{_R}{args_str}"
+        f"  {_D}op:{short_id}{_R}",
+        flush=True,
+    )
+
+
+def print_generation_result(op_id: str, provider: str, candidates: int, duration_s: float = 0.0) -> None:
+    """Print when generation completes with candidates."""
+    short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
+    dur = f" {_D}({duration_s:.1f}s){_R}" if duration_s > 0 else ""
+    print(
+        f"\n  \U0001f9ec {_BGRN}{_B}{candidates} candidate(s){_R} via {_CYN}{provider}{_R}{dur}"
+        f"  {_D}op:{short_id}{_R}",
+        flush=True,
+    )
+
+
+def print_validation_result(op_id: str, passed: bool, test_count: int = 0, failures: int = 0) -> None:
+    """Print validation result."""
+    short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
+    if passed:
+        print(
+            f"  \u2705 {_BGRN}VALIDATE:{_R} {test_count} tests passed  {_D}op:{short_id}{_R}",
+            flush=True,
+        )
+    else:
+        print(
+            f"  \u274c {_BRED}VALIDATE:{_R} {failures}/{test_count} failed  {_D}op:{short_id}{_R}",
+            flush=True,
+        )
+
+
+def print_l2_repair(op_id: str, iteration: int, status: str, detail: str = "") -> None:
+    """Print L2 repair engine progress."""
+    short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
+    detail_str = f" \u2014 {detail}" if detail else ""
+    print(
+        f"  \U0001f527 {_YLW}L2 Repair iter {iteration}:{_R} {status}{detail_str}"
+        f"  {_D}op:{short_id}{_R}",
+        flush=True,
+    )
+
+
+def print_apply_file(op_id: str, file_path: str) -> None:
+    """Print when a file is being applied."""
+    short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
+    print(
+        f"  \U0001f4be {_GRN}APPLY:{_R} {file_path}  {_D}op:{short_id}{_R}",
+        flush=True,
+    )
+
+
 # ══════════════════════════════════════════════════════════════════
 # BattleDiffTransport — CommProtocol transport
 # ══════════════════════════════════════════════════════════════════
@@ -352,8 +420,49 @@ class BattleDiffTransport:
 
             elif msg_type == "HEARTBEAT":
                 phase = payload.get("phase", "")
-                # Skip FSM internal states and duplicate phases
-                if phase and ":" not in phase:
+
+                # --- Venom tool call display ---
+                if payload.get("tool_name"):
+                    print_tool_call(
+                        op_id=op_id,
+                        tool_name=payload["tool_name"],
+                        args_summary=payload.get("tool_args_summary", ""),
+                        round_idx=payload.get("round_index", 0),
+                    )
+
+                # --- Generation result display ---
+                elif payload.get("candidates_count") is not None:
+                    print_generation_result(
+                        op_id=op_id,
+                        provider=payload.get("provider", "unknown"),
+                        candidates=payload.get("candidates_count", 0),
+                        duration_s=payload.get("generation_duration_s", 0.0),
+                    )
+
+                # --- Validation result display ---
+                elif phase.upper() in ("VALIDATE", "VALIDATE_RETRY") and "test_passed" in payload:
+                    print_validation_result(
+                        op_id=op_id,
+                        passed=payload.get("test_passed", False),
+                        test_count=payload.get("test_count", 0),
+                        failures=payload.get("test_failures", 0),
+                    )
+
+                # --- L2 repair display ---
+                elif payload.get("l2_iteration") is not None:
+                    print_l2_repair(
+                        op_id=op_id,
+                        iteration=payload["l2_iteration"],
+                        status=payload.get("l2_status", ""),
+                        detail=payload.get("l2_detail", ""),
+                    )
+
+                # --- File apply display ---
+                elif phase.upper() == "APPLY" and payload.get("target_file"):
+                    print_apply_file(op_id, payload["target_file"])
+
+                # --- Standard phase progress ---
+                elif phase and ":" not in phase:
                     seen = self._seen_phases.get(op_id, set())
                     if phase.upper() not in seen:
                         seen.add(phase.upper())
