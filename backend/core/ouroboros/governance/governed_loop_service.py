@@ -2601,8 +2601,11 @@ class GovernedLoopService:
                 BackgroundAgentPool,
             )
             self._bg_pool = BackgroundAgentPool(orchestrator=self._orchestrator)
-            asyncio.get_event_loop().create_task(self._bg_pool.start())
-            logger.info("[GLS] BackgroundAgentPool started (non-blocking op submission)")
+            await self._bg_pool.start()
+            logger.info(
+                "[GLS] BackgroundAgentPool started (pool_size=%d, queue_size=%d)",
+                self._bg_pool._pool_size, self._bg_pool._queue_size,
+            )
         except Exception as exc:
             logger.debug("[GLS] BackgroundAgentPool skipped: %s", exc)
 

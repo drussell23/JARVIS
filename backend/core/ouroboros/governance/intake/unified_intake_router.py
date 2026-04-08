@@ -327,6 +327,10 @@ class UnifiedIntakeRouter:
                 # Fall through to GLS as fallback
 
         # --- Route to GLS for code changes ---
+        # Use submit_background() for parallel operation execution via
+        # BackgroundAgentPool. Falls back to synchronous submit() if pool
+        # is unavailable. This enables the organism to work on multiple
+        # operations concurrently (Manifesto §3: disciplined concurrency).
         from backend.core.ouroboros.governance.op_context import OperationContext
 
         ctx = OperationContext.create(
@@ -335,10 +339,17 @@ class UnifiedIntakeRouter:
             op_id=envelope.causal_id,
         )
         try:
-            await asyncio.wait_for(
-                self._gls.submit(ctx, trigger_source=envelope.source),
-                timeout=self._config.dispatch_timeout_s,
-            )
+            _submit_fn = getattr(self._gls, "submit_background", None)
+            if _submit_fn is not None:
+                await asyncio.wait_for(
+                    _submit_fn(ctx, trigger_source=envelope.source),
+                    timeout=self._config.dispatch_timeout_s,
+                )
+            else:
+                await asyncio.wait_for(
+                    self._gls.submit(ctx, trigger_source=envelope.source),
+                    timeout=self._config.dispatch_timeout_s,
+                )
             self._wal.update_status(envelope.lease_id, "acked")
             self._retry_count.pop(ikey, None)
         except Exception as exc:
