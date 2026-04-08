@@ -263,8 +263,10 @@ class OuroborosConsole:
         provider: str,
         duration_s: float = 0.0,
         tool_count: int = 0,
+        candidate_files: Optional[List[str]] = None,
+        candidate_preview: str = "",
     ) -> None:
-        """Show generation completion."""
+        """Show generation completion with code preview."""
         short_id = op_id.split("-")[1][:8] if "-" in op_id else op_id[:8]
         badge = _PROVIDER_BADGES.get(provider, provider)
         tool_str = f", {tool_count} tool calls" if tool_count > 0 else ""
@@ -273,8 +275,34 @@ class OuroborosConsole:
             f"\n  \U0001f9ec [bold green]{candidates} candidate(s)[/bold green] "
             f"via {badge}"
             f"  [dim]({duration_s:.1f}s{tool_str})[/dim]"
-            f"  [dim]op:{short_id}[/dim]\n"
+            f"  [dim]op:{short_id}[/dim]"
         )
+
+        # Show candidate file paths
+        if candidate_files:
+            for f in candidate_files[:5]:
+                if f:
+                    self._console.print(f"     \U0001f4c4 [cyan]{f}[/cyan]")
+
+        # Show code preview if expanded or always show first 200 chars
+        if candidate_preview:
+            preview = candidate_preview[:300] if not self._expand_mode else candidate_preview[:1000]
+            if preview:
+                try:
+                    syntax = Syntax(
+                        preview, "json", theme="monokai",
+                        line_numbers=False, word_wrap=True,
+                    )
+                    self._console.print(Panel(
+                        syntax,
+                        title="\u2728 Generated Code Preview",
+                        border_style="green",
+                        padding=(0, 1),
+                    ))
+                except Exception:
+                    self._console.print(f"  [dim]{preview}[/dim]")
+
+        self._console.print()
 
     # ── Validation ─────────────────────────────────────────────
 
@@ -544,6 +572,8 @@ class OuroborosTUITransport:
                         provider=provider,
                         duration_s=payload.get("generation_duration_s", 0.0),
                         tool_count=payload.get("tool_records", 0),
+                        candidate_files=payload.get("candidate_files", []),
+                        candidate_preview=payload.get("candidate_preview", ""),
                     )
 
                 # Validation result

@@ -1053,6 +1053,14 @@ class GovernedOrchestrator:
                                 "provider": generation.provider_name,
                                 "generation_duration_s": generation.generation_duration_s,
                                 "tool_records": len(getattr(generation, "tool_execution_records", ()) or ()),
+                                # Include candidate file paths and preview for TUI display
+                                "candidate_files": [
+                                    getattr(c, "file_path", "") for c in generation.candidates[:3]
+                                ],
+                                "candidate_preview": (
+                                    getattr(generation.candidates[0], "raw_content", "")[:500]
+                                    if generation.candidates else ""
+                                ),
                             },
                             "op_id": ctx.op_id,
                             "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
