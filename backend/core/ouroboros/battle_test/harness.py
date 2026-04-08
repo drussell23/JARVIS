@@ -241,6 +241,46 @@ class BattleTestHarness:
                 f"\n"
             )
 
+            # Subscribe to operation completion events for session recording
+            try:
+                _emitter = getattr(self._governed_loop_service, "_event_emitter", None)
+                if _emitter is not None:
+                    from backend.core.ouroboros.governance.autonomy.autonomy_types import (
+                        AutonomyEventType,
+                    )
+
+                    async def _on_op_completed(event: Any) -> None:
+                        """Record completed operations into SessionRecorder."""
+                        try:
+                            p = event.payload
+                            status = "completed" if p.get("success") else "failed"
+                            if p.get("rollback"):
+                                status = "rolled_back"
+                            self._session_recorder.record_operation(
+                                op_id=p.get("op_id", ""),
+                                status=status,
+                                sensor=p.get("outcome_source", "unknown"),
+                                technique=p.get("provider", "unknown"),
+                                composite_score=0.0,
+                                elapsed_s=p.get("duration_s", 0.0),
+                            )
+                            logger.debug(
+                                "SessionRecorder: recorded op=%s status=%s",
+                                p.get("op_id", "")[:16], status,
+                            )
+                        except Exception:
+                            pass  # Recording is non-critical
+
+                    _emitter.subscribe(
+                        AutonomyEventType.OP_COMPLETED, _on_op_completed,
+                    )
+                    _emitter.subscribe(
+                        AutonomyEventType.OP_ROLLED_BACK, _on_op_completed,
+                    )
+                    logger.info("SessionRecorder subscribed to operation events")
+            except Exception as exc:
+                logger.debug("SessionRecorder event subscription failed: %s", exc)
+
             # Start idle watchdog
             await self._idle_watchdog.start()
 
