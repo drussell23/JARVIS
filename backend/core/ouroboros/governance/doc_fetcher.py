@@ -135,11 +135,13 @@ class DocFetcher:
         results: List[DocFetchResult] = []
         packages = package_names[:_MAX_FETCHES_PER_ROUND]
 
+        async def _fetch_all() -> None:
+            for pkg in packages:
+                result = await self._fetch_pypi_package(pkg)
+                results.append(result)
+
         try:
-            async with asyncio.timeout(_ROUND_TIMEOUT_S):
-                for pkg in packages:
-                    result = await self._fetch_pypi_package(pkg)
-                    results.append(result)
+            await asyncio.wait_for(_fetch_all(), timeout=_ROUND_TIMEOUT_S)
         except asyncio.TimeoutError:
             logger.warning("[DocFetcher] Round timeout after %ds", _ROUND_TIMEOUT_S)
         except asyncio.CancelledError:
@@ -164,11 +166,13 @@ class DocFetcher:
                 source_type="rejected",
             ))
 
+        async def _fetch_all_urls() -> None:
+            for url in allowed[:_MAX_FETCHES_PER_ROUND]:
+                result = await self._fetch_url(url)
+                results.append(result)
+
         try:
-            async with asyncio.timeout(_ROUND_TIMEOUT_S):
-                for url in allowed[:_MAX_FETCHES_PER_ROUND]:
-                    result = await self._fetch_url(url)
-                    results.append(result)
+            await asyncio.wait_for(_fetch_all_urls(), timeout=_ROUND_TIMEOUT_S)
         except asyncio.TimeoutError:
             logger.warning("[DocFetcher] Round timeout")
         except asyncio.CancelledError:

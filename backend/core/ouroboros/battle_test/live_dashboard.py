@@ -33,14 +33,14 @@ symbiote must be entirely visible.
 from __future__ import annotations
 
 import asyncio
+import logging
+import subprocess
 import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-
-import subprocess
 
 from rich.console import Console
 from rich.layout import Layout
@@ -165,6 +165,7 @@ class LiveDashboard:
         self._console = Console(emoji=True, highlight=False)
         self._live: Optional[Live] = None
         self._refresh_task: Optional[asyncio.Task] = None
+        self._muted_handlers: List[logging.Handler] = []
 
     @property
     def console(self) -> Console:
@@ -172,14 +173,40 @@ class LiveDashboard:
 
     # ── Lifecycle ─────────────────────────────────────────────
 
+    def _mute_terminal_logging(self) -> None:
+        """Mute logging StreamHandlers that write to the terminal.
+
+        Rich Live tracks cursor position via ANSI escapes.  Any raw
+        stderr/stdout write between refreshes corrupts that tracking and
+        causes the dashboard to re-render as stacked frames.  We mute
+        terminal handlers on start() and restore them on stop().
+        """
+        root = logging.getLogger()
+        for handler in root.handlers[:]:
+            if isinstance(handler, logging.StreamHandler) and handler.stream in (
+                sys.stderr, sys.stdout,
+            ):
+                root.removeHandler(handler)
+                self._muted_handlers.append(handler)
+
+    def _unmute_terminal_logging(self) -> None:
+        """Restore previously muted terminal logging handlers."""
+        root = logging.getLogger()
+        for handler in self._muted_handlers:
+            root.addHandler(handler)
+        self._muted_handlers.clear()
+
     async def start(self) -> None:
         """Start the Live dashboard rendering."""
         self._started_at = time.time()
+        # Mute terminal logging — raw stderr writes corrupt Rich Live's
+        # cursor tracking and cause stacked frame rendering.
+        self._mute_terminal_logging()
         self._live = Live(
             self._build_layout(),
             console=self._console,
             refresh_per_second=4,
-            screen=False,  # Don't clear screen — allow scrollback
+            screen=False,
             transient=False,
         )
         self._live.start()
@@ -188,7 +215,7 @@ class LiveDashboard:
         )
 
     async def stop(self) -> None:
-        """Stop the Live dashboard."""
+        """Stop the Live dashboard and restore terminal logging."""
         if self._refresh_task and not self._refresh_task.done():
             self._refresh_task.cancel()
             try:
@@ -200,6 +227,7 @@ class LiveDashboard:
                 self._live.stop()
             except Exception:
                 pass
+        self._unmute_terminal_logging()
 
     async def _auto_refresh(self) -> None:
         """Background task to update the dashboard layout."""

@@ -29,6 +29,17 @@ _ENABLED = os.environ.get(
     "JARVIS_OUROBOROS_ANIMATION", "true"
 ).lower() in ("true", "1", "yes")
 
+# When LiveDashboard is active, the serpent is redundant — the dashboard
+# already shows phase + elapsed per operation.  The serpent's raw stderr
+# writes fight with Rich Live's in-place rendering, causing visual stutter.
+_SUPPRESSED = False
+
+
+def suppress() -> None:
+    """Suppress the serpent animation (called by LiveDashboard on boot)."""
+    global _SUPPRESSED
+    _SUPPRESSED = True
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Ouroboros serpent frames — the snake eating its own tail
 # ═══════════════════════════════════════════════════════════════════════════
@@ -135,7 +146,7 @@ class OuroborosSerpent:
 
     async def start(self, phase: str = "CLASSIFY") -> None:
         """Start the serpent animation in a background task."""
-        if not _ENABLED:
+        if not _ENABLED or _SUPPRESSED:
             return
         self._phase = phase
         self._running = True
