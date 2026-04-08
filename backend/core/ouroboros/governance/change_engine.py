@@ -520,6 +520,30 @@ class ChangeEngine:
             ) as handle:
                 target.write_text(signed_content, encoding="utf-8")
 
+            # Emit diff heartbeat so SerpentFlow can show colored inline diffs
+            # as the file is being assimilated (Manifesto §7: Absolute Observability).
+            try:
+                import difflib as _difflib
+                _diff_lines = list(_difflib.unified_diff(
+                    rollback.original_content.splitlines(keepends=True),
+                    signed_content.splitlines(keepends=True),
+                    fromfile=f"a/{target}",
+                    tofile=f"b/{target}",
+                    n=3,
+                ))
+                if _diff_lines:
+                    _diff_text = "".join(_diff_lines)
+                    # Cap at 5000 chars to avoid flooding the transport
+                    if len(_diff_text) > 5000:
+                        _diff_text = _diff_text[:5000] + "\n... truncated"
+                    await self._comm.emit_heartbeat(
+                        op_id=op_id, phase="APPLY", progress_pct=75.0,
+                        target_file=str(target),
+                        diff_text=_diff_text,
+                    )
+            except Exception:
+                pass  # Diff display is non-critical
+
             # Post-hook notification (fire-and-forget; errors swallowed by registry)
             if self._tool_hook_registry is not None:
                 try:

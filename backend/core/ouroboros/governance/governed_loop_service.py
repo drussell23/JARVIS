@@ -543,7 +543,7 @@ class GovernedLoopConfig:
     claude_model: str = "claude-sonnet-4-20250514"
     claude_max_cost_per_op: float = 0.50
     claude_daily_budget: float = 10.00
-    generation_timeout_s: float = 120.0
+    generation_timeout_s: float = 180.0
     context_expansion_timeout_s: float = 30.0
     approval_timeout_s: float = 600.0
     health_probe_interval_s: float = 30.0
@@ -624,7 +624,7 @@ class GovernedLoopConfig:
                 os.getenv("JARVIS_GOVERNED_CLAUDE_DAILY_BUDGET", "10.00")
             ),
             generation_timeout_s=float(
-                _cfg("generation_timeout_s", "JARVIS_GENERATION_TIMEOUT_S", "120")
+                _cfg("generation_timeout_s", "JARVIS_GENERATION_TIMEOUT_S", "180")
             ),
             context_expansion_timeout_s=float(
                 os.getenv("JARVIS_GOVERNED_EXPANSION_TIMEOUT", "30.0")
