@@ -2396,6 +2396,39 @@ class GovernedLoopService:
                     "[GovernedLoop] DoublewordProvider: configured (model=%s, mode=%s)",
                     tier0._model, _mode,
                 )
+                # Boot Semantic Triage Engine (DW 35B pre-analysis)
+                try:
+                    from backend.core.ouroboros.governance.semantic_triage import (
+                        SemanticTriageEngine,
+                    )
+                    self._semantic_triage = SemanticTriageEngine(
+                        dw_provider=tier0,
+                        project_root=self._config.project_root,
+                    )
+                    # Verify triage model is available on DW API (non-blocking, non-fatal)
+                    _model_ok = await asyncio.wait_for(
+                        self._semantic_triage.verify_model(), timeout=15.0,
+                    )
+                    if _model_ok:
+                        logger.info(
+                            "[GovernedLoop] SemanticTriageEngine: booted (model=%s, verified=True)",
+                            self._semantic_triage._effective_model,
+                        )
+                    else:
+                        logger.warning(
+                            "[GovernedLoop] SemanticTriageEngine: triage model unavailable — disabled",
+                        )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "[GovernedLoop] SemanticTriageEngine: model verification timed out — "
+                        "proceeding with unverified model %s",
+                        os.environ.get("OUROBOROS_TRIAGE_MODEL", "Qwen/Qwen3.5-35B-A3B-FP8"),
+                    )
+                except Exception as _triage_boot_exc:
+                    logger.debug(
+                        "[GovernedLoop] SemanticTriageEngine boot failed (non-fatal): %s",
+                        _triage_boot_exc,
+                    )
             except Exception as exc:
                 logger.warning(
                     "[GovernedLoop] DoublewordProvider build failed: %s", exc

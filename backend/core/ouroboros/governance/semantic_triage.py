@@ -151,6 +151,9 @@ class SemanticTriageEngine:
     ) -> None:
         self._dw = dw_provider
         self._project_root = project_root
+        # Model verification state
+        self._model_verified: bool | None = None  # None = not checked yet
+        self._effective_model: str = _TRIAGE_MODEL  # May change after verify_model()
         # Stats
         self._total_triages: int = 0
         self._no_ops_caught: int = 0
@@ -162,10 +165,137 @@ class SemanticTriageEngine:
 
     @property
     def is_available(self) -> bool:
-        """Check if triage can run (DW available + feature enabled)."""
+        """Check if triage can run (DW available + feature enabled + model verified)."""
         if not _TRIAGE_ENABLED:
             return False
-        return self._dw is not None and getattr(self._dw, "is_available", False)
+        if self._dw is None or not getattr(self._dw, "is_available", False):
+            return False
+        # If we've already verified the model, respect that result
+        if self._model_verified is False:
+            return False
+        return True
+
+    async def verify_model(self) -> bool:
+        """Verify the triage model is available on the DW API.
+
+        Queries the ``/v1/models`` endpoint and checks that the configured
+        triage model appears in the response.  Falls back to the DW
+        provider's default model (397B) if the triage model isn't found,
+        logging a warning so the operator can adjust.
+
+        Call this once at boot (non-blocking, non-fatal).
+
+        Returns
+        -------
+        bool
+            True if the triage model (or a fallback) is ready.
+        """
+        if self._dw is None:
+            self._model_verified = False
+            return False
+
+        try:
+            session = await self._dw._get_session()
+            base_url = getattr(self._dw, "_base_url", "")
+            if not base_url:
+                self._model_verified = False
+                return False
+
+            async with session.get(
+                f"{base_url}/models",
+                timeout=self._dw._request_timeout(),
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(
+                        "[SemanticTriage] /v1/models returned %d — "
+                        "cannot verify triage model availability",
+                        resp.status,
+                    )
+                    # Proceed anyway — model might still work
+                    self._model_verified = True
+                    return True
+
+                body = await resp.json()
+
+            # DW models endpoint returns {"data": [{"id": "model-name", ...}, ...]}
+            # or a flat list — handle both
+            models_list = body if isinstance(body, list) else body.get("data", [])
+            available_ids = set()
+            for m in models_list:
+                if isinstance(m, str):
+                    available_ids.add(m)
+                elif isinstance(m, dict):
+                    available_ids.add(m.get("id", ""))
+
+            if _TRIAGE_MODEL in available_ids:
+                logger.info(
+                    "[SemanticTriage] Model verified: %s is available "
+                    "(%d models on endpoint)",
+                    _TRIAGE_MODEL, len(available_ids),
+                )
+                self._model_verified = True
+                return True
+
+            # Triage model not found — try to find a suitable alternative
+            # Look for any smaller Qwen model (prefer 35B, then any non-397B)
+            _fallback_candidates = sorted(
+                (mid for mid in available_ids if "qwen" in mid.lower()),
+                key=lambda x: ("397" not in x, "35" in x, x),
+                reverse=True,
+            )
+
+            if _fallback_candidates:
+                _fallback = _fallback_candidates[0]
+                if _fallback != _TRIAGE_MODEL:
+                    logger.warning(
+                        "[SemanticTriage] Configured model %s NOT found. "
+                        "Falling back to %s. Available models: %s",
+                        _TRIAGE_MODEL, _fallback,
+                        ", ".join(sorted(available_ids)),
+                    )
+                    self._effective_model = _fallback
+                    self._model_verified = True
+                    return True
+
+            # No suitable model found at all — use the DW provider's default
+            _dw_default = getattr(self._dw, "_model", None)
+            if _dw_default and _dw_default in available_ids:
+                logger.warning(
+                    "[SemanticTriage] No lightweight model found. "
+                    "Using DW default %s (more expensive for triage). "
+                    "Available: %s",
+                    _dw_default, ", ".join(sorted(available_ids)),
+                )
+                self._effective_model = _dw_default
+                self._model_verified = True
+                return True
+
+            # Nothing works — log everything and disable
+            logger.error(
+                "[SemanticTriage] No usable model found on DW API. "
+                "Triage disabled. Configured: %s, Available: %s",
+                _TRIAGE_MODEL,
+                ", ".join(sorted(available_ids)) if available_ids else "(empty)",
+            )
+            self._model_verified = False
+            return False
+
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[SemanticTriage] /v1/models timed out — "
+                "proceeding with configured model %s (unverified)",
+                _TRIAGE_MODEL,
+            )
+            self._model_verified = True  # Optimistic — let it try
+            return True
+        except Exception as exc:
+            logger.warning(
+                "[SemanticTriage] Model verification failed: %s — "
+                "proceeding with configured model %s (unverified)",
+                exc, _TRIAGE_MODEL,
+            )
+            self._model_verified = True  # Optimistic
+            return True
 
     async def triage(self, ctx: Any) -> TriageResult:
         """Run semantic triage on an operation's target files.
@@ -197,7 +327,7 @@ class SemanticTriageEngine:
             raw_response = await asyncio.wait_for(
                 self._dw.prompt_only(
                     prompt=prompt,
-                    model=_TRIAGE_MODEL,
+                    model=self._effective_model,
                     caller_id=f"triage_{ctx.op_id[:12]}",
                     response_format={"type": "json_object"},
                     max_tokens=_TRIAGE_MAX_TOKENS,
@@ -211,7 +341,7 @@ class SemanticTriageEngine:
 
             # Parse the response
             result = self._parse_response(raw_response, t0)
-            result.triage_model = _TRIAGE_MODEL
+            result.triage_model = self._effective_model
 
             # Track stats
             elapsed = time.monotonic() - t0
@@ -229,7 +359,7 @@ class SemanticTriageEngine:
                 "[SemanticTriage] op=%s decision=%s confidence=%.2f "
                 "model=%s elapsed=%.1fs files=%d",
                 ctx.op_id[:12], result.decision.name, result.confidence,
-                _TRIAGE_MODEL.split("/")[-1], elapsed,
+                self._effective_model.split("/")[-1], elapsed,
                 len(ctx.target_files),
             )
 
@@ -406,7 +536,9 @@ class SemanticTriageEngine:
                 if self._total_triages > 0
                 else 0.0
             ),
-            "triage_model": _TRIAGE_MODEL,
+            "triage_model": self._effective_model,
+            "configured_model": _TRIAGE_MODEL,
+            "model_verified": self._model_verified,
         }
 
     def format_for_prompt(self, result: TriageResult) -> str:
