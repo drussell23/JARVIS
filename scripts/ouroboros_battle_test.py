@@ -237,9 +237,15 @@ def main() -> None:
         ),
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
-    # Suppress noisy loggers that flood DEBUG output
-    for _noisy in ("fsevents", "watchdog", "watchdog.observers",
-                    "aiohttp.access", "urllib3", "chromadb"):
+    # Suppress noisy loggers that flood DEBUG output with internal details
+    for _noisy in (
+        "fsevents", "watchdog", "watchdog.observers",  # file watcher internals
+        "aiohttp.access", "urllib3", "urllib3.connectionpool",  # HTTP internals
+        "chromadb", "chromadb.telemetry",  # vector store internals
+        "anthropic._base_client", "anthropic._client",  # Anthropic SDK request/response dumps
+        "httpcore", "httpx",  # HTTP transport internals
+        "asyncio",  # event loop debug
+    ):
         logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     # ------------------------------------------------------------------
