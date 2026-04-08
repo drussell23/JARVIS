@@ -246,7 +246,7 @@ class BattleTestHarness:
                 _emitter = getattr(self._governed_loop_service, "_event_emitter", None)
                 if _emitter is not None:
                     from backend.core.ouroboros.governance.autonomy.autonomy_types import (
-                        AutonomyEventType,
+                        EventType,
                     )
 
                     async def _on_op_completed(event: Any) -> None:
@@ -272,10 +272,10 @@ class BattleTestHarness:
                             pass  # Recording is non-critical
 
                     _emitter.subscribe(
-                        AutonomyEventType.OP_COMPLETED, _on_op_completed,
+                        EventType.OP_COMPLETED, _on_op_completed,
                     )
                     _emitter.subscribe(
-                        AutonomyEventType.OP_ROLLED_BACK, _on_op_completed,
+                        EventType.OP_ROLLED_BACK, _on_op_completed,
                     )
                     logger.info("SessionRecorder subscribed to operation events")
             except Exception as exc:
