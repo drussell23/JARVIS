@@ -281,6 +281,12 @@ class BattleTestHarness:
             except Exception as exc:
                 logger.debug("SessionRecorder event subscription failed: %s", exc)
 
+            # Show TUI controls bar and start keyboard handler
+            if hasattr(self, "_tui_console") and self._tui_console is not None:
+                self._tui_console.show_controls_bar()
+            if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
+                await self._keyboard_handler.start()
+
             # Start idle watchdog
             await self._idle_watchdog.start()
 
@@ -364,15 +370,33 @@ class BattleTestHarness:
                 gov_config,
                 oracle=self._oracle,
             )
-            # Inject BattleDiffTransport for live colored diffs in CLI
+            # Inject OuroborosTUI for Claude Code-level interactive display
             try:
-                from backend.core.ouroboros.battle_test.diff_display import BattleDiffTransport
+                from backend.core.ouroboros.battle_test.ouroboros_tui import (
+                    OuroborosConsole,
+                    OuroborosTUITransport,
+                    KeyboardHandler,
+                )
+                self._tui_console = OuroborosConsole(repo_path=self._config.repo_path)
+                _tui_transport = OuroborosTUITransport(tui=self._tui_console)
                 if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
-                    diff_transport = BattleDiffTransport(repo_path=self._config.repo_path)
-                    self._governance_stack.comm._transports.append(diff_transport)
-                    logger.info("BattleDiffTransport wired (live colored diffs in CLI)")
+                    self._governance_stack.comm._transports.append(_tui_transport)
+                    logger.info("OuroborosTUI wired (Rich-powered interactive display)")
+                # Keyboard handler will be started after banner
+                self._keyboard_handler = KeyboardHandler(
+                    tui=self._tui_console,
+                    shutdown_event=self._shutdown_event,
+                )
             except Exception as exc:
-                logger.debug("BattleDiffTransport not available: %s", exc)
+                logger.debug("OuroborosTUI not available, falling back to basic: %s", exc)
+                # Fallback to basic diff transport
+                try:
+                    from backend.core.ouroboros.battle_test.diff_display import BattleDiffTransport
+                    if hasattr(self._governance_stack, "comm") and self._governance_stack.comm is not None:
+                        diff_transport = BattleDiffTransport(repo_path=self._config.repo_path)
+                        self._governance_stack.comm._transports.append(diff_transport)
+                except Exception:
+                    pass
 
             logger.info("Governance stack booted")
         except Exception as exc:
@@ -710,7 +734,14 @@ class BattleTestHarness:
         except Exception:
             pass
 
-        # 0b. Cost monitor
+        # 0b. Keyboard handler
+        try:
+            if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
+                await self._keyboard_handler.stop()
+        except Exception:
+            pass
+
+        # 0c. Cost monitor
         try:
             if hasattr(self, "_cost_monitor_task") and self._cost_monitor_task:
                 self._cost_monitor_task.cancel()
