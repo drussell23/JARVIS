@@ -755,14 +755,31 @@ class SagaApplyStrategy:
             logger.info("[Saga-B+] %s: no diff after apply, skipping commit", repo)
             await self._emit_sub_event("skipped_no_diff", saga_id, ctx.op_id, repo=repo)
             return
+        # Build commit signature showing which subsystems contributed
+        _provider = getattr(ctx, "provider_used", "unknown")
+        _has_tool_records = bool(getattr(ctx, "tool_execution_records", ()))
+        _venom = "Venom" if _has_tool_records else ""
+        _consciousness = ""
+        try:
+            _gls = getattr(self, "_gls", None) or getattr(self._stack, "governed_loop_service", None) if hasattr(self, "_stack") else None
+            if _gls and getattr(_gls, "_consciousness_bridge", None):
+                _consciousness = "Consciousness"
+        except Exception:
+            pass
+        _subsystems = " + ".join(filter(None, ["Ouroboros", _venom, _consciousness]))
+
         commit_msg = (
             f"[ouroboros] {ctx.description[:72]}\n\n"
             f"op_id: {ctx.op_id}\n"
             f"saga_id: {saga_id}\n"
             f"repo: {repo}\n"
             f"base_sha: {self._base_shas.get(repo, '')}\n"
+            f"provider: {_provider}\n"
             f"phase: apply\n"
             f"schema_version: {ctx.schema_version}\n"
+            f"\n"
+            f"Generated-By: {_subsystems}\n"
+            f"Signed-off-by: JARVIS Ouroboros <ouroboros@jarvis.local>\n"
         )
         env = {
             "GIT_AUTHOR_NAME": "JARVIS Ouroboros",
