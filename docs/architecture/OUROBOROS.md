@@ -672,6 +672,52 @@ All Ouroboros operations work on ephemeral branches:
 Voice debounce: `OUROBOROS_VOICE_DEBOUNCE_S` (default 60s) prevents
 narration spam.
 
+### Thought Log
+
+**Source**: `backend/core/ouroboros/governance/goal_memory_bridge.py`
+
+The `GoalMemoryBridge` writes a human-readable JSONL thought log to
+`.jarvis/ouroboros_thoughts.jsonl` showing the organism's reasoning
+process at each phase:
+
+| Phase | What is logged |
+|-------|---------------|
+| `BOOT` | Scanning codebase for opportunities |
+| `MEMORY_RECALL` | What memories were found, how many, relevance |
+| `TOOL` | Which tool was called and why (read_file, bash, run_tests) |
+| `GENERATE` | Generation strategy, provider used, context size |
+| `REPAIR` | L2 iteration progress, failure classification, convergence |
+| `POST_APPLY` | Success/failure outcome, what was learned |
+
+Logged at INFO level so `battle_test.py -v` shows the thought process
+in real time. Also persisted to disk for post-session review.
+
+### Autonomous Commit Signature
+
+Every commit made by Ouroboros includes a dynamic `Generated-By` trailer
+identifying which subsystems contributed:
+
+```
+[ouroboros] fix FIXME in governed_loop_service.py
+
+op_id: op-019d6633-10ed-71ae-b324-fd5d412cfc3b
+saga_id: saga-abc123
+repo: jarvis
+provider: claude-api
+phase: apply
+
+Generated-By: Ouroboros + Venom + Consciousness
+Signed-off-by: JARVIS Ouroboros <ouroboros@jarvis.local>
+```
+
+| Signature component | When present |
+|---------------------|-------------|
+| `Ouroboros` | Always (governance pipeline) |
+| `+ Venom` | When `tool_execution_records` exist (multi-turn tool use) |
+| `+ Consciousness` | When `ConsciousnessBridge` is active (memory/prediction) |
+
+Git author: `JARVIS Ouroboros <ouroboros@jarvis.local>`.
+
 ### Telemetry
 
 `HostTelemetry`, `RoutingIntentTelemetry`, and `TelemetryContext` are
@@ -830,6 +876,7 @@ The session stops on whichever fires first:
 
 | File | Purpose |
 |------|---------|
-| `backend/core/ouroboros/governance/saga/saga_apply_strategy.py` | Multi-repo saga application |
+| `backend/core/ouroboros/governance/saga/saga_apply_strategy.py` | Multi-repo saga application + commit signature |
+| `backend/core/ouroboros/governance/goal_memory_bridge.py` | GoalMemoryBridge + thought log |
 | `backend/core/ouroboros/governance/saga/cross_repo_verifier.py` | Cross-repo patch verification |
 | `backend/core/ouroboros/governance/multi_repo/registry.py` | RepoRegistry for 3 repos |
