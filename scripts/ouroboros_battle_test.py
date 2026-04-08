@@ -56,8 +56,22 @@ _BOLD = "\033[1m"
 _RESET = "\033[0m"
 
 
+# API keys that .env should always override (stale shell exports are a
+# common source of 401 errors during battle test).  Everything else uses
+# setdefault so explicit `env VAR=val cmd` still works for non-secret config.
+_FORCE_OVERRIDE_KEYS = frozenset({
+    "ANTHROPIC_API_KEY",
+    "DOUBLEWORD_API_KEY",
+})
+
+
 def _load_env_files() -> None:
-    """Load .env files from project root and backend/ (without overwriting)."""
+    """Load .env files from project root and backend/.
+
+    API keys (ANTHROPIC_API_KEY, DOUBLEWORD_API_KEY) are force-overridden
+    from .env so that stale shell exports don't cause silent 401 errors.
+    All other variables use setdefault (shell wins).
+    """
     for env_path in (_PROJECT_ROOT / ".env", _PROJECT_ROOT / "backend" / ".env"):
         if not env_path.exists():
             continue
@@ -66,7 +80,12 @@ def _load_env_files() -> None:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
-            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+            key = key.strip()
+            value = value.strip().strip("'\"")
+            if key in _FORCE_OVERRIDE_KEYS:
+                os.environ[key] = value  # .env wins for API keys
+            else:
+                os.environ.setdefault(key, value)
 
 
 def _check_env(key: str) -> str:
