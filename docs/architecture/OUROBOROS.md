@@ -456,7 +456,11 @@ It is the **soul** of the organism (Manifesto Section 4: "The Synthetic Soul").
 │  └── UAE (Unified Awareness Engine)              │
 │                                                  │
 │  Integration:                                    │
-│  └── ConsciousnessBridge (5 methods → pipeline)  │
+│  ├── ConsciousnessBridge (5 methods → pipeline)  │
+│  └── GoalMemoryBridge (ChromaDB cross-session)   │
+│                                                  │
+│  Strategic Direction:                            │
+│  └── StrategicDirectionService (Manifesto → ops) │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -511,35 +515,85 @@ It is the **soul** of the organism (Manifesto Section 4: "The Synthetic Soul").
 - Output: `OperationAwareness` with suggested_provider_tier, thinking_budget, prompt_injection
 - Awareness levels: DORMANT, OBSERVING, ATTENTIVE, FOCUSED, HYPERAWARE
 
-### The Complete Loop
+### Strategic Direction Service
+
+**Source**: `backend/core/ouroboros/governance/strategic_direction.py`
+
+Reads the Manifesto (README.md) and architecture docs on boot, extracts
+the 7 core principles, and injects a ~2500-character strategic context
+digest into every operation's `strategic_memory_prompt`.
+
+**What the provider sees in every generation prompt:**
 
 ```
+## Strategic Direction (Manifesto v4)
+
+You are generating code for the JARVIS Trinity AI Ecosystem — an autonomous,
+self-evolving AI Operating System. Every change must align with these principles:
+
+1. The unified organism (tri-partite microkernel)
+2. Progressive awakening (adaptive lifecycle)
+3. Asynchronous tendrils (disciplined concurrency)
+4. The synthetic soul (Trinity consciousness)
+5. Intelligence-driven routing (the cognitive forge)
+6. Threshold-triggered neuroplasticity (Ouroboros)
+7. Absolute observability (systemic transparency)
+
+MANDATE: Structural repair, not patches.
+```
+
+**Sources read on boot:**
+
+| Doc | What's extracted |
+|-----|-----------------|
+| `README.md` | 7 principles, zero-shortcut mandate, Trinity architecture |
+| `docs/architecture/OUROBOROS.md` | Pipeline overview, provider routing |
+| `docs/architecture/BRAIN_ROUTING.md` | 3-tier cascade overview |
+
+This means the organism generates code that aligns with the developer's
+architectural vision — not generic fixes, but Manifesto-compliant code.
+
+### The Complete Loop: 6 Layers Working Together
+
+```
+Strategic Direction (compass — WHERE are we going?)
+    │  Manifesto: 7 principles, Trinity ecosystem, zero-shortcut mandate
+    │  Injected into every operation's generation prompt
+    │
+    ▼
 Trinity Consciousness (soul — WHY evolve?)
     │  MemoryEngine: "tests/test_utils.py has failed 60% of the time"
     │  ProphecyEngine: "HIGH regression risk for this file"
-    │  UAE: "FOCUSED awareness, suggest extended thinking budget"
+    │  GoalMemoryBridge: cross-session ChromaDB episodic learning
+    │
+    ▼
+Event Spine (senses — WHEN to act?)
+    │  FileWatchGuard: .py file changed → fs.changed.modified
+    │  pytest plugin: test_results.json → TestFailureSensor
+    │  post-commit hook: git_events.json → DocStalenessSensor
     │
     ▼
 Ouroboros Pipeline (skeleton — WHAT to do, safely)
-    │  CLASSIFY: risk elevated to HIGH based on file reputation
-    │  ROUTE: UAE suggests tier1 (Claude) for extended reasoning
-    │  EXPAND: Oracle enriches context with related files
+    │  CLASSIFY: risk + strategic direction + consciousness context
+    │  ROUTE: adaptive 3-tier cascade (DW → Claude → GCP)
+    │  2 parallel operations via BackgroundAgentPool
     │
     ▼
 Venom Agentic Loop (nervous system — HOW to do it)
-    │  Turn 1: read_file(tests/test_utils.py) → understands the test
-    │  Turn 2: search_code("def widget_") → finds the function
-    │  Turn 3: generates fix with full context
-    │  Turn 4: run_tests(tests/test_utils.py) → verifies fix
-    │  L2 Repair: if tests fail, classify error, revise, retry (5x)
+    │  read_file → search_code → bash → run_tests → web_search → revise
+    │  Deadline-based loop (iterate until done or time expires)
+    │  L2 Repair: generate → test → classify → fix → test again (5x)
     │
     ▼
 Code Applied, Tests Pass, Operation COMPLETE
+    │  Signed: Generated-By: Ouroboros + Venom + Consciousness
+    │  Thought log: .jarvis/ouroboros_thoughts.jsonl
     │
     ▼
 Trinity Consciousness (learns from outcome)
     │  MemoryEngine: records success → file reputation improves
-    │  Next time: ProphecyEngine predicts LOWER risk for this file
+    │  GoalMemory: records to ChromaDB for cross-session retrieval
+    │  Next operation benefits from accumulated experience
 ```
 
 ---
@@ -878,5 +932,6 @@ The session stops on whichever fires first:
 |------|---------|
 | `backend/core/ouroboros/governance/saga/saga_apply_strategy.py` | Multi-repo saga application + commit signature |
 | `backend/core/ouroboros/governance/goal_memory_bridge.py` | GoalMemoryBridge + thought log |
+| `backend/core/ouroboros/governance/strategic_direction.py` | StrategicDirectionService (Manifesto → prompt) |
 | `backend/core/ouroboros/governance/saga/cross_repo_verifier.py` | Cross-repo patch verification |
 | `backend/core/ouroboros/governance/multi_repo/registry.py` | RepoRegistry for 3 repos |
