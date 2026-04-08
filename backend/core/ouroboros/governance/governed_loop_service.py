@@ -2070,10 +2070,10 @@ class GovernedLoopService:
             primary_ok = await asyncio.wait_for(
                 provider.health_probe(), timeout=probe_timeout
             )
-        except Exception:
+        except Exception as _probe_exc:
             logger.debug(
-                "[GovernedLoop] Preflight: primary probe raised exception",
-                exc_info=True,
+                "[GovernedLoop] Preflight: primary probe failed: %s",
+                type(_probe_exc).__name__,
             )
             primary_ok = False
 
