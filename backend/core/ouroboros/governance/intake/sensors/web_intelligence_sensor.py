@@ -155,13 +155,13 @@ class WebIntelligenceSensor:
                     timeout=_PYPI_TIMEOUT_S,
                 )
                 findings.extend(pkg_findings)
-            except asyncio.TimeoutError:
+            except (asyncio.TimeoutError, OSError):
                 logger.debug("[WebIntelSensor] Timeout checking %s", pkg_name)
             except asyncio.CancelledError:
                 raise
-            except Exception:
+            except Exception as _exc:
                 logger.debug(
-                    "[WebIntelSensor] Error checking %s", pkg_name, exc_info=True
+                    "[WebIntelSensor] Error checking %s: %s", pkg_name, type(_exc).__name__
                 )
 
         # Emit envelopes for new findings
@@ -323,10 +323,13 @@ class WebIntelligenceSensor:
 
         except asyncio.CancelledError:
             raise
+        except (asyncio.TimeoutError, OSError):
+            # Network timeout or DNS failure — clean one-liner, no traceback
+            logger.debug("[WebIntelSensor] Timeout checking %s", pkg_name)
         except Exception:
             logger.debug(
-                "[WebIntelSensor] PyPI check failed for %s", pkg_name,
-                exc_info=True,
+                "[WebIntelSensor] PyPI check failed for %s: %s",
+                pkg_name, type(Exception).__name__,
             )
 
         return findings
