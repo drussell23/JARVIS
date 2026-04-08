@@ -1420,18 +1420,19 @@ class GovernedLoopService:
                                 len(_insights),
                             )
 
-                    # PROCEED and SKIP: continue normally (no action needed)
-                    if _triage_result.decision not in (
-                        TriageDecision.PROCEED, TriageDecision.SKIP,
-                    ):
-                        try:
-                            await self._stack.comm.emit_heartbeat(
-                                op_id=ctx.op_id,
-                                phase="semantic_triage",
-                                progress_pct=5.0,
-                            )
-                        except Exception:
-                            pass
+                    # Emit triage heartbeat for ALL decisions so the dashboard
+                    # can track triage statistics (NO_OP saves, PROCEED rate, etc.)
+                    try:
+                        await self._stack.comm.emit_heartbeat(
+                            op_id=ctx.op_id,
+                            phase="semantic_triage",
+                            progress_pct=5.0,
+                            triage_decision=_triage_result.decision.name,
+                            triage_confidence=_triage_result.confidence,
+                            triage_reason=getattr(_triage_result, "no_op_reason", ""),
+                        )
+                    except Exception:
+                        pass
 
                 except Exception as _triage_exc:
                     logger.debug(

@@ -40,10 +40,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+import subprocess
+
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 
@@ -321,27 +324,267 @@ class LiveDashboard:
             f"{tools_str}  [dim]({duration_s:.1f}s)[/dim]  op:{short}",
         )
 
+    # ── Code generation & diff display (rendered above dashboard) ──
+
+    def _print_above(self, renderable: Any) -> None:
+        """Print a Rich renderable above the pinned dashboard.
+
+        Rich Live with screen=False keeps the dashboard at the bottom;
+        console.print() output scrolls above it — giving the user both
+        a persistent overview AND detailed code/diff output.
+        """
+        if self._live and self._live.console:
+            self._live.console.print(renderable)
+        else:
+            self._console.print(renderable)
+
+    def show_code_preview(
+        self,
+        op_id: str,
+        provider: str,
+        candidate_files: List[str],
+        candidate_preview: str = "",
+        duration_s: float = 0.0,
+        tool_count: int = 0,
+    ) -> None:
+        """Show syntax-highlighted code preview above the dashboard.
+
+        Called when generation completes — shows the actual code that
+        Ouroboros wrote so the user can see it in real time.
+        """
+        op = self._active_ops.get(op_id)
+        short = op.short_id if op else op_id[:6]
+        prov = _PROVIDER_SHORT.get(provider, provider[:10])
+        tools_str = f" + {tool_count} Venom tools" if tool_count > 0 else ""
+
+        # Header line
+        self._print_above(Text.from_markup(
+            f"\n  ✨ [bold]GENERATED[/bold]  op:{short}  via [cyan]{prov}[/cyan]"
+            f"{tools_str}  [dim]({duration_s:.1f}s)[/dim]"
+        ))
+
+        # File list
+        if candidate_files:
+            for f in candidate_files[:8]:
+                self._print_above(Text.from_markup(f"     📄 [cyan]{f}[/cyan]"))
+
+        # Syntax-highlighted code preview
+        if candidate_preview:
+            preview = candidate_preview
+            truncated = False
+            if not self._expand_mode and len(preview) > 1500:
+                preview = preview[:1500]
+                truncated = True
+
+            # Detect language from file extension
+            lang = "python"
+            if candidate_files:
+                ext = candidate_files[0].rsplit(".", 1)[-1] if "." in candidate_files[0] else ""
+                lang_map = {"py": "python", "ts": "typescript", "js": "javascript",
+                            "json": "json", "yaml": "yaml", "yml": "yaml", "md": "markdown"}
+                lang = lang_map.get(ext, "python")
+
+            try:
+                syntax = Syntax(
+                    preview, lang, theme="monokai",
+                    line_numbers=True, word_wrap=True,
+                )
+                subtitle = f"[dim]+{len(candidate_preview) - 1500} chars truncated[/dim]" if truncated else ""
+                self._print_above(Panel(
+                    syntax,
+                    title=f"[bold green]✨ Generated Code[/bold green]  op:{short}",
+                    subtitle=subtitle,
+                    border_style="green",
+                    padding=(0, 1),
+                ))
+            except Exception:
+                self._print_above(Text.from_markup(f"  [dim]{preview[:500]}[/dim]"))
+
+        self._print_above(Text(""))  # spacing
+
+    def show_diff(
+        self,
+        file_path: str,
+        diff_text: str = "",
+        op_id: str = "",
+    ) -> None:
+        """Show colored git diff above the dashboard.
+
+        Called during APPLY phase — shows the actual changes being
+        written to disk so the user can review in real time.
+        """
+        if not self._show_diffs:
+            return
+
+        short = ""
+        if op_id:
+            op = self._active_ops.get(op_id)
+            short = op.short_id if op else op_id[:6]
+
+        # Get diff from git if not provided
+        if not diff_text:
+            diff_text = self._get_git_diff(file_path)
+
+        if not diff_text:
+            self._print_above(Text.from_markup(
+                f"  💾 [green]APPLY:[/green] {file_path}"
+                + (f"  [dim]op:{short}[/dim]" if short else "")
+            ))
+            return
+
+        # Truncate very large diffs
+        truncated = False
+        if not self._expand_mode and len(diff_text) > 3000:
+            lines = diff_text.split("\n")
+            diff_text = "\n".join(lines[:80])
+            truncated = True
+
+        try:
+            syntax = Syntax(
+                diff_text, "diff", theme="monokai",
+                line_numbers=True, word_wrap=True,
+            )
+            subtitle_parts = []
+            if short:
+                subtitle_parts.append(f"op:{short}")
+            if truncated:
+                subtitle_parts.append("truncated — press 'e' to expand")
+            subtitle = "  ".join(subtitle_parts) if subtitle_parts else None
+
+            self._print_above(Panel(
+                syntax,
+                title=f"[bold]📝 {file_path}[/bold]",
+                subtitle=f"[dim]{subtitle}[/dim]" if subtitle else None,
+                border_style="green",
+                padding=(0, 1),
+            ))
+        except Exception:
+            # Fallback: raw colored lines
+            self._print_above(Text.from_markup(
+                f"  💾 [green]APPLY:[/green] {file_path}"
+            ))
+
+    def show_completion_panel(
+        self,
+        op_id: str,
+        files_changed: List[str],
+        provider: str,
+        duration_s: float,
+        cost_usd: float = 0.0,
+    ) -> None:
+        """Show a success/signature panel above the dashboard."""
+        short = op_id.split("-")[1][:6] if "-" in op_id else op_id[:6]
+        prov = _PROVIDER_SHORT.get(provider, provider[:10])
+        cost_str = f"  💰 ${cost_usd:.4f}" if cost_usd > 0 else ""
+
+        self._print_above(Panel(
+            Text.from_markup(
+                f"Generated-By: [bold]Ouroboros + Venom + Consciousness[/bold]\n"
+                f"Signed-off-by: [dim]JARVIS Ouroboros <ouroboros@jarvis.local>[/dim]\n"
+                f"Provider: [cyan]{prov}[/cyan]  "
+                f"Files: {', '.join(f[:30] for f in files_changed[:3])}"
+            ),
+            title=f"[bold green]✅ SUCCESS[/bold green]  ⏱ {duration_s:.1f}s{cost_str}",
+            subtitle=f"[dim]op:{short}[/dim]",
+            border_style="green",
+            padding=(0, 2),
+        ))
+
+    def show_failure_panel(
+        self,
+        op_id: str,
+        reason: str,
+        phase: str = "",
+        duration_s: float = 0.0,
+    ) -> None:
+        """Show a failure panel above the dashboard."""
+        short = op_id.split("-")[1][:6] if "-" in op_id else op_id[:6]
+        phase_str = f" at [bold]{phase}[/bold]" if phase else ""
+
+        self._print_above(Panel(
+            Text.from_markup(
+                f"[red]Reason: {reason}[/red]{phase_str}\n"
+                f"[dim]The organism will learn from this failure.[/dim]"
+            ),
+            title=f"[bold red]❌ FAILED[/bold red]  ⏱ {duration_s:.1f}s",
+            subtitle=f"[dim]op:{short}[/dim]",
+            border_style="red",
+            padding=(0, 2),
+        ))
+
+    def _get_git_diff(self, file_path: str) -> str:
+        """Get git diff for a file."""
+        for args in (
+            ["git", "diff", "--cached", "--", file_path],
+            ["git", "diff", "--", file_path],
+            ["git", "diff", "HEAD~1", "--", file_path],
+        ):
+            try:
+                result = subprocess.run(
+                    args, cwd=self._repo_path,
+                    capture_output=True, text=True, timeout=5,
+                )
+                if result.stdout.strip():
+                    return result.stdout.strip()
+            except Exception:
+                continue
+        return ""
+
+    # ── Streaming output ──────────────────────────────────────
+
+    def show_streaming_start(self, provider: str, op_id: str = "") -> None:
+        """Begin streaming code generation output above the dashboard."""
+        prov = _PROVIDER_SHORT.get(provider, provider[:10])
+        short = op_id.split("-")[1][:6] if "-" in op_id else op_id[:6] if op_id else ""
+        id_str = f"  op:{short}" if short else ""
+        self._print_above(Text.from_markup(
+            f"\n  ✨ [dim]Generating via [cyan]{prov}[/cyan]...{id_str}[/dim]"
+        ))
+        # Start dim text for streaming tokens
+        sys.stdout.write("  \033[2m")
+        sys.stdout.flush()
+
+    def show_streaming_token(self, token: str) -> None:
+        """Print a streaming token chunk (real-time code writing)."""
+        sys.stdout.write(token)
+        sys.stdout.flush()
+
+    def show_streaming_end(self) -> None:
+        """End the streaming output block."""
+        sys.stdout.write("\033[0m\n")
+        sys.stdout.flush()
+
+    # ── Operation completion (updates dashboard + prints panels) ──
+
     def op_completed(
         self, op_id: str, files_changed: List[str],
         provider: str = "", cost_usd: float = 0.0,
     ) -> None:
-        """Mark an operation as complete."""
+        """Mark an operation as complete and show success panel."""
         op = self._active_ops.pop(op_id, None)
         short = op.short_id if op else op_id[:6]
         self._completed_count += 1
         elapsed = time.time() - (op.started_at if op else time.time())
         files_str = f"{len(files_changed)} file{'s' if len(files_changed) != 1 else ''}"
         cost_str = f" ${cost_usd:.4f}" if cost_usd > 0 else ""
+
+        # Show diffs above dashboard
+        if self._show_diffs and files_changed:
+            for f in files_changed[:5]:
+                self.show_diff(f, op_id=op_id)
+
+        # Show completion panel above dashboard
+        self.show_completion_panel(
+            op_id=op_id, files_changed=files_changed,
+            provider=provider, duration_s=elapsed, cost_usd=cost_usd,
+        )
+
+        # Update event log
         self.add_event(
             "✅",
             f"[bold green]COMPLETE[/bold green]  op:{short}  "
             f"{files_str} changed  [dim]{elapsed:.0f}s{cost_str}[/dim]",
         )
-
-        # Show diff paths in event log
-        if self._show_diffs and files_changed:
-            for f in files_changed[:3]:
-                self.add_event("📝", f"  [dim]{f}[/dim]")
 
     def op_failed(self, op_id: str, reason: str, phase: str = "") -> None:
         """Mark an operation as failed."""

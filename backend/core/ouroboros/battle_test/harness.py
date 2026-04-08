@@ -1007,10 +1007,15 @@ class BattleTestHarness:
         except Exception:
             pass
 
-        # 0b. Keyboard handler
+        # 0b. Keyboard handler + LiveDashboard
         try:
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
                 await self._keyboard_handler.stop()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "_live_dashboard") and self._live_dashboard is not None:
+                await self._live_dashboard.stop()
         except Exception:
             pass
 
