@@ -237,6 +237,10 @@ def main() -> None:
         ),
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
+    # Suppress noisy loggers that flood DEBUG output
+    for _noisy in ("fsevents", "watchdog", "watchdog.observers",
+                    "aiohttp.access", "urllib3", "chromadb"):
+        logging.getLogger(_noisy).setLevel(logging.WARNING)
 
     # ------------------------------------------------------------------
     # Build config + harness

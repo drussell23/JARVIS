@@ -384,16 +384,36 @@ class BattleTestHarness:
                 from backend.core.ouroboros.consciousness.memory_engine import MemoryEngine
                 from backend.core.ouroboros.consciousness.prophecy_engine import ProphecyEngine
 
-                _memory = MemoryEngine()
-                _cortex = HealthCortex()
+                _consciousness_dir = self._config.repo_path / ".jarvis" / "ouroboros" / "consciousness"
+                _consciousness_dir.mkdir(parents=True, exist_ok=True)
+
+                # MemoryEngine needs a ledger and persistence dir
+                _ledger = getattr(self._governed_loop_service, "_ledger", None)
+                _memory = MemoryEngine(
+                    ledger=_ledger,
+                    persistence_dir=_consciousness_dir,
+                    repo_path=str(self._config.repo_path),
+                )
+                # HealthCortex needs subsystems dict and comm
+                _comm = None
+                if self._governance_stack is not None:
+                    _comm = getattr(self._governance_stack, "comm", None)
+                _cortex = HealthCortex(
+                    subsystems={},  # No subsystem probes in battle test — health is best-effort
+                    comm=_comm,
+                    trend_path=_consciousness_dir / "health_trend.json",
+                )
                 _prophecy = ProphecyEngine(memory_engine=_memory)
+
+                from backend.core.ouroboros.consciousness.types import ConsciousnessConfig
+                _c_config = ConsciousnessConfig.from_env()
 
                 _consciousness = TrinityConsciousness(
                     health_cortex=_cortex,
                     memory_engine=_memory,
-                    dream_engine=None,
+                    dream_engine=None,  # DreamEngine needs GPU/idle — skip in battle test
                     prophecy_engine=_prophecy,
-                    config=None,
+                    config=_c_config,
                 )
                 await asyncio.wait_for(
                     asyncio.shield(_consciousness.start()), timeout=10.0,
