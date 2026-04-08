@@ -2288,34 +2288,35 @@ class ClaudeProvider:
                 input_tokens = 0
                 output_tokens = 0
                 _cached_input = 0
-                try:
-                    async with asyncio.timeout(timeout_s):
-                        async with client.messages.stream(
-                            model=self._model,
-                            max_tokens=_effective_max_tokens,
-                            temperature=0.2,
-                            system=_system_with_cache,
-                            messages=[{"role": "user", "content": user_content}],
-                        ) as stream:
-                            async for text in stream.text_stream:
-                                raw_content += text
-                                try:
-                                    _stream_callback(text)
-                                except Exception:
-                                    pass
-                            # Get final message for usage stats
-                            msg = await stream.get_final_message()
-                            _last_msg[0] = msg
-                            input_tokens = getattr(msg.usage, "input_tokens", 0)
-                            output_tokens = getattr(msg.usage, "output_tokens", 0)
+
+                async def _do_stream() -> None:
+                    nonlocal raw_content, input_tokens, output_tokens, _cached_input
+                    async with client.messages.stream(
+                        model=self._model,
+                        max_tokens=_effective_max_tokens,
+                        temperature=0.2,
+                        system=_system_with_cache,
+                        messages=[{"role": "user", "content": user_content}],
+                    ) as stream:
+                        async for text in stream.text_stream:
+                            raw_content += text
                             try:
-                                _cached_input = int(
-                                    getattr(msg.usage, "cache_read_input_tokens", 0) or 0
-                                )
-                            except (TypeError, ValueError):
-                                _cached_input = 0
-                except asyncio.TimeoutError:
-                    raise
+                                _stream_callback(text)
+                            except Exception:
+                                pass
+                        # Get final message for usage stats
+                        msg = await stream.get_final_message()
+                        _last_msg[0] = msg
+                        input_tokens = getattr(msg.usage, "input_tokens", 0)
+                        output_tokens = getattr(msg.usage, "output_tokens", 0)
+                        try:
+                            _cached_input = int(
+                                getattr(msg.usage, "cache_read_input_tokens", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            _cached_input = 0
+
+                await asyncio.wait_for(_do_stream(), timeout=timeout_s)
             else:
                 # Non-streaming fallback
                 msg = await asyncio.wait_for(
