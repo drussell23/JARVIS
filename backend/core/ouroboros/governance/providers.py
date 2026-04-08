@@ -2163,9 +2163,19 @@ class ClaudeProvider:
         """Record cost from a generation call."""
         self._daily_spend += cost
 
-    def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
-        """Estimate cost in USD from token counts."""
-        input_cost = (input_tokens / 1_000_000) * _CLAUDE_INPUT_COST_PER_M
+    def _estimate_cost(
+        self, input_tokens: int, output_tokens: int, cached_input_tokens: int = 0,
+    ) -> float:
+        """Estimate cost in USD from token counts.
+
+        Cached input tokens cost 90% less ($0.30/M vs $3.00/M).
+        """
+        _CACHED_INPUT_COST_PER_M = 0.30  # Anthropic prompt caching rate
+        uncached_input = max(0, input_tokens - cached_input_tokens)
+        input_cost = (
+            (uncached_input / 1_000_000) * _CLAUDE_INPUT_COST_PER_M
+            + (cached_input_tokens / 1_000_000) * _CACHED_INPUT_COST_PER_M
+        )
         output_cost = (output_tokens / 1_000_000) * _CLAUDE_OUTPUT_COST_PER_M
         return input_cost + output_cost
 
@@ -2242,12 +2252,25 @@ class ClaudeProvider:
             else:
                 user_content = p
 
+            # Prompt caching: mark the system prompt as cacheable.
+            # Anthropic caches identical system prompts across calls —
+            # cached input tokens cost $0.30/M instead of $3.00/M (90% savings).
+            # The system prompt + tool definitions are identical across all
+            # generation calls, making this highly effective.
+            _system_with_cache = [
+                {
+                    "type": "text",
+                    "text": _CODEGEN_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ]
+
             msg = await asyncio.wait_for(
                 client.messages.create(
                     model=self._model,
                     max_tokens=min(self._max_tokens, 8192),
                     temperature=0.2,
-                    system=_CODEGEN_SYSTEM_PROMPT,
+                    system=_system_with_cache,
                     messages=[{"role": "user", "content": user_content}],
                 ),
                 timeout=timeout_s,
@@ -2256,7 +2279,19 @@ class ClaudeProvider:
             raw_content = msg.content[0].text if msg.content else ""
             input_tokens = getattr(msg.usage, "input_tokens", 0)
             output_tokens = getattr(msg.usage, "output_tokens", 0)
-            cost = self._estimate_cost(input_tokens, output_tokens)
+            # Check for cached token savings (90% cheaper)
+            try:
+                _cached_input = int(getattr(getattr(msg, "usage", None), "cache_read_input_tokens", 0) or 0)
+            except (TypeError, ValueError):
+                _cached_input = 0
+            if _cached_input > 0:
+                logger.info(
+                    "[ClaudeProvider] \U0001f4b0 Prompt cache hit: %d cached tokens "
+                    "(90%% savings, $%.4f saved)",
+                    _cached_input,
+                    (_cached_input / 1_000_000) * (_CLAUDE_INPUT_COST_PER_M - 0.30),
+                )
+            cost = self._estimate_cost(input_tokens, output_tokens, _cached_input)
             self._record_cost(cost)
             total_cost += cost
             if total_cost >= self._max_cost_per_op:
