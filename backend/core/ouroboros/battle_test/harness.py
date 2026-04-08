@@ -163,28 +163,78 @@ class BattleTestHarness:
                 self._config.cost_cap_usd,
                 int(self._config.idle_timeout_s),
             )
+            # Detect active subsystems for banner
+            _gls = self._governed_loop_service
+            _has_consciousness = (
+                _gls is not None
+                and getattr(_gls, "_consciousness_bridge", None) is not None
+            )
+            _has_goal_memory = (
+                _gls is not None
+                and getattr(_gls, "_goal_memory_bridge", None) is not None
+            )
+            _has_strategic = (
+                _gls is not None
+                and getattr(_gls, "_strategic_direction", None) is not None
+                and getattr(_gls._strategic_direction, "is_loaded", False)
+            )
+            _has_tool_loop = (
+                _gls is not None
+                and getattr(_gls, "_config", None) is not None
+                and getattr(_gls._config, "tool_use_enabled", False)
+            )
+            _has_l2 = bool(os.environ.get("JARVIS_L2_ENABLED", "").lower() == "true")
+            _has_bg_pool = (
+                _gls is not None
+                and getattr(_gls, "_bg_pool", None) is not None
+            )
+
+            _on = "\033[92mON\033[0m"
+            _off = "\033[2mOFF\033[0m"
+
+            _n_principles = 0
+            if _has_strategic:
+                _n_principles = len(_gls._strategic_direction.principles)
+
             print(
                 f"\n"
                 f"\033[1m\033[96m"
                 f"      \U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\n"
                 f"\033[0m"
                 f"\033[1m\033[96m"
-                f"      O U R O B O R O S\n"
+                f"      O U R O B O R O S  +  V E N O M\n"
                 f"      The Self-Developing Organism\n"
                 f"\033[0m"
                 f"\033[2m"
-                f"      ─────────────────────────────────────────────\n"
+                f"      {'─' * 52}\n"
                 f"\033[0m"
                 f"\n"
                 f"  \U0001f9ec  Session    {self._session_id}\n"
                 f"  \U0001f333  Branch     {self._branch_name or 'N/A'}\n"
                 f"  \U0001f4b0  Budget     ${self._config.cost_cap_usd:.2f}\n"
                 f"  \u23f3  Idle       {int(self._config.idle_timeout_s)}s\n"
-                f"  \U0001f9e0  Brain      Doubleword 397B (PRIMARY)\n"
                 f"  \U0001f6e1\ufe0f   Mode       Governed (SAFE_AUTO auto-apply)\n"
                 f"\n"
                 f"\033[2m"
-                f"      ─────────────────────────────────────────────\n"
+                f"      {'─' * 52}\n"
+                f"\033[0m"
+                f"\033[1m  6-Layer Organism Status:\033[0m\n"
+                f"\n"
+                f"  \U0001f9ed  Strategic Direction   [{_on if _has_strategic else _off}]"
+                f"  {_n_principles} Manifesto principles\n"
+                f"  \U0001f9e0  Consciousness         [{_on if _has_consciousness else _off}]"
+                f"  Memory + Prophecy + Health\n"
+                f"  \U0001f4e1  Event Spine           [{_on}]"
+                f"  FileWatch \u2192 TrinityBus \u2192 sensors\n"
+                f"  \u2699\ufe0f   Ouroboros Pipeline    [{_on}]"
+                f"  {'parallel (' + str(getattr(_gls._bg_pool, '_pool_size', 2)) + ' workers)' if _has_bg_pool else 'sequential'}\n"
+                f"  \U0001f40d  Venom Agentic Loop    [{_on if _has_tool_loop else _off}]"
+                f"  {'bash + web + tests + L2' if _has_l2 else 'tools active'}\n"
+                f"  \U0001f4dd  Thought Log           [{_on}]"
+                f"  .jarvis/ouroboros_thoughts.jsonl\n"
+                f"\n"
+                f"\033[2m"
+                f"      {'─' * 52}\n"
                 f"\033[0m"
                 f"  \U0001f50b Organism is alive. Sensors scanning...\n"
                 f"  \u2328\ufe0f  Press Ctrl+C to stop.\n"
