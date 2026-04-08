@@ -368,6 +368,24 @@ class BattleTestHarness:
                     logger.info("Goal Memory Bridge booted (ChromaDB)")
                 except Exception as exc:
                     logger.warning("Goal Memory Bridge failed: %s", exc)
+
+                # Boot Strategic Direction Service (reads Manifesto + arch docs)
+                try:
+                    from backend.core.ouroboros.governance.strategic_direction import (
+                        StrategicDirectionService,
+                    )
+                    _sds = StrategicDirectionService(
+                        project_root=self._config.repo_path,
+                    )
+                    await _sds.load()
+                    self._governed_loop_service._strategic_direction = _sds
+                    logger.info(
+                        "Strategic Direction loaded (%d principles, %d char digest)",
+                        len(_sds.principles), len(_sds.digest),
+                    )
+                except Exception as exc:
+                    logger.warning("Strategic Direction failed: %s", exc)
+
             except Exception as exc:
                 logger.warning("Trinity Consciousness failed to boot: %s", exc)
 

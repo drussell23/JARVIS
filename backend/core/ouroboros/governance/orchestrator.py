@@ -499,6 +499,31 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] Goal memory injection failed", exc_info=True)
 
+        # ---- Strategic Direction injection (Manifesto + architecture docs) ----
+        _strategic_svc = None
+        if _gls_for_gmb is not None:
+            _strategic_svc = getattr(_gls_for_gmb, "_strategic_direction", None)
+        if _strategic_svc is not None and getattr(_strategic_svc, "is_loaded", False):
+            try:
+                _strat_prompt = _strategic_svc.format_for_prompt()
+                if _strat_prompt:
+                    _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = ctx.with_strategic_memory_context(
+                        strategic_intent_id="manifesto-v4",
+                        strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                        strategic_memory_prompt=_strat_prompt + "\n\n" + _existing,
+                        strategic_memory_digest=(
+                            ctx.strategic_memory_digest
+                            or _strategic_svc.digest[:500]
+                        ),
+                    )
+                    logger.debug(
+                        "[Orchestrator] Strategic direction injected (%d principles)",
+                        len(_strategic_svc.principles),
+                    )
+            except Exception:
+                logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)
+
         # ---- Policy engine check (declarative YAML rules) ----
         # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
         # explicit deny rules in policy files can override the risk engine.
