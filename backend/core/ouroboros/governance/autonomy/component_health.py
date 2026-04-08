@@ -53,6 +53,7 @@ class TransitionReason(str, enum.Enum):
 VALID_TRANSITIONS: Dict[ComponentState, frozenset] = {
     ComponentState.NOT_INITIALIZED: frozenset({
         ComponentState.READY,
+        ComponentState.ACTIVE,   # Components that boot directly into active (e.g. health probe)
         ComponentState.ERROR,
         ComponentState.OFFLINE,
     }),
