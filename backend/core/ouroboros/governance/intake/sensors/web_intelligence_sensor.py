@@ -275,8 +275,9 @@ class WebIntelligenceSensor:
         session = await self._get_session()
 
         try:
+            import aiohttp as _aio
             url = f"https://pypi.org/pypi/{pkg_name}/json"
-            async with session.get(url) as resp:
+            async with session.get(url, timeout=_aio.ClientTimeout(total=10)) as resp:
                 if resp.status != 200:
                     return []
                 data = await resp.json(content_type=None)
