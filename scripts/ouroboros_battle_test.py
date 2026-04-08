@@ -35,12 +35,24 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.metadata as _metadata
 import logging
 import os
 import sys
 import textwrap
 import warnings
 from pathlib import Path
+
+# Python 3.9 compat: patch packages_distributions before any library touches it
+if not hasattr(_metadata, "packages_distributions"):
+    def _packages_distributions_fallback():  # type: ignore[misc]
+        """Minimal fallback for packages_distributions on Python <3.11."""
+        try:
+            from importlib_metadata import packages_distributions  # type: ignore[import-untyped]
+            return packages_distributions()
+        except Exception:
+            return {}
+    _metadata.packages_distributions = _packages_distributions_fallback  # type: ignore[attr-defined]
 
 # Suppress noisy warnings that leak to terminal (urllib3, google, etc.)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
