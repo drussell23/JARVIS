@@ -1505,6 +1505,15 @@ class GovernedOrchestrator:
                 break  # at least one candidate passed
 
             # All candidates failed this attempt
+            # Short-circuit: if no tests were discovered, retrying is pointless —
+            # the same candidates will produce the same 0-test result every time.
+            if best_validation is not None and getattr(best_validation, "test_count", -1) == 0:
+                logger.info(
+                    "[Orchestrator] Skipping retries — no tests discovered for op=%s",
+                    ctx.op_id,
+                )
+                validate_retries_remaining = -1  # fall through to L2 / cancel
+
             validate_retries_remaining -= 1
             if validate_retries_remaining < 0:
                 # ── L2 self-repair dispatch ───────────────────────────────────
@@ -1557,7 +1566,7 @@ class GovernedOrchestrator:
                 _repair_target = list(ctx.target_files)[0] if ctx.target_files else None
                 if _repair_target:
                     _repair_abs = self._config.project_root / _repair_target
-                    if _repair_abs.exists():
+                    if _repair_abs.is_file():
                         _repair_content = _repair_abs.read_text(errors="replace")
                         _test_argv = ["python3", "-m", "pytest", "-x", "-q"]
                         _repair_result = await asyncio.wait_for(

@@ -584,10 +584,16 @@ class RepairEngine:
             records.append(rec)
 
     def _emit_record(self, op_id: str, record: RepairIterationRecord) -> None:
-        """Append a RepairIterationRecord to the ledger (if wired)."""
+        """Append a RepairIterationRecord to the ledger (if wired).
+
+        ``OperationLedger.append`` is async, so we schedule it as a
+        fire-and-forget task on the running event loop.  Called from both
+        sync inner functions and the async ``run()`` body.
+        """
         if self._ledger is None:
             return
         try:
+            import asyncio as _asyncio
             from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
             entry = LedgerEntry(
                 op_id=op_id,
@@ -595,7 +601,12 @@ class RepairEngine:
                 data={"kind": "repair.iter.v1", **dataclasses.asdict(record)},
                 entry_id=f"{op_id}:l2:iter:{record.iteration}",
             )
-            self._ledger.append(entry)
+            try:
+                loop = _asyncio.get_running_loop()
+                loop.create_task(self._ledger.append(entry))
+            except RuntimeError:
+                # No running loop — silently drop (non-critical telemetry)
+                pass
         except Exception:
             _logger.debug("repair_engine: failed to emit ledger record", exc_info=True)
 

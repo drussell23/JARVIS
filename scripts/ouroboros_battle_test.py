@@ -39,7 +39,14 @@ import logging
 import os
 import sys
 import textwrap
+import warnings
 from pathlib import Path
+
+# Suppress noisy warnings that leak to terminal (urllib3, google, etc.)
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*NotOpenSSLWarning.*")
+warnings.filterwarnings("ignore", message=".*urllib3.*")
 
 # Ensure the project root is importable regardless of cwd.
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent

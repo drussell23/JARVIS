@@ -435,6 +435,32 @@ class BattleTestHarness:
                     _suppress_serpent()
                 except Exception:
                     pass
+                # Redirect logging from terminal → log file so SerpentFlow
+                # output isn't drowned by DEBUG noise.  The log file lives
+                # next to the session artifacts for post-mortem analysis.
+                try:
+                    _log_dir = self._config.repo_path / ".ouroboros" / "sessions" / self._session_id
+                    _log_dir.mkdir(parents=True, exist_ok=True)
+                    _log_file = _log_dir / "debug.log"
+                    _file_handler = logging.FileHandler(str(_log_file), encoding="utf-8")
+                    _file_handler.setLevel(logging.DEBUG)
+                    _file_handler.setFormatter(logging.Formatter(
+                        "%(asctime)s [%(name)s] %(levelname)s %(message)s",
+                        datefmt="%Y-%m-%dT%H:%M:%S",
+                    ))
+                    _root = logging.getLogger()
+                    _root.addHandler(_file_handler)
+                    # Remove all StreamHandlers (stdout/stderr) from root logger
+                    for _h in list(_root.handlers):
+                        if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
+                            _root.removeHandler(_h)
+                    logger.info("Logging redirected to %s", _log_file)
+                    self._serpent_flow.console.print(
+                        f"             │ 📝 logs: [dim]{_log_file}[/dim]",
+                        highlight=False,
+                    )
+                except Exception as _log_exc:
+                    logger.debug("Log redirect failed: %s", _log_exc)
                 self._keyboard_handler = None
                 # Also keep a reference for cost updates
                 self._tui_console = None

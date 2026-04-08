@@ -344,7 +344,15 @@ class SerpentFlow:
     ) -> None:
         """Immune check result."""
         short = _short_id(op_id)
-        if passed:
+        if test_count == 0:
+            # No tests discovered — show neutral status
+            self.console.print(
+                f"[{_C['heal']}]🛡️ immune check[/{_C['heal']}] │ "
+                f"[{_C['dim']}]no tests found[/{_C['dim']}]"
+                f"  [{_C['dim']}]op:{short}[/{_C['dim']}]",
+                highlight=False,
+            )
+        elif passed:
             self.console.print(
                 f"[{_C['life']}]🛡️ immune check[/{_C['life']}] │ "
                 f"[green]✅ {test_count}/{test_count} tests passing[/green]"
@@ -671,6 +679,8 @@ class SerpentTransport:
     def __init__(self, flow: SerpentFlow) -> None:
         self._flow = flow
         self._op_providers: Dict[str, str] = {}
+        self._boot_recovery_count: int = 0
+        self._boot_recovery_flushed: bool = False
 
     async def send(self, msg: Any) -> None:
         """Handle a CommMessage and render via SerpentFlow."""
@@ -680,6 +690,15 @@ class SerpentTransport:
             msg_type = msg.msg_type.value if hasattr(msg, "msg_type") else ""
 
             if msg_type == "INTENT":
+                # Flush boot recovery summary before first real operation
+                if self._boot_recovery_count > 0 and not self._boot_recovery_flushed:
+                    self._boot_recovery_flushed = True
+                    self._flow.console.print(
+                        f"[dim]⏭️  boot recovery │ {self._boot_recovery_count} stale entries reconciled[/dim]",
+                        highlight=False,
+                    )
+                    self._flow.console.print()
+
                 if payload.get("risk_tier") not in ("routing",):
                     self._flow.op_started(
                         op_id=op_id,
@@ -797,6 +816,19 @@ class SerpentTransport:
 
             elif msg_type == "DECISION":
                 outcome = payload.get("outcome", "")
+                reason_code = payload.get("reason_code", "")
+
+                # Suppress boot_recovery spam — these are stale ledger entries
+                # replayed at startup, not live operations. Count and summarize.
+                if reason_code.startswith("boot_recovery_"):
+                    self._boot_recovery_count += 1
+                    if self._boot_recovery_count == 1:
+                        self._flow.console.print(
+                            f"[dim]⏭️  boot recovery │ reconciling stale ledger entries...[/dim]",
+                            highlight=False,
+                        )
+                    return
+
                 files = payload.get("files_changed", payload.get("affected_files", []))
                 provider = self._op_providers.pop(op_id, "unknown")
 
@@ -810,7 +842,7 @@ class SerpentTransport:
                 elif outcome in ("failed", "postmortem"):
                     self._flow.op_failed(
                         op_id=op_id,
-                        reason=payload.get("reason_code", outcome),
+                        reason=reason_code or outcome,
                         phase=payload.get("failed_phase", ""),
                     )
 
