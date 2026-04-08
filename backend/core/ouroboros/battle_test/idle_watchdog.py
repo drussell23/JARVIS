@@ -4,11 +4,37 @@ The Battle Test harness pokes the watchdog on every operation completion.
 If no poke arrives within `timeout_s` seconds the `idle_event` is set,
 which can be awaited alongside budget_event and shutdown_event so that the
 first to fire stops the session.
+
+The watchdog also tracks *why* it fired (genuine idle vs. stale ops) so
+the harness can produce actionable stop-reason diagnostics.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class StaleOpInfo:
+    """Forensic snapshot of an operation that exceeded the staleness threshold."""
+    op_id: str
+    phase: str
+    elapsed_s: float
+    last_transition_utc: str
+
+
+@dataclass
+class WatchdogDiagnostics:
+    """Diagnostics attached when the idle event fires."""
+    reason: str  # "genuine_idle" | "all_ops_stale"
+    stale_ops: list = field(default_factory=list)
+    total_pokes: int = 0
+    seconds_since_last_poke: float = 0.0
 
 
 class IdleWatchdog:
@@ -27,6 +53,7 @@ class IdleWatchdog:
 
         # or wait for idle:
         await watchdog.idle_event.wait()
+        print(watchdog.diagnostics)  # why it fired
     """
 
     def __init__(self, timeout_s: float = 600.0) -> None:
@@ -35,6 +62,7 @@ class IdleWatchdog:
         self._poke_count: int = 0
         self.idle_event: asyncio.Event = asyncio.Event()
         self._task: asyncio.Task | None = None
+        self.diagnostics: Optional[WatchdogDiagnostics] = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -53,6 +81,24 @@ class IdleWatchdog:
         """Reset the idle timer and increment the poke counter."""
         self._last_poke = time.monotonic()
         self._poke_count += 1
+
+    def fire_stale(self, stale_ops: list) -> None:
+        """Immediately fire the idle event due to stale operations.
+
+        Called by the ActivityMonitor when all in-flight ops have exceeded
+        the staleness threshold — the system is alive but not progressing.
+        """
+        self.diagnostics = WatchdogDiagnostics(
+            reason="all_ops_stale",
+            stale_ops=stale_ops,
+            total_pokes=self._poke_count,
+            seconds_since_last_poke=time.monotonic() - self._last_poke,
+        )
+        logger.warning(
+            "[IdleWatchdog] Firing: all %d in-flight ops are stale (threshold exceeded)",
+            len(stale_ops),
+        )
+        self.idle_event.set()
 
     async def start(self) -> None:
         """Start the background watchdog task."""
@@ -76,6 +122,11 @@ class IdleWatchdog:
                 elapsed = time.monotonic() - self._last_poke
                 remaining = self._timeout_s - elapsed
                 if remaining <= 0:
+                    self.diagnostics = WatchdogDiagnostics(
+                        reason="genuine_idle",
+                        total_pokes=self._poke_count,
+                        seconds_since_last_poke=elapsed,
+                    )
                     self.idle_event.set()
                     return
                 await asyncio.sleep(min(remaining, 1.0))

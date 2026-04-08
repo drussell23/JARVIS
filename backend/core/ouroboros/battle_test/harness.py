@@ -342,7 +342,19 @@ class BattleTestHarness:
             elif budget_waiter in done:
                 self._stop_reason = "budget_exhausted"
             elif idle_waiter in done:
-                self._stop_reason = "idle_timeout"
+                diag = self._idle_watchdog.diagnostics
+                if diag and diag.reason == "all_ops_stale":
+                    self._stop_reason = "stale_ops_detected"
+                    logger.warning(
+                        "Session stopping: all in-flight ops were stale. "
+                        "Stale ops: %s",
+                        ", ".join(
+                            f"{s.op_id}({s.phase}, {s.elapsed_s:.0f}s)"
+                            for s in diag.stale_ops
+                        ) if diag.stale_ops else "none",
+                    )
+                else:
+                    self._stop_reason = "idle_timeout"
             else:
                 self._stop_reason = "unknown"
 
@@ -633,33 +645,200 @@ class BattleTestHarness:
             logger.warning("Signal handlers not supported on this platform")
 
     # ------------------------------------------------------------------
-    # GLS Activity Monitor
+    # GLS Activity Monitor (staleness-aware)
     # ------------------------------------------------------------------
 
-    async def _monitor_gls_activity(self) -> None:
-        """Background task: pokes idle watchdog whenever GLS has in-flight ops.
+    # Per-op staleness threshold: if an operation hasn't transitioned FSM
+    # state in this many seconds, it's considered stale. The watchdog is
+    # NOT poked for stale ops — if ALL ops are stale the idle timer fires.
+    _OP_STALE_THRESHOLD_S: float = float(
+        os.environ.get("OUROBOROS_OP_STALE_THRESHOLD_S", "600")
+    )
 
-        The Doubleword batch API can take minutes per operation. Without this,
-        the idle watchdog fires while batches are still in flight. This monitor
-        checks every 5 seconds whether the GLS has active operations and pokes
-        the watchdog if so — keeping the session alive during long batches.
+    # After this many seconds of zero phase transitions we forcibly cancel
+    # the stale op via GLS (if it exposes a cancel API). 0 = never cancel.
+    _OP_FORCE_CANCEL_S: float = float(
+        os.environ.get("OUROBOROS_OP_FORCE_CANCEL_S", "900")
+    )
+
+    async def _monitor_gls_activity(self) -> None:
+        """Background task: staleness-aware watchdog feeder.
+
+        Every 5 seconds, inspects each in-flight operation's FSM context to
+        determine whether it has made progress (phase transition) recently.
+
+        - If at least one op is progressing → poke the idle watchdog.
+        - If ALL ops are stale (no transitions beyond threshold) → stop
+          poking.  The idle watchdog will eventually fire and stop the session.
+        - If an op exceeds the force-cancel threshold → attempt cancellation
+          and log forensics so the session can move on.
+
+        This prevents a single hung operation from keeping the session alive
+        indefinitely while producing no useful work.
         """
+        # Track per-op first-seen-stale time for force-cancel escalation
+        _stale_since: dict[str, float] = {}
+
         try:
             while True:
                 await asyncio.sleep(5.0)
-                if self._governed_loop_service is not None:
-                    try:
-                        active = getattr(self._governed_loop_service, "_active_ops", set())
-                        if active:
-                            self._idle_watchdog.poke()
-                            logger.debug(
-                                "[ActivityMonitor] %d ops in flight, poked watchdog",
-                                len(active),
+                gls = self._governed_loop_service
+                if gls is None:
+                    continue
+
+                try:
+                    active_ops: set = getattr(gls, "_active_ops", set())
+                    if not active_ops:
+                        continue  # No ops — let the normal idle timer handle it
+
+                    fsm_contexts: dict = getattr(gls, "_fsm_contexts", {})
+                    now = datetime.now(tz=timezone.utc)
+                    now_mono = time.monotonic()
+
+                    progressing_count = 0
+                    stale_count = 0
+                    stale_details: list = []
+
+                    for dedupe_key in list(active_ops):
+                        # Find the matching FSM context (op_id may differ from dedupe_key)
+                        fsm_ctx = None
+                        for op_id, ctx in fsm_contexts.items():
+                            if op_id == dedupe_key or dedupe_key in op_id:
+                                fsm_ctx = ctx
+                                break
+
+                        if fsm_ctx is None:
+                            # No FSM context yet — op is still in early setup, count as progressing
+                            progressing_count += 1
+                            _stale_since.pop(dedupe_key, None)
+                            continue
+
+                        last_transition = getattr(fsm_ctx, "last_transition_at_utc", None)
+                        if last_transition is None:
+                            progressing_count += 1
+                            _stale_since.pop(dedupe_key, None)
+                            continue
+
+                        elapsed_s = (now - last_transition).total_seconds()
+
+                        if elapsed_s < self._OP_STALE_THRESHOLD_S:
+                            # Op is progressing normally
+                            progressing_count += 1
+                            _stale_since.pop(dedupe_key, None)
+                        else:
+                            # Op is stale
+                            stale_count += 1
+                            phase_name = getattr(
+                                getattr(fsm_ctx, "state", None), "name", "UNKNOWN"
                             )
-                    except Exception:
-                        pass
+
+                            if dedupe_key not in _stale_since:
+                                _stale_since[dedupe_key] = now_mono
+                                logger.warning(
+                                    "[ActivityMonitor] Op %s is STALE: "
+                                    "phase=%s, no transition for %.0fs (threshold=%.0fs)",
+                                    dedupe_key[:16], phase_name,
+                                    elapsed_s, self._OP_STALE_THRESHOLD_S,
+                                )
+
+                            stale_details.append({
+                                "op_id": dedupe_key[:16],
+                                "phase": phase_name,
+                                "elapsed_s": round(elapsed_s, 1),
+                                "last_transition_utc": str(last_transition),
+                            })
+
+                            # Force-cancel escalation
+                            stale_duration = now_mono - _stale_since[dedupe_key]
+                            if (
+                                self._OP_FORCE_CANCEL_S > 0
+                                and stale_duration >= self._OP_FORCE_CANCEL_S
+                            ):
+                                logger.error(
+                                    "[ActivityMonitor] FORCE-CANCELLING stale op %s "
+                                    "(stuck in %s for %.0fs, force-cancel threshold=%.0fs)",
+                                    dedupe_key[:16], phase_name,
+                                    elapsed_s, self._OP_FORCE_CANCEL_S,
+                                )
+                                await self._force_cancel_op(gls, dedupe_key)
+                                _stale_since.pop(dedupe_key, None)
+
+                    # Clean up tracking for ops that are no longer active
+                    for key in list(_stale_since):
+                        if key not in active_ops:
+                            _stale_since.pop(key, None)
+
+                    # Decision: poke or starve the watchdog
+                    if progressing_count > 0:
+                        self._idle_watchdog.poke()
+                        if stale_count > 0:
+                            logger.info(
+                                "[ActivityMonitor] %d progressing, %d stale — poked watchdog",
+                                progressing_count, stale_count,
+                            )
+                        else:
+                            logger.debug(
+                                "[ActivityMonitor] %d ops progressing, poked watchdog",
+                                progressing_count,
+                            )
+                    else:
+                        # ALL ops are stale — do NOT poke. If this persists,
+                        # the idle watchdog fires and stops the session.
+                        logger.warning(
+                            "[ActivityMonitor] ALL %d ops are stale — NOT poking watchdog "
+                            "(idle timer will fire in ≤%.0fs)",
+                            stale_count, self._config.idle_timeout_s,
+                        )
+                        # If stale for long enough, fire immediately with diagnostics
+                        from backend.core.ouroboros.battle_test.idle_watchdog import StaleOpInfo
+                        all_stale_long_enough = all(
+                            (now_mono - _stale_since.get(k, now_mono)) >= self._OP_STALE_THRESHOLD_S
+                            for k in active_ops
+                        )
+                        if all_stale_long_enough and stale_details:
+                            stale_infos = [
+                                StaleOpInfo(
+                                    op_id=d["op_id"],
+                                    phase=d["phase"],
+                                    elapsed_s=d["elapsed_s"],
+                                    last_transition_utc=d["last_transition_utc"],
+                                )
+                                for d in stale_details
+                            ]
+                            self._idle_watchdog.fire_stale(stale_infos)
+
+                except Exception as exc:
+                    logger.debug("[ActivityMonitor] Error in staleness check: %s", exc)
+
         except asyncio.CancelledError:
             pass
+
+    async def _force_cancel_op(self, gls: Any, dedupe_key: str) -> None:
+        """Best-effort cancellation of a stuck operation.
+
+        Removes the op from _active_ops and _fsm_contexts so the system
+        can move on. The orchestrator's own timeout should eventually clean
+        up the actual task, but this unblocks the harness immediately.
+        """
+        try:
+            active_ops: set = getattr(gls, "_active_ops", set())
+            active_ops.discard(dedupe_key)
+
+            fsm_contexts: dict = getattr(gls, "_fsm_contexts", {})
+            # Find and remove matching FSM context
+            to_remove = [
+                op_id for op_id in fsm_contexts
+                if op_id == dedupe_key or dedupe_key in op_id
+            ]
+            for op_id in to_remove:
+                fsm_contexts.pop(op_id, None)
+
+            logger.info(
+                "[ActivityMonitor] Force-cancelled op %s (removed from active_ops + fsm_contexts)",
+                dedupe_key[:16],
+            )
+        except Exception as exc:
+            logger.warning("[ActivityMonitor] Force-cancel failed for %s: %s", dedupe_key[:16], exc)
 
     # ------------------------------------------------------------------
     # Provider Cost Monitor
