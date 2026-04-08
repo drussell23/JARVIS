@@ -126,6 +126,8 @@ class DoublewordProvider:
         rate_limiter: Optional[Any] = None,
         max_cost_per_op: float = _DW_MAX_COST_PER_OP,
         daily_budget: float = _DW_DAILY_BUDGET,
+        tool_loop: Optional[Any] = None,
+        realtime_enabled: bool = True,
     ) -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
@@ -137,6 +139,8 @@ class DoublewordProvider:
         self._session: Optional[Any] = None  # aiohttp.ClientSession (lazy)
         self._rate_limiter = rate_limiter
         self._last_error_status: int = 0  # HTTP status from last failure (0 = non-HTTP)
+        self._tool_loop = tool_loop
+        self._realtime_enabled = realtime_enabled  # Use /v1/chat/completions instead of batch
         # Cost gating (matches ClaudeProvider pattern)
         self._max_cost_per_op = max_cost_per_op
         self._daily_budget = daily_budget
@@ -449,6 +453,11 @@ class DoublewordProvider:
                 generation_duration_s=0.0,
             )
 
+        # Real-time mode: use /v1/chat/completions for instant response + Venom tool loop
+        if self._realtime_enabled:
+            return await self._generate_realtime(context, deadline, prompt_override=prompt_override)
+
+        # Batch mode: legacy 4-stage async batch API
         t0 = time.monotonic()
         self._last_error_status = 0  # reset before attempt
 
@@ -463,6 +472,213 @@ class DoublewordProvider:
             raise DoublewordInfraError(
                 "Batch retrieval failed", status_code=self._last_error_status,
             )
+        return result
+
+    # ------------------------------------------------------------------
+    # Real-time generation via /v1/chat/completions (Venom-compatible)
+    # ------------------------------------------------------------------
+
+    async def _generate_realtime(
+        self,
+        context: OperationContext,
+        deadline: Any = None,
+        *,
+        prompt_override: Optional[str] = None,
+    ) -> GenerationResult:
+        """Generate code via DoubleWord real-time chat completions API.
+
+        Uses ``/v1/chat/completions`` (OpenAI-compatible) instead of the
+        batch API.  This enables the Venom tool loop: the provider can
+        call read_file, search_code, run_tests, bash, etc. during
+        generation — the same multi-turn agentic loop that ClaudeProvider
+        supports.
+
+        30-37x cheaper than Claude with the same tool-use capability.
+        """
+        from backend.core.ouroboros.governance.providers import (
+            _build_codegen_prompt,
+            _parse_generation_response,
+        )
+        from datetime import datetime, timezone, timedelta
+        import hashlib as _hl
+
+        self._check_budget()
+        t0 = time.monotonic()
+        total_cost = 0.0
+
+        prompt = prompt_override or _build_codegen_prompt(
+            context,
+            repo_root=self._repo_root,
+            repo_roots=self._repo_roots or None,
+            force_full_content=True,
+        )
+
+        _SYSTEM_PROMPT = (
+            "You are a code generation assistant for the JARVIS Trinity AI Ecosystem. "
+            "You MUST respond with ONLY a valid JSON object matching the schema described "
+            "in the user prompt. No explanations, no markdown — ONLY the JSON object. "
+            "Start your response with { and end with }."
+        )
+
+        async def _generate_raw(p: str) -> str:
+            """Single chat completion call (used by tool_loop.run())."""
+            nonlocal total_cost
+            session = await self._get_session()
+
+            body = {
+                "model": self._model,
+                "messages": [
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user", "content": p},
+                ],
+                "max_tokens": self._max_tokens,
+                "temperature": _DW_TEMPERATURE,
+                "chat_template_kwargs": {"enable_thinking": False},
+            }
+
+            async with session.post(
+                f"{self._base_url}/chat/completions",
+                json=body,
+                headers={"Content-Type": "application/json"},
+                timeout=self._request_timeout(),
+            ) as resp:
+                if resp.status >= 300:
+                    self._last_error_status = resp.status
+                    err_body = await resp.text()
+                    raise DoublewordInfraError(
+                        f"Chat completions failed: {resp.status} {err_body[:200]}",
+                        status_code=resp.status,
+                    )
+
+                data = await resp.json()
+                choices = data.get("choices", [])
+                usage = data.get("usage", {})
+
+                if not choices:
+                    raise DoublewordInfraError("No choices in response", status_code=0)
+
+                content = choices[0].get("message", {}).get("content", "")
+
+                # Track cost
+                input_tokens = usage.get("prompt_tokens", 0)
+                output_tokens = usage.get("completion_tokens", 0)
+                cost = (
+                    input_tokens * _DW_INPUT_COST_PER_M / 1_000_000
+                    + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
+                )
+                self._stats.total_input_tokens += input_tokens
+                self._stats.total_output_tokens += output_tokens
+                self._stats.total_cost_usd += cost
+                self._record_cost(cost)
+                total_cost += cost
+
+                if total_cost >= self._max_cost_per_op:
+                    raise DoublewordInfraError(
+                        f"doubleword_budget_exhausted_op:{total_cost:.4f}",
+                        status_code=0,
+                    )
+
+                return content
+
+        def _parse_tool_call_response(raw: str) -> Optional[Any]:
+            """Parse a tool call from the model's response.
+
+            Returns None if the response is a final answer (no tool call).
+            """
+            # Check for tool_call JSON pattern used by the tool loop
+            import re
+            match = re.search(
+                r'\{\s*"schema_version"\s*:\s*"2b\.2-tool".*?"tool_call"',
+                raw, re.DOTALL,
+            )
+            if not match:
+                return None
+            # Extract the JSON object
+            try:
+                # Find the full JSON object
+                brace_count = 0
+                start = match.start()
+                for i in range(start, len(raw)):
+                    if raw[i] == "{":
+                        brace_count += 1
+                    elif raw[i] == "}":
+                        brace_count -= 1
+                        if brace_count == 0:
+                            tool_json = json.loads(raw[start:i + 1])
+                            tc = tool_json.get("tool_call", {})
+                            from backend.core.ouroboros.governance.tool_executor import ToolCall
+                            return ToolCall(
+                                name=tc.get("name", ""),
+                                arguments=tc.get("arguments", {}),
+                            )
+            except (json.JSONDecodeError, KeyError):
+                pass
+            return None
+
+        # Execute with or without tool loop
+        tool_records: tuple = ()
+        raw: str = ""
+
+        if self._tool_loop is not None:
+            deadline_mono = time.monotonic() + max(
+                0.0,
+                (deadline - datetime.now(tz=timezone.utc)).total_seconds()
+                if deadline else 120.0,
+            )
+            raw, tool_records_list = await self._tool_loop.run(
+                prompt=prompt,
+                generate_fn=_generate_raw,
+                parse_fn=_parse_tool_call_response,
+                repo=getattr(context, "primary_repo", "jarvis"),
+                op_id=getattr(context, "operation_id", f"dw-rt-{int(time.time())}"),
+                deadline=deadline_mono,
+            )
+            tool_records = tuple(tool_records_list)
+        else:
+            raw = await _generate_raw(prompt)
+
+        elapsed = time.monotonic() - t0
+        self._stats.total_batches += 1
+        self._stats.total_latency_s += elapsed
+
+        if not raw:
+            raise DoublewordInfraError("Empty response from real-time API", status_code=0)
+
+        # Parse the response into GenerationResult
+        _src = prompt[:500]
+        _src_hash = _hl.sha256(_src.encode()).hexdigest()[:16]
+
+        from backend.core.ouroboros.governance.providers import _extract_json_block
+        _extracted = _extract_json_block(raw)
+        if _extracted and not _extracted.lstrip().startswith("{"):
+            logger.warning(
+                "[DoublewordProvider] RT: 397B returned natural language instead of JSON. "
+                "Response starts with: %s",
+                _extracted[:100].replace("\n", " "),
+            )
+            raise DoublewordInfraError("Non-JSON response from real-time API", status_code=0)
+
+        result = _parse_generation_response(
+            raw=raw,
+            provider_name="doubleword",
+            duration_s=elapsed,
+            ctx=context,
+            source_hash=_src_hash,
+            source_path="",
+            repo_roots=self._repo_roots or None,
+            repo_root=self._repo_root,
+        )
+
+        # Attach tool records if available
+        if tool_records and hasattr(result, "_replace"):
+            # GenerationResult may be a namedtuple or dataclass
+            pass  # tool_records stored on the ToolLoopCoordinator
+
+        logger.info(
+            "[DoublewordProvider] RT: %d candidates in %.1fs ($%.4f, %d tool calls)",
+            len(result.candidates), elapsed, total_cost, len(tool_records),
+        )
+
         return result
 
     # ------------------------------------------------------------------

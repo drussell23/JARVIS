@@ -2265,16 +2265,24 @@ class GovernedLoopService:
                     RateLimitService,
                 )
                 _dw_rate_limiter = RateLimitService()
+                # Real-time mode: use /v1/chat/completions with Venom tool loop
+                # instead of batch API. Enabled by default when tool_loop is available.
+                _dw_realtime = os.environ.get(
+                    "DOUBLEWORD_REALTIME_ENABLED", "true"
+                ).lower() == "true"
                 tier0 = DoublewordProvider(
                     api_key=_dw_api_key,
                     repo_root=self._config.project_root,
                     repo_roots=repo_roots_map,
                     rate_limiter=_dw_rate_limiter,
+                    tool_loop=_tool_coordinator if _dw_realtime else None,
+                    realtime_enabled=_dw_realtime,
                 )
                 self._doubleword_ref = tier0
+                _mode = "real-time + Venom" if _dw_realtime else "batch"
                 logger.info(
-                    "[GovernedLoop] DoublewordProvider: configured (model=%s)",
-                    tier0._model,
+                    "[GovernedLoop] DoublewordProvider: configured (model=%s, mode=%s)",
+                    tier0._model, _mode,
                 )
             except Exception as exc:
                 logger.warning(
