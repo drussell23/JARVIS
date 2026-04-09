@@ -173,6 +173,213 @@ def _print_preflight() -> None:
     print()
 
 
+def _replay_session(session_ref: str) -> None:
+    """Replay a previous battle test session timeline.
+
+    Parameters
+    ----------
+    session_ref:
+        Either a session ID (e.g. ``bt-2026-04-08-143022``), a direct path
+        to ``summary.json``, or ``"list"`` to show available sessions.
+    """
+    import json
+
+    sessions_root = _PROJECT_ROOT / ".ouroboros" / "sessions"
+
+    # ── List mode ──
+    if session_ref.lower() == "list":
+        if not sessions_root.exists():
+            print(f"  {_RED}No sessions found in {sessions_root}{_RESET}")
+            return
+        found = sorted(sessions_root.iterdir(), reverse=True)
+        if not found:
+            print(f"  {_RED}No sessions found.{_RESET}")
+            return
+        print(f"\n{_BOLD}{_CYAN}  Available Sessions{_RESET}")
+        print(f"{_DIM}  {'─' * 52}{_RESET}")
+        for d in found[:20]:
+            summary_path = d / "summary.json"
+            if summary_path.exists():
+                try:
+                    data = json.loads(summary_path.read_text())
+                    ops = len(data.get("operations", []))
+                    cost = data.get("cost_total", 0.0)
+                    dur = data.get("duration_s", 0.0)
+                    m, s = int(dur) // 60, int(dur) % 60
+                    stop = data.get("stop_reason", "?")
+                    print(
+                        f"  {_CYAN}{d.name}{_RESET}  "
+                        f"{ops} ops  ${cost:.3f}  {m}m{s:02d}s  "
+                        f"{_DIM}{stop}{_RESET}"
+                    )
+                except Exception:
+                    print(f"  {_CYAN}{d.name}{_RESET}  {_DIM}(corrupt summary){_RESET}")
+            else:
+                print(f"  {_DIM}{d.name}  (no summary.json){_RESET}")
+        print()
+        return
+
+    # ── Resolve summary.json path ──
+    summary_path: Path
+    if session_ref.endswith(".json") and Path(session_ref).exists():
+        summary_path = Path(session_ref)
+    else:
+        # Try as session ID
+        candidate = sessions_root / session_ref / "summary.json"
+        if candidate.exists():
+            summary_path = candidate
+        else:
+            # Try partial match
+            matches = sorted(sessions_root.glob(f"*{session_ref}*"))
+            if matches:
+                summary_path = matches[-1] / "summary.json"
+            else:
+                print(f"  {_RED}Session not found: {session_ref}{_RESET}")
+                print(f"  {_DIM}Use --replay list to see available sessions{_RESET}")
+                return
+
+    if not summary_path.exists():
+        print(f"  {_RED}Summary not found: {summary_path}{_RESET}")
+        return
+
+    data = json.loads(summary_path.read_text())
+    operations = data.get("operations", [])
+    session_id = data.get("session_id", "unknown")
+    duration_s = data.get("duration_s", 0.0)
+    cost_total = data.get("cost_total", 0.0)
+    stop_reason = data.get("stop_reason", "unknown")
+    stats = data.get("stats", {})
+
+    m, s = int(duration_s) // 60, int(duration_s) % 60
+
+    # ── Header ──
+    print(f"\n{'═' * 64}")
+    print(f"  {_BOLD}{_CYAN}SESSION REPLAY{_RESET}  {session_id}")
+    print(f"  {_DIM}Duration: {m}m {s:02d}s │ Cost: ${cost_total:.3f} │ Stop: {stop_reason}{_RESET}")
+    print(f"  {_DIM}Attempted: {stats.get('attempted', '?')} │ "
+          f"Completed: {stats.get('completed', '?')} │ "
+          f"Failed: {stats.get('failed', '?')} │ "
+          f"Queued: {stats.get('queued', '?')}{_RESET}")
+    print(f"{'═' * 64}\n")
+
+    if not operations:
+        print(f"  {_DIM}No operations recorded in this session.{_RESET}\n")
+        return
+
+    # ── Sort by recorded_at for chronological timeline ──
+    operations.sort(key=lambda o: o.get("recorded_at", 0.0))
+
+    # Find session start time (earliest recorded_at - elapsed)
+    first_ts = operations[0].get("recorded_at", 0.0)
+    first_elapsed = operations[0].get("elapsed_s", 0.0)
+    session_start = first_ts - first_elapsed if first_ts else 0.0
+
+    # ── Timeline ──
+    for i, op in enumerate(operations, 1):
+        op_id = op.get("op_id", "?")
+        short_id = op_id[:12] if len(op_id) > 12 else op_id
+        status = op.get("status", "?")
+        sensor = op.get("sensor", "?")
+        provider = op.get("provider", "?")
+        cost = op.get("cost_usd", 0.0)
+        elapsed = op.get("elapsed_s", 0.0)
+        technique = op.get("technique", "")
+        tool_calls = op.get("tool_calls", 0)
+        files_changed = op.get("files_changed", 0)
+        recorded_at = op.get("recorded_at", 0.0)
+
+        # Time offset from session start
+        offset_s = recorded_at - session_start if session_start else 0.0
+        om, os_ = int(offset_s) // 60, int(offset_s) % 60
+
+        # Status icon + color
+        if status == "completed":
+            icon = f"{_GREEN}✅"
+            status_color = _GREEN
+        elif status == "failed":
+            icon = f"{_RED}💀"
+            status_color = _RED
+        elif status == "queued":
+            icon = f"{_YELLOW}⏳"
+            status_color = _YELLOW
+        elif status == "cancelled":
+            icon = f"{_DIM}⏭️"
+            status_color = _DIM
+        else:
+            icon = f"{_DIM}?"
+            status_color = _DIM
+
+        # Provider short name
+        prov_map = {
+            "doubleword-397b": "DW-397B", "doubleword": "DW-397B",
+            "claude-api": "Claude", "claude": "Claude",
+            "gcp-jprime": "J-Prime",
+        }
+        prov_short = prov_map.get(provider, provider[:10])
+
+        print(
+            f"  {_DIM}[{om:02d}:{os_:02d}]{_RESET} "
+            f"{icon}{_RESET} "
+            f"{_CYAN}{short_id}{_RESET}  "
+            f"{status_color}{status:<10s}{_RESET}  "
+            f"{sensor}"
+        )
+
+        detail_parts = []
+        if prov_short:
+            detail_parts.append(f"via {prov_short}")
+        detail_parts.append(f"{elapsed:.1f}s")
+        if cost > 0:
+            detail_parts.append(f"${cost:.4f}")
+        if tool_calls:
+            detail_parts.append(f"{tool_calls} tools")
+        if files_changed:
+            detail_parts.append(f"{files_changed} files")
+        if technique:
+            detail_parts.append(technique)
+
+        print(f"  {_DIM}         {'  │  '.join(detail_parts)}{_RESET}")
+
+        # ── Check for ledger entries ──
+        ledger_path = _PROJECT_ROOT / ".jarvis" / "ouroboros" / "ledger" / f"{op_id}.jsonl"
+        if ledger_path.exists():
+            try:
+                ledger_lines = ledger_path.read_text().strip().splitlines()
+                phases = []
+                for ll in ledger_lines:
+                    entry = json.loads(ll)
+                    phase = entry.get("phase", entry.get("state", ""))
+                    if phase:
+                        phases.append(phase)
+                if phases:
+                    chain = " → ".join(phases)
+                    print(f"  {_DIM}         {chain}{_RESET}")
+            except Exception:
+                pass
+
+        print()
+
+    # ── Footer ──
+    top_sensors = data.get("top_sensors", [])
+    if top_sensors:
+        print(f"  {_BOLD}Top Sensors:{_RESET}")
+        for name, count in top_sensors[:5]:
+            print(f"    {name:<30s} {count} ops")
+        print()
+
+    convergence = data.get("convergence_state", "")
+    if convergence:
+        slope = data.get("convergence_slope", 0.0)
+        r2 = data.get("convergence_r2", 0.0)
+        print(
+            f"  {_BOLD}Convergence:{_RESET} {convergence}  "
+            f"{_DIM}(slope={slope:.4f}, R²={r2:.2f}){_RESET}"
+        )
+        print()
+
+    print(f"{'═' * 64}\n")
+
+
 def main() -> None:
     # ------------------------------------------------------------------
     # Argument parsing
@@ -248,8 +455,26 @@ def main() -> None:
         action="store_true",
         help="Enable DEBUG-level logging (shows thought process).",
     )
+    parser.add_argument(
+        "--replay",
+        type=str,
+        default=None,
+        metavar="SESSION_ID",
+        help=(
+            "Replay a previous session timeline instead of running live. "
+            "Pass a session ID (e.g. bt-2026-04-08-143022) or a path to "
+            "summary.json. Lists available sessions when set to 'list'."
+        ),
+    )
 
     args = parser.parse_args()
+
+    # ------------------------------------------------------------------
+    # Replay mode — show a previous session timeline and exit
+    # ------------------------------------------------------------------
+    if args.replay is not None:
+        _replay_session(args.replay)
+        return
 
     # ------------------------------------------------------------------
     # Load environment
