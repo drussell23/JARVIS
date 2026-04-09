@@ -565,11 +565,17 @@ class SerpentFlow:
             f"             risk: {risk_badge}{target_str}",
         )
 
-    def op_phase(self, op_id: str, phase: str, progress_pct: float = 0.0) -> None:
+    def op_phase(
+        self, op_id: str, phase: str, progress_pct: float = 0.0,
+        **kwargs: Any,
+    ) -> None:
         """Phase transition — only log significant phases."""
         phase_upper = phase.upper()
         if phase_upper in ("CLASSIFY", "ROUTE", "CONTEXT_EXPANSION", "GENERATE", "VALIDATE"):
             return  # Handled by dedicated methods
+        if phase_upper == "PLAN":
+            self._render_plan_phase(op_id, **kwargs)
+            return
         phase_map = {
             "GATE": ("🛡️", "governance gate"),
             "APPROVE": ("👤", "awaiting approval"),
@@ -580,6 +586,33 @@ class SerpentFlow:
             op_id,
             f"[{_C['neural']}]{emoji} {verb}[/{_C['neural']}]",
         )
+
+    def _render_plan_phase(self, op_id: str, **kwargs: Any) -> None:
+        """Render the PLAN phase with complexity and change count."""
+        complexity = kwargs.get("plan_complexity", "")
+        n_changes = kwargs.get("plan_changes", 0)
+        if complexity:
+            # Plan result — show complexity + change count
+            color = {
+                "trivial": _C["dim"],
+                "moderate": _C["neural"],
+                "complex": _C["heal"],
+                "architectural": _C["provider"],
+            }.get(complexity, _C["neural"])
+            detail = f"[{color}]{complexity}[/{color}]"
+            if n_changes:
+                detail += f"  [{_C['dim']}]{n_changes} ordered changes[/{_C['dim']}]"
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]🗺️  planned[/{_C['neural']}]   {detail}",
+            )
+        else:
+            # Plan phase starting
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]🗺️  planning[/{_C['neural']}]  "
+                f"[{_C['dim']}]reasoning about implementation strategy...[/{_C['dim']}]",
+            )
 
     # ── Triage ────────────────────────────────────────────────
 
@@ -1556,6 +1589,8 @@ class SerpentTransport:
                         op_id=op_id,
                         phase=phase,
                         progress_pct=payload.get("progress_pct", 0.0),
+                        plan_complexity=payload.get("plan_complexity", ""),
+                        plan_changes=payload.get("plan_changes", 0),
                     )
 
             elif msg_type == "DECISION":

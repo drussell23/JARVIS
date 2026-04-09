@@ -31,10 +31,10 @@ JARVIS (Body) <--HTTP/WS--> J-Prime (Mind) <--sandbox--> Reactor Core (Soul)
 
 ## Ouroboros Pipeline
 
-The self-development engine runs a 10-phase governance pipeline:
+The self-development engine runs an 11-phase governance pipeline:
 
 ```
-CLASSIFY -> ROUTE -> CONTEXT_EXPANSION -> GENERATE -> VALIDATE -> GATE -> APPROVE -> APPLY -> VERIFY -> COMPLETE
+CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GATE -> [APPROVE] -> APPLY -> VERIFY -> COMPLETE
 ```
 
 ### Provider Chain (3-Tier Failback)
@@ -61,6 +61,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 
 ### Key Subsystems
 
+- **PlanGenerator** (`plan_generator.py`): Model-reasoned implementation planning (PLAN phase) -- structured JSON plan (schema plan.1) with approach, ordered changes, risk factors, test strategy. Injected into GENERATE prompt.
 - **SemanticTriage** (`semantic_triage.py`): Pre-generation filter -- classifies NO_OP/REDIRECT/ENRICH/GENERATE before expensive generation
 - **CommProtocol** (`comm_protocol.py`): 5-phase observability -- INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM
 - **SerpentFlow** (`battle_test/serpent_flow.py`, 1900+ lines): CC-style flowing CLI with `Update(path)` blocks, numbered diffs, per-op reasoning
@@ -86,6 +87,7 @@ O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capab
 - **REPL /cancel**: `cancel <op-id>` cooperative cancellation, checked at GENERATE and APPLY phase boundaries.
 - **Diff preview for Yellow**: `JARVIS_NOTIFY_APPLY_DELAY_S` (default 5s) delay with diff rendered before auto-apply.
 - **Per-op reasoning**: Model rationale captured at GENERATE, displayed in SerpentFlow `Update` blocks.
+- **Model-reasoned planning**: PLAN phase between CONTEXT_EXPANSION and GENERATE. Model reasons about implementation strategy (schema plan.1) before writing code. Trivial ops skip planning.
 
 ## Battle Test
 
@@ -101,10 +103,11 @@ Boots the full 6-layer stack: GovernedLoopService, IntakeLayer (16 sensors), Tri
 backend/core/ouroboros/
   governance/
     governed_loop_service.py    # Main loop (Zone 6.8)
-    orchestrator.py             # 10-phase FSM
+    orchestrator.py             # 11-phase FSM
     candidate_generator.py      # 3-tier failback
     providers.py                # Claude + Prime providers
     doubleword_provider.py      # DW 397B
+    plan_generator.py           # Model-reasoned PLAN phase (schema plan.1)
     semantic_triage.py          # Pre-generation filter
     comm_protocol.py            # 5-phase observability
     tool_executor.py            # Venom tool loop

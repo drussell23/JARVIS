@@ -17,10 +17,10 @@ approval is required for high-risk changes.
 ## Pipeline Phases
 
 ```
-CLASSIFY --> ROUTE --> CONTEXT_EXPANSION --> GENERATE --> VALIDATE
-                                                            |
-                                                            v
-                    COMPLETE <-- VERIFY <-- APPLY <-- GATE/APPROVE
+CLASSIFY --> ROUTE --> [CONTEXT_EXPANSION] --> [PLAN] --> GENERATE --> VALIDATE
+                                                                         |
+                                                                         v
+                            COMPLETE <-- VERIFY <-- APPLY <-- GATE/APPROVE
 ```
 
 ### Phase Definitions
@@ -30,6 +30,7 @@ CLASSIFY --> ROUTE --> CONTEXT_EXPANSION --> GENERATE --> VALIDATE
 | `CLASSIFY` | Risk classification (RiskTier, ChangeType) | No |
 | `ROUTE` | Brain selection and provider routing | No |
 | `CONTEXT_EXPANSION` | Enrich operation context with related files | No |
+| `PLAN` | Model-reasoned implementation planning (schema plan.1) | No |
 | `GENERATE` | Produce candidate patches via model provider | No |
 | `GENERATE_RETRY` | Retry generation after transient failure | No |
 | `VALIDATE` | Run tests, lint, type-check against candidate | No |
@@ -48,7 +49,8 @@ CLASSIFY --> ROUTE --> CONTEXT_EXPANSION --> GENERATE --> VALIDATE
 ```
 CLASSIFY ---------> ROUTE, CANCELLED
 ROUTE ------------> CONTEXT_EXPANSION, GENERATE, CANCELLED
-CONTEXT_EXPANSION -> GENERATE, CANCELLED
+CONTEXT_EXPANSION -> PLAN, GENERATE, CANCELLED
+PLAN -------------> GENERATE, CANCELLED
 GENERATE ---------> VALIDATE, GENERATE_RETRY, CANCELLED, COMPLETE (noop)
 GENERATE_RETRY ---> VALIDATE, GENERATE_RETRY, CANCELLED
 VALIDATE ---------> GATE, VALIDATE_RETRY, CANCELLED, POSTMORTEM
@@ -622,6 +624,44 @@ defaults to `true`.  To disable all tools, set it to `false`.
 intelligence is the nervous system."  The Iron Gate (AST parser, command
 blocklist) is the deterministic skeleton.  The tools are the nervous system.
 The skeleton does not think; the nervous system does not hold weight.
+
+---
+
+## Model-Reasoned PLAN Phase (Gap #3)
+
+**Source**: `plan_generator.py` (`PlanGenerator`, `PlanResult`)
+
+Between CONTEXT_EXPANSION and GENERATE, the model reasons about **HOW** to
+implement a change before writing code. This replicates Claude Code's internal
+planning step as an explicit, observable phase.
+
+**Schema**: `plan.1` -- structured JSON with:
+- `approach`: 1-3 sentence strategy summary
+- `complexity`: trivial | moderate | complex | architectural
+- `ordered_changes`: dependency-ordered file change descriptors
+- `risk_factors`: specific, actionable risks
+- `test_strategy`: verification approach
+- `architectural_notes`: cross-cutting concerns
+
+**Behavior**:
+- Trivial ops (single file, short description) skip planning entirely
+- Planning failures are soft -- pipeline falls through to GENERATE
+- The plan is injected into the GENERATE prompt as an `## Implementation Plan`
+  section so the code-generation model follows a coherent strategy
+- Coherence validation: planned files must overlap with target files,
+  internal dependencies must form a DAG (no cycles)
+
+**Environment variables**:
+- `JARVIS_PLAN_TIMEOUT_S` (default 45): planning phase timeout
+- `JARVIS_PLAN_FILE_CONTEXT_CHARS` (default 6000): max chars per file in plan prompt
+- `JARVIS_PLAN_TRIVIAL_MAX_FILES` (default 1): skip planning below this file count
+
+**SerpentFlow rendering**: Plan phase shows as `🗺️  planning` during execution
+and `🗺️  planned` with complexity badge on completion.
+
+**Manifesto alignment**: §5 -- "Deploy intelligence only where it creates true
+leverage." Multi-file coordinated changes benefit most from upfront planning.
+Trivial single-file edits skip the overhead.
 
 ---
 
