@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 _TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.65"))
 _TIER0_MAX_WAIT_S = float(os.environ.get("OUROBOROS_TIER0_MAX_WAIT_S", "90"))
-_TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "15"))
+_TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25"))
 
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
@@ -91,6 +91,11 @@ _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
 }
 _PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
 _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "20"))
+
+# Minimum time worth attempting a fallback API call.  Below this threshold
+# the call will almost certainly timeout before the model finishes; skip it
+# and raise immediately to avoid burning network round-trip time.
+_MIN_VIABLE_FALLBACK_S = float(os.environ.get("OUROBOROS_MIN_VIABLE_FALLBACK_S", "10"))
 
 # ---------------------------------------------------------------------------
 # Content failure classification
@@ -1143,6 +1148,19 @@ class CandidateGenerator:
             remaining = min(
                 self._remaining_seconds(deadline),
                 self._FALLBACK_MAX_TIMEOUT_S,
+            )
+            if remaining < _MIN_VIABLE_FALLBACK_S:
+                logger.warning(
+                    "[CandidateGenerator] Fallback skipped — only %.1fs "
+                    "remaining (need >= %.0fs). Tier 0 consumed too much budget.",
+                    remaining, _MIN_VIABLE_FALLBACK_S,
+                )
+                raise RuntimeError(
+                    f"all_providers_exhausted:fallback_budget_starved_{remaining:.0f}s"
+                )
+            logger.info(
+                "[CandidateGenerator] Fallback: budget=%.1fs (cap=%.0fs)",
+                remaining, self._FALLBACK_MAX_TIMEOUT_S,
             )
             async with self._fallback_sem:
                 return await asyncio.wait_for(

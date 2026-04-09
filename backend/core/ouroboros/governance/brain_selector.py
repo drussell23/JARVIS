@@ -560,7 +560,12 @@ _DEFAULT_POLICY: Dict = {
     },
     "gates": {
         "task_gate": {
-            "trivial_patterns": ["append.*line", "add.*comment", "monitored by", "single.*line"],
+            "trivial_patterns": [
+                "append.*line", "add.*comment", "monitored by", "single.*line",
+                "fix.*todo", "add.*docstring", "bump.*version", "fix.*typo",
+                "update.*import", "remove.*unused", "rename.*variable",
+                "add.*type.*hint", "fix.*lint", "fix.*format",
+            ],
             "heavy_patterns": ["refactor", "implement", "redesign", "migrate", "optimize.*performance"],
             "trivial_max_files": 1,
             "heavy_min_files": 3,

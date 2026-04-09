@@ -568,7 +568,7 @@ class GovernedLoopConfig:
     # L1 tool-use settings (Manifesto §6: tools enabled by default under
     # governance — Iron Gate + risk engine + approval gates are the safety net)
     tool_use_enabled: bool = True
-    max_tool_rounds: int = 5
+    max_tool_rounds: int = 15
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 2
 
@@ -645,7 +645,7 @@ class GovernedLoopConfig:
                 _cfg("pipeline_timeout_s", "JARVIS_PIPELINE_TIMEOUT_S", "600.0")
             ),
             tool_use_enabled=os.environ.get("JARVIS_GOVERNED_TOOL_USE_ENABLED", "true").lower() == "true",
-            max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "5")),
+            max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "15")),
             tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
             max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),
             repair_budget=_lazy_repair_budget_from_env(),

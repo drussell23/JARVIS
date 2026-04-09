@@ -2399,8 +2399,14 @@ class PrimeProvider:
             )
             return raw_content
 
+        # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper)
+        _complexity = getattr(context, "task_complexity", "")
+        _skip_tools = _complexity in ("trivial",)
+        if _skip_tools:
+            logger.info("[PrimeProvider] \u26a1 Trivial task — skipping Venom tool loop")
+
         tool_records: tuple = ()
-        if self._tool_loop is not None:
+        if self._tool_loop is not None and not _skip_tools:
             deadline_mono = (
                 time.monotonic()
                 + max(0.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
@@ -2416,11 +2422,19 @@ class PrimeProvider:
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
-        elif self._tools_enabled:
+        elif self._tools_enabled and not _skip_tools:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             current_prompt = prompt
             raw = None
             while True:
+                # Time-budget guard: exit loop if deadline is near
+                _remaining = (deadline - datetime.now(tz=timezone.utc)).total_seconds()
+                if _remaining <= 5.0:
+                    logger.warning(
+                        "[PrimeProvider] Tool loop exiting — only %.1fs remaining "
+                        "(round %d)", _remaining, tool_rounds,
+                    )
+                    break
                 resp = await self._client.generate(
                     prompt=current_prompt,
                     system_prompt=_CODEGEN_SYSTEM_PROMPT,
@@ -2918,6 +2932,12 @@ class ClaudeProvider:
             raw = None
             while True:
                 timeout_s = max(1.0, (deadline - datetime.now(tz=timezone.utc)).total_seconds())
+                if timeout_s <= 5.0:
+                    logger.warning(
+                        "[ClaudeProvider] Tool loop exiting — only %.1fs remaining "
+                        "(round %d)", timeout_s, tool_rounds,
+                    )
+                    break
                 msg = await asyncio.wait_for(
                     client.messages.create(
                         model=self._model,
