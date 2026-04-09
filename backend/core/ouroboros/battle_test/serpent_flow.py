@@ -676,6 +676,7 @@ class SerpentFlow:
         self, op_id: str, candidates: int, provider: str,
         duration_s: float = 0.0, tool_count: int = 0,
         model_id: str = "", input_tokens: int = 0, output_tokens: int = 0,
+        cost_usd: float = 0.0,
     ) -> None:
         """Generation completed — stop spinner, show summary."""
         self._stop_status()
@@ -690,12 +691,20 @@ class SerpentFlow:
         token_str = f" [{_C['dim']}]│[/{_C['dim']}] {total_tokens:,} tok" if total_tokens > 0 else ""
         tools_str = f" + 🔧 {tool_count}" if tool_count > 0 else ""
 
+        # Per-operation cost (3 decimal places for sub-cent, 2 for larger)
+        if cost_usd >= 0.01:
+            cost_str = f" [{_C['dim']}]│[/{_C['dim']}] ${cost_usd:.2f}"
+        elif cost_usd > 0.001:
+            cost_str = f" [{_C['dim']}]│[/{_C['dim']}] ${cost_usd:.3f}"
+        else:
+            cost_str = ""
+
         self._op_line(
             op_id,
             f"[{_C['neural']}]🧬 synthesized[/{_C['neural']}]  "
             f"{candidates} candidate{'s' if candidates != 1 else ''} via "
             f"[{_C['provider']}]{model_str}[/{_C['provider']}]"
-            f"{tools_str}{token_str}"
+            f"{tools_str}{token_str}{cost_str}"
             f"  [{_C['dim']}]({duration_s:.1f}s)[/{_C['dim']}]",
         )
 
@@ -1501,6 +1510,7 @@ class SerpentTransport:
                         model_id=payload.get("model_id", ""),
                         input_tokens=payload.get("total_input_tokens", 0),
                         output_tokens=payload.get("total_output_tokens", 0),
+                        cost_usd=payload.get("cost_usd", 0.0),
                     )
                     candidate_files = payload.get("candidate_files", [])
                     candidate_rationales = payload.get("candidate_rationales", [])

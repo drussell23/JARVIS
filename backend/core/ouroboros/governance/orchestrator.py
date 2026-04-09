@@ -1195,6 +1195,29 @@ class GovernedOrchestrator:
                     session_lessons=_lessons_text,
                 )
 
+        # ── Consciousness: inject fragile-file memory into first generation ──
+        # Manifesto §4: "The organism possesses episodic memory and metacognition"
+        if _consciousness_bridge is not None:
+            try:
+                _fragile_ctx = _consciousness_bridge.get_fragile_file_context(
+                    ctx.target_files
+                )
+                if _fragile_ctx:
+                    _existing_mem = getattr(ctx, "strategic_memory_prompt", "") or ""
+                    ctx = dataclasses.replace(
+                        ctx,
+                        strategic_memory_prompt=(
+                            f"{_existing_mem}\n\n{_fragile_ctx}" if _existing_mem else _fragile_ctx
+                        ),
+                    )
+                    logger.info(
+                        "[Orchestrator] Consciousness memory injected into GENERATE context "
+                        "(%d chars) [%s]",
+                        len(_fragile_ctx), ctx.op_id,
+                    )
+            except Exception:
+                logger.debug("[Orchestrator] Consciousness injection failed", exc_info=True)
+
         # ── Stale-exploration guard: snapshot file hashes at GENERATE time ──
         _gen_hashes: list = []
         for _tf in ctx.target_files:
@@ -1273,6 +1296,7 @@ class GovernedOrchestrator:
                                 "tool_records": len(getattr(generation, "tool_execution_records", ()) or ()),
                                 "total_input_tokens": getattr(generation, "total_input_tokens", 0),
                                 "total_output_tokens": getattr(generation, "total_output_tokens", 0),
+                                "cost_usd": getattr(generation, "cost_usd", 0.0),
                                 # Include candidate file paths and preview for TUI display
                                 "candidate_files": [
                                     getattr(c, "file_path", "") for c in generation.candidates[:3]
@@ -2231,6 +2255,18 @@ class GovernedOrchestrator:
         # ---- Phase 7: APPLY ----
         ctx = ctx.advance(OperationPhase.APPLY)
 
+        # ── Pre-APPLY git checkpoint (Manifesto §6: Iron Gate) ──
+        _checkpoint = None
+        _ckpt_mgr = None
+        try:
+            from backend.core.ouroboros.governance.workspace_checkpoint import WorkspaceCheckpointManager
+            _ckpt_mgr = WorkspaceCheckpointManager(self._config.project_root)
+            _checkpoint = await _ckpt_mgr.create_checkpoint(
+                ctx.op_id, f"pre-apply: {ctx.description[:80]}"
+            )
+        except Exception:
+            logger.debug("[Orchestrator] Pre-APPLY checkpoint skipped", exc_info=True)
+
         # Heartbeat: APPLY phase starting (Manifesto §7)
         try:
             _apply_target = list(ctx.target_files)[0] if ctx.target_files else ""
@@ -2578,6 +2614,17 @@ class GovernedOrchestrator:
                     )
             except Exception as exc:
                 logger.error("[Orchestrator] Verify rollback failed: %s", exc)
+
+            # Git checkpoint restore as safety net (Manifesto §6: Iron Gate)
+            if _checkpoint is not None and _ckpt_mgr is not None:
+                try:
+                    await _ckpt_mgr.restore_checkpoint(_checkpoint.checkpoint_id)
+                    logger.info(
+                        "[Orchestrator] Git checkpoint restored: %s [%s]",
+                        _checkpoint.checkpoint_id, ctx.op_id,
+                    )
+                except Exception:
+                    logger.debug("[Orchestrator] Checkpoint restore failed", exc_info=True)
 
             if _serpent: _serpent.update_phase("POSTMORTEM")
             ctx = ctx.advance(

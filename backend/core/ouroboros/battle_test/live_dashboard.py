@@ -378,6 +378,7 @@ class LiveDashboard:
     def op_generation(
         self, op_id: str, candidates: int, provider: str,
         duration_s: float = 0.0, tool_count: int = 0,
+        cost_usd: float = 0.0,
     ) -> None:
         """Record generation result."""
         op = self._active_ops.get(op_id)
@@ -387,10 +388,16 @@ class LiveDashboard:
             op.provider = prov
             op.tool_count = tool_count
         tools_str = f" + {tool_count} tools" if tool_count > 0 else ""
+        if cost_usd >= 0.01:
+            cost_str = f"  ${cost_usd:.2f}"
+        elif cost_usd > 0.001:
+            cost_str = f"  ${cost_usd:.3f}"
+        else:
+            cost_str = ""
         self.add_event(
             "✨",
             f"[bold]GENERATE[/bold] {candidates} candidate(s) via {prov}"
-            f"{tools_str}  [dim]({duration_s:.1f}s)[/dim]  op:{short}",
+            f"{tools_str}{cost_str}  [dim]({duration_s:.1f}s)[/dim]  op:{short}",
         )
 
     # ── Code generation & diff display (rendered above dashboard) ──
@@ -1058,6 +1065,7 @@ class DashboardTransport:
                         provider=provider,
                         duration_s=payload.get("generation_duration_s", 0.0),
                         tool_count=payload.get("tool_records", 0),
+                        cost_usd=payload.get("cost_usd", 0.0),
                     )
                     # Show code preview above dashboard when candidate files present
                     candidate_files = payload.get("candidate_files", [])

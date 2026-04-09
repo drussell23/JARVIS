@@ -79,6 +79,16 @@ logger = logging.getLogger(__name__)
 _TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.65"))
 _TIER0_MAX_WAIT_S = float(os.environ.get("OUROBOROS_TIER0_MAX_WAIT_S", "90"))
 _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "15"))
+
+# Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
+# Higher complexity => more time for DW 397B code generation.
+_TIER0_COMPLEXITY_MULTIPLIER: dict[str, float] = {
+    "trivial": 1.0,           # 0.65 * 1.0  = 0.65
+    "moderate": 1.077,         # 0.65 * 1.077 ≈ 0.70
+    "standard": 1.077,         # alias for moderate
+    "complex": 1.231,          # 0.65 * 1.231 ≈ 0.80
+    "heavy_code": 1.231,       # alias for complex
+}
 _PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
 _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "20"))
 
@@ -685,13 +695,14 @@ class CandidateGenerator:
                 # cascade to Claude fallback with guaranteed reserve time.
                 _tier0_attempted = True
                 remaining = self._remaining_seconds(deadline)
-                tier0_budget = self._compute_tier0_budget(remaining)
+                _complexity = getattr(context, "task_complexity", "trivial")
+                tier0_budget = self._compute_tier0_budget(remaining, _complexity)
                 tier1_reserve = remaining - tier0_budget
 
                 logger.info(
                     "[CandidateGenerator] Tier 0 RT: budget=%.1fs of %.1fs "
-                    "(Tier 1 reserve=%.1fs), model=%s",
-                    tier0_budget, remaining, tier1_reserve,
+                    "(Tier 1 reserve=%.1fs), complexity=%s, model=%s",
+                    tier0_budget, remaining, tier1_reserve, _complexity,
                     getattr(self._tier0, "_model", "unknown"),
                 )
 
@@ -790,12 +801,13 @@ class CandidateGenerator:
                 _dw_poll_task = self._background_polls.get(_op_id)
                 if _dw_poll_task is not None and (_dw_is_primary or _dw_is_fallback):
                     remaining = self._remaining_seconds(deadline)
-                    tier0_budget = self._compute_tier0_budget(remaining)
+                    _complexity = getattr(context, "task_complexity", "trivial")
+                    tier0_budget = self._compute_tier0_budget(remaining, _complexity)
 
                     logger.info(
                         "[CandidateGenerator] Awaiting batch poll: "
-                        "budget=%.1fs of %.1fs",
-                        tier0_budget, remaining,
+                        "budget=%.1fs of %.1fs, complexity=%s",
+                        tier0_budget, remaining, _complexity,
                     )
                     try:
                         await asyncio.wait_for(
@@ -1122,15 +1134,21 @@ class CandidateGenerator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_tier0_budget(total_s: float) -> float:
+    def _compute_tier0_budget(
+        total_s: float, complexity: str = "trivial",
+    ) -> float:
         """Deterministic Tier 0 (DoubleWord) budget with Tier 1 reserve.
 
         Tier 0 is the preferred path (cheap, Manifesto §5 Tier 0 fast-path).
         It gets 65% of the total budget by default.  When the total budget is
         tight (< 90s), we log a warning — both tiers may starve.
 
+        *complexity* scales the base fraction via ``_TIER0_COMPLEXITY_MULTIPLIER``
+        so that complex operations receive proportionally more Tier 0 time
+        (e.g. 80% instead of 65%).
+
         Invariants:
-          - tier0_budget <= total_s * _TIER0_BUDGET_FRACTION
+          - tier0_budget <= total_s * effective_fraction
           - tier0_budget <= _TIER0_MAX_WAIT_S
           - total_s - tier0_budget >= _TIER1_MIN_RESERVE_S (when possible)
         """
@@ -1143,10 +1161,12 @@ class CandidateGenerator:
                 "2-tier cascade.",
                 total_s,
             )
+        multiplier = _TIER0_COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
+        effective_fraction = min(_TIER0_BUDGET_FRACTION * multiplier, 0.90)
         # Reserve Tier 1 budget first (defensive — Tier 1 must always get a chance)
-        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * 0.35)
+        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * (1.0 - effective_fraction))
         budget = min(
-            total_s * _TIER0_BUDGET_FRACTION,
+            total_s * effective_fraction,
             _TIER0_MAX_WAIT_S,
             total_s - tier1_reserve,
         )

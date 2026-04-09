@@ -355,17 +355,18 @@ class DoublewordProvider:
             self._stats.total_batches += 1
             self._stats.total_latency_s += elapsed
 
+            _batch_cost = 0.0
             if usage:
                 input_tokens = usage.get("prompt_tokens", 0)
                 output_tokens = usage.get("completion_tokens", 0)
                 self._stats.total_input_tokens += input_tokens
                 self._stats.total_output_tokens += output_tokens
-                cost = (
+                _batch_cost = (
                     input_tokens * _DW_INPUT_COST_PER_M / 1_000_000
                     + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
                 )
-                self._stats.total_cost_usd += cost
-                self._record_cost(cost)
+                self._stats.total_cost_usd += _batch_cost
+                self._record_cost(_batch_cost)
 
             if not content:
                 self._stats.empty_content_retries += 1
@@ -415,12 +416,13 @@ class DoublewordProvider:
                 repo_roots=self._repo_roots or None,
                 repo_root=self._repo_root,
             )
-            # Attach token usage from batch
-            if usage:
+            # Attach token usage and cost from batch
+            if usage or _batch_cost > 0:
                 result = dataclasses.replace(
                     result,
                     total_input_tokens=input_tokens,
                     total_output_tokens=output_tokens,
+                    cost_usd=_batch_cost,
                 )
             return result
 
@@ -813,12 +815,13 @@ class DoublewordProvider:
             repo_root=self._repo_root,
         )
 
-        # Attach token usage from _generate_raw
-        if _token_usage["input"] or _token_usage["output"]:
+        # Attach token usage and cost from _generate_raw
+        if _token_usage["input"] or _token_usage["output"] or total_cost > 0:
             result = dataclasses.replace(
                 result,
                 total_input_tokens=_token_usage["input"],
                 total_output_tokens=_token_usage["output"],
+                cost_usd=total_cost,
             )
 
         logger.info(

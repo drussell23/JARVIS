@@ -66,9 +66,11 @@ class OpsLogger:
 
     @staticmethod
     def _format_entry(msg: CommMessage) -> str:
-        ts = datetime.fromtimestamp(msg.timestamp, tz=timezone.utc)
+        _ts = getattr(msg, "timestamp", None) or time.time()
+        ts = datetime.fromtimestamp(_ts, tz=timezone.utc)
         ts_str = ts.strftime("%Y-%m-%d %H:%M:%S")
-        msg_type = msg.msg_type.name
+        _msg_type = getattr(msg, "msg_type", None)
+        msg_type = getattr(_msg_type, "name", getattr(_msg_type, "value", "UNKNOWN"))
 
         lines = [f"[{ts_str}] {msg_type}  {msg.op_id}"]
 
