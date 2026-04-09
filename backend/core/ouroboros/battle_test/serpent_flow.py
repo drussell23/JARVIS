@@ -27,7 +27,9 @@ from typing import Any, Callable, Dict, List, Optional
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.status import Status
+from rich.syntax import Syntax
 
 # ══════════════════════════════════════════════════════════════
 # Color palette (organism theme)
@@ -747,6 +749,239 @@ class SerpentFlow:
         """Cost tick — shown periodically between operations."""
         self._cost_total = total
 
+    # ── Proactive event interruptions ────────────────────────
+
+    def emit_proactive_alert(
+        self,
+        title: str,
+        body: str,
+        severity: str = "warning",
+        source: str = "",
+        op_id: str = "",
+    ) -> None:
+        """Inject a prominent alert Panel into the terminal stream.
+
+        Called by background tasks (sensors, consciousness, health cortex)
+        when they detect an event that demands the operator's attention.
+
+        Because the REPL runs under ``prompt_toolkit.patch_stdout``, all
+        writes through Rich's Console are automatically buffered and
+        rendered *above* the active input line — the operator's typing
+        is never interrupted.
+
+        Parameters
+        ----------
+        title:
+            Short headline (e.g. ``"Capability Gap Detected"``).
+        body:
+            Multi-line detail (Markdown-safe).
+        severity:
+            ``"critical"`` (red), ``"warning"`` (yellow), or ``"info"`` (cyan).
+        source:
+            Originating subsystem (e.g. ``"CapabilityGapSensor"``).
+        op_id:
+            Related operation ID, if any.
+        """
+        color_map = {
+            "critical": _C["death"],
+            "warning": _C["heal"],
+            "info": _C["neural"],
+        }
+        border = color_map.get(severity, _C["neural"])
+        icon_map = {
+            "critical": "🚨",
+            "warning": "⚠️",
+            "info": "🔔",
+        }
+        icon = icon_map.get(severity, "🔔")
+
+        subtitle_parts: List[str] = []
+        if source:
+            subtitle_parts.append(source)
+        if op_id:
+            subtitle_parts.append(f"op:{_short_id(op_id)}")
+        subtitle = f"[{_C['dim']}]{' │ '.join(subtitle_parts)}[/{_C['dim']}]" if subtitle_parts else ""
+
+        panel = Panel(
+            body,
+            title=f"{icon} {title}",
+            subtitle=subtitle,
+            border_style=border,
+            expand=False,
+            width=min(self.console.width, 72),
+            padding=(0, 1),
+        )
+        self.console.print()
+        self.console.print(panel)
+        self.console.print()
+
+    # ── Iron Gate permission prompt ──────────────────────────
+
+    async def request_execution_permission(
+        self,
+        op_id: str,
+        description: str,
+        target_files: List[str],
+        risk_reason: str = "",
+        diff_text: str = "",
+        candidate_rationale: str = "",
+    ) -> bool:
+        """Interactive [Y/n] permission gate — Manifesto §6 Iron Gate.
+
+        Pauses the calling agentic coroutine and renders:
+          1. A color-coded diff preview (``rich.syntax.Syntax``)
+          2. An alert Panel summarizing the proposed change
+          3. A ``prompt_toolkit`` async prompt awaiting ``[Y/n]``
+
+        Returns ``True`` for approval, ``False`` for rejection.
+        The caller's ``asyncio.Task`` is suspended (not the event loop)
+        so background telemetry, sensors, and streaming continue.
+
+        Parameters
+        ----------
+        op_id:
+            Operation requesting permission.
+        description:
+            Human-readable goal of the operation.
+        target_files:
+            Files to be modified.
+        risk_reason:
+            Why the Iron Gate was triggered (e.g. "similarity_escalation").
+        diff_text:
+            Unified diff of proposed changes.  If non-empty, rendered as a
+            syntax-highlighted preview before the prompt.
+        candidate_rationale:
+            LLM rationale for the change.
+        """
+        short = _short_id(op_id) if op_id else ""
+        c = self.console
+
+        # ── Step 1: Live diff preview (rich.syntax.Syntax, lexer="diff") ──
+        if diff_text:
+            self.show_diff_preview(
+                diff_text=diff_text,
+                target_files=target_files,
+                op_id=op_id,
+            )
+
+        # ── Step 2: Iron Gate alert panel ──
+        body_lines = [f"[bold]{description}[/bold]"]
+        if target_files:
+            files_display = ", ".join(
+                f.split("/")[-1] if "/" in f else f for f in target_files[:5]
+            )
+            body_lines.append(f"📂 {files_display}")
+        if candidate_rationale:
+            body_lines.append(f"[{_C['dim']}]{candidate_rationale[:120]}[/{_C['dim']}]")
+        if risk_reason:
+            body_lines.append(f"[{_C['heal']}]⚡ {risk_reason}[/{_C['heal']}]")
+
+        panel = Panel(
+            "\n".join(body_lines),
+            title=f"🔒 Iron Gate │ op:{short}",
+            border_style=_C["heal"],
+            expand=False,
+            width=min(c.width, 72),
+            padding=(0, 1),
+        )
+        c.print()
+        c.print(panel)
+
+        # ── Step 3: Async [Y/n] prompt ──
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.patch_stdout import patch_stdout
+
+            session = PromptSession()
+            with patch_stdout():
+                answer = await session.prompt_async(
+                    HTML("<b>  Apply this change? [Y/n] </b>"),
+                )
+            answer = answer.strip().lower()
+            approved = answer in ("", "y", "yes")
+        except ImportError:
+            # No prompt_toolkit — auto-approve with warning
+            c.print(
+                f"[{_C['heal']}]  (prompt_toolkit unavailable — auto-approving)[/{_C['heal']}]",
+                highlight=False,
+            )
+            approved = True
+        except (EOFError, KeyboardInterrupt):
+            approved = False
+
+        # ── Step 4: Print decision artifact ──
+        if approved:
+            c.print(
+                f"[{_C['life']}]  ✅ approved[/{_C['life']}] │ "
+                f"[{_C['dim']}]op:{short}[/{_C['dim']}]",
+                highlight=False,
+            )
+        else:
+            c.print(
+                f"[{_C['death']}]  ❌ rejected[/{_C['death']}] │ "
+                f"[{_C['dim']}]op:{short}[/{_C['dim']}]",
+                highlight=False,
+            )
+        c.print()
+        return approved
+
+    # ── Live diff preview (rich.syntax.Syntax, lexer="diff") ─
+
+    def show_diff_preview(
+        self,
+        diff_text: str,
+        target_files: Optional[List[str]] = None,
+        op_id: str = "",
+    ) -> None:
+        """Render a syntax-highlighted diff preview.
+
+        Uses ``rich.syntax.Syntax`` with ``lexer="diff"`` so additions
+        are green, deletions are red, and hunk headers are styled —
+        proper terminal typography per Manifesto §7.
+
+        Called by ``request_execution_permission()`` before the Iron Gate
+        prompt, and can be called standalone for any diff preview need.
+        """
+        short = _short_id(op_id) if op_id else ""
+        c = self.console
+
+        # Header
+        files_str = ""
+        if target_files:
+            primary = target_files[0]
+            if len(primary) > 50:
+                parts = primary.split("/")
+                primary = "/".join(parts[-2:])
+            files_str = f" [{_C['file']}]{primary}[/{_C['file']}]"
+            if len(target_files) > 1:
+                files_str += f" [{_C['dim']}]+{len(target_files)-1} more[/{_C['dim']}]"
+
+        id_str = f"  [{_C['dim']}]op:{short}[/{_C['dim']}]" if short else ""
+        c.print(
+            f"[{_C['neural']}]📋 proposed changes[/{_C['neural']}] │{files_str}{id_str}",
+            highlight=False,
+        )
+
+        # Truncate for terminal readability
+        lines = diff_text.split("\n")
+        if len(lines) > 120:
+            truncated = "\n".join(lines[:120])
+            truncated += f"\n... +{len(lines) - 120} lines truncated"
+        else:
+            truncated = diff_text
+
+        # Render with rich.syntax.Syntax — proper lexer-based highlighting
+        syntax = Syntax(
+            truncated,
+            lexer="diff",
+            theme="monokai",
+            line_numbers=False,
+            word_wrap=False,
+            padding=(0, 1),
+        )
+        c.print(syntax)
+
     # ── Helpers ────────────────────────────────────────────────
 
     def _separator(self) -> None:
@@ -962,6 +1197,16 @@ class SerpentTransport:
                         title=payload.get("dream_title", ""),
                     )
 
+                # Proactive alert from background tasks (sensors, consciousness)
+                elif payload.get("proactive_alert"):
+                    self._flow.emit_proactive_alert(
+                        title=payload.get("alert_title", "Alert"),
+                        body=payload.get("alert_body", ""),
+                        severity=payload.get("alert_severity", "warning"),
+                        source=payload.get("alert_source", ""),
+                        op_id=op_id,
+                    )
+
                 # Standard phase transition
                 elif phase and ":" not in phase:
                     self._flow.op_phase(
@@ -983,6 +1228,19 @@ class SerpentTransport:
                             f"[dim]⏭️  boot recovery │ reconciling stale ledger entries...[/dim]",
                             highlight=False,
                         )
+                    return
+
+                # Escalation — emit proactive alert (similarity gate, security, etc.)
+                if outcome == "escalated":
+                    self._flow.emit_proactive_alert(
+                        title="Iron Gate Escalation",
+                        body=f"Operation escalated to APPROVAL_REQUIRED.\n"
+                             f"Reason: {reason_code}\n"
+                             f"Files: {', '.join(payload.get('target_files', [])[:3])}",
+                        severity="warning",
+                        source="GovernanceGate",
+                        op_id=op_id,
+                    )
                     return
 
                 files = payload.get("files_changed", payload.get("affected_files", []))
@@ -1011,6 +1269,102 @@ class SerpentTransport:
 
         except Exception:
             pass  # The serpent never crashes the pipeline
+
+
+# ══════════════════════════════════════════════════════════════
+# SerpentApprovalProvider — Iron Gate wired to prompt_toolkit
+# ══════════════════════════════════════════════════════════════
+
+
+class SerpentApprovalProvider:
+    """Approval provider that renders diff + Iron Gate prompt via SerpentFlow.
+
+    Wraps the standard ``CLIApprovalProvider`` and overrides the
+    approval flow to:
+
+    1. Generate a unified diff of the proposed change
+    2. Render it with ``rich.syntax.Syntax(lexer="diff")``
+    3. Present an interactive ``[Y/n]`` prompt via ``prompt_toolkit``
+    4. Route the decision back through the standard provider
+
+    Conforms to the ``ApprovalProvider`` protocol so the orchestrator
+    can use it as a drop-in replacement.
+    """
+
+    def __init__(self, flow: SerpentFlow, inner: Any) -> None:
+        self._flow = flow
+        self._inner = inner  # CLIApprovalProvider
+
+    async def request(self, context: Any) -> str:
+        """Delegate request registration to the inner provider."""
+        return await self._inner.request(context)
+
+    async def await_decision(
+        self, request_id: str, timeout_s: float,
+    ) -> Any:
+        """Show diff + Iron Gate prompt, then route decision to inner provider.
+
+        If the user approves, calls ``inner.approve()``.
+        If the user rejects, calls ``inner.reject()``.
+        The returned ``ApprovalResult`` comes from the inner provider
+        so the orchestrator sees a standard result.
+        """
+        # Retrieve the pending request context from the inner provider
+        pending = self._inner._requests.get(request_id)
+        if pending is None or pending.result is not None:
+            return await self._inner.await_decision(request_id, timeout_s)
+
+        ctx = pending.context
+        op_id = ctx.op_id
+        description = ctx.description or ""
+        target_files = list(ctx.target_files) if ctx.target_files else []
+
+        # Generate proposed diff from the candidate
+        diff_text = ""
+        candidate_rationale = ""
+        try:
+            candidate = getattr(ctx, "best_candidate", None) or {}
+            proposed = candidate.get("full_content", "")
+            candidate_rationale = (candidate.get("rationale", "") or "")[:120]
+            if proposed and target_files:
+                import subprocess as _sp
+                _repo = self._flow._repo_path
+                _target = _repo / target_files[0]
+                if _target.exists():
+                    _original = _target.read_text(errors="replace")
+                    if _original != proposed:
+                        import difflib
+                        diff_lines = difflib.unified_diff(
+                            _original.splitlines(keepends=True),
+                            proposed.splitlines(keepends=True),
+                            fromfile=f"a/{target_files[0]}",
+                            tofile=f"b/{target_files[0]}",
+                            lineterm="",
+                        )
+                        diff_text = "\n".join(diff_lines)
+        except Exception:
+            pass
+
+        # Render Iron Gate prompt
+        risk_reason = getattr(ctx, "terminal_reason_code", "") or ""
+        approved = await self._flow.request_execution_permission(
+            op_id=op_id,
+            description=description,
+            target_files=target_files,
+            risk_reason=risk_reason,
+            diff_text=diff_text,
+            candidate_rationale=candidate_rationale,
+        )
+
+        # Route decision through the inner provider
+        if approved:
+            return await self._inner.approve(request_id, "operator")
+        else:
+            return await self._inner.reject(request_id, "operator", "rejected via Iron Gate")
+
+    async def list_pending(self) -> List[Dict[str, Any]]:
+        """Delegate to inner provider."""
+        return await self._inner.list_pending()
 
 
 # ══════════════════════════════════════════════════════════════
