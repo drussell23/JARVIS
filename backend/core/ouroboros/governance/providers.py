@@ -363,8 +363,8 @@ def validate_diff_context(original: str, diff_text: str) -> None:
         if _norm(actual) == norm_hunk:
             continue
 
-        # Bounded fuzzy search (±5 lines) to tolerate minor off-by-N from LLM
-        window = int(os.environ.get("OUROBOROS_DIFF_FUZZY_WINDOW", "5"))
+        # Bounded fuzzy search (±15 lines) to tolerate off-by-N from LLM
+        window = int(os.environ.get("OUROBOROS_DIFF_FUZZY_WINDOW", "15"))
         lo = max(0, orig_start - window)
         hi = min(len(orig_lines) - hunk_len + 1, orig_start + window + 1)
         found = -1
@@ -372,6 +372,15 @@ def validate_diff_context(original: str, diff_text: str) -> None:
             if _norm(orig_lines[candidate:candidate + hunk_len]) == norm_hunk:
                 found = candidate
                 break
+
+        # Secondary: whitespace-stripped comparison (Claude often gets indent wrong)
+        if found == -1:
+            _ws_norm = lambda lines: [ln.strip() for ln in _norm(lines)]
+            ws_hunk = _ws_norm(hunk_orig)
+            for candidate in range(lo, hi):
+                if _ws_norm(orig_lines[candidate:candidate + hunk_len]) == ws_hunk:
+                    found = candidate
+                    break
 
         if found == -1:
             raise StaleDiffError(
@@ -475,11 +484,12 @@ def _apply_unified_diff(original: str, diff_text: str) -> str:
     def _normalize(lines: List[str]) -> List[str]:
         return [ln.rstrip("\n\r") for ln in lines]
 
-    def _find_hunk_start(result: List[str], orig_start: int, hunk_orig: List[str], window: int = 3) -> int:
+    def _find_hunk_start(result: List[str], orig_start: int, hunk_orig: List[str], window: int = 15) -> int:
         """Search for hunk_orig within a ±window line window of orig_start.
 
         Returns the best matching start index, or -1 if not found.
         This tolerates off-by-N line numbers that LLMs commonly generate.
+        Falls back to whitespace-stripped comparison if exact match fails.
         """
         norm_hunk = _normalize(hunk_orig)
         hunk_len = len(hunk_orig)
@@ -487,6 +497,11 @@ def _apply_unified_diff(original: str, diff_text: str) -> str:
         hi = min(len(result) - hunk_len + 1, orig_start + window + 1)
         for candidate in range(lo, hi):
             if _normalize(result[candidate:candidate + hunk_len]) == norm_hunk:
+                return candidate
+        # Secondary: whitespace-stripped comparison
+        ws_hunk = [ln.strip() for ln in norm_hunk]
+        for candidate in range(lo, hi):
+            if [ln.rstrip("\n\r").strip() for ln in result[candidate:candidate + hunk_len]] == ws_hunk:
                 return candidate
         return -1
 
@@ -2124,7 +2139,16 @@ def _parse_generation_response(
             try:
                 # Pre-apply validation gate (Disease 1 fix): check context lines
                 # against the ACTUAL file before attempting to mutate anything.
-                validate_diff_context(orig_content, unified_diff)
+                try:
+                    validate_diff_context(orig_content, unified_diff)
+                except StaleDiffError as ctx_exc:
+                    # Validation strict-failed; try direct apply anyway — it has
+                    # its own ±15-line fuzzy + whitespace-stripped matching.
+                    logger.info(
+                        "[%s] Diff context validation failed at line %d, "
+                        "trying lenient apply: %s",
+                        pfx, ctx_exc.hunk_line, ctx_exc,
+                    )
                 patched = _apply_unified_diff(orig_content, unified_diff)
             except StaleDiffError as exc:
                 logger.warning(

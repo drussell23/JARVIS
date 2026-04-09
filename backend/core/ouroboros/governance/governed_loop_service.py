@@ -89,6 +89,50 @@ except ImportError:
 logger = logging.getLogger("Ouroboros.GovernedLoop")
 
 # ---------------------------------------------------------------------------
+# Sandbox-safe state directory — redirect ~/.jarvis when not writable
+# ---------------------------------------------------------------------------
+# Many subsystems write to ~/.jarvis/ouroboros/*.  In sandboxed environments
+# (e.g. Claude Code, macOS sandbox, CI containers) that path may not be
+# writable.  Detect once at import time and redirect to a repo-local
+# fallback via JARVIS_STATE_DIR so all subsystems that resolve via
+# Path.home() / ".jarvis" or JARVIS_SELF_EVOLUTION_DIR fall through cleanly.
+
+def _ensure_writable_state_dir() -> None:
+    """Set JARVIS_STATE_DIR if ~/.jarvis is not writable."""
+    if os.environ.get("JARVIS_STATE_DIR"):
+        return  # already explicitly set
+    home_jarvis = Path.home() / ".jarvis"
+    try:
+        home_jarvis.mkdir(parents=True, exist_ok=True)
+        # Write-test with a temp file
+        _probe = home_jarvis / ".write_probe"
+        _probe.write_text("ok")
+        _probe.unlink()
+    except OSError:
+        # Not writable — fall back to repo-local .ouroboros/state/
+        _fallback = Path.cwd() / ".ouroboros" / "state"
+        try:
+            _fallback.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return  # can't create fallback either — let individual modules handle it
+        os.environ["JARVIS_STATE_DIR"] = str(_fallback)
+        # Redirect subsystem env vars that default to ~/.jarvis paths
+        _redirects = {
+            "JARVIS_SELF_EVOLUTION_DIR": str(_fallback / "ouroboros" / "evolution"),
+            "JARVIS_GOVERNED_L3_STATE_DIR": str(_fallback / "ouroboros" / "execution_graphs"),
+            "JARVIS_GOVERNED_L4_STATE_DIR": str(_fallback / "ouroboros" / "advanced_coordination"),
+        }
+        for key, val in _redirects.items():
+            if not os.environ.get(key):
+                os.environ[key] = val
+        logger.info(
+            "[GovernedLoop] ~/.jarvis not writable — redirected state to %s",
+            _fallback,
+        )
+
+_ensure_writable_state_dir()
+
+# ---------------------------------------------------------------------------
 # Module-level constants
 # ---------------------------------------------------------------------------
 

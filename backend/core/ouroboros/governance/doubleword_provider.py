@@ -581,7 +581,9 @@ class DoublewordProvider:
         # When Venom tool loop is available, send a minimal instruction and let
         # the model pull context incrementally via read_file/search_code/etc.
         # Manifesto §5: "Agentic intelligence handles the 5% that is novel."
-        _tools_available = self._tool_loop is not None
+        _complexity = getattr(context, "task_complexity", "")
+        _will_skip_tools = _complexity in ("trivial", "simple")
+        _tools_available = self._tool_loop is not None and not _will_skip_tools
         if prompt_override:
             prompt = prompt_override
         elif _should_use_lean_prompt(context, tools_enabled=_tools_available):
@@ -811,14 +813,16 @@ class DoublewordProvider:
             return None
 
         # Execute with or without tool loop.
-        # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper).
+        # Complexity routing: skip Venom for TRIVIAL and SIMPLE tasks on DW.
+        # DW 397B tool loop adds 80-100s for simple tasks where one-shot suffices.
+        # Claude keeps tools for simple tasks (it's the fallback and has thinking).
         _complexity = getattr(context, "task_complexity", "")
         _eff_mt = _DW_COMPLEXITY_MAX_TOKENS.get(_complexity, self._max_tokens)
-        _skip_tools = _complexity in ("trivial",)
+        _skip_tools = _complexity in ("trivial", "simple")
         if _skip_tools:
             logger.info(
-                "[DoublewordProvider] \u26a1 Trivial task — skipping Venom tool loop "
-                "(one-shot, max_tokens=%d)", _eff_mt,
+                "[DoublewordProvider] \u26a1 %s task — skipping Venom tool loop "
+                "(one-shot, max_tokens=%d)", _complexity or "trivial", _eff_mt,
             )
         elif _eff_mt != self._max_tokens:
             logger.info(
