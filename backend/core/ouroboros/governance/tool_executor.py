@@ -155,7 +155,7 @@ def _compute_args_hash(arguments: Dict[str, Any]) -> str:
 # L1 Tool-Use: Protocols (B-ready seams)
 # ---------------------------------------------------------------------------
 
-_OUTPUT_CAP_DEFAULT = 4096
+_OUTPUT_CAP_DEFAULT = 32_768  # CC-parity: was 4096, raised to match Claude Code's full-file reads
 
 @runtime_checkable
 class ToolPolicy(Protocol):
@@ -200,12 +200,12 @@ def _format_tool_result(call: "ToolCall", result: "ToolResult") -> str:
 
 _L1_MANIFESTS: Dict[str, ToolManifest] = {
     "read_file": ToolManifest(
-        name="read_file", version="1.0",
-        description="Read a file within the repository",
+        name="read_file", version="1.1",
+        description="Read a file within the repository (full content by default)",
         arg_schema={
             "path":       {"type": "string"},
             "lines_from": {"type": "integer", "default": 1},
-            "lines_to":   {"type": "integer", "default": 200},
+            "lines_to":   {"type": "integer", "default": 2000},
         },
         capabilities=frozenset({"read"}),
     ),
@@ -272,6 +272,72 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"subprocess"}),
     ),
+    # ---- CC-parity tools (closing the gap with Claude Code) ----
+    "glob_files": ToolManifest(
+        name="glob_files", version="1.0",
+        description="Find files matching a glob pattern (e.g. **/*.py, src/**/*.ts). Returns paths sorted by modification time.",
+        arg_schema={
+            "pattern": {"type": "string"},
+            "path":    {"type": "string", "default": "."},
+        },
+        capabilities=frozenset({"read"}),
+    ),
+    "list_dir": ToolManifest(
+        name="list_dir", version="1.0",
+        description="List directory contents with file types and sizes. Use max_depth for recursive listing.",
+        arg_schema={
+            "path":      {"type": "string", "default": "."},
+            "max_depth": {"type": "integer", "default": 1},
+        },
+        capabilities=frozenset({"read"}),
+    ),
+    "git_log": ToolManifest(
+        name="git_log", version="1.0",
+        description="Show recent git commit history (oneline format). Optionally filter by file path.",
+        arg_schema={
+            "path": {"type": "string", "default": ""},
+            "n":    {"type": "integer", "default": 20},
+        },
+        capabilities=frozenset({"subprocess"}),
+    ),
+    "git_diff": ToolManifest(
+        name="git_diff", version="1.0",
+        description="Show git diff — unstaged changes by default. Use ref for HEAD~1, branch names, etc.",
+        arg_schema={
+            "ref":  {"type": "string", "default": ""},
+            "path": {"type": "string", "default": ""},
+        },
+        capabilities=frozenset({"subprocess"}),
+    ),
+    "git_blame": ToolManifest(
+        name="git_blame", version="1.0",
+        description="Show line-by-line git blame for a file. Optionally restrict to a line range.",
+        arg_schema={
+            "path":       {"type": "string"},
+            "lines_from": {"type": "integer", "default": 0},
+            "lines_to":   {"type": "integer", "default": 0},
+        },
+        capabilities=frozenset({"subprocess"}),
+    ),
+    "edit_file": ToolManifest(
+        name="edit_file", version="1.0",
+        description="Surgical text replacement: find old_text (must be unique) and replace with new_text. Like Claude Code's Edit tool.",
+        arg_schema={
+            "path":     {"type": "string"},
+            "old_text": {"type": "string"},
+            "new_text": {"type": "string"},
+        },
+        capabilities=frozenset({"write"}),
+    ),
+    "write_file": ToolManifest(
+        name="write_file", version="1.0",
+        description="Create a new file or overwrite an existing file with the given content.",
+        arg_schema={
+            "path":    {"type": "string"},
+            "content": {"type": "string"},
+        },
+        capabilities=frozenset({"write"}),
+    ),
 }
 
 
@@ -279,7 +345,7 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
 # Executor
 # ---------------------------------------------------------------------------
 
-_MAX_TOOL_OUTPUT_CHARS = 4_000  # truncate results exceeding this (legacy ToolExecutor path; see _OUTPUT_CAP_DEFAULT for async path)
+_MAX_TOOL_OUTPUT_CHARS = 32_000  # CC-parity: was 4000, raised for full-file reads and rich search results
 
 
 class ToolExecutor:
@@ -297,6 +363,15 @@ class ToolExecutor:
             "search_code": self._search_code,
             "run_tests": self._run_tests,
             "get_callers": self._get_callers,
+            # CC-parity tools
+            "glob_files": self._glob_files,
+            "list_dir": self._list_dir,
+            "git_log": self._git_log,
+            "git_diff": self._git_diff,
+            "git_blame": self._git_blame,
+            "bash": self._bash,
+            "edit_file": self._edit_file,
+            "write_file": self._write_file,
         }
 
     # ------------------------------------------------------------------
@@ -361,7 +436,7 @@ class ToolExecutor:
     def _read_file(self, args: Dict[str, Any]) -> str:
         path_str: str = args["path"]
         lines_from: int = max(1, int(args.get("lines_from", 1)))
-        lines_to: int = int(args.get("lines_to", 200))
+        lines_to: int = int(args.get("lines_to", 2000))  # CC-parity: was 200
 
         resolved = self._safe_resolve(path_str)
 
@@ -413,7 +488,7 @@ class ToolExecutor:
         if not raw_lines:
             return "(no matches)"
 
-        cap = 50
+        cap = 200  # CC-parity: was 50
         if len(raw_lines) <= cap:
             return "\n".join(raw_lines)
 
@@ -473,12 +548,248 @@ class ToolExecutor:
         if not raw_lines:
             return "(no callers found)"
 
-        cap = 30
+        cap = 100  # CC-parity: was 30
         if len(raw_lines) <= cap:
             return "\n".join(raw_lines)
 
         n_extra = len(raw_lines) - cap
         return "\n".join(raw_lines[:cap]) + f"\n... ({n_extra} more)"
+
+    # ------------------------------------------------------------------
+    # CC-parity handlers
+    # ------------------------------------------------------------------
+
+    def _glob_files(self, args: Dict[str, Any]) -> str:
+        """Find files by glob pattern (like Claude Code's Glob tool)."""
+        pattern: str = args["pattern"]
+        base: str = args.get("path", ".")
+
+        resolved = self._safe_resolve(base) if base != "." else self._repo_root
+        if not resolved.is_dir():
+            return f"(not a directory: {base})"
+
+        # Use rglob for ** patterns, glob for single-level
+        matches: List[str] = []
+        try:
+            for p in sorted(resolved.rglob(pattern) if "**" in pattern else resolved.glob(pattern)):
+                if p.is_file():
+                    matches.append(str(p.relative_to(self._repo_root)))
+        except Exception as exc:
+            return f"(glob error: {exc})"
+
+        if not matches:
+            return "(no matches)"
+        cap = 500
+        if len(matches) > cap:
+            return "\n".join(matches[:cap]) + f"\n... ({len(matches) - cap} more files)"
+        return "\n".join(matches)
+
+    def _list_dir(self, args: Dict[str, Any]) -> str:
+        """List directory contents with types and sizes (like ls -la)."""
+        path_str: str = args.get("path", ".")
+        max_depth: int = min(int(args.get("max_depth", 1)), 4)
+
+        resolved = self._safe_resolve(path_str) if path_str != "." else self._repo_root
+        if not resolved.is_dir():
+            return f"(not a directory: {path_str})"
+
+        lines: List[str] = []
+
+        def _walk(p: Path, depth: int, prefix: str = "") -> None:
+            if depth > max_depth or len(lines) > 500:
+                return
+            try:
+                entries = sorted(p.iterdir(), key=lambda x: (not x.is_dir(), x.name.lower()))
+            except PermissionError:
+                lines.append(f"{prefix}(permission denied)")
+                return
+            for entry in entries:
+                # Skip hidden dirs at top level, always skip .git
+                if entry.name.startswith(".") and (depth == 0 or entry.name == ".git"):
+                    continue
+                if entry.is_dir():
+                    lines.append(f"{prefix}{entry.name}/")
+                    if depth < max_depth:
+                        _walk(entry, depth + 1, prefix + "  ")
+                else:
+                    size = _human_size(entry.stat().st_size)
+                    lines.append(f"{prefix}{entry.name}  ({size})")
+
+        _walk(resolved, 0)
+        if not lines:
+            return "(empty directory)"
+        if len(lines) > 500:
+            return "\n".join(lines[:500]) + f"\n... (truncated)"
+        return "\n".join(lines)
+
+    def _git_log(self, args: Dict[str, Any]) -> str:
+        """Show recent git commit history."""
+        path_str: str = args.get("path", "")
+        n: int = min(int(args.get("n", 20)), 100)
+
+        cmd = ["git", "log", "--oneline", "--no-decorate", f"-{n}"]
+        if path_str:
+            resolved = self._safe_resolve(path_str)
+            cmd += ["--", str(resolved)]
+        try:
+            proc = subprocess.run(
+                cmd, cwd=self._repo_root,
+                capture_output=True, text=True, timeout=10,
+            )
+            return proc.stdout.strip() or "(no commits)"
+        except subprocess.TimeoutExpired:
+            return "(git log timed out)"
+
+    def _git_diff(self, args: Dict[str, Any]) -> str:
+        """Show git diff — unstaged, staged, or between refs."""
+        ref: str = args.get("ref", "")
+        path_str: str = args.get("path", "")
+
+        cmd = ["git", "diff", "--stat" if not ref and not path_str else ""]
+        cmd = [c for c in cmd if c]  # Remove empty strings
+        if not ref and not path_str:
+            # Default: show full unstaged diff with content
+            cmd = ["git", "diff"]
+        else:
+            cmd = ["git", "diff"]
+            if ref:
+                cmd.append(ref)
+        if path_str:
+            resolved = self._safe_resolve(path_str)
+            cmd += ["--", str(resolved)]
+        try:
+            proc = subprocess.run(
+                cmd, cwd=self._repo_root,
+                capture_output=True, text=True, timeout=15,
+            )
+            return proc.stdout.strip() or "(no diff)"
+        except subprocess.TimeoutExpired:
+            return "(git diff timed out)"
+
+    def _git_blame(self, args: Dict[str, Any]) -> str:
+        """Show line-by-line git blame for a file."""
+        path_str: str = args["path"]
+        resolved = self._safe_resolve(path_str)
+        lines_from: int = int(args.get("lines_from", 0))
+        lines_to: int = int(args.get("lines_to", 0))
+
+        cmd = ["git", "blame", "--no-color"]
+        if lines_from > 0 and lines_to > 0:
+            cmd += [f"-L{lines_from},{lines_to}"]
+        cmd.append(str(resolved))
+        try:
+            proc = subprocess.run(
+                cmd, cwd=self._repo_root,
+                capture_output=True, text=True, timeout=10,
+            )
+            return proc.stdout.strip() or "(no blame data)"
+        except subprocess.TimeoutExpired:
+            return "(git blame timed out)"
+
+    def _bash(self, args: Dict[str, Any]) -> str:
+        """Sandboxed shell execution with Iron Gate (Manifesto §6).
+
+        Blocks known destructive patterns. Timeout-enforced.
+        Requires JARVIS_TOOL_BASH_ALLOWED=true.
+        """
+        command: str = args["command"]
+        timeout: float = min(float(args.get("timeout", 30)), 60)
+
+        # Iron Gate: block destructive command patterns
+        _blocked_patterns = [
+            "rm -rf /", "rm -rf ~", "rm -rf .", "mkfs.", "dd if=",
+            ":(){ :", "git push", "git reset --hard",
+            "> /dev/sd", "chmod -R 777", "curl|sh", "curl|bash",
+            "wget|sh", "pip install", "npm install -g",
+            "sudo ", "su -", "passwd",
+        ]
+        cmd_lower = command.lower().strip()
+        for blocked in _blocked_patterns:
+            if blocked in cmd_lower:
+                return f"(Iron Gate: blocked destructive command pattern: {blocked!r})"
+
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", command],
+                cwd=self._repo_root,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+            output = proc.stdout or ""
+            if proc.stderr:
+                output += f"\nstderr: {proc.stderr}"
+            if proc.returncode != 0:
+                output = f"exit={proc.returncode}\n{output}"
+            return output.strip() or "(no output)"
+        except subprocess.TimeoutExpired:
+            return f"(command timed out after {timeout:.0f}s)"
+
+    def _edit_file(self, args: Dict[str, Any]) -> str:
+        """Surgical text replacement — like Claude Code's Edit tool.
+
+        Finds old_text (must be unique) and replaces with new_text.
+        Requires JARVIS_TOOL_EDIT_ALLOWED=true.
+        """
+        path_str: str = args["path"]
+        old_text: str = args["old_text"]
+        new_text: str = args["new_text"]
+
+        resolved = self._safe_resolve(path_str)
+        if not resolved.exists():
+            return f"(file not found: {path_str})"
+
+        content = resolved.read_text(errors="replace")
+        if old_text not in content:
+            return f"(old_text not found in {path_str} — check for exact whitespace/indentation)"
+
+        count = content.count(old_text)
+        if count > 1:
+            return (
+                f"(old_text found {count} times in {path_str} — must be unique. "
+                f"Include more surrounding context to disambiguate.)"
+            )
+
+        new_content = content.replace(old_text, new_text, 1)
+        resolved.write_text(new_content)
+
+        # Compact diff summary
+        added = new_text.count("\n") + 1
+        removed = old_text.count("\n") + 1
+        return (
+            f"OK: edited {path_str}\n"
+            f"  -{removed} lines, +{added} lines"
+        )
+
+    def _write_file(self, args: Dict[str, Any]) -> str:
+        """Create or overwrite a file — like Claude Code's Write tool.
+
+        Requires JARVIS_TOOL_EDIT_ALLOWED=true (same gate as edit_file).
+        """
+        path_str: str = args["path"]
+        file_content: str = args["content"]
+
+        resolved = self._safe_resolve(path_str)
+        existed = resolved.exists()
+
+        # Ensure parent directory exists
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(file_content)
+
+        n_lines = file_content.count("\n") + 1
+        action = "overwritten" if existed else "created"
+        return f"OK: {action} {path_str} ({n_lines} lines)"
+
+
+def _human_size(nbytes: int) -> str:
+    """Convert bytes to human-readable size string."""
+    size = float(nbytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}TB"
 
 
 # ---------------------------------------------------------------------------
@@ -628,6 +939,89 @@ class GoverningToolPolicy:
                     decision=PolicyDecision.DENY,
                     reason_code="tool.denied.path_outside_repo",
                     detail=f"file_path {fp!r} escapes repo root",
+                )
+
+        # ---- CC-parity policy rules ----
+
+        # Rule 6: glob_files — path must be within repo_root
+        elif name == "glob_files":
+            path_arg = call.arguments.get("path", ".")
+            if path_arg != "." and _safe_resolve_policy(path_arg, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"glob path {path_arg!r} escapes repo root",
+                )
+
+        # Rule 7: list_dir — path must be within repo_root
+        elif name == "list_dir":
+            path_arg = call.arguments.get("path", ".")
+            if path_arg != "." and _safe_resolve_policy(path_arg, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"list_dir path {path_arg!r} escapes repo root",
+                )
+
+        # Rule 8: git_blame — path must be within repo_root
+        elif name == "git_blame":
+            path_arg = call.arguments.get("path", "")
+            if not path_arg or _safe_resolve_policy(path_arg, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"blame path {path_arg!r} escapes repo root",
+                )
+
+        # Rule 9: git_diff — optional path must be within repo_root
+        elif name == "git_diff":
+            path_arg = call.arguments.get("path", "")
+            if path_arg and _safe_resolve_policy(path_arg, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"diff path {path_arg!r} escapes repo root",
+                )
+
+        # Rule 10: git_log — optional path must be within repo_root
+        elif name == "git_log":
+            path_arg = call.arguments.get("path", "")
+            if path_arg and _safe_resolve_policy(path_arg, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"git_log path {path_arg!r} escapes repo root",
+                )
+
+        # Rule 11: bash — requires JARVIS_TOOL_BASH_ALLOWED env opt-in (Manifesto §6)
+        elif name == "bash":
+            allowed = (
+                os.environ.get("JARVIS_TOOL_BASH_ALLOWED", "false").lower() == "true"
+            )
+            if not allowed:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.bash_disabled",
+                    detail="JARVIS_TOOL_BASH_ALLOWED is not 'true'",
+                )
+
+        # Rule 12: edit_file / write_file — requires JARVIS_TOOL_EDIT_ALLOWED env opt-in
+        elif name in ("edit_file", "write_file"):
+            allowed = (
+                os.environ.get("JARVIS_TOOL_EDIT_ALLOWED", "false").lower() == "true"
+            )
+            if not allowed:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.edit_disabled",
+                    detail="JARVIS_TOOL_EDIT_ALLOWED is not 'true'",
+                )
+            path_arg = call.arguments.get("path", "")
+            if not path_arg or _safe_resolve_policy(path_arg, repo_root) is None:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.path_outside_repo",
+                    detail=f"edit path {path_arg!r} escapes repo root",
                 )
 
         return PolicyResult(decision=PolicyDecision.ALLOW, reason_code="")
@@ -829,7 +1223,7 @@ class AsyncProcessToolBackend:
 # L1 Tool-Use: ToolLoopCoordinator
 # ---------------------------------------------------------------------------
 
-_MAX_PROMPT_CHARS = 32_768
+_MAX_PROMPT_CHARS = 131_072  # CC-parity: was 32768, raised to accommodate larger tool outputs
 
 
 class ToolLoopCoordinator:
