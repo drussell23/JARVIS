@@ -899,6 +899,32 @@ class CandidateGenerator:
             return await self._call_fallback(context, deadline)
 
         if state is FailbackState.PRIMARY_READY:
+            # P2.3: Model-selection learning — check if historical data
+            # recommends the fallback for this complexity class.  Only
+            # applies when both providers are healthy (PRIMARY_READY);
+            # infrastructure health always takes precedence.
+            _complexity = getattr(context, "task_complexity", "") or "unknown"
+            _recommended = self._query_provider_recommendation(_complexity)
+            if (
+                _recommended is not None
+                and self._fallback is not None
+                and getattr(self._fallback, "provider_name", "") == _recommended
+            ):
+                logger.info(
+                    "[CandidateGenerator] Learning override: '%s' recommended "
+                    "for complexity=%s — trying fallback first (%.1fs remaining)",
+                    _recommended, _complexity, self._remaining_seconds(deadline),
+                )
+                try:
+                    return await self._call_fallback(context, deadline)
+                except Exception as _fb_exc:
+                    logger.info(
+                        "[CandidateGenerator] Learning-recommended fallback failed: %s "
+                        "— falling back to primary",
+                        type(_fb_exc).__name__,
+                    )
+                    return await self._call_primary(context, deadline)
+
             return await self._try_primary_then_fallback(context, deadline)
 
         # FALLBACK_ACTIVE or PRIMARY_DEGRADED: adaptive recovery routing.
@@ -1073,6 +1099,29 @@ class CandidateGenerator:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _query_provider_recommendation(self, complexity: str) -> Optional[str]:
+        """Query ProviderPerformanceTracker for a routing recommendation.
+
+        Returns a provider name if learning data strongly recommends a
+        non-default provider for this complexity class, else None.
+        Fault-isolated — returns None on any error.
+        """
+        try:
+            from backend.core.ouroboros.governance.adaptive_learning import (
+                ProviderPerformanceTracker,
+            )
+            candidates = []
+            if self._primary is not None:
+                candidates.append(getattr(self._primary, "provider_name", "primary"))
+            if self._fallback is not None:
+                candidates.append(getattr(self._fallback, "provider_name", "fallback"))
+            if len(candidates) < 2:
+                return None
+            tracker = ProviderPerformanceTracker()
+            return tracker.recommend_provider(complexity, candidates)
+        except Exception:
+            return None
 
     async def _try_primary_then_fallback(
         self,

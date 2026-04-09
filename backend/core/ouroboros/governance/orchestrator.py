@@ -2887,6 +2887,37 @@ class GovernedOrchestrator:
             except Exception:
                 pass  # Positive feedback is best-effort — never block
 
+        # P2.3: Provider performance tracking — model-selection learning.
+        # Records (provider, complexity, success, duration) so future routing
+        # can prefer the provider that succeeds at this complexity class.
+        try:
+            from backend.core.ouroboros.governance.adaptive_learning import (
+                ProviderPerformanceTracker,
+            )
+            _provider = ""
+            _gen_duration = 0.0
+            if ctx.generation is not None:
+                _provider = ctx.generation.provider_name
+                _gen_duration = ctx.generation.generation_duration_s
+            if _provider:
+                _complexity = getattr(ctx, "task_complexity", "unknown") or "unknown"
+                _is_success = final_state in (OperationState.APPLIED,)
+                _tracker = ProviderPerformanceTracker()
+                _tracker.record(
+                    provider=_provider,
+                    complexity=_complexity,
+                    success=_is_success,
+                    generation_s=_gen_duration,
+                )
+                _tracker.persist()
+                logger.debug(
+                    "[Orchestrator] Provider performance: %s/%s/%s (%.1fs)",
+                    _provider, _complexity,
+                    "OK" if _is_success else "FAIL", _gen_duration,
+                )
+        except Exception:
+            pass  # Provider tracking is best-effort
+
         # Self-evolution feedback: record outcome for prompt adaptation +
         # negative constraints + evolution tracking
         try:

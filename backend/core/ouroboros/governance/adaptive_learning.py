@@ -613,3 +613,226 @@ class ThresholdTuner:
                 self._observations[name] = [tuple(o) for o in obs]
         except Exception:
             logger.debug("[ThresholdTuner] Load failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# 4. Provider Performance Tracker — model-selection learning (P2.3)
+# ---------------------------------------------------------------------------
+
+# Minimum observations before a provider recommendation is actionable.
+_MIN_OBS_FOR_RECOMMENDATION = int(
+    os.environ.get("JARVIS_PROVIDER_MIN_OBS", "3")
+)
+# Window size: only consider the last N observations per (provider, complexity).
+_PROVIDER_WINDOW_SIZE = int(
+    os.environ.get("JARVIS_PROVIDER_WINDOW_SIZE", "30")
+)
+
+
+@dataclass
+class ProviderRecord:
+    """A single observation of provider performance."""
+    provider: str
+    complexity: str       # "trivial" | "light" | "heavy_code" | "complex" | "moderate"
+    success: bool
+    generation_s: float   # How long generation took (0 if unknown)
+    timestamp: float = field(default_factory=time.time)
+
+
+class ProviderPerformanceTracker:
+    """Tracks which provider succeeds at which operation complexity.
+
+    Lightweight in-memory aggregator with JSON persistence.  Records
+    (provider, complexity, success, duration) tuples and answers:
+    "Given this complexity, which provider has the best success rate?"
+
+    The CandidateGenerator queries this before Tier 1 routing to decide
+    whether to prefer primary or fallback for a given complexity class.
+
+    Boundary Principle (Manifesto §5):
+      Deterministic: Statistical aggregation, no model inference.
+      Agentic: How the routing decision affects the generation prompt.
+    """
+
+    def __init__(self, persistence_dir: Path = _PERSISTENCE_DIR) -> None:
+        self._persistence_dir = persistence_dir
+        # (provider, complexity) → List[ProviderRecord], bounded by window
+        self._records: Dict[Tuple[str, str], List[ProviderRecord]] = defaultdict(list)
+        self._dirty: bool = False
+        self._load()
+
+    def record(
+        self,
+        provider: str,
+        complexity: str,
+        success: bool,
+        generation_s: float = 0.0,
+    ) -> None:
+        """Record an observation. Called from orchestrator _publish_outcome."""
+        key = (provider, complexity or "unknown")
+        rec = ProviderRecord(
+            provider=provider,
+            complexity=complexity or "unknown",
+            success=success,
+            generation_s=generation_s,
+        )
+        bucket = self._records[key]
+        bucket.append(rec)
+        # Sliding window — keep only the most recent observations.
+        if len(bucket) > _PROVIDER_WINDOW_SIZE:
+            self._records[key] = bucket[-_PROVIDER_WINDOW_SIZE:]
+        self._dirty = True
+
+    def success_rate(self, provider: str, complexity: str) -> Tuple[float, int]:
+        """Return (success_rate, sample_count) for a (provider, complexity) pair.
+
+        Returns (0.0, 0) if no observations exist.
+        """
+        key = (provider, complexity or "unknown")
+        bucket = self._records.get(key, [])
+        if not bucket:
+            return 0.0, 0
+        wins = sum(1 for r in bucket if r.success)
+        return wins / len(bucket), len(bucket)
+
+    def recommend_provider(
+        self,
+        complexity: str,
+        candidates: List[str],
+    ) -> Optional[str]:
+        """Recommend the best provider for a given complexity class.
+
+        Returns the provider name with the highest success rate (among
+        *candidates*) if it has enough observations and meaningfully
+        outperforms the default ordering.  Returns None if no clear
+        recommendation (too few observations or no significant difference).
+
+        Parameters
+        ----------
+        complexity:
+            Operation complexity class ("trivial", "moderate", "complex", etc.)
+        candidates:
+            Provider names to consider (in default priority order).
+        """
+        best_name: Optional[str] = None
+        best_rate: float = -1.0
+        best_count: int = 0
+
+        for name in candidates:
+            rate, count = self.success_rate(name, complexity)
+            if count >= _MIN_OBS_FOR_RECOMMENDATION and rate > best_rate:
+                best_rate = rate
+                best_count = count
+                best_name = name
+
+        if best_name is None or best_count < _MIN_OBS_FOR_RECOMMENDATION:
+            return None  # Not enough data to recommend
+
+        # Only recommend if the best is meaningfully better than default
+        # (first candidate in the list). If default is already best, no change.
+        if best_name == candidates[0]:
+            return None  # Default ordering already optimal
+
+        default_rate, default_count = self.success_rate(candidates[0], complexity)
+        if default_count >= _MIN_OBS_FOR_RECOMMENDATION:
+            # Require >15% improvement over default to justify reordering
+            if best_rate - default_rate < 0.15:
+                return None
+
+        logger.info(
+            "[ProviderPerformance] Recommending '%s' for complexity=%s "
+            "(%.0f%% over %d obs vs default '%.0f%%')",
+            best_name, complexity, best_rate * 100, best_count,
+            default_rate * 100 if default_count > 0 else 0,
+        )
+        return best_name
+
+    def format_summary(self) -> str:
+        """Format a human-readable summary of provider performance."""
+        if not self._records:
+            return "No provider performance data yet."
+
+        # Aggregate by provider across all complexities
+        by_provider: Dict[str, List[ProviderRecord]] = defaultdict(list)
+        for records in self._records.values():
+            for r in records:
+                by_provider[r.provider].append(r)
+
+        lines = ["## Provider Performance"]
+        for provider, records in sorted(by_provider.items()):
+            wins = sum(1 for r in records if r.success)
+            total = len(records)
+            rate = wins / total if total else 0
+            avg_s = (
+                sum(r.generation_s for r in records if r.generation_s > 0)
+                / max(1, sum(1 for r in records if r.generation_s > 0))
+            )
+            lines.append(
+                f"- **{provider}**: {rate:.0%} success ({wins}/{total}), "
+                f"avg {avg_s:.1f}s"
+            )
+
+            # Per-complexity breakdown
+            by_cx: Dict[str, List[ProviderRecord]] = defaultdict(list)
+            for r in records:
+                by_cx[r.complexity].append(r)
+            for cx, cx_recs in sorted(by_cx.items()):
+                cx_wins = sum(1 for r in cx_recs if r.success)
+                lines.append(f"  - {cx}: {cx_wins}/{len(cx_recs)}")
+
+        return "\n".join(lines)
+
+    def persist(self) -> None:
+        """Flush to disk if dirty. Called periodically, not on every record."""
+        if not self._dirty:
+            return
+        try:
+            self._persistence_dir.mkdir(parents=True, exist_ok=True)
+            path = self._persistence_dir / "provider_performance.json"
+            data: Dict[str, list] = {}
+            for (prov, cx), records in self._records.items():
+                key = f"{prov}:{cx}"
+                data[key] = [
+                    {
+                        "provider": r.provider,
+                        "complexity": r.complexity,
+                        "success": r.success,
+                        "generation_s": r.generation_s,
+                        "timestamp": r.timestamp,
+                    }
+                    for r in records
+                ]
+            path.write_text(json.dumps(data, indent=2))
+            self._dirty = False
+        except Exception:
+            logger.debug("[ProviderPerformance] Persist failed", exc_info=True)
+
+    def _load(self) -> None:
+        try:
+            path = self._persistence_dir / "provider_performance.json"
+            if not path.exists():
+                return
+            data = json.loads(path.read_text())
+            for compound_key, records_data in data.items():
+                parts = compound_key.split(":", 1)
+                prov = parts[0]
+                cx = parts[1] if len(parts) > 1 else "unknown"
+                key = (prov, cx)
+                self._records[key] = [
+                    ProviderRecord(
+                        provider=r["provider"],
+                        complexity=r["complexity"],
+                        success=r["success"],
+                        generation_s=r.get("generation_s", 0.0),
+                        timestamp=r.get("timestamp", 0.0),
+                    )
+                    for r in records_data[-_PROVIDER_WINDOW_SIZE:]
+                ]
+            total = sum(len(v) for v in self._records.values())
+            if total:
+                logger.info(
+                    "[ProviderPerformance] Loaded %d records across %d buckets",
+                    total, len(self._records),
+                )
+        except Exception:
+            logger.debug("[ProviderPerformance] Load failed", exc_info=True)
