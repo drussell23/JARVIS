@@ -70,11 +70,25 @@ def _detect_lang(file_path: str) -> str:
 
 
 def _short_id(op_id: str) -> str:
-    """Extract a short display ID from an op_id."""
-    if "-" in op_id:
-        parts = op_id.split("-")
-        return parts[1][:6] if len(parts) > 1 else op_id[:6]
-    return op_id[:6]
+    """Extract a unique short display ID from an op_id.
+
+    Op IDs use UUIDv7 format: ``op-019d6fbd-e010-7f4a-a118-7972ac22de4c-jarvis``
+    The first 12 hex chars are a millisecond timestamp (shared within a session).
+    We skip the ``op-`` prefix and timestamp, then take 6 chars from the random
+    portion to get a unique per-operation identifier.
+    """
+    # Strip the "op-" prefix and repo suffix, flatten hyphens
+    raw = op_id
+    if raw.startswith("op-"):
+        raw = raw[3:]
+    # Remove trailing repo name (e.g. "-jarvis")
+    # UUIDv7 is 32 hex + 4 hyphens = 36 chars
+    hex_only = raw.replace("-", "")
+    # Skip first 12 hex chars (timestamp), take 6 from the random portion
+    if len(hex_only) > 18:
+        return hex_only[12:18]
+    # Fallback: last 6 chars
+    return hex_only[-6:] if len(hex_only) >= 6 else hex_only
 
 
 def _prov(provider: str) -> str:
@@ -679,6 +693,9 @@ class SerpentTransport:
         self._op_providers: Dict[str, str] = {}
         self._boot_recovery_count: int = 0
         self._boot_recovery_flushed: bool = False
+        # Dedup: track which ops already displayed validation/synthesizing
+        self._validation_shown: set = set()
+        self._synthesizing_shown: set = set()
 
     async def send(self, msg: Any) -> None:
         """Handle a CommMessage and render via SerpentFlow."""
@@ -698,6 +715,9 @@ class SerpentTransport:
                     self._flow.console.print()
 
                 if payload.get("risk_tier") not in ("routing",):
+                    # New op — clear dedup sets so this op gets fresh display
+                    self._validation_shown.discard(op_id)
+                    self._synthesizing_shown.discard(op_id)
                     self._flow.op_started(
                         op_id=op_id,
                         goal=payload.get("goal", ""),
@@ -756,14 +776,16 @@ class SerpentTransport:
                             candidate_rationales=candidate_rationales,
                         )
 
-                # Validation
+                # Validation — dedup: show once per op (orchestrator emits per-candidate)
                 elif phase.upper() in ("VALIDATE", "VALIDATE_RETRY") and "test_passed" in payload:
-                    self._flow.op_validation(
-                        op_id=op_id,
-                        passed=payload.get("test_passed", False),
-                        test_count=payload.get("test_count", 0),
-                        failures=payload.get("test_failures", 0),
-                    )
+                    if op_id not in self._validation_shown:
+                        self._validation_shown.add(op_id)
+                        self._flow.op_validation(
+                            op_id=op_id,
+                            passed=payload.get("test_passed", False),
+                            test_count=payload.get("test_count", 0),
+                            failures=payload.get("test_failures", 0),
+                        )
 
                 # L2 repair
                 elif payload.get("l2_iteration") is not None:
@@ -782,13 +804,14 @@ class SerpentTransport:
                         op_id=op_id,
                     )
 
-                # Streaming code generation tokens
+                # Streaming — dedup: show synthesizing once per op
+                # (orchestrator emits streaming=start per retry attempt)
                 elif payload.get("streaming") == "start":
-                    provider = payload.get("provider", "unknown")
-                    self._op_providers[op_id] = provider
-                    self._flow.show_streaming_start(provider=provider, op_id=op_id)
-                elif payload.get("streaming") == "token":
-                    self._flow.show_streaming_token(payload.get("token", ""))
+                    if op_id not in self._synthesizing_shown:
+                        self._synthesizing_shown.add(op_id)
+                        provider = payload.get("provider", "unknown")
+                        self._op_providers[op_id] = provider
+                        self._flow.show_streaming_start(provider=provider, op_id=op_id)
                 elif payload.get("streaming") == "end":
                     self._flow.show_streaming_end()
 
