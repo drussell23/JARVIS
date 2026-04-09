@@ -558,6 +558,8 @@ class DoublewordProvider:
         """
         from backend.core.ouroboros.governance.providers import (
             _build_codegen_prompt,
+            _build_lean_codegen_prompt,
+            _should_use_lean_prompt,
             _parse_generation_response,
         )
         from datetime import datetime, timezone
@@ -574,13 +576,38 @@ class DoublewordProvider:
                 _mcp_tools = await self._mcp_client.discover_tools()
             except Exception:
                 pass
-        prompt = prompt_override or _build_codegen_prompt(
-            context,
-            repo_root=self._repo_root,
-            repo_roots=self._repo_roots or None,
-            force_full_content=True,
-            mcp_tools=_mcp_tools,
-        )
+
+        # P0.1: Lean tool-first prompt — 60-70% smaller than the full prompt.
+        # When Venom tool loop is available, send a minimal instruction and let
+        # the model pull context incrementally via read_file/search_code/etc.
+        # Manifesto §5: "Agentic intelligence handles the 5% that is novel."
+        _tools_available = self._tool_loop is not None
+        if prompt_override:
+            prompt = prompt_override
+        elif _should_use_lean_prompt(context, tools_enabled=_tools_available):
+            prompt = _build_lean_codegen_prompt(
+                context,
+                repo_root=self._repo_root,
+                repo_roots=self._repo_roots or None,
+                force_full_content=True,
+                mcp_tools=_mcp_tools,
+            )
+            logger.info(
+                "[DoublewordProvider] RT: using lean prompt (%d chars, ~%d tokens)",
+                len(prompt), len(prompt) // 4,
+            )
+        else:
+            prompt = _build_codegen_prompt(
+                context,
+                repo_root=self._repo_root,
+                repo_roots=self._repo_roots or None,
+                force_full_content=True,
+                mcp_tools=_mcp_tools,
+            )
+            logger.info(
+                "[DoublewordProvider] RT: using full prompt (%d chars, ~%d tokens)",
+                len(prompt), len(prompt) // 4,
+            )
 
         _SYSTEM_PROMPT = (
             "You are a code generation assistant for the JARVIS Trinity AI Ecosystem. "

@@ -114,7 +114,7 @@ def _resolve_effective_repo_root(
 
 # ── Tool-use interface ────────────────────────────────────────────────
 _TOOL_SCHEMA_VERSION = "2b.2-tool"
-MAX_TOOL_ITERATIONS  = 5
+MAX_TOOL_ITERATIONS  = int(os.environ.get("JARVIS_MAX_TOOL_ITERATIONS", "15"))
 MAX_TOOL_LOOP_CHARS  = 32_000   # hard accumulated-prompt budget
 
 
@@ -692,6 +692,303 @@ def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str
     )
     return base
 
+
+# ---------------------------------------------------------------------------
+# Lean Tool-First Prompt Builder (P0.1)
+# ---------------------------------------------------------------------------
+# Manifesto §5: "Deterministic code handles the 95% known path with
+# nanosecond precision.  Agentic intelligence handles the 5% that is
+# novel, fuzzy, or compositional."
+#
+# The old prompt front-loads everything (full file, imports, tests,
+# manifesto, plan, structural index) into a single 30-50K token mega-
+# prompt.  DW 397B burns its entire time budget parsing this before it
+# can generate.
+#
+# The lean prompt follows the CC pattern: send a minimal instruction
+# with tool access.  Let the model pull what it needs incrementally.
+# The skeleton (prompt structure) is deterministic; the nervous system
+# (tool loop) is agentic.
+#
+# Prompt budget targets:
+#   - Trivial ops:  ~2K tokens (no tool loop, direct patch)
+#   - Standard ops: ~4K tokens (lean prompt + Venom tools)
+#   - Complex ops:  ~8K tokens (lean prompt + plan + Venom tools)
+#   - Full prompt:  only when tools are disabled (batch fallback)
+# ---------------------------------------------------------------------------
+
+# Lean prompt: aggressive file truncation — model uses read_file for details
+_LEAN_TARGET_REGION_LINES = int(os.environ.get("JARVIS_LEAN_REGION_LINES", "100"))
+_LEAN_MAX_FILE_CHARS = 4000      # ~1K tokens — just enough for orientation
+_LEAN_STRATEGIC_CHARS = 600      # ~150 tokens — compressed manifesto essence
+
+
+def _extract_target_region(
+    content: str,
+    description: str,
+    max_lines: int = _LEAN_TARGET_REGION_LINES,
+) -> str:
+    """Extract the most relevant region of a file for the lean prompt.
+
+    Strategy:
+    1. If the description mentions a line number, centre on that.
+    2. If it mentions a function/class name, find it in the file.
+    3. Otherwise, return the first ``max_lines`` lines (the most common
+       location for imports, module-level logic, and initial classes).
+
+    Returns a string with line numbers prefixed (``NNN | code``).
+    """
+    lines = content.splitlines()
+    if not lines:
+        return ""
+
+    start = 0
+
+    # Strategy 1: explicit line reference in description
+    import re as _re
+    _line_match = _re.search(r"(?:line|L)\s*(\d+)", description, _re.IGNORECASE)
+    if _line_match:
+        target_line = int(_line_match.group(1)) - 1  # 0-indexed
+        start = max(0, target_line - max_lines // 2)
+
+    # Strategy 2: function/class name reference
+    if start == 0 and description:
+        # Extract potential symbol names (words with underscores or CamelCase)
+        _symbols = _re.findall(r"\b([A-Z][a-zA-Z0-9]+|[a-z_][a-z0-9_]{3,})\b", description)
+        for sym in _symbols[:5]:  # check first 5 candidates
+            for i, line in enumerate(lines):
+                if (f"def {sym}" in line or f"class {sym}" in line
+                        or f"def {sym}(" in line or f"class {sym}(" in line):
+                    start = max(0, i - 5)  # 5 lines before the definition
+                    break
+            if start > 0:
+                break
+
+    end = min(start + max_lines, len(lines))
+    region = lines[start:end]
+
+    # Format with line numbers for precise tool-call references
+    numbered = "\n".join(f"{start + i + 1:4d} | {line}" for i, line in enumerate(region))
+
+    # Add truncation markers
+    header = ""
+    footer = ""
+    if start > 0:
+        header = f"[... {start} lines above ...]\n"
+    if end < len(lines):
+        footer = f"\n[... {len(lines) - end} lines below ...]"
+
+    return f"{header}{numbered}{footer}"
+
+
+def _build_lean_strategic_context() -> str:
+    """Return a compressed Manifesto essence for lean prompts (~150 tokens).
+
+    The full strategic digest is ~2000 tokens.  For tool-first prompts,
+    we inject only the actionable engineering principles — the boundary
+    between deterministic and agentic.
+    """
+    return (
+        "## Engineering Principles (Symbiotic AI-Native Manifesto)\n"
+        "- Structural repair, not brute-force retries or bypasses\n"
+        "- Minimal edits — preserve existing behaviour, match code style\n"
+        "- Explore before modifying — read the code, check dependents\n"
+        "- No hardcoded models, no blocking calls on the event loop\n"
+        "- async-first (asyncio.wait_for, not asyncio.timeout)\n"
+        "- Zero polling. Pure reflex. Event-driven where possible\n"
+        "- from __future__ import annotations in all files\n"
+        "- Absolute observability — every autonomous decision visible"
+    )
+
+
+def _build_lean_codegen_prompt(
+    ctx: "OperationContext",
+    repo_root: Optional[Path] = None,
+    repo_roots: Optional[Dict[str, Path]] = None,
+    force_full_content: bool = False,
+    mcp_tools: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Build a lean, tool-first generation prompt (~3-6K tokens).
+
+    Unlike ``_build_codegen_prompt`` which front-loads full file contents,
+    import context, test context, and expanded context into a single
+    mega-prompt, this builder follows the CC pattern:
+
+    1. **Minimal instruction** — task description + target file metadata
+    2. **Target region** — the ~100-line region most relevant to the task
+    3. **Structural index** — function/class signatures (what already exists)
+    4. **Tool instructions** — how to use Venom tools to gather more context
+    5. **Output schema** — what format to respond in
+
+    The model uses ``read_file``, ``search_code``, ``get_callers`` etc. to
+    gather whatever additional context it needs.  This reduces the initial
+    prompt from ~30-50K tokens to ~3-6K tokens, letting DW 397B respond
+    within its time budget.
+
+    Manifesto §5: "Deterministic code is the skeleton — fast, reliable,
+    secure.  Agentic intelligence is the nervous system — adaptive,
+    creative, fluid."
+    """
+    from backend.core.ouroboros.governance.test_runner import BlockedPathError
+
+    if repo_root is None:
+        repo_root = Path.cwd()
+    effective_root = _resolve_effective_repo_root(ctx, repo_root, repo_roots)
+
+    parts: List[str] = []
+
+    # ── 1. Human instructions (always first if present) ─────────────────
+    _human_instr = getattr(ctx, "human_instructions", "") or ""
+    if isinstance(_human_instr, str) and _human_instr.strip():
+        parts.append(f"## Human Instructions\n\n{_human_instr.strip()}\n\n---")
+
+    # ── 2. Task description ─────────────────────────────────────────────
+    parts.append(f"## Task\nOp-ID: {ctx.op_id}\nGoal: {ctx.description}")
+
+    # ── 3. Compressed strategic context (~150 tokens vs ~2000) ──────────
+    parts.append(_build_lean_strategic_context())
+
+    # ── 4. Implementation plan (if available — already compact) ─────────
+    _impl_plan = getattr(ctx, "implementation_plan", "")
+    if isinstance(_impl_plan, str) and _impl_plan.strip():
+        try:
+            from backend.core.ouroboros.governance.plan_generator import PlanResult
+            _plan_data = json.loads(_impl_plan)
+            _pr = PlanResult(
+                plan_json=_impl_plan,
+                approach=_plan_data.get("approach", ""),
+                complexity=_plan_data.get("complexity", "moderate"),
+                ordered_changes=_plan_data.get("ordered_changes", []),
+                risk_factors=_plan_data.get("risk_factors", []),
+                test_strategy=_plan_data.get("test_strategy", ""),
+                architectural_notes=_plan_data.get("architectural_notes", ""),
+            )
+            _plan_section = _pr.to_prompt_section()
+            if _plan_section:
+                parts.append(_plan_section)
+        except Exception:
+            pass  # Plan parsing failed — skip, model will explore
+
+    # ── 5. Session lessons (compact, direct from prior ops) ─────────────
+    _session_lessons = getattr(ctx, "session_lessons", "")
+    if isinstance(_session_lessons, str) and _session_lessons.strip():
+        parts.append(
+            "## Session Lessons\n\n" + _session_lessons.strip()
+        )
+
+    # ── 6. Target file metadata + region (the core lean payload) ────────
+    for raw_path in ctx.target_files:
+        abs_path = (
+            Path(raw_path) if Path(raw_path).is_absolute()
+            else (effective_root / raw_path).resolve()
+        )
+        try:
+            abs_path = _safe_context_path(effective_root, abs_path)
+        except BlockedPathError as exc:
+            parts.append(f"## File: {raw_path}\n[BLOCKED: {exc}]")
+            continue
+
+        if not abs_path.is_file():
+            parts.append(
+                f"## Target: {raw_path}\n"
+                f"File does not exist yet. Use `read_file` or `list_dir` "
+                f"to explore the directory structure before creating it."
+            )
+            continue
+
+        content = abs_path.read_text(encoding="utf-8", errors="replace")
+        source_hash = _file_source_hash(content)
+        size_bytes = len(content.encode())
+        line_count = content.count("\n")
+
+        # Structural index — what already exists (prevents duplication)
+        func_idx = ""
+        if abs_path.suffix == ".py":
+            try:
+                func_idx = _build_function_index(content, str(abs_path))
+            except Exception:
+                pass
+
+        # Target region — the most relevant ~100 lines
+        region = _extract_target_region(content, ctx.description)
+
+        parts.append(
+            f"## Target: {raw_path} "
+            f"[SHA-256: {source_hash[:12]}] "
+            f"[{size_bytes} bytes, {line_count} lines]\n"
+        )
+        if func_idx:
+            parts.append(func_idx)
+        parts.append(
+            f"### Target Region (use `read_file(\"{raw_path}\")` for full content)\n"
+            f"```\n{region}\n```"
+        )
+
+    # ── 7. Tool instructions (always included in lean mode) ─────────────
+    parts.append(_build_tool_section(mcp_tools=mcp_tools))
+
+    # ── 8. Output schema ────────────────────────────────────────────────
+    # Lean mode always uses full_content schema — simpler for the model
+    # and avoids diff-anchoring issues with partial source snapshots.
+    schema_instruction = f"""## Output Schema
+
+After exploring with tools, return a JSON object matching **exactly** this structure (schema_version: "{_SCHEMA_VERSION}"):
+
+```json
+{{
+  "schema_version": "{_SCHEMA_VERSION}",
+  "candidates": [
+    {{
+      "candidate_id": "c1",
+      "file_path": "<repo-relative path matching the target file>",
+      "full_content": "<complete modified file content — not a diff>",
+      "rationale": "<one sentence, max 200 chars>"
+    }}
+  ],
+  "provider_metadata": {{
+    "model_id": "<your model identifier>",
+    "reasoning_summary": "<max 200 chars>"
+  }}
+}}
+```
+
+Rules:
+- **Explore first**: Use `read_file` to read the full target file before generating.
+  Use `search_code` or `get_callers` to check what depends on code you're changing.
+- `full_content` must be the **complete** file (not a diff or patch).
+- Python files must be syntactically valid (`ast.parse()`-clean).
+- If the change is already implemented, return `{{"schema_version": "2b.1-noop", "reason": "<why>"}}`.
+- No extra keys. Return ONLY the JSON object."""
+    parts.append(schema_instruction)
+
+    return "\n\n".join(parts)
+
+
+def _should_use_lean_prompt(
+    ctx: "OperationContext",
+    tools_enabled: bool,
+    force_full: bool = False,
+) -> bool:
+    """Decide whether to use the lean tool-first prompt.
+
+    Lean prompt is used when:
+    1. Tools are enabled (Venom tool loop available)
+    2. Not a cross-repo operation (lean doesn't support 2c.1/2d.1 schemas)
+    3. Not explicitly forced to full mode
+    4. Not a repair iteration (repair needs the full candidate in-prompt)
+
+    Returns True if the lean prompt should be used.
+    """
+    if force_full:
+        return False
+    if not tools_enabled:
+        return False
+    if getattr(ctx, "cross_repo", False):
+        return False
+    # Env override: JARVIS_LEAN_PROMPT=false to disable
+    if os.environ.get("JARVIS_LEAN_PROMPT", "true").lower() == "false":
+        return False
+    return True
 
 
 def _build_codegen_prompt(
@@ -2032,15 +2329,32 @@ class PrimeProvider:
                 _mcp_tools = await self._mcp_client.discover_tools()
             except Exception:
                 pass
-        prompt = _build_codegen_prompt(
-            context,
-            repo_root=repo_root,
-            repo_roots=self._repo_roots,
-            tools_enabled=self._tools_enabled,
-            force_full_content=_force_full,
-            repair_context=repair_context,
-            mcp_tools=_mcp_tools,
-        )
+        # P0.1: Lean prompt when tool loop is available and not repairing
+        if (
+            repair_context is None
+            and _should_use_lean_prompt(context, tools_enabled=self._tools_enabled)
+        ):
+            prompt = _build_lean_codegen_prompt(
+                context,
+                repo_root=repo_root,
+                repo_roots=self._repo_roots,
+                force_full_content=_force_full,
+                mcp_tools=_mcp_tools,
+            )
+            logger.info(
+                "[ClaudeProvider] Using lean prompt (%d chars, ~%d tokens)",
+                len(prompt), len(prompt) // 4,
+            )
+        else:
+            prompt = _build_codegen_prompt(
+                context,
+                repo_root=repo_root,
+                repo_roots=self._repo_roots,
+                tools_enabled=self._tools_enabled,
+                force_full_content=_force_full,
+                repair_context=repair_context,
+                mcp_tools=_mcp_tools,
+            )
         accumulated_chars = len(prompt)
         tool_rounds = 0
         start = time.monotonic()
@@ -2380,14 +2694,30 @@ class ClaudeProvider:
                 _mcp_tools = await self._mcp_client.discover_tools()
             except Exception:
                 pass
-        prompt_text = _build_codegen_prompt(
-            context,
-            repo_root=repo_root,
-            repo_roots=self._repo_roots,
-            tools_enabled=self._tools_enabled,
-            repair_context=repair_context,
-            mcp_tools=_mcp_tools,
-        )
+        # P0.1: Lean prompt when tool loop is available and not repairing
+        if (
+            repair_context is None
+            and _should_use_lean_prompt(context, tools_enabled=self._tools_enabled)
+        ):
+            prompt_text = _build_lean_codegen_prompt(
+                context,
+                repo_root=repo_root,
+                repo_roots=self._repo_roots,
+                mcp_tools=_mcp_tools,
+            )
+            logger.info(
+                "[ClaudeAPI] Using lean prompt (%d chars, ~%d tokens)",
+                len(prompt_text), len(prompt_text) // 4,
+            )
+        else:
+            prompt_text = _build_codegen_prompt(
+                context,
+                repo_root=repo_root,
+                repo_roots=self._repo_roots,
+                tools_enabled=self._tools_enabled,
+                repair_context=repair_context,
+                mcp_tools=_mcp_tools,
+            )
         # Build messages array for multi-turn conversation
         messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt_text}]
         accumulated_chars = len(prompt_text)
