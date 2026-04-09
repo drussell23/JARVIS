@@ -768,6 +768,16 @@ class CandidateGenerator:
                                 return result
                         except (asyncio.TimeoutError, asyncio.CancelledError):
                             pass
+                        except Exception as ext_exc:
+                            # DW returned content during grace period but it
+                            # failed parsing (e.g. json_parse_error).  Fall
+                            # through to Claude cascade instead of escaping.
+                            _mode = FailbackStateMachine.classify_exception(ext_exc)
+                            logger.warning(
+                                "[CandidateGenerator] Tier 0 RT: grace-period "
+                                "content failed (mode=%s, %s). Cascading.",
+                                _mode.name, ext_exc,
+                            )
                         _gen_task.cancel()
                     else:
                         _gen_task.cancel()
