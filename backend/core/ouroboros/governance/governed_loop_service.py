@@ -754,6 +754,8 @@ class GovernedLoopService:
         self._active_ops: Set[str] = set()
         self._active_file_ops: Set[str] = set()  # canonical file paths currently in-flight
         self._completed_ops: Dict[str, OperationResult] = {}
+        # Cooperative cancellation: op_ids requested for cancel via REPL /cancel
+        self._cancel_requested: Set[str] = set()
 
     @property
     def state(self) -> ServiceState:
@@ -1085,6 +1087,25 @@ class GovernedLoopService:
         if self._bg_pool is not None:
             return self._bg_pool.get_result(op_id)
         return None
+
+    def request_cancel(self, op_id: str) -> bool:
+        """Request cooperative cancellation of an in-flight operation.
+
+        The orchestrator checks ``is_cancel_requested()`` at phase transitions.
+        Returns True if the op was found active and the cancel was registered.
+        """
+        # Match by prefix — REPL users may provide abbreviated op_ids
+        matched = [k for k in self._active_ops if k.startswith(op_id)]
+        if not matched:
+            return False
+        for m in matched:
+            self._cancel_requested.add(m)
+        logger.info("[GovernedLoop] Cancel requested for op(s): %s", matched)
+        return True
+
+    def is_cancel_requested(self, op_id: str) -> bool:
+        """Check if cancellation was requested for this operation."""
+        return op_id in self._cancel_requested
 
     async def submit(
         self,

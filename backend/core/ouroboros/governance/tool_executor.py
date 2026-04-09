@@ -1320,6 +1320,13 @@ class ToolLoopCoordinator:
         self._tool_round_max_tokens: int = int(
             os.environ.get("JARVIS_TOOL_ROUND_MAX_TOKENS", "1024")
         )
+        # Exploration budget: cap exploration-only rounds to prevent unbounded
+        # codebase scanning before generation.  When exceeded, the model gets
+        # a nudge to produce its final answer.
+        self._max_exploration_rounds: int = int(
+            os.environ.get("JARVIS_MAX_EXPLORATION_ROUNDS", "5")
+        )
+        self._EXPLORATION_TOOLS: frozenset = frozenset({"read_file", "search_code", "get_callers"})
 
     async def run(
         self,
@@ -1348,6 +1355,7 @@ class ToolLoopCoordinator:
         # answer (no tool call) or the deadline expires. max_rounds is a
         # safety ceiling, not the primary termination condition.
         round_index = -1
+        _explore_only_rounds = 0
         while True:
             round_index += 1
 
@@ -1519,6 +1527,23 @@ class ToolLoopCoordinator:
 
             self._last_records = list(records)
             current_prompt += prompt_appendix
+
+            # ── Exploration budget enforcement ──
+            # Count rounds where ONLY exploration tools were called.
+            # When the cap is reached, inject a nudge to produce the final answer.
+            _round_tool_names = {tc.name for tc, *_ in exec_results} if exec_results else set()
+            if _round_tool_names and _round_tool_names <= self._EXPLORATION_TOOLS:
+                _explore_only_rounds += 1
+                if _explore_only_rounds >= self._max_exploration_rounds:
+                    current_prompt += (
+                        "\n\n[SYSTEM] You have reached the exploration budget "
+                        f"({self._max_exploration_rounds} exploration-only rounds). "
+                        "You have enough context. Produce your final code change now.\n"
+                    )
+                    logger.info(
+                        "[ToolLoop] Exploration budget reached (%d rounds) for %s, nudging generation",
+                        _explore_only_rounds, op_id[:12],
+                    )
 
             if len(current_prompt) > _MAX_PROMPT_CHARS:
                 raise RuntimeError(f"tool_loop_budget_exceeded:{len(current_prompt)}")

@@ -76,12 +76,16 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capabilities:
 
 - **4-tier risk escalation**: `SAFE_AUTO` / `NOTIFY_APPLY` / `APPROVAL_REQUIRED` / `BLOCKED` -- Green/Yellow auto-apply, Orange blocks for human
-- **Exploration-first**: Generation prompt requires 2+ tool calls before any patch. Read first, write second.
-- **Post-apply verification**: Scoped test run after APPLY, routes failures to L2 repair before rollback
-- **Session intelligence**: `_session_lessons` buffer (20 max) injected into generation prompts via `OperationContext.session_lessons`
-- **Cost-aware priority**: `_compute_priority()` in intake router factors urgency, file count, confidence
-- **Dependency DAG**: `_active_file_ops` in intake router prevents conflicting concurrent patches on same files
-- **Per-op reasoning**: Model rationale captured at GENERATE, displayed in SerpentFlow `Update` blocks
+- **Exploration-first**: Generation prompt requires 2+ tool calls before any patch. Enforced at VALIDATE gate + budget cap in tool loop.
+- **Post-apply verification**: Scoped test run after APPLY, routes failures to L2 repair. L2 candidate now applied via change_engine.
+- **Session intelligence**: `_session_lessons` buffer (20 max) with infra/code tagging. Convergence metric auto-clears misleading lessons.
+- **Cost-aware priority**: `_compute_priority()` factors urgency, file count, confidence, dependency credit (capped at 3).
+- **Dependency DAG**: `_active_file_ops` with TTL-based stale lock release (`JARVIS_FILE_LOCK_TTL_S`, default 300s).
+- **Signal coalescing**: Same-file signals merged into single operation within `JARVIS_COALESCE_WINDOW_S` (default 30s).
+- **Stale exploration guard**: File hashes snapshotted at GENERATE, verified at APPLY. Stale candidates logged.
+- **REPL /cancel**: `cancel <op-id>` cooperative cancellation, checked at GENERATE and APPLY phase boundaries.
+- **Diff preview for Yellow**: `JARVIS_NOTIFY_APPLY_DELAY_S` (default 5s) delay with diff rendered before auto-apply.
+- **Per-op reasoning**: Model rationale captured at GENERATE, displayed in SerpentFlow `Update` blocks.
 
 ## Battle Test
 

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import hashlib
 import logging
 import os
 import tempfile
@@ -234,9 +235,22 @@ class GovernedOrchestrator:
         # Accumulates compact lessons from completed/failed ops within this
         # session.  Injected into subsequent generation prompts so the model
         # avoids repeating mistakes and builds on successes.
-        self._session_lessons: list = []  # List[str]
+        # Thread-safety: safe under asyncio single-threaded event loop.
+        # If the orchestrator ever moves to multi-threaded execution,
+        # wrap accesses in an asyncio.Lock.
+        self._session_lessons: list = []  # List[Tuple[str, str]] — (lesson_type, lesson_text)
         _max = int(os.environ.get("JARVIS_SESSION_LESSONS_MAX", "20"))
         self._session_lessons_max: int = max(5, _max)
+
+        # ── Session intelligence convergence metric ──
+        # Tracks success rate before/after first lesson to detect poisoned lessons.
+        self._ops_before_lesson: int = 0  # ops completed before first lesson recorded
+        self._ops_before_lesson_success: int = 0
+        self._ops_after_lesson: int = 0  # ops completed after first lesson recorded
+        self._ops_after_lesson_success: int = 0
+        self._convergence_check_interval: int = int(
+            os.environ.get("JARVIS_LESSON_CONVERGENCE_CHECK_INTERVAL", "10")
+        )
 
         # RSI Convergence Framework — lazy initialization
         self._rsi_score_function = None
@@ -291,6 +305,13 @@ class GovernedOrchestrator:
     def set_exploration_fleet(self, fleet: Any) -> None:
         """Attach an ExplorationFleet for parallel codebase exploration."""
         self._exploration_fleet = fleet
+
+    def _is_cancel_requested(self, op_id: str) -> bool:
+        """Check if REPL /cancel was requested for this operation."""
+        _gls = getattr(self._stack, "governed_loop_service", None)
+        if _gls is not None and hasattr(_gls, "is_cancel_requested"):
+            return _gls.is_cancel_requested(op_id)
+        return False
 
     async def run(self, ctx: OperationContext) -> OperationContext:
         """Execute the full governed pipeline, returning the terminal context.
@@ -1072,6 +1093,12 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] Self-evolution P2 injection failed", exc_info=True)
 
+        # ── Cooperative cancellation check (pre-GENERATE) ──
+        if self._is_cancel_requested(ctx.op_id):
+            ctx = ctx.advance(OperationPhase.CANCELLED, terminal_reason_code="user_cancelled")
+            await self._record_ledger(ctx, OperationState.FAILED, {"reason": "user_cancelled"})
+            return ctx
+
         if _serpent: _serpent.update_phase("GENERATE")
         # ---- Phase 3: GENERATE (with retry + episodic failure memory) ----
         generation: Optional[GenerationResult] = None
@@ -1099,6 +1126,18 @@ class GovernedOrchestrator:
                     ctx,
                     session_lessons=_lessons_text,
                 )
+
+        # ── Stale-exploration guard: snapshot file hashes at GENERATE time ──
+        _gen_hashes: list = []
+        for _tf in ctx.target_files:
+            _tf_path = self._config.project_root / _tf
+            try:
+                _tf_bytes = _tf_path.read_bytes()
+                _gen_hashes.append((_tf, hashlib.sha256(_tf_bytes).hexdigest()))
+            except (OSError, IOError):
+                _gen_hashes.append((_tf, ""))  # new file — no hash
+        if _gen_hashes:
+            ctx = dataclasses.replace(ctx, generate_file_hashes=tuple(_gen_hashes))
 
         for attempt in range(1 + self._config.max_generate_retries):
             try:
@@ -1369,6 +1408,27 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] LSP check skipped", exc_info=True)
 
+        # ── Exploration-first enforcement ──
+        # Verify the model explored (read_file, search_code, get_callers)
+        # before proposing writes.  Soft gate: warn + flag, don't reject.
+        _EXPLORATION_TOOLS = frozenset({"read_file", "search_code", "get_callers"})
+        _min_explore = int(os.environ.get("JARVIS_MIN_EXPLORATION_CALLS", "2"))
+        _exploration_count = 0
+        _exploration_first_ok = True
+        if generation.tool_execution_records:
+            for _rec in generation.tool_execution_records:
+                _tname = getattr(_rec, "tool_name", "")
+                if _tname in _EXPLORATION_TOOLS:
+                    _exploration_count += 1
+            if _exploration_count < _min_explore:
+                _exploration_first_ok = False
+                logger.warning(
+                    "[Orchestrator] Exploration-first violation: %d/%d exploration calls "
+                    "(expected >= %d) for op %s — candidate may lack codebase context",
+                    _exploration_count, len(generation.tool_execution_records),
+                    _min_explore, ctx.op_id[:12],
+                )
+
         best_candidate: Optional[Dict[str, Any]] = None
         best_validation: Optional[ValidationResult] = None
         validate_retries_remaining = self._config.max_validate_retries
@@ -1421,6 +1481,8 @@ class GovernedOrchestrator:
                     "duration_s": round(_validate_duration_s, 3),
                     "provider": generation.provider_name,
                     "model": getattr(generation, "model_id", ""),
+                    "exploration_first_ok": _exploration_first_ok,
+                    "exploration_count": _exploration_count,
                 })
 
                 # Heartbeat: validation result for TUI (Manifesto §7)
@@ -1954,7 +2016,7 @@ class GovernedOrchestrator:
                 ctx.op_id,
             )
 
-        # ---- Phase 5b: NOTIFY_APPLY (Yellow — auto-apply with prominent CLI notice) ----
+        # ---- Phase 5b: NOTIFY_APPLY (Yellow — auto-apply with prominent CLI notice + diff preview) ----
         if risk_tier is RiskTier.NOTIFY_APPLY:
             _reason = getattr(ctx, "risk_reason_code", "notify_apply")
             logger.info(
@@ -1970,6 +2032,51 @@ class GovernedOrchestrator:
                 )
             except Exception:
                 pass
+
+            # Render diff preview in CLI before auto-apply
+            _notify_delay_s = float(os.environ.get("JARVIS_NOTIFY_APPLY_DELAY_S", "5"))
+            if best_candidate is not None and _notify_delay_s > 0:
+                _diff_preview = (
+                    best_candidate.get("unified_diff")
+                    or best_candidate.get("full_content", "")
+                )
+                if _diff_preview:
+                    # Emit diff via heartbeat so SerpentFlow renders it
+                    try:
+                        for _t in getattr(self._stack.comm, "_transports", []):
+                            try:
+                                _preview_msg = type("_Msg", (), {
+                                    "payload": {
+                                        "phase": "notify_apply_diff",
+                                        "diff_preview": str(_diff_preview)[:4000],
+                                        "delay_s": _notify_delay_s,
+                                        "target_files": list(ctx.target_files),
+                                    },
+                                    "op_id": ctx.op_id,
+                                    "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                                })()
+                                await _t.send(_preview_msg)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # Delay window — /reject during this window triggers cancellation
+                    logger.info(
+                        "[Orchestrator] NOTIFY_APPLY diff preview shown, waiting %.0fs for /reject",
+                        _notify_delay_s,
+                    )
+                    await asyncio.sleep(_notify_delay_s)
+                    # Check if user cancelled during the window
+                    if self._is_cancel_requested(ctx.op_id):
+                        ctx = ctx.advance(
+                            OperationPhase.CANCELLED,
+                            terminal_reason_code="user_rejected_notify_apply",
+                        )
+                        await self._record_ledger(
+                            ctx, OperationState.FAILED,
+                            {"reason": "user_rejected_notify_apply"},
+                        )
+                        return ctx
 
         # ---- Phase 6: APPROVE (conditional) ----
         if risk_tier is RiskTier.APPROVAL_REQUIRED:
@@ -2047,6 +2154,12 @@ class GovernedOrchestrator:
             except Exception:
                 pass
 
+        # ── Cooperative cancellation check (pre-APPLY) ──
+        if self._is_cancel_requested(ctx.op_id):
+            ctx = ctx.advance(OperationPhase.CANCELLED, terminal_reason_code="user_cancelled")
+            await self._record_ledger(ctx, OperationState.FAILED, {"reason": "user_cancelled"})
+            return ctx
+
         # ---- Phase 7: APPLY ----
         ctx = ctx.advance(OperationPhase.APPLY)
 
@@ -2087,6 +2200,32 @@ class GovernedOrchestrator:
                     best_candidate,
                 )
             return await self._execute_saga_apply(ctx, best_candidate)
+
+        # ── Stale-exploration guard: check hashes before APPLY ──
+        # If a target file was modified by a concurrent operation since GENERATE,
+        # the candidate is stale.  Log a warning (soft gate) — the apply proceeds
+        # but the ledger records the staleness for future convergence analysis.
+        _stale_files: list = []
+        if ctx.generate_file_hashes:
+            for _ghf, _ghash in ctx.generate_file_hashes:
+                if not _ghash:
+                    continue  # new file at GENERATE time, skip
+                _ghf_path = self._config.project_root / _ghf
+                try:
+                    _now_hash = hashlib.sha256(_ghf_path.read_bytes()).hexdigest()
+                except (OSError, IOError):
+                    continue  # file deleted — different problem
+                if _now_hash != _ghash:
+                    _stale_files.append(_ghf)
+            if _stale_files:
+                logger.warning(
+                    "[Orchestrator] Stale-exploration: %d file(s) changed between GENERATE and APPLY: %s [%s]",
+                    len(_stale_files), _stale_files[:3], ctx.op_id[:12],
+                )
+                await self._record_ledger(ctx, OperationState.APPLYING, {
+                    "event": "stale_exploration_detected",
+                    "stale_files": _stale_files,
+                })
 
         # Capture pre-apply snapshots for complexity baseline
         snapshots: Dict[str, str] = {}
@@ -2672,6 +2811,45 @@ class GovernedOrchestrator:
             # Cap to prevent unbounded growth
             if len(self._session_lessons) > self._session_lessons_max:
                 self._session_lessons = self._session_lessons[-self._session_lessons_max:]
+
+            # ── Convergence metric: track success rate before/after first lesson ──
+            _has_lessons = len(self._session_lessons) > 1  # >1 = lessons exist from prior ops
+            if _has_lessons:
+                self._ops_after_lesson += 1
+                if _is_success:
+                    self._ops_after_lesson_success += 1
+                # Periodic check: if post-lesson success rate is worse, clear lessons
+                if (self._ops_after_lesson > 0
+                        and self._ops_after_lesson % self._convergence_check_interval == 0):
+                    _pre_rate = (
+                        self._ops_before_lesson_success / max(1, self._ops_before_lesson)
+                    )
+                    _post_rate = (
+                        self._ops_after_lesson_success / max(1, self._ops_after_lesson)
+                    )
+                    if _post_rate < _pre_rate and self._ops_before_lesson >= 3:
+                        logger.warning(
+                            "[Orchestrator] Session intelligence convergence NEGATIVE: "
+                            "pre-lesson %.0f%% (%d/%d) > post-lesson %.0f%% (%d/%d) — clearing lesson buffer",
+                            _pre_rate * 100, self._ops_before_lesson_success, self._ops_before_lesson,
+                            _post_rate * 100, self._ops_after_lesson_success, self._ops_after_lesson,
+                        )
+                        self._session_lessons.clear()
+                        # Reset counters so the metric starts fresh
+                        self._ops_before_lesson = self._ops_after_lesson
+                        self._ops_before_lesson_success = self._ops_after_lesson_success
+                        self._ops_after_lesson = 0
+                        self._ops_after_lesson_success = 0
+                    else:
+                        logger.info(
+                            "[Orchestrator] Session intelligence convergence OK: "
+                            "pre-lesson %.0f%% post-lesson %.0f%%",
+                            _pre_rate * 100, _post_rate * 100,
+                        )
+            else:
+                self._ops_before_lesson += 1
+                if _is_success:
+                    self._ops_before_lesson_success += 1
         except Exception:
             pass  # Session lessons are best-effort
 

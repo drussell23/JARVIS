@@ -166,6 +166,17 @@ class UnifiedIntakeRouter:
             os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300")
         )
 
+        # ── Signal coalescing buffer ──
+        # Envelopes targeting overlapping files within a window are merged into
+        # a single multi-goal operation before dispatch (reduces cost by N×).
+        # HIGH urgency signals bypass coalescing and dispatch immediately.
+        self._coalesce_window_s: float = float(
+            os.environ.get("JARVIS_COALESCE_WINDOW_S", "30")
+        )
+        # Maps frozenset(target_files) key -> (first_arrival_monotonic, [envelopes])
+        self._coalesce_buffer: Dict[str, List[IntentEnvelope]] = {}
+        self._coalesce_timestamps: Dict[str, float] = {}  # key -> first arrival
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -311,27 +322,117 @@ class UnifiedIntakeRouter:
     # Dispatch loop
     # ------------------------------------------------------------------
 
+    def _coalesce_key(self, envelope: IntentEnvelope) -> str:
+        """Key for grouping envelopes that target overlapping files."""
+        return "|".join(sorted(envelope.target_files)) if envelope.target_files else ""
+
+    def _flush_coalesced(self, key: str) -> Optional[IntentEnvelope]:
+        """Merge buffered envelopes for *key* into a single multi-goal envelope.
+
+        Returns the merged envelope, or None if the buffer is empty.
+        """
+        envelopes = self._coalesce_buffer.pop(key, [])
+        self._coalesce_timestamps.pop(key, None)
+        if not envelopes:
+            return None
+        if len(envelopes) == 1:
+            return envelopes[0]
+        # Merge: union target_files, combine descriptions, keep highest urgency
+        _all_files: list = []
+        _descs: list = []
+        _urgency_rank = {"high": 0, "medium": 1, "low": 2}
+        _best_urgency = "low"
+        for env in envelopes:
+            _all_files.extend(env.target_files)
+            _descs.append(env.description)
+            if _urgency_rank.get(env.urgency, 2) < _urgency_rank.get(_best_urgency, 2):
+                _best_urgency = env.urgency
+        _merged_files = tuple(dict.fromkeys(_all_files))  # dedup, preserve order
+        _merged_desc = " | ".join(_descs)
+        logger.info(
+            "[Router] Coalesced %d signals targeting %s into single operation",
+            len(envelopes), list(_merged_files)[:3],
+        )
+        # Use the first envelope as base, replace merged fields
+        base = envelopes[0]
+        return IntentEnvelope(
+            schema_version=base.schema_version,
+            source=base.source,
+            description=_merged_desc,
+            target_files=_merged_files,
+            repo=base.repo,
+            confidence=max(e.confidence for e in envelopes),
+            urgency=_best_urgency,
+            dedup_key=base.dedup_key,
+            causal_id=base.causal_id,
+            signal_id=base.signal_id,
+            idempotency_key=base.idempotency_key,
+            lease_id=base.lease_id,
+            evidence=base.evidence,
+            requires_human_ack=any(e.requires_human_ack for e in envelopes),
+            submitted_at=base.submitted_at,
+        )
+
     async def _dispatch_loop(self) -> None:
-        """Background task: drain the priority queue and call GLS.submit()."""
+        """Background task: drain the priority queue and call GLS.submit().
+
+        Applies a coalescing window: envelopes targeting overlapping files
+        are buffered for up to ``_coalesce_window_s`` before dispatch.
+        HIGH urgency signals bypass coalescing.
+        """
         while self._running:
             try:
                 priority, ts, envelope = await asyncio.wait_for(
                     self._queue.get(), timeout=1.0
                 )
             except asyncio.TimeoutError:
+                # Flush any expired coalescing buffers
+                await self._flush_expired_coalesce_buffers()
                 continue
             except asyncio.CancelledError:
                 break
-            try:
-                await self._dispatch_one(envelope)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception(
-                    "Router: dispatch error for lease_id=%s", envelope.lease_id
-                )
-            finally:
-                self._queue.task_done()
+
+            # HIGH urgency: bypass coalescing, dispatch immediately
+            if envelope.urgency == "high" or self._coalesce_window_s <= 0:
+                try:
+                    await self._dispatch_one(envelope)
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    logger.exception(
+                        "Router: dispatch error for lease_id=%s", envelope.lease_id
+                    )
+                finally:
+                    self._queue.task_done()
+                continue
+
+            # Buffer for coalescing
+            _key = self._coalesce_key(envelope)
+            if _key not in self._coalesce_buffer:
+                self._coalesce_buffer[_key] = []
+                self._coalesce_timestamps[_key] = time.monotonic()
+            self._coalesce_buffer[_key].append(envelope)
+            self._queue.task_done()
+
+            # Flush if window expired
+            await self._flush_expired_coalesce_buffers()
+
+    async def _flush_expired_coalesce_buffers(self) -> None:
+        """Dispatch any coalescing buffers whose window has expired."""
+        _now = time.monotonic()
+        _expired_keys = [
+            k for k, ts in self._coalesce_timestamps.items()
+            if _now - ts >= self._coalesce_window_s
+        ]
+        for _key in _expired_keys:
+            merged = self._flush_coalesced(_key)
+            if merged is not None:
+                try:
+                    await self._dispatch_one(merged)
+                except Exception:
+                    logger.exception(
+                        "Router: dispatch error for coalesced key=%s", _key[:50]
+                    )
 
     @staticmethod
     def _is_runtime_task(envelope: IntentEnvelope) -> bool:

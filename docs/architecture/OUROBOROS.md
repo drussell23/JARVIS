@@ -577,6 +577,120 @@ WAL replay) use the composite score.
 
 ---
 
+## Edge Case Hardening (12 Refinements)
+
+These refinements close failure modes discovered during the first battle tests.
+
+### 8. Session Intelligence Poisoning Guard
+
+**Source**: `orchestrator.py` (`_INFRA_PATTERNS`, `_lesson_type`)
+
+Infrastructure failures (timeouts, provider outages, rate limits) are tagged
+as `"infra"` and excluded from the `## Session Lessons` injection into
+generation prompts. Only `"code"` lessons (actual logic failures, test
+regressions) reach the model. This prevents transient infrastructure noise
+from teaching the model false patterns.
+
+### 9. Cost-Aware Priority with Dependency Credit
+
+**Source**: `unified_intake_router.py` (`_compute_priority`, `dependency_credit`)
+
+Signals that block other signals get a priority boost: `_dep_credit` counts
+how many envelopes are queued behind files this op would touch. The credit
+is capped at 3 to prevent runaway promotion.
+
+### 10. Post-Apply Verify + L2 Repair Scope Fix
+
+**Source**: `orchestrator.py` (Phase 8a)
+
+When the scoped test suite fails after APPLY, the L2 repair candidate is now
+actually written to disk via `change_engine.execute()` — previously the fix
+was generated but not applied.
+
+### 11. DAG Queue Starvation Prevention (TTL)
+
+**Source**: `unified_intake_router.py` (`_file_lock_ttl_s`, `_find_file_conflict`)
+
+Active file locks now carry timestamps. `_find_file_conflict()` force-releases
+locks older than `JARVIS_FILE_LOCK_TTL_S` (default 300s) with a warning log.
+Prevents signals from being permanently queued behind crashed operations.
+
+### 12. Exploration-First Runtime Enforcement
+
+**Source**: `orchestrator.py` (VALIDATE gate), `tool_executor.py` (`_max_exploration_rounds`)
+
+At VALIDATE time, `GenerationResult.tool_execution_records` is scanned to
+verify the model called at least `JARVIS_MIN_EXPLORATION_CALLS` (default 2)
+exploration tools (`read_file`, `search_code`, `get_callers`). Violations
+produce a warning and are recorded in the per-candidate ledger.
+
+The tool loop also enforces an exploration budget: after
+`JARVIS_MAX_EXPLORATION_ROUNDS` (default 5) exploration-only rounds, a system
+nudge forces the model to produce its final answer.
+
+### 13. Session Intelligence Thread-Safety
+
+`_session_lessons` is safe under the asyncio single-threaded event loop.
+A comment documents that an `asyncio.Lock` is needed if the orchestrator ever
+moves to multi-threaded execution.
+
+### 14. Stale Exploration Guard (File Hash)
+
+**Source**: `orchestrator.py` (`generate_file_hashes`), `op_context.py`
+
+Target file SHA-256 hashes are snapshotted at GENERATE time and stored on
+`OperationContext.generate_file_hashes`. At APPLY time, hashes are
+recomputed — if any differ, the candidate was built on stale file state.
+Currently a soft gate (warning + ledger), preventing silent data loss from
+concurrent operations.
+
+### 15. Signal Coalescing Window
+
+**Source**: `unified_intake_router.py` (`_coalesce_buffer`, `_coalesce_window_s`)
+
+When multiple sensors detect issues in the same file within a configurable
+window (`JARVIS_COALESCE_WINDOW_S`, default 30s), their envelopes are merged
+into a single multi-goal operation. This reduces N sequential operations to
+one, cutting cost by up to Nx. HIGH urgency signals bypass coalescing.
+
+### 16. Operation Cancellation from REPL
+
+**Source**: `governed_loop_service.py` (`request_cancel`, `is_cancel_requested`),
+`serpent_flow.py` (`SerpentREPL._handle_cancel`), `orchestrator.py`
+
+REPL command: `cancel <op-id>` (prefix match). Sets a cooperative
+cancellation flag checked at GENERATE and APPLY phase boundaries. The
+orchestrator transitions to `CANCELLED` with reason `user_cancelled`.
+
+### 17. Diff Preview for NOTIFY_APPLY (Yellow)
+
+**Source**: `orchestrator.py` (Phase 5b)
+
+Before auto-applying Yellow-tier changes, the diff is rendered in the CLI
+with a configurable delay (`JARVIS_NOTIFY_APPLY_DELAY_S`, default 5s).
+During this window, `/cancel` (or REPL `cancel`) can reject the change.
+After the window, apply proceeds.
+
+### 18. Session Intelligence Convergence Metric
+
+**Source**: `orchestrator.py` (`_ops_before_lesson`, `_ops_after_lesson`)
+
+Tracks success rates before and after the first lesson is recorded. Every
+`JARVIS_LESSON_CONVERGENCE_CHECK_INTERVAL` (default 10) post-lesson operations,
+compares the rates. If post-lesson success rate is lower than pre-lesson,
+the lessons are considered misleading and the buffer is cleared.
+
+### 19. Exploration Budget Control
+
+**Source**: `tool_executor.py` (`_max_exploration_rounds`)
+
+Caps exploration-only tool rounds at `JARVIS_MAX_EXPLORATION_ROUNDS` (default 5).
+After the cap, a system message nudges the model: "You have enough context.
+Produce your final code change now." Prevents unbounded codebase scanning
+before generation.
+
+---
+
 ## SerpentFlow CLI
 
 **Source**: `battle_test/serpent_flow.py` (1,900+ lines)

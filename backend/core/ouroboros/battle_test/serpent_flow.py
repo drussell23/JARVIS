@@ -1750,6 +1750,7 @@ class SerpentREPL:
         flow: SerpentFlow,
         on_command: Optional[Callable[[str], Any]] = None,
         prompt_str: str = "🐍 ouroboros > ",
+        gls: Any = None,
     ) -> None:
         self._flow = flow
         self._on_command = on_command
@@ -1757,6 +1758,7 @@ class SerpentREPL:
         self._session: Any = None
         self._running = False
         self._task: Optional[asyncio.Task[None]] = None
+        self._gls = gls  # GovernedLoopService reference for /cancel
 
     async def start(self) -> None:
         """Start the REPL loop as a background task."""
@@ -1835,6 +1837,10 @@ class SerpentREPL:
                     if line == "help":
                         self._print_help()
                         continue
+                    if line.startswith("cancel "):
+                        _cancel_target = line.split(None, 1)[1].strip()
+                        await self._handle_cancel(_cancel_target)
+                        continue
 
                     # Delegate to external handler
                     if self._on_command is not None:
@@ -1886,6 +1892,7 @@ class SerpentREPL:
         lines = [
             f"  [{_C['dim']}]status[/{_C['dim']}]    organism status panel",
             f"  [{_C['dim']}]cost[/{_C['dim']}]      cost breakdown",
+            f"  [{_C['dim']}]cancel <id>[/{_C['dim']}] cancel an in-flight operation",
             f"  [{_C['dim']}]help[/{_C['dim']}]      this message",
             f"  [{_C['dim']}]quit[/{_C['dim']}]      graceful shutdown",
         ]
@@ -1899,3 +1906,29 @@ class SerpentREPL:
         self._flow.console.print()
         self._flow.console.print(panel)
         self._flow.console.print()
+
+    async def _handle_cancel(self, op_id: str) -> None:
+        """Request cancellation of an in-flight operation."""
+        if self._gls is None:
+            self._flow.console.print(
+                f"  [{_C['death']}]Cancel not available (no GLS reference)[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        if hasattr(self._gls, "request_cancel"):
+            found = self._gls.request_cancel(op_id)
+            if found:
+                self._flow.console.print(
+                    f"  [{_C['evolved']}]Cancel requested for {op_id} — will take effect at next phase boundary[/{_C['evolved']}]",
+                    highlight=False,
+                )
+            else:
+                self._flow.console.print(
+                    f"  [{_C['death']}]No active operation matching '{op_id}'[/{_C['death']}]",
+                    highlight=False,
+                )
+        else:
+            self._flow.console.print(
+                f"  [{_C['death']}]GLS does not support cancel (upgrade needed)[/{_C['death']}]",
+                highlight=False,
+            )

@@ -519,6 +519,12 @@ class OperationContext:
     # ---- Cumulative session intelligence (injected before GENERATE) ----
     session_lessons: str = ""  # ephemeral lessons from prior ops in this session
 
+    # ---- Stale-exploration guard: file hashes captured at GENERATE ----
+    # Tuple of (filepath, sha256_hex) pairs snapshotted when GENERATE begins.
+    # Compared at APPLY time — if any hash differs, the file was modified by
+    # a concurrent operation and the candidate is stale.
+    generate_file_hashes: Tuple[Tuple[str, str], ...] = ()
+
     # ---- Reasoning chain result (stamped at CLASSIFY if chain is active) ----
     reasoning_chain_result: Optional[Dict[str, Any]] = None
 
