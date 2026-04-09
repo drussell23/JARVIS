@@ -42,6 +42,17 @@ _DW_MODEL = os.environ.get(
 )
 _DW_COMPLETION_WINDOW = os.environ.get("DOUBLEWORD_WINDOW", "1h")
 _DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "16384"))
+
+# Complexity-aware max_tokens: lower ceilings for simpler tasks make DW
+# respond faster (fewer tokens to generate) without sacrificing quality.
+# Trivial one-liner fixes don't need 16K output tokens.
+_DW_COMPLEXITY_MAX_TOKENS: Dict[str, int] = {
+    "trivial": 4096,
+    "moderate": 8192,
+    "standard": 8192,
+    "complex": 16384,
+    "heavy_code": 16384,
+}
 _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "5"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
@@ -159,6 +170,7 @@ class DoublewordProvider:
         self._daily_spend: float = 0.0
         self._budget_reset_date = time.strftime("%Y-%m-%d", time.gmtime())
         self._mcp_client: Optional[Any] = None  # Injected by GLS for MCP tool forwarding (Gap #7)
+        self._last_chunk_at: float = 0.0  # monotonic timestamp of last SSE chunk (stream activity tracking)
 
     @property
     def provider_name(self) -> str:
@@ -204,6 +216,7 @@ class DoublewordProvider:
             self._session = aiohttp.ClientSession(
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 connector=connector,
+                trust_env=True,  # honour HTTP_PROXY / HTTPS_PROXY env vars
             )
         return self._session
 
@@ -355,17 +368,18 @@ class DoublewordProvider:
             self._stats.total_batches += 1
             self._stats.total_latency_s += elapsed
 
+            _batch_cost = 0.0
             if usage:
                 input_tokens = usage.get("prompt_tokens", 0)
                 output_tokens = usage.get("completion_tokens", 0)
                 self._stats.total_input_tokens += input_tokens
                 self._stats.total_output_tokens += output_tokens
-                cost = (
+                _batch_cost = (
                     input_tokens * _DW_INPUT_COST_PER_M / 1_000_000
                     + output_tokens * _DW_OUTPUT_COST_PER_M / 1_000_000
                 )
-                self._stats.total_cost_usd += cost
-                self._record_cost(cost)
+                self._stats.total_cost_usd += _batch_cost
+                self._record_cost(_batch_cost)
 
             if not content:
                 self._stats.empty_content_retries += 1
@@ -378,10 +392,23 @@ class DoublewordProvider:
 
             from backend.core.ouroboros.governance.providers import (
                 _parse_generation_response,
+                _file_source_hash,
             )
-            import hashlib as _hl
-            _src = pending.prompt[:500] if pending.prompt else ""
-            _src_hash = _hl.sha256(_src.encode()).hexdigest()[:16]
+            # Source hash: full SHA-256 of target file content (matches
+            # _check_source_drift at GATE).  Old code hashed prompt[:500]
+            # which guaranteed false-positive drift for every DW candidate.
+            _src_hash = ""
+            _src_path_str = ""
+            if ctx.target_files:
+                _src_path_str = ctx.target_files[0]
+                _abs = (self._repo_root / _src_path_str).resolve()
+                try:
+                    if _abs.is_file():
+                        _src_hash = _file_source_hash(
+                            _abs.read_text(encoding="utf-8", errors="replace")
+                        )
+                except OSError:
+                    pass
 
             # Log raw response preview for debugging parse failures
             _preview = content[:200].replace("\n", "\\n") if content else "(empty)"
@@ -411,16 +438,17 @@ class DoublewordProvider:
                 duration_s=elapsed,
                 ctx=ctx,
                 source_hash=_src_hash,
-                source_path="",
+                source_path=_src_path_str,
                 repo_roots=self._repo_roots or None,
                 repo_root=self._repo_root,
             )
-            # Attach token usage from batch
-            if usage:
+            # Attach token usage and cost from batch
+            if usage or _batch_cost > 0:
                 result = dataclasses.replace(
                     result,
                     total_input_tokens=input_tokens,
                     total_output_tokens=output_tokens,
+                    cost_usd=_batch_cost,
                 )
             return result
 
@@ -532,12 +560,12 @@ class DoublewordProvider:
             _build_codegen_prompt,
             _parse_generation_response,
         )
-        from datetime import datetime, timezone, timedelta
-        import hashlib as _hl
+        from datetime import datetime, timezone
 
         self._check_budget()
         t0 = time.monotonic()
         total_cost = 0.0
+        self._last_chunk_at = 0.0  # reset — prevents stale timestamps from prior generation
 
         # Gap #7: discover MCP tools for prompt injection
         _mcp_tools = None
@@ -569,8 +597,12 @@ class DoublewordProvider:
             nonlocal total_cost
             session = await self._get_session()
 
-            # Smart max_tokens: lower during Venom tool rounds (cost optimization)
-            _eff_max_tokens = self._max_tokens
+            # Smart max_tokens: complexity-aware ceiling for initial generation,
+            # lower during Venom tool rounds (cost optimization).
+            # Trivial ops: 4096 (vs 16384 default) — DW responds ~50% faster.
+            _eff_max_tokens = _DW_COMPLEXITY_MAX_TOKENS.get(
+                getattr(context, "task_complexity", ""), self._max_tokens,
+            )
             if self._tool_loop is not None and getattr(self._tool_loop, "is_tool_round", False):
                 _eff_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
 
@@ -637,6 +669,7 @@ class DoublewordProvider:
                             token = delta.get("content", "")
                             if token:
                                 content += token
+                                self._last_chunk_at = time.monotonic()
                                 try:
                                     _stream_callback(token)
                                 except Exception:
@@ -753,10 +786,17 @@ class DoublewordProvider:
         # Execute with or without tool loop.
         # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper).
         _complexity = getattr(context, "task_complexity", "")
+        _eff_mt = _DW_COMPLEXITY_MAX_TOKENS.get(_complexity, self._max_tokens)
         _skip_tools = _complexity in ("trivial",)
         if _skip_tools:
             logger.info(
-                "[DoublewordProvider] \u26a1 Trivial task — skipping Venom tool loop (one-shot)",
+                "[DoublewordProvider] \u26a1 Trivial task — skipping Venom tool loop "
+                "(one-shot, max_tokens=%d)", _eff_mt,
+            )
+        elif _eff_mt != self._max_tokens:
+            logger.info(
+                "[DoublewordProvider] Complexity=%s → max_tokens=%d (default=%d)",
+                _complexity, _eff_mt, self._max_tokens,
             )
 
         tool_records: tuple = ()
@@ -789,10 +829,24 @@ class DoublewordProvider:
             raise DoublewordInfraError("Empty response from real-time API", status_code=0)
 
         # Parse the response into GenerationResult
-        _src = prompt[:500]
-        _src_hash = _hl.sha256(_src.encode()).hexdigest()[:16]
-
-        from backend.core.ouroboros.governance.providers import _extract_json_block
+        # Source hash must match what _check_source_drift() computes at GATE:
+        # full SHA-256 of the target file's content (not the prompt).
+        from backend.core.ouroboros.governance.providers import (
+            _extract_json_block,
+            _file_source_hash,
+        )
+        _src_hash = ""
+        _src_path_str = ""
+        if context.target_files:
+            _src_path_str = context.target_files[0]
+            _abs = (self._repo_root / _src_path_str).resolve()
+            try:
+                if _abs.is_file():
+                    _src_hash = _file_source_hash(
+                        _abs.read_text(encoding="utf-8", errors="replace")
+                    )
+            except OSError:
+                pass
         _extracted = _extract_json_block(raw)
         if _extracted and not _extracted.lstrip().startswith("{"):
             logger.warning(
@@ -808,17 +862,18 @@ class DoublewordProvider:
             duration_s=elapsed,
             ctx=context,
             source_hash=_src_hash,
-            source_path="",
+            source_path=_src_path_str,
             repo_roots=self._repo_roots or None,
             repo_root=self._repo_root,
         )
 
-        # Attach token usage from _generate_raw
-        if _token_usage["input"] or _token_usage["output"]:
+        # Attach token usage and cost from _generate_raw
+        if _token_usage["input"] or _token_usage["output"] or total_cost > 0:
             result = dataclasses.replace(
                 result,
                 total_input_tokens=_token_usage["input"],
                 total_output_tokens=_token_usage["output"],
+                cost_usd=total_cost,
             )
 
         logger.info(

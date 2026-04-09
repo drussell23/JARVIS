@@ -56,7 +56,7 @@ import os
 import time
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -76,9 +76,19 @@ logger = logging.getLogger(__name__)
 # Tier 1 primary (J-Prime): gets a capped fraction, MUST leave fallback reserve.
 # Tier 1 fallback (Claude): gets whatever remains — guaranteed minimum.
 
-_TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.50"))
+_TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.65"))
 _TIER0_MAX_WAIT_S = float(os.environ.get("OUROBOROS_TIER0_MAX_WAIT_S", "90"))
-_TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25"))
+_TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "15"))
+
+# Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
+# Higher complexity => more time for DW 397B code generation.
+_TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
+    "trivial": 1.0,           # 0.65 * 1.0  = 0.65
+    "moderate": 1.077,         # 0.65 * 1.077 ≈ 0.70
+    "standard": 1.077,         # alias for moderate
+    "complex": 1.231,          # 0.65 * 1.231 ≈ 0.80
+    "heavy_code": 1.231,       # alias for complex
+}
 _PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
 _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "20"))
 
@@ -685,20 +695,26 @@ class CandidateGenerator:
                 # cascade to Claude fallback with guaranteed reserve time.
                 _tier0_attempted = True
                 remaining = self._remaining_seconds(deadline)
-                tier0_budget = self._compute_tier0_budget(remaining)
+                _complexity = getattr(context, "task_complexity", "trivial")
+                tier0_budget = self._compute_tier0_budget(remaining, _complexity)
                 tier1_reserve = remaining - tier0_budget
 
                 logger.info(
                     "[CandidateGenerator] Tier 0 RT: budget=%.1fs of %.1fs "
-                    "(Tier 1 reserve=%.1fs), model=%s",
-                    tier0_budget, remaining, tier1_reserve,
+                    "(Tier 1 reserve=%.1fs), complexity=%s, model=%s",
+                    tier0_budget, remaining, tier1_reserve, _complexity,
                     getattr(self._tier0, "_model", "unknown"),
                 )
 
+                # Stream-aware timeout: use asyncio.shield so we can
+                # grant a grace extension if DW is actively streaming
+                # tokens when the base budget expires (Manifesto §3).
+                _gen_task = asyncio.ensure_future(
+                    self._tier0.generate(context, deadline),
+                )
                 try:
                     result = await asyncio.wait_for(
-                        self._tier0.generate(context, deadline),
-                        timeout=tier0_budget,
+                        asyncio.shield(_gen_task), timeout=tier0_budget,
                     )
                     if result is not None and len(result.candidates) > 0:
                         # RT success — record recovery if coming back from failure
@@ -717,6 +733,40 @@ class CandidateGenerator:
                         self._remaining_seconds(deadline),
                     )
                 except asyncio.TimeoutError:
+                    # Check if DW is actively streaming SSE tokens.
+                    # If so, grant up to 30s extension while preserving
+                    # Tier 1 reserve — don't kill a productive stream.
+                    _last_chunk = getattr(self._tier0, "_last_chunk_at", 0.0)
+                    _streaming = _last_chunk > 0 and (time.monotonic() - _last_chunk) < 10.0
+                    _ext_cap = self._remaining_seconds(deadline) - _TIER1_MIN_RESERVE_S
+                    _extension = min(30.0, _ext_cap)
+
+                    if _streaming and _extension > 5.0:
+                        logger.info(
+                            "[CandidateGenerator] Tier 0 RT: actively streaming, "
+                            "granting +%.0fs extension (Tier 1 reserve preserved)",
+                            _extension,
+                        )
+                        try:
+                            result = await asyncio.wait_for(
+                                _gen_task, timeout=_extension,
+                            )
+                            if result is not None and len(result.candidates) > 0:
+                                if self.fsm._consecutive_failures > 0:
+                                    self.fsm.record_primary_success()
+                                logger.info(
+                                    "[CandidateGenerator] Tier 0 RT: %d candidates "
+                                    "in %.1fs (stream extension saved it)",
+                                    len(result.candidates),
+                                    result.generation_duration_s,
+                                )
+                                return result
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            pass
+                        _gen_task.cancel()
+                    else:
+                        _gen_task.cancel()
+
                     logger.warning(
                         "[CandidateGenerator] Tier 0 RT: budget exhausted "
                         "(%.1fs). Cascading to Tier 1 (%.1fs remaining)",
@@ -724,8 +774,10 @@ class CandidateGenerator:
                     )
                     self.fsm.record_primary_failure(mode=FailureMode.TIMEOUT)
                 except asyncio.CancelledError:
+                    _gen_task.cancel()
                     raise
                 except Exception as rt_exc:
+                    _gen_task.cancel()
                     mode = FailbackStateMachine.classify_exception(rt_exc)
                     logger.warning(
                         "[CandidateGenerator] Tier 0 RT failed (mode=%s, %s: %s). "
@@ -790,12 +842,13 @@ class CandidateGenerator:
                 _dw_poll_task = self._background_polls.get(_op_id)
                 if _dw_poll_task is not None and (_dw_is_primary or _dw_is_fallback):
                     remaining = self._remaining_seconds(deadline)
-                    tier0_budget = self._compute_tier0_budget(remaining)
+                    _complexity = getattr(context, "task_complexity", "trivial")
+                    tier0_budget = self._compute_tier0_budget(remaining, _complexity)
 
                     logger.info(
                         "[CandidateGenerator] Awaiting batch poll: "
-                        "budget=%.1fs of %.1fs",
-                        tier0_budget, remaining,
+                        "budget=%.1fs of %.1fs, complexity=%s",
+                        tier0_budget, remaining, _complexity,
                     )
                     try:
                         await asyncio.wait_for(
@@ -1122,20 +1175,39 @@ class CandidateGenerator:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _compute_tier0_budget(total_s: float) -> float:
+    def _compute_tier0_budget(
+        total_s: float, complexity: str = "trivial",
+    ) -> float:
         """Deterministic Tier 0 (DoubleWord) budget with Tier 1 reserve.
 
+        Tier 0 is the preferred path (cheap, Manifesto §5 Tier 0 fast-path).
+        It gets 65% of the total budget by default.  When the total budget is
+        tight (< 90s), we log a warning — both tiers may starve.
+
+        *complexity* scales the base fraction via ``_TIER0_COMPLEXITY_MULTIPLIER``
+        so that complex operations receive proportionally more Tier 0 time
+        (e.g. 80% instead of 65%).
+
         Invariants:
-          - tier0_budget <= total_s * _TIER0_BUDGET_FRACTION
+          - tier0_budget <= total_s * effective_fraction
           - tier0_budget <= _TIER0_MAX_WAIT_S
           - total_s - tier0_budget >= _TIER1_MIN_RESERVE_S (when possible)
         """
         if total_s <= 0:
             return 0.0
+        if total_s < 90.0:
+            logger.warning(
+                "[CandidateGenerator] Generation budget tight (%.0fs < 90s). "
+                "Consider increasing JARVIS_GENERATION_TIMEOUT_S for reliable "
+                "2-tier cascade.",
+                total_s,
+            )
+        multiplier = _TIER0_COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
+        effective_fraction = min(_TIER0_BUDGET_FRACTION * multiplier, 0.90)
         # Reserve Tier 1 budget first (defensive — Tier 1 must always get a chance)
-        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * 0.5)
+        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * (1.0 - effective_fraction))
         budget = min(
-            total_s * _TIER0_BUDGET_FRACTION,
+            total_s * effective_fraction,
             _TIER0_MAX_WAIT_S,
             total_s - tier1_reserve,
         )

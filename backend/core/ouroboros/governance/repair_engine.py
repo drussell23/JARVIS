@@ -437,24 +437,48 @@ class RepairEngine:
             total_validation_runs += 1
             file_path = current_candidate.get("file_path", "")
             sandbox_content = ""
+            _patch_failed = False
             try:
                 async with self._sandbox_factory(
                     self._repo_root, budget.per_iteration_test_timeout_s
                 ) as sb:
-                    await sb.apply_patch(diff, file_path)
-                    target = sb.sandbox_root / file_path if file_path else None
-                    if target is not None and hasattr(target, "exists") and target.exists():
-                        try:
-                            sandbox_content = target.read_text(encoding="utf-8", errors="replace")
-                        except Exception:
-                            sandbox_content = ""
+                    try:
+                        await sb.apply_patch(diff, file_path)
+                    except RuntimeError as patch_exc:
+                        # Patch application failure — the diff is malformed or
+                        # doesn't match the file.  This is a candidate quality
+                        # issue, not infra.  Treat as failed iteration so L2
+                        # can retry with a new candidate.
+                        _logger.info(
+                            "[L2 Repair] Iteration %d: patch failed: %s",
+                            iteration, patch_exc,
+                        )
+                        _patch_failed = True
+                    if not _patch_failed:
+                        target = sb.sandbox_root / file_path if file_path else None
+                        if target is not None and hasattr(target, "exists") and target.exists():
+                            try:
+                                sandbox_content = target.read_text(encoding="utf-8", errors="replace")
+                            except Exception:
+                                sandbox_content = ""
                     svr = await sb.run_tests(
                         (), budget.per_iteration_test_timeout_s
-                    )
+                    ) if not _patch_failed else None
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 return _stopped(f"sandbox_infra_error:{type(exc).__name__}")
+
+            # Patch application failure → treat as failed test (try next iteration)
+            if _patch_failed or svr is None:
+                from backend.core.ouroboros.governance.repair_sandbox import SandboxValidationResult
+                svr = SandboxValidationResult(
+                    passed=False,
+                    stdout="patch application failed",
+                    stderr="",
+                    returncode=-1,
+                    duration_s=0.0,
+                )
 
             # ----------------------------------------------------------------
             # CONVERGED?

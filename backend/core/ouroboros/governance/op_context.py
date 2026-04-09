@@ -91,6 +91,7 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
     },
     OperationPhase.ROUTE: {
         OperationPhase.CONTEXT_EXPANSION,
+        OperationPhase.PLAN,            # fast-path: skip expansion, go directly to planning
         OperationPhase.GENERATE,
         OperationPhase.CANCELLED,
     },
@@ -189,6 +190,8 @@ class GenerationResult:
     # Token usage (0 = not reported by provider)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
+    # Cost in USD (0.0 = not reported by provider)
+    cost_usd: float = 0.0
 
     def with_tool_records(self, records: Tuple[Any, ...]) -> "GenerationResult":
         """Return a new GenerationResult with tool_execution_records set (called by provider after tool loop)."""

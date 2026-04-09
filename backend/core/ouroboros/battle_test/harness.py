@@ -125,6 +125,7 @@ class BattleTestHarness:
         self._branch_manager: Any = None
         self._branch_name: Optional[str] = None
         self._intake_service: Any = None
+        self._intake_paused: bool = False
         self._graduation_orchestrator: Any = None
 
     # ------------------------------------------------------------------
@@ -754,23 +755,124 @@ class BattleTestHarness:
     async def _handle_repl_command(self, command: str) -> None:
         """Process a user command from the SerpentREPL.
 
-        Currently supports ``quit`` (handled inside SerpentREPL) and
-        ``stop`` as an alias for graceful shutdown.
+        Supports: stop, shutdown, cost, pause, resume, status, ops.
         """
         cmd = command.strip().lower()
         if cmd in ("stop", "shutdown"):
             self._shutdown_event.set()
         elif cmd == "cost":
-            if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
-                breakdown = self._cost_tracker.breakdown
-                parts = "  ".join(f"{k}: ${v:.4f}" for k, v in breakdown.items())
-                self._serpent_flow.console.print(
-                    f"[dim]💰 ${self._cost_tracker.total_spent:.4f} / "
-                    f"${self._config.cost_cap_usd:.2f}  ({parts})[/dim]",
-                    highlight=False,
-                )
+            self._repl_cmd_cost()
+        elif cmd == "pause":
+            self._repl_cmd_pause()
+        elif cmd == "resume":
+            self._repl_cmd_resume()
+        elif cmd == "status":
+            self._repl_cmd_status()
+        elif cmd == "ops":
+            self._repl_cmd_ops()
         else:
             logger.debug("Unknown REPL command: %s", cmd)
+
+    # -- REPL sub-commands ------------------------------------------------
+
+    def _repl_print(self, msg: str) -> None:
+        """Print to SerpentFlow console if available, else log."""
+        sf = getattr(self, "_serpent_flow", None)
+        if sf is not None:
+            sf.console.print(msg, highlight=False)
+        else:
+            logger.info(msg)
+
+    def _repl_cmd_cost(self) -> None:
+        breakdown = self._cost_tracker.breakdown
+        parts = "  ".join(f"{k}: ${v:.4f}" for k, v in breakdown.items())
+        self._repl_print(
+            f"[dim]💰 ${self._cost_tracker.total_spent:.4f} / "
+            f"${self._config.cost_cap_usd:.2f}  ({parts})[/dim]",
+        )
+
+    def _repl_cmd_pause(self) -> None:
+        if self._intake_paused:
+            self._repl_print("[yellow]Intake already paused.[/yellow]")
+            return
+        self._intake_paused = True
+        svc = self._intake_service
+        if svc is not None:
+            svc._state = type(svc._state)["DEGRADED"] if hasattr(svc._state, "name") else svc._state
+        self._repl_print("[yellow]⏸  Intake paused — no new signals will be accepted.[/yellow]")
+
+    def _repl_cmd_resume(self) -> None:
+        if not self._intake_paused:
+            self._repl_print("[yellow]Intake is not paused.[/yellow]")
+            return
+        self._intake_paused = False
+        svc = self._intake_service
+        if svc is not None:
+            try:
+                svc._state = type(svc._state)["ACTIVE"]
+            except (KeyError, TypeError):
+                pass
+        self._repl_print("[green]▶  Intake resumed — signals flowing.[/green]")
+
+    def _repl_cmd_status(self) -> None:
+        gls = self._governed_loop_service
+        active = len(getattr(gls, "_active_ops", set())) if gls else 0
+        completed_map = getattr(gls, "_completed_ops", {}) if gls else {}
+        completed = len(completed_map)
+        failed = sum(
+            1 for r in completed_map.values()
+            if getattr(r, "terminal_class", "") not in ("PRIMARY_SUCCESS", "FALLBACK_SUCCESS", "NOOP")
+        )
+        cost = self._cost_tracker.total_spent
+        cap = self._config.cost_cap_usd
+        paused_tag = "  [yellow](intake paused)[/yellow]" if self._intake_paused else ""
+        self._repl_print(
+            f"[bold]Status:[/bold]  active={active}  completed={completed}  "
+            f"failed={failed}  cost=${cost:.4f}/${cap:.2f}{paused_tag}"
+        )
+
+    def _repl_cmd_ops(self) -> None:
+        gls = self._governed_loop_service
+        active_ids: set = getattr(gls, "_active_ops", set()) if gls else set()
+        fsm_ctxs: dict = getattr(gls, "_fsm_contexts", {}) if gls else {}
+        completed_map: dict = getattr(gls, "_completed_ops", {}) if gls else {}
+
+        if not active_ids and not completed_map:
+            self._repl_print("[dim]No operations recorded yet.[/dim]")
+            return
+
+        lines: list = []
+        # Active operations
+        for op_id in sorted(active_ids):
+            short = op_id[:12]
+            fsm = fsm_ctxs.get(op_id)
+            state = getattr(fsm, "state", None)
+            state_str = state.name if state is not None else "RUNNING"
+            lines.append(f"  [bold green]▸[/bold green] {short}  [cyan]{state_str}[/cyan]")
+
+        # Recent completed (last 10)
+        recent = sorted(
+            completed_map.values(),
+            key=lambda r: getattr(r, "op_id", ""),
+            reverse=True,
+        )[:10]
+        for r in recent:
+            short = getattr(r, "op_id", "?")[:12]
+            phase = getattr(r, "terminal_phase", None)
+            phase_str = phase.name if phase is not None else "?"
+            tc = getattr(r, "terminal_class", "")
+            if tc in ("PRIMARY_SUCCESS", "FALLBACK_SUCCESS"):
+                tag = "[green]OK[/green]"
+            elif tc == "NOOP":
+                tag = "[dim]NOOP[/dim]"
+            else:
+                tag = f"[red]{tc}[/red]"
+            lines.append(f"  [dim]•[/dim] {short}  {phase_str}  {tag}")
+
+        header = f"[bold]Operations[/bold]  (active={len(active_ids)}, completed={len(completed_map)})"
+        self._repl_print(header)
+        for ln in lines:
+            self._repl_print(ln)
 
     # ------------------------------------------------------------------
     # Signal handlers

@@ -2660,12 +2660,13 @@ class ClaudeProvider:
             repo_root=repo_root,
         )
 
-        # Attach token usage
-        if _token_usage["input"] or _token_usage["output"]:
+        # Attach token usage and cost
+        if _token_usage["input"] or _token_usage["output"] or total_cost > 0:
             result = dataclasses.replace(
                 result,
                 total_input_tokens=_token_usage["input"],
                 total_output_tokens=_token_usage["output"],
+                cost_usd=total_cost,
             )
 
         logger.info(
