@@ -56,7 +56,7 @@ _DW_COMPLEXITY_MAX_TOKENS: Dict[str, int] = {
 _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "5"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
-_DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "30"))
+_DW_CONNECT_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_CONNECT_TIMEOUT_S", "10"))
 _DW_REQUEST_TIMEOUT_S = float(os.environ.get("DOUBLEWORD_REQUEST_TIMEOUT_S", "120"))
 
 # Pricing (March 2026)

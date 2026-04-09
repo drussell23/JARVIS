@@ -2943,7 +2943,7 @@ class ClaudeProvider:
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
-        elif self._tools_enabled:
+        elif self._tools_enabled and not _skip_tools:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             raw = None
             while True:

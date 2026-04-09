@@ -479,13 +479,15 @@ class GovernedOrchestrator:
                 target_files=list(ctx.target_files),
             )
             # Stamp complexity on context for downstream routing decisions.
-            # OperationContext uses a custom __init__, so we set it as an
-            # attribute directly rather than dataclasses.replace().
-            try:
-                ctx.task_complexity = _complexity_result.complexity.value
-            except (AttributeError, TypeError):
-                # Frozen dataclass — use object.__setattr__ as escape hatch
-                object.__setattr__(ctx, "task_complexity", _complexity_result.complexity.value)
+            # OperationContext has a custom __init__ that doesn't accept
+            # task_complexity, so we must use object.__setattr__ on the
+            # frozen dataclass.  This survives dataclasses.replace() because
+            # replace() reads field values via getattr, not __dict__.
+            object.__setattr__(ctx, "task_complexity", _complexity_result.complexity.value)
+            logger.debug(
+                "[Orchestrator] task_complexity=%s set on ctx %s",
+                _complexity_result.complexity.value, id(ctx),
+            )
 
             logger.info(
                 "[Orchestrator] \U0001f4ca Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",
