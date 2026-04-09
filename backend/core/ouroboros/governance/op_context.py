@@ -91,6 +91,7 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
     },
     OperationPhase.ROUTE: {
         OperationPhase.CONTEXT_EXPANSION,
+        OperationPhase.PLAN,            # fast-path: skip expansion, go directly to planning
         OperationPhase.GENERATE,
         OperationPhase.CANCELLED,
     },
