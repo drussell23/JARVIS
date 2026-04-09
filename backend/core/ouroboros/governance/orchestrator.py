@@ -2973,8 +2973,13 @@ class GovernedOrchestrator:
             if final_state in (OperationState.APPLIED,):
                 _lesson_text = f"[OK] {ctx.description[:80]} ({_files_short})"
             else:
-                _err_tag = _err or "unknown"
-                _lesson_text = f"[FAIL:{_err_tag}] {ctx.description[:60]} ({_files_short})"
+                # P1.3: Causal post-mortem — deterministic analysis of what
+                # went wrong and what the model should do differently next time.
+                _causal = self._causal_postmortem(_err, ctx)
+                _lesson_text = (
+                    f"[FAIL:{_err or 'unknown'}] {ctx.description[:60]} "
+                    f"({_files_short}) — {_causal}"
+                )
             self._session_lessons.append((_lesson_type, _lesson_text))
             # Cap to prevent unbounded growth
             if len(self._session_lessons) > self._session_lessons_max:
@@ -3020,6 +3025,100 @@ class GovernedOrchestrator:
                     self._ops_before_lesson_success += 1
         except Exception:
             pass  # Session lessons are best-effort
+
+    @staticmethod
+    def _causal_postmortem(error_pattern: str, ctx: "OperationContext") -> str:
+        """Deterministic causal analysis of a failed operation.
+
+        Maps failure reason codes to actionable lessons the model can use
+        in subsequent generations.  No LLM call — pure pattern matching.
+        Returns a short (<100 word) causal sentence.
+        """
+        _err = (error_pattern or "").lower()
+        _n_files = len(ctx.target_files)
+
+        # Generation failures
+        if "generation_failed" in _err:
+            return (
+                "All generation attempts failed. The prompt may be too large or "
+                "the task too ambiguous. Try: narrower scope, fewer target files, "
+                "or split into smaller operations."
+            )
+        if "tool_loop_max_iterations" in _err:
+            return (
+                "Model exhausted the tool loop without producing a patch. "
+                "It may be over-exploring. Try: more specific task description."
+            )
+        if "tool_loop_budget_exceeded" in _err:
+            return (
+                "Accumulated tool context exceeded the prompt budget. "
+                "Too many large file reads. Use targeted line ranges instead."
+            )
+
+        # Validation failures
+        if "no_candidate_valid" in _err:
+            return (
+                "Generated code failed validation (tests or type checks). "
+                "Read the test file first and ensure the patch matches expected behavior."
+            )
+        if "source_drift" in _err:
+            return (
+                "Target file changed between generation and application. "
+                "Another operation may have modified the same file. "
+                "Re-read before patching."
+            )
+        if "schema_invalid" in _err or "validate_diff" in _err:
+            return (
+                "Generated output didn't match the expected JSON schema. "
+                "Ensure the response contains a valid diff block with correct format."
+            )
+
+        # Apply failures
+        if "change_engine" in _err:
+            return (
+                "Patch application failed. The diff likely targets lines that "
+                "no longer exist. Use read_file to verify the exact current content "
+                "before generating the diff."
+            )
+        if "stale_diff" in _err:
+            return (
+                "The diff references content that doesn't match the current file. "
+                "Always read_file immediately before generating a patch."
+            )
+
+        # Verify failures
+        if "verify_regression" in _err:
+            return (
+                "Post-apply tests regressed. The change broke existing behavior. "
+                "Check dependents with search_code/get_callers before modifying "
+                "shared functions."
+            )
+
+        # Security / gate failures
+        if "security_review_blocked" in _err:
+            return (
+                "Security review blocked the change. Avoid patterns like: "
+                "hardcoded secrets, command injection, unsafe deserialization."
+            )
+        if "gate_blocked" in _err:
+            return "File write permission denied. Check file lock state."
+
+        # Budget / provider failures (infra — less actionable but still logged)
+        if "budget" in _err or "exhausted" in _err:
+            return "Provider budget exhausted. Operation was too expensive."
+        if "timeout" in _err or "deadline" in _err:
+            return (
+                "Operation timed out. Consider: simpler task scope, fewer files, "
+                "or check if the provider is under load."
+            )
+
+        # Fallback
+        if _n_files > 3:
+            return (
+                f"Failed on {_n_files}-file operation. Multi-file changes are "
+                "harder — consider splitting into single-file operations."
+            )
+        return "Unknown failure. Read target files and check dependents before retrying."
 
     async def _run_benchmark(
         self,

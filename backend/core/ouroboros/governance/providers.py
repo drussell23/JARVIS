@@ -632,9 +632,11 @@ def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str
         "  ]\n"
         "}\n"
         "```\n\n"
-        "Use `tool_calls` (plural) when calling multiple independent tools in one\n"
-        "round — they execute in parallel for faster results. Use `tool_call`\n"
-        "(singular) when you only need one tool.\n\n"
+        "**ALWAYS use `tool_calls` (plural) when calling 2+ independent tools** —\n"
+        "they execute in parallel via asyncio.gather. This is critical for speed:\n"
+        "instead of 3 sequential rounds (read_file → search_code → get_callers),\n"
+        "batch them into 1 round: `tool_calls: [{read_file}, {search_code}, {get_callers}]`.\n"
+        "Use `tool_call` (singular) only when you need exactly one tool.\n\n"
         "### Available tools\n\n"
         "**Codebase exploration:**\n"
         '- `search_code(pattern, file_glob="*.py")` — regex search across files (ripgrep-backed, 200 result cap)\n'
@@ -647,6 +649,8 @@ def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str
         '- `git_log(path="", n=20)` — recent commit history (oneline format)\n'
         '- `git_diff(ref="", path="")` — show diffs (default: unstaged changes)\n'
         "- `git_blame(path, lines_from=0, lines_to=0)` — line-by-line blame\n\n"
+        "**Type checking:**\n"
+        "- `type_check(files)` — run pyright/mypy on files, returns errors/warnings with file:line:message\n\n"
         "**Execution & testing:**\n"
         "- `run_tests(paths)` — run pytest (list of test paths), returns structured summary\n"
         "- `bash(command, timeout=30)` — sandboxed shell command (allowlisted, Iron Gate filtered)\n"
@@ -686,7 +690,9 @@ def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str
         "1. **Read the target file** — `read_file` to see the actual current code.\n"
         "   NEVER generate a patch from parametric memory alone.\n"
         "2. **Check dependents** — `search_code` or `get_callers` to find code that\n"
-        "   imports/calls the function you're changing. This prevents breaking callers.\n\n"
+        "   imports/calls the function you're changing. This prevents breaking callers.\n"
+        "3. **Verify types** (optional) — `type_check` on modified files to catch type errors early.\n\n"
+        "Batch independent exploration into a single `tool_calls` round for speed.\n"
         "Skipping exploration produces patches that silently break other code.\n"
         "A senior engineer reads first, then writes."
     )

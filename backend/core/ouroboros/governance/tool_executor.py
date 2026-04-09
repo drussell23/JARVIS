@@ -366,6 +366,20 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"human_interaction"}),
     ),
+    # ---- LSP / type-checking tools (P1.1: CC-parity type resolution) ----
+    "type_check": ToolManifest(
+        name="type_check", version="1.0",
+        description=(
+            "Run pyright/mypy type checker on specific files. Returns errors, "
+            "warnings, and diagnostics with file/line/message/severity. Use after "
+            "reading code to verify type correctness before proposing changes."
+        ),
+        arg_schema={
+            "files": {"type": "array", "items": {"type": "string"},
+                      "description": "Repo-relative file paths to check"},
+        },
+        capabilities=frozenset({"subprocess"}),
+    ),
 }
 
 
@@ -400,6 +414,7 @@ class ToolExecutor:
             "bash": self._bash,
             "edit_file": self._edit_file,
             "write_file": self._write_file,
+            "type_check": self._type_check,
         }
 
     # ------------------------------------------------------------------
@@ -862,6 +877,43 @@ class ToolExecutor:
         action = "overwritten" if existed else "created"
         return f"OK: {action} {path_str} ({n_lines} lines)"
 
+    def _type_check(self, args: Dict[str, Any]) -> str:
+        """Run pyright/mypy on specific files — returns diagnostics.
+
+        Uses LSPTypeChecker for subprocess-based type checking (no LSP server).
+        Returns structured error/warning list with file, line, message, severity.
+        """
+        files: list = args.get("files", [])
+        if not files:
+            return "ERROR: 'files' argument required (list of repo-relative paths)"
+
+        from backend.core.ouroboros.governance.lsp_checker import LSPTypeChecker
+
+        checker = LSPTypeChecker(project_root=self._repo_root)
+        abs_files = []
+        for f in files:
+            resolved = self._safe_resolve(str(f))
+            abs_files.append(str(resolved))
+
+        result = checker.check_incremental(abs_files, timeout_s=15.0)
+
+        lines = [f"Checker: {result.checker_used}"]
+        if result.checker_used == "none":
+            lines.append("No type checker (pyright/mypy) found. Install: pip install pyright")
+            return "\n".join(lines)
+
+        lines.append(f"Errors: {result.error_count}, Warnings: {result.warning_count}")
+        if result.passed:
+            lines.append("PASSED — no type errors")
+        for err in result.errors[:20]:
+            sev = err.get("severity", "error")
+            lines.append(
+                f"  {sev}: {err.get('file', '?')}:{err.get('line', '?')} "
+                f"— {err.get('message', '?')}"
+                + (f" [{err.get('rule')}]" if err.get("rule") else "")
+            )
+        return "\n".join(lines)
+
 
 def _human_size(nbytes: int) -> str:
     """Convert bytes to human-readable size string."""
@@ -1115,7 +1167,24 @@ class GoverningToolPolicy:
                     detail=f"edit path {path_arg!r} escapes repo root",
                 )
 
-        # Rule 13: ask_human — requires NOTIFY_APPLY or APPROVAL_REQUIRED risk tier
+        # Rule 13: type_check — validate file paths within repo
+        elif name == "type_check":
+            files = call.arguments.get("files", [])
+            if not isinstance(files, list) or not files:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.type_check_no_files",
+                    detail="type_check requires a non-empty 'files' array",
+                )
+            for f in files:
+                if _safe_resolve_policy(str(f), repo_root) is None:
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason_code="tool.denied.path_outside_repo",
+                        detail=f"type_check path {f!r} escapes repo root",
+                    )
+
+        # Rule 14: ask_human — requires NOTIFY_APPLY or APPROVAL_REQUIRED risk tier
         # (Manifesto §5: deploy intelligence where it creates true leverage;
         # Green ops shouldn't bother the human with questions)
         elif name == "ask_human":

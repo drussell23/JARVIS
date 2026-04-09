@@ -299,15 +299,23 @@ class DreamEngine:
                     f"(threshold {self._config.dream_reentry_cooldown_s:.0f}s)"
                 )
 
-        # Gate 1: J-Prime health (TC09)
-        snapshot = self._health_cortex.get_snapshot()
-        if snapshot is None:
-            return False, "No health snapshot available yet"
-        prime = snapshot.prime
-        if prime.status != "healthy":
-            return False, f"Prime not healthy: status={prime.status}"
-        if not prime.details.get("model_loaded"):
-            return False, "Prime model not loaded"
+        # Gate 1: Inference backend available
+        # Original gate required J-Prime healthy + model loaded (TC09).
+        # With DW 35B and Claude as inference backends, J-Prime is no longer
+        # required — skip the health check if an alternative is available.
+        _has_alt_backend = (
+            self._dw_provider is not None or self._claude_provider is not None
+        )
+        if not _has_alt_backend:
+            # Legacy path: require J-Prime health
+            snapshot = self._health_cortex.get_snapshot()
+            if snapshot is None:
+                return False, "No health snapshot and no alternative inference backend"
+            prime = snapshot.prime
+            if prime.status != "healthy":
+                return False, f"Prime not healthy: status={prime.status}"
+            if not prime.details.get("model_loaded"):
+                return False, "Prime model not loaded"
 
         # Gate 2: User idle (TC10)
         idle_s = self._activity_monitor.last_activity_s()
@@ -317,14 +325,19 @@ class DreamEngine:
                 f"threshold {self._config.dream_idle_threshold_s:.0f}s"
             )
 
-        # Gate 3: VM warm from user, not dream (TC11)
-        uptime_s = prime.details.get("uptime_s", 0)
-        if uptime_s < self._config.dream_idle_threshold_s:
-            return False, (
-                f"VM uptime too short: {uptime_s:.0f}s < "
-                f"threshold {self._config.dream_idle_threshold_s:.0f}s "
-                "(VM may have been woken for dream, not by user warm traffic)"
-            )
+        # Gate 3: VM warm from user traffic (TC11)
+        # When using DW/Claude (cloud-based), VM warmth is irrelevant —
+        # inference doesn't run on the local VM.
+        if not _has_alt_backend:
+            snapshot = self._health_cortex.get_snapshot()
+            prime = snapshot.prime if snapshot else None
+            uptime_s = prime.details.get("uptime_s", 0) if prime else 0
+            if uptime_s < self._config.dream_idle_threshold_s:
+                return False, (
+                    f"VM uptime too short: {uptime_s:.0f}s < "
+                    f"threshold {self._config.dream_idle_threshold_s:.0f}s "
+                    "(VM may have been woken for dream, not by user warm traffic)"
+                )
 
         # Gate 4: Resource governor
         should_yield = await self._resource_governor.should_yield()

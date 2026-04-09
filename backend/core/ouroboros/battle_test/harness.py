@@ -588,6 +588,13 @@ class BattleTestHarness:
                     from backend.core.ouroboros.consciousness.dream_metrics import DreamMetricsTracker
 
                     _dw_ref = getattr(self._governed_loop_service, "_doubleword_ref", None)
+                    # Claude provider for Dream Engine Tier 2 fallback
+                    _claude_ref = None
+                    _gen = getattr(self._governed_loop_service, "_generator", None)
+                    if _gen is not None:
+                        _fb = getattr(_gen, "_fallback", None)
+                        if _fb is not None and getattr(_fb, "provider_name", "") == "claude-api":
+                            _claude_ref = _fb
                     _dream_metrics = DreamMetricsTracker()
 
                     # Lightweight stubs — battle test always considers user "idle"
@@ -610,10 +617,12 @@ class BattleTestHarness:
                         persistence_dir=_consciousness_dir / "dreams",
                         comm=_comm,
                         dw_provider=_dw_ref,
+                        claude_provider=_claude_ref,
                     )
                     logger.info(
-                        "DreamEngine booted (dw=%s, jprime=%s)",
+                        "DreamEngine booted (dw=%s, claude=%s, jprime=%s)",
                         "active" if _dw_ref else "none",
+                        "active" if _claude_ref else "none",
                         "active" if os.environ.get("JPRIME_URL") else "none",
                     )
                 except Exception as _dream_exc:
