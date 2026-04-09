@@ -8,22 +8,28 @@ Manifesto §7: Absolute Observability — the inner workings of the
 symbiote must be entirely visible.
 
 Design:
-  - No Rich Live, no Layout, no pinned panels
-  - Just Console.print() flowing down the terminal
+  - Console.print() flows downward — scannable, grep-friendly
+  - Async execution masking via rich.Status (spinners vanish on completion)
+  - Live Markdown streaming via rich.Live + rich.Markdown during synthesis
+  - Non-blocking REPL via prompt_toolkit.PromptSession.prompt_async()
   - Organism vocabulary: sensed, synthesizing, immune check, evolved, shed
   - Inline syntax-highlighted diffs (Claude Code style + serpent personality)
   - Emoji + color coding for scannable readability
-  - Streaming code generation (character-by-character)
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 
 from rich.console import Console
+from rich.live import Live
+from rich.markdown import Markdown
+from rich.status import Status
 from rich.syntax import Syntax
 from rich.text import Text
 
@@ -145,8 +151,18 @@ class SerpentFlow:
         self._op_starts: Dict[str, float] = {}
         self._streaming_active: bool = False
 
-        # Rich console — no Live widget, just print()
+        # Rich console
         self.console = Console(emoji=True, highlight=False)
+
+        # ── Execution masking (rich.Status) ──────────────────
+        # Active spinner — only one at a time.  `_stop_status()` clears it
+        # before printing the completion artifact so the spinner vanishes.
+        self._active_status: Optional[Status] = None
+
+        # ── Live Markdown streaming (rich.Live + rich.Markdown) ──
+        # Accumulates tokens during synthesis; rendered in real-time.
+        self._live: Optional[Live] = None
+        self._stream_buffer: str = ""
 
     # ── Lifecycle ─────────────────────────────────────────────
 
@@ -166,6 +182,9 @@ class SerpentFlow:
 
     async def stop(self) -> None:
         """Print the shutdown summary."""
+        # Clean up any active spinner or live stream before final output
+        self._stop_status()
+        self.show_streaming_end()
         elapsed = time.time() - self._started_at
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
@@ -309,7 +328,12 @@ class SerpentFlow:
         duration_s: float = 0.0, tool_count: int = 0,
         model_id: str = "", input_tokens: int = 0, output_tokens: int = 0,
     ) -> None:
-        """Generation completed — show summary with model + token count."""
+        """Generation completed — stop spinner, show summary with model + token count."""
+        # Stop any active execution-masking spinner (synthesis or tool)
+        self._stop_status()
+        # Stop live Markdown stream if still running
+        self.show_streaming_end()
+
         short = _short_id(op_id)
         prov = _prov(provider)
         self._op_providers[op_id] = provider
@@ -337,12 +361,36 @@ class SerpentFlow:
 
     # ── Tool calls (Venom) ────────────────────────────────────
 
+    def op_tool_start(
+        self, op_id: str, tool_name: str, args_summary: str = "",
+        round_index: int = 0,
+    ) -> None:
+        """Spin a masking spinner while a Venom tool executes.
+
+        Called *before* the tool runs.  The spinner is replaced by the
+        final artifact line when ``op_tool_call`` fires on completion.
+        """
+        tool_icons = {
+            "read_file": "📄", "search_code": "🔍", "run_tests": "🧪",
+            "bash": "💻", "web_search": "🌐", "web_fetch": "🌐",
+            "get_callers": "🔗", "list_symbols": "📋",
+        }
+        icon = tool_icons.get(tool_name, "🔧")
+        summary = f"  {args_summary[:45]}" if args_summary else ""
+        self._start_status(
+            f"          │ {icon} T{round_index+1} {tool_name}{summary}",
+            spinner="dots",
+        )
+
     def op_tool_call(
         self, op_id: str, tool_name: str, args_summary: str = "",
         round_index: int = 0, result_preview: str = "",
         duration_ms: float = 0.0, status: str = "success",
     ) -> None:
-        """Venom tool call — inline, compact."""
+        """Venom tool call completed — stop spinner, print clean artifact."""
+        # Stop the execution masking spinner before printing the artifact
+        self._stop_status()
+
         tool_icons = {
             "read_file": "📄", "search_code": "🔍", "run_tests": "🧪",
             "bash": "💻", "web_search": "🌐", "web_fetch": "🌐",
@@ -365,10 +413,19 @@ class SerpentFlow:
 
     # ── Validation ────────────────────────────────────────────
 
+    def op_validation_start(self, op_id: str) -> None:
+        """Spin a masking spinner while the immune check runs."""
+        short = _short_id(op_id)
+        self._start_status(
+            f"🛡️ immune check │ running tests…  [dim]op:{short}[/dim]",
+            spinner="dots",
+        )
+
     def op_validation(
         self, op_id: str, passed: bool, test_count: int = 0, failures: int = 0,
     ) -> None:
-        """Immune check result."""
+        """Immune check result — stop spinner, print clean artifact."""
+        self._stop_status()
         short = _short_id(op_id)
         if test_count == 0:
             # No tests discovered — show neutral status
@@ -495,31 +552,92 @@ class SerpentFlow:
 
         c.print()
 
-    # ── Streaming output ──────────────────────────────────────
+    # ── Execution masking (rich.Status spinners) ────────────────
+
+    def _start_status(self, message: str, spinner: str = "dots") -> None:
+        """Begin an async execution spinner.
+
+        The spinner renders inline and vanishes when ``_stop_status`` is
+        called, leaving only the final artifact printed by the caller.
+        Only one spinner is active at a time; starting a new one stops
+        the previous.
+        """
+        self._stop_status()
+        self._active_status = self.console.status(
+            message, spinner=spinner, spinner_style=_C["neural"],
+        )
+        self._active_status.start()
+
+    def _stop_status(self) -> None:
+        """Stop the current spinner (if any) — leaves a clean terminal."""
+        if self._active_status is not None:
+            try:
+                self._active_status.stop()
+            except Exception:
+                pass
+            self._active_status = None
+
+    # ── Live Markdown streaming (rich.Live + rich.Markdown) ───
 
     def show_streaming_start(self, provider: str, op_id: str = "") -> None:
-        """Begin streaming — show synthesizing header (tokens buffered silently)."""
+        """Begin synthesis — spin a masking spinner, then open a Live Markdown panel."""
+        self._streaming_active = True
+        self._stream_buffer = ""
+
         short = _short_id(op_id) if op_id else ""
-        id_str = f"  [{_C['dim']}]op:{short}[/{_C['dim']}]" if short else ""
+        id_str = f"  [dim]op:{short}[/dim]" if short else ""
+        prov = _prov(provider) if provider else ""
+        via_str = f" via [{_C['provider']}]{prov}[/{_C['provider']}]" if prov else ""
 
-        if provider:
-            prov = _prov(provider)
-            via_str = f" via [{_C['provider']}]{prov}[/{_C['provider']}]"
-        else:
-            via_str = ""
-
+        # Print the header (permanent artifact)
         self.console.print(
             f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}] │{via_str}{id_str}",
             highlight=False,
         )
-        self._streaming_active = True
+
+        # Open a rich.Live context for real-time Markdown rendering.
+        # transient=True makes the live region vanish when stopped,
+        # but we refresh with a final snapshot first so the output persists.
+        self._live = Live(
+            Markdown(""),
+            console=self.console,
+            transient=False,
+            refresh_per_second=8,
+        )
+        self._live.start()
 
     def show_streaming_token(self, token: str) -> None:
-        """No-op — tokens are buffered silently by the provider."""
-        pass
+        """Append a token and re-render the Markdown panel in-place.
+
+        Called from the provider's SSE/streaming callback.  Each call
+        updates the ``rich.Live`` region so the terminal shows a
+        progressively-rendered Markdown document.
+        """
+        if not token:
+            return
+        self._stream_buffer += token
+        if self._live is not None:
+            try:
+                self._live.update(Markdown(self._stream_buffer))
+            except Exception:
+                pass
 
     def show_streaming_end(self) -> None:
-        """End the streaming block."""
+        """Finalize the Live Markdown region.
+
+        Performs one final render so the accumulated text remains visible,
+        then stops the Live widget cleanly.
+        """
+        if self._live is not None:
+            try:
+                # Final render — keeps the content in terminal history
+                if self._stream_buffer:
+                    self._live.update(Markdown(self._stream_buffer))
+                self._live.stop()
+            except Exception:
+                pass
+            self._live = None
+        self._stream_buffer = ""
         self._streaming_active = False
 
     # ── Operation completion ──────────────────────────────────
@@ -529,6 +647,7 @@ class SerpentFlow:
         provider: str = "", cost_usd: float = 0.0,
     ) -> None:
         """The organism evolved — operation succeeded."""
+        self._stop_status()  # Clean up any lingering spinner
         self._completed += 1
         short = _short_id(op_id)
         elapsed = time.time() - self._op_starts.pop(op_id, time.time())
@@ -561,6 +680,7 @@ class SerpentFlow:
 
     def op_failed(self, op_id: str, reason: str, phase: str = "") -> None:
         """The organism shed a failed change."""
+        self._stop_status()  # Clean up any lingering spinner
         self._failed += 1
         short = _short_id(op_id)
         elapsed = time.time() - self._op_starts.pop(op_id, time.time())
