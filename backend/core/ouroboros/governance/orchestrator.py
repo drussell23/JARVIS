@@ -479,15 +479,10 @@ class GovernedOrchestrator:
                 target_files=list(ctx.target_files),
             )
             # Stamp complexity on context for downstream routing decisions.
-            # OperationContext has a custom __init__ that doesn't accept
-            # task_complexity, so we must use object.__setattr__ on the
-            # frozen dataclass.  This survives dataclasses.replace() because
-            # replace() reads field values via getattr, not __dict__.
+            # task_complexity is a declared field on OperationContext, so
+            # object.__setattr__ values survive dataclasses.replace() in
+            # advance() and all with_*() methods.
             object.__setattr__(ctx, "task_complexity", _complexity_result.complexity.value)
-            logger.debug(
-                "[Orchestrator] task_complexity=%s set on ctx %s",
-                _complexity_result.complexity.value, id(ctx),
-            )
 
             logger.info(
                 "[Orchestrator] \U0001f4ca Complexity: %s, Persistence: %s, auto_approve=%s, fast_path=%s [%s]",

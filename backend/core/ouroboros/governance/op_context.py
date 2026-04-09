@@ -528,6 +528,9 @@ class OperationContext:
     # ---- Cumulative session intelligence (injected before GENERATE) ----
     session_lessons: str = ""  # ephemeral lessons from prior ops in this session
 
+    # ---- Complexity classification (stamped at CLASSIFY by ComplexityClassifier) ----
+    task_complexity: str = ""  # "trivial" | "simple" | "light" | "heavy_code" | "complex"
+
     # ---- Dependency intelligence from Oracle graph (injected at CONTEXT_EXPANSION) ----
     # ~200-token summary: direct dependents, transitive importers, blast radius.
     # Prevents breaking downstream consumers that import the target files.
@@ -654,6 +657,7 @@ class OperationContext:
             "previous_op_hash_by_scope": previous_op_hash_by_scope,
             "frozen_autonomy_tier": "governed",
             "reasoning_chain_result": None,
+            "task_complexity": "",
         }
         context_hash = _compute_hash(fields_for_hash)
 
