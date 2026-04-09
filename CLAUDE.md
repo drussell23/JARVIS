@@ -70,6 +70,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **L2 Repair** (`repair_engine.py`): Iterative self-repair FSM (5 iterations, 120s timebox)
 - **ConsciousnessBridge** (`consciousness_bridge.py`): Injects memory/prediction into pipeline
 - **StrategicDirection** (`strategic_direction.py`): Manifesto principles injected into every generation prompt
+- **AutoCommitter** (`auto_committer.py`): Structured git commits with O+V signature after successful APPLY+VERIFY. Conventional commit format, risk-tier metadata, protected-branch push prevention.
 - **DreamEngine** (`consciousness/dream_engine.py`): Idle GPU speculative improvement blueprints
 
 ### Autonomous Developer Intelligence (O+V)
@@ -90,6 +91,7 @@ O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capab
 - **Model-reasoned planning**: PLAN phase between CONTEXT_EXPANSION and GENERATE. Model reasons about implementation strategy (schema plan.1) before writing code. Trivial ops skip planning.
 - **Mid-operation clarification**: `ask_human` tool in Venom lets the model ask the human for clarification. Gated to NOTIFY_APPLY+ risk tiers (Green ops don't interrupt).
 - **L3 worktree isolation**: Enabled by default (`JARVIS_GOVERNED_L3_ENABLED=true`). Parallel execution graphs use isolated git worktrees to prevent filesystem conflicts.
+- **Auto-commit post-APPLY**: AutoCommitter creates structured git commits with O+V signature after VERIFY passes. Conventional commit type/scope inference, risk-tier metadata, protected-branch push prevention. Master switch: `JARVIS_AUTO_COMMIT_ENABLED`.
 
 ## Battle Test
 
@@ -113,6 +115,7 @@ backend/core/ouroboros/
     semantic_triage.py          # Pre-generation filter
     comm_protocol.py            # 5-phase observability
     tool_executor.py            # Venom tool loop
+    auto_committer.py           # Auto-commit with O+V signature (Gap #6)
     repair_engine.py            # L2 self-repair
     consciousness_bridge.py     # Consciousness integration
     strategic_direction.py      # Manifesto injection

@@ -713,6 +713,72 @@ interfering with each other.
 
 ---
 
+## Auto-Commit Post-APPLY (Gap #6)
+
+**Source**: `auto_committer.py` (`AutoCommitter`), `orchestrator.py` (Phase 8b)
+
+Closes the autonomy loop: after O+V applies a change and verifies it passes
+tests, the AutoCommitter creates a structured git commit with the O+V
+signature. Without this, applied changes sit on disk as uncommitted
+modifications, breaking the self-development cycle.
+
+### Commit Message Format
+
+```text
+<type>(<scope>): <description>
+
+Op-ID: <op_id>
+Risk: <risk_tier>
+Provider: <provider> ($<cost>)
+Files: <file_list>
+
+Ouroboros+Venom [O+V] — Autonomous Self-Development Engine
+Co-Authored-By: Ouroboros+Venom <ouroboros@jarvis.trinity>
+```
+
+- **Type**: Inferred from description keywords (`fix`, `feat`, `refactor`, `test`, `docs`, `perf`, `style`)
+- **Scope**: Inferred from common path prefix of target files
+- **O+V Signature**: Non-negotiable identity block on every autonomous commit
+
+### Risk-Tier Behavior
+
+| Tier | Behavior |
+|------|----------|
+| `SAFE_AUTO` (Green) | Commit immediately after VERIFY passes |
+| `NOTIFY_APPLY` (Yellow) | Commit after diff preview delay |
+| `APPROVAL_REQUIRED` (Orange) | Commit after human approval |
+| `BLOCKED` (Red) | Never reaches APPLY — no commit |
+
+### Environment Variables
+
+- `JARVIS_AUTO_COMMIT_ENABLED` (default `true`): Master switch
+- `JARVIS_AUTO_PUSH_BRANCH` (default `""`): If set, push to this branch after commit. Empty = no push. Never pushes to protected branches (`main`, `master`, `production`, `release`).
+
+### Orchestrator Integration
+
+Phase 8b in the 11-phase pipeline, between VERIFY success and COMPLETE:
+
+1. AutoCommitter stages only the target files (not `git add -A`)
+2. Builds structured commit message with O+V signature
+3. Creates commit via `asyncio.create_subprocess_exec` (no shell injection)
+4. Emits heartbeat with commit hash for SerpentFlow rendering
+5. Optional push to non-protected branch
+
+### SerpentFlow Rendering
+
+Commit results appear in the flowing CLI output:
+
+```
+📝 committed  a1b2c3d  -> feature-branch  O+V
+```
+
+### Manifesto Alignment
+
+- **§6 — The Iron Gate**: All git operations use `create_subprocess_exec` arrays, never shell strings. Push gated to non-protected branches.
+- **§7 — Absolute Observability**: Commit hash emitted via heartbeat for SerpentFlow rendering.
+
+---
+
 ## Edge Case Hardening (12 Refinements)
 
 These refinements close failure modes discovered during the first battle tests.
