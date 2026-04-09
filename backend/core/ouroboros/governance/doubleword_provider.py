@@ -216,6 +216,7 @@ class DoublewordProvider:
             self._session = aiohttp.ClientSession(
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 connector=connector,
+                trust_env=True,  # honour HTTP_PROXY / HTTPS_PROXY env vars
             )
         return self._session
 
