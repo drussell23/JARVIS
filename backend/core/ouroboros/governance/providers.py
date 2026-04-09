@@ -2031,8 +2031,8 @@ class PrimeProvider:
                 )
                 _last_response[0] = resp
                 raw = resp.content
-                tool_call = _parse_tool_call_response(raw)
-                if tool_call is not None:
+                tool_calls = _parse_tool_call_response(raw)
+                if tool_calls is not None:
                     if tool_rounds >= MAX_TOOL_ITERATIONS:
                         raise RuntimeError(
                             f"gcp-jprime_tool_loop_max_iterations:{MAX_TOOL_ITERATIONS}"
@@ -2040,17 +2040,26 @@ class PrimeProvider:
                     if executor is None:
                         from backend.core.ouroboros.governance.tool_executor import ToolExecutor
                         executor = ToolExecutor(repo_root=repo_root)
-                    tool_result = executor.execute(tool_call)
+                    result_parts: list = []
+                    for tc in tool_calls:
+                        tool_result = executor.execute(tc)
+                        output = tool_result.output if not tool_result.error else "ERROR: " + tool_result.error
+                        result_parts.append(
+                            f"--- Tool Result: {tc.name} ---\n"
+                            f"{output}\n"
+                            "--- End Tool Result ---"
+                        )
                     result_text = (
-                        f"--- Tool Result: {tool_call.name} ---\n"
-                        f"{tool_result.output if not tool_result.error else 'ERROR: ' + tool_result.error}\n"
-                        "--- End Tool Result ---\n"
+                        "\n".join(result_parts) + "\n"
                         "Now continue. Either call another tool or return the patch JSON."
                     )
                     old_prompt_len = len(current_prompt)
+                    call_summary = ", ".join(
+                        f"{tc.name}({json.dumps(tc.arguments)})" for tc in tool_calls
+                    )
                     current_prompt = (
                         f"{current_prompt}\n\n"
-                        f"[You called: {tool_call.name}({json.dumps(tool_call.arguments)})]\n"
+                        f"[You called: {call_summary}]\n"
                         f"{result_text}"
                     )
                     accumulated_chars += len(current_prompt) - old_prompt_len
