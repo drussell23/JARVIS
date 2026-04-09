@@ -42,6 +42,17 @@ _DW_MODEL = os.environ.get(
 )
 _DW_COMPLETION_WINDOW = os.environ.get("DOUBLEWORD_WINDOW", "1h")
 _DW_MAX_TOKENS = int(os.environ.get("DOUBLEWORD_MAX_TOKENS", "16384"))
+
+# Complexity-aware max_tokens: lower ceilings for simpler tasks make DW
+# respond faster (fewer tokens to generate) without sacrificing quality.
+# Trivial one-liner fixes don't need 16K output tokens.
+_DW_COMPLEXITY_MAX_TOKENS: Dict[str, int] = {
+    "trivial": 4096,
+    "moderate": 8192,
+    "standard": 8192,
+    "complex": 16384,
+    "heavy_code": 16384,
+}
 _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "5"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))
@@ -159,6 +170,7 @@ class DoublewordProvider:
         self._daily_spend: float = 0.0
         self._budget_reset_date = time.strftime("%Y-%m-%d", time.gmtime())
         self._mcp_client: Optional[Any] = None  # Injected by GLS for MCP tool forwarding (Gap #7)
+        self._last_chunk_at: float = 0.0  # monotonic timestamp of last SSE chunk (stream activity tracking)
 
     @property
     def provider_name(self) -> str:
@@ -540,6 +552,7 @@ class DoublewordProvider:
         self._check_budget()
         t0 = time.monotonic()
         total_cost = 0.0
+        self._last_chunk_at = 0.0  # reset — prevents stale timestamps from prior generation
 
         # Gap #7: discover MCP tools for prompt injection
         _mcp_tools = None
@@ -571,8 +584,12 @@ class DoublewordProvider:
             nonlocal total_cost
             session = await self._get_session()
 
-            # Smart max_tokens: lower during Venom tool rounds (cost optimization)
-            _eff_max_tokens = self._max_tokens
+            # Smart max_tokens: complexity-aware ceiling for initial generation,
+            # lower during Venom tool rounds (cost optimization).
+            # Trivial ops: 4096 (vs 16384 default) — DW responds ~50% faster.
+            _eff_max_tokens = _DW_COMPLEXITY_MAX_TOKENS.get(
+                getattr(context, "task_complexity", ""), self._max_tokens,
+            )
             if self._tool_loop is not None and getattr(self._tool_loop, "is_tool_round", False):
                 _eff_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
 
@@ -639,6 +656,7 @@ class DoublewordProvider:
                             token = delta.get("content", "")
                             if token:
                                 content += token
+                                self._last_chunk_at = time.monotonic()
                                 try:
                                     _stream_callback(token)
                                 except Exception:
