@@ -46,7 +46,7 @@ class OpsLogger:
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(entry)
         except Exception:
-            logger.debug("OpsLogger: failed to write for op %s", msg.op_id)
+            logger.debug("OpsLogger: failed to write for op %s", msg.op_id, exc_info=True)
 
     async def cleanup_old_logs(self) -> None:
         """Remove log files older than retention_days."""

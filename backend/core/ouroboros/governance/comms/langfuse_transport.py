@@ -160,6 +160,14 @@ class LangfuseTransport:
 
     async def _on_intent(self, msg: "CommMessage") -> None:  # noqa: F821
         """Start a new Langfuse trace for this operation."""
+        if not hasattr(self._langfuse, "trace") or not callable(self._langfuse.trace):
+            # SDK version mismatch — disable transport to avoid repeated errors
+            logger.warning(
+                "Langfuse client has no .trace() method (SDK version mismatch?) "
+                "— disabling transport",
+            )
+            self._langfuse = None
+            return
         payload = msg.payload
         trace = self._langfuse.trace(
             name="ouroboros-op",

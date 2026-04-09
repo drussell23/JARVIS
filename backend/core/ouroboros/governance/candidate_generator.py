@@ -76,9 +76,9 @@ logger = logging.getLogger(__name__)
 # Tier 1 primary (J-Prime): gets a capped fraction, MUST leave fallback reserve.
 # Tier 1 fallback (Claude): gets whatever remains — guaranteed minimum.
 
-_TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.50"))
+_TIER0_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_TIER0_BUDGET_FRACTION", "0.65"))
 _TIER0_MAX_WAIT_S = float(os.environ.get("OUROBOROS_TIER0_MAX_WAIT_S", "90"))
-_TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25"))
+_TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "15"))
 _PRIMARY_BUDGET_FRACTION = float(os.environ.get("OUROBOROS_PRIMARY_BUDGET_FRACTION", "0.65"))
 _FALLBACK_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_FALLBACK_MIN_RESERVE_S", "20"))
 
@@ -1125,6 +1125,10 @@ class CandidateGenerator:
     def _compute_tier0_budget(total_s: float) -> float:
         """Deterministic Tier 0 (DoubleWord) budget with Tier 1 reserve.
 
+        Tier 0 is the preferred path (cheap, Manifesto §5 Tier 0 fast-path).
+        It gets 65% of the total budget by default.  When the total budget is
+        tight (< 90s), we log a warning — both tiers may starve.
+
         Invariants:
           - tier0_budget <= total_s * _TIER0_BUDGET_FRACTION
           - tier0_budget <= _TIER0_MAX_WAIT_S
@@ -1132,8 +1136,15 @@ class CandidateGenerator:
         """
         if total_s <= 0:
             return 0.0
+        if total_s < 90.0:
+            logger.warning(
+                "[CandidateGenerator] Generation budget tight (%.0fs < 90s). "
+                "Consider increasing JARVIS_GENERATION_TIMEOUT_S for reliable "
+                "2-tier cascade.",
+                total_s,
+            )
         # Reserve Tier 1 budget first (defensive — Tier 1 must always get a chance)
-        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * 0.5)
+        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * 0.35)
         budget = min(
             total_s * _TIER0_BUDGET_FRACTION,
             _TIER0_MAX_WAIT_S,
