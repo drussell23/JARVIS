@@ -994,6 +994,10 @@ def _should_use_lean_prompt(
         return False
     if not tools_enabled:
         return False
+    # Trivial tasks skip the tool loop, so the lean (tool-first) prompt
+    # would confuse the model into returning tool calls that nobody handles.
+    if getattr(ctx, "task_complexity", "") in ("trivial",):
+        return False
     if getattr(ctx, "cross_repo", False):
         return False
     # Env override: JARVIS_LEAN_PROMPT=false to disable
@@ -2092,6 +2096,14 @@ def _parse_generation_response(
             is_noop=True,
         )
 
+    if actual_version == _TOOL_SCHEMA_VERSION:
+        # Model returned a tool call instead of a patch — happens when the
+        # lean prompt (with tool instructions) was used but the tool loop was
+        # skipped (e.g. trivial task).  Treat as content failure so the
+        # candidate generator can retry or cascade.
+        raise RuntimeError(
+            f"{pfx}_schema_invalid:tool_call_without_tool_loop:{actual_version}"
+        )
     if actual_version != _SCHEMA_VERSION:
         raise RuntimeError(
             f"{pfx}_schema_invalid:wrong_schema_version:{actual_version}"
