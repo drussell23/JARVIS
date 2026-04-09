@@ -795,6 +795,22 @@ class GovernedOrchestrator:
                             )
                     except Exception as _fleet_exc:
                         logger.debug("[Orchestrator] ExplorationFleet skipped: %s", _fleet_exc)
+
+                # P2.1: Dependency-aware generation — inject Oracle graph summary
+                _oracle_ref = getattr(self._stack, "oracle", None)
+                if _oracle_ref is not None and ctx.target_files:
+                    try:
+                        _dep_summary = self._build_dependency_summary(
+                            _oracle_ref, ctx.target_files,
+                        )
+                        if _dep_summary:
+                            ctx = dataclasses.replace(ctx, dependency_summary=_dep_summary)
+                            logger.info(
+                                "[Orchestrator] Dependency summary injected (%d chars, %d files)",
+                                len(_dep_summary), len(ctx.target_files),
+                            )
+                    except Exception as _dep_exc:
+                        logger.debug("[Orchestrator] Dependency summary skipped: %s", _dep_exc)
             except Exception as exc:
                 logger.warning(
                     "[Orchestrator] Context expansion failed for op=%s: %s; "
@@ -2222,6 +2238,7 @@ class GovernedOrchestrator:
                 return ctx
 
             if decision.status is ApprovalStatus.REJECTED:
+                _reject_reason = getattr(decision, "reason", "") or ""
                 ctx = ctx.advance(
                     OperationPhase.CANCELLED,
                     terminal_reason_code="approval_rejected",
@@ -2232,8 +2249,47 @@ class GovernedOrchestrator:
                     {
                         "reason": "approval_rejected",
                         "approver": decision.approver,
+                        "rejection_reason": _reject_reason,
                     },
                 )
+
+                # P2.2: Capture rejection as a session lesson so the model
+                # learns what the human doesn't want within this session.
+                _files_short = ", ".join(
+                    p.rsplit("/", 1)[-1] for p in ctx.target_files[:3]
+                )
+                _reason_tag = _reject_reason[:80] if _reject_reason else "no reason given"
+                self._session_lessons.append((
+                    "code",
+                    f"[REJECTED] {ctx.description[:60]} ({_files_short}) "
+                    f"— human rejected: {_reason_tag}. "
+                    f"Avoid this approach in future operations.",
+                ))
+                if len(self._session_lessons) > self._session_lessons_max:
+                    self._session_lessons = self._session_lessons[-self._session_lessons_max:]
+
+                # P2.2: Feed rejection into NegativeConstraintStore for
+                # cross-session learning (prompt adaptation on similar ops).
+                if _reject_reason:
+                    try:
+                        from backend.core.ouroboros.governance.self_evolution import (
+                            NegativeConstraintStore,
+                        )
+                        from backend.core.ouroboros.governance.entropy_calculator import (
+                            extract_domain_key as _rej_edk,
+                        )
+                        _rej_domain = _rej_edk(ctx.target_files, ctx.description)
+                        _ns = NegativeConstraintStore()
+                        _ns.add_constraint(
+                            _rej_domain,
+                            f"Human rejected: {_reject_reason[:120]}",
+                            f"Op {ctx.op_id} on {_files_short} was rejected at Iron Gate",
+                            source_op_id=ctx.op_id,
+                            severity="hard",
+                        )
+                    except Exception:
+                        pass  # Constraint recording is best-effort
+
                 return ctx
 
             # APPROVED -- continue to APPLY
@@ -3025,6 +3081,70 @@ class GovernedOrchestrator:
                     self._ops_before_lesson_success += 1
         except Exception:
             pass  # Session lessons are best-effort
+
+    @staticmethod
+    def _build_dependency_summary(
+        oracle: Any,
+        target_files: Sequence[str],
+    ) -> str:
+        """Build a ~200-token dependency summary from the Oracle graph.
+
+        Queries direct dependents, transitive importers, and blast radius
+        for each target file.  The summary is injected into the generation
+        prompt so the model avoids breaking downstream consumers.
+
+        Returns empty string if the Oracle is unavailable or target files
+        have no dependents.
+        """
+        if oracle is None or not target_files:
+            return ""
+
+        lines: list = []
+        seen_files: set = set()
+
+        for raw_path in target_files[:3]:  # Cap at 3 files to stay within budget
+            try:
+                ctx_info = oracle.get_context_for_improvement(raw_path, max_depth=2)
+            except Exception:
+                continue
+
+            if not ctx_info.get("found"):
+                continue
+
+            risk = ctx_info.get("risk_assessment", {})
+            dependents = ctx_info.get("dependents", [])
+            related = ctx_info.get("related_files", [])
+
+            if not dependents and not related:
+                continue
+
+            # Direct dependents (files that import/call this target)
+            dep_paths = []
+            for d in dependents[:8]:
+                fp = d.get("file_path", "") if isinstance(d, dict) else getattr(d, "file_path", "")
+                if fp and fp not in seen_files:
+                    dep_paths.append(fp)
+                    seen_files.add(fp)
+
+            risk_level = risk.get("risk_level", "low")
+            total_affected = risk.get("total_affected", 0)
+
+            file_line = f"**{raw_path}** — risk={risk_level}, {total_affected} affected"
+            if dep_paths:
+                file_line += f"\n  Dependents: {', '.join(dep_paths[:6])}"
+                if len(dep_paths) > 6:
+                    file_line += f" (+{len(dep_paths) - 6} more)"
+            lines.append(file_line)
+
+        if not lines:
+            return ""
+
+        return (
+            "## Dependency Impact (from Oracle graph)\n\n"
+            "These files import/call your targets. Ensure changes are "
+            "backward-compatible or update dependents too.\n\n"
+            + "\n".join(lines)
+        )
 
     @staticmethod
     def _causal_postmortem(error_pattern: str, ctx: "OperationContext") -> str:

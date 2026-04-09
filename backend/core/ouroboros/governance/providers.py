@@ -882,6 +882,11 @@ def _build_lean_codegen_prompt(
             "## Session Lessons\n\n" + _session_lessons.strip()
         )
 
+    # ── 5b. Dependency impact from Oracle graph ─────────────────────────
+    _dep_summary = getattr(ctx, "dependency_summary", "")
+    if isinstance(_dep_summary, str) and _dep_summary.strip():
+        parts.append(_dep_summary.strip())
+
     # ── 6. Target file metadata + region (the core lean payload) ────────
     for raw_path in ctx.target_files:
         abs_path = (
@@ -1396,6 +1401,11 @@ Rules:
             "Use these to avoid repeating mistakes and build on successes:\n\n"
             + _session_lessons.strip()
         )
+
+    # ── 4d. Dependency impact from Oracle graph ──────────────────────────
+    _dep_summary = getattr(ctx, "dependency_summary", "")
+    if isinstance(_dep_summary, str) and _dep_summary.strip():
+        parts.append(_dep_summary.strip())
 
     # ── 4a. Structural index + recent history (Sub-project B: The Eyes) ──
     if ctx.target_files:

@@ -528,6 +528,11 @@ class OperationContext:
     # ---- Cumulative session intelligence (injected before GENERATE) ----
     session_lessons: str = ""  # ephemeral lessons from prior ops in this session
 
+    # ---- Dependency intelligence from Oracle graph (injected at CONTEXT_EXPANSION) ----
+    # ~200-token summary: direct dependents, transitive importers, blast radius.
+    # Prevents breaking downstream consumers that import the target files.
+    dependency_summary: str = ""
+
     # ---- Stale-exploration guard: file hashes captured at GENERATE ----
     # Tuple of (filepath, sha256_hex) pairs snapshotted when GENERATE begins.
     # Compared at APPLY time — if any hash differs, the file was modified by
