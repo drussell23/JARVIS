@@ -182,15 +182,13 @@ class BattleTestHarness:
                 self._config.cost_cap_usd,
                 int(self._config.idle_timeout_s),
             )
-            # Detect active subsystems for banner
+            # ── Compact boot banner via SerpentFlow.boot_banner() ──
+            # Detects active subsystems and renders a single Rich Panel
+            # instead of 30+ loose print lines.
             _gls = self._governed_loop_service
             _has_consciousness = (
                 _gls is not None
                 and getattr(_gls, "_consciousness_bridge", None) is not None
-            )
-            _has_goal_memory = (
-                _gls is not None
-                and getattr(_gls, "_goal_memory_bridge", None) is not None
             )
             _has_strategic = (
                 _gls is not None
@@ -208,49 +206,43 @@ class BattleTestHarness:
                 and getattr(_gls, "_bg_pool", None) is not None
             )
 
-            _on = "[bright_green]ON[/bright_green]"
-            _off = "[dim]OFF[/dim]"
-
             _n_principles = 0
             if _has_strategic:
                 _n_principles = len(_gls._strategic_direction.principles)
 
-            # Use Rich console for the boot banner — consistent styling,
-            # no raw ANSI escapes, works with prompt_toolkit's patch_stdout.
-            _c = self._serpent_flow.console if hasattr(self, "_serpent_flow") and self._serpent_flow else None
-            if _c is None:
-                from rich.console import Console as _C
-                _c = _C(emoji=True, highlight=False)
-
-            _pool_info = f"parallel ({getattr(_gls._bg_pool, '_pool_size', 2)} workers)" if _has_bg_pool else "sequential"
+            _pool_info = (
+                f"parallel ({getattr(_gls._bg_pool, '_pool_size', 2)} workers)"
+                if _has_bg_pool else "sequential"
+            )
             _venom_info = "bash + web + tests + L2" if _has_l2 else "tools active"
 
-            _c.print()
-            _c.print("[bold cyan]      🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍[/bold cyan]", highlight=False)
-            _c.print("[bold cyan]      O U R O B O R O S  +  V E N O M[/bold cyan]", highlight=False)
-            _c.print("[bold cyan]      The Self-Developing Organism[/bold cyan]", highlight=False)
-            _c.print(f"[dim]      {'─' * 52}[/dim]", highlight=False)
-            _c.print()
-            _c.print(f"  🧬  Session    {self._session_id}", highlight=False)
-            _c.print(f"  🌳  Branch     {self._branch_name or 'N/A'}", highlight=False)
-            _c.print(f"  💰  Budget     ${self._config.cost_cap_usd:.2f}", highlight=False)
-            _c.print(f"  ⏳  Idle       {int(self._config.idle_timeout_s)}s", highlight=False)
-            _c.print("  🛡️   Mode       Governed (SAFE_AUTO auto-apply)", highlight=False)
-            _c.print()
-            _c.print(f"[dim]      {'─' * 52}[/dim]", highlight=False)
-            _c.print("[bold]  6-Layer Organism Status:[/bold]", highlight=False)
-            _c.print()
-            _c.print(f"  🧭  Strategic Direction   [{_on if _has_strategic else _off}]  {_n_principles} Manifesto principles", highlight=False)
-            _c.print(f"  🧠  Consciousness         [{_on if _has_consciousness else _off}]  Memory + Prophecy + Health", highlight=False)
-            _c.print(f"  📡  Event Spine           [{_on}]  FileWatch → TrinityBus → sensors", highlight=False)
-            _c.print(f"  ⚙️   Ouroboros Pipeline    [{_on}]  {_pool_info}", highlight=False)
-            _c.print(f"  🐍  Venom Agentic Loop    [{_on if _has_tool_loop else _off}]  {_venom_info}", highlight=False)
-            _c.print(f"  📝  Thought Log           [{_on}]  .jarvis/ouroboros_thoughts.jsonl", highlight=False)
-            _c.print()
-            _c.print(f"[dim]      {'─' * 52}[/dim]", highlight=False)
-            _c.print("  🔋 Organism is alive. Sensors scanning...", highlight=False)
-            _c.print("  ⌨️  Press Ctrl+C to stop.", highlight=False)
-            _c.print()
+            # Build 6-layer status: (icon, name, is_on, detail)
+            _layers = [
+                ("🧭", "Strategic Direction", _has_strategic, f"{_n_principles} Manifesto principles"),
+                ("🧠", "Consciousness", _has_consciousness, "Memory + Prophecy + Health"),
+                ("📡", "Event Spine", True, "FileWatch → TrinityBus → sensors"),
+                ("⚙️ ", "Ouroboros Pipeline", True, _pool_info),
+                ("🐍", "Venom Agentic Loop", _has_tool_loop, _venom_info),
+                ("📝", "Thought Log", True, "ouroboros_thoughts.jsonl"),
+            ]
+
+            _log_path = getattr(self, "_log_file_path", "")
+
+            if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
+                self._serpent_flow.boot_banner(
+                    layers=_layers,
+                    n_sensors=0,  # Updated below after intake boot
+                    log_path=_log_path,
+                )
+            else:
+                # Fallback: basic Rich console output
+                from rich.console import Console as _C
+                _c = _C(emoji=True, highlight=False)
+                _c.print("[bold cyan]🐍 OUROBOROS + VENOM[/bold cyan]", highlight=False)
+                _c.print(f"  Session: {self._session_id}", highlight=False)
+                _c.print(f"  Branch:  {self._branch_name or 'N/A'}", highlight=False)
+                _c.print(f"  Budget:  ${self._config.cost_cap_usd:.2f}", highlight=False)
+                _c.print()
 
             # Subscribe to operation completion events for session recording
             try:
@@ -478,10 +470,7 @@ class BattleTestHarness:
                         if isinstance(_h, logging.StreamHandler) and not isinstance(_h, logging.FileHandler):
                             _root.removeHandler(_h)
                     logger.info("Logging redirected to %s", _log_file)
-                    self._serpent_flow.console.print(
-                        f"             │ 📝 logs: [dim]{_log_file}[/dim]",
-                        highlight=False,
-                    )
+                    self._log_file_path = str(_log_file)
                 except Exception as _log_exc:
                     logger.debug("Log redirect failed: %s", _log_exc)
                 self._keyboard_handler = None
