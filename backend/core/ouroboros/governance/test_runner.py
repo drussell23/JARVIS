@@ -130,13 +130,21 @@ _ADAPTER_RULES: Tuple[_AdapterRule, ...] = (
 def _normalize(path: Path, repo_root: Path) -> str:
     """Resolve path to repo-relative POSIX string.
 
-    Raises BlockedPathError if path resolves outside repo_root.
-    This is for routing decisions only (not the _is_safe_path test security check).
+    Raises BlockedPathError if path resolves outside repo_root *and*
+    outside allowed sandbox prefixes.  Sandbox paths are expected —
+    the orchestrator writes candidate content into a temp directory
+    before calling LanguageRouter.  For sandbox paths, the filename
+    is returned as-is (sufficient for adapter routing).
     """
     try:
         resolved = path.resolve()
         return resolved.relative_to(repo_root.resolve()).as_posix()
     except ValueError:
+        # Allow paths under known sandbox/temp prefixes — the
+        # orchestrator writes files there for validation.
+        resolved_str = str(path.resolve())
+        if any(resolved_str.startswith(p) for p in _ALLOWED_SANDBOX_PREFIXES):
+            return path.name
         raise BlockedPathError(
             f"Path {path} resolves outside repo root {repo_root}. "
             "Pipeline CANCELLED — security gate."

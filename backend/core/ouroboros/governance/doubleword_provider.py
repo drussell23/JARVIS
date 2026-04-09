@@ -392,10 +392,23 @@ class DoublewordProvider:
 
             from backend.core.ouroboros.governance.providers import (
                 _parse_generation_response,
+                _file_source_hash,
             )
-            import hashlib as _hl
-            _src = pending.prompt[:500] if pending.prompt else ""
-            _src_hash = _hl.sha256(_src.encode()).hexdigest()[:16]
+            # Source hash: full SHA-256 of target file content (matches
+            # _check_source_drift at GATE).  Old code hashed prompt[:500]
+            # which guaranteed false-positive drift for every DW candidate.
+            _src_hash = ""
+            _src_path_str = ""
+            if ctx.target_files:
+                _src_path_str = ctx.target_files[0]
+                _abs = (self._repo_root / _src_path_str).resolve()
+                try:
+                    if _abs.is_file():
+                        _src_hash = _file_source_hash(
+                            _abs.read_text(encoding="utf-8", errors="replace")
+                        )
+                except OSError:
+                    pass
 
             # Log raw response preview for debugging parse failures
             _preview = content[:200].replace("\n", "\\n") if content else "(empty)"
@@ -425,7 +438,7 @@ class DoublewordProvider:
                 duration_s=elapsed,
                 ctx=ctx,
                 source_hash=_src_hash,
-                source_path="",
+                source_path=_src_path_str,
                 repo_roots=self._repo_roots or None,
                 repo_root=self._repo_root,
             )
@@ -547,8 +560,7 @@ class DoublewordProvider:
             _build_codegen_prompt,
             _parse_generation_response,
         )
-        from datetime import datetime, timezone, timedelta
-        import hashlib as _hl
+        from datetime import datetime, timezone
 
         self._check_budget()
         t0 = time.monotonic()
@@ -817,10 +829,24 @@ class DoublewordProvider:
             raise DoublewordInfraError("Empty response from real-time API", status_code=0)
 
         # Parse the response into GenerationResult
-        _src = prompt[:500]
-        _src_hash = _hl.sha256(_src.encode()).hexdigest()[:16]
-
-        from backend.core.ouroboros.governance.providers import _extract_json_block
+        # Source hash must match what _check_source_drift() computes at GATE:
+        # full SHA-256 of the target file's content (not the prompt).
+        from backend.core.ouroboros.governance.providers import (
+            _extract_json_block,
+            _file_source_hash,
+        )
+        _src_hash = ""
+        _src_path_str = ""
+        if context.target_files:
+            _src_path_str = context.target_files[0]
+            _abs = (self._repo_root / _src_path_str).resolve()
+            try:
+                if _abs.is_file():
+                    _src_hash = _file_source_hash(
+                        _abs.read_text(encoding="utf-8", errors="replace")
+                    )
+            except OSError:
+                pass
         _extracted = _extract_json_block(raw)
         if _extracted and not _extracted.lstrip().startswith("{"):
             logger.warning(
@@ -836,7 +862,7 @@ class DoublewordProvider:
             duration_s=elapsed,
             ctx=context,
             source_hash=_src_hash,
-            source_path="",
+            source_path=_src_path_str,
             repo_roots=self._repo_roots or None,
             repo_root=self._repo_root,
         )
