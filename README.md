@@ -304,6 +304,117 @@ Deterministic post-APPLY hook. When the agentic layer modifies `requirements.txt
 | `package.json` | `npm install` |
 | `.env`, `backend/.env` | In-process env var reload (additive merge) |
 
+### Ouroboros + Venom: The Proactive Autonomous Developer (O+V)
+
+**The Paradigm Shift: Proactive, Not Reactive**
+
+Traditional AI coding assistants (Claude Code, Cursor, Copilot) are *reactive* -- they wait for a human to type a prompt, then respond. Ouroboros + Venom (O+V) inverts this relationship. O+V is a **proactive autonomous developer** that continuously explores the codebase, detects improvement opportunities through 16 sensors, synthesizes patches, validates them, and applies them -- all without human intervention unless the severity of the change demands it.
+
+Think of it this way: **Claude Code proved the UX language for AI-assisted development. O+V uses that same language for autonomous work.** The difference is that O+V initiates its own work, understands the developer's architectural direction from the Manifesto, and decides what to build next based on strategic intent rather than waiting for instructions.
+
+```
+Claude Code (Reactive)           Ouroboros + Venom (Proactive)
+========================         ==============================
+Human types prompt        -->    16 sensors detect opportunities
+Human reviews suggestion  -->    Risk engine classifies autonomy tier
+Human approves change     -->    Iron Gate auto-approves / escalates by severity
+Human runs tests          -->    Post-apply verification loop + L2 self-repair
+Human moves to next task  -->    Session intelligence carries lessons forward
+```
+
+**When does O+V escalate to a human?**
+
+O+V uses a **graduated severity protocol** with four tiers:
+
+| Tier | Color | Behavior | Trigger |
+|------|-------|----------|---------|
+| `SAFE_AUTO` | Green | Auto-apply, silent in logs | Single-file, non-core, low-risk |
+| `NOTIFY_APPLY` | Yellow | Auto-apply, prominent CLI notice | New files, multi-file changes, core path modifications |
+| `APPROVAL_REQUIRED` | Orange | Block until human approves | Security-sensitive paths, breaking API changes |
+| `BLOCKED` | Red | Reject outright | Supervisor, credentials, governance engine itself |
+
+The organism handles Green and Yellow autonomously. Orange pauses and asks. Red never proceeds.
+
+**SerpentFlow CLI: Claude Code UX for Autonomous Work**
+
+The `SerpentFlow` CLI (`battle_test/serpent_flow.py`, 1,900+ lines) renders O+V's autonomous operations using the visual language pioneered by Claude Code -- `Update(path)` blocks, `Added N, removed M` summaries, numbered context diffs with `+`/`-` coloring -- but within an organism-themed flowing terminal that reflects O+V's proactive nature:
+
+```
+  ┌ op-2026-0408-1723 ────────────────────────────────
+  │ TestFailure  Fix assertion error in test_provider.py
+  │ triage       GENERATE (0.92)
+  │ 🧬 synthesized  1 candidate via DW-397B + 🔧 3  1,247 tok  (4.2s)
+  │ ⏺ Read(backend/core/ouroboros/governance/providers.py)
+  │ ⏺ Read(tests/test_provider.py)
+  │ ⏺ Update(tests/test_provider.py)
+  │   ⎿  Added 3 lines, removed 1 line
+  │   ⎿  reasoning: fix off-by-one in assertion — expected 3, was comparing to 2
+  │      42   def test_parse_tool_calls(self):
+  │      43 -     assert len(result) == 2
+  │      43 +     assert len(result) == 3
+  │      44 +     assert result[2].name == "search_code"
+  │ 🛡️ immune      ✅ 7/7 passing
+  │ ⏺ Verify(test_provider.py)
+  │   ⎿  ✅ 7/7 passing
+  │ ⚠ NOTIFY     multi_file_change  providers.py, test_provider.py
+  │   ⎿  auto-applying (Yellow severity — review in git log)
+  └ ✅ complete    DW-397B  $0.003  (8.1s)
+```
+
+Key differences from the LiveDashboard TUI (which uses a pinned Rich `Live` table):
+- **Flowing output** -- events scroll like a terminal log, not a fixed dashboard
+- **CC-style artifact blocks** -- `Read`, `Update`, `Write`, `Verify` with context diffs
+- **Per-operation reasoning** -- model rationale displayed under each `Update` block
+- **Organism personality** -- op-scoped `┌│└` borders, sensor vocabulary, serpent boot banner
+- **Interactive REPL** -- `prompt_toolkit`-based command input while operations flow above
+
+**7 Autonomous Developer Intelligence Capabilities**
+
+These capabilities make O+V behave like a senior developer, not a code completion engine:
+
+**1. Operation Intent Visibility** -- Every operation displays the model's reasoning for why it made a specific change. The rationale is captured from the generation output and displayed as a `reasoning:` line under each `Update` block. No black-box patches.
+
+**2. Severity-Based Human Escalation** -- The 4-tier graduated protocol (Green/Yellow/Orange/Red) described above. `NOTIFY_APPLY` is the key innovation: changes that are safe enough to auto-apply but important enough to surface prominently -- new file creation, multi-file modifications, core orchestration paths.
+
+**3. Operation Dependency Chains (DAG-Based Signal Merging)** -- When multiple sensors detect opportunities that target the same files, O+V prevents conflicting concurrent patches. The `UnifiedIntakeRouter` tracks active file operations and queues overlapping signals behind the in-flight operation. When the blocking op completes, queued signals are automatically re-ingested. No merge conflicts from the organism fighting itself.
+
+**4. Exploration-First Enforcement** -- The generation prompt requires the model to call at least 2 exploration tools (`read_file`, `search_code`, `get_callers`) before proposing any code change. This prevents patches generated from stale parametric memory. "A senior engineer reads first, then writes."
+
+**5. Post-Apply Verification Loop** -- After APPLY succeeds, O+V runs a **scoped test suite** targeting only the files that were just modified. On failure, the operation routes into L2 self-repair (up to 5 iterations, 120s timebox) instead of immediately rolling back. The CLI renders a `Verify(files)` block showing pass/fail counts. Only if L2 repair also fails does rollback occur.
+
+**6. Cumulative Session Intelligence** -- An ephemeral lessons buffer on the orchestrator accumulates compact insights from every operation in the session: `[OK] description (files)` for successes, `[FAIL:pattern] description (files)` for failures. These lessons are injected as a `## Session Lessons` section into subsequent generation prompts. The model learns within a session without persistent fine-tuning. Capped at 20 lessons (configurable via `JARVIS_SESSION_LESSONS_MAX`).
+
+**7. Cost-Aware Operation Prioritization** -- The intake router's priority queue factors urgency, file count, and confidence into a composite score. Critical/high-urgency signals are promoted. Multi-file operations (which consume more generation tokens for less focused impact) are mildly deprioritized. High-confidence signals (>=0.9) get a slight boost. Within the same source tier, focused single-file ops are processed before sprawling multi-file ones.
+
+**O+V vs Claude Code: Comparative Architecture**
+
+| Dimension | Claude Code | O+V |
+|---|---|---|
+| **Initiation** | Human types prompt | 16 sensors detect opportunities autonomously |
+| **Scope** | Single conversation | Continuous session across hundreds of operations |
+| **Cost** | $3-15/M tokens (Claude) | $0.10-0.40/M tokens (DW 397B primary) |
+| **Codebase understanding** | Per-conversation exploration | Oracle semantic index + per-file reputation memory |
+| **Self-repair** | User retries manually | L2 repair engine (5 iterations, 120s timebox, failure classification) |
+| **Risk governance** | User judgment | 4-tier deterministic risk classification + Iron Gate |
+| **Strategic direction** | User provides context | Manifesto auto-injected into every prompt |
+| **Cross-session learning** | None | MemoryEngine (file reputation), LearningConsolidator (domain rules) |
+| **Regression prediction** | None | ProphecyEngine predicts risk before generation |
+| **Multi-repo** | Single repo | Saga-based cross-repo patches (JARVIS + J-Prime + Reactor) |
+| **Session intelligence** | Conversation context | Cumulative lessons buffer injected into prompts |
+| **UX language** | `Update(path)` + diffs | Same CC UX language, adapted for autonomous flowing output |
+
+**How O+V Understands Your Direction**
+
+O+V doesn't just fix bugs -- it understands *where the project is going*:
+
+1. **StrategicDirectionService** reads the Manifesto (README.md) and architecture docs at boot, extracts the 7 core principles, and injects them into every generation prompt
+2. **IntentDiscoverySensor** combines Manifesto principles + DreamEngine blueprints + Oracle semantic search to proactively discover what should be improved next
+3. **Session intelligence** carries forward what worked and what failed within the current session
+4. **MemoryEngine** builds per-file reputation across sessions -- fragile files get extra scrutiny, stable files get lighter validation
+5. **SuccessPatternStore** records (domain, approach, outcome) triples so the organism can replicate what works
+
+The organism reads the Manifesto, understands "async-first, zero shortcuts, structural repair", and generates code that aligns with those principles.
+
 **Graduation Orchestrator (Pillar 6):**
 
 Converts ephemeral tools into permanent agents: TRACKING → EVALUATING → WORKTREE_CREATING → GENERATING → VALIDATING → COMMITTING → AWAITING_APPROVAL → PUSHING → AWAITING_MERGE → REGISTERING → GRADUATED. After `JARVIS_GRADUATION_THRESHOLD` (default 3) successful uses, synthesizes production-ready agent code, runs contract tests, creates a Git PR, and hot-loads the new agent on merge.
@@ -392,11 +503,18 @@ The primary interface is voice. Derek talks to JARVIS and JARVIS talks back — 
 2. **Slow/Fast Thinking Router** (SIADAFIX) — simple fixes get 0.5x tokens, complex get 2x + force Tier 0.
 3. **Documentation-Augmented Repair** (RepoRepair) — auto-generate docs via AST FIRST, use as repair context.
 
-### LiveDashboard TUI (Battle Test Interface)
+### Battle Test Interfaces (LiveDashboard + SerpentFlow)
 
-**`backend/core/ouroboros/battle_test/live_dashboard.py`** (1,233 lines)
+**`backend/core/ouroboros/battle_test/live_dashboard.py`** (1,233 lines) + **`serpent_flow.py`** (1,900+ lines)
 
-The persistent terminal interface for watching Ouroboros operate autonomously. Built on Rich's `Live` + `Layout` + `Table` + `Panel`, the dashboard renders an in-place updating table showing every pipeline operation's progress in real-time.
+Two complementary terminal interfaces for watching Ouroboros operate autonomously:
+
+- **LiveDashboard** -- Persistent in-place updating Rich TUI. Best for monitoring multiple operations in a fixed table layout. Uses `Live` + `Layout` + `Table` + `Panel`.
+- **SerpentFlow** -- Flowing Claude Code-style CLI. Best for detailed per-operation visibility with CC-style `Update(path)` blocks, numbered context diffs, and per-op reasoning. Uses `prompt_toolkit` + Rich `Console` with an interactive REPL. The default interface for the battle test runner.
+
+Both interfaces receive the same CommProtocol messages via their respective transports (`DashboardTransport` and `SerpentTransport`).
+
+The LiveDashboard renders an in-place updating table showing every pipeline operation's progress in real-time.
 
 **Display elements:**
 - **Operation table**: Phase progression (CLASSIFY → ROUTE → ... → COMPLETE) with color-coded status badges, elapsed time, provider name, tool call count, and L2 repair iteration count
@@ -558,6 +676,11 @@ Core configuration. All values have sensible defaults; only `ANTHROPIC_API_KEY` 
 | `JARVIS_SEMANTIC_REVIEW_ENABLED` | `true` | Enable semantic code review gate for sensitive files |
 | `JARVIS_VOICE_ENABLED` | `true` | Enable voice input/output |
 | `JARVIS_AUDIO_BUS_ENABLED` | `false` | Enable real-time full-duplex audio bus |
+| `JARVIS_SESSION_LESSONS_MAX` | `20` | Maximum session intelligence lessons carried forward between operations |
+| `JARVIS_VERIFY_TIMEOUT_S` | `60` | Post-apply scoped verification test timeout (seconds) |
+| `JARVIS_L2_ENABLED` | `false` | Enable L2 iterative self-repair engine |
+| `JARVIS_L2_MAX_ITERS` | `5` | Maximum L2 repair iterations before hard stop |
+| `JARVIS_L2_TIMEBOX_S` | `120` | Total wall-clock time budget for entire repair loop |
 | `JARVIS_DEBUG` | `false` | Verbose debug logging |
 | `BACKEND_PORT` | `8000` | HTTP/WebSocket server port |
 
@@ -644,6 +767,7 @@ JARVIS-AI-Agent/
 |   |       |   `-- types.py                  # Shared dataclasses (485 lines)
 |   |       |-- battle_test/                  # Ouroboros battle test harness
 |   |       |   |-- harness.py                # 6-layer stack boot + orchestration
+|   |       |   |-- serpent_flow.py           # SerpentFlow CLI: CC-style UX (1,900+ lines)
 |   |       |   `-- live_dashboard.py         # Persistent Rich TUI (1,233 lines)
 |   |       `-- oracle.py                     # Codebase semantic index
 |   |-- core_contexts/                # 5 Core Execution Contexts (Brain)

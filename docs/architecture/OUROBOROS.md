@@ -432,6 +432,195 @@ Ouroboros GENERATE phase
 
 ---
 
+## Autonomous Developer Intelligence (7 Capabilities)
+
+These capabilities transform O+V from a patch generator into a proactive
+autonomous developer that understands the codebase, learns from its own
+history, and makes graduated autonomy decisions.
+
+### 1. Operation Intent Visibility
+
+**Source**: `serpent_flow.py` (`set_op_reasoning`, `show_diff`)
+
+Every operation displays the model's reasoning for why it made a specific
+change. The rationale is captured from `candidate_rationales` at GENERATE
+and stored per-op via `set_op_reasoning(op_id, reasoning)`. Displayed as a
+`reasoning:` line under each `Update(path)` block in the SerpentFlow CLI.
+
+### 2. Severity-Based Human Escalation Protocol
+
+**Source**: `risk_engine.py` (`RiskTier.NOTIFY_APPLY`), `orchestrator.py` (Phase 5b)
+
+The `RiskTier` enum now has 4 tiers:
+
+| Tier | Color | Auto-Apply? | Trigger Rules |
+|------|-------|-------------|---------------|
+| `SAFE_AUTO` | Green | Yes, silent | Single-file, non-core |
+| `NOTIFY_APPLY` | Yellow | Yes, visible | New files (Rule 10), multi-file changes (Rule 11), core orchestration paths (Rule 12) |
+| `APPROVAL_REQUIRED` | Orange | No, blocks | Security-sensitive, breaking API |
+| `BLOCKED` | Red | Rejected | Supervisor, credentials, governance engine |
+
+The orchestrator handles `NOTIFY_APPLY` at Phase 5b: it emits a
+`notify_apply` decision via CommProtocol (surfaced prominently in
+SerpentFlow as `NOTIFY ... auto-applying (Yellow severity)`), then
+continues to APPLY without blocking.
+
+### 3. Operation Dependency Chains (DAG-Based Signal Merging)
+
+**Source**: `unified_intake_router.py` (`_active_file_ops`, `_queued_behind`, `release_op`)
+
+When multiple sensors detect opportunities targeting the same files, the
+intake router prevents conflicting concurrent patches:
+
+```
+Signal A targets [foo.py] → registered in _active_file_ops
+Signal B targets [foo.py] → _find_file_conflict() returns A's op_id
+  → B queued behind A in _queued_behind[op_id_A]
+Signal A completes → release_op(op_id_A)
+  → removes foo.py from _active_file_ops
+  → re-ingests Signal B automatically
+```
+
+This eliminates merge conflicts from the organism fighting itself.
+
+### 4. Exploration-First Enforcement
+
+**Source**: `providers.py` (`_build_tool_section`)
+
+The generation prompt requires the model to call at least 2 exploration
+tools before proposing any code change:
+
+```
+### CRITICAL: Exploration-first protocol
+
+Before proposing ANY code change, you MUST verify the current state using
+at least 2 exploration tools:
+1. Read the target file — read_file to see the actual current code.
+   NEVER generate a patch from parametric memory alone.
+2. Check dependents — search_code or get_callers to find code that
+   imports/calls the function you're changing.
+```
+
+This prevents patches generated from stale weights. The model reads first,
+then writes -- like a senior engineer.
+
+### 5. Post-Apply Verification Loop
+
+**Source**: `orchestrator.py` (Phase 8a), `serpent_flow.py` (`op_verify_start`, `op_verify_result`)
+
+After APPLY succeeds, O+V runs a **scoped test suite** targeting only the
+files that were just modified. This catches regressions before the broader
+benchmark gate and enables targeted L2 repair:
+
+```
+Phase 8a: Scoped post-apply test run
+  ├── _validation_runner.run(changed_files, timeout=60s)
+  ├── Emit heartbeat with verify_test_starting / verify_test_passed
+  ├── SerpentFlow renders ⏺ Verify(files) with pass/fail counts
+  │
+  ├── On PASS → continue to benchmark gate → COMPLETE
+  └── On FAIL → route to L2 repair engine
+      ├── Build synthetic ValidationResult
+      ├── _l2_hook(ctx, synth_val, deadline)
+      ├── If L2 converges → continue to COMPLETE
+      └── If L2 fails → combine with benchmark result → rollback
+```
+
+Budget: `JARVIS_VERIFY_TIMEOUT_S` (default 60s).
+
+### 6. Cumulative Session Intelligence
+
+**Source**: `orchestrator.py` (`_session_lessons`), `providers.py` (prompt injection), `op_context.py` (`session_lessons` field)
+
+An ephemeral lessons buffer on `GovernedOrchestrator` accumulates compact
+insights from every operation in the session:
+
+- Success: `[OK] Fix assertion error in test_provider.py (test_provider.py)`
+- Failure: `[FAIL:test] Add type hints to config loader (config_loader.py)`
+
+Before each GENERATE phase, the lessons are injected into the
+`OperationContext.session_lessons` field and rendered in the generation
+prompt as a `## Session Lessons` section:
+
+```
+## Session Lessons (from prior operations this session)
+
+Use these to avoid repeating mistakes and build on successes:
+
+- [OK] Fix off-by-one in provider parser (providers.py)
+- [FAIL:build] Add async wrapper — missing await (event_channel.py)
+- [OK] Suppress PyPI timeout tracebacks (runtime_health_sensor.py)
+```
+
+Capped at 20 lessons (configurable via `JARVIS_SESSION_LESSONS_MAX`).
+
+### 7. Cost-Aware Operation Prioritization
+
+**Source**: `unified_intake_router.py` (`_compute_priority`)
+
+The intake router's `PriorityQueue` uses a composite score instead of
+raw source-type mapping:
+
+```python
+def _compute_priority(envelope):
+    base = _PRIORITY_MAP.get(envelope.source, 99)    # source tier
+    urgency = _URGENCY_BOOST.get(envelope.urgency, 0) # critical=3, high=1
+    cost_penalty = 0 if files <= 1 else (1 if files <= 4 else 2)
+    confidence_bonus = 1 if envelope.confidence >= 0.9 else 0
+    return base - urgency + cost_penalty - confidence_bonus
+```
+
+Within the same source tier, focused single-file ops are processed before
+sprawling multi-file ones. Critical/high-urgency signals are promoted
+regardless of file count. All three enqueue paths (initial, retry,
+WAL replay) use the composite score.
+
+---
+
+## SerpentFlow CLI
+
+**Source**: `battle_test/serpent_flow.py` (1,900+ lines)
+
+The SerpentFlow CLI is the default interface for the battle test runner.
+It renders autonomous operations using the visual language pioneered by
+Claude Code, adapted for O+V's proactive nature.
+
+### Architecture
+
+```
+SerpentFlow (Rich Console + prompt_toolkit)
+  ├── SerpentTransport (CommProtocol transport)
+  │   └── Routes INTENT/HEARTBEAT/DECISION/POSTMORTEM → flow methods
+  ├── SerpentApprovalProvider (Iron Gate)
+  │   └── prompt_toolkit session for Y/N approval
+  └── SerpentREPL (interactive commands)
+      └── /status, /cost, /pause, /resume, /q
+```
+
+### Visual Elements
+
+| Block | Trigger | Renders |
+|-------|---------|---------|
+| `┌ op-id ... goal` | INTENT message | Op header with sensor type |
+| `⏺ Read(path)` | read_file tool call | File path |
+| `⏺ Update(path)` | edit_file tool call | CC-style diff with +/- lines |
+| `⏺ Write(path)` | write_file tool call | Line count |
+| `⏺ Verify(files)` | Post-apply test | Pass/fail counts |
+| `🧬 synthesized` | Generation complete | Provider, tokens, duration |
+| `🛡️ immune` | Validation result | Test pass/fail |
+| `🩹 repair` | L2 iteration | Iteration count, status |
+| `⚠ NOTIFY` | NOTIFY_APPLY decision | Reason code, files |
+| `└ ✅ complete` | DECISION:completed | Provider, cost, duration |
+
+### Terminal Rendering
+
+SerpentFlow uses `Console(force_terminal=True)` to force Rich ANSI output
+through prompt_toolkit's stdout proxy, and `patch_stdout(raw=True)` to
+preserve ANSI escape codes. Without these, Rich output appears as raw
+`?[2m` sequences in the prompt_toolkit-patched terminal.
+
+---
+
 ## Trinity Consciousness: The Metacognition Layer
 
 **Source**: `backend/core/ouroboros/consciousness/`

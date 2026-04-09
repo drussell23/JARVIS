@@ -63,6 +63,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 
 - **SemanticTriage** (`semantic_triage.py`): Pre-generation filter -- classifies NO_OP/REDIRECT/ENRICH/GENERATE before expensive generation
 - **CommProtocol** (`comm_protocol.py`): 5-phase observability -- INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM
+- **SerpentFlow** (`battle_test/serpent_flow.py`, 1900+ lines): CC-style flowing CLI with `Update(path)` blocks, numbered diffs, per-op reasoning
 - **LiveDashboard** (`battle_test/live_dashboard.py`, 1233 lines): Persistent Rich TUI with 3-channel terminal muting
 - **Venom** (`tool_executor.py`): Multi-turn agentic tool loop (read_file, search_code, run_tests, get_callers)
 - **L2 Repair** (`repair_engine.py`): Iterative self-repair FSM (5 iterations, 120s timebox)
@@ -70,13 +71,25 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **StrategicDirection** (`strategic_direction.py`): Manifesto principles injected into every generation prompt
 - **DreamEngine** (`consciousness/dream_engine.py`): Idle GPU speculative improvement blueprints
 
+### Autonomous Developer Intelligence (O+V)
+
+O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capabilities:
+
+- **4-tier risk escalation**: `SAFE_AUTO` / `NOTIFY_APPLY` / `APPROVAL_REQUIRED` / `BLOCKED` -- Green/Yellow auto-apply, Orange blocks for human
+- **Exploration-first**: Generation prompt requires 2+ tool calls before any patch. Read first, write second.
+- **Post-apply verification**: Scoped test run after APPLY, routes failures to L2 repair before rollback
+- **Session intelligence**: `_session_lessons` buffer (20 max) injected into generation prompts via `OperationContext.session_lessons`
+- **Cost-aware priority**: `_compute_priority()` in intake router factors urgency, file count, confidence
+- **Dependency DAG**: `_active_file_ops` in intake router prevents conflicting concurrent patches on same files
+- **Per-op reasoning**: Model rationale captured at GENERATE, displayed in SerpentFlow `Update` blocks
+
 ## Battle Test
 
 ```bash
 python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
 ```
 
-Boots the full 6-layer stack: GovernedLoopService, IntakeLayer (16 sensors), TrinityConsciousness, StrategicDirection, CommProtocol, LiveDashboard.
+Boots the full 6-layer stack: GovernedLoopService, IntakeLayer (16 sensors), TrinityConsciousness, StrategicDirection, CommProtocol, SerpentFlow CLI.
 
 ## File Layout (Key Paths)
 
@@ -108,6 +121,7 @@ backend/core/ouroboros/
     prophecy_engine.py          # Regression prediction
   battle_test/
     harness.py                  # 6-layer stack boot
+    serpent_flow.py             # SerpentFlow: CC-style CLI (1,900+ lines)
     live_dashboard.py           # Persistent Rich TUI (1,233 lines)
   oracle.py                     # Codebase semantic index
 ```
