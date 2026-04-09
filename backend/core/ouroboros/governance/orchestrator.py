@@ -230,6 +230,14 @@ class GovernedOrchestrator:
         self._pre_action_narrator: Optional[Any] = None  # set via set_pre_action_narrator()
         self._exploration_fleet: Optional[Any] = None  # set via set_exploration_fleet()
 
+        # ── Session Intelligence: ephemeral lessons buffer ──
+        # Accumulates compact lessons from completed/failed ops within this
+        # session.  Injected into subsequent generation prompts so the model
+        # avoids repeating mistakes and builds on successes.
+        self._session_lessons: list = []  # List[str]
+        _max = int(os.environ.get("JARVIS_SESSION_LESSONS_MAX", "20"))
+        self._session_lessons_max: int = max(5, _max)
+
         # RSI Convergence Framework — lazy initialization
         self._rsi_score_function = None
         self._rsi_score_history = None
@@ -1076,6 +1084,16 @@ class GovernedOrchestrator:
             _episodic_memory = EpisodicFailureMemory(ctx.op_id)
         except ImportError:
             pass
+
+        # ── Inject cumulative session lessons into context ──
+        if self._session_lessons:
+            _lessons_text = "\n".join(
+                f"- {lesson}" for lesson in self._session_lessons[-self._session_lessons_max:]
+            )
+            ctx = dataclasses.replace(
+                ctx,
+                session_lessons=_lessons_text,
+            )
 
         for attempt in range(1 + self._config.max_generate_retries):
             try:
@@ -2187,6 +2205,101 @@ class GovernedOrchestrator:
             OperationState.APPLIED,
             {"op_id": ctx.op_id},
         )
+
+        # ---- Phase 8a: Scoped post-apply test run ----
+        # Run tests scoped to the files that were just modified.  This catches
+        # regressions *before* the broader benchmark gate and can route failures
+        # into L2 repair instead of immediate rollback.
+        _verify_test_passed = True
+        _verify_test_total = 0
+        _verify_test_failures = 0
+        _verify_failed_names: Tuple[str, ...] = ()
+
+        if self._validation_runner is not None and ctx.target_files:
+            _changed = tuple(
+                self._config.project_root / f for f in ctx.target_files
+            )
+            _files_str = ", ".join(str(f) for f in list(ctx.target_files)[:3])
+
+            # Heartbeat: scoped verify starting (drives ⏺ Verify block in CLI)
+            try:
+                await self._stack.comm.emit_heartbeat(
+                    op_id=ctx.op_id, phase="verify",
+                    verify_test_starting=True,
+                    verify_target_files=list(ctx.target_files),
+                )
+            except Exception:
+                pass
+
+            _verify_budget_s = min(
+                60.0,
+                float(os.environ.get("JARVIS_VERIFY_TIMEOUT_S", "60")),
+            )
+            try:
+                _multi = await asyncio.wait_for(
+                    self._validation_runner.run(
+                        changed_files=_changed,
+                        sandbox_dir=None,
+                        timeout_budget_s=_verify_budget_s,
+                        op_id=ctx.op_id,
+                    ),
+                    timeout=_verify_budget_s + 5.0,
+                )
+                _verify_test_passed = _multi.passed
+                for _ar in _multi.adapter_results:
+                    _verify_test_total += _ar.test_result.total
+                    _verify_test_failures += _ar.test_result.failed
+                    _verify_failed_names += _ar.test_result.failed_tests
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                logger.warning("[Orchestrator] Verify scoped test timed out [%s]", ctx.op_id)
+                _verify_test_passed = False
+                _verify_test_failures = 1
+            except BlockedPathError:
+                pass  # security gate — skip scoped verify, let benchmark handle
+            except Exception as exc:
+                logger.debug("[Orchestrator] Verify scoped test error: %s", exc)
+
+            # Heartbeat: scoped verify result (drives ⏺ Verify result in CLI)
+            try:
+                await self._stack.comm.emit_heartbeat(
+                    op_id=ctx.op_id, phase="verify",
+                    verify_test_passed=_verify_test_passed,
+                    verify_test_total=_verify_test_total,
+                    verify_test_failures=_verify_test_failures,
+                    verify_target_files=list(ctx.target_files),
+                )
+            except Exception:
+                pass
+
+            # On failure: attempt L2 repair before rollback
+            if not _verify_test_passed and self._config.repair_engine is not None:
+                logger.info(
+                    "[Orchestrator] VERIFY test failed (%d/%d) — routing to L2 repair [%s]",
+                    _verify_test_failures, _verify_test_total, ctx.op_id,
+                )
+                _pl_deadline = ctx.pipeline_deadline or (
+                    datetime.now(timezone.utc) + timedelta(seconds=60)
+                )
+                # Build a synthetic ValidationResult for L2
+                _synth_val = ValidationResult(
+                    passed=False,
+                    best_candidate=best_candidate,
+                    validation_duration_s=0.0,
+                    error=f"post-apply verify: {_verify_test_failures}/{_verify_test_total} failing",
+                    failure_class="test",
+                    short_summary=f"verify: {', '.join(_verify_failed_names[:3])}",
+                    adapter_names_run=(),
+                )
+                try:
+                    directive = await self._l2_hook(ctx, _synth_val, _pl_deadline)
+                    if directive[0] == "break":
+                        # L2 converged — re-run scoped tests to confirm
+                        _verify_test_passed = True
+                        _verify_test_failures = 0
+                        logger.info("[Orchestrator] L2 repair converged in VERIFY phase [%s]", ctx.op_id)
+                except Exception as _l2_exc:
+                    logger.debug("[Orchestrator] L2 repair in VERIFY failed: %s", _l2_exc)
+
         ctx = await self._run_benchmark(ctx, [])
 
         # ---- Verify Gate: enforce regression thresholds (Sub-project C) ----
@@ -2205,6 +2318,10 @@ class GovernedOrchestrator:
                 _verify_error = enforce_verify_thresholds(_br, baseline_coverage=_baseline_cov)
         except Exception as exc:
             logger.debug("[Orchestrator] Verify gate skipped: %s", exc)
+
+        # Combine scoped-test failure with benchmark regression
+        if _verify_error is None and not _verify_test_passed:
+            _verify_error = f"scoped verify: {_verify_test_failures}/{_verify_test_total} tests failing"
 
         if _verify_error is not None:
             logger.warning(
@@ -2508,6 +2625,21 @@ class GovernedOrchestrator:
                     ))
             except Exception:
                 logger.debug("RSI transition tracking failed", exc_info=True)
+
+        # ── Session Intelligence: record ephemeral lesson ──────────────
+        try:
+            _files_short = ", ".join(str(f).split("/")[-1] for f in list(ctx.target_files)[:2])
+            if final_state in (OperationState.APPLIED,):
+                _lesson = f"[OK] {ctx.description[:80]} ({_files_short})"
+            else:
+                _err = error_pattern or "unknown"
+                _lesson = f"[FAIL:{_err}] {ctx.description[:60]} ({_files_short})"
+            self._session_lessons.append(_lesson)
+            # Cap to prevent unbounded growth
+            if len(self._session_lessons) > self._session_lessons_max:
+                self._session_lessons = self._session_lessons[-self._session_lessons_max:]
+        except Exception:
+            pass  # Session lessons are best-effort
 
     async def _run_benchmark(
         self,

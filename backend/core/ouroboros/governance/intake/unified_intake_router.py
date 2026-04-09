@@ -43,8 +43,39 @@ _PRIORITY_MAP: Dict[str, int] = {
     "runtime_health": 6,
 }
 
+# Urgency → priority boost (subtracted from base, so lower = higher priority)
+_URGENCY_BOOST: Dict[str, int] = {
+    "critical": 3,
+    "high": 1,
+    "normal": 0,
+    "low": -1,
+}
+
 # Sources that bypass backpressure
 _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
+
+
+def _compute_priority(envelope: "IntentEnvelope") -> int:
+    """Compute cost-aware priority score for an envelope.
+
+    Lower int = higher priority.  Factors:
+    1. Base priority from source type
+    2. Urgency boost (critical/high get promoted)
+    3. Cost-awareness: operations touching many files are penalized
+       (they consume more generation tokens for less focused impact)
+
+    The cost penalty is mild (0-2 points) — urgency and source type
+    still dominate, but within the same tier, focused single-file ops
+    are preferred over sprawling multi-file ones.
+    """
+    base = _PRIORITY_MAP.get(envelope.source, 99)
+    urgency = _URGENCY_BOOST.get(envelope.urgency, 0)
+    # Cost penalty: 0 for 1 file, 1 for 2-4 files, 2 for 5+ files
+    file_count = len(envelope.target_files) if envelope.target_files else 1
+    cost_penalty = 0 if file_count <= 1 else (1 if file_count <= 4 else 2)
+    # Confidence discount: high-confidence signals get slight priority
+    confidence_bonus = 1 if envelope.confidence >= 0.9 else 0
+    return base - urgency + cost_penalty - confidence_bonus
 
 
 @dataclass(frozen=True)
@@ -208,7 +239,8 @@ class UnifiedIntakeRouter:
         self._register_dedup(envelope)
 
         # 6. Place on priority queue (lower int = higher priority)
-        priority = _PRIORITY_MAP.get(envelope.source, 99)
+        # Cost-aware: factors urgency, file count, confidence
+        priority = _compute_priority(envelope)
         await self._queue.put((priority, envelope.submitted_at, envelope))
 
         # Fire A-narrator hook — non-critical; failures logged only
@@ -396,7 +428,7 @@ class UnifiedIntakeRouter:
                 # Re-enqueue for retry at the same priority.
                 # Use put_nowait() to avoid blocking the dispatch loop (self-deadlock).
                 # If the queue is full, dead-letter immediately rather than stall.
-                priority = _PRIORITY_MAP.get(envelope.source, 99)
+                priority = _compute_priority(envelope)
                 try:
                     self._queue.put_nowait((priority, envelope.submitted_at, envelope))
                 except asyncio.QueueFull:
@@ -422,7 +454,7 @@ class UnifiedIntakeRouter:
         for entry in pending:
             try:
                 envelope = IE.from_dict(entry.envelope_dict)
-                priority = _PRIORITY_MAP.get(envelope.source, 99)
+                priority = _compute_priority(envelope)
                 await self._queue.put((priority, envelope.submitted_at, envelope))
                 logger.debug(
                     "Router: replayed lease_id=%s source=%s",

@@ -1810,6 +1810,13 @@ class GovernedLoopService:
                     pass
             for _canonical in _locked_files:
                 self._active_file_ops.discard(_canonical)
+            # Release intake router file-overlap locks (re-ingest queued signals)
+            _intake = getattr(self, "_intake_router", None)
+            if _intake is not None:
+                try:
+                    await _intake.release_op(ctx.op_id)
+                except Exception:
+                    pass
             # Phase 4: clean up per-op FSM context
             self._fsm_contexts.pop(ctx.op_id, None)
             self._fsm_checkpoint_seq.pop(ctx.op_id, None)

@@ -516,6 +516,9 @@ class OperationContext:
     # ---- Human-authored instructions from OUROBOROS.md hierarchy (injected at submit time) ----
     human_instructions: str = ""  # injected from OUROBOROS.md hierarchy at submit time
 
+    # ---- Cumulative session intelligence (injected before GENERATE) ----
+    session_lessons: str = ""  # ephemeral lessons from prior ops in this session
+
     # ---- Reasoning chain result (stamped at CLASSIFY if chain is active) ----
     reasoning_chain_result: Optional[Dict[str, Any]] = None
 

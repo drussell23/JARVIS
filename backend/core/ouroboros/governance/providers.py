@@ -650,7 +650,16 @@ def _build_tool_section() -> str:
         "**Write tools (env-gated: JARVIS_TOOL_EDIT_ALLOWED=1):**\n"
         "- `edit_file(path, old_string, new_string)` — find-and-replace edit (old_string must be unique)\n"
         "- `write_file(path, content)` — create or overwrite a file\n\n"
-        f"Max {MAX_TOOL_ITERATIONS} tool rounds total. After gathering info, respond with the patch JSON."
+        f"Max {MAX_TOOL_ITERATIONS} tool rounds total. After gathering info, respond with the patch JSON.\n\n"
+        "### CRITICAL: Exploration-first protocol\n\n"
+        "Before proposing ANY code change, you MUST verify the current state using\n"
+        "at least 2 exploration tools:\n"
+        "1. **Read the target file** — `read_file` to see the actual current code.\n"
+        "   NEVER generate a patch from parametric memory alone.\n"
+        "2. **Check dependents** — `search_code` or `get_callers` to find code that\n"
+        "   imports/calls the function you're changing. This prevents breaking callers.\n\n"
+        "Skipping exploration produces patches that silently break other code.\n"
+        "A senior engineer reads first, then writes."
     )
 
 
@@ -1018,6 +1027,15 @@ Rules:
         strategic_memory_prompt = ""
     if strategic_memory_prompt.strip():
         parts.append(strategic_memory_prompt)
+
+    # ── 4b. Session intelligence — lessons from prior ops this session ──
+    _session_lessons = getattr(ctx, "session_lessons", "")
+    if isinstance(_session_lessons, str) and _session_lessons.strip():
+        parts.append(
+            "## Session Lessons (from prior operations this session)\n\n"
+            "Use these to avoid repeating mistakes and build on successes:\n\n"
+            + _session_lessons.strip()
+        )
 
     # ── 4a. Structural index + recent history (Sub-project B: The Eyes) ──
     if ctx.target_files:

@@ -811,6 +811,61 @@ class SerpentFlow:
             f"[{color}]{status_emoji} {status}[/{color}]",
         )
 
+    # ── Post-apply Verify ─────────────────────────────────────
+
+    def op_verify_start(self, op_id: str, target_files: Optional[List[str]] = None) -> None:
+        """Spin a masking spinner while post-apply verification runs."""
+        files = target_files or []
+        files_str = ", ".join(f.split("/")[-1] for f in files[:3])
+        if len(files) > 3:
+            files_str += f" +{len(files) - 3}"
+        prefix = "  │  " if op_id in self._active_ops else "  "
+        self._start_status(
+            f"{prefix}⏺ Verify({files_str})",
+            spinner="dots",
+        )
+
+    def op_verify_result(
+        self, op_id: str, passed: bool,
+        test_total: int = 0, test_failures: int = 0,
+        target_files: Optional[List[str]] = None,
+    ) -> None:
+        """Post-apply verify result — CC-style ⏺ Verify block."""
+        self._stop_status()
+        files = target_files or []
+        files_str = ", ".join(f.split("/")[-1] for f in files[:3])
+        if len(files) > 3:
+            files_str += f" +{len(files) - 3}"
+
+        if test_total == 0:
+            self._op_line(
+                op_id,
+                f"[{_C['heal']}]⏺ Verify[/{_C['heal']}]({files_str})",
+            )
+            self._op_line(
+                op_id,
+                f"[{_C['dim']}]⎿  no scoped tests found[/{_C['dim']}]",
+            )
+        elif passed:
+            self._op_line(
+                op_id,
+                f"[{_C['life']}]⏺ Verify[/{_C['life']}]({files_str})",
+            )
+            self._op_line(
+                op_id,
+                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [green]✅ {test_total}/{test_total} passing[/green]",
+            )
+        else:
+            passing = test_total - test_failures
+            self._op_line(
+                op_id,
+                f"[{_C['death']}]⏺ Verify[/{_C['death']}]({files_str})",
+            )
+            self._op_line(
+                op_id,
+                f"  [{_C['dim']}]⎿[/{_C['dim']}]  [red]❌ {test_failures} failing, {passing} passing[/red]",
+            )
+
     # ── Code preview ──────────────────────────────────────────
 
     def show_code_preview(
@@ -1434,6 +1489,21 @@ class SerpentTransport:
                         iteration=payload["l2_iteration"],
                         max_iters=payload.get("l2_max_iters", 5),
                         status=payload.get("l2_status", ""),
+                    )
+
+                # Post-apply VERIFY — scoped test run
+                elif phase.upper() == "VERIFY" and payload.get("verify_test_starting"):
+                    self._flow.op_verify_start(
+                        op_id=op_id,
+                        target_files=payload.get("verify_target_files", []),
+                    )
+                elif phase.upper() == "VERIFY" and "verify_test_passed" in payload:
+                    self._flow.op_verify_result(
+                        op_id=op_id,
+                        passed=payload.get("verify_test_passed", False),
+                        test_total=payload.get("verify_test_total", 0),
+                        test_failures=payload.get("verify_test_failures", 0),
+                        target_files=payload.get("verify_target_files", []),
                     )
 
                 # APPLY phase — show real-time diffs
