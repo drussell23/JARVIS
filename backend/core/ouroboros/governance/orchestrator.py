@@ -8,7 +8,7 @@ engine, and operation ledger into a single deterministic pipeline:
 
 .. code-block:: text
 
-    CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> GENERATE -> VALIDATE -> GATE -> [APPROVE] -> APPLY -> VERIFY -> COMPLETE
+    CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GATE -> [APPROVE] -> APPLY -> VERIFY -> COMPLETE
 
 The orchestrator owns **no domain logic** -- only phase transitions and
 error handling.  Every code path ends in a terminal phase (COMPLETE,
@@ -802,10 +802,78 @@ class GovernedOrchestrator:
                     ctx.op_id, exc,
                 )
 
-            ctx = ctx.advance(OperationPhase.GENERATE)
+            ctx = ctx.advance(OperationPhase.PLAN)
         else:
-            # Expansion disabled: skip directly from ROUTE to GENERATE
-            ctx = ctx.advance(OperationPhase.GENERATE)
+            # Expansion disabled: skip directly from ROUTE to PLAN
+            ctx = ctx.advance(OperationPhase.PLAN)
+
+        # ---- Phase 2c: PLAN — model-reasoned implementation planning ----
+        # The model reasons about HOW to implement the change before writing
+        # code. Planning failures are soft — the pipeline falls through to
+        # GENERATE with an empty plan. Trivial ops skip planning entirely.
+        if _serpent:
+            _serpent.update_phase("PLAN")
+        try:
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id, phase="plan", progress_pct=25.0,
+            )
+        except Exception:
+            pass
+
+        try:
+            from backend.core.ouroboros.governance.plan_generator import (
+                PlanGenerator, PLAN_TIMEOUT_S,
+            )
+            _plan_gen = PlanGenerator(
+                generator=self._generator,
+                repo_root=self._config.project_root,
+            )
+            _plan_deadline = datetime.now(tz=timezone.utc) + timedelta(
+                seconds=PLAN_TIMEOUT_S,
+            )
+            _plan_result = await asyncio.wait_for(
+                _plan_gen.generate_plan(ctx, _plan_deadline),
+                timeout=PLAN_TIMEOUT_S + 5.0,
+            )
+
+            if not _plan_result.skipped:
+                # Store plan in context for injection into GENERATE prompt
+                ctx = dataclasses.replace(
+                    ctx,
+                    implementation_plan=_plan_result.plan_json,
+                    previous_hash=ctx.context_hash,
+                )
+                # Emit plan result for SerpentFlow rendering
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="plan", progress_pct=28.0,
+                        plan_complexity=_plan_result.complexity,
+                        plan_changes=len(_plan_result.ordered_changes),
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "[Orchestrator] PLAN complete for op=%s: complexity=%s, "
+                    "%d ordered changes, %.1fs",
+                    ctx.op_id, _plan_result.complexity,
+                    len(_plan_result.ordered_changes),
+                    _plan_result.planning_duration_s,
+                )
+            else:
+                logger.debug(
+                    "[Orchestrator] PLAN skipped for op=%s: %s",
+                    ctx.op_id, _plan_result.skip_reason,
+                )
+        except ImportError:
+            logger.debug("[Orchestrator] PlanGenerator not available, skipping PLAN phase")
+        except Exception as exc:
+            logger.warning(
+                "[Orchestrator] PLAN phase failed for op=%s: %s; "
+                "continuing to GENERATE without plan",
+                ctx.op_id, exc,
+            )
+
+        ctx = ctx.advance(OperationPhase.GENERATE)
 
         # ── PreActionNarrator: voice WHAT before GENERATE ──
         if self._pre_action_narrator is not None:

@@ -1028,7 +1028,33 @@ Rules:
     if strategic_memory_prompt.strip():
         parts.append(strategic_memory_prompt)
 
-    # ── 4b. Session intelligence — lessons from prior ops this session ──
+    # ── 4b. Implementation plan (model-reasoned strategy from PLAN phase) ──
+    _impl_plan = getattr(ctx, "implementation_plan", "")
+    if isinstance(_impl_plan, str) and _impl_plan.strip():
+        try:
+            from backend.core.ouroboros.governance.plan_generator import PlanResult
+            _plan_data = json.loads(_impl_plan)
+            _pr = PlanResult(
+                plan_json=_impl_plan,
+                approach=_plan_data.get("approach", ""),
+                complexity=_plan_data.get("complexity", "moderate"),
+                ordered_changes=_plan_data.get("ordered_changes", []),
+                risk_factors=_plan_data.get("risk_factors", []),
+                test_strategy=_plan_data.get("test_strategy", ""),
+                architectural_notes=_plan_data.get("architectural_notes", ""),
+            )
+            _plan_section = _pr.to_prompt_section()
+            if _plan_section:
+                parts.append(_plan_section)
+        except Exception:
+            # Fallback: inject raw plan JSON if parsing fails
+            parts.append(
+                "## Implementation Plan\n\n"
+                "Follow this plan when generating code:\n\n"
+                f"```json\n{_impl_plan}\n```"
+            )
+
+    # ── 4c. Session intelligence — lessons from prior ops this session ──
     _session_lessons = getattr(ctx, "session_lessons", "")
     if isinstance(_session_lessons, str) and _session_lessons.strip():
         parts.append(
