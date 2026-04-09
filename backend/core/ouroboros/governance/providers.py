@@ -1667,6 +1667,91 @@ def _extract_json_block(raw: str) -> str:
     return cleaned
 
 
+def _repair_json(text: str) -> str:
+    """Best-effort repair of common JSON defects from 397B/reasoning models.
+
+    Applied only when the initial ``json.loads`` fails, so the hot path is
+    unaffected.  Handles:
+    - Trailing commas before ``}`` or ``]``
+    - Control characters inside string values (ASCII 0x00-0x1f except \\n/\\t)
+    - Single-quoted strings → double-quoted
+    - Unquoted keys  (e.g.  ``schema_version: "2b.1"`` → ``"schema_version": "2b.1"``)
+    - Truncated JSON (unbalanced braces) — closes open containers
+    """
+    import json as _json
+
+    # 1. Strip trailing commas  ( ,} or ,] )
+    repaired = re.sub(r",\s*([}\]])", r"\1", text)
+
+    # 2. Replace control chars inside strings (except \n \t \r which are valid)
+    repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", repaired)
+
+    # 3. Try parse — most DW failures are trailing commas
+    try:
+        _json.loads(repaired)
+        return repaired
+    except (ValueError, _json.JSONDecodeError):
+        pass
+
+    # 4. Single quotes → double quotes (only outside existing double-quoted strings)
+    # Simple heuristic: if no double-quoted keys exist, swap all single quotes
+    if "'" in repaired and '"schema_version"' not in repaired:
+        sq_attempt = repaired.replace("'", '"')
+        try:
+            _json.loads(sq_attempt)
+            return sq_attempt
+        except (ValueError, _json.JSONDecodeError):
+            pass
+
+    # 5. Unquoted keys:  key: value → "key": value
+    uq_attempt = re.sub(
+        r'(?<=[\{,\n])\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*:', r' "\1":', repaired
+    )
+    try:
+        _json.loads(uq_attempt)
+        return uq_attempt
+    except (ValueError, _json.JSONDecodeError):
+        pass
+
+    # 6. Truncated JSON — close unbalanced braces/brackets
+    depth_brace = 0
+    depth_bracket = 0
+    in_str = False
+    esc = False
+    for ch in repaired:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch == "{":
+            depth_brace += 1
+        elif ch == "}":
+            depth_brace -= 1
+        elif ch == "[":
+            depth_bracket += 1
+        elif ch == "]":
+            depth_bracket -= 1
+    if depth_brace > 0 or depth_bracket > 0:
+        # Strip trailing comma if present, then close containers
+        closed = repaired.rstrip().rstrip(",")
+        closed += "]" * max(depth_bracket, 0)
+        closed += "}" * max(depth_brace, 0)
+        try:
+            _json.loads(closed)
+            return closed
+        except (ValueError, _json.JSONDecodeError):
+            pass
+
+    return repaired
+
+
 def _find_balanced_json(text: str, start_search: int) -> Optional[str]:
     """Find a balanced JSON object starting from or before start_search.
 
@@ -1977,11 +2062,17 @@ def _parse_generation_response(
             is_noop=True,
         )
 
-    # Step 1: JSON parse
+    # Step 1: JSON parse (with repair fallback for DW 397B malformed output)
+    _extracted = _extract_json_block(raw)
     try:
-        data = json.loads(_extract_json_block(raw))
-    except (json.JSONDecodeError, ValueError) as exc:
-        raise RuntimeError(f"{pfx}_schema_invalid:json_parse_error") from exc
+        data = json.loads(_extracted)
+    except (json.JSONDecodeError, ValueError):
+        # Attempt best-effort repair before giving up
+        try:
+            data = json.loads(_repair_json(_extracted))
+            logger.info("[%s] JSON repair succeeded (original was malformed)", pfx)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise RuntimeError(f"{pfx}_schema_invalid:json_parse_error") from exc
 
     # Step 2: top-level type
     if not isinstance(data, dict):
