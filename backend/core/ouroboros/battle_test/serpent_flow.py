@@ -211,6 +211,8 @@ class SerpentFlow:
         self._active_ops: set = set()
         # Sensor type per op (for close border label)
         self._op_sensors: Dict[str, str] = {}
+        # Per-op reasoning — captured at GENERATE, shown at ⏺ Update
+        self._op_rationales: Dict[str, str] = {}
 
         # Rich console — force_terminal=True ensures ANSI codes survive
         # prompt_toolkit's patch_stdout proxy (which replaces sys.stdout
@@ -842,8 +844,14 @@ class SerpentFlow:
 
     # ── Diff display ──────────────────────────────────────────
 
+    def set_op_reasoning(self, op_id: str, reasoning: str) -> None:
+        """Store per-op reasoning for display in ⏺ Update blocks."""
+        if reasoning:
+            self._op_rationales[op_id] = reasoning.strip()
+
     def show_diff(
         self, file_path: str, diff_text: str = "", op_id: str = "",
+        reasoning: str = "",
     ) -> None:
         """Show a CC-style inline update block for a file change.
 
@@ -885,6 +893,17 @@ class SerpentFlow:
             parts.append(f"[{_C['code_del']}]removed {removed} line{'s' if removed != 1 else ''}[/{_C['code_del']}]")
         summary = ", ".join(parts) if parts else "no changes"
         self._op_line(op_id, f"[{_C['dim']}]⎿[/{_C['dim']}]  {summary}")
+
+        # ── Reasoning: why the organism made this change ──
+        # Check explicit parameter first, then stored per-op reasoning
+        _reason = reasoning or self._op_rationales.get(op_id, "")
+        if _reason:
+            # Escape markup in model-generated text
+            safe_reason = _reason.replace("[", "\\[")[:120]
+            self._op_line(
+                op_id,
+                f"[{_C['dim']}]⎿  reasoning: {safe_reason}[/{_C['dim']}]",
+            )
 
         # ── Contextual diff lines (max 3 hunks, 20 lines each) ──
         hunk_limit = 3
@@ -983,6 +1002,7 @@ class SerpentFlow:
     def op_completed(
         self, op_id: str, files_changed: List[str],
         provider: str = "", cost_usd: float = 0.0,
+        reasoning: str = "",
     ) -> None:
         """The organism evolved — operation succeeded."""
         self._stop_status()
@@ -991,7 +1011,11 @@ class SerpentFlow:
         prov = _prov(self._op_providers.pop(op_id, provider))
         self._cost_total += cost_usd
 
-        # Show diffs as nested blocks
+        # Store reasoning for display in ⏺ Update blocks
+        if reasoning:
+            self._op_rationales[op_id] = reasoning
+
+        # Show diffs as CC-style ⏺ Update blocks (reasoning shown inline)
         if files_changed:
             for f in files_changed[:5]:
                 self.show_diff(f, op_id=op_id)
@@ -1006,7 +1030,8 @@ class SerpentFlow:
             f"{files_str} [{_C['dim']}]│[/{_C['dim']}] ⏱ {elapsed:.1f}s{cost_str}",
         )
 
-        # Close the op block
+        # Close the op block and clean up per-op state
+        self._op_rationales.pop(op_id, None)
         self._close_op_block(op_id)
 
     def op_failed(self, op_id: str, reason: str, phase: str = "") -> None:
@@ -1015,6 +1040,7 @@ class SerpentFlow:
         self._failed += 1
         elapsed = time.time() - self._op_starts.pop(op_id, time.time())
         self._op_providers.pop(op_id, None)
+        self._op_rationales.pop(op_id, None)
 
         phase_str = f" at [{_C['neural']}]{phase}[/{_C['neural']}]" if phase else ""
 
@@ -1379,6 +1405,11 @@ class SerpentTransport:
                             candidate_files=candidate_files,
                             candidate_rationales=candidate_rationales,
                         )
+                    # Capture rationale for display in ⏺ Update blocks
+                    if candidate_rationales:
+                        self._flow.set_op_reasoning(
+                            op_id, candidate_rationales[0],
+                        )
 
                 # Validation — dedup: show once per op
                 elif phase.upper() in ("VALIDATE", "VALIDATE_RETRY") and "test_passed" in payload:
@@ -1470,6 +1501,24 @@ class SerpentTransport:
                             f"reconciling stale ledger entries...[/{_C['dim']}]",
                             highlight=False,
                         )
+                    return
+
+                # NOTIFY_APPLY (Yellow) — auto-apply with prominent CLI notice
+                if outcome == "notify_apply":
+                    _files = payload.get("target_files", [])
+                    _files_str = ", ".join(f[:40] for f in _files[:3])
+                    if len(_files) > 3:
+                        _files_str += f" +{len(_files) - 3}"
+                    self._flow._op_line(
+                        op_id,
+                        f"[{_C['heal']}]⚠ NOTIFY[/{_C['heal']}]     "
+                        f"[{_C['dim']}]{reason_code}[/{_C['dim']}]  "
+                        f"[{_C['file']}]{_files_str}[/{_C['file']}]",
+                    )
+                    self._flow._op_line(
+                        op_id,
+                        f"[{_C['dim']}]⎿  auto-applying (Yellow severity — review in git log)[/{_C['dim']}]",
+                    )
                     return
 
                 # Escalation — emit proactive alert

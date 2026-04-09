@@ -2070,7 +2070,7 @@ class GovernedLoopService:
                 # confirm the op is safe to proceed without full autonomy.
                 from backend.core.ouroboros.governance.risk_engine import RiskTier
                 _risk_tier = ctx.risk_tier
-                if _risk_tier != RiskTier.SAFE_AUTO:
+                if _risk_tier not in (RiskTier.SAFE_AUTO, RiskTier.NOTIFY_APPLY):
                     logger.warning(
                         "[GovernedLoop] Preflight: REDUCED_AUTONOMY blocks non-SAFE_AUTO op %s "
                         "(risk_tier=%s — None means not yet classified; fail-safe block)",

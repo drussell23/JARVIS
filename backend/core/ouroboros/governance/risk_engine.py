@@ -38,9 +38,23 @@ POLICY_VERSION: str = "v0.2.0"
 
 
 class RiskTier(Enum):
-    """Classification tier for an autonomous operation."""
+    """Classification tier for an autonomous operation.
+
+    Four graduated severity levels (Green → Yellow → Orange → Red):
+
+    - **SAFE_AUTO** (Green): Auto-apply silently. Read-only exploration,
+      test additions, doc fixes, trivial dependency bumps.
+    - **NOTIFY_APPLY** (Yellow): Auto-apply but surface prominently in
+      the CLI stream. Behavioral code changes, new files, config changes.
+    - **APPROVAL_REQUIRED** (Orange): Block and ask the operator.
+      Breaking API changes, deleting files/tests, security-adjacent,
+      cost threshold crossings.
+    - **BLOCKED** (Red): Unconditionally forbidden. Supervisor, security
+      surface, hard invariant violations.
+    """
 
     SAFE_AUTO = auto()
+    NOTIFY_APPLY = auto()
     APPROVAL_REQUIRED = auto()
     BLOCKED = auto()
 
@@ -368,7 +382,29 @@ class RiskEngine:
                 reason_code="low_test_confidence",
             )
 
-        # Rule 10: All checks passed -- safe to auto-execute
+        # Rule 10: New files or behavioral modifications → NOTIFY_APPLY (Yellow)
+        # These are auto-applied but surfaced prominently in the CLI.
+        if profile.change_type is ChangeType.CREATE:
+            return RiskClassification(
+                tier=RiskTier.NOTIFY_APPLY,
+                reason_code="new_file_created",
+            )
+
+        # Rule 11: Multi-file modifications → NOTIFY_APPLY
+        if len(profile.files_affected) > 1:
+            return RiskClassification(
+                tier=RiskTier.NOTIFY_APPLY,
+                reason_code="multi_file_change",
+            )
+
+        # Rule 12: Core orchestration path modifications → NOTIFY_APPLY
+        if profile.is_core_orchestration_path:
+            return RiskClassification(
+                tier=RiskTier.NOTIFY_APPLY,
+                reason_code="core_path_modification",
+            )
+
+        # Rule 13: All checks passed -- safe to auto-execute silently
         return RiskClassification(
             tier=RiskTier.SAFE_AUTO,
             reason_code="all_checks_passed",

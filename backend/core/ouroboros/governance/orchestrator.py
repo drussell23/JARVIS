@@ -1931,6 +1931,23 @@ class GovernedOrchestrator:
                 ctx.op_id,
             )
 
+        # ---- Phase 5b: NOTIFY_APPLY (Yellow — auto-apply with prominent CLI notice) ----
+        if risk_tier is RiskTier.NOTIFY_APPLY:
+            _reason = getattr(ctx, "risk_reason_code", "notify_apply")
+            logger.info(
+                "[Orchestrator] GATE: NOTIFY_APPLY (Yellow) — auto-applying with notice; op=%s reason=%s",
+                ctx.op_id, _reason,
+            )
+            try:
+                await self._stack.comm.emit_decision(
+                    op_id=ctx.op_id,
+                    outcome="notify_apply",
+                    reason_code=_reason,
+                    target_files=list(ctx.target_files),
+                )
+            except Exception:
+                pass
+
         # ---- Phase 6: APPROVE (conditional) ----
         if risk_tier is RiskTier.APPROVAL_REQUIRED:
             if self._approval_provider is None:

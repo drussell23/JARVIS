@@ -117,6 +117,13 @@ class UnifiedIntakeRouter:
         # Assign a coroutine callable to enable; None disables.
         self._on_ingest_hook: Optional[Callable[..., Any]] = None
 
+        # ── Operation dependency tracking (DAG-based signal merging) ──
+        # Maps file paths to the op_id that is currently active on that file.
+        # Used to detect when a new signal targets files already under active
+        # modification — prevents conflicting concurrent patches.
+        self._active_file_ops: Dict[str, str] = {}  # file_path -> op_id
+        self._queued_behind: Dict[str, List[IntentEnvelope]] = {}  # op_id -> [envelopes]
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -165,7 +172,21 @@ class UnifiedIntakeRouter:
             self._pending_ack.park(envelope)
             return "pending_ack"
 
-        # 3. Backpressure check
+        # 3. File-overlap conflict detection (DAG-based signal merging)
+        # If another op is already active on any of this envelope's target files,
+        # queue behind it instead of spawning a conflicting concurrent patch.
+        if envelope.target_files:
+            blocking_op = self._find_file_conflict(envelope)
+            if blocking_op is not None:
+                self._queued_behind.setdefault(blocking_op, []).append(envelope)
+                logger.info(
+                    "[Router] Signal queued behind active op %s (file overlap: %s)",
+                    blocking_op[:12],
+                    ", ".join(envelope.target_files[:3]),
+                )
+                return "queued_behind"
+
+        # 4. Backpressure check
         if (
             envelope.source not in _BACKPRESSURE_EXEMPT
             and self.intake_queue_depth() >= self._config.backpressure_threshold
@@ -412,6 +433,49 @@ class UnifiedIntakeRouter:
                 logger.exception(
                     "Router: WAL replay failed for lease_id=%s", entry.lease_id
                 )
+
+    # ------------------------------------------------------------------
+    # Operation dependency tracking (DAG-based signal merging)
+    # ------------------------------------------------------------------
+
+    def _find_file_conflict(self, envelope: IntentEnvelope) -> Optional[str]:
+        """Return the op_id of an active operation that overlaps this envelope's files.
+
+        Returns None if no conflict exists (safe to dispatch concurrently).
+        """
+        for fpath in (envelope.target_files or []):
+            blocking = self._active_file_ops.get(fpath)
+            if blocking is not None:
+                return blocking
+        return None
+
+    def register_active_op(self, op_id: str, target_files: List[str]) -> None:
+        """Mark files as actively being modified by an operation.
+
+        Called by GLS/orchestrator when an operation enters the GENERATE phase.
+        """
+        for fpath in target_files:
+            self._active_file_ops[fpath] = op_id
+
+    async def release_op(self, op_id: str) -> None:
+        """Release file locks for a completed/failed operation.
+
+        Any envelopes that were queued behind this op are re-ingested
+        into the pipeline, now that the conflicting files are free.
+        """
+        # Clear file reservations
+        stale_keys = [k for k, v in self._active_file_ops.items() if v == op_id]
+        for k in stale_keys:
+            del self._active_file_ops[k]
+
+        # Re-ingest queued signals
+        queued = self._queued_behind.pop(op_id, [])
+        for envelope in queued:
+            logger.info(
+                "[Router] Re-ingesting signal queued behind completed op %s: %s",
+                op_id[:12], envelope.description[:50],
+            )
+            await self.ingest(envelope)
 
     # ------------------------------------------------------------------
     # Deduplication
