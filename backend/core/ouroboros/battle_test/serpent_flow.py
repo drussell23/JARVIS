@@ -35,7 +35,6 @@ from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.status import Status
-from rich.syntax import Syntax
 
 # ══════════════════════════════════════════════════════════════
 # Color palette (organism theme)
@@ -110,6 +109,53 @@ def _visible_len(text: str) -> int:
     return len(_MARKUP_RE.sub("", text))
 
 
+def _parse_unified_diff(diff_text: str) -> tuple:
+    """Parse a unified diff into (added, removed, hunks).
+
+    Returns
+    -------
+    added : int
+        Total lines added across all hunks.
+    removed : int
+        Total lines removed across all hunks.
+    hunks : list of dict
+        Each dict has ``old_start``, ``new_start``, and ``lines``
+        (raw diff lines including the +/-/space prefix).
+    """
+    added = 0
+    removed = 0
+    hunks: List[Dict[str, Any]] = []
+    current_hunk: Optional[Dict[str, Any]] = None
+
+    _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+
+    for line in diff_text.split("\n"):
+        # Skip file headers
+        if line.startswith("diff ") or line.startswith("index "):
+            continue
+        if line.startswith("--- ") or line.startswith("+++ "):
+            continue
+
+        hunk_match = _HUNK_RE.match(line)
+        if hunk_match:
+            current_hunk = {
+                "old_start": int(hunk_match.group(1)),
+                "new_start": int(hunk_match.group(2)),
+                "lines": [],
+            }
+            hunks.append(current_hunk)
+            continue
+
+        if current_hunk is not None:
+            current_hunk["lines"].append(line)
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+
+    return added, removed, hunks
+
+
 # ══════════════════════════════════════════════════════════════
 # SerpentFlow — the flowing organism CLI
 # ══════════════════════════════════════════════════════════════
@@ -166,8 +212,11 @@ class SerpentFlow:
         # Sensor type per op (for close border label)
         self._op_sensors: Dict[str, str] = {}
 
-        # Rich console
-        self.console = Console(emoji=True, highlight=False)
+        # Rich console — force_terminal=True ensures ANSI codes survive
+        # prompt_toolkit's patch_stdout proxy (which replaces sys.stdout
+        # with a non-tty wrapper). Without this, Rich detects the proxy
+        # as non-terminal and falls back to plain text.
+        self.console = Console(emoji=True, highlight=False, force_terminal=True)
 
         # Execution masking (rich.Status)
         self._active_status: Optional[Status] = None
@@ -624,13 +673,22 @@ class SerpentFlow:
         round_index: int = 0, result_preview: str = "",
         duration_ms: float = 0.0, status: str = "success",
     ) -> None:
-        """Venom tool call completed — stop spinner, print artifact."""
+        """Venom tool call completed — stop spinner, print artifact.
+
+        Write tools (edit_file, write_file) render CC-style
+        ``⏺ Update(path)`` / ``⏺ Write(path)`` blocks.
+        Read tools show a compact one-liner.
+        """
         self._stop_status()
 
         tool_icons = {
             "read_file": "📄", "search_code": "🔍", "run_tests": "🧪",
             "bash": "💻", "web_search": "🌐", "web_fetch": "🌐",
             "get_callers": "🔗", "list_symbols": "📋",
+            "glob_files": "📁", "list_dir": "📂",
+            "git_log": "📜", "git_diff": "📊", "git_blame": "🔎",
+            "edit_file": "✏️", "write_file": "📝",
+            "code_explore": "🧪",
         }
         icon = tool_icons.get(tool_name, "🔧")
 
@@ -643,6 +701,52 @@ class SerpentFlow:
             )
 
         status_mark = "" if status == "success" else f"  [{_C['death']}]✗[/{_C['death']}]"
+
+        # ── CC-style blocks for write/edit tools ──
+        if tool_name == "edit_file" and status == "success":
+            # Render as ⏺ Update(path) with result preview as inline diff
+            path = args_summary[:60] if args_summary else "file"
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]⏺ Update[/{_C['neural']}]"
+                f"([{_C['file']}]{path}[/{_C['file']}]){dur}",
+            )
+            if result_preview:
+                # Count added/removed lines from result
+                lines = result_preview.split("\n")
+                n_changed = sum(1 for l in lines if l.strip())
+                self._op_line(
+                    op_id,
+                    f"[{_C['dim']}]⎿  edit applied ({n_changed} line{'s' if n_changed != 1 else ''} affected)[/{_C['dim']}]",
+                )
+            return
+
+        if tool_name == "write_file" and status == "success":
+            path = args_summary[:60] if args_summary else "file"
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]⏺ Write[/{_C['neural']}]"
+                f"([{_C['file']}]{path}[/{_C['file']}]){dur}",
+            )
+            if result_preview:
+                n_lines = result_preview.count("\n") + 1
+                self._op_line(
+                    op_id,
+                    f"[{_C['dim']}]⎿  {n_lines} line{'s' if n_lines != 1 else ''} written[/{_C['dim']}]",
+                )
+            return
+
+        # ── Read tool: CC-style Read(path) header ──
+        if tool_name == "read_file":
+            path = args_summary[:60] if args_summary else "file"
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]⏺ Read[/{_C['neural']}]"
+                f"([{_C['file']}]{path}[/{_C['file']}]){dur}{status_mark}",
+            )
+            return
+
+        # ── Default: compact one-liner for other tools ──
         summary = f"  [{_C['dim']}]{args_summary[:40]}[/{_C['dim']}]" if args_summary else ""
 
         self._op_line(
@@ -741,45 +845,100 @@ class SerpentFlow:
     def show_diff(
         self, file_path: str, diff_text: str = "", op_id: str = "",
     ) -> None:
-        """Show a colored git diff as a nested block within the op."""
+        """Show a CC-style inline update block for a file change.
+
+        Renders the Claude Code ``⏺ Update(path)`` pattern with summary
+        counts, numbered context lines, and colored +/- diff markers.
+        Falls back to a compact one-liner when no diff is available.
+        """
         if not diff_text:
             diff_text = self._get_git_diff(file_path)
 
         short_path = file_path
-        if len(file_path) > 45:
+        if len(file_path) > 60:
             parts = file_path.split("/")
-            short_path = "/".join(parts[-2:])
+            short_path = "/".join(parts[-3:]) if len(parts) >= 3 else file_path
 
         if not diff_text:
             self._op_line(
                 op_id,
-                f"[{_C['neural']}]🔗 applied[/{_C['neural']}]     "
-                f"[{_C['file']}]{short_path}[/{_C['file']}]",
+                f"[{_C['neural']}]⏺ Update[/{_C['neural']}]"
+                f"([{_C['file']}]{short_path}[/{_C['file']}])",
             )
             return
 
-        # Open nested diff block
-        self._open_nested(op_id, f"📋 {short_path}")
+        # Parse unified diff into structured hunks
+        added, removed, hunks = _parse_unified_diff(diff_text)
 
-        # Render diff lines with color coding
-        lines = diff_text.split("\n")
-        if len(lines) > 60:
-            lines = lines[:60]
-            lines.append(f"... +{len(diff_text.split(chr(10))) - 60} lines truncated")
+        # ── Header: ⏺ Update(path) ──
+        self._op_line(
+            op_id,
+            f"[{_C['neural']}]⏺ Update[/{_C['neural']}]"
+            f"([{_C['file']}]{short_path}[/{_C['file']}])",
+        )
 
-        for line in lines:
-            if line.startswith("+++") or line.startswith("---"):
-                self._nested_line(op_id, f"[{_C['dim']}]{line}[/{_C['dim']}]")
-            elif line.startswith("@@"):
-                self._nested_line(op_id, f"[{_C['code_hunk']}]{line}[/{_C['code_hunk']}]")
-            elif line.startswith("+"):
-                self._nested_line(op_id, f"[{_C['code_add']}]{line}[/{_C['code_add']}]")
-            elif line.startswith("-"):
-                self._nested_line(op_id, f"[{_C['code_del']}]{line}[/{_C['code_del']}]")
-            else:
-                self._nested_line(op_id, f"[{_C['dim']}]{line}[/{_C['dim']}]")
+        # ── Summary: ⎿  Added N lines, removed M lines ──
+        parts: List[str] = []
+        if added:
+            parts.append(f"[{_C['code_add']}]Added {added} line{'s' if added != 1 else ''}[/{_C['code_add']}]")
+        if removed:
+            parts.append(f"[{_C['code_del']}]removed {removed} line{'s' if removed != 1 else ''}[/{_C['code_del']}]")
+        summary = ", ".join(parts) if parts else "no changes"
+        self._op_line(op_id, f"[{_C['dim']}]⎿[/{_C['dim']}]  {summary}")
 
-        self._close_nested(op_id)
+        # ── Contextual diff lines (max 3 hunks, 20 lines each) ──
+        hunk_limit = 3
+        lines_per_hunk = 20
+        for hunk_idx, hunk in enumerate(hunks[:hunk_limit]):
+            old_start = hunk["old_start"]
+            new_start = hunk["new_start"]
+            old_lineno = old_start
+            new_lineno = new_start
+
+            shown = 0
+            for diff_line in hunk["lines"][:lines_per_hunk]:
+                kind = diff_line[0] if diff_line else " "
+                content = diff_line[1:] if len(diff_line) > 1 else ""
+                # Escape Rich markup in code content
+                safe = content.replace("[", "\\[")
+
+                if kind == "-":
+                    self._op_line(
+                        op_id,
+                        f"    [{_C['dim']}]{old_lineno:>5}[/{_C['dim']}] "
+                        f"[{_C['code_del']}]- {safe}[/{_C['code_del']}]",
+                    )
+                    old_lineno += 1
+                elif kind == "+":
+                    self._op_line(
+                        op_id,
+                        f"    [{_C['dim']}]{new_lineno:>5}[/{_C['dim']}] "
+                        f"[{_C['code_add']}]+ {safe}[/{_C['code_add']}]",
+                    )
+                    new_lineno += 1
+                else:
+                    # Context line
+                    self._op_line(
+                        op_id,
+                        f"    [{_C['dim']}]{new_lineno:>5}   {safe}[/{_C['dim']}]",
+                    )
+                    old_lineno += 1
+                    new_lineno += 1
+                shown += 1
+
+            remaining_in_hunk = len(hunk["lines"]) - shown
+            if remaining_in_hunk > 0:
+                self._op_line(
+                    op_id,
+                    f"    [{_C['dim']}]      ... +{remaining_in_hunk} lines[/{_C['dim']}]",
+                )
+
+        remaining_hunks = len(hunks) - hunk_limit
+        if remaining_hunks > 0:
+            self._op_line(
+                op_id,
+                f"    [{_C['dim']}]      ... +{remaining_hunks} more hunk{'s' if remaining_hunks != 1 else ''}[/{_C['dim']}]",
+            )
 
     def show_diff_preview(
         self,
@@ -787,43 +946,37 @@ class SerpentFlow:
         target_files: Optional[List[str]] = None,
         op_id: str = "",
     ) -> None:
-        """Render a syntax-highlighted diff preview (Iron Gate / approval flow)."""
-        c = self.console
+        """Render a CC-style diff preview for the approval flow.
 
-        # Header
-        files_str = ""
-        if target_files:
-            primary = target_files[0]
-            if len(primary) > 50:
-                parts = primary.split("/")
-                primary = "/".join(parts[-2:])
-            files_str = f" [{_C['file']}]{primary}[/{_C['file']}]"
-            if len(target_files) > 1:
-                files_str += f" [{_C['dim']}]+{len(target_files) - 1}[/{_C['dim']}]"
+        Uses the same ``⏺ Update(path)`` layout as ``show_diff`` but
+        renders per-file blocks for each target file in the diff.
+        """
+        if not target_files:
+            target_files = []
 
-        c.print(
-            f"  [{_C['neural']}]📋 proposed changes[/{_C['neural']}]{files_str}",
-            highlight=False,
-        )
+        # Parse the full diff to get per-file counts
+        added, removed, hunks = _parse_unified_diff(diff_text)
 
-        # Truncate for terminal readability
-        lines = diff_text.split("\n")
-        if len(lines) > 120:
-            truncated = "\n".join(lines[:120])
-            truncated += f"\n... +{len(lines) - 120} lines truncated"
-        else:
-            truncated = diff_text
+        for tf in target_files:
+            short = tf
+            if len(tf) > 60:
+                parts = tf.split("/")
+                short = "/".join(parts[-3:]) if len(parts) >= 3 else tf
+            # Show each file with its own update block
+            self.show_diff(tf, diff_text=diff_text, op_id=op_id)
 
-        # Render with rich.syntax.Syntax — proper lexer-based highlighting
-        syntax = Syntax(
-            truncated,
-            lexer="diff",
-            theme="monokai",
-            line_numbers=False,
-            word_wrap=False,
-            padding=(0, 1),
-        )
-        c.print(syntax)
+        # If no target files provided, show a standalone summary
+        if not target_files and diff_text:
+            parts_sum: List[str] = []
+            if added:
+                parts_sum.append(f"[{_C['code_add']}]+{added}[/{_C['code_add']}]")
+            if removed:
+                parts_sum.append(f"[{_C['code_del']}]-{removed}[/{_C['code_del']}]")
+            summary = " ".join(parts_sum) if parts_sum else "no changes"
+            self._op_line(
+                op_id,
+                f"[{_C['neural']}]⏺ Proposed changes[/{_C['neural']}]  {summary}",
+            )
 
     # ── Operation completion ──────────────────────────────────
 
@@ -1049,7 +1202,7 @@ class SerpentFlow:
             from prompt_toolkit.patch_stdout import patch_stdout
 
             session = PromptSession()
-            with patch_stdout():
+            with patch_stdout(raw=True):
                 answer = await session.prompt_async(
                     HTML("<b>  Apply this change? [Y/n] </b>"),
                 )
@@ -1539,7 +1692,7 @@ class SerpentREPL:
 
         self._session = PromptSession(bottom_toolbar=_toolbar)
 
-        with patch_stdout():
+        with patch_stdout(raw=True):
             while self._running:
                 try:
                     line = await self._session.prompt_async(
