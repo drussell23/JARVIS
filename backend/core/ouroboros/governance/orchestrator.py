@@ -2172,6 +2172,24 @@ class GovernedOrchestrator:
                 ctx.op_id,
             )
 
+        # ---- Risk floor override (REPL /risk command) ----
+        # JARVIS_RISK_CEILING env var sets the minimum risk tier floor.
+        # E.g. /risk notify_apply → everything is at least NOTIFY_APPLY.
+        _risk_floor_str = os.environ.get("JARVIS_RISK_CEILING", "")
+        if _risk_floor_str:
+            _floor_map = {
+                "SAFE_AUTO": RiskTier.SAFE_AUTO,
+                "NOTIFY_APPLY": RiskTier.NOTIFY_APPLY,
+                "APPROVAL_REQUIRED": RiskTier.APPROVAL_REQUIRED,
+            }
+            _floor = _floor_map.get(_risk_floor_str.upper())
+            if _floor is not None and risk_tier.value < _floor.value:
+                logger.info(
+                    "[Orchestrator] GATE: risk floor %s → escalating %s to %s; op=%s",
+                    _risk_floor_str, risk_tier.name, _floor.name, ctx.op_id,
+                )
+                risk_tier = _floor
+
         # ---- Phase 5b: NOTIFY_APPLY (Yellow — auto-apply with prominent CLI notice + diff preview) ----
         if risk_tier is RiskTier.NOTIFY_APPLY:
             _reason = getattr(ctx, "risk_reason_code", "notify_apply")

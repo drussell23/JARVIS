@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import signal
 import time
 from dataclasses import dataclass, field
@@ -764,7 +765,8 @@ class BattleTestHarness:
     async def _handle_repl_command(self, command: str) -> None:
         """Process a user command from the SerpentREPL.
 
-        Supports: stop, shutdown, cost, pause, resume, status, ops.
+        Supports: stop, shutdown, cost, pause, resume, status, ops,
+        /risk, /budget, /goal.
         """
         cmd = command.strip().lower()
         if cmd in ("stop", "shutdown"):
@@ -779,6 +781,13 @@ class BattleTestHarness:
             self._repl_cmd_status()
         elif cmd == "ops":
             self._repl_cmd_ops()
+        elif cmd.startswith("/goal") or cmd.startswith("goal "):
+            self._repl_cmd_goal(command.strip())
+        elif cmd.startswith("/budget") or cmd.startswith("budget "):
+            self._repl_cmd_budget(command.strip())
+        elif cmd.startswith("/risk") or cmd.startswith("risk "):
+            # /risk is handled entirely in SerpentREPL (env var only)
+            pass
         else:
             logger.debug("Unknown REPL command: %s", cmd)
 
@@ -882,6 +891,96 @@ class BattleTestHarness:
         self._repl_print(header)
         for ln in lines:
             self._repl_print(ln)
+
+    def _repl_cmd_budget(self, line: str) -> None:
+        """Adjust the session budget mid-run."""
+        parts = line.replace("/budget", "budget", 1).split(None, 1)
+        if len(parts) < 2:
+            self._repl_print(
+                f"[dim]💰 ${self._cost_tracker.total_spent:.4f} / "
+                f"${self._config.cost_cap_usd:.2f}[/dim]"
+            )
+            return
+        try:
+            amount = float(parts[1].strip().lstrip("$"))
+        except ValueError:
+            self._repl_print("[red]Invalid amount. Usage: /budget 1.00[/red]")
+            return
+        if amount <= 0:
+            self._repl_print("[red]Budget must be positive[/red]")
+            return
+        self._config.cost_cap_usd = amount
+        self._cost_tracker._budget_usd = amount
+        self._repl_print(f"[green]Budget updated to ${amount:.2f}[/green]")
+
+    def _repl_cmd_goal(self, line: str) -> None:
+        """Manage active goals at runtime.
+
+        Usage:
+          /goal               — list active goals
+          /goal add <desc>    — add a goal (keywords extracted from description)
+          /goal remove <id>   — remove a goal by ID
+        """
+        parts = line.replace("/goal", "goal", 1).split(None, 2)
+        subcmd = parts[1].strip().lower() if len(parts) > 1 else "list"
+
+        # Lazy import GoalTracker
+        try:
+            from backend.core.ouroboros.governance.strategic_direction import (
+                ActiveGoal, GoalTracker,
+            )
+        except ImportError:
+            self._repl_print("[red]GoalTracker not available[/red]")
+            return
+
+        tracker = GoalTracker(self._config.repo_path)
+
+        if subcmd == "list":
+            goals = tracker.active_goals
+            if not goals:
+                self._repl_print("[dim]No active goals. Use: /goal add <description>[/dim]")
+                return
+            self._repl_print("[bold]Active Goals[/bold]")
+            for g in goals:
+                kw = ", ".join(g.keywords[:5])
+                weight = ""
+                if g.priority_weight >= 2.0:
+                    weight = " [bold red]HIGH[/bold red]"
+                elif g.priority_weight <= 0.5:
+                    weight = " [dim]low[/dim]"
+                self._repl_print(f"  [cyan]{g.goal_id}[/cyan]  {g.description}  [dim]({kw}){weight}[/dim]")
+
+        elif subcmd == "add" and len(parts) > 2:
+            desc = parts[2].strip().strip("'\"")
+            # Auto-generate goal_id from description
+            slug = re.sub(r"[^a-z0-9]+", "-", desc.lower())[:40].strip("-")
+            # Auto-extract keywords: split on spaces, keep words 4+ chars
+            keywords = tuple(
+                w.lower() for w in desc.split()
+                if len(w) >= 4 and w.lower() not in ("with", "from", "that", "this", "have", "been")
+            )[:8]
+            goal = ActiveGoal(
+                goal_id=slug,
+                description=desc,
+                keywords=keywords,
+            )
+            tracker.add_goal(goal)
+            self._repl_print(
+                f"[green]Goal added:[/green] [cyan]{slug}[/cyan]  "
+                f"[dim]keywords: {', '.join(keywords)}[/dim]"
+            )
+
+        elif subcmd in ("remove", "rm") and len(parts) > 2:
+            goal_id = parts[2].strip()
+            if tracker.remove_goal(goal_id):
+                self._repl_print(f"[green]Removed goal: {goal_id}[/green]")
+            else:
+                self._repl_print(f"[red]No goal matching '{goal_id}'[/red]")
+
+        else:
+            self._repl_print(
+                "[dim]Usage: /goal | /goal add <description> | /goal remove <id>[/dim]"
+            )
 
     # ------------------------------------------------------------------
     # Signal handlers

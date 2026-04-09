@@ -24,6 +24,7 @@ symbiote must be entirely visible.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import subprocess
 import time
@@ -80,6 +81,69 @@ def _detect_lang(file_path: str) -> str:
         ext = file_path.rsplit(".", 1)[-1].lower()
         return _LANG_MAP.get(ext, "python")
     return "python"
+
+
+# ── Failure reason → actionable suggestion mapping ──────────────
+# Each tuple: (substring to match in reason, suggestion template).
+# First match wins. Templates can use {elapsed:.0f} for duration.
+_FAILURE_SUGGESTIONS: list = [
+    # Timeouts
+    ("timed out", "Try: increase JARVIS_GENERATION_TIMEOUT_S or reduce file complexity"),
+    ("timeout", "Try: increase JARVIS_GENERATION_TIMEOUT_S or reduce file complexity"),
+    ("deadline", "Generation deadline exceeded. Try: split into smaller changes"),
+    # Provider failures
+    ("rate limit", "Provider throttled. DW will auto-recover; or set DOUBLEWORD_REALTIME_ENABLED=false"),
+    ("429", "Rate-limited. The failback FSM will retry — no action needed"),
+    ("503", "Provider unavailable. Failback will route to next tier automatically"),
+    ("502", "Bad gateway. Transient — will retry on next sensor tick"),
+    ("connection", "Network error. Check connectivity or increase JARVIS_DW_CONNECT_TIMEOUT_S"),
+    # Validation / gate failures
+    ("validation failed", "Patch failed structural checks. Review VALIDATE constraints or relax with /risk"),
+    ("syntax error", "Generated code has syntax errors. May need simpler target or richer context"),
+    ("parse error", "Output could not be parsed. Provider may need a clearer prompt — check target complexity"),
+    ("no changes", "Generation produced empty diff. Signal may be stale — will be de-duplicated"),
+    ("empty", "No output from provider. Retry will use fresh context"),
+    # Iron Gate / approval
+    ("rejected", "Human rejected at Iron Gate. Constraint recorded — organism will avoid this pattern"),
+    ("blocked", "Risk tier BLOCKED. Requires /risk notify_apply or JARVIS_DEFAULT_RISK_TIER=NOTIFY_APPLY"),
+    ("approval", "Needs human approval. Use /risk safe_auto for auto-approve or respond in REPL"),
+    # Repair failures
+    ("repair failed", "L2 repair exhausted 5 iterations. Manual intervention needed on this file"),
+    ("repair timeout", "L2 repair timed out (120s). Try: reduce repair scope or increase JARVIS_REPAIR_TIMEOUT_S"),
+    # Test failures
+    ("test fail", "Post-apply tests failed. L2 repair will attempt fix; if persistent, check test fixtures"),
+    ("pytest", "Test suite error. Check for missing fixtures or flaky tests"),
+    # Stale / conflict
+    ("stale", "Files changed since generation started. Fresh context will be used on retry"),
+    ("conflict", "Merge conflict on apply. Another operation may have touched the same files"),
+    ("lock", "File lock held by another operation. Will retry after lock TTL expires"),
+    # Cost
+    ("cost cap", "Session budget exhausted. Increase --cost-cap or set OUROBOROS_BATTLE_COST_CAP"),
+    ("budget", "Budget limit reached. Use /budget <amount> to adjust mid-session"),
+    # Catch-all handled below
+]
+
+
+def _actionable_suggestion(reason: str, phase: str, elapsed: float) -> str:
+    """Map a failure reason to a concrete next-step suggestion."""
+    reason_lower = reason.lower()
+    for pattern, suggestion in _FAILURE_SUGGESTIONS:
+        if pattern in reason_lower:
+            return suggestion
+
+    # Phase-specific fallbacks
+    if phase:
+        phase_lower = phase.lower()
+        if "generate" in phase_lower:
+            return f"Generation failed after {elapsed:.0f}s. Check provider logs or try a simpler target"
+        if "validate" in phase_lower:
+            return "Validation rejected the patch. Review constraints in VALIDATE phase config"
+        if "apply" in phase_lower:
+            return "Apply failed. Check file permissions and git working tree state"
+        if "verify" in phase_lower:
+            return "Post-apply verification failed. L2 repair will handle if enabled"
+
+    return f"Failed after {elapsed:.0f}s. Check debug.log for details: grep {reason[:20]!r}"
 
 
 def _short_id(op_id: str) -> str:
@@ -1251,9 +1315,12 @@ class SerpentFlow:
             f"[{_C['death']}]{reason[:70]}[/{_C['death']}]{phase_str}"
             f"  [{_C['dim']}]⏱ {elapsed:.1f}s[/{_C['dim']}]",
         )
+
+        # Actionable next-step based on failure reason
+        suggestion = _actionable_suggestion(reason, phase, elapsed)
         self._op_line(
             op_id,
-            f"[{_C['dim']}]             the organism will learn from this failure[/{_C['dim']}]",
+            f"[{_C['dim']}]             💡 {suggestion}[/{_C['dim']}]",
         )
 
         # Close the op block
@@ -2008,6 +2075,17 @@ class SerpentREPL:
                         await self._handle_cancel(_cancel_target)
                         continue
 
+                    # Runtime configuration commands
+                    if line.startswith("/risk") or line.startswith("risk ") or line == "risk":
+                        self._handle_risk(line)
+                        continue
+                    if line.startswith("/budget") or line.startswith("budget ") or line == "budget":
+                        self._handle_budget(line)
+                        continue
+                    if line.startswith("/goal") or line.startswith("goal "):
+                        await self._handle_goal(line)
+                        continue
+
                     # Delegate to external handler
                     if self._on_command is not None:
                         try:
@@ -2056,17 +2134,20 @@ class SerpentREPL:
     def _print_help(self) -> None:
         """Print available REPL commands."""
         lines = [
-            f"  [{_C['dim']}]status[/{_C['dim']}]    organism status panel",
-            f"  [{_C['dim']}]cost[/{_C['dim']}]      cost breakdown",
-            f"  [{_C['dim']}]cancel <id>[/{_C['dim']}] cancel an in-flight operation",
-            f"  [{_C['dim']}]help[/{_C['dim']}]      this message",
-            f"  [{_C['dim']}]quit[/{_C['dim']}]      graceful shutdown",
+            f"  [{_C['dim']}]status[/{_C['dim']}]         organism status panel",
+            f"  [{_C['dim']}]cost[/{_C['dim']}]           cost breakdown",
+            f"  [{_C['dim']}]cancel <id>[/{_C['dim']}]    cancel an in-flight operation",
+            f"  [{_C['dim']}]/risk [tier][/{_C['dim']}]   set risk ceiling (safe_auto|notify_apply)",
+            f"  [{_C['dim']}]/budget <usd>[/{_C['dim']}]  adjust session budget",
+            f"  [{_C['dim']}]/goal [add|rm][/{_C['dim']}] manage active goals",
+            f"  [{_C['dim']}]help[/{_C['dim']}]           this message",
+            f"  [{_C['dim']}]quit[/{_C['dim']}]           graceful shutdown",
         ]
         panel = Panel(
             "\n".join(lines),
             title="[cyan]🐍 Commands[/cyan]",
             border_style="dim",
-            width=min(self._flow.console.width, 44),
+            width=min(self._flow.console.width, 52),
             padding=(0, 1),
         )
         self._flow.console.print()
@@ -2096,5 +2177,108 @@ class SerpentREPL:
         else:
             self._flow.console.print(
                 f"  [{_C['death']}]GLS does not support cancel (upgrade needed)[/{_C['death']}]",
+                highlight=False,
+            )
+
+    # ── Runtime configuration commands ──────────────────────────
+
+    _VALID_RISK_TIERS = ("safe_auto", "notify_apply", "approval_required", "blocked")
+
+    def _handle_risk(self, line: str) -> None:
+        """Set or show the runtime risk tier ceiling.
+
+        Usage: /risk [safe_auto|notify_apply|approval_required]
+        Sets JARVIS_RISK_CEILING env var — the orchestrator's GATE phase
+        will clamp risk_tier to at most this level.
+        """
+        parts = line.replace("/risk", "risk", 1).split(None, 1)
+        if len(parts) < 2:
+            current = os.environ.get("JARVIS_RISK_CEILING", "(not set — using per-op classification)")
+            self._flow.console.print(
+                f"  [{_C['neural']}]Risk ceiling:[/{_C['neural']}] {current}\n"
+                f"  [{_C['dim']}]Usage: /risk safe_auto | notify_apply | approval_required[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        tier = parts[1].strip().lower()
+        if tier not in self._VALID_RISK_TIERS:
+            self._flow.console.print(
+                f"  [{_C['death']}]Invalid tier '{tier}'. "
+                f"Choose: {', '.join(self._VALID_RISK_TIERS[:3])}[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        os.environ["JARVIS_RISK_CEILING"] = tier.upper()
+        self._flow.console.print(
+            f"  [{_C['evolved']}]Risk ceiling set to {tier.upper()} — "
+            f"takes effect on next operation[/{_C['evolved']}]",
+            highlight=False,
+        )
+
+    def _handle_budget(self, line: str) -> None:
+        """Adjust the session budget mid-run.
+
+        Usage: /budget <amount>
+        Updates the cost tracker's budget and the harness config.
+        """
+        parts = line.replace("/budget", "budget", 1).split(None, 1)
+        if len(parts) < 2:
+            _ct = getattr(self._flow, "_cost_total", 0.0)
+            _cap = getattr(self._flow, "_cost_cap", 0.0)
+            self._flow.console.print(
+                f"  [{_C['neural']}]Budget:[/{_C['neural']}] ${_ct:.4f} / ${_cap:.2f}\n"
+                f"  [{_C['dim']}]Usage: /budget <amount_usd>[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+        try:
+            amount = float(parts[1].strip().lstrip("$"))
+        except ValueError:
+            self._flow.console.print(
+                f"  [{_C['death']}]Invalid amount. Usage: /budget 1.00[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        if amount <= 0:
+            self._flow.console.print(
+                f"  [{_C['death']}]Budget must be positive[/{_C['death']}]",
+                highlight=False,
+            )
+            return
+        # Update SerpentFlow's cost cap display
+        self._flow._cost_cap = amount
+        # Update env var for subsystems that read it
+        os.environ["OUROBOROS_BATTLE_COST_CAP"] = str(amount)
+        self._flow.console.print(
+            f"  [{_C['evolved']}]Budget updated to ${amount:.2f}[/{_C['evolved']}]",
+            highlight=False,
+        )
+
+    async def _handle_goal(self, line: str) -> None:
+        """Manage active goals at runtime.
+
+        Usage:
+          /goal                     — list active goals
+          /goal add <description>   — add a goal (keywords auto-extracted)
+          /goal remove <id>         — remove a goal by ID
+        """
+        parts = line.replace("/goal", "goal", 1).split(None, 2)
+        subcmd = parts[1].strip().lower() if len(parts) > 1 else "list"
+
+        # Delegate to harness handler via on_command callback
+        # The harness has GoalTracker access; we just format the REPL command
+        if self._on_command is not None:
+            try:
+                result = self._on_command(line)
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                self._flow.console.print(
+                    f"  [{_C['death']}]Goal error: {exc}[/{_C['death']}]",
+                    highlight=False,
+                )
+        else:
+            self._flow.console.print(
+                f"  [{_C['dim']}]Goal management requires harness connection[/{_C['dim']}]",
                 highlight=False,
             )
