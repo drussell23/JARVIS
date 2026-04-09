@@ -20,18 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-import sys
 import time
-from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from rich.console import Console
 from rich.live import Live
 from rich.markdown import Markdown
 from rich.status import Status
-from rich.syntax import Syntax
-from rich.text import Text
 
 # ══════════════════════════════════════════════════════════════
 # Color palette (organism theme)
@@ -859,17 +855,27 @@ class SerpentTransport:
                     if payload["triage_decision"].upper() == "NO_OP":
                         self._flow.op_noop(op_id, payload.get("triage_reason", ""))
 
-                # Tool call
+                # Tool call — two-phase: start (spin) then complete (artifact)
                 elif payload.get("tool_name"):
-                    self._flow.op_tool_call(
-                        op_id=op_id,
-                        tool_name=payload["tool_name"],
-                        args_summary=payload.get("tool_args_summary", ""),
-                        round_index=payload.get("round_index", 0),
-                        result_preview=payload.get("result_preview", ""),
-                        duration_ms=payload.get("duration_ms", 0.0),
-                        status=payload.get("status", "success"),
-                    )
+                    if payload.get("tool_starting"):
+                        # Pre-execution: spin a masking spinner
+                        self._flow.op_tool_start(
+                            op_id=op_id,
+                            tool_name=payload["tool_name"],
+                            args_summary=payload.get("tool_args_summary", ""),
+                            round_index=payload.get("round_index", 0),
+                        )
+                    else:
+                        # Post-execution: stop spinner, print artifact
+                        self._flow.op_tool_call(
+                            op_id=op_id,
+                            tool_name=payload["tool_name"],
+                            args_summary=payload.get("tool_args_summary", ""),
+                            round_index=payload.get("round_index", 0),
+                            result_preview=payload.get("result_preview", ""),
+                            duration_ms=payload.get("duration_ms", 0.0),
+                            status=payload.get("status", "success"),
+                        )
 
                 # Generation result
                 elif payload.get("candidates_count") is not None:
@@ -907,6 +913,11 @@ class SerpentTransport:
                             failures=payload.get("test_failures", 0),
                         )
 
+                # Validation phase starting — spin masking spinner until results arrive
+                elif phase.upper() == "VALIDATE" and "test_passed" not in payload:
+                    if op_id not in self._validation_shown:
+                        self._flow.op_validation_start(op_id=op_id)
+
                 # L2 repair
                 elif payload.get("l2_iteration") is not None:
                     self._flow.op_l2_repair(
@@ -932,6 +943,8 @@ class SerpentTransport:
                         provider = payload.get("provider", "unknown")
                         self._op_providers[op_id] = provider
                         self._flow.show_streaming_start(provider=provider, op_id=op_id)
+                elif payload.get("streaming") == "token":
+                    self._flow.show_streaming_token(payload.get("token", ""))
                 elif payload.get("streaming") == "end":
                     self._flow.show_streaming_end()
 
@@ -998,3 +1011,144 @@ class SerpentTransport:
 
         except Exception:
             pass  # The serpent never crashes the pipeline
+
+
+# ══════════════════════════════════════════════════════════════
+# SerpentREPL — Non-blocking async REPL (prompt_toolkit)
+# ══════════════════════════════════════════════════════════════
+
+
+class SerpentREPL:
+    """Non-blocking REPL that coexists with the Ouroboros async event loop.
+
+    Uses ``prompt_toolkit.PromptSession.prompt_async()`` so the daemon
+    can wait for human input without blocking the event loop or halting
+    background telemetry, sensor polling, or streaming output.
+
+    Parameters
+    ----------
+    flow:
+        SerpentFlow instance — used for styled output via ``flow.console``.
+    on_command:
+        Async callback invoked with each line of user input.
+        Signature: ``async (command: str) -> None``
+    prompt_str:
+        The prompt string shown to the user.
+    """
+
+    def __init__(
+        self,
+        flow: SerpentFlow,
+        on_command: Optional[Callable[[str], Any]] = None,
+        prompt_str: str = "🐍 ouroboros > ",
+    ) -> None:
+        self._flow = flow
+        self._on_command = on_command
+        self._prompt_str = prompt_str
+        self._session: Any = None  # PromptSession — lazy-initialized
+        self._running = False
+        self._task: Optional[asyncio.Task[None]] = None
+
+    async def start(self) -> None:
+        """Start the REPL loop as a background task on the current event loop."""
+        if self._running:
+            return
+        self._running = True
+        self._task = asyncio.ensure_future(self._loop())
+
+    async def stop(self) -> None:
+        """Gracefully shut down the REPL."""
+        self._running = False
+        if self._task is not None:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+    async def _loop(self) -> None:
+        """Async REPL loop — yields to the event loop between prompts."""
+        try:
+            from prompt_toolkit import PromptSession
+            from prompt_toolkit.formatted_text import HTML
+            from prompt_toolkit.patch_stdout import patch_stdout
+        except ImportError:
+            # prompt_toolkit not installed — degrade gracefully
+            self._flow.console.print(
+                f"[{_C['dim']}]REPL disabled: prompt_toolkit not installed[/{_C['dim']}]",
+                highlight=False,
+            )
+            return
+
+        self._session = PromptSession()
+
+        # patch_stdout redirects plain print/logging through prompt_toolkit
+        # so that background output doesn't corrupt the prompt line.
+        with patch_stdout():
+            while self._running:
+                try:
+                    line = await self._session.prompt_async(
+                        HTML(f"<b>{self._prompt_str}</b>"),
+                    )
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Built-in commands
+                    if line in ("quit", "exit", "q"):
+                        self._flow.console.print(
+                            f"[{_C['dim']}]Shutting down…[/{_C['dim']}]",
+                            highlight=False,
+                        )
+                        self._running = False
+                        break
+                    if line == "status":
+                        self._print_status()
+                        continue
+                    if line == "help":
+                        self._print_help()
+                        continue
+
+                    # Delegate to external handler
+                    if self._on_command is not None:
+                        try:
+                            result = self._on_command(line)
+                            if asyncio.iscoroutine(result):
+                                await result
+                        except Exception as exc:
+                            self._flow.console.print(
+                                f"[{_C['death']}]Error: {exc}[/{_C['death']}]",
+                                highlight=False,
+                            )
+                except EOFError:
+                    break
+                except KeyboardInterrupt:
+                    continue
+                except asyncio.CancelledError:
+                    break
+
+    def _print_status(self) -> None:
+        """Print current organism status."""
+        f = self._flow
+        elapsed = time.time() - f._started_at
+        mins = int(elapsed // 60)
+        secs = int(elapsed % 60)
+        f.console.print(
+            f"\n[{_C['neural']}]🐍 status[/{_C['neural']}] │ "
+            f"⏱ {mins}m {secs:02d}s │ "
+            f"[green]✅ {f._completed} evolved[/green]  "
+            f"[red]💀 {f._failed} shed[/red]  "
+            f"💰 ${f._cost_total:.4f} / ${f._cost_cap:.2f}\n",
+            highlight=False,
+        )
+
+    def _print_help(self) -> None:
+        """Print available REPL commands."""
+        self._flow.console.print(
+            f"\n[{_C['neural']}]🐍 commands[/{_C['neural']}]\n"
+            f"  [{_C['dim']}]status[/{_C['dim']}]   — current organism status\n"
+            f"  [{_C['dim']}]help[/{_C['dim']}]     — this message\n"
+            f"  [{_C['dim']}]quit[/{_C['dim']}]     — graceful shutdown\n",
+            highlight=False,
+        )

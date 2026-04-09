@@ -189,57 +189,49 @@ class BattleTestHarness:
                 and getattr(_gls, "_bg_pool", None) is not None
             )
 
-            _on = "\033[92mON\033[0m"
-            _off = "\033[2mOFF\033[0m"
+            _on = "[bright_green]ON[/bright_green]"
+            _off = "[dim]OFF[/dim]"
 
             _n_principles = 0
             if _has_strategic:
                 _n_principles = len(_gls._strategic_direction.principles)
 
-            print(
-                f"\n"
-                f"\033[1m\033[96m"
-                f"      \U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\U0001f40d\n"
-                f"\033[0m"
-                f"\033[1m\033[96m"
-                f"      O U R O B O R O S  +  V E N O M\n"
-                f"      The Self-Developing Organism\n"
-                f"\033[0m"
-                f"\033[2m"
-                f"      {'─' * 52}\n"
-                f"\033[0m"
-                f"\n"
-                f"  \U0001f9ec  Session    {self._session_id}\n"
-                f"  \U0001f333  Branch     {self._branch_name or 'N/A'}\n"
-                f"  \U0001f4b0  Budget     ${self._config.cost_cap_usd:.2f}\n"
-                f"  \u23f3  Idle       {int(self._config.idle_timeout_s)}s\n"
-                f"  \U0001f6e1\ufe0f   Mode       Governed (SAFE_AUTO auto-apply)\n"
-                f"\n"
-                f"\033[2m"
-                f"      {'─' * 52}\n"
-                f"\033[0m"
-                f"\033[1m  6-Layer Organism Status:\033[0m\n"
-                f"\n"
-                f"  \U0001f9ed  Strategic Direction   [{_on if _has_strategic else _off}]"
-                f"  {_n_principles} Manifesto principles\n"
-                f"  \U0001f9e0  Consciousness         [{_on if _has_consciousness else _off}]"
-                f"  Memory + Prophecy + Health\n"
-                f"  \U0001f4e1  Event Spine           [{_on}]"
-                f"  FileWatch \u2192 TrinityBus \u2192 sensors\n"
-                f"  \u2699\ufe0f   Ouroboros Pipeline    [{_on}]"
-                f"  {'parallel (' + str(getattr(_gls._bg_pool, '_pool_size', 2)) + ' workers)' if _has_bg_pool else 'sequential'}\n"
-                f"  \U0001f40d  Venom Agentic Loop    [{_on if _has_tool_loop else _off}]"
-                f"  {'bash + web + tests + L2' if _has_l2 else 'tools active'}\n"
-                f"  \U0001f4dd  Thought Log           [{_on}]"
-                f"  .jarvis/ouroboros_thoughts.jsonl\n"
-                f"\n"
-                f"\033[2m"
-                f"      {'─' * 52}\n"
-                f"\033[0m"
-                f"  \U0001f50b Organism is alive. Sensors scanning...\n"
-                f"  \u2328\ufe0f  Press Ctrl+C to stop.\n"
-                f"\n"
-            )
+            # Use Rich console for the boot banner — consistent styling,
+            # no raw ANSI escapes, works with prompt_toolkit's patch_stdout.
+            _c = self._serpent_flow.console if hasattr(self, "_serpent_flow") and self._serpent_flow else None
+            if _c is None:
+                from rich.console import Console as _C
+                _c = _C(emoji=True, highlight=False)
+
+            _pool_info = f"parallel ({getattr(_gls._bg_pool, '_pool_size', 2)} workers)" if _has_bg_pool else "sequential"
+            _venom_info = "bash + web + tests + L2" if _has_l2 else "tools active"
+
+            _c.print()
+            _c.print("[bold cyan]      🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍🐍[/bold cyan]", highlight=False)
+            _c.print("[bold cyan]      O U R O B O R O S  +  V E N O M[/bold cyan]", highlight=False)
+            _c.print("[bold cyan]      The Self-Developing Organism[/bold cyan]", highlight=False)
+            _c.print(f"[dim]      {'─' * 52}[/dim]", highlight=False)
+            _c.print()
+            _c.print(f"  🧬  Session    {self._session_id}", highlight=False)
+            _c.print(f"  🌳  Branch     {self._branch_name or 'N/A'}", highlight=False)
+            _c.print(f"  💰  Budget     ${self._config.cost_cap_usd:.2f}", highlight=False)
+            _c.print(f"  ⏳  Idle       {int(self._config.idle_timeout_s)}s", highlight=False)
+            _c.print("  🛡️   Mode       Governed (SAFE_AUTO auto-apply)", highlight=False)
+            _c.print()
+            _c.print(f"[dim]      {'─' * 52}[/dim]", highlight=False)
+            _c.print("[bold]  6-Layer Organism Status:[/bold]", highlight=False)
+            _c.print()
+            _c.print(f"  🧭  Strategic Direction   [{_on if _has_strategic else _off}]  {_n_principles} Manifesto principles", highlight=False)
+            _c.print(f"  🧠  Consciousness         [{_on if _has_consciousness else _off}]  Memory + Prophecy + Health", highlight=False)
+            _c.print(f"  📡  Event Spine           [{_on}]  FileWatch → TrinityBus → sensors", highlight=False)
+            _c.print(f"  ⚙️   Ouroboros Pipeline    [{_on}]  {_pool_info}", highlight=False)
+            _c.print(f"  🐍  Venom Agentic Loop    [{_on if _has_tool_loop else _off}]  {_venom_info}", highlight=False)
+            _c.print(f"  📝  Thought Log           [{_on}]  .jarvis/ouroboros_thoughts.jsonl", highlight=False)
+            _c.print()
+            _c.print(f"[dim]      {'─' * 52}[/dim]", highlight=False)
+            _c.print("  🔋 Organism is alive. Sensors scanning...", highlight=False)
+            _c.print("  ⌨️  Press Ctrl+C to stop.", highlight=False)
+            _c.print()
 
             # Subscribe to operation completion events for session recording
             try:
@@ -310,6 +302,18 @@ class BattleTestHarness:
                     n_sensors = len(getattr(_intake, "_sensors", []))
                     self._serpent_flow.update_sensors(n_sensors)
                 await self._serpent_flow.start()
+
+                # Boot non-blocking REPL (prompt_toolkit) — runs alongside
+                # background telemetry without blocking the event loop.
+                try:
+                    from backend.core.ouroboros.battle_test.serpent_flow import SerpentREPL
+                    self._serpent_repl = SerpentREPL(
+                        flow=self._serpent_flow,
+                        on_command=self._handle_repl_command,
+                    )
+                    await self._serpent_repl.start()
+                except Exception as _repl_exc:
+                    logger.debug("SerpentREPL not available: %s", _repl_exc)
             elif hasattr(self, "_tui_console") and self._tui_console is not None:
                 self._tui_console.show_controls_bar()
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
@@ -736,6 +740,31 @@ class BattleTestHarness:
             logger.warning("GraduationOrchestrator failed to boot: %s", exc)
 
     # ------------------------------------------------------------------
+    # REPL command handler
+    # ------------------------------------------------------------------
+
+    async def _handle_repl_command(self, command: str) -> None:
+        """Process a user command from the SerpentREPL.
+
+        Currently supports ``quit`` (handled inside SerpentREPL) and
+        ``stop`` as an alias for graceful shutdown.
+        """
+        cmd = command.strip().lower()
+        if cmd in ("stop", "shutdown"):
+            self._shutdown_event.set()
+        elif cmd == "cost":
+            if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
+                breakdown = self._cost_tracker.breakdown
+                parts = "  ".join(f"{k}: ${v:.4f}" for k, v in breakdown.items())
+                self._serpent_flow.console.print(
+                    f"[dim]💰 ${self._cost_tracker.total_spent:.4f} / "
+                    f"${self._config.cost_cap_usd:.2f}  ({parts})[/dim]",
+                    highlight=False,
+                )
+        else:
+            logger.debug("Unknown REPL command: %s", cmd)
+
+    # ------------------------------------------------------------------
     # Signal handlers
     # ------------------------------------------------------------------
 
@@ -1035,7 +1064,12 @@ class BattleTestHarness:
         except Exception:
             pass
 
-        # 0b. Keyboard handler + SerpentFlow
+        # 0b. REPL + keyboard handler + SerpentFlow
+        try:
+            if hasattr(self, "_serpent_repl") and self._serpent_repl is not None:
+                await self._serpent_repl.stop()
+        except Exception:
+            pass
         try:
             if hasattr(self, "_keyboard_handler") and self._keyboard_handler is not None:
                 await self._keyboard_handler.stop()
@@ -1187,7 +1221,12 @@ class BattleTestHarness:
                 convergence_slope=convergence_slope,
                 convergence_r2=convergence_r2,
             )
-            print(terminal_summary)
+            # Use Rich console for proper formatting / prompt_toolkit compat
+            _c = self._serpent_flow.console if hasattr(self, "_serpent_flow") and self._serpent_flow else None
+            if _c is not None:
+                _c.print(terminal_summary, highlight=False)
+            else:
+                print(terminal_summary)
         except Exception as exc:
             logger.warning("Failed to format terminal summary: %s", exc)
 

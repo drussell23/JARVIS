@@ -2260,16 +2260,37 @@ class GovernedLoopService:
             # Real-time tool call display callback (Manifesto §7: Absolute Observability)
             # Fires twice per tool: once before execution (tool name + args) and
             # once after execution (result preview + duration + status).
+            # Routes through CommProtocol so SerpentTransport can render spinners.
             def _on_tool_call_display(**kwargs: Any) -> None:
                 try:
-                    from backend.core.ouroboros.battle_test.ouroboros_tui import OuroborosConsole
-                    # Try TUI first (Rich rendering), fall back to basic
-                    _tui_ref = getattr(self, "_tui_console_ref", None)
-                    if _tui_ref is not None:
-                        _tui_ref.show_tool_call(**kwargs)
-                    else:
-                        from backend.core.ouroboros.battle_test.diff_display import print_tool_call
-                        print_tool_call(**kwargs)
+                    _comm = getattr(self._governance_stack, "comm", None) if hasattr(self, "_governance_stack") else None
+                    if _comm is not None:
+                        _tool_msg = type("_Msg", (), {
+                            "payload": {
+                                "phase": "generate",
+                                "tool_name": kwargs.get("tool_name", ""),
+                                "tool_args_summary": kwargs.get("args_summary", ""),
+                                "round_index": kwargs.get("round_index", 0),
+                                "result_preview": kwargs.get("result_preview", ""),
+                                "duration_ms": kwargs.get("duration_ms", 0.0),
+                                "status": kwargs.get("status", ""),
+                                # Empty status = pre-execution (start spinner)
+                                # Non-empty status = post-execution (stop spinner, print artifact)
+                                "tool_starting": not kwargs.get("status"),
+                            },
+                            "op_id": kwargs.get("op_id", ""),
+                            "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                        })()
+                        for _t in getattr(_comm, "_transports", []):
+                            try:
+                                import asyncio as _aio
+                                _loop = _aio.get_event_loop()
+                                if _loop.is_running():
+                                    _loop.create_task(_t.send(_tool_msg))
+                                else:
+                                    _loop.run_until_complete(_t.send(_tool_msg))
+                            except Exception:
+                                pass
                 except Exception:
                     pass  # Display is non-critical
 
@@ -2280,12 +2301,28 @@ class GovernedLoopService:
                 on_tool_call=_on_tool_call_display,
             )
 
-            # Streaming token callback — SerpentFlow buffers tokens silently
-            # and shows periodic dots. No raw token dumping to stdout.
-            # The on_token hook is still wired so SerpentFlow can count tokens
-            # via CommProtocol heartbeats, but the actual display is handled
-            # by SerpentFlow's show_streaming_token (dots, not raw text).
-            _tool_coordinator.on_token = None  # SerpentFlow handles display via heartbeats
+            # Streaming token callback — pipes tokens through CommProtocol
+            # so SerpentFlow can render live Markdown via rich.Live.
+            def _on_streaming_token(token: str) -> None:
+                try:
+                    _comm = getattr(self._governance_stack, "comm", None) if hasattr(self, "_governance_stack") else None
+                    if _comm is not None:
+                        _tok_msg = type("_Msg", (), {
+                            "payload": {"streaming": "token", "token": token},
+                            "op_id": "",
+                            "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                        })()
+                        for _t in getattr(_comm, "_transports", []):
+                            try:
+                                import asyncio as _aio
+                                _loop = _aio.get_event_loop()
+                                if _loop.is_running():
+                                    _loop.create_task(_t.send(_tok_msg))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            _tool_coordinator.on_token = _on_streaming_token
 
             logger.info(
                 "[GovernedLoop] ToolLoopCoordinator wired: max_rounds=%d, timeout=%.1fs, concurrency=%d, streaming=ON",
