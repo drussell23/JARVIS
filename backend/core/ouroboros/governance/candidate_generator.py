@@ -83,7 +83,8 @@ _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
 _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
-    "trivial": 1.0,           # 0.65 * 1.0  = 0.65
+    "trivial": 0.31,           # 0.65 * 0.31 ≈ 0.20 → ~24s DW, ~96s Claude
+    "simple": 0.62,            # 0.65 * 0.62 ≈ 0.40 → ~48s DW, ~72s Claude
     "moderate": 1.077,         # 0.65 * 1.077 ≈ 0.70
     "standard": 1.077,         # alias for moderate
     "complex": 1.231,          # 0.65 * 1.231 ≈ 0.80
