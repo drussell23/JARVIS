@@ -157,6 +157,25 @@ class BattleTestHarness:
             await self.boot_intake()
             await self.boot_graduation()
 
+            # Wire SerpentApprovalProvider — wraps the inner CLIApprovalProvider
+            # with diff preview + interactive [Y/n] Iron Gate prompt when
+            # SerpentFlow is the active transport.
+            try:
+                if hasattr(self, "_serpent_flow") and self._serpent_flow is not None:
+                    _gls_ref = self._governed_loop_service
+                    _inner_ap = getattr(_gls_ref, "_approval_provider", None)
+                    if _inner_ap is not None:
+                        from backend.core.ouroboros.battle_test.serpent_flow import SerpentApprovalProvider
+                        _serpent_ap = SerpentApprovalProvider(flow=self._serpent_flow, inner=_inner_ap)
+                        _gls_ref._approval_provider = _serpent_ap
+                        # Also update the orchestrator's reference
+                        _orch = getattr(_gls_ref, "_orchestrator", None)
+                        if _orch is not None:
+                            _orch._approval_provider = _serpent_ap
+                        logger.info("SerpentApprovalProvider wired (Iron Gate prompt active)")
+            except Exception as _ap_exc:
+                logger.debug("SerpentApprovalProvider wiring failed: %s", _ap_exc)
+
             logger.info(
                 "Ouroboros is alive — session %s | budget=$%.2f | idle=%ds",
                 self._session_id,

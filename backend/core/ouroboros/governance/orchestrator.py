@@ -1867,6 +1867,26 @@ class GovernedOrchestrator:
                         "[Orchestrator] Security review WARN: %s [%s]",
                         _sec_result.summary, ctx.op_id,
                     )
+                    # Emit proactive alert for security warnings (Manifesto §7)
+                    try:
+                        _warn_msg = type("_Msg", (), {
+                            "payload": {
+                                "proactive_alert": True,
+                                "alert_title": "Security Review Warning",
+                                "alert_body": _sec_result.summary or "Potential security concern detected.",
+                                "alert_severity": "warning",
+                                "alert_source": "SecurityReviewer",
+                            },
+                            "op_id": ctx.op_id,
+                            "msg_type": type("_T", (), {"value": "HEARTBEAT"})(),
+                        })()
+                        for _t in getattr(self._stack.comm, "_transports", []):
+                            try:
+                                await _t.send(_warn_msg)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
         except Exception:
             logger.debug("[Orchestrator] SecurityReviewer not available", exc_info=True)
 

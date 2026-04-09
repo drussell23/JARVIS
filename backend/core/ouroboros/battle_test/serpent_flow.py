@@ -1319,21 +1319,30 @@ class SerpentApprovalProvider:
         description = ctx.description or ""
         target_files = list(ctx.target_files) if ctx.target_files else []
 
-        # Generate proposed diff from the candidate
+        # Generate proposed diff from the candidate.
+        # The candidate lives on ctx.validation.best_candidate (ValidationResult)
+        # or can be found via ctx.generation.candidates[0].
         diff_text = ""
         candidate_rationale = ""
         try:
-            candidate = getattr(ctx, "best_candidate", None) or {}
+            candidate: Dict[str, Any] = {}
+            _val = getattr(ctx, "validation", None)
+            if _val is not None:
+                candidate = getattr(_val, "best_candidate", None) or {}
+            if not candidate:
+                _gen = getattr(ctx, "generation", None)
+                if _gen is not None and getattr(_gen, "candidates", None):
+                    candidate = _gen.candidates[0] if _gen.candidates else {}
+
             proposed = candidate.get("full_content", "")
             candidate_rationale = (candidate.get("rationale", "") or "")[:120]
             if proposed and target_files:
-                import subprocess as _sp
+                import difflib
                 _repo = self._flow._repo_path
                 _target = _repo / target_files[0]
                 if _target.exists():
                     _original = _target.read_text(errors="replace")
                     if _original != proposed:
-                        import difflib
                         diff_lines = difflib.unified_diff(
                             _original.splitlines(keepends=True),
                             proposed.splitlines(keepends=True),
