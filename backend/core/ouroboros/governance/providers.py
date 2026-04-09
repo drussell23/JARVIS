@@ -604,7 +604,8 @@ def _build_tool_section() -> str:
     return (
         "## Available Tools\n\n"
         "If you need more information before writing the patch, respond with ONLY a\n"
-        "tool_call JSON (no other text):\n\n"
+        "tool call JSON (no other text).\n\n"
+        "### Single tool call\n"
         "```json\n"
         "{\n"
         f'  "schema_version": "{_TOOL_SCHEMA_VERSION}",\n'
@@ -614,17 +615,42 @@ def _build_tool_section() -> str:
         "  }\n"
         "}\n"
         "```\n\n"
-        "Available tools:\n"
-        '- `search_code(pattern, file_glob="*.py")` — search the codebase with a regex pattern\n'
-        "- `read_file(path, lines_from=1, lines_to=200)` — read file content (repo-relative path)\n"
+        "### Parallel tool calls (preferred when tools are independent)\n"
+        "```json\n"
+        "{\n"
+        f'  "schema_version": "{_TOOL_SCHEMA_VERSION}",\n'
+        '  "tool_calls": [\n'
+        '    {"name": "<tool_a>", "arguments": {...}},\n'
+        '    {"name": "<tool_b>", "arguments": {...}}\n'
+        "  ]\n"
+        "}\n"
+        "```\n\n"
+        "Use `tool_calls` (plural) when calling multiple independent tools in one\n"
+        "round — they execute in parallel for faster results. Use `tool_call`\n"
+        "(singular) when you only need one tool.\n\n"
+        "### Available tools\n\n"
+        "**Codebase exploration:**\n"
+        '- `search_code(pattern, file_glob="*.py")` — regex search across files (ripgrep-backed, 200 result cap)\n'
+        "- `read_file(path, lines_from=1, lines_to=2000)` — read file content (repo-relative path)\n"
         "- `list_symbols(module_path)` — list functions and classes in a Python file\n"
-        "- `run_tests(paths)` — run pytest for the given test paths (list of strings), returns summary\n"
         "- `get_callers(function_name, file_path=None)` — find call sites of a function\n"
-        "- `bash(command, timeout=30)` — execute a shell command (sandboxed, allowlisted)\n"
-        "- `web_fetch(url)` — fetch a URL and return its text content (HTML stripped)\n"
-        '- `web_search(query, max_results=5)` — search the web (DuckDuckGo), returns titles/URLs/snippets from developer docs\n'
-        '- `code_explore(snippet)` — run a Python snippet in a sandbox to test a hypothesis (e.g., check imports, types, return values)\n\n'
-        f"Max {MAX_TOOL_ITERATIONS} tool calls total. After gathering info, respond with the patch JSON."
+        '- `glob_files(pattern, path=".")` — find files by glob pattern (e.g. `**/*.py`)\n'
+        '- `list_dir(path=".", max_depth=1)` — list directory contents with types and sizes\n\n'
+        "**Git operations:**\n"
+        '- `git_log(path="", n=20)` — recent commit history (oneline format)\n'
+        '- `git_diff(ref="", path="")` — show diffs (default: unstaged changes)\n'
+        "- `git_blame(path, lines_from=0, lines_to=0)` — line-by-line blame\n\n"
+        "**Execution & testing:**\n"
+        "- `run_tests(paths)` — run pytest (list of test paths), returns structured summary\n"
+        "- `bash(command, timeout=30)` — sandboxed shell command (allowlisted, Iron Gate filtered)\n"
+        '- `code_explore(snippet)` — run a Python snippet in sandbox to test a hypothesis\n\n'
+        "**Web:**\n"
+        "- `web_fetch(url)` — fetch URL, return text content (HTML stripped)\n"
+        '- `web_search(query, max_results=5)` — search the web (DuckDuckGo)\n\n'
+        "**Write tools (env-gated: JARVIS_TOOL_EDIT_ALLOWED=1):**\n"
+        "- `edit_file(path, old_string, new_string)` — find-and-replace edit (old_string must be unique)\n"
+        "- `write_file(path, content)` — create or overwrite a file\n\n"
+        f"Max {MAX_TOOL_ITERATIONS} tool rounds total. After gathering info, respond with the patch JSON."
     )
 
 
@@ -1287,9 +1313,10 @@ def _find_balanced_json(text: str, start_search: int) -> Optional[str]:
     return None
 
 
-def _parse_tool_call_response(raw: str) -> Optional["ToolCall"]:
-    """Parse a 2b.2-tool response into a ToolCall, or return None.
+def _parse_tool_call_response(raw: str) -> Optional[List["ToolCall"]]:
+    """Parse a 2b.2-tool response into ToolCall(s), or return None.
 
+    Supports both singular ``tool_call`` and plural ``tool_calls`` (parallel).
     Returns None for any parse/validation failure (including patch responses),
     so callers can treat None as "not a tool call".
     """
@@ -1301,17 +1328,31 @@ def _parse_tool_call_response(raw: str) -> Optional["ToolCall"]:
         return None
     if data.get("schema_version") != _TOOL_SCHEMA_VERSION:
         return None
-    tc = data.get("tool_call")
-    if not isinstance(tc, dict):
-        return None
-    name = tc.get("name")
-    if not isinstance(name, str) or not name:
-        return None
-    arguments = tc.get("arguments", {})
-    if not isinstance(arguments, dict):
-        arguments = {}
+
     from backend.core.ouroboros.governance.tool_executor import ToolCall
-    return ToolCall(name=name, arguments=arguments)
+
+    def _parse_one(tc: Any) -> Optional["ToolCall"]:
+        if not isinstance(tc, dict):
+            return None
+        name = tc.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        arguments = tc.get("arguments", {})
+        if not isinstance(arguments, dict):
+            arguments = {}
+        return ToolCall(name=name, arguments=arguments)
+
+    # Parallel: tool_calls (plural) — list of tool call objects
+    plural = data.get("tool_calls")
+    if isinstance(plural, list) and plural:
+        calls = [_parse_one(item) for item in plural]
+        valid = [c for c in calls if c is not None]
+        return valid if valid else None
+
+    # Singular: tool_call — single tool call object (backward compat)
+    tc = data.get("tool_call")
+    parsed = _parse_one(tc)
+    return [parsed] if parsed is not None else None
 
 
 def _parse_multi_repo_response(
@@ -2404,8 +2445,8 @@ class ClaudeProvider:
                 total_cost += cost
                 if total_cost >= self._max_cost_per_op:
                     raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
-                tool_call = _parse_tool_call_response(raw)
-                if tool_call is not None:
+                tool_calls = _parse_tool_call_response(raw)
+                if tool_calls is not None:
                     if tool_rounds >= MAX_TOOL_ITERATIONS:
                         raise RuntimeError(
                             f"claude-api_tool_loop_max_iterations:{MAX_TOOL_ITERATIONS}"
@@ -2413,10 +2454,13 @@ class ClaudeProvider:
                     if executor is None:
                         from backend.core.ouroboros.governance.tool_executor import ToolExecutor
                         executor = ToolExecutor(repo_root=repo_root)
-                    tool_result = executor.execute(tool_call)
+                    result_parts: list = []
+                    for tc in tool_calls:
+                        tool_result = executor.execute(tc)
+                        output = tool_result.output if not tool_result.error else "ERROR: " + tool_result.error
+                        result_parts.append(f"Tool result for {tc.name}:\n{output}")
                     result_text = (
-                        f"Tool result for {tool_call.name}:\n"
-                        f"{tool_result.output if not tool_result.error else 'ERROR: ' + tool_result.error}\n"
+                        "\n".join(result_parts) + "\n"
                         "Now either call another tool or return the patch JSON."
                     )
                     messages.append({"role": "assistant", "content": raw})

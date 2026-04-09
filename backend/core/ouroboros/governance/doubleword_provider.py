@@ -22,7 +22,7 @@ import time
 import dataclasses
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -689,22 +689,23 @@ class DoublewordProvider:
 
             return content
 
-        def _parse_tool_call_response(raw: str) -> Optional[Any]:
-            """Parse a tool call from the model's response.
+        def _parse_tool_call_response(raw: str) -> Optional[List[Any]]:
+            """Parse tool call(s) from the model's response.
 
-            Returns None if the response is a final answer (no tool call).
+            Supports both singular ``tool_call`` and plural ``tool_calls``
+            (parallel execution). Returns None if the response is a final
+            answer (no tool call).
             """
-            # Check for tool_call JSON pattern used by the tool loop
             import re
+            # Match either tool_call or tool_calls key
             match = re.search(
-                r'\{\s*"schema_version"\s*:\s*"2b\.2-tool".*?"tool_call"',
+                r'\{\s*"schema_version"\s*:\s*"2b\.2-tool".*?"tool_call',
                 raw, re.DOTALL,
             )
             if not match:
                 return None
-            # Extract the JSON object
+            # Extract the full JSON object
             try:
-                # Find the full JSON object
                 brace_count = 0
                 start = match.start()
                 for i in range(start, len(raw)):
@@ -714,12 +715,28 @@ class DoublewordProvider:
                         brace_count -= 1
                         if brace_count == 0:
                             tool_json = json.loads(raw[start:i + 1])
-                            tc = tool_json.get("tool_call", {})
                             from backend.core.ouroboros.governance.tool_executor import ToolCall
-                            return ToolCall(
-                                name=tc.get("name", ""),
-                                arguments=tc.get("arguments", {}),
-                            )
+
+                            def _parse_one(tc_dict: dict) -> Optional[Any]:
+                                name = tc_dict.get("name", "")
+                                if not name:
+                                    return None
+                                return ToolCall(
+                                    name=name,
+                                    arguments=tc_dict.get("arguments", {}),
+                                )
+
+                            # Parallel: tool_calls (plural)
+                            plural = tool_json.get("tool_calls")
+                            if isinstance(plural, list) and plural:
+                                valid = [_parse_one(item) for item in plural if isinstance(item, dict)]
+                                valid = [c for c in valid if c is not None]
+                                return valid if valid else None
+
+                            # Singular: tool_call
+                            tc = tool_json.get("tool_call", {})
+                            parsed = _parse_one(tc)
+                            return [parsed] if parsed is not None else None
             except (json.JSONDecodeError, KeyError):
                 pass
             return None
