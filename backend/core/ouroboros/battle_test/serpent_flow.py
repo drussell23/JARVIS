@@ -576,6 +576,9 @@ class SerpentFlow:
         if phase_upper == "PLAN":
             self._render_plan_phase(op_id, **kwargs)
             return
+        if phase_upper == "COMMIT":
+            self._render_commit_phase(op_id, **kwargs)
+            return
         phase_map = {
             "GATE": ("🛡️", "governance gate"),
             "APPROVE": ("👤", "awaiting approval"),
@@ -612,6 +615,21 @@ class SerpentFlow:
                 op_id,
                 f"[{_C['neural']}]🗺️  planning[/{_C['neural']}]  "
                 f"[{_C['dim']}]reasoning about implementation strategy...[/{_C['dim']}]",
+            )
+
+    def _render_commit_phase(self, op_id: str, **kwargs: Any) -> None:
+        """Render the auto-commit result with hash and push status."""
+        commit_hash = kwargs.get("commit_hash", "")
+        pushed = kwargs.get("commit_pushed", False)
+        branch = kwargs.get("commit_branch", "")
+        if commit_hash:
+            parts = f"[{_C['life']}]{commit_hash}[/{_C['life']}]"
+            if pushed and branch:
+                parts += f"  [{_C['dim']}]-> {branch}[/{_C['dim']}]"
+            self._op_line(
+                op_id,
+                f"[{_C['life']}]📝 committed[/{_C['life']}]  {parts}  "
+                f"[{_C['dim']}]O+V[/{_C['dim']}]",
             )
 
     # ── Triage ────────────────────────────────────────────────
@@ -1591,6 +1609,9 @@ class SerpentTransport:
                         progress_pct=payload.get("progress_pct", 0.0),
                         plan_complexity=payload.get("plan_complexity", ""),
                         plan_changes=payload.get("plan_changes", 0),
+                        commit_hash=payload.get("commit_hash", ""),
+                        commit_pushed=payload.get("commit_pushed", False),
+                        commit_branch=payload.get("commit_branch", ""),
                     )
 
             elif msg_type == "DECISION":

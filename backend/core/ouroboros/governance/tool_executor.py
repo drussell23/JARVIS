@@ -111,6 +111,7 @@ class PolicyContext:
     op_id:       str
     call_id:     str   # "{op_id}:r{round_index}:{tool_name}"
     round_index: int
+    risk_tier:   Optional[Any] = None  # Optional[RiskTier] — gated import to avoid circular
 
 @dataclass(frozen=True)
 class TestFailure:
@@ -351,6 +352,19 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
             "content": {"type": "string"},
         },
         capabilities=frozenset({"write"}),
+    ),
+    "ask_human": ToolManifest(
+        name="ask_human", version="1.0",
+        description=(
+            "Ask the human operator a clarifying question mid-operation. "
+            "Use when uncertain about intent, scope, or approach. "
+            "Only available for NOTIFY_APPLY (Yellow) or higher risk operations."
+        ),
+        arg_schema={
+            "question": {"type": "string", "description": "The question to ask the human"},
+            "options":  {"type": "array", "items": {"type": "string"}, "default": []},
+        },
+        capabilities=frozenset({"human_interaction"}),
     ),
 }
 
@@ -1093,6 +1107,29 @@ class GoverningToolPolicy:
                     detail=f"edit path {path_arg!r} escapes repo root",
                 )
 
+        # Rule 13: ask_human — requires NOTIFY_APPLY or APPROVAL_REQUIRED risk tier
+        # (Manifesto §5: deploy intelligence where it creates true leverage;
+        # Green ops shouldn't bother the human with questions)
+        elif name == "ask_human":
+            try:
+                from backend.core.ouroboros.governance.risk_engine import RiskTier
+                _tier = ctx.risk_tier
+                if _tier is None or _tier == RiskTier.SAFE_AUTO:
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason_code="tool.denied.ask_human_low_risk",
+                        detail="ask_human requires NOTIFY_APPLY+ risk tier; "
+                               "SAFE_AUTO ops should not interrupt the human",
+                    )
+                if _tier == RiskTier.BLOCKED:
+                    return PolicyResult(
+                        decision=PolicyDecision.DENY,
+                        reason_code="tool.denied.ask_human_blocked_op",
+                        detail="BLOCKED operations cannot interact with human",
+                    )
+            except ImportError:
+                pass
+
         return PolicyResult(decision=PolicyDecision.ALLOW, reason_code="")
 
 
@@ -1153,9 +1190,11 @@ class AsyncProcessToolBackend:
     """
 
     def __init__(self, semaphore: asyncio.Semaphore,
-                 _executor_instance: Optional["ToolExecutor"] = None) -> None:
+                 _executor_instance: Optional["ToolExecutor"] = None,
+                 approval_provider: Optional[Any] = None) -> None:
         self._semaphore = semaphore
         self._executor_instance = _executor_instance
+        self._approval_provider = approval_provider  # For ask_human tool
 
     def _get_executor(self, repo_root: Path) -> "ToolExecutor":
         return self._executor_instance or ToolExecutor(repo_root=repo_root)
@@ -1174,8 +1213,8 @@ class AsyncProcessToolBackend:
         async with self._semaphore:
             if call.name == "run_tests":
                 return await self._run_tests_async(call, policy_ctx, timeout, cap)
-            # Async-native tools (web search, code exploration)
-            if call.name in ("web_search", "web_fetch", "code_explore"):
+            # Async-native tools (web search, code exploration, ask_human)
+            if call.name in ("web_search", "web_fetch", "code_explore", "ask_human"):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
             return await self._run_sync_tool_async(call, policy_ctx.repo_root, timeout, cap)
 
@@ -1234,6 +1273,30 @@ class AsyncProcessToolBackend:
                 output = f"exit={result.exit_code}\n{result.stdout}"
                 if result.stderr:
                     output += f"\nstderr: {result.stderr}"
+
+            elif call.name == "ask_human":
+                if self._approval_provider is None:
+                    return ToolResult(
+                        tool_call=call, output="",
+                        error="No approval provider — cannot ask human",
+                        status=ToolExecStatus.EXEC_ERROR,
+                    )
+                question = call.arguments.get("question", "")
+                options_raw = call.arguments.get("options", [])
+                options = list(options_raw) if isinstance(options_raw, (list, tuple)) else []
+                answer = await asyncio.wait_for(
+                    self._approval_provider.elicit(
+                        request_id=policy_ctx.op_id,
+                        question=question,
+                        options=options or None,
+                        timeout_s=min(timeout, 300.0),
+                    ),
+                    timeout=timeout,
+                )
+                if answer is None:
+                    output = json.dumps({"status": "timeout", "answer": None})
+                else:
+                    output = json.dumps({"status": "answered", "answer": answer})
 
             return ToolResult(
                 tool_call=call, output=output[:cap],
@@ -1338,6 +1401,7 @@ class ToolLoopCoordinator:
         repo: str,
         op_id: str,
         deadline: float,
+        risk_tier: Optional[Any] = None,  # Optional[RiskTier] for ask_human gating
     ) -> Tuple[str, List[ToolExecutionRecord]]:
         """Multi-turn tool loop with parallel execution support.
 
@@ -1392,7 +1456,8 @@ class ToolLoopCoordinator:
                 tool_version = manifest.version if manifest else "unknown"
 
                 policy_ctx = PolicyContext(repo=repo, repo_root=repo_root,
-                    op_id=op_id, call_id=call_id, round_index=round_index)
+                    op_id=op_id, call_id=call_id, round_index=round_index,
+                    risk_tier=risk_tier)
                 policy_result = self._policy.evaluate(tc, policy_ctx)
 
                 if policy_result.decision == PolicyDecision.DENY:

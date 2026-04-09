@@ -665,6 +665,54 @@ Trivial single-file edits skip the overhead.
 
 ---
 
+## Mid-Operation Clarification: ask_human Tool (Gap #4)
+
+**Source**: `tool_executor.py` (`_L1_MANIFESTS["ask_human"]`)
+
+When the model is uncertain about intent, scope, or approach during the Venom
+tool loop, it can call the `ask_human` tool to ask the human operator for
+clarification. This prevents wrong-direction work on non-trivial changes.
+
+**Risk tier gating** (Manifesto §5):
+- `SAFE_AUTO` (Green): **DENIED** — low-risk ops should not interrupt the human
+- `NOTIFY_APPLY` (Yellow): **ALLOWED** — model can ask before auto-applying
+- `APPROVAL_REQUIRED` (Orange): **ALLOWED** — model can clarify before submission
+- `BLOCKED` (Red): **DENIED** — blocked ops cannot interact at all
+
+**Mechanism**: Calls `CLIApprovalProvider.elicit()` which sets a per-request
+`asyncio.Event` and waits for the REPL or MCP handler to deliver an answer.
+Timeout defaults to 300s (5 minutes). Returns `{"status": "answered", "answer": "..."}` or `{"status": "timeout", "answer": null}`.
+
+**Manifesto alignment**: §5 — Deploy intelligence where it creates leverage.
+Asking the human a 10-second question can save 5 minutes of wrong-direction work.
+
+---
+
+## L3 Worktree Isolation (Gap #5)
+
+**Source**: `governed_loop_service.py` (`l3_enabled`), `worktree_manager.py`
+
+Enabled by default (`JARVIS_GOVERNED_L3_ENABLED=true`). When execution graphs
+run parallel work units, each unit gets an isolated git worktree to prevent
+filesystem conflicts between concurrent operations.
+
+**Environment variables**:
+- `JARVIS_GOVERNED_L3_ENABLED` (default `true`): Master switch
+- `JARVIS_GOVERNED_L3_MAX_CONCURRENT_GRAPHS` (default `2`): Limits disk/resource usage
+- `JARVIS_GOVERNED_L3_STATE_DIR` (default `~/.jarvis/ouroboros/execution_graphs`): Graph state persistence
+
+**Safety guarantees**:
+- Worktree cleanup always runs in `finally` block (idempotent)
+- Fallback to shared repo if worktree creation fails
+- All git operations use `subprocess_exec` (no shell injection)
+- Branch names derived from deterministic unit_id + graph_id
+
+**Manifesto alignment**: §6 — The Iron Gate. Worktree isolation is a
+deterministic safety boundary that prevents concurrent agentic operations from
+interfering with each other.
+
+---
+
 ## Edge Case Hardening (12 Refinements)
 
 These refinements close failure modes discovered during the first battle tests.

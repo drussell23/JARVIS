@@ -2594,6 +2594,59 @@ class GovernedOrchestrator:
             await self._publish_outcome(ctx, OperationState.FAILED, "verify_regression")
             return ctx
 
+        # ---- Phase 8b: Auto-commit (Gap #6 — autonomy loop closer) ----
+        # After successful APPLY+VERIFY, commit with structured O+V signature.
+        # Commit failures are non-fatal — the change is already applied on disk.
+        try:
+            from backend.core.ouroboros.governance.auto_committer import AutoCommitter
+            _committer = AutoCommitter(repo_root=self._config.project_root)
+            _gen = ctx.generation
+            _provider = getattr(_gen, "provider_name", "") if _gen else ""
+            _cost = 0.0
+            if _gen:
+                _in_tok = getattr(_gen, "total_input_tokens", 0) or 0
+                _out_tok = getattr(_gen, "total_output_tokens", 0) or 0
+                _cost = (_in_tok * 0.0000001 + _out_tok * 0.0000004)  # rough estimate
+            _commit_result = await asyncio.wait_for(
+                _committer.commit(
+                    op_id=ctx.op_id,
+                    description=ctx.description,
+                    target_files=ctx.target_files,
+                    risk_tier=ctx.risk_tier,
+                    provider_name=_provider,
+                    generation_cost=_cost,
+                ),
+                timeout=30.0,
+            )
+            if _commit_result.committed:
+                try:
+                    await self._stack.comm.emit_heartbeat(
+                        op_id=ctx.op_id, phase="commit",
+                        progress_pct=98.0,
+                        commit_hash=_commit_result.commit_hash,
+                        commit_pushed=_commit_result.pushed,
+                        commit_branch=_commit_result.push_branch,
+                    )
+                except Exception:
+                    pass
+                logger.info(
+                    "[Orchestrator] Auto-committed %s for op=%s",
+                    _commit_result.commit_hash, ctx.op_id,
+                )
+            elif _commit_result.skipped_reason:
+                logger.debug(
+                    "[Orchestrator] Auto-commit skipped: %s",
+                    _commit_result.skipped_reason,
+                )
+        except ImportError:
+            logger.debug("[Orchestrator] AutoCommitter not available")
+        except Exception as exc:
+            logger.warning(
+                "[Orchestrator] Auto-commit failed for op=%s: %s; "
+                "change is applied but not committed",
+                ctx.op_id, exc,
+            )
+
         if _serpent: _serpent.update_phase("COMPLETE")
         ctx = ctx.advance(OperationPhase.COMPLETE, terminal_reason_code="complete")
 

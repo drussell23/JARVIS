@@ -574,7 +574,7 @@ class GovernedLoopConfig:
 
     # L2 self-repair settings (RepairBudget drives the repair loop)
     repair_budget: Any = field(default_factory=_lazy_repair_budget_from_env)
-    l3_enabled: bool = False
+    l3_enabled: bool = True  # Gap #5: worktree isolation enabled by default (Manifesto §6)
     max_concurrent_execution_graphs: int = 2
     execution_graph_state_dir: Path = field(
         default_factory=lambda: Path.home() / ".jarvis" / "ouroboros" / "execution_graphs"
@@ -649,7 +649,7 @@ class GovernedLoopConfig:
             tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
             max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),
             repair_budget=_lazy_repair_budget_from_env(),
-            l3_enabled=os.environ.get("JARVIS_GOVERNED_L3_ENABLED", "false").lower() == "true",
+            l3_enabled=os.environ.get("JARVIS_GOVERNED_L3_ENABLED", "true").lower() == "true",
             max_concurrent_execution_graphs=int(
                 os.environ.get("JARVIS_GOVERNED_L3_MAX_CONCURRENT_GRAPHS", "2")
             ),
@@ -2569,6 +2569,13 @@ class GovernedLoopService:
         self._approval_provider = CLIApprovalProvider(
             project_root=self._config.project_root,
         )
+
+        # Wire approval_provider into the tool backend for ask_human tool (Gap #4).
+        # The backend was created earlier without it; we inject it now.
+        if _tool_coordinator is not None:
+            _be = getattr(_tool_coordinator, "_backend", None)
+            if _be is not None and hasattr(_be, "_approval_provider"):
+                _be._approval_provider = self._approval_provider
 
         # Build ValidationRunner (LanguageRouter with Python + C++ adapters)
         from backend.core.ouroboros.governance.test_runner import (

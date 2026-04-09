@@ -2057,6 +2057,7 @@ class PrimeProvider:
                 repo=getattr(context, "primary_repo", "jarvis"),
                 op_id=getattr(context, "op_id", ""),
                 deadline=deadline_mono,
+                risk_tier=getattr(context, "risk_tier", None),
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
@@ -2527,6 +2528,7 @@ class ClaudeProvider:
                 repo=getattr(context, "primary_repo", "jarvis"),
                 op_id=getattr(context, "op_id", ""),
                 deadline=deadline_mono,
+                risk_tier=getattr(context, "risk_tier", None),
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)

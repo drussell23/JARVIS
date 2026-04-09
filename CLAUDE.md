@@ -66,7 +66,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **CommProtocol** (`comm_protocol.py`): 5-phase observability -- INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM
 - **SerpentFlow** (`battle_test/serpent_flow.py`, 1900+ lines): CC-style flowing CLI with `Update(path)` blocks, numbered diffs, per-op reasoning
 - **LiveDashboard** (`battle_test/live_dashboard.py`, 1233 lines): Persistent Rich TUI with 3-channel terminal muting
-- **Venom** (`tool_executor.py`): Multi-turn agentic tool loop -- 15 tools (read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame). All enabled by default under governance.
+- **Venom** (`tool_executor.py`): Multi-turn agentic tool loop -- 16 tools (read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame, ask_human). All enabled by default under governance.
 - **L2 Repair** (`repair_engine.py`): Iterative self-repair FSM (5 iterations, 120s timebox)
 - **ConsciousnessBridge** (`consciousness_bridge.py`): Injects memory/prediction into pipeline
 - **StrategicDirection** (`strategic_direction.py`): Manifesto principles injected into every generation prompt
@@ -88,6 +88,8 @@ O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capab
 - **Diff preview for Yellow**: `JARVIS_NOTIFY_APPLY_DELAY_S` (default 5s) delay with diff rendered before auto-apply.
 - **Per-op reasoning**: Model rationale captured at GENERATE, displayed in SerpentFlow `Update` blocks.
 - **Model-reasoned planning**: PLAN phase between CONTEXT_EXPANSION and GENERATE. Model reasons about implementation strategy (schema plan.1) before writing code. Trivial ops skip planning.
+- **Mid-operation clarification**: `ask_human` tool in Venom lets the model ask the human for clarification. Gated to NOTIFY_APPLY+ risk tiers (Green ops don't interrupt).
+- **L3 worktree isolation**: Enabled by default (`JARVIS_GOVERNED_L3_ENABLED=true`). Parallel execution graphs use isolated git worktrees to prevent filesystem conflicts.
 
 ## Battle Test
 

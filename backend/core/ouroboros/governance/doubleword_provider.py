@@ -766,6 +766,7 @@ class DoublewordProvider:
                 repo=getattr(context, "primary_repo", "jarvis"),
                 op_id=getattr(context, "operation_id", f"dw-rt-{int(time.time())}"),
                 deadline=deadline_mono,
+                risk_tier=getattr(context, "risk_tier", None),
             )
             tool_records = tuple(tool_records_list)
         else:
