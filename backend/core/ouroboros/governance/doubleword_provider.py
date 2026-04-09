@@ -297,7 +297,16 @@ class DoublewordProvider:
             "body": {
                 "model": self._model,
                 "messages": [
-                    {"role": "system", "content": "You are a code generation assistant. You MUST respond with ONLY a valid JSON object. No explanations, no markdown, no natural language — ONLY the JSON object matching the schema described in the user prompt. Start your response with { and end with }."},
+                    {"role": "system", "content": (
+                        "You are a code generation assistant. RESPOND WITH ONLY A SINGLE VALID JSON OBJECT. "
+                        "RULES: "
+                        "1. Start your response with { and end with }. "
+                        "2. No text before or after the JSON. No markdown fences. No explanations. "
+                        "3. All string values must use double quotes. Escape special characters: use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
+                        "4. No trailing commas before } or ]. "
+                        "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
+                        "6. NEVER return unified diffs, patches, or partial file content."
+                    )},
                     {"role": "user", "content": prompt},
                 ],
                 "max_tokens": self._max_tokens,
@@ -613,9 +622,15 @@ class DoublewordProvider:
 
         _SYSTEM_PROMPT = (
             "You are a code generation assistant for the JARVIS Trinity AI Ecosystem. "
-            "You MUST respond with ONLY a valid JSON object matching the schema described "
-            "in the user prompt. No explanations, no markdown — ONLY the JSON object. "
-            "Start your response with { and end with }."
+            "RESPOND WITH ONLY A SINGLE VALID JSON OBJECT. "
+            "RULES: "
+            "1. Start your response with { and end with }. "
+            "2. No text before or after the JSON. No markdown fences. No explanations. "
+            "3. All string values must use double quotes. Escape special characters: "
+            "use \\n for newlines, \\t for tabs, \\\\ for backslashes. "
+            "4. No trailing commas before } or ]. "
+            "5. Use schema_version '2b.1' with full_content containing the COMPLETE file. "
+            "6. NEVER return unified diffs, patches, or partial file content."
         )
 
         # Mutable container to capture token usage from _generate_raw

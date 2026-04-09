@@ -55,13 +55,12 @@ _CODEGEN_SYSTEM_PROMPT = (
     "respond with schema_version 2d.1 and a top-level execution_graph object. "
     "You MUST respond with valid JSON only. "
     "No markdown preamble, no explanations outside the JSON. Only the JSON object. "
-    # Diff-anchoring mandate — critical for small models that default to trained memory
-    "DIFF ANCHORING RULES: When generating unified_diff output, context lines MUST be "
-    "verbatim copies of lines from the ## Source Snapshot provided in the prompt. "
-    "Do NOT reconstruct context lines from your training data or memory of what the "
-    "file 'should' contain. Copy them exactly from the provided source. "
+    # Full-content mandate — models cannot reliably produce verbatim diff context lines
+    "OUTPUT FORMAT: Always use schema_version '2b.1' with 'full_content' containing the "
+    "COMPLETE modified file. NEVER return unified diffs, patches, or partial file content. "
+    "The full_content field must contain every line of the file, not just changed sections. "
     "If the requested change is already present in the source file, return "
-    '{"schema_version": "2b.1-noop", "reason": "<why already done>"} instead of a diff. '
+    '{"schema_version": "2b.1-noop", "reason": "<why already done>"} instead. '
     # Anti-duplication mandate — prevents blind re-implementation of existing logic
     "ANTI-DUPLICATION RULES: Before generating code, review the entire source snapshot "
     "and the structural index (if provided). Do NOT generate functions, methods, or logic "
@@ -1186,11 +1185,10 @@ def _build_codegen_prompt(
     # ── 3. Output schema instruction ────────────────────────────────────
     # force_full_content disables the diff schema — smaller models (≤13B) can't
     # generate verbatim context lines; they hallucinate from training data.
-    _single_file_task = (
-        len(ctx.target_files) == 1
-        and not getattr(ctx, "cross_repo", False)
-        and not force_full_content
-    )
+    # Diff schema (2b.1-diff) disabled — models cannot reliably produce
+    # verbatim context lines, causing diff_apply_failed on most operations.
+    # Always use full_content (2b.1) for single-file tasks.
+    _single_file_task = False
     if (
         getattr(ctx, "cross_repo", False)
         and repo_roots
@@ -1701,6 +1699,39 @@ def _repair_json(text: str) -> str:
     # 2. Replace control chars inside strings (except \n \t \r which are valid)
     repaired = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", repaired)
 
+    # 2b. Escape literal newlines inside JSON string values.
+    # DW 397B sometimes outputs actual newline bytes inside strings
+    # instead of the \\n escape sequence.  Walk the text with a state
+    # machine that tracks whether we're inside a JSON string, and
+    # replace raw newlines inside strings with \\n.
+    _nl_repaired_chars: list = []
+    _in_str = False
+    _esc = False
+    for _ch in repaired:
+        if _esc:
+            _nl_repaired_chars.append(_ch)
+            _esc = False
+            continue
+        if _ch == "\\":
+            _nl_repaired_chars.append(_ch)
+            _esc = True
+            continue
+        if _ch == '"':
+            _in_str = not _in_str
+            _nl_repaired_chars.append(_ch)
+            continue
+        if _in_str and _ch == "\n":
+            _nl_repaired_chars.append("\\n")
+            continue
+        _nl_repaired_chars.append(_ch)
+    _nl_repaired = "".join(_nl_repaired_chars)
+    if _nl_repaired != repaired:
+        try:
+            _json.loads(_nl_repaired)
+            return _nl_repaired
+        except (ValueError, _json.JSONDecodeError):
+            repaired = _nl_repaired  # keep the improvement for further repairs
+
     # 3. Try parse — most DW failures are trailing commas
     try:
         _json.loads(repaired)
@@ -2103,7 +2134,13 @@ def _parse_generation_response(
         return _parse_execution_graph_response(data, provider_name, duration_s, ctx)
 
     # Task 4: reconstruct full_content from unified diff before normal validation
+    # NOTE: With full_content forced in all providers, this path should rarely fire.
+    # When it does, it means the model ignored the full_content instruction.
     if actual_version == _SCHEMA_VERSION_DIFF:
+        logger.warning(
+            "[%s] Model returned 2b.1-diff schema despite full_content instruction. "
+            "Attempting diff→full_content reconstruction as fallback.", pfx,
+        )
         # Resolve source path: repo_root takes precedence over cwd (Disease 7 fix)
         orig_content = ""
         if source_path:
@@ -2192,7 +2229,9 @@ def _parse_generation_response(
                 "rationale": cand.get("rationale", ""),
             })
         if not rewritten:
-            raise RuntimeError(f"{pfx}_schema_invalid:diff_apply_failed_all_candidates")
+            # content_failure (not schema_invalid) so the cascade correctly
+            # classifies this as a soft failure — no FSM penalty, clean fallback.
+            raise RuntimeError(f"{pfx}_content_failure:diff_apply_failed_all_candidates")
         # Overwrite data so the rest of the function validates normally as 2b.1
         data = {
             "schema_version": _SCHEMA_VERSION,
@@ -2481,7 +2520,7 @@ class PrimeProvider:
                 context,
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
-                force_full_content=_force_full,
+                force_full_content=True,
                 mcp_tools=_mcp_tools,
             )
             logger.info(
@@ -2494,7 +2533,7 @@ class PrimeProvider:
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
-                force_full_content=_force_full,
+                force_full_content=True,
                 repair_context=repair_context,
                 mcp_tools=_mcp_tools,
             )
@@ -2860,6 +2899,7 @@ class ClaudeProvider:
                 context,
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
+                force_full_content=True,
                 mcp_tools=_mcp_tools,
             )
             logger.info(
@@ -2872,6 +2912,7 @@ class ClaudeProvider:
                 repo_root=repo_root,
                 repo_roots=self._repo_roots,
                 tools_enabled=self._tools_enabled,
+                force_full_content=True,
                 repair_context=repair_context,
                 mcp_tools=_mcp_tools,
             )

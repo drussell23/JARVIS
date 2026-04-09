@@ -1448,9 +1448,46 @@ class GovernedOrchestrator:
                 # Retry: advance to GENERATE_RETRY with episodic memory context
                 _retry_ctx_kwargs = {}
 
-                # Inject re-plan if available
+                # Inject direct error feedback so the model knows what went wrong
+                _err_str = str(exc)
+                _error_feedback = (
+                    "## PREVIOUS GENERATION FAILED\n\n"
+                    f"Error: {_err_str[:300]}\n\n"
+                    "INSTRUCTIONS FOR RETRY:\n"
+                    "- Return schema_version '2b.1' with 'full_content' containing the COMPLETE file\n"
+                    "- Do NOT return unified diffs or patches\n"
+                    "- Ensure the JSON is valid (no trailing commas, no unquoted keys)\n"
+                    "- full_content must be the entire file, not a summary or placeholder\n"
+                )
+                _retry_ctx_kwargs["strategic_memory_prompt"] = _error_feedback
+
+                # Record generation failure in episodic memory for downstream use
+                if _episodic_memory is not None:
+                    _gen_failure_class = "content"
+                    if "json_parse_error" in _err_str:
+                        _gen_failure_class = "json_parse"
+                    elif "diff_apply_failed" in _err_str:
+                        _gen_failure_class = "diff_apply"
+                    elif "schema_invalid" in _err_str:
+                        _gen_failure_class = "schema"
+                    try:
+                        _episodic_memory.record(
+                            file_path=list(ctx.target_files)[0] if ctx.target_files else "unknown",
+                            attempt=attempt + 1,
+                            failure_class=_gen_failure_class,
+                            error_summary=_err_str[:500],
+                            specific_errors=[_err_str[:200]],
+                            line_numbers=[],
+                        )
+                    except Exception:
+                        pass
+
+                # Inject re-plan if available (appends to error feedback)
                 if _replan_text:
-                    _retry_ctx_kwargs["strategic_memory_prompt"] = _replan_text
+                    _existing = _retry_ctx_kwargs.get("strategic_memory_prompt", "")
+                    _retry_ctx_kwargs["strategic_memory_prompt"] = (
+                        f"{_existing}\n\n{_replan_text}" if _existing else _replan_text
+                    )
 
                 if _episodic_memory is not None and _episodic_memory.has_failures():
                     _failure_context = _episodic_memory.format_for_prompt()
