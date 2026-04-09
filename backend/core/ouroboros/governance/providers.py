@@ -2210,6 +2210,17 @@ class ClaudeProvider:
         self._tools_enabled = tools_enabled or (tool_loop is not None)
         self._tool_loop = tool_loop
 
+        # Extended thinking: enables deep chain-of-thought reasoning before
+        # code generation.  Manifesto §6: "deploy intelligence where it creates
+        # true leverage" — the model thinks before it writes.
+        self._extended_thinking = (
+            os.environ.get("JARVIS_EXTENDED_THINKING_ENABLED", "true").lower()
+            not in ("false", "0", "no", "off")
+        )
+        self._thinking_budget = int(
+            os.environ.get("JARVIS_THINKING_BUDGET", "10000")
+        )
+
     @property
     def provider_name(self) -> str:
         return "claude-api"
@@ -2330,8 +2341,29 @@ class ClaudeProvider:
             # Smart max_tokens: during Venom tool rounds, the model only needs
             # ~200-1024 tokens (tool call JSON). Full 8192 only for final patch.
             _effective_max_tokens = min(self._max_tokens, 8192)
-            if self._tool_loop is not None and getattr(self._tool_loop, "is_tool_round", False):
+            _is_tool_round = (
+                self._tool_loop is not None
+                and getattr(self._tool_loop, "is_tool_round", False)
+            )
+            if _is_tool_round:
                 _effective_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
+
+            # Extended thinking: enable deep reasoning for non-tool-round calls.
+            # Tool rounds are fast JSON responses — no thinking needed.
+            # Anthropic requires temperature=1.0 when thinking is enabled.
+            _use_thinking = self._extended_thinking and not _is_tool_round
+            _temperature = 1.0 if _use_thinking else 0.2
+            _thinking_param: Optional[Dict[str, Any]] = None
+            if _use_thinking:
+                _thinking_param = {
+                    "type": "enabled",
+                    "budget_tokens": self._thinking_budget,
+                }
+                # max_tokens must accommodate thinking budget + output
+                _effective_max_tokens = max(
+                    _effective_max_tokens,
+                    self._thinking_budget + 4096,
+                )
 
             # Prompt caching: mark the system prompt as cacheable.
             # Anthropic caches identical system prompts across calls —
@@ -2361,13 +2393,16 @@ class ClaudeProvider:
 
                 async def _do_stream() -> None:
                     nonlocal raw_content, input_tokens, output_tokens, _cached_input
-                    async with client.messages.stream(
-                        model=self._model,
-                        max_tokens=_effective_max_tokens,
-                        temperature=0.2,
-                        system=_system_with_cache,
-                        messages=[{"role": "user", "content": user_content}],
-                    ) as stream:
+                    _stream_kwargs: Dict[str, Any] = {
+                        "model": self._model,
+                        "max_tokens": _effective_max_tokens,
+                        "temperature": _temperature,
+                        "system": _system_with_cache,
+                        "messages": [{"role": "user", "content": user_content}],
+                    }
+                    if _thinking_param is not None:
+                        _stream_kwargs["thinking"] = _thinking_param
+                    async with client.messages.stream(**_stream_kwargs) as stream:
                         async for text in stream.text_stream:
                             raw_content += text
                             try:
@@ -2389,18 +2424,28 @@ class ClaudeProvider:
                 await asyncio.wait_for(_do_stream(), timeout=timeout_s)
             else:
                 # Non-streaming fallback
+                _create_kwargs: Dict[str, Any] = {
+                    "model": self._model,
+                    "max_tokens": _effective_max_tokens,
+                    "temperature": _temperature,
+                    "system": _system_with_cache,
+                    "messages": [{"role": "user", "content": user_content}],
+                }
+                if _thinking_param is not None:
+                    _create_kwargs["thinking"] = _thinking_param
                 msg = await asyncio.wait_for(
-                    client.messages.create(
-                        model=self._model,
-                        max_tokens=_effective_max_tokens,
-                        temperature=0.2,
-                        system=_system_with_cache,
-                        messages=[{"role": "user", "content": user_content}],
-                    ),
+                    client.messages.create(**_create_kwargs),
                     timeout=timeout_s,
                 )
                 _last_msg[0] = msg
-                raw_content = msg.content[0].text if msg.content else ""
+                # Extract text content only (skip thinking blocks)
+                raw_content = ""
+                for _block in (msg.content or []):
+                    if getattr(_block, "type", None) == "text":
+                        raw_content += getattr(_block, "text", "")
+                if not raw_content and msg.content:
+                    # Fallback: first block's text (for models without thinking)
+                    raw_content = getattr(msg.content[0], "text", "")
                 input_tokens = getattr(msg.usage, "input_tokens", 0)
                 output_tokens = getattr(msg.usage, "output_tokens", 0)
                 try:
@@ -2417,6 +2462,17 @@ class ClaudeProvider:
                     _cached_input,
                     (_cached_input / 1_000_000) * (_CLAUDE_INPUT_COST_PER_M - 0.30),
                 )
+            if _use_thinking and _last_msg[0] is not None:
+                _thinking_tokens = 0
+                for _blk in getattr(_last_msg[0], "content", []):
+                    if getattr(_blk, "type", None) == "thinking":
+                        _thinking_tokens += len(getattr(_blk, "thinking", "")) // 4  # rough estimate
+                if _thinking_tokens > 0:
+                    logger.info(
+                        "[ClaudeProvider] \U0001f9e0 Extended thinking: ~%d thinking tokens "
+                        "(budget: %d) — deep reasoning before generation",
+                        _thinking_tokens, self._thinking_budget,
+                    )
             cost = self._estimate_cost(input_tokens, output_tokens, _cached_input)
             self._record_cost(cost)
             total_cost += cost

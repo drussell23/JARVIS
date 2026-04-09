@@ -565,8 +565,9 @@ class GovernedLoopConfig:
     oracle_enabled: bool = True
     oracle_incremental_poll_interval_s: float = 300.0
 
-    # L1 tool-use settings
-    tool_use_enabled: bool = False
+    # L1 tool-use settings (Manifesto §6: tools enabled by default under
+    # governance — Iron Gate + risk engine + approval gates are the safety net)
+    tool_use_enabled: bool = True
     max_tool_rounds: int = 5
     tool_timeout_s: float = 30.0
     max_concurrent_tools: int = 2
@@ -643,7 +644,7 @@ class GovernedLoopConfig:
             pipeline_timeout_s=float(
                 _cfg("pipeline_timeout_s", "JARVIS_PIPELINE_TIMEOUT_S", "600.0")
             ),
-            tool_use_enabled=os.environ.get("JARVIS_GOVERNED_TOOL_USE_ENABLED", "false").lower() == "true",
+            tool_use_enabled=os.environ.get("JARVIS_GOVERNED_TOOL_USE_ENABLED", "true").lower() == "true",
             max_tool_rounds=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_ROUNDS", "5")),
             tool_timeout_s=float(os.environ.get("JARVIS_GOVERNED_TOOL_TIMEOUT_S", "30")),
             max_concurrent_tools=int(os.environ.get("JARVIS_GOVERNED_TOOL_MAX_CONCURRENT", "2")),

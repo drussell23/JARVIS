@@ -577,6 +577,54 @@ WAL replay) use the composite score.
 
 ---
 
+## Cognitive Depth: Extended Thinking
+
+**Source**: `providers.py` (`ClaudeProvider._extended_thinking`)
+
+When Claude is the generation provider, the Anthropic extended thinking API is
+enabled by default (`JARVIS_EXTENDED_THINKING_ENABLED=true`).  This gives the
+model a configurable thinking budget (`JARVIS_THINKING_BUDGET`, default 10000
+tokens) to reason deeply before producing code.
+
+**Manifesto alignment**: §6 — "deploy intelligence where it creates true
+leverage."  Extended thinking is intelligence at the reasoning boundary.  The
+model thinks through edge cases, considers alternatives, and plans changes
+before writing them.  This is the difference between a junior developer who
+writes the first thing that comes to mind and a senior developer who considers
+the implications.
+
+**Implementation details**:
+- Thinking is enabled for generation calls only (not tool rounds or planning)
+- `temperature=1.0` is required by Anthropic when thinking is enabled
+- Tool rounds use `temperature=0.2` and no thinking (fast JSON responses)
+- Response parsing extracts only `text` blocks, skipping `thinking` blocks
+- Token usage tracking includes thinking tokens in the budget
+
+## Tool Defaults: Unshackled Under Governance
+
+All 15 Venom tools are **enabled by default**.  The safety perimeter is the
+governance stack (Iron Gate, risk engine, approval gates), not env-var opt-in:
+
+| Tool | Gate | Default |
+|------|------|---------|
+| `read_file`, `search_code`, `get_callers`, `glob_files`, `list_dir`, `list_symbols` | Always allowed | ON |
+| `git_log`, `git_diff`, `git_blame` | Read-only | ON |
+| `edit_file`, `write_file` | `JARVIS_TOOL_EDIT_ALLOWED` | **ON** |
+| `bash` | `JARVIS_TOOL_BASH_ALLOWED` + Iron Gate blocklist | **ON** |
+| `run_tests` | `JARVIS_TOOL_RUN_TESTS_ALLOWED` | **ON** |
+| `web_fetch`, `web_search` | `JARVIS_WEB_TOOL_ENABLED` + domain allowlist | **ON** |
+| `code_explore` | Sandbox subprocess | ON |
+
+The Venom tool loop master switch (`JARVIS_GOVERNED_TOOL_USE_ENABLED`) also
+defaults to `true`.  To disable all tools, set it to `false`.
+
+**Manifesto alignment**: §1 — "Deterministic code is the skeleton; agentic
+intelligence is the nervous system."  The Iron Gate (AST parser, command
+blocklist) is the deterministic skeleton.  The tools are the nervous system.
+The skeleton does not think; the nervous system does not hold weight.
+
+---
+
 ## Edge Case Hardening (12 Refinements)
 
 These refinements close failure modes discovered during the first battle tests.

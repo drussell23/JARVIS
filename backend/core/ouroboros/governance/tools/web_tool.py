@@ -16,7 +16,7 @@ Safety:
   - No POST/PUT/DELETE -- read-only access
 
 Environment:
-  JARVIS_WEB_TOOL_ENABLED       -- "true" to enable (default: "false")
+  JARVIS_WEB_TOOL_ENABLED       -- "true" to enable (default: "true")
   JARVIS_WEB_TOOL_TIMEOUT       -- default timeout in seconds (default: 15)
   JARVIS_WEB_TOOL_MAX_SIZE      -- max response bytes (default: 512000)
   JARVIS_WEB_TOOL_UNRESTRICTED  -- "true" to skip domain allowlist (default: "false")
@@ -76,7 +76,7 @@ class WebToolConfig:
     @classmethod
     def from_env(cls) -> WebToolConfig:
         """Build config from environment variables."""
-        enabled = os.getenv("JARVIS_WEB_TOOL_ENABLED", "false").lower() in ("true", "1", "yes")
+        enabled = os.getenv("JARVIS_WEB_TOOL_ENABLED", "true").lower() in ("true", "1", "yes")
         return cls(
             enabled=enabled,
             timeout_s=float(os.getenv("JARVIS_WEB_TOOL_TIMEOUT", "15")),

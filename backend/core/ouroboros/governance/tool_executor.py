@@ -961,7 +961,7 @@ class GoverningToolPolicy:
                 allowed = self._run_tests_allowed_override
             else:
                 allowed = (
-                    os.environ.get("JARVIS_TOOL_RUN_TESTS_ALLOWED", "false").lower()
+                    os.environ.get("JARVIS_TOOL_RUN_TESTS_ALLOWED", "true").lower()
                     == "true"
                 )
             if not allowed:
@@ -1060,10 +1060,11 @@ class GoverningToolPolicy:
                     detail=f"git_log path {path_arg!r} escapes repo root",
                 )
 
-        # Rule 11: bash — requires JARVIS_TOOL_BASH_ALLOWED env opt-in (Manifesto §6)
+        # Rule 11: bash — enabled by default under governance (Manifesto §6: Iron Gate
+        # blocks destructive commands; risk engine gates operations by severity)
         elif name == "bash":
             allowed = (
-                os.environ.get("JARVIS_TOOL_BASH_ALLOWED", "false").lower() == "true"
+                os.environ.get("JARVIS_TOOL_BASH_ALLOWED", "true").lower() == "true"
             )
             if not allowed:
                 return PolicyResult(
@@ -1072,10 +1073,11 @@ class GoverningToolPolicy:
                     detail="JARVIS_TOOL_BASH_ALLOWED is not 'true'",
                 )
 
-        # Rule 12: edit_file / write_file — requires JARVIS_TOOL_EDIT_ALLOWED env opt-in
+        # Rule 12: edit_file / write_file — enabled by default under governance
+        # (Manifesto §6: risk engine + approval gates protect against bad writes)
         elif name in ("edit_file", "write_file"):
             allowed = (
-                os.environ.get("JARVIS_TOOL_EDIT_ALLOWED", "false").lower() == "true"
+                os.environ.get("JARVIS_TOOL_EDIT_ALLOWED", "true").lower() == "true"
             )
             if not allowed:
                 return PolicyResult(

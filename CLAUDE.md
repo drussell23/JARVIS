@@ -42,7 +42,7 @@ CLASSIFY -> ROUTE -> CONTEXT_EXPANSION -> GENERATE -> VALIDATE -> GATE -> APPROV
 | Tier | Provider | Cost | Notes |
 |------|----------|------|-------|
 | 0 | DoubleWord 397B (batch + real-time) | $0.10/$0.40/M | 16384 max_tokens, 5s poll interval, preferred |
-| 1 | Claude (Anthropic API) | $3/$15/M | Prompt caching enabled, 60s fallback cap |
+| 1 | Claude (Anthropic API) | $3/$15/M | Extended thinking + prompt caching, 60s fallback cap |
 | 2 | J-Prime (GCP self-hosted) | VM cost only | When available |
 
 ### Timeout Enforcement
@@ -65,7 +65,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **CommProtocol** (`comm_protocol.py`): 5-phase observability -- INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM
 - **SerpentFlow** (`battle_test/serpent_flow.py`, 1900+ lines): CC-style flowing CLI with `Update(path)` blocks, numbered diffs, per-op reasoning
 - **LiveDashboard** (`battle_test/live_dashboard.py`, 1233 lines): Persistent Rich TUI with 3-channel terminal muting
-- **Venom** (`tool_executor.py`): Multi-turn agentic tool loop (read_file, search_code, run_tests, get_callers)
+- **Venom** (`tool_executor.py`): Multi-turn agentic tool loop -- 15 tools (read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame). All enabled by default under governance.
 - **L2 Repair** (`repair_engine.py`): Iterative self-repair FSM (5 iterations, 120s timebox)
 - **ConsciousnessBridge** (`consciousness_bridge.py`): Injects memory/prediction into pipeline
 - **StrategicDirection** (`strategic_direction.py`): Manifesto principles injected into every generation prompt
