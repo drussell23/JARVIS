@@ -505,6 +505,77 @@ class GovernanceMCPClient:
                 return False
         return bool(server.url)
 
+    async def discover_tools(self) -> List[Dict[str, Any]]:
+        """Discover tools from all connected MCP servers.
+
+        Returns a list of tool descriptors, each with:
+          - ``name``: qualified tool name (``server_name:tool_name``)
+          - ``server``: MCP server name
+          - ``description``: tool description from the MCP server
+          - ``input_schema``: JSON Schema for the tool's arguments
+
+        Called during prompt construction so the model knows which
+        external tools are available. Fire-and-forget on failure.
+        """
+        tools: List[Dict[str, Any]] = []
+        if not self.is_enabled:
+            return tools
+        for name, conn in self._connections.items():
+            if not conn.connected:
+                continue
+            try:
+                result = await asyncio.wait_for(
+                    conn.list_tools(timeout=_MCP_REQUEST_TIMEOUT),
+                    timeout=_MCP_REQUEST_TIMEOUT + 2.0,
+                )
+                if result is None:
+                    continue
+                raw_tools = result.get("tools", [])
+                for tool in raw_tools:
+                    tool_name = tool.get("name", "")
+                    if not tool_name:
+                        continue
+                    tools.append({
+                        "name": f"mcp_{name}_{tool_name}",
+                        "server": name,
+                        "original_name": tool_name,
+                        "description": tool.get("description", ""),
+                        "input_schema": tool.get("inputSchema", {}),
+                    })
+                logger.debug(
+                    "[MCPClient] Discovered %d tools from %s", len(raw_tools), name,
+                )
+            except Exception as exc:
+                logger.debug("[MCPClient] Tool discovery failed for %s: %s", name, exc)
+        return tools
+
+    async def call_tool(
+        self,
+        qualified_name: str,
+        arguments: Dict[str, Any],
+        *,
+        timeout: Optional[float] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Call an MCP tool by its qualified name (``server_name:tool_name``).
+
+        The qualified name format is ``mcp_{server}_{tool}``. This method
+        strips the prefix and routes to the correct server connection.
+        """
+        # Parse qualified name: mcp_{server}_{tool}
+        prefix = "mcp_"
+        if not qualified_name.startswith(prefix):
+            return None
+        remainder = qualified_name[len(prefix):]
+        # Find the server name that matches
+        for server_name, conn in self._connections.items():
+            if remainder.startswith(server_name + "_"):
+                tool_name = remainder[len(server_name) + 1:]
+                if conn.connected:
+                    return await conn.call_tool(
+                        tool_name, arguments, timeout=timeout,
+                    )
+        return None
+
     async def on_postmortem(self, ctx: Any) -> None:
         """React to pipeline failures with external actions.
 

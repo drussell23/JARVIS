@@ -779,6 +779,136 @@ Commit results appear in the flowing CLI output:
 
 ---
 
+## MCP Tool Forwarding (Gap #7)
+
+**Source**: `mcp_tool_client.py` (`GovernanceMCPClient.discover_tools`), `providers.py` (`_build_tool_section`), `tool_executor.py` (MCP dispatch)
+
+External MCP tools from connected servers are discovered at prompt construction
+time and injected into the generation prompt alongside the 16 built-in Venom
+tools. The model can call any MCP tool using the `mcp_{server}_{tool}` naming
+convention.
+
+### Architecture
+
+```
+GovernanceMCPClient.discover_tools()
+    ↓  (tools/list JSON-RPC to each connected server)
+List[{name, description, input_schema}]
+    ↓  (injected into _build_tool_section)
+Generation prompt: "**External MCP tools (connected servers):**"
+    ↓  (model calls mcp_github_create_issue)
+ToolLoopCoordinator → GoverningToolPolicy (Rule 0b: auto-allow)
+    ↓
+AsyncProcessToolBackend._run_mcp_tool()
+    ↓  (tools/call JSON-RPC to server)
+GovernanceMCPClient.call_tool(qualified_name, arguments)
+```
+
+### Policy
+
+MCP tools bypass the standard manifest check (Rule 0) and are auto-allowed
+(Rule 0b: `tool.allowed.mcp_external`). External servers handle their own
+authentication and authorization.
+
+### Configuration
+
+- `JARVIS_MCP_CONFIG`: YAML path for MCP server connections
+- Each server can be `stdio` (subprocess) or `sse` (remote)
+
+### Manifesto Alignment
+
+- **§5 — Intelligence-Driven Routing**: MCP tools are discovered dynamically,
+  not hardcoded. The model chooses which tools to call based on context.
+- **§6 — The Iron Gate**: MCP subprocess transport uses
+  `create_subprocess_exec` (no shell injection). JSON-RPC 2.0 protocol.
+
+---
+
+## Live Context Auto-Compaction (Gap #8)
+
+**Source**: `tool_executor.py` (`ToolLoopCoordinator._compact_prompt`), `context_compaction.py` (`ContextCompactor`)
+
+During long tool loop runs, the accumulated prompt grows as tool results are
+appended. When the prompt exceeds 75% of the maximum budget (default 98,304
+chars), older tool results are compacted into a deterministic summary.
+
+### Algorithm
+
+1. Split accumulated prompt at `[TOOL RESULT]` / `[TOOL ERROR]` boundaries
+2. Preserve the most recent 6 tool result chunks (configurable via
+   `JARVIS_COMPACT_PRESERVE_TOOL_CHUNKS`)
+3. Summarize older chunks: count tool calls by name, total chars removed
+4. Replace older chunks with summary block:
+   ```
+   [CONTEXT COMPACTED]
+   Compacted 12 earlier tool results (45,230 chars): 5 read_file, 4 search_code, 3 bash.
+   Recent results preserved below.
+   [END CONTEXT COMPACTED]
+   ```
+
+### Properties
+
+- **No model inference**: Pure deterministic counting and string manipulation
+- **Preserves recent context**: Model always sees its most recent tool results
+- **Graceful degradation**: Only triggers when needed (75% threshold). If still
+  over budget after compaction, the hard `_MAX_PROMPT_CHARS` limit applies.
+
+### Environment Variables
+
+- `JARVIS_TOOL_LOOP_COMPACT_THRESHOLD`: Trigger threshold in chars (default: 75% of max)
+- `JARVIS_COMPACT_PRESERVE_TOOL_CHUNKS`: Number of recent chunks to preserve (default: 6)
+
+### Manifesto Alignment
+
+- **§3 — Disciplined Concurrency**: Context compaction prevents runaway memory
+  growth in long tool loops without blocking the event loop.
+
+---
+
+## DW 3-Tier Event-Driven Architecture
+
+**Source**: `doubleword_provider.py`, `batch_future_registry.py`, `event_channel.py`, `governed_loop_service.py`
+
+The DoubleWord provider implements a 3-tier architecture that eliminates
+polling for the primary path (Manifesto §3: Zero polling. Pure reflex.).
+
+### Tier 0: Real-Time SSE (Primary)
+
+Default path. Uses `/v1/chat/completions` with SSE streaming and Venom tool
+loop. Zero polling. Token-by-token streaming. Falls back to batch on 429/503
+(stays within cheap DW instead of cascading to 150x more expensive Claude).
+
+- `DOUBLEWORD_REALTIME_ENABLED` (default `true`)
+
+### Tier 1: Webhook-Driven Batch (Zero-Poll)
+
+For batch operations that fall through from Tier 0. The `BatchFutureRegistry`
+maps `batch_id` to `asyncio.Future`, resolved by incoming DW webhooks via the
+`EventChannelServer`.
+
+- `BatchFutureRegistry`: register/resolve/reject/wait + TTL auto-pruning
+- `EventChannelServer`: `POST /webhook/doubleword` with Standard Webhooks
+  HMAC-SHA256 signature verification
+- `DOUBLEWORD_WEBHOOK_SECRET`: Signing key from DW dashboard
+
+### Tier 2: Adaptive Backoff Poll (Safety Net)
+
+Fallback when webhooks aren't configured. Replaces fixed 5s polling with
+exponential backoff + jitter:
+
+- Starting interval: 2s, multiplier: 1.5x, cap: 30s, jitter: ±25%
+- Network-aware: connection errors jump to 15s base
+- One-line debug logs (no tracebacks on transient failures)
+
+### Manifesto Alignment
+
+- **§3 — Zero Polling. Pure Reflex**: Tier 0 (SSE) and Tier 1 (webhook)
+  eliminate polling entirely. Tier 2 uses adaptive backoff only as last resort.
+- **§6 — The Iron Gate**: Webhook signature verification prevents spoofed
+  batch completions.
+
+---
+
 ## Edge Case Hardening (12 Refinements)
 
 These refinements close failure modes discovered during the first battle tests.

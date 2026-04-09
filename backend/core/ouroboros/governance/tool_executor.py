@@ -942,11 +942,19 @@ class GoverningToolPolicy:
         repo_root = ctx.repo_root.resolve()
 
         # Rule 0: unknown tool → deny immediately
-        if name not in _L1_MANIFESTS:
+        # Exception: MCP tools (prefixed mcp_) are forwarded to external servers (Gap #7)
+        if name not in _L1_MANIFESTS and not name.startswith("mcp_"):
             return PolicyResult(
                 decision=PolicyDecision.DENY,
                 reason_code="tool.denied.unknown_tool",
                 detail=f"Unknown tool: {name!r}",
+            )
+        # Rule 0b: MCP tools — ALLOW (external servers handle their own auth)
+        if name.startswith("mcp_"):
+            return PolicyResult(
+                decision=PolicyDecision.ALLOW,
+                reason_code="tool.allowed.mcp_external",
+                detail=f"MCP tool forwarded to external server: {name}",
             )
 
         # Rule 1: read_file — path must be within repo_root
@@ -1191,10 +1199,12 @@ class AsyncProcessToolBackend:
 
     def __init__(self, semaphore: asyncio.Semaphore,
                  _executor_instance: Optional["ToolExecutor"] = None,
-                 approval_provider: Optional[Any] = None) -> None:
+                 approval_provider: Optional[Any] = None,
+                 mcp_client: Optional[Any] = None) -> None:
         self._semaphore = semaphore
         self._executor_instance = _executor_instance
         self._approval_provider = approval_provider  # For ask_human tool
+        self._mcp_client = mcp_client  # For MCP tool dispatch (Gap #7)
 
     def _get_executor(self, repo_root: Path) -> "ToolExecutor":
         return self._executor_instance or ToolExecutor(repo_root=repo_root)
@@ -1213,6 +1223,9 @@ class AsyncProcessToolBackend:
         async with self._semaphore:
             if call.name == "run_tests":
                 return await self._run_tests_async(call, policy_ctx, timeout, cap)
+            # MCP tools: forward to external MCP server (Gap #7)
+            if call.name.startswith("mcp_") and self._mcp_client is not None:
+                return await self._run_mcp_tool(call, timeout, cap)
             # Async-native tools (web search, code exploration, ask_human)
             if call.name in ("web_search", "web_fetch", "code_explore", "ask_human"):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
@@ -1237,6 +1250,50 @@ class AsyncProcessToolBackend:
             return ToolResult(tool_call=call, output="", error="TIMEOUT", status=ToolExecStatus.TIMEOUT)
         except Exception as exc:  # noqa: BLE001
             return ToolResult(tool_call=call, output="", error=str(exc), status=ToolExecStatus.EXEC_ERROR)
+
+    async def _run_mcp_tool(
+        self, call: ToolCall, timeout: float, cap: int,
+    ) -> ToolResult:
+        """Execute an MCP tool via the GovernanceMCPClient (Gap #7).
+
+        Routes ``mcp_{server}_{tool}`` calls to the correct MCP server
+        connection. Returns structured output or error.
+        """
+        try:
+            result = await asyncio.wait_for(
+                self._mcp_client.call_tool(call.name, call.arguments or {}, timeout=timeout),
+                timeout=timeout,
+            )
+            if result is None:
+                return ToolResult(
+                    tool_call=call, output="",
+                    error="MCP tool returned no result (server unavailable?)",
+                    status=ToolExecStatus.EXEC_ERROR,
+                )
+            # MCP tools return {"content": [{"type": "text", "text": "..."}]}
+            content = result.get("content", [])
+            if isinstance(content, list):
+                text_parts = [
+                    item.get("text", "") for item in content
+                    if isinstance(item, dict) and item.get("type") == "text"
+                ]
+                output = "\n".join(text_parts)
+            else:
+                output = json.dumps(result)
+            return ToolResult(
+                tool_call=call, output=output[:cap],
+                status=ToolExecStatus.SUCCESS,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                tool_call=call, output="", error="TIMEOUT",
+                status=ToolExecStatus.TIMEOUT,
+            )
+        except Exception as exc:
+            return ToolResult(
+                tool_call=call, output="", error=str(exc),
+                status=ToolExecStatus.EXEC_ERROR,
+            )
 
     async def _run_async_native_tool(
         self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
@@ -1356,6 +1413,9 @@ class AsyncProcessToolBackend:
 # ---------------------------------------------------------------------------
 
 _MAX_PROMPT_CHARS = 131_072  # CC-parity: was 32768, raised to accommodate larger tool outputs
+_COMPACT_THRESHOLD_CHARS = int(
+    os.environ.get("JARVIS_TOOL_LOOP_COMPACT_THRESHOLD", str(int(_MAX_PROMPT_CHARS * 0.75)))
+)  # Trigger compaction at 75% of max to avoid hard crash
 
 
 class ToolLoopCoordinator:
@@ -1612,6 +1672,18 @@ class ToolLoopCoordinator:
                         _explore_only_rounds, op_id[:12],
                     )
 
+            # ── Live context auto-compaction (Gap #8) ──
+            # When the accumulated prompt exceeds 75% of budget, compact
+            # older tool results into a deterministic summary to reclaim
+            # context space. Preserves recent rounds and safety-critical
+            # entries. No model inference — pure counting.
+            if len(current_prompt) > _COMPACT_THRESHOLD_CHARS and round_index >= 2:
+                current_prompt = self._compact_prompt(
+                    base_prompt=prompt,
+                    current_prompt=current_prompt,
+                    op_id=op_id,
+                )
+
             if len(current_prompt) > _MAX_PROMPT_CHARS:
                 raise RuntimeError(f"tool_loop_budget_exceeded:{len(current_prompt)}")
 
@@ -1619,3 +1691,69 @@ class ToolLoopCoordinator:
         # The provider may have produced useful output in the final round.
         self._last_records = list(records)
         return raw, records
+
+    # ── Live context auto-compaction (Gap #8) ────────────────────────
+    @staticmethod
+    def _compact_prompt(
+        base_prompt: str,
+        current_prompt: str,
+        op_id: str,
+    ) -> str:
+        """Compact older tool results in the accumulated prompt.
+
+        Splits the prompt at ``[TOOL RESULT]`` / ``[TOOL ERROR]`` boundaries,
+        keeps the base prompt + a summary of old rounds + the most recent 3
+        round blocks. No model inference — deterministic counting.
+
+        Returns the compacted prompt string.
+        """
+        # The accumulated prompt = base_prompt + tool round appendices.
+        # Each appendix contains [TOOL RESULT] or [TOOL ERROR] blocks.
+        if not current_prompt.startswith(base_prompt):
+            return current_prompt  # Can't split — return as-is
+
+        appendix = current_prompt[len(base_prompt):]
+        if not appendix:
+            return current_prompt
+
+        # Split into round chunks at [TOOL RESULT] boundaries.
+        # Each chunk = one or more tool results from one round.
+        import re as _re
+        _ROUND_SPLIT = _re.compile(r"(?=\n\[TOOL (?:RESULT|ERROR)\])")
+        chunks = _ROUND_SPLIT.split(appendix)
+        chunks = [c for c in chunks if c.strip()]
+
+        _PRESERVE_RECENT = int(os.environ.get("JARVIS_COMPACT_PRESERVE_TOOL_CHUNKS", "6"))
+        if len(chunks) <= _PRESERVE_RECENT:
+            return current_prompt  # Not enough to compact
+
+        # Older chunks → summary
+        old_chunks = chunks[:-_PRESERVE_RECENT]
+        recent_chunks = chunks[-_PRESERVE_RECENT:]
+
+        # Build deterministic summary of compacted chunks
+        tool_counts: dict = {}
+        total_chars = 0
+        for chunk in old_chunks:
+            total_chars += len(chunk)
+            # Extract tool name from [TOOL RESULT]\ntool: <name>
+            _m = _re.search(r"\ntool:\s*(\S+)", chunk)
+            if _m:
+                tool_counts[_m.group(1)] = tool_counts.get(_m.group(1), 0) + 1
+
+        summary_parts = [f"{count} {name}" for name, count in sorted(tool_counts.items())]
+        summary = (
+            f"\n[CONTEXT COMPACTED]\n"
+            f"Compacted {len(old_chunks)} earlier tool results "
+            f"({total_chars:,} chars): {', '.join(summary_parts) if summary_parts else 'mixed'}. "
+            f"Recent results preserved below.\n"
+            f"[END CONTEXT COMPACTED]\n"
+        )
+
+        compacted = base_prompt + summary + "".join(recent_chunks)
+        _saved = len(current_prompt) - len(compacted)
+        logger.info(
+            "[ToolLoop] Context compacted for %s: %d->%d chars (-%d, %d chunks removed)",
+            op_id[:12], len(current_prompt), len(compacted), _saved, len(old_chunks),
+        )
+        return compacted

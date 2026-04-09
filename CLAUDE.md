@@ -41,7 +41,7 @@ CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GA
 
 | Tier | Provider | Cost | Notes |
 |------|----------|------|-------|
-| 0 | DoubleWord 397B (batch + real-time) | $0.10/$0.40/M | 16384 max_tokens, 5s poll interval, preferred |
+| 0 | DoubleWord 397B (3-tier: RT SSE + webhook + adaptive poll) | $0.10/$0.40/M | 16384 max_tokens, RT default, preferred |
 | 1 | Claude (Anthropic API) | $3/$15/M | Extended thinking + prompt caching, 60s fallback cap |
 | 2 | J-Prime (GCP self-hosted) | VM cost only | When available |
 
@@ -66,7 +66,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **CommProtocol** (`comm_protocol.py`): 5-phase observability -- INTENT -> PLAN -> HEARTBEAT -> DECISION -> POSTMORTEM
 - **SerpentFlow** (`battle_test/serpent_flow.py`, 1900+ lines): CC-style flowing CLI with `Update(path)` blocks, numbered diffs, per-op reasoning
 - **LiveDashboard** (`battle_test/live_dashboard.py`, 1233 lines): Persistent Rich TUI with 3-channel terminal muting
-- **Venom** (`tool_executor.py`): Multi-turn agentic tool loop -- 16 tools (read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame, ask_human). All enabled by default under governance.
+- **Venom** (`tool_executor.py`): Multi-turn agentic tool loop -- 16 built-in tools + MCP external tools. Built-in: read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame, ask_human. MCP tools from external servers discovered at prompt time and forwarded (Gap #7). Live context auto-compaction between rounds (Gap #8).
 - **L2 Repair** (`repair_engine.py`): Iterative self-repair FSM (5 iterations, 120s timebox)
 - **ConsciousnessBridge** (`consciousness_bridge.py`): Injects memory/prediction into pipeline
 - **StrategicDirection** (`strategic_direction.py`): Manifesto principles injected into every generation prompt
@@ -92,6 +92,8 @@ O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capab
 - **Mid-operation clarification**: `ask_human` tool in Venom lets the model ask the human for clarification. Gated to NOTIFY_APPLY+ risk tiers (Green ops don't interrupt).
 - **L3 worktree isolation**: Enabled by default (`JARVIS_GOVERNED_L3_ENABLED=true`). Parallel execution graphs use isolated git worktrees to prevent filesystem conflicts.
 - **Auto-commit post-APPLY**: AutoCommitter creates structured git commits with O+V signature after VERIFY passes. Conventional commit type/scope inference, risk-tier metadata, protected-branch push prevention. Master switch: `JARVIS_AUTO_COMMIT_ENABLED`.
+- **MCP tool forwarding**: External MCP tools discovered from connected servers and injected into generation prompt (Gap #7). Model can call `mcp_{server}_{tool}` during tool loop. Policy engine auto-allows MCP tools; external servers handle their own auth.
+- **Live context auto-compaction**: When tool loop prompt exceeds 75% of budget, older tool results are compacted into a deterministic summary (Gap #8). Preserves recent 6 chunks. No model inference. Env: `JARVIS_TOOL_LOOP_COMPACT_THRESHOLD`.
 
 ## Battle Test
 
@@ -114,8 +116,12 @@ backend/core/ouroboros/
     plan_generator.py           # Model-reasoned PLAN phase (schema plan.1)
     semantic_triage.py          # Pre-generation filter
     comm_protocol.py            # 5-phase observability
-    tool_executor.py            # Venom tool loop
+    tool_executor.py            # Venom tool loop + live context compaction
     auto_committer.py           # Auto-commit with O+V signature (Gap #6)
+    mcp_tool_client.py          # MCP external tool client (Gap #7)
+    context_compaction.py       # Live context auto-compaction (Gap #8)
+    batch_future_registry.py    # Zero-poll webhook batch futures (DW Tier 1)
+    event_channel.py            # Webhook receiver (DW + GitHub + CI)
     repair_engine.py            # L2 self-repair
     consciousness_bridge.py     # Consciousness integration
     strategic_direction.py      # Manifesto injection

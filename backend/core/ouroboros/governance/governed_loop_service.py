@@ -1046,6 +1046,14 @@ class GovernedLoopService:
             )
             await asyncio.sleep(0)  # Yield for any pending completions
 
+        # Stop EventChannelServer (DW 3-tier webhook receiver)
+        _evt_ch = getattr(self, "_event_channel", None)
+        if _evt_ch is not None:
+            try:
+                await _evt_ch.stop()
+            except Exception:
+                pass
+
         # Detach from stack
         self._detach_from_stack()
         self._state = ServiceState.INACTIVE
@@ -2444,6 +2452,19 @@ class GovernedLoopService:
                 _dw_realtime = os.environ.get(
                     "DOUBLEWORD_REALTIME_ENABLED", "true"
                 ).lower() != "false"
+                # DW 3-tier architecture (Manifesto §3: Zero polling. Pure reflex.)
+                # Tier 1 webhook: BatchFutureRegistry resolves futures via webhook
+                # Tier 2 adaptive poll: exponential backoff fallback
+                _batch_registry = None
+                try:
+                    from backend.core.ouroboros.governance.batch_future_registry import (
+                        BatchFutureRegistry,
+                    )
+                    _batch_registry = BatchFutureRegistry()
+                    self._batch_registry = _batch_registry
+                    logger.info("[GovernedLoop] BatchFutureRegistry: wired (Tier 1 webhook)")
+                except Exception as _bfr_exc:
+                    logger.debug("[GovernedLoop] BatchFutureRegistry skipped: %s", _bfr_exc)
                 tier0 = DoublewordProvider(
                     api_key=_dw_api_key,
                     repo_root=self._config.project_root,
@@ -2451,6 +2472,7 @@ class GovernedLoopService:
                     rate_limiter=_dw_rate_limiter,
                     tool_loop=_tool_coordinator,  # Always wire Venom (RT uses it, batch ignores it)
                     realtime_enabled=_dw_realtime,
+                    batch_registry=_batch_registry,
                 )
                 self._doubleword_ref = tier0
                 _mode = "real-time + Venom" if _dw_realtime else "batch"
@@ -2754,11 +2776,42 @@ class GovernedLoopService:
             _mcp = GovernanceMCPClient()
             if _mcp.is_enabled:
                 self._mcp_client = _mcp
-                logger.info("[GLS] GovernanceMCPClient wired")
+                # Gap #7: inject MCP client into tool backend for MCP tool dispatch
+                if _tool_coordinator is not None:
+                    _be = getattr(_tool_coordinator, "_backend", None)
+                    if _be is not None and hasattr(_be, "_mcp_client"):
+                        _be._mcp_client = _mcp
+                # Gap #7: inject MCP client into providers for tool section rendering
+                if self._doubleword_ref is not None and hasattr(self._doubleword_ref, "_mcp_client"):
+                    self._doubleword_ref._mcp_client = _mcp
+                logger.info("[GLS] GovernanceMCPClient wired (tools forwarded to generation context)")
             else:
                 logger.debug("[GLS] GovernanceMCPClient: no servers configured")
         except Exception as exc:
             logger.debug("[GLS] GovernanceMCPClient skipped: %s", exc)
+
+        # ---- Wire EventChannelServer (DW 3-tier: webhook-driven batch) ----
+        self._event_channel = None
+        try:
+            from backend.core.ouroboros.governance.event_channel import EventChannelServer
+            _batch_reg = getattr(self, "_batch_registry", None)
+            _intake = getattr(self, "_intake_router", None)
+            if _intake is not None:
+                _evt_channel = EventChannelServer(
+                    router=_intake,
+                    batch_registry=_batch_reg,
+                )
+                if _evt_channel.is_enabled:
+                    await _evt_channel.start()
+                    self._event_channel = _evt_channel
+                    logger.info(
+                        "[GLS] EventChannelServer started (batch_registry=%s)",
+                        "wired" if _batch_reg is not None else "none",
+                    )
+                else:
+                    logger.debug("[GLS] EventChannelServer: disabled via env")
+        except Exception as exc:
+            logger.debug("[GLS] EventChannelServer skipped: %s", exc)
 
         # ---- Wire ReasoningNarrator (P0 Wiring: WHY-not-WHAT explanations) ----
         try:

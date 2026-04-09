@@ -599,9 +599,16 @@ def _build_system_context_block(ctx: "OperationContext") -> Optional[str]:
     return "\n".join(lines)
 
 
-def _build_tool_section() -> str:
-    """Return the 'Available Tools' block injected into the generation prompt."""
-    return (
+def _build_tool_section(mcp_tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Return the 'Available Tools' block injected into the generation prompt.
+
+    Parameters
+    ----------
+    mcp_tools:
+        Optional list of MCP tool descriptors from ``GovernanceMCPClient.discover_tools()``.
+        Each descriptor has ``name``, ``description``, and ``input_schema``.
+    """
+    base = (
         "## Available Tools\n\n"
         "If you need more information before writing the patch, respond with ONLY a\n"
         "tool call JSON (no other text).\n\n"
@@ -650,6 +657,28 @@ def _build_tool_section() -> str:
         "**Write tools (env-gated: JARVIS_TOOL_EDIT_ALLOWED=1):**\n"
         "- `edit_file(path, old_string, new_string)` — find-and-replace edit (old_string must be unique)\n"
         "- `write_file(path, content)` — create or overwrite a file\n\n"
+    )
+
+    # MCP tools (Gap #7: forward external tools into generation context)
+    if mcp_tools:
+        base += "**External MCP tools (connected servers):**\n"
+        for tool in mcp_tools:
+            name = tool.get("name", "")
+            desc = tool.get("description", "")
+            schema = tool.get("input_schema", {})
+            # Build compact argument signature from JSON Schema properties
+            props = schema.get("properties", {})
+            if props:
+                args_sig = ", ".join(
+                    f"{k}" + (f"={v.get('default')}" if "default" in v else "")
+                    for k, v in list(props.items())[:6]  # Cap at 6 params
+                )
+                base += f"- `{name}({args_sig})` — {desc}\n"
+            else:
+                base += f"- `{name}(...)` — {desc}\n"
+        base += "\n"
+
+    base += (
         f"Max {MAX_TOOL_ITERATIONS} tool rounds total. After gathering info, respond with the patch JSON.\n\n"
         "### CRITICAL: Exploration-first protocol\n\n"
         "Before proposing ANY code change, you MUST verify the current state using\n"
@@ -661,6 +690,7 @@ def _build_tool_section() -> str:
         "Skipping exploration produces patches that silently break other code.\n"
         "A senior engineer reads first, then writes."
     )
+    return base
 
 
 
@@ -672,6 +702,7 @@ def _build_codegen_prompt(
     max_prompt_tokens: Optional[int] = None,
     force_full_content: bool = False,
     repair_context: Optional[Any] = None,
+    mcp_tools: Optional[List[Dict[str, Any]]] = None,
 ) -> str:
     """Build an enriched codegen prompt with file contents, context, and schema.
 
@@ -1089,7 +1120,7 @@ Rules:
     if expanded_context_block:
         parts.append(expanded_context_block)
     if tools_enabled:
-        parts.append(_build_tool_section())
+        parts.append(_build_tool_section(mcp_tools=mcp_tools))
     # ── Repair context injection (L2 correction mode) ────────────────────────
     if repair_context is not None:
         _rc = repair_context
@@ -1940,6 +1971,7 @@ class PrimeProvider:
         repo_roots: Optional[Dict[str, Path]] = None,
         tools_enabled: bool = False,
         tool_loop: Optional[Any] = None,  # Optional[ToolLoopCoordinator]
+        mcp_client: Optional[Any] = None,  # Optional[GovernanceMCPClient]
     ) -> None:
         self._client = prime_client
         self._max_tokens = max_tokens
@@ -1947,6 +1979,7 @@ class PrimeProvider:
         self._repo_roots = repo_roots
         self._tools_enabled = tools_enabled or (tool_loop is not None)
         self._tool_loop = tool_loop
+        self._mcp_client = mcp_client
 
     @property
     def provider_name(self) -> str:
@@ -1992,6 +2025,13 @@ class PrimeProvider:
             )
         _force_full = _schema_cap != "full_content_and_diff"
 
+        # Gap #7: discover MCP tools for prompt injection
+        _mcp_tools = None
+        if self._mcp_client is not None and self._tools_enabled:
+            try:
+                _mcp_tools = await self._mcp_client.discover_tools()
+            except Exception:
+                pass
         prompt = _build_codegen_prompt(
             context,
             repo_root=repo_root,
@@ -1999,6 +2039,7 @@ class PrimeProvider:
             tools_enabled=self._tools_enabled,
             force_full_content=_force_full,
             repair_context=repair_context,
+            mcp_tools=_mcp_tools,
         )
         accumulated_chars = len(prompt)
         tool_rounds = 0
@@ -2223,6 +2264,7 @@ class ClaudeProvider:
         repo_roots: Optional[Dict[str, Path]] = None,
         tools_enabled: bool = False,
         tool_loop: Optional[Any] = None,  # Optional[ToolLoopCoordinator]
+        mcp_client: Optional[Any] = None,  # Optional[GovernanceMCPClient]
     ) -> None:
         self._api_key = api_key
         self._model = model
@@ -2236,6 +2278,7 @@ class ClaudeProvider:
         self._repo_roots = repo_roots
         self._tools_enabled = tools_enabled or (tool_loop is not None)
         self._tool_loop = tool_loop
+        self._mcp_client = mcp_client
 
         # Extended thinking: enables deep chain-of-thought reasoning before
         # code generation.  Manifesto §6: "deploy intelligence where it creates
@@ -2330,12 +2373,20 @@ class ClaudeProvider:
         )
         executor = None  # lazy init on first tool call
 
+        # Gap #7: discover MCP tools for prompt injection
+        _mcp_tools = None
+        if self._mcp_client is not None and self._tools_enabled:
+            try:
+                _mcp_tools = await self._mcp_client.discover_tools()
+            except Exception:
+                pass
         prompt_text = _build_codegen_prompt(
             context,
             repo_root=repo_root,
             repo_roots=self._repo_roots,
             tools_enabled=self._tools_enabled,
             repair_context=repair_context,
+            mcp_tools=_mcp_tools,
         )
         # Build messages array for multi-turn conversation
         messages: List[Dict[str, Any]] = [{"role": "user", "content": prompt_text}]

@@ -158,6 +158,7 @@ class DoublewordProvider:
         self._daily_budget = daily_budget
         self._daily_spend: float = 0.0
         self._budget_reset_date = time.strftime("%Y-%m-%d", time.gmtime())
+        self._mcp_client: Optional[Any] = None  # Injected by GLS for MCP tool forwarding (Gap #7)
 
     @property
     def provider_name(self) -> str:
@@ -538,11 +539,19 @@ class DoublewordProvider:
         t0 = time.monotonic()
         total_cost = 0.0
 
+        # Gap #7: discover MCP tools for prompt injection
+        _mcp_tools = None
+        if self._mcp_client is not None:
+            try:
+                _mcp_tools = await self._mcp_client.discover_tools()
+            except Exception:
+                pass
         prompt = prompt_override or _build_codegen_prompt(
             context,
             repo_root=self._repo_root,
             repo_roots=self._repo_roots or None,
             force_full_content=True,
+            mcp_tools=_mcp_tools,
         )
 
         _SYSTEM_PROMPT = (
