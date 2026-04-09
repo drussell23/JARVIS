@@ -54,6 +54,11 @@ _URGENCY_BOOST: Dict[str, int] = {
 # Sources that bypass backpressure
 _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
 
+# P2.4: Module-level GoalTracker reference.  Set by UnifiedIntakeRouter on
+# init so _compute_priority can apply goal-alignment boost without changing
+# the function signature at every call site.
+_active_goal_tracker: Optional[Any] = None
+
 
 def _compute_priority(
     envelope: "IntentEnvelope",
@@ -67,6 +72,7 @@ def _compute_priority(
     3. Cost-awareness: operations touching many files are penalized
        (they consume more generation tokens for less focused impact)
     4. Dependency credit: ops that unblock queued signals get priority boost
+    5. Goal alignment: signals that match active user goals get boosted (P2.4)
 
     The cost penalty is mild (0-2 points) — urgency and source type
     still dominate, but within the same tier, focused single-file ops
@@ -82,7 +88,16 @@ def _compute_priority(
     # Dependency credit: ops that would unblock queued signals get boosted
     # Capped at 3 to prevent runaway priority from large queues
     dep_bonus = min(dependency_credit, 3)
-    return base - urgency + cost_penalty - confidence_bonus - dep_bonus
+    # P2.4: Goal alignment boost — signals aligned with active user goals
+    goal_boost = 0
+    if _active_goal_tracker is not None:
+        try:
+            goal_boost = _active_goal_tracker.alignment_boost(
+                envelope.description, envelope.target_files,
+            )
+        except Exception:
+            pass  # Goal scoring is best-effort
+    return base - urgency + cost_penalty - confidence_bonus - dep_bonus - goal_boost
 
 
 @dataclass(frozen=True)
@@ -137,6 +152,7 @@ class UnifiedIntakeRouter:
     """
 
     def __init__(self, gls: Any, config: IntakeRouterConfig, runtime_orchestrator: Any = None) -> None:
+        global _active_goal_tracker
         self._gls = gls
         self._runtime_orchestrator = runtime_orchestrator
         self._config = config
@@ -154,6 +170,15 @@ class UnifiedIntakeRouter:
         # Optional post-ingest hook (A-narrator). Called with envelope on "enqueued" only.
         # Assign a coroutine callable to enable; None disables.
         self._on_ingest_hook: Optional[Callable[..., Any]] = None
+
+        # P2.4: Initialize GoalTracker for goal-directed prioritization.
+        # Sets the module-level reference so _compute_priority can use it.
+        try:
+            from backend.core.ouroboros.governance.strategic_direction import GoalTracker
+            self._goal_tracker = GoalTracker(config.project_root)
+            _active_goal_tracker = self._goal_tracker
+        except Exception:
+            self._goal_tracker = None
 
         # ── Operation dependency tracking (DAG-based signal merging) ──
         # Maps file paths to (op_id, registered_at_monotonic).

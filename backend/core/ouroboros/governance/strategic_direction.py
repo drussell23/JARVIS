@@ -11,10 +11,14 @@ Boundary Principle (Manifesto §4 — The Synthetic Soul):
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -212,3 +216,193 @@ class StrategicDirectionService:
             parts.append("")
 
         return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# GoalTracker — dynamic goal-directed prioritization (P2.4)
+# ---------------------------------------------------------------------------
+
+_GOAL_FILE = ".jarvis/active_goals.json"
+_MAX_GOALS = int(os.environ.get("JARVIS_MAX_ACTIVE_GOALS", "5"))
+
+# Priority boost for goal-aligned signals (subtracted from priority score,
+# so lower = higher priority).  Moderate boost — doesn't override urgency
+# or source type, but breaks ties in favor of goal-aligned work.
+_GOAL_ALIGNMENT_BOOST = int(os.environ.get("JARVIS_GOAL_ALIGNMENT_BOOST", "2"))
+
+
+@dataclass
+class ActiveGoal:
+    """A user-defined strategic goal that influences O+V prioritization."""
+    goal_id: str                 # Short slug: "test-coverage", "reduce-governance-complexity"
+    description: str             # Human-readable: "Improve test coverage in governance/"
+    keywords: Tuple[str, ...]    # Matching keywords: ("test", "coverage", "pytest")
+    path_patterns: Tuple[str, ...] = ()  # File path prefixes: ("backend/core/ouroboros/governance/",)
+    priority_weight: float = 1.0  # 0.5 = mild preference, 1.0 = standard, 2.0 = strong focus
+    created_at: float = field(default_factory=time.time)
+
+
+class GoalTracker:
+    """Tracks 3-5 active user goals and provides alignment scoring.
+
+    Goals are persisted to ``.jarvis/active_goals.json`` so they survive
+    across sessions.  The intake router queries ``alignment_boost()`` to
+    bias priority toward goal-aligned signals.  The prompt builders query
+    ``format_for_prompt()`` to inject goal context into generation.
+
+    Boundary Principle (Manifesto §5):
+      Deterministic: Keyword/path matching, priority arithmetic.
+      Agentic: How the model interprets goal context during generation.
+    """
+
+    def __init__(self, project_root: Path) -> None:
+        self._root = project_root.resolve()
+        self._goals: List[ActiveGoal] = []
+        self._load()
+
+    @property
+    def active_goals(self) -> List[ActiveGoal]:
+        return list(self._goals)
+
+    def set_goals(self, goals: List[ActiveGoal]) -> None:
+        """Replace all active goals. Persists to disk."""
+        self._goals = goals[:_MAX_GOALS]
+        self._persist()
+        logger.info(
+            "[GoalTracker] Set %d active goals: %s",
+            len(self._goals),
+            ", ".join(g.goal_id for g in self._goals),
+        )
+
+    def add_goal(self, goal: ActiveGoal) -> None:
+        """Add a goal. If at capacity, drops the oldest."""
+        # Deduplicate by goal_id
+        self._goals = [g for g in self._goals if g.goal_id != goal.goal_id]
+        self._goals.append(goal)
+        if len(self._goals) > _MAX_GOALS:
+            dropped = self._goals.pop(0)
+            logger.info("[GoalTracker] Dropped oldest goal: %s", dropped.goal_id)
+        self._persist()
+
+    def remove_goal(self, goal_id: str) -> bool:
+        """Remove a goal by ID. Returns True if found."""
+        before = len(self._goals)
+        self._goals = [g for g in self._goals if g.goal_id != goal_id]
+        if len(self._goals) < before:
+            self._persist()
+            return True
+        return False
+
+    def alignment_boost(
+        self,
+        description: str,
+        target_files: Sequence[str] = (),
+    ) -> int:
+        """Compute priority boost for a signal based on goal alignment.
+
+        Returns a non-negative integer to subtract from priority score
+        (lower = higher priority).  Returns 0 if no goals match.
+
+        Matching logic:
+        - Keyword match: any goal keyword appears in the description
+        - Path match: any target file starts with a goal path pattern
+        - Both must match at least one goal to earn the boost
+        """
+        if not self._goals:
+            return 0
+
+        desc_lower = description.lower()
+        best_weight = 0.0
+
+        for goal in self._goals:
+            matched = False
+            # Keyword matching
+            for kw in goal.keywords:
+                if kw.lower() in desc_lower:
+                    matched = True
+                    break
+            # Path pattern matching (supplement keyword match)
+            if not matched and target_files and goal.path_patterns:
+                for tf in target_files:
+                    for pat in goal.path_patterns:
+                        if tf.startswith(pat):
+                            matched = True
+                            break
+                    if matched:
+                        break
+            if matched and goal.priority_weight > best_weight:
+                best_weight = goal.priority_weight
+
+        if best_weight <= 0:
+            return 0
+        return max(1, int(_GOAL_ALIGNMENT_BOOST * best_weight))
+
+    def format_for_prompt(self) -> str:
+        """Format active goals for injection into generation prompts.
+
+        Returns a compact (~100-150 token) block that communicates the
+        user's current priorities so the model makes aligned decisions
+        about what to fix, how to approach the work, and what to test.
+        """
+        if not self._goals:
+            return ""
+        lines = [
+            "## Active Goals (user-defined priorities)\n",
+            "Align your changes with these current objectives:\n",
+        ]
+        for g in self._goals:
+            weight_tag = ""
+            if g.priority_weight >= 2.0:
+                weight_tag = " [HIGH PRIORITY]"
+            elif g.priority_weight <= 0.5:
+                weight_tag = " [low priority]"
+            paths = ""
+            if g.path_patterns:
+                paths = f" (focus: {', '.join(g.path_patterns[:3])})"
+            lines.append(f"- **{g.goal_id}**: {g.description}{paths}{weight_tag}")
+        return "\n".join(lines)
+
+    def _persist(self) -> None:
+        try:
+            path = self._root / _GOAL_FILE
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = [
+                {
+                    "goal_id": g.goal_id,
+                    "description": g.description,
+                    "keywords": list(g.keywords),
+                    "path_patterns": list(g.path_patterns),
+                    "priority_weight": g.priority_weight,
+                    "created_at": g.created_at,
+                }
+                for g in self._goals
+            ]
+            path.write_text(json.dumps(data, indent=2))
+        except Exception:
+            logger.debug("[GoalTracker] Persist failed", exc_info=True)
+
+    def _load(self) -> None:
+        try:
+            path = self._root / _GOAL_FILE
+            if not path.exists():
+                return
+            data = json.loads(path.read_text())
+            self._goals = [
+                ActiveGoal(
+                    goal_id=g["goal_id"],
+                    description=g["description"],
+                    keywords=tuple(g.get("keywords", ())),
+                    path_patterns=tuple(g.get("path_patterns", ())),
+                    priority_weight=g.get("priority_weight", 1.0),
+                    created_at=g.get("created_at", 0.0),
+                )
+                for g in data[:_MAX_GOALS]
+            ]
+            if self._goals:
+                logger.info(
+                    "[GoalTracker] Loaded %d active goals: %s",
+                    len(self._goals),
+                    ", ".join(g.goal_id for g in self._goals),
+                )
+        except Exception:
+            logger.debug("[GoalTracker] Load failed", exc_info=True)

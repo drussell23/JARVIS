@@ -568,6 +568,28 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] Strategic direction injection failed", exc_info=True)
 
+        # ---- P2.4: Goal-directed context injection ----
+        # Append active user goals to strategic_memory_prompt so the
+        # generation model aligns its decisions with current priorities.
+        try:
+            from backend.core.ouroboros.governance.strategic_direction import GoalTracker
+            _goal_tracker = GoalTracker(self._config.project_root)
+            _goal_prompt = _goal_tracker.format_for_prompt()
+            if _goal_prompt:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=ctx.strategic_intent_id or "goals-v1",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=_existing + "\n\n" + _goal_prompt if _existing else _goal_prompt,
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.debug(
+                    "[Orchestrator] Goal context injected (%d active goals)",
+                    len(_goal_tracker.active_goals),
+                )
+        except Exception:
+            logger.debug("[Orchestrator] Goal injection skipped", exc_info=True)
+
         # ---- Policy engine check (declarative YAML rules) ----
         # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
         # explicit deny rules in policy files can override the risk engine.
