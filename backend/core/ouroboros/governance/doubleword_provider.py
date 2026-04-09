@@ -773,10 +773,17 @@ class DoublewordProvider:
         # Execute with or without tool loop.
         # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper).
         _complexity = getattr(context, "task_complexity", "")
+        _eff_mt = _DW_COMPLEXITY_MAX_TOKENS.get(_complexity, self._max_tokens)
         _skip_tools = _complexity in ("trivial",)
         if _skip_tools:
             logger.info(
-                "[DoublewordProvider] \u26a1 Trivial task — skipping Venom tool loop (one-shot)",
+                "[DoublewordProvider] \u26a1 Trivial task — skipping Venom tool loop "
+                "(one-shot, max_tokens=%d)", _eff_mt,
+            )
+        elif _eff_mt != self._max_tokens:
+            logger.info(
+                "[DoublewordProvider] Complexity=%s → max_tokens=%d (default=%d)",
+                _complexity, _eff_mt, self._max_tokens,
             )
 
         tool_records: tuple = ()
