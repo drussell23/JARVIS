@@ -56,7 +56,7 @@ import os
 import time
 from datetime import datetime, timezone
 from enum import Enum, auto
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, Optional, Protocol, runtime_checkable
 
 from backend.core.ouroboros.governance.op_context import (
     GenerationResult,
@@ -82,7 +82,7 @@ _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "15
 
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
-_TIER0_COMPLEXITY_MULTIPLIER: dict[str, float] = {
+_TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
     "trivial": 1.0,           # 0.65 * 1.0  = 0.65
     "moderate": 1.077,         # 0.65 * 1.077 ≈ 0.70
     "standard": 1.077,         # alias for moderate
