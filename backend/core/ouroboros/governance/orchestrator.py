@@ -652,6 +652,32 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("Reasoning chain bridge error", exc_info=True)
 
+        # P3.1: Emit intent chain heartbeat — full reasoning chain for the
+        # SerpentFlow display.  Deterministic: all data already computed.
+        try:
+            _chain_payload: Dict[str, Any] = {
+                "phase": "intent_chain",
+                "risk_tier": risk_tier.name,
+                "complexity": (
+                    _complexity_result.complexity.value
+                    if _complexity_result is not None else ""
+                ),
+                "auto_approve": (
+                    _complexity_result.auto_approve_eligible
+                    if _complexity_result is not None else False
+                ),
+                "fast_path": (
+                    _complexity_result.fast_path_eligible
+                    if _complexity_result is not None else False
+                ),
+            }
+            await self._stack.comm.emit_heartbeat(
+                op_id=ctx.op_id, phase="intent_chain", progress_pct=10.0,
+                **_chain_payload,
+            )
+        except Exception:
+            pass  # Intent chain visibility is best-effort
+
         # Advance to ROUTE with risk_tier set (and optional reasoning result)
         if _serpent: _serpent.update_phase("ROUTE")
         ctx = ctx.advance(

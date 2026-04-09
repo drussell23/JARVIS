@@ -32,9 +32,9 @@ from typing import Any, Callable, Dict, List, Optional
 
 from rich.console import Console
 from rich.live import Live
-from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.status import Status
+from rich.syntax import Syntax
 
 # ══════════════════════════════════════════════════════════════
 # Color palette (organism theme)
@@ -223,9 +223,10 @@ class SerpentFlow:
         # Execution masking (rich.Status)
         self._active_status: Optional[Status] = None
 
-        # Live Markdown streaming (rich.Live + rich.Markdown)
+        # Live syntax-highlighted streaming (rich.Live + rich.Syntax)
         self._live: Optional[Live] = None
         self._stream_buffer: str = ""
+        self._stream_language: str = "json"
 
     # ══════════════════════════════════════════════════════════
     # Zone 0: Boot Banner
@@ -469,13 +470,25 @@ class SerpentFlow:
             self._active_status = None
 
     # ══════════════════════════════════════════════════════════
-    # Live Markdown streaming (rich.Live + rich.Markdown)
+    # Live syntax-highlighted streaming (rich.Live + rich.Syntax)
     # ══════════════════════════════════════════════════════════
 
-    def show_streaming_start(self, provider: str, op_id: str = "") -> None:
-        """Begin synthesis — header + open Live Markdown panel."""
+    def show_streaming_start(
+        self, provider: str, op_id: str = "", language: str = "",
+    ) -> None:
+        """Begin synthesis — header + open Live Syntax panel.
+
+        P3.2: Uses Rich.Syntax for real-time syntax highlighting
+        during DW SSE token streaming, matching CC's highlighting UX.
+        """
         self._streaming_active = True
         self._stream_buffer = ""
+
+        # Detect language from target files if available
+        if not language:
+            language = "json"  # Model output is JSON by default
+
+        self._stream_language = language
 
         prov = _prov(provider) if provider else ""
         via_str = f" via [{_C['provider']}]{prov}[/{_C['provider']}]" if prov else ""
@@ -484,10 +497,10 @@ class SerpentFlow:
             f"[{_C['neural']}]🧬 synthesizing[/{_C['neural']}] {via_str}",
         )
 
-        # Open Live Markdown rendering.  transient=False keeps output
+        # Open Live Syntax rendering.  transient=False keeps output
         # in terminal history after the stream ends.
         self._live = Live(
-            Markdown(""),
+            Syntax("", language, theme="monokai", word_wrap=True),
             console=self.console,
             transient=False,
             refresh_per_second=8,
@@ -495,27 +508,45 @@ class SerpentFlow:
         self._live.start()
 
     def show_streaming_token(self, token: str) -> None:
-        """Append a token and re-render the Markdown panel in-place."""
+        """Append a token and re-render the Syntax panel in-place.
+
+        P3.2: Syntax highlighting on every update — Rich.Syntax lexes
+        the accumulated buffer, giving real-time code coloring as
+        tokens arrive from the SSE stream.
+        """
         if not token:
             return
         self._stream_buffer += token
         if self._live is not None:
             try:
-                self._live.update(Markdown(self._stream_buffer))
+                lang = getattr(self, "_stream_language", "json")
+                self._live.update(
+                    Syntax(
+                        self._stream_buffer, lang,
+                        theme="monokai", word_wrap=True,
+                    )
+                )
             except Exception:
                 pass
 
     def show_streaming_end(self) -> None:
-        """Finalize the Live Markdown region."""
+        """Finalize the Live Syntax region."""
         if self._live is not None:
             try:
                 if self._stream_buffer:
-                    self._live.update(Markdown(self._stream_buffer))
+                    lang = getattr(self, "_stream_language", "json")
+                    self._live.update(
+                        Syntax(
+                            self._stream_buffer, lang,
+                            theme="monokai", word_wrap=True,
+                        )
+                    )
                 self._live.stop()
             except Exception:
                 pass
             self._live = None
         self._stream_buffer = ""
+        self._stream_language = "json"
         self._streaming_active = False
 
     # ══════════════════════════════════════════════════════════
@@ -631,6 +662,61 @@ class SerpentFlow:
                 f"[{_C['life']}]📝 committed[/{_C['life']}]  {parts}  "
                 f"[{_C['dim']}]O+V[/{_C['dim']}]",
             )
+
+    # ── Intent Chain (P3.1: full reasoning chain visibility) ──
+
+    def update_intent_chain(
+        self, op_id: str, risk_tier: str = "", complexity: str = "",
+        auto_approve: bool = False, fast_path: bool = False,
+        sensor: str = "",
+    ) -> None:
+        """Render the full reasoning chain in a single compact line.
+
+        Shows: sensor → complexity → risk → routing path.
+        Manifesto §7: Absolute observability — every autonomous decision visible.
+        """
+        parts: List[str] = []
+
+        # Sensor origin
+        if sensor:
+            parts.append(f"[{_C['dim']}]{sensor}[/{_C['dim']}]")
+
+        # Complexity badge
+        if complexity:
+            cx_color = {
+                "trivial": _C["dim"],
+                "light": _C["neural"],
+                "moderate": _C["neural"],
+                "heavy_code": _C["heal"],
+                "complex": _C["provider"],
+            }.get(complexity, _C["dim"])
+            parts.append(f"[{cx_color}]{complexity}[/{cx_color}]")
+
+        # Risk tier badge
+        if risk_tier:
+            rt = risk_tier.upper()
+            if rt in ("SAFE_AUTO", "LOW"):
+                rt_color = "green"
+            elif rt in ("NOTIFY_APPLY", "MEDIUM"):
+                rt_color = _C["heal"]
+            else:
+                rt_color = _C["death"]
+            parts.append(f"[{rt_color}]{rt}[/{rt_color}]")
+
+        # Routing path hint
+        if fast_path:
+            parts.append(f"[{_C['dim']}]fast-path[/{_C['dim']}]")
+        elif auto_approve:
+            parts.append(f"[{_C['dim']}]auto-approve[/{_C['dim']}]")
+
+        if not parts:
+            return
+
+        chain = f" [{_C['dim']}]→[/{_C['dim']}] ".join(parts)
+        self._op_line(
+            op_id,
+            f"[{_C['neural']}]🔗 chain[/{_C['neural']}]     {chain}",
+        )
 
     # ── Triage ────────────────────────────────────────────────
 
@@ -1466,8 +1552,20 @@ class SerpentTransport:
             elif msg_type == "HEARTBEAT":
                 phase = payload.get("phase", "")
 
+                # P3.1: Intent chain — full reasoning chain visibility
+                if phase == "intent_chain":
+                    sensor = self._flow._op_sensors.get(op_id, "")
+                    self._flow.update_intent_chain(
+                        op_id=op_id,
+                        risk_tier=payload.get("risk_tier", ""),
+                        complexity=payload.get("complexity", ""),
+                        auto_approve=payload.get("auto_approve", False),
+                        fast_path=payload.get("fast_path", False),
+                        sensor=sensor,
+                    )
+
                 # Triage decision
-                if phase == "semantic_triage" and payload.get("triage_decision"):
+                elif phase == "semantic_triage" and payload.get("triage_decision"):
                     self._flow.update_triage(
                         decision=payload["triage_decision"],
                         op_id=op_id,
@@ -1581,6 +1679,8 @@ class SerpentTransport:
                         self._synthesizing_shown.add(op_id)
                         provider = payload.get("provider", "unknown")
                         self._op_providers[op_id] = provider
+                        # P3.1: Show provider routing before streaming starts
+                        self._flow.op_provider(op_id, provider)
                         self._flow.show_streaming_start(provider=provider, op_id=op_id)
                 elif payload.get("streaming") == "token":
                     self._flow.show_streaming_token(payload.get("token", ""))
