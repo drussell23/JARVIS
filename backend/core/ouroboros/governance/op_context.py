@@ -14,13 +14,13 @@ Phase Transitions
 
 .. code-block:: text
 
-    CLASSIFY -> ROUTE -> GENERATE -> VALIDATE -> GATE -> APPROVE -> APPLY -> VERIFY -> COMPLETE
-                              |           |        |       |          |          |
-                              v           v        v       v          v          v
-                         GEN_RETRY   VAL_RETRY          EXPIRED   POSTMORTEM  POSTMORTEM
-                              |           |
-                              v           v
-                          VALIDATE       GATE
+    CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GATE -> [APPROVE] -> APPLY -> VERIFY -> COMPLETE
+                                                           |              |        |       |           |          |
+                                                           v              v        v       v           v          v
+                                                      GEN_RETRY      VAL_RETRY         EXPIRED    POSTMORTEM  POSTMORTEM
+                                                           |              |
+                                                           v              v
+                                                       VALIDATE         GATE
 
     (most non-terminal phases can also transition to CANCELLED)
 
@@ -65,6 +65,7 @@ class OperationPhase(Enum):
     CLASSIFY = auto()
     ROUTE = auto()
     CONTEXT_EXPANSION = auto()
+    PLAN = auto()           # Model-reasoned implementation planning (Manifesto §5)
     GENERATE = auto()
     GENERATE_RETRY = auto()
     VALIDATE = auto()
@@ -94,6 +95,11 @@ PHASE_TRANSITIONS: Dict[OperationPhase, Set[OperationPhase]] = {
         OperationPhase.CANCELLED,
     },
     OperationPhase.CONTEXT_EXPANSION: {
+        OperationPhase.PLAN,
+        OperationPhase.GENERATE,       # direct-to-GENERATE for trivial ops (skip planning)
+        OperationPhase.CANCELLED,
+    },
+    OperationPhase.PLAN: {
         OperationPhase.GENERATE,
         OperationPhase.CANCELLED,
     },
@@ -524,6 +530,13 @@ class OperationContext:
     # Compared at APPLY time — if any hash differs, the file was modified by
     # a concurrent operation and the candidate is stale.
     generate_file_hashes: Tuple[Tuple[str, str], ...] = ()
+
+    # ---- Model-reasoned implementation plan (stamped at PLAN phase) ----
+    # Structured JSON plan produced by PlanGenerator before GENERATE.
+    # Contains: approach, file_changes (ordered with dependencies), risk_factors,
+    # test_strategy, complexity estimate. Injected into GENERATE prompt so the
+    # model follows a coherent strategy instead of ad-hoc patching.
+    implementation_plan: str = ""
 
     # ---- Reasoning chain result (stamped at CLASSIFY if chain is active) ----
     reasoning_chain_result: Optional[Dict[str, Any]] = None
