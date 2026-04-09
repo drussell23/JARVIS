@@ -1086,14 +1086,19 @@ class GovernedOrchestrator:
             pass
 
         # ── Inject cumulative session lessons into context ──
+        # Filter out infrastructure failures (timeouts, provider outages) to
+        # avoid poisoning the model with environmentally-caused failures.
         if self._session_lessons:
-            _lessons_text = "\n".join(
-                f"- {lesson}" for lesson in self._session_lessons[-self._session_lessons_max:]
-            )
-            ctx = dataclasses.replace(
-                ctx,
-                session_lessons=_lessons_text,
-            )
+            _code_lessons = [
+                text for (ltype, text) in self._session_lessons
+                if ltype == "code"
+            ][-self._session_lessons_max:]
+            if _code_lessons:
+                _lessons_text = "\n".join(f"- {lesson}" for lesson in _code_lessons)
+                ctx = dataclasses.replace(
+                    ctx,
+                    session_lessons=_lessons_text,
+                )
 
         for attempt in range(1 + self._config.max_generate_retries):
             try:
@@ -2293,10 +2298,27 @@ class GovernedOrchestrator:
                 try:
                     directive = await self._l2_hook(ctx, _synth_val, _pl_deadline)
                     if directive[0] == "break":
-                        # L2 converged — re-run scoped tests to confirm
-                        _verify_test_passed = True
-                        _verify_test_failures = 0
-                        logger.info("[Orchestrator] L2 repair converged in VERIFY phase [%s]", ctx.op_id)
+                        # L2 converged — apply the repair candidate to real files,
+                        # then mark verify as passed.  Without this step, the L2
+                        # candidate is validated in sandbox but never written to disk.
+                        _l2_candidate = directive[1]
+                        _l2_change = self._build_change_request(ctx, _l2_candidate)
+                        try:
+                            _l2_result = await self._stack.change_engine.execute(_l2_change)
+                            if _l2_result.success:
+                                _verify_test_passed = True
+                                _verify_test_failures = 0
+                                logger.info(
+                                    "[Orchestrator] L2 repair applied in VERIFY phase [%s]",
+                                    ctx.op_id,
+                                )
+                            else:
+                                logger.warning(
+                                    "[Orchestrator] L2 repair candidate failed to apply [%s]",
+                                    ctx.op_id,
+                                )
+                        except Exception as _apply_exc:
+                            logger.debug("[Orchestrator] L2 repair apply error: %s", _apply_exc)
                 except Exception as _l2_exc:
                     logger.debug("[Orchestrator] L2 repair in VERIFY failed: %s", _l2_exc)
 
@@ -2627,14 +2649,26 @@ class GovernedOrchestrator:
                 logger.debug("RSI transition tracking failed", exc_info=True)
 
         # ── Session Intelligence: record ephemeral lesson ──────────────
+        # Each lesson is a (type, text) tuple.  Type is "code" or "infra".
+        # Infrastructure failures (timeouts, provider outages) are excluded
+        # from generation prompts to avoid poisoning the model with
+        # environmentally-caused failures that don't reflect code quality.
+        _INFRA_PATTERNS = frozenset({
+            "timeout", "connection_error", "budget", "all_providers_exhausted",
+            "pypi_timeout", "change_engine_error", "infrastructure_failed",
+            "deadline_exceeded", "provider_unavailable", "rate_limited",
+        })
         try:
             _files_short = ", ".join(str(f).split("/")[-1] for f in list(ctx.target_files)[:2])
+            _err = error_pattern or ""
+            _is_infra = any(p in _err.lower() for p in _INFRA_PATTERNS)
+            _lesson_type = "infra" if _is_infra else "code"
             if final_state in (OperationState.APPLIED,):
-                _lesson = f"[OK] {ctx.description[:80]} ({_files_short})"
+                _lesson_text = f"[OK] {ctx.description[:80]} ({_files_short})"
             else:
-                _err = error_pattern or "unknown"
-                _lesson = f"[FAIL:{_err}] {ctx.description[:60]} ({_files_short})"
-            self._session_lessons.append(_lesson)
+                _err_tag = _err or "unknown"
+                _lesson_text = f"[FAIL:{_err_tag}] {ctx.description[:60]} ({_files_short})"
+            self._session_lessons.append((_lesson_type, _lesson_text))
             # Cap to prevent unbounded growth
             if len(self._session_lessons) > self._session_lessons_max:
                 self._session_lessons = self._session_lessons[-self._session_lessons_max:]

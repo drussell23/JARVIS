@@ -55,7 +55,10 @@ _URGENCY_BOOST: Dict[str, int] = {
 _BACKPRESSURE_EXEMPT = frozenset({"voice_human", "test_failure"})
 
 
-def _compute_priority(envelope: "IntentEnvelope") -> int:
+def _compute_priority(
+    envelope: "IntentEnvelope",
+    dependency_credit: int = 0,
+) -> int:
     """Compute cost-aware priority score for an envelope.
 
     Lower int = higher priority.  Factors:
@@ -63,6 +66,7 @@ def _compute_priority(envelope: "IntentEnvelope") -> int:
     2. Urgency boost (critical/high get promoted)
     3. Cost-awareness: operations touching many files are penalized
        (they consume more generation tokens for less focused impact)
+    4. Dependency credit: ops that unblock queued signals get priority boost
 
     The cost penalty is mild (0-2 points) — urgency and source type
     still dominate, but within the same tier, focused single-file ops
@@ -75,7 +79,10 @@ def _compute_priority(envelope: "IntentEnvelope") -> int:
     cost_penalty = 0 if file_count <= 1 else (1 if file_count <= 4 else 2)
     # Confidence discount: high-confidence signals get slight priority
     confidence_bonus = 1 if envelope.confidence >= 0.9 else 0
-    return base - urgency + cost_penalty - confidence_bonus
+    # Dependency credit: ops that would unblock queued signals get boosted
+    # Capped at 3 to prevent runaway priority from large queues
+    dep_bonus = min(dependency_credit, 3)
+    return base - urgency + cost_penalty - confidence_bonus - dep_bonus
 
 
 @dataclass(frozen=True)
@@ -149,11 +156,15 @@ class UnifiedIntakeRouter:
         self._on_ingest_hook: Optional[Callable[..., Any]] = None
 
         # ── Operation dependency tracking (DAG-based signal merging) ──
-        # Maps file paths to the op_id that is currently active on that file.
+        # Maps file paths to (op_id, registered_at_monotonic).
         # Used to detect when a new signal targets files already under active
         # modification — prevents conflicting concurrent patches.
-        self._active_file_ops: Dict[str, str] = {}  # file_path -> op_id
+        # TTL prevents starvation: stale locks are force-released.
+        self._active_file_ops: Dict[str, Tuple[str, float]] = {}  # file_path -> (op_id, time.monotonic())
         self._queued_behind: Dict[str, List[IntentEnvelope]] = {}  # op_id -> [envelopes]
+        self._file_lock_ttl_s: float = float(
+            os.environ.get("JARVIS_FILE_LOCK_TTL_S", "300")
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -239,8 +250,16 @@ class UnifiedIntakeRouter:
         self._register_dedup(envelope)
 
         # 6. Place on priority queue (lower int = higher priority)
-        # Cost-aware: factors urgency, file count, confidence
-        priority = _compute_priority(envelope)
+        # Cost-aware: factors urgency, file count, confidence, dependency credit.
+        # Dependency credit: count how many signals are queued behind files
+        # this op would touch — completing it unblocks them.
+        _dep_credit = 0
+        for _fpath in (envelope.target_files or ()):
+            _blocking_entry = self._active_file_ops.get(_fpath)
+            if _blocking_entry is not None:
+                _blocking_id, _ = _blocking_entry
+                _dep_credit += len(self._queued_behind.get(_blocking_id, []))
+        priority = _compute_priority(envelope, dependency_credit=_dep_credit)
         await self._queue.put((priority, envelope.submitted_at, envelope))
 
         # Fire A-narrator hook — non-critical; failures logged only
@@ -474,11 +493,21 @@ class UnifiedIntakeRouter:
         """Return the op_id of an active operation that overlaps this envelope's files.
 
         Returns None if no conflict exists (safe to dispatch concurrently).
+        Stale locks (older than ``_file_lock_ttl_s``) are force-released.
         """
+        _now = time.monotonic()
         for fpath in (envelope.target_files or []):
-            blocking = self._active_file_ops.get(fpath)
-            if blocking is not None:
-                return blocking
+            entry = self._active_file_ops.get(fpath)
+            if entry is not None:
+                _op_id, _registered_at = entry
+                if _now - _registered_at > self._file_lock_ttl_s:
+                    logger.warning(
+                        "[Router] Force-releasing stale file lock: %s held by %s for %.0fs (TTL %ds)",
+                        fpath, _op_id[:12], _now - _registered_at, self._file_lock_ttl_s,
+                    )
+                    del self._active_file_ops[fpath]
+                    continue
+                return _op_id
         return None
 
     def register_active_op(self, op_id: str, target_files: List[str]) -> None:
@@ -486,8 +515,9 @@ class UnifiedIntakeRouter:
 
         Called by GLS/orchestrator when an operation enters the GENERATE phase.
         """
+        _now = time.monotonic()
         for fpath in target_files:
-            self._active_file_ops[fpath] = op_id
+            self._active_file_ops[fpath] = (op_id, _now)
 
     async def release_op(self, op_id: str) -> None:
         """Release file locks for a completed/failed operation.
@@ -496,7 +526,7 @@ class UnifiedIntakeRouter:
         into the pipeline, now that the conflicting files are free.
         """
         # Clear file reservations
-        stale_keys = [k for k, v in self._active_file_ops.items() if v == op_id]
+        stale_keys = [k for k, v in self._active_file_ops.items() if v[0] == op_id]
         for k in stale_keys:
             del self._active_file_ops[k]
 
