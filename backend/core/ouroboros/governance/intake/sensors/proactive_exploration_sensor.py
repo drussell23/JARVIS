@@ -146,8 +146,16 @@ class ProactiveExplorationSensor:
                         "[ExplorationSensor] Emit failed for %s", domain_key
                     )
 
-        except ImportError:
-            pass
+        except ImportError as exc:
+            # LearningConsolidator unavailable — log once at debug to aid ops
+            # triage ("why is proactive_exploration emitting zero signals?")
+            # without spamming the poll loop every 2 hours.
+            if not self._explored_domains:
+                logger.debug(
+                    "[ExplorationSensor] LearningConsolidator import failed; "
+                    "sensor will be inert this cycle: %s",
+                    exc,
+                )
         except Exception:
             logger.debug("[ExplorationSensor] Scan error", exc_info=True)
 

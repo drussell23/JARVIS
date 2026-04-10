@@ -90,6 +90,7 @@ All flow through `UnifiedIntakeRouter` with priority queuing, deduplication, and
 - **Venom** (`tool_executor.py`): Multi-turn agentic tool loop -- 16 built-in tools + MCP external tools. Built-in: read_file, search_code, edit_file, write_file, bash, web_fetch, web_search, run_tests, get_callers, glob_files, list_dir, list_symbols, git_log, git_diff, git_blame, ask_human. MCP tools from external servers discovered at prompt time and forwarded (Gap #7). Live context auto-compaction between rounds (Gap #8).
 - **L2 Repair** (`repair_engine.py`): Iterative self-repair FSM (5 iterations, 120s timebox). **Enabled by default** (`JARVIS_L2_ENABLED=true`) — engages when VALIDATE exhausts retries, closes the Ouroboros cycle per Manifesto §6.
 - **Iron Gate** (orchestrator.py post-GENERATE): Two deterministic gates flow through the GENERATE retry loop with targeted feedback. (1) Exploration-first (`JARVIS_EXPLORATION_GATE`): min 2 `read_file`/`search_code`/`get_callers` calls before any patch (trivial ops bypass). (2) ASCII-strictness (`JARVIS_ASCII_GATE`): rejects any non-ASCII codepoint in candidate content to prevent Unicode corruption (e.g. `rapidفuzz` → blocked). Manifesto §6 Iron Gate enforcement.
+- **Multi-file coordinated generation** (orchestrator.py `_iter_candidate_files`/`_apply_multi_file_candidate`): Candidates may return a `files: [{file_path, full_content, rationale}, ...]` list in addition to the legacy single `file_path`/`full_content` pair. Every file is AST/placeholder-validated at the parser, and the APPLY path composes per-file `ChangeEngine.execute` calls with **batch-level rollback** — if file N fails, files 1..N-1 are restored from pre-apply snapshots (new files are unlinked). Preserves the 8-phase guarantees per file while adding atomic multi-file semantics. Master switch: `JARVIS_MULTI_FILE_GEN_ENABLED` (default `true`).
 - **ConsciousnessBridge** (`consciousness_bridge.py`): Injects memory/prediction into pipeline
 - **StrategicDirection** (`strategic_direction.py`): Manifesto principles injected into every generation prompt
 - **AutoCommitter** (`auto_committer.py`): Structured git commits with O+V signature after successful APPLY+VERIFY. Conventional commit format, risk-tier metadata, protected-branch push prevention.
@@ -124,6 +125,8 @@ python3 scripts/ouroboros_battle_test.py --cost-cap 0.50 --idle-timeout 600 -v
 ```
 
 Boots the full 6-layer stack: GovernedLoopService, IntakeLayer (16 sensors), TrinityConsciousness, StrategicDirection, CommProtocol, SerpentFlow CLI.
+
+On startup, the harness auto-reaps any zombie `ouroboros_battle_test.py` processes from earlier crashed sessions (psutil-based, strict path-tail match, SIGTERM → SIGKILL escalation) and removes stale `.jarvis/intake_router.lock` files whose owning PID is dead. Prevents budget competition between sessions. Master switch: `JARVIS_BATTLE_REAP_ZOMBIES` (default `true`).
 
 ## File Layout (Key Paths)
 
