@@ -969,3 +969,41 @@ def _negate_iso(iso: str) -> str:
     """
     # Invert character codes so lexicographic ascending sort becomes descending.
     return "".join(chr(0x7F - (ord(c) & 0x7F)) for c in iso)
+
+
+# ---------------------------------------------------------------------------
+# Process-level singleton
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_STORE: Optional[UserPreferenceStore] = None
+_DEFAULT_STORE_LOCK = threading.Lock()
+
+
+def get_default_store(
+    project_root: Optional[Path] = None,
+) -> UserPreferenceStore:
+    """Return a process-wide :class:`UserPreferenceStore` singleton.
+
+    The first call decides the project root — subsequent calls ignore
+    the ``project_root`` argument and return the cached instance. This
+    lets orchestrator hooks reach the store without threading it through
+    every service constructor. Tests should create their own instance
+    with an explicit ``project_root`` (the singleton is not re-entrant).
+    """
+    global _DEFAULT_STORE
+    with _DEFAULT_STORE_LOCK:
+        if _DEFAULT_STORE is None:
+            root = Path(project_root) if project_root else Path(os.getcwd())
+            _DEFAULT_STORE = UserPreferenceStore(
+                root, auto_register_protected_paths=True
+            )
+        return _DEFAULT_STORE
+
+
+def reset_default_store() -> None:
+    """Clear the process-wide singleton. Primarily for tests."""
+    global _DEFAULT_STORE
+    with _DEFAULT_STORE_LOCK:
+        _DEFAULT_STORE = None
+    register_protected_path_provider(None)

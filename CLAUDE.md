@@ -118,6 +118,7 @@ O+V is **proactive** (self-initiating), not reactive (human-prompted). Key capab
 - **Auto-commit post-APPLY**: AutoCommitter creates structured git commits with O+V signature after VERIFY passes. Conventional commit type/scope inference, risk-tier metadata, protected-branch push prevention. Master switch: `JARVIS_AUTO_COMMIT_ENABLED`.
 - **MCP tool forwarding**: External MCP tools discovered from connected servers and injected into generation prompt (Gap #7). Model can call `mcp_{server}_{tool}` during tool loop. Policy engine auto-allows MCP tools; external servers handle their own auth.
 - **Live context auto-compaction**: When tool loop prompt exceeds 75% of budget, older tool results are compacted into a deterministic summary (Gap #8). Preserves recent 6 chunks. No model inference. Env: `JARVIS_TOOL_LOOP_COMPACT_THRESHOLD`.
+- **UserPreferenceMemory** (`user_preference_memory.py`): Persistent typed memory across O+V sessions, modeled on Claude Code auto-memory (typed `.md` files with YAML frontmatter + `MEMORY.md` index). Six types: `USER` / `FEEDBACK` / `PROJECT` / `REFERENCE` / `FORBIDDEN_PATH` / `STYLE`. Storage lives at `.jarvis/user_preferences/`. Three integration points: (1) StrategicDirection injects a relevance-scored "User Preferences" prompt section at CONTEXT_EXPANSION (scored by path overlap > tag match > type bonus, FORBIDDEN_PATH doubled on matching target). (2) ToolExecutor's `_is_protected_path` consults a global provider hook — every `FORBIDDEN_PATH` memory becomes a hard block on Venom `edit_file`/`write_file`/`delete_file` (same layer as the hardcoded `.git/`, `.env`, `credentials` list). (3) Post-rejection postmortem: when a human rejects an `APPROVAL_REQUIRED` op, `orchestrator.py` auto-extracts the rejection reason into a `FEEDBACK` memory tagged `("rejection", "approval")`, deduped by op-description slug so repeat rejections upsert rather than pile up. Manifesto §4 (synthetic soul, cross-session learning) + §6 (threshold-triggered neuroplasticity).
 
 ## Battle Test
 
@@ -152,6 +153,7 @@ backend/core/ouroboros/
     repair_engine.py            # L2 self-repair
     consciousness_bridge.py     # Consciousness integration
     strategic_direction.py      # Manifesto injection
+    user_preference_memory.py   # Persistent typed memory across sessions (Task #195)
     serpent_animation.py        # ASCII animation
     intake/
       sensors/                  # 16 sensors (5,400+ lines)

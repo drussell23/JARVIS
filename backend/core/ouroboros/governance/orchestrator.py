@@ -595,6 +595,39 @@ class GovernedOrchestrator:
         except Exception:
             logger.debug("[Orchestrator] Goal injection skipped", exc_info=True)
 
+        # ---- Task #195: User Preference Memory injection ----
+        # Append typed user-preference memories (facts about the user,
+        # feedback rules, forbidden paths, style choices) scoped by
+        # relevance to the current op. Zero model inference — pure
+        # deterministic scoring. Empty when no memory matches the op
+        # shape, so silent on fresh repos.
+        try:
+            from backend.core.ouroboros.governance.user_preference_memory import (
+                get_default_store,
+            )
+            _user_prefs = get_default_store(self._config.project_root)
+            _pref_prompt = _user_prefs.format_for_prompt(
+                target_files=list(ctx.target_files),
+                description=ctx.description,
+                risk_tier=str(getattr(ctx, "risk_tier", "") or ""),
+            )
+            if _pref_prompt:
+                _existing = getattr(ctx, "strategic_memory_prompt", "") or ""
+                ctx = ctx.with_strategic_memory_context(
+                    strategic_intent_id=ctx.strategic_intent_id or "user-prefs-v1",
+                    strategic_memory_fact_ids=ctx.strategic_memory_fact_ids,
+                    strategic_memory_prompt=(
+                        _existing + "\n\n" + _pref_prompt if _existing else _pref_prompt
+                    ),
+                    strategic_memory_digest=ctx.strategic_memory_digest,
+                )
+                logger.debug(
+                    "[Orchestrator] User preferences injected (%d chars)",
+                    len(_pref_prompt),
+                )
+        except Exception:
+            logger.debug("[Orchestrator] User preference injection skipped", exc_info=True)
+
         # ---- Policy engine check (declarative YAML rules) ----
         # Evaluated BEFORE the risk-engine BLOCKED short-circuit so that
         # explicit deny rules in policy files can override the risk engine.
@@ -2888,6 +2921,26 @@ class GovernedOrchestrator:
                         )
                     except Exception:
                         pass  # Constraint recording is best-effort
+
+                # Task #195: Persist rejection to UserPreferenceStore as a
+                # typed FEEDBACK memory. NegativeConstraintStore is domain-
+                # keyed (cross-session prompt adaptation); the user-pref
+                # memory is human-readable and surfaces in the User
+                # Preferences prompt section on any similarly-shaped op.
+                if _reject_reason:
+                    try:
+                        from backend.core.ouroboros.governance.user_preference_memory import (
+                            get_default_store,
+                        )
+                        get_default_store().record_approval_rejection(
+                            op_id=ctx.op_id,
+                            description=ctx.description,
+                            target_files=list(ctx.target_files),
+                            reason=_reject_reason,
+                            approver=getattr(decision, "approver", "human") or "human",
+                        )
+                    except Exception:
+                        pass  # Postmortem persistence is best-effort
 
                 return ctx
 
