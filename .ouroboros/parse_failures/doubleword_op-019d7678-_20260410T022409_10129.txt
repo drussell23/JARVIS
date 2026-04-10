@@ -1,0 +1,23 @@
+# provider=doubleword
+# op_id=op-019d7678-7961-7310-a9cc-104c45a642b9-cau
+# exception_type=JSONDecodeError
+# exception_message=Unterminated string starting at: line 5 column 23 (char 76)
+# raw_len=79
+# extracted_len=79
+# ============================================================
+# RAW (pre-extraction):
+# ============================================================
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1
+
+# ============================================================
+# EXTRACTED (post _extract_json_block):
+# ============================================================
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1

@@ -121,6 +121,10 @@ def _ensure_writable_state_dir() -> None:
             "JARVIS_SELF_EVOLUTION_DIR": str(_fallback / "ouroboros" / "evolution"),
             "JARVIS_GOVERNED_L3_STATE_DIR": str(_fallback / "ouroboros" / "execution_graphs"),
             "JARVIS_GOVERNED_L4_STATE_DIR": str(_fallback / "ouroboros" / "advanced_coordination"),
+            # OperationLedger (change_engine Phase 1 writes). If this is not
+            # redirected, every op that reaches APPLY dies on the first
+            # ledger.append() with PermissionError — see bt-2026-04-10-075150.
+            "OUROBOROS_LEDGER_DIR": str(_fallback / "ouroboros" / "ledger"),
         }
         for key, val in _redirects.items():
             if not os.environ.get(key):

@@ -35,6 +35,18 @@ The gate is gated by ``JARVIS_ASCII_GATE`` (default ``true``). Setting
 it to ``false`` bypasses the gate entirely — scan functions still work
 when called directly, but :func:`is_enabled` returns ``False`` so the
 orchestrator's caller can skip the scan loop.
+
+Auto-repair (punctuation safe-list)
+-----------------------------------
+Before hard-rejecting, the gate applies a deterministic repair pass
+over a safe-list of common Unicode punctuation → ASCII equivalents
+(em-dash → ``-``, curly quotes → straight, ellipsis → ``...`` etc).
+This fixes the deterministic training-data artifact where Claude emits
+U+2014 in a ``requirements.txt`` comment on every generation for the
+same file, without relaxing the ``rapidفuzz``-class letter guard —
+Unicode *letters* (Arabic, Cyrillic, Greek etc) still hard-fail
+because they can occupy identifier positions. Gated by
+``JARVIS_ASCII_GATE_AUTO_REPAIR`` (default ``true``).
 """
 from __future__ import annotations
 
@@ -63,6 +75,127 @@ def is_enabled() -> bool:
     return os.environ.get("JARVIS_ASCII_GATE", "true").lower() not in (
         "false", "0", "no", "off",
     )
+
+
+def is_auto_repair_enabled() -> bool:
+    """Return whether the punctuation auto-repair pass is active.
+
+    Default ``true``. Set ``JARVIS_ASCII_GATE_AUTO_REPAIR=false`` to
+    disable and restore pure reject-only behaviour (useful for tests
+    that want to observe the raw rejection path).
+    """
+    return os.environ.get(
+        "JARVIS_ASCII_GATE_AUTO_REPAIR", "true",
+    ).lower() not in ("false", "0", "no", "off")
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Unicode punctuation auto-repair table
+# ─────────────────────────────────────────────────────────────────────
+#
+# Safe-list only. The mapping rule is: "would a human reading this as
+# plain text accept the ASCII substitute as visually-equivalent?". We
+# DO NOT repair Unicode letters (Arabic/Cyrillic/Greek/etc) because
+# those can occupy Python identifier positions and silently make a
+# package unresolvable (the ``rapidفuzz``-class failure). Letters must
+# hard-fail the gate so the model re-generates.
+#
+# Every entry here is punctuation, whitespace, or a symbol that has an
+# unambiguous ASCII substitute. Order within a codepoint doesn't matter
+# — this is a lookup table, applied via ``str.translate``.
+
+_UNICODE_REPAIR_MAP: Dict[int, str] = {
+    # Dashes / minus
+    0x2010: "-",   # HYPHEN
+    0x2011: "-",   # NON-BREAKING HYPHEN
+    0x2012: "-",   # FIGURE DASH
+    0x2013: "-",   # EN DASH
+    0x2014: "-",   # EM DASH  ← the main offender in requirements.txt
+    0x2015: "-",   # HORIZONTAL BAR
+    0x2212: "-",   # MINUS SIGN
+    # Single quotes / apostrophe
+    0x2018: "'",   # LEFT SINGLE QUOTATION MARK
+    0x2019: "'",   # RIGHT SINGLE QUOTATION MARK (also "apostrophe")
+    0x201A: "'",   # SINGLE LOW-9 QUOTATION MARK
+    0x201B: "'",   # SINGLE HIGH-REVERSED-9 QUOTATION MARK
+    0x2032: "'",   # PRIME
+    0x02B9: "'",   # MODIFIER LETTER PRIME
+    0x02BC: "'",   # MODIFIER LETTER APOSTROPHE
+    # Double quotes
+    0x201C: '"',   # LEFT DOUBLE QUOTATION MARK
+    0x201D: '"',   # RIGHT DOUBLE QUOTATION MARK
+    0x201E: '"',   # DOUBLE LOW-9 QUOTATION MARK
+    0x201F: '"',   # DOUBLE HIGH-REVERSED-9 QUOTATION MARK
+    0x2033: '"',   # DOUBLE PRIME
+    0x2036: '"',   # REVERSED DOUBLE PRIME
+    0x00AB: '"',   # LEFT-POINTING DOUBLE ANGLE QUOTATION MARK
+    0x00BB: '"',   # RIGHT-POINTING DOUBLE ANGLE QUOTATION MARK
+    # Ellipsis
+    0x2026: "...",  # HORIZONTAL ELLIPSIS
+    # Spaces
+    0x00A0: " ",   # NO-BREAK SPACE
+    0x2002: " ",   # EN SPACE
+    0x2003: " ",   # EM SPACE
+    0x2004: " ",   # THREE-PER-EM SPACE
+    0x2005: " ",   # FOUR-PER-EM SPACE
+    0x2006: " ",   # SIX-PER-EM SPACE
+    0x2007: " ",   # FIGURE SPACE
+    0x2008: " ",   # PUNCTUATION SPACE
+    0x2009: " ",   # THIN SPACE
+    0x200A: " ",   # HAIR SPACE
+    0x202F: " ",   # NARROW NO-BREAK SPACE
+    0x205F: " ",   # MEDIUM MATHEMATICAL SPACE
+    0x3000: " ",   # IDEOGRAPHIC SPACE
+    # Zero-width / invisible (strip — these are notorious for code pollution)
+    0x200B: "",    # ZERO WIDTH SPACE
+    0x200C: "",    # ZERO WIDTH NON-JOINER
+    0x200D: "",    # ZERO WIDTH JOINER
+    0x2060: "",    # WORD JOINER
+    0xFEFF: "",    # ZERO WIDTH NO-BREAK SPACE (BOM)
+    # Bullets / list markers (only inside comments/prose — safe to ASCII-ize)
+    0x2022: "*",   # BULLET
+    0x2023: ">",   # TRIANGULAR BULLET
+    0x25E6: "o",   # WHITE BULLET
+    0x2043: "-",   # HYPHEN BULLET
+    # Common typographic symbols with clear ASCII equivalents
+    0x00D7: "x",   # MULTIPLICATION SIGN
+    0x00F7: "/",   # DIVISION SIGN
+    0x00B7: ".",   # MIDDLE DOT
+    0x2044: "/",   # FRACTION SLASH
+}
+
+
+def repair_content(content: str) -> Tuple[str, int]:
+    """Apply the punctuation safe-list to a content string.
+
+    Returns ``(repaired_content, num_repairs)``. Fast-paths when the
+    content has no non-ASCII codepoints (the common success case) by
+    skipping the translate call.
+
+    Does NOT repair Unicode letters — those will still show up in
+    :func:`scan_content` after this pass runs and will hard-fail the
+    gate. This is intentional per Manifesto §6 (Iron Gate structural
+    fixes): punctuation drift gets auto-healed, identifier corruption
+    gets the model re-running.
+    """
+    if not isinstance(content, str) or not content:
+        return content, 0
+
+    # Fast path — common case where content is already clean ASCII.
+    if content.isascii():
+        return content, 0
+
+    # str.translate accepts int-keyed mapping directly. Collect count
+    # first so we can report telemetry without a second pass.
+    repairs = 0
+    for cp in _UNICODE_REPAIR_MAP:
+        if chr(cp) in content:
+            repairs += content.count(chr(cp))
+
+    if repairs == 0:
+        return content, 0
+
+    return content.translate(_UNICODE_REPAIR_MAP), repairs
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -113,6 +246,8 @@ class BadCodepoint:
 # ─────────────────────────────────────────────────────────────────────
 
 _REJECTION_COUNT = 0
+_REPAIR_COUNT = 0
+_REPAIRED_CANDIDATES = 0
 
 
 def record_rejection(num_samples: int = 1) -> None:
@@ -135,6 +270,37 @@ def reset_rejection_count() -> None:
     """Reset the counter to zero. Primarily for tests."""
     global _REJECTION_COUNT
     _REJECTION_COUNT = 0
+
+
+def record_repair(num_codepoints: int) -> None:
+    """Increment the repair counters.
+
+    Records both the total codepoints repaired (``num_codepoints``) and
+    a "candidates with at least one repair" counter so callers can
+    distinguish "one big repair" from "many small repairs".
+    """
+    global _REPAIR_COUNT, _REPAIRED_CANDIDATES
+    if num_codepoints <= 0:
+        return
+    _REPAIR_COUNT += int(num_codepoints)
+    _REPAIRED_CANDIDATES += 1
+
+
+def get_repair_count() -> int:
+    """Return the total number of codepoints repaired since process start."""
+    return _REPAIR_COUNT
+
+
+def get_repaired_candidate_count() -> int:
+    """Return the number of distinct candidates that had at least one repair."""
+    return _REPAIRED_CANDIDATES
+
+
+def reset_repair_count() -> None:
+    """Reset the repair counters. Primarily for tests."""
+    global _REPAIR_COUNT, _REPAIRED_CANDIDATES
+    _REPAIR_COUNT = 0
+    _REPAIRED_CANDIDATES = 0
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -345,12 +511,14 @@ class AsciiStrictGate:
         self,
         max_samples: int = _DEFAULT_MAX_SAMPLES,
         enabled: Optional[bool] = None,
+        auto_repair: Optional[bool] = None,
     ) -> None:
         self.max_samples = max_samples
-        # Explicit ``enabled`` param overrides env var — useful for
-        # tests that need to force-enable or force-disable the gate
-        # without monkey-patching the environment.
+        # Explicit ``enabled`` / ``auto_repair`` params override env
+        # vars — useful for tests that need to force-toggle without
+        # monkey-patching the environment.
         self._enabled_override = enabled
+        self._auto_repair_override = auto_repair
 
     @property
     def enabled(self) -> bool:
@@ -358,11 +526,73 @@ class AsciiStrictGate:
             return self._enabled_override
         return is_enabled()
 
+    @property
+    def auto_repair_enabled(self) -> bool:
+        if self._auto_repair_override is not None:
+            return self._auto_repair_override
+        return is_auto_repair_enabled()
+
     def scan(self, candidate: Dict[str, Any]) -> List[BadCodepoint]:
         """Scan a candidate; empty list when gate is disabled."""
         if not self.enabled:
             return []
         return scan_candidate(candidate, max_samples=self.max_samples)
+
+    def repair(self, candidate: Dict[str, Any]) -> int:
+        """Apply the punctuation auto-repair to a candidate **in-place**.
+
+        Walks both the multi-file (``candidate["files"]``) and
+        single-file (``candidate["full_content"]`` / ``raw_content``)
+        shapes, substituting each string via :func:`repair_content` and
+        mutating the candidate dict in place.
+
+        Returns
+        -------
+        int
+            Total number of codepoints repaired across all content
+            fields of the candidate. ``0`` when the candidate is
+            already clean or auto-repair is disabled.
+
+        Notes
+        -----
+        Does not mutate the candidate when ``auto_repair_enabled`` is
+        ``False``. Does not mutate fields that aren't strings. Records
+        telemetry exactly once per candidate (not once per field) so
+        the "repaired candidates" counter tracks real candidates, not
+        multi-file sub-entries.
+        """
+        if not self.auto_repair_enabled or not isinstance(candidate, dict):
+            return 0
+
+        total_repairs = 0
+
+        # Multi-file shape: mutate each entry's full_content + raw_content.
+        files_field = candidate.get("files")
+        if isinstance(files_field, list) and files_field:
+            for entry in files_field:
+                if not isinstance(entry, dict):
+                    continue
+                for key in ("full_content", "raw_content"):
+                    val = entry.get(key)
+                    if isinstance(val, str) and val:
+                        repaired, n = repair_content(val)
+                        if n > 0:
+                            entry[key] = repaired
+                            total_repairs += n
+
+        # Single-file shape: mutate the top-level full_content/raw_content.
+        for key in ("full_content", "raw_content"):
+            val = candidate.get(key)
+            if isinstance(val, str) and val:
+                repaired, n = repair_content(val)
+                if n > 0:
+                    candidate[key] = repaired
+                    total_repairs += n
+
+        if total_repairs > 0:
+            record_repair(total_repairs)
+
+        return total_repairs
 
     def check(
         self, candidate: Dict[str, Any],
@@ -374,8 +604,32 @@ class AsciiStrictGate:
         ``reason`` is the pre-formatted error string for raising as
         ``RuntimeError`` and ``samples`` is the offender list for
         telemetry / retry feedback.
+
+        When auto-repair is enabled, punctuation offenders are healed
+        in-place **before** the hard-reject scan. Only Unicode letters
+        (and other unlisted codepoints) survive the repair pass and
+        trigger rejection. The candidate dict is mutated in place with
+        repaired content so the orchestrator can feed it straight into
+        APPLY without a second handoff.
+
+        The candidate may be annotated with ``_ascii_repair_count`` for
+        observability so the orchestrator can log the repair delta.
         """
-        offenders = self.scan(candidate)
+        if not self.enabled:
+            return True, None, []
+
+        # Phase 1 — punctuation auto-repair (mutating). Does nothing
+        # when JARVIS_ASCII_GATE_AUTO_REPAIR=false.
+        repairs = self.repair(candidate)
+        if repairs > 0 and isinstance(candidate, dict):
+            # Annotate for orchestrator logging. Non-load-bearing — any
+            # downstream consumer that doesn't know about this key just
+            # ignores it.
+            candidate["_ascii_repair_count"] = repairs
+
+        # Phase 2 — hard-reject scan over what's left. Letters + any
+        # codepoint not in the safe-list will show up here.
+        offenders = scan_candidate(candidate, max_samples=self.max_samples)
         if not offenders:
             return True, None, []
         record_rejection(len(offenders))

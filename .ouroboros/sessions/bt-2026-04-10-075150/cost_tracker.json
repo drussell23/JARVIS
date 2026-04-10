@@ -1,0 +1,8 @@
+{
+  "budget_usd": 0.5,
+  "total_spent": 0.197321,
+  "breakdown": {
+    "claude": 0.196074,
+    "doubleword": 0.001247
+  }
+}

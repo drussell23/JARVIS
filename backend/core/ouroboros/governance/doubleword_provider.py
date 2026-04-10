@@ -53,6 +53,20 @@ _DW_COMPLEXITY_MAX_TOKENS: Dict[str, int] = {
     "complex": 16384,
     "heavy_code": 16384,
 }
+
+# Dynamic max_tokens constants — parallel to _CLAUDE_OUTPUT_* in providers.py.
+# Task #187 added dynamic output budgets to Claude but not DW, so a
+# "trivial" task targeting a 7KB requirements.txt was truncated at the
+# 4096 ceiling — bt-2026-04-10-091829 debug.log:677 showed DW streaming
+# ~4203 chars of valid ASCII content before JSON parse failed with
+# "Unterminated string". The formula: needed = (bytes/CHARS_PER_TOKEN) *
+# SAFETY + OVERHEAD, floored at the complexity ceiling, capped at
+# _DW_MAX_TOKENS. Small files keep the cheap complexity ceiling; large
+# files get a proportionally bigger budget so full-file rewrites never
+# truncate.
+_DW_CHARS_PER_TOKEN = 3.5
+_DW_OUTPUT_SAFETY = 1.4
+_DW_OUTPUT_OVERHEAD_TOKENS = 2048  # JSON schema wrapper + rationale + slack
 _DW_POLL_INTERVAL_S = float(os.environ.get("DOUBLEWORD_POLL_INTERVAL_S", "5"))
 _DW_MAX_WAIT_S = float(os.environ.get("DOUBLEWORD_MAX_WAIT_S", "3600"))
 _DW_TEMPERATURE = float(os.environ.get("DOUBLEWORD_TEMPERATURE", "0.2"))

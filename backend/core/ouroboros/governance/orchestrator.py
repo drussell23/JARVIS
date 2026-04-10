@@ -1447,12 +1447,29 @@ class GovernedOrchestrator:
                 # Gate 2 — ASCII/Unicode strictness (prevent rapidفuzz-class
                 # typos where model emits non-ASCII code points in identifier
                 # positions). Deterministic scan; O(n) on candidate size.
-                # Delegates to AsciiStrictGate which handles both single-file
-                # and multi-file candidate shapes.
+                # Delegates to AsciiStrictGate which:
+                #   1) auto-repairs common punctuation drift (em-dash →
+                #      hyphen, curly quotes → straight, ellipsis → ...,
+                #      nbsp → space, zero-width strip) IN-PLACE on the
+                #      candidate dict — healing the deterministic training-
+                #      data artifact where Claude always inserts U+2014 at
+                #      the same byte offset of requirements.txt.
+                #   2) hard-rejects any residue (Unicode letters in
+                #      identifier positions, unlisted symbols) per the
+                #      original Iron Gate contract.
                 _ascii_gate = AsciiStrictGate()
                 if _ascii_gate.enabled:
                     for _cand in generation.candidates:
                         _ok, _ascii_err, _bad_list = _ascii_gate.check(_cand)
+                        _repairs = _cand.get("_ascii_repair_count", 0) if isinstance(_cand, dict) else 0
+                        if _repairs:
+                            logger.info(
+                                "[Orchestrator] Iron Gate — ascii_auto_repaired: "
+                                "%d codepoint(s) healed file=%s op=%s",
+                                _repairs,
+                                _cand.get("file_path", "?") if isinstance(_cand, dict) else "?",
+                                ctx.op_id[:12],
+                            )
                         if not _ok:
                             _samples_str = ", ".join(
                                 bc.format_sample() for bc in _bad_list

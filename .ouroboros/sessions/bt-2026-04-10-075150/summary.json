@@ -1,0 +1,29 @@
+{
+  "session_id": "bt-2026-04-10-075150",
+  "stop_reason": "idle_timeout",
+  "duration_s": 674.9579949378967,
+  "stats": {
+    "attempted": 0,
+    "completed": 0,
+    "failed": 0,
+    "cancelled": 0,
+    "queued": 0
+  },
+  "cost_total": 0.197321,
+  "cost_breakdown": {
+    "claude": 0.196074,
+    "doubleword": 0.001247
+  },
+  "branch_stats": {
+    "commits": 0,
+    "files_changed": 0,
+    "insertions": 0,
+    "deletions": 0
+  },
+  "convergence_state": "INSUFFICIENT_DATA",
+  "convergence_slope": 0.0,
+  "convergence_r2": 0.0,
+  "top_sensors": [],
+  "top_techniques": [],
+  "operations": []
+}

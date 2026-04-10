@@ -3338,20 +3338,27 @@ class ClaudeProvider:
             if self._tool_loop is not None:
                 _stream_callback = getattr(self._tool_loop, "on_token", None)
 
-            # Assistant prefill: force JSON-first output. Without this, Claude
-            # routinely prefaces responses with reasoning preamble ("Looking at
-            # the task, I need to:") and wraps the JSON in a markdown ```json
-            # fence — both of which waste output tokens and, on starved budgets,
-            # cause the JSON body to truncate mid-string. By seeding the
-            # assistant turn with an opening brace, the model physically cannot
-            # emit anything before the JSON. Works for codegen schema 2b.1 and
-            # tool-call schema 2b.2 — both start with '{'. Extended thinking
-            # requires the assistant response to begin with a thinking block,
-            # so prefill is disabled when thinking is on. Env override:
-            # JARVIS_CLAUDE_JSON_PREFILL (default on).
+            # Assistant prefill: force JSON-first output by seeding the
+            # assistant turn with an opening brace. Benefit: eliminates the
+            # "Looking at the task, I need to:" preamble that Claude emits
+            # despite explicit instructions, which saves output tokens and
+            # prevents mid-string JSON truncation on large files.
+            #
+            # Caveat observed in battle test bt-2026-04-10-073056:
+            # claude-sonnet-4-6 on the stream endpoint returned 400
+            # "This model does not support assistant message prefill. The
+            # conversation must end with a user message." even with
+            # thinking=off. Until we characterise exactly when this fires
+            # (model version? stream vs create? tools+prefill combo?),
+            # prefill is opt-in. Enable with JARVIS_CLAUDE_JSON_PREFILL=true.
+            #
+            # A BadRequestError carrying the "prefill" signature is caught
+            # below in _do_stream/create and the call is retried without
+            # prefill as a safety net — so users enabling the feature get
+            # graceful degradation instead of a dead op.
             _prefill_enabled = (
-                os.environ.get("JARVIS_CLAUDE_JSON_PREFILL", "true").lower()
-                not in ("false", "0", "no", "off")
+                os.environ.get("JARVIS_CLAUDE_JSON_PREFILL", "false").lower()
+                in ("true", "1", "yes", "on")
             )
             _use_prefill = _prefill_enabled and not _use_thinking
             _messages: List[Dict[str, Any]] = [
@@ -3430,8 +3437,43 @@ class ClaudeProvider:
                         except (TypeError, ValueError):
                             _cached_input = 0
 
+                async def _stream_with_prefill_fallback() -> None:
+                    """Run _do_stream; on prefill-rejection 400, strip the
+                    prefill and retry once. Some model versions reject
+                    assistant message prefill even when thinking is off
+                    (battle test bt-2026-04-10-073056). This makes the
+                    failure graceful instead of dead-op.
+                    """
+                    try:
+                        await _do_stream()
+                    except Exception as _exc:
+                        _msg = str(_exc).lower()
+                        # Anthropic returns BadRequestError subclassed from
+                        # APIStatusError; we match on the message signature
+                        # to avoid importing the SDK class conditionally.
+                        if (
+                            _use_prefill
+                            and "prefill" in _msg
+                            and len(_messages) >= 2
+                            and _messages[-1].get("role") == "assistant"
+                        ):
+                            logger.warning(
+                                "[ClaudeProvider] prefill rejected by model "
+                                "(%s) — retrying without assistant prefill",
+                                type(_exc).__name__,
+                            )
+                            # Strip the assistant prefill and retry in-place.
+                            # _do_stream reads _messages from enclosing scope,
+                            # so modifying the list is visible on retry.
+                            _messages.pop()
+                            await _do_stream()
+                        else:
+                            raise
+
                 try:
-                    await asyncio.wait_for(_do_stream(), timeout=timeout_s)
+                    await asyncio.wait_for(
+                        _stream_with_prefill_fallback(), timeout=timeout_s,
+                    )
                 except asyncio.TimeoutError as _te:
                     # Re-raise with enough context that the cascade log and
                     # postmortem can explain what actually happened. Without
@@ -3461,9 +3503,30 @@ class ClaudeProvider:
                 }
                 if _thinking_param is not None:
                     _create_kwargs["thinking"] = _thinking_param
+                async def _create_with_prefill_fallback() -> Any:
+                    """Same prefill-rejection fallback as the stream path."""
+                    try:
+                        return await client.messages.create(**_create_kwargs)
+                    except Exception as _exc:
+                        _msg = str(_exc).lower()
+                        if (
+                            _use_prefill
+                            and "prefill" in _msg
+                            and len(_messages) >= 2
+                            and _messages[-1].get("role") == "assistant"
+                        ):
+                            logger.warning(
+                                "[ClaudeProvider] prefill rejected by model "
+                                "(%s) — retrying without assistant prefill",
+                                type(_exc).__name__,
+                            )
+                            _messages.pop()
+                            return await client.messages.create(**_create_kwargs)
+                        raise
+
                 try:
                     msg = await asyncio.wait_for(
-                        client.messages.create(**_create_kwargs),
+                        _create_with_prefill_fallback(),
                         timeout=timeout_s,
                     )
                 except asyncio.TimeoutError as _te:
