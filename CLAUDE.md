@@ -59,7 +59,7 @@ Deterministic routing based on signal urgency + source + task complexity. Stampe
 
 ### Timeout Enforcement (Route-Aware)
 
-- **IMMEDIATE generation**: 45s + 5s grace (fast reflex — don't burn budget on hung calls)
+- **IMMEDIATE generation**: 60s + 5s grace (fast reflex — accounts for Venom tool rounds)
 - **STANDARD generation**: 120s + 5s grace
 - **COMPLEX/BACKGROUND generation**: 180s + 5s grace
 - **Fallback provider**: Hard cap at 60s (`_FALLBACK_MAX_TIMEOUT_S`)

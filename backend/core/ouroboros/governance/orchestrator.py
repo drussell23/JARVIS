@@ -1349,7 +1349,7 @@ class GovernedOrchestrator:
                 #   BACKGROUND/SPECULATIVE: 180s — no urgency
                 _route = getattr(ctx, "provider_route", "") or "standard"
                 _route_timeouts = {
-                    "immediate": 45.0,
+                    "immediate": 60.0,
                     "standard": 120.0,
                     "complex": 180.0,
                     "background": 180.0,
@@ -1517,7 +1517,8 @@ class GovernedOrchestrator:
                     # ── IMMEDIATE → STANDARD demotion ──
                     # If IMMEDIATE exhausted Claude retries, demote to
                     # STANDARD (DW primary → Claude fallback) for one
-                    # more attempt. Better to get a DW answer than none.
+                    # last attempt.  Direct call — don't rely on the
+                    # exhausted for-loop range.
                     if _route == "immediate":
                         logger.info(
                             "[Orchestrator] IMMEDIATE exhausted — demoting "
@@ -1529,8 +1530,21 @@ class GovernedOrchestrator:
                             ctx, "provider_route_reason",
                             f"demotion:immediate_exhausted:{_err_msg[:60]}",
                         )
-                        generate_retries_remaining = 0  # one more attempt
-                        continue
+                        _route = "standard"  # update local for timeout calc
+                        try:
+                            _dem_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=120.0)
+                            generation = await asyncio.wait_for(
+                                self._generator.generate(ctx, _dem_deadline),
+                                timeout=125.0,
+                            )
+                            if generation is not None and len(generation.candidates) > 0:
+                                break  # success — continue pipeline
+                            generation = None
+                        except Exception as dem_exc:
+                            logger.warning(
+                                "[Orchestrator] STANDARD demotion also failed: %s [%s]",
+                                dem_exc, ctx.op_id,
+                            )
 
                     # All retries truly exhausted
                     ctx = ctx.advance(
