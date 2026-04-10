@@ -1479,8 +1479,33 @@ class GovernedOrchestrator:
                                 "%d offender(s) [%s] op=%s",
                                 len(_bad_list), _samples_str, ctx.op_id[:12],
                             )
+                            # Stash the rejected content + offenders on the
+                            # exception so the retry feedback builder can
+                            # extract the specific offending lines and show
+                            # them back to the model in context. Without
+                            # this, the model only sees "U+0641 at L106:C6"
+                            # which isn't enough to locate the bad identifier
+                            # in a 200-line file.
+                            _rejected_content = ""
+                            if isinstance(_cand, dict):
+                                _rejected_content = (
+                                    _cand.get("full_content", "")
+                                    or _cand.get("raw_content", "")
+                                    or ""
+                                )
+                                if not _rejected_content and isinstance(_cand.get("files"), list):
+                                    # Multi-file shape — grab the first file matching an offender
+                                    _bad_path = _bad_list[0].file_path if _bad_list else ""
+                                    for _entry in _cand["files"]:
+                                        if isinstance(_entry, dict) and _entry.get("file_path") == _bad_path:
+                                            _rejected_content = _entry.get("full_content", "") or ""
+                                            break
                             generation = None
-                            raise RuntimeError(_ascii_err or "ascii_corruption")
+                            _ascii_exc = RuntimeError(_ascii_err or "ascii_corruption")
+                            # Private attributes — read back in the retry feedback builder.
+                            _ascii_exc._ascii_bad_codepoints = _bad_list  # type: ignore[attr-defined]
+                            _ascii_exc._ascii_rejected_content = _rejected_content  # type: ignore[attr-defined]
+                            raise _ascii_exc
 
                 # Heartbeat: generation succeeded with candidates
                 try:
@@ -1681,16 +1706,72 @@ class GovernedOrchestrator:
                         "- Exploration is NOT optional. Patches without context corrupt code.\n"
                     )
                 elif _err_str.startswith("ascii_corruption"):
+                    # Extract the specific offending lines from the rejected
+                    # candidate so the model sees its own bad code in context
+                    # (not just "U+0641 at L106:C6"). The orchestrator stashed
+                    # the full_content + BadCodepoint list on the exception
+                    # just before raising, so we can reconstruct the exact
+                    # lines that tripped the gate and show ASCII-only
+                    # corrections alongside them.
+                    _rejected = getattr(exc, "_ascii_rejected_content", "") or ""
+                    _bad_cps = getattr(exc, "_ascii_bad_codepoints", None) or []
+                    _offending_block = ""
+                    if _rejected and _bad_cps:
+                        _lines = _rejected.split("\n")
+                        _seen_lines: set = set()
+                        _line_samples = []
+                        for _bc in _bad_cps[:5]:
+                            _ln = getattr(_bc, "line", 0)
+                            if _ln <= 0 or _ln in _seen_lines or _ln > len(_lines):
+                                continue
+                            _seen_lines.add(_ln)
+                            _raw_line = _lines[_ln - 1]
+                            # Build an ASCII-only "what-to-write-instead" hint
+                            # by stripping every non-ASCII codepoint. For
+                            # letters this produces a visible "hole" that
+                            # shows where the model must make a deliberate
+                            # spelling decision (e.g. rapidفuzz → rapiduzz,
+                            # which makes the corruption obvious).
+                            _stripped = "".join(
+                                ch if ord(ch) < 128 else "·" for ch in _raw_line
+                            )
+                            _cp_hex = f"U+{getattr(_bc, 'codepoint', 0):04X}"
+                            _char = getattr(_bc, "char", "?")
+                            _line_samples.append(
+                                f"  line {_ln} contains {_cp_hex} '{_char}':\n"
+                                f"      WRONG: {_raw_line}\n"
+                                f"      (·=non-ASCII): {_stripped}"
+                            )
+                        if _line_samples:
+                            _offending_block = (
+                                "\nSPECIFIC OFFENDING LINES FROM YOUR LAST OUTPUT:\n"
+                                + "\n".join(_line_samples) + "\n"
+                            )
+
                     _error_feedback = (
                         "## PREVIOUS GENERATION REJECTED — UNICODE CORRUPTION\n\n"
-                        f"{_err_str[:400]}\n\n"
+                        f"{_err_str[:400]}\n"
+                        f"{_offending_block}\n"
                         "INSTRUCTIONS FOR RETRY:\n"
-                        "- The previous file contained non-ASCII characters in code\n"
-                        "  positions (identifiers, imports, keywords). This is a typo.\n"
-                        "- Re-emit the file using only 7-bit ASCII for all code tokens.\n"
-                        "- Common culprits: Arabic 'ف' for 'f', Cyrillic 'а' for 'a',\n"
-                        "  smart quotes for straight quotes.\n"
-                        "- Double-check package names (rapidfuzz, not rapidفuzz).\n"
+                        "- The lines above contain Unicode LETTERS that look like\n"
+                        "  ASCII letters but aren't. These are HARD FAILURES — the\n"
+                        "  Iron Gate auto-heals punctuation (em-dash, curly quotes,\n"
+                        "  ellipsis, nbsp) but it will NEVER auto-heal letters\n"
+                        "  because changing a letter changes the identity of a\n"
+                        "  package, function, or variable.\n"
+                        "- Re-emit the ENTIRE file using only 7-bit ASCII (0x20–0x7E)\n"
+                        "  for every character. Every byte must satisfy ord(c) < 128.\n"
+                        "- Common culprits in package manifests (requirements.txt,\n"
+                        "  package.json, pyproject.toml, Pipfile):\n"
+                        "    * U+0641 Arabic FEH 'ف' looks like ASCII 'f'\n"
+                        "    * U+0430 Cyrillic 'а' looks like ASCII 'a'\n"
+                        "    * U+0435 Cyrillic 'е' looks like ASCII 'e'\n"
+                        "    * U+03BF Greek omicron 'ο' looks like ASCII 'o'\n"
+                        "  If you're about to write 'rapidfuzz', type r-a-p-i-d-f-u-z-z\n"
+                        "  using ONLY characters from the ASCII table. Do not rely on\n"
+                        "  memory of what the package name 'looks like'.\n"
+                        "- Sanity check: every single character in your output must\n"
+                        "  be in the range 0x20–0x7E or \\n (0x0A). No exceptions.\n"
                     )
                 else:
                     _error_feedback = (
