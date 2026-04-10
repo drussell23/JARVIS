@@ -40,6 +40,10 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Sequence, Tuple
 if TYPE_CHECKING:
     from backend.core.ouroboros.governance.multi_repo.registry import RepoRegistry
 
+from backend.core.ouroboros.governance.ascii_strict_gate import (
+    AsciiStrictGate,
+    build_retry_feedback as _ascii_gate_retry_feedback,
+)
 from backend.core.ouroboros.governance.test_runner import BlockedPathError
 from backend.core.ouroboros.governance.context_expander import ContextExpander
 from backend.core.ouroboros.governance.approval_provider import (
@@ -1443,42 +1447,23 @@ class GovernedOrchestrator:
                 # Gate 2 — ASCII/Unicode strictness (prevent rapidفuzz-class
                 # typos where model emits non-ASCII code points in identifier
                 # positions). Deterministic scan; O(n) on candidate size.
-                _ascii_gate_enabled = (
-                    os.environ.get("JARVIS_ASCII_GATE", "true").lower() == "true"
-                )
-                if _ascii_gate_enabled:
-                    _bad_chars: list[Tuple[str, int, str]] = []
+                # Delegates to AsciiStrictGate which handles both single-file
+                # and multi-file candidate shapes.
+                _ascii_gate = AsciiStrictGate()
+                if _ascii_gate.enabled:
                     for _cand in generation.candidates:
-                        _content = _cand.get("full_content", "") or _cand.get("raw_content", "")
-                        if not isinstance(_content, str):
-                            continue
-                        _fp = str(_cand.get("file_path", "?"))
-                        # Scan every codepoint; record first few offenders.
-                        for _idx, _ch in enumerate(_content):
-                            if ord(_ch) > 127:
-                                _bad_chars.append((_fp, _idx, _ch))
-                                if len(_bad_chars) >= 3:
-                                    break
-                        if _bad_chars:
-                            break
-                    if _bad_chars:
-                        _samples = ", ".join(
-                            f"{_fp}@{_idx}:U+{ord(_ch):04X}"
-                            for _fp, _idx, _ch in _bad_chars
-                        )
-                        _ascii_err = (
-                            f"ascii_corruption: non-ASCII codepoint(s) in generated "
-                            f"content [{_samples}]. ALL identifiers, keywords, and "
-                            f"module names MUST be 7-bit ASCII. String literals may "
-                            f"contain Unicode only inside explicit quotes. Re-emit "
-                            f"the file with correct ASCII spellings."
-                        )
-                        logger.warning(
-                            "[Orchestrator] Iron Gate — ascii_corruption: %s [%s]",
-                            _samples, ctx.op_id[:12],
-                        )
-                        generation = None
-                        raise RuntimeError(_ascii_err)
+                        _ok, _ascii_err, _bad_list = _ascii_gate.check(_cand)
+                        if not _ok:
+                            _samples_str = ", ".join(
+                                bc.format_sample() for bc in _bad_list
+                            )
+                            logger.warning(
+                                "[Orchestrator] Iron Gate — ascii_corruption: "
+                                "%d offender(s) [%s] op=%s",
+                                len(_bad_list), _samples_str, ctx.op_id[:12],
+                            )
+                            generation = None
+                            raise RuntimeError(_ascii_err or "ascii_corruption")
 
                 # Heartbeat: generation succeeded with candidates
                 try:
