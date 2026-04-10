@@ -2537,6 +2537,70 @@ class GovernedOrchestrator:
 
         # ---- Phase 6: APPROVE (conditional) ----
         if risk_tier is RiskTier.APPROVAL_REQUIRED:
+            # New: async PR review path. Opt-in via JARVIS_ORANGE_PR_ENABLED.
+            # When enabled, we file a GitHub PR on a review branch instead of
+            # blocking the loop. On any failure, we fall back to the existing
+            # CLI approval provider path.
+            try:
+                from backend.core.ouroboros.governance.orange_pr_reviewer import (
+                    OrangePRReviewer,
+                    is_orange_pr_enabled,
+                )
+                _orange_pr_on = is_orange_pr_enabled()
+            except Exception:
+                _orange_pr_on = False
+
+            if _orange_pr_on:
+                try:
+                    _files_for_pr = self._iter_candidate_files(best_candidate)
+                    _reviewer = OrangePRReviewer(self._config.project_root)
+                    _pr_result = await _reviewer.create_review_pr(
+                        op_id=ctx.op_id,
+                        description=ctx.description,
+                        files=_files_for_pr,
+                        evidence={
+                            "risk_tier": risk_tier.name,
+                            "target_files": list(ctx.target_files),
+                            "file_count": len(_files_for_pr),
+                        },
+                        risk_tier_name=risk_tier.name,
+                    )
+                except Exception:
+                    logger.exception(
+                        "[Orchestrator] Orange PR reviewer raised for op=%s; "
+                        "falling back to CLI approval",
+                        ctx.op_id,
+                    )
+                    _pr_result = None
+
+                if _pr_result is not None:
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="pending_pr_review",
+                    )
+                    await self._record_ledger(
+                        ctx,
+                        OperationState.GATING,
+                        {
+                            "event": "orange_pr_created",
+                            "pr_url": _pr_result.url,
+                            "branch": _pr_result.branch,
+                            "base_branch": _pr_result.base_branch,
+                            "risk_tier": risk_tier.name,
+                        },
+                    )
+                    logger.info(
+                        "[Orchestrator] op=%s handed off to async PR review: %s",
+                        ctx.op_id, _pr_result.url,
+                    )
+                    return ctx
+                # Fall through to the CLI approval path on PR creation failure.
+                logger.warning(
+                    "[Orchestrator] op=%s Orange PR creation failed; "
+                    "using CLI approval fallback",
+                    ctx.op_id,
+                )
+
             if self._approval_provider is None:
                 # No approval provider available -> CANCELLED
                 ctx = ctx.advance(
