@@ -1,0 +1,55 @@
+# provider=claude-api
+# op_id=op-019d762a-1457-70e4-b5f5-dac59dbdf567-cau
+# exception_type=JSONDecodeError
+# exception_message=Expecting value: line 1 column 1 (char 0)
+# raw_len=3556
+# extracted_len=3556
+# ============================================================
+# RAW (pre-extraction):
+# ============================================================
+Looking at the file, I need to:
+1. Add docstrings to the 3 undocumented public symbols: `SecurityVerdict`, `SecurityFinding`, `SecurityFinding` fields, and `SecurityReviewer.__init__`, `_build_system_prompt`, `_build_review_prompt` (private methods don't count as public). Let me re-check which 3/4 public symbols are undocumented.
+
+Public symbols in the module:
+- `SecurityVerdict` (class) — no docstring ❌
+- `SecurityFinding` (dataclass) — no docstring ❌  
+- `SecurityReviewResult` (dataclass) — no docstring ❌
+- `SecurityReviewer` (class) — has docstring ✅
+
+So I need to add docstrings to `SecurityVerdict`, `SecurityFinding`, and `SecurityReviewResult`.
+
+I also need to create a test file.
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/security_reviewer.py",
+      "full_content": "\"\"\"SecurityReviewer — LLM-as-a-Judge for automated security analysis.\n\nUses the existing PrimeClient to send generated code to a brain for\nsecurity-focused review BEFORE the human APPROVE gate. The reviewer\nlooks for: injection vulnerabilities, hardcoded secrets, unsafe imports,\npermission escalation, sandbox escape patterns, and supply chain risks.\n\nReturns a SecurityVerdict that the orchestrator uses to:\n    - PASS: proceed to APPROVE gate normally\n    - WARN: proceed but flag warnings in the approval prompt\n    - BLOCK: reject immediately, never reaches human approval\n\nDesign:\n    - Reuses existing PrimeClient (no new HTTP connections)\n    - Routes to Claude API by default (highest judgment quality for security)\n    - Configurable brain via JARVIS_SECURITY_REVIEW_BRAIN env var\n    - All errors → PASS with warning (never blocks pipeline due to reviewer crash)\n    - Structured output parsed from JSON, with markdown fallback\n\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport logging\nimport os\nimport re\nfrom dataclasses import dataclass\nfrom enum import Enum\nfrom typing import Any, Dict, List, Optional\n\nlogger = logging.getLogger(__name__)\n\n\nclass SecurityVerdict(str, Enum):\n    \"\"\"Outcome of a security review pass.\n\n    PASS  — no issues found; proceed to APPROVE gate normally.\n    WARN  — non-blocking issues; flagged in the approval prompt.\n    BLOCK — critical security issue; rejected before human approval.\n    \"\"\"\n\n    PASS = \"pass\"       # no issues found\n    WARN = \"warn\"       # non-blocking issues\n    BLOCK = \"block\"     # critical security issue — reject\n\n\n@dataclass(frozen=True)\nclass SecurityFinding:\n    \"\"\"A single security finding produced by the LLM reviewer.\n\n    Attributes:\n        severity:       Risk level — one of \"critical\", \"high\", \"medium\", \"low\", \"info\".\n        category:       Finding category (e.g. \"injection\", \"secrets\", \"sandbox_escape\").\n        file_path:      Repo-relative path of the affected file.\n        line_number:    Approximate line number within the file, or None if unknown.\n        description:    Human-readable description of the vulnerability.\n        recommendation: Suggested remediation action.\n    \"\"\"\n\n    severity: str           # \"critical\", \"high\", \"medium\", \"low\", \"info\"\n    category: str           # \"injection\", \"secrets\", \"permissions\", \"sandbox_escape\", etc.\n    file_path: str\n    line_number: Optional[int]\n    description: str\n    recommendation: str\n\n\n@dataclass(frozen=True)\nclass SecurityReviewResult:\n    \"\"\"Aggregated result returned by
+
+# ============================================================
+# EXTRACTED (post _extract_json_block):
+# ============================================================
+Looking at the file, I need to:
+1. Add docstrings to the 3 undocumented public symbols: `SecurityVerdict`, `SecurityFinding`, `SecurityFinding` fields, and `SecurityReviewer.__init__`, `_build_system_prompt`, `_build_review_prompt` (private methods don't count as public). Let me re-check which 3/4 public symbols are undocumented.
+
+Public symbols in the module:
+- `SecurityVerdict` (class) — no docstring ❌
+- `SecurityFinding` (dataclass) — no docstring ❌  
+- `SecurityReviewResult` (dataclass) — no docstring ❌
+- `SecurityReviewer` (class) — has docstring ✅
+
+So I need to add docstrings to `SecurityVerdict`, `SecurityFinding`, and `SecurityReviewResult`.
+
+I also need to create a test file.
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/security_reviewer.py",
+      "full_content": "\"\"\"SecurityReviewer — LLM-as-a-Judge for automated security analysis.\n\nUses the existing PrimeClient to send generated code to a brain for\nsecurity-focused review BEFORE the human APPROVE gate. The reviewer\nlooks for: injection vulnerabilities, hardcoded secrets, unsafe imports,\npermission escalation, sandbox escape patterns, and supply chain risks.\n\nReturns a SecurityVerdict that the orchestrator uses to:\n    - PASS: proceed to APPROVE gate normally\n    - WARN: proceed but flag warnings in the approval prompt\n    - BLOCK: reject immediately, never reaches human approval\n\nDesign:\n    - Reuses existing PrimeClient (no new HTTP connections)\n    - Routes to Claude API by default (highest judgment quality for security)\n    - Configurable brain via JARVIS_SECURITY_REVIEW_BRAIN env var\n    - All errors → PASS with warning (never blocks pipeline due to reviewer crash)\n    - Structured output parsed from JSON, with markdown fallback\n\"\"\"\nfrom __future__ import annotations\n\nimport json\nimport logging\nimport os\nimport re\nfrom dataclasses import dataclass\nfrom enum import Enum\nfrom typing import Any, Dict, List, Optional\n\nlogger = logging.getLogger(__name__)\n\n\nclass SecurityVerdict(str, Enum):\n    \"\"\"Outcome of a security review pass.\n\n    PASS  — no issues found; proceed to APPROVE gate normally.\n    WARN  — non-blocking issues; flagged in the approval prompt.\n    BLOCK — critical security issue; rejected before human approval.\n    \"\"\"\n\n    PASS = \"pass\"       # no issues found\n    WARN = \"warn\"       # non-blocking issues\n    BLOCK = \"block\"     # critical security issue — reject\n\n\n@dataclass(frozen=True)\nclass SecurityFinding:\n    \"\"\"A single security finding produced by the LLM reviewer.\n\n    Attributes:\n        severity:       Risk level — one of \"critical\", \"high\", \"medium\", \"low\", \"info\".\n        category:       Finding category (e.g. \"injection\", \"secrets\", \"sandbox_escape\").\n        file_path:      Repo-relative path of the affected file.\n        line_number:    Approximate line number within the file, or None if unknown.\n        description:    Human-readable description of the vulnerability.\n        recommendation: Suggested remediation action.\n    \"\"\"\n\n    severity: str           # \"critical\", \"high\", \"medium\", \"low\", \"info\"\n    category: str           # \"injection\", \"secrets\", \"permissions\", \"sandbox_escape\", etc.\n    file_path: str\n    line_number: Optional[int]\n    description: str\n    recommendation: str\n\n\n@dataclass(frozen=True)\nclass SecurityReviewResult:\n    \"\"\"Aggregated result returned by

@@ -1633,6 +1633,162 @@ async def _emit_content_failure_to_reactor(payload: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
+#: Max head/tail sample lengths for parse-failure log lines. Keeps the
+#: log readable while preserving enough context to eyeball the problem.
+_PARSE_FAIL_HEAD = 400
+_PARSE_FAIL_TAIL = 200
+
+#: How many parse-failure dumps we're willing to write per process before
+#: going silent — prevents a runaway provider from filling the disk.
+_PARSE_FAIL_DUMP_LIMIT = 32
+_parse_fail_dump_count = 0
+
+
+def _parse_failure_dump_dir() -> Optional[Path]:
+    """Resolve the directory where full parse-failure raw dumps should land.
+
+    Priority:
+      1. Explicit ``JARVIS_PARSE_FAILURE_DUMP_DIR`` env var (absolute or
+         relative to cwd). Disabled when set to ``off`` / ``none`` / ``""``.
+      2. ``<cwd>/.ouroboros/parse_failures`` when a ``.ouroboros`` directory
+         already exists next to the process — piggybacks on the battle test
+         session layout without creating stray dirs elsewhere.
+      3. None — in which case only the truncated log sample is emitted.
+    """
+    override = os.environ.get("JARVIS_PARSE_FAILURE_DUMP_DIR")
+    if override is not None:
+        if override.strip().lower() in ("", "off", "none", "false", "0"):
+            return None
+        return Path(override).expanduser()
+    cwd_ouroboros = Path.cwd() / ".ouroboros"
+    if cwd_ouroboros.is_dir():
+        return cwd_ouroboros / "parse_failures"
+    return None
+
+
+def _log_parse_failure(
+    provider_name: str,
+    raw: str,
+    extracted: str,
+    exc: Exception,
+    *,
+    op_id: str = "",
+) -> Optional[Path]:
+    """Emit a diagnostic log line and optionally persist the raw response.
+
+    Called from the JSON-parse failure site in :func:`_parse_generation_response`.
+    The goal is to make ``schema_invalid:json_parse_error`` *debuggable* —
+    when a model returns something that neither ``json.loads`` nor
+    ``_repair_json`` can handle, we want to know **what** it returned.
+
+    Log contents (single WARNING line):
+      - ``[provider] JSON parse failed`` header
+      - Decode error location (line/col) when the underlying exception is a
+        :class:`json.JSONDecodeError`
+      - Lengths of ``raw`` vs ``extracted`` (so we can tell if extraction
+        itself corrupted things)
+      - Head sample: first ``_PARSE_FAIL_HEAD`` chars of the extracted block
+      - Tail sample: last ``_PARSE_FAIL_TAIL`` chars (catches truncation)
+
+    Persistence:
+      - When a dump dir is resolvable, writes
+        ``<dump_dir>/<provider>_<op_id>_<ts>.txt`` with both the raw and
+        extracted payloads. This is a best-effort side channel — a failed
+        write is logged at DEBUG and swallowed so the parse-error path
+        stays reliable.
+      - Caps at ``_PARSE_FAIL_DUMP_LIMIT`` dumps per process to prevent a
+        runaway model from filling the disk.
+
+    Returns the Path that was written (if any), or ``None``.
+    """
+    global _parse_fail_dump_count
+
+    # --- Build log sample ------------------------------------------------
+    # Extract decode position when possible — JSONDecodeError is our most
+    # common failure mode and the (line, col, pos) tuple tells us exactly
+    # where the parser choked, which is far more useful than "parse error".
+    err_loc = ""
+    if isinstance(exc, json.JSONDecodeError):
+        err_loc = f" at L{exc.lineno}:C{exc.colno} (pos={exc.pos})"
+
+    # Head/tail sampling — the full extracted block is often tens of KB,
+    # but the defect is almost always visible in the first ~400 chars
+    # (syntax errors near the start) or last ~200 chars (truncation).
+    extracted_len = len(extracted)
+    raw_len = len(raw)
+    head_sample = extracted[:_PARSE_FAIL_HEAD]
+    tail_sample = (
+        extracted[-_PARSE_FAIL_TAIL:] if extracted_len > _PARSE_FAIL_HEAD else ""
+    )
+
+    def _sanitize(s: str) -> str:
+        # Collapse newlines so the log line stays on one line; repr-escape
+        # control chars so the reader can still see them.
+        return s.replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+
+    op_tag = f" op={op_id[:12]}" if op_id else ""
+    tail_block = f" TAIL={_sanitize(tail_sample)!r}" if tail_sample else ""
+    logger.warning(
+        "[%s] JSON parse failed%s%s (raw=%d, extracted=%d) — %s: %s "
+        "HEAD=%r%s",
+        provider_name,
+        op_tag,
+        err_loc,
+        raw_len,
+        extracted_len,
+        type(exc).__name__,
+        str(exc)[:200],
+        _sanitize(head_sample),
+        tail_block,
+    )
+
+    # --- Persist full dump (best-effort) ---------------------------------
+    if _parse_fail_dump_count >= _PARSE_FAIL_DUMP_LIMIT:
+        return None
+    dump_dir = _parse_failure_dump_dir()
+    if dump_dir is None:
+        return None
+    try:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        ts = time.strftime("%Y%m%dT%H%M%S")
+        op_suffix = f"_{op_id[:12]}" if op_id else ""
+        # Include PID so two processes writing in the same second don't
+        # collide on filename.
+        fname = f"{provider_name}{op_suffix}_{ts}_{os.getpid()}.txt"
+        dump_path = dump_dir / fname
+        header_lines = [
+            f"# provider={provider_name}",
+            f"# op_id={op_id}",
+            f"# exception_type={type(exc).__name__}",
+            f"# exception_message={str(exc)[:500]}",
+            f"# raw_len={raw_len}",
+            f"# extracted_len={extracted_len}",
+            "# " + "=" * 60,
+            "# RAW (pre-extraction):",
+            "# " + "=" * 60,
+            raw,
+            "",
+            "# " + "=" * 60,
+            "# EXTRACTED (post _extract_json_block):",
+            "# " + "=" * 60,
+            extracted,
+            "",
+        ]
+        dump_path.write_text("\n".join(header_lines), encoding="utf-8")
+        _parse_fail_dump_count += 1
+        logger.info(
+            "[%s] Parse-failure raw dumped to %s",
+            provider_name, dump_path,
+        )
+        return dump_path
+    except Exception as dump_exc:  # noqa: BLE001 — best-effort
+        logger.debug(
+            "[%s] Parse-failure dump write failed (non-fatal): %s",
+            provider_name, dump_exc,
+        )
+        return None
+
+
 def _extract_json_block(raw: str) -> str:
     """Extract JSON from raw model output, handling common wrapping formats.
 
@@ -2124,6 +2280,15 @@ def _parse_generation_response(
             data = json.loads(_repair_json(_extracted))
             logger.info("[%s] JSON repair succeeded (original was malformed)", pfx)
         except (json.JSONDecodeError, ValueError) as exc:
+            # Emit a diagnostic sample + dump the full raw so the
+            # ``json_parse_error`` failure mode is actually debuggable.
+            _log_parse_failure(
+                provider_name=pfx,
+                raw=raw,
+                extracted=_extracted,
+                exc=exc,
+                op_id=getattr(ctx, "op_id", "") or "",
+            )
             raise RuntimeError(f"{pfx}_schema_invalid:json_parse_error") from exc
 
     # Step 2: top-level type
@@ -2805,6 +2970,20 @@ class PrimeProvider:
 _CLAUDE_INPUT_COST_PER_M = 3.00   # Sonnet pricing
 _CLAUDE_OUTPUT_COST_PER_M = 15.00
 
+# ---- Dynamic output budget constants -----------------------------------------
+# The legacy 8192 cap was too small for full-file rewrites of anything above
+# ~600 lines — parse-failure dumps in .ouroboros/parse_failures/ showed the
+# JSON body truncating mid-string on large targets. Claude Sonnet 4.5/4.6
+# supports up to 64K output tokens; 32K is the safe default ceiling. Override
+# via JARVIS_CLAUDE_MAX_OUTPUT_TOKENS.
+_CLAUDE_OUTPUT_CEILING_DEFAULT = 32768
+_CLAUDE_OUTPUT_FLOOR = 4096
+# Chars per token (rough): 3.5 for code-heavy content (more punctuation).
+# Safety multiplier covers JSON overhead (schema, keys, escaping).
+_CLAUDE_CHARS_PER_TOKEN = 3.5
+_CLAUDE_OUTPUT_SAFETY = 1.4
+_CLAUDE_OUTPUT_OVERHEAD_TOKENS = 2048  # schema wrapper + rationale + misc
+
 
 class ClaudeProvider:
     """CandidateProvider adapter wrapping the Anthropic Claude API.
@@ -2830,7 +3009,7 @@ class ClaudeProvider:
         self,
         api_key: str,
         model: str = "claude-sonnet-4-20250514",
-        max_tokens: int = 8192,
+        max_tokens: int = 16384,
         max_cost_per_op: float = 0.50,
         daily_budget: float = 10.00,
         repo_root: Optional[Path] = None,
@@ -2841,7 +3020,20 @@ class ClaudeProvider:
     ) -> None:
         self._api_key = api_key
         self._model = model
-        self._max_tokens = max_tokens
+        # Dynamic output budget ceiling — env-tunable up to the model's actual
+        # max (currently 64000 for Sonnet 4.5/4.6). Default 32768 is a safe
+        # middle ground that handles ~1800-line full-file rewrites while
+        # avoiding API rejections for older models.
+        _env_ceiling = int(
+            os.environ.get(
+                "JARVIS_CLAUDE_MAX_OUTPUT_TOKENS",
+                str(_CLAUDE_OUTPUT_CEILING_DEFAULT),
+            )
+        )
+        self._output_ceiling = max(_CLAUDE_OUTPUT_FLOOR, _env_ceiling)
+        # max_tokens is the *starting* budget; dynamic computation may scale
+        # it up per call based on target file sizes. Never exceeds ceiling.
+        self._max_tokens = min(max_tokens, self._output_ceiling)
         self._max_cost_per_op = max_cost_per_op
         self._daily_budget = daily_budget
         self._daily_spend: float = 0.0
@@ -2906,6 +3098,69 @@ class ClaudeProvider:
         )
         output_cost = (output_tokens / 1_000_000) * _CLAUDE_OUTPUT_COST_PER_M
         return input_cost + output_cost
+
+    def _resolve_target_path(self, rel_path: str, primary_repo: str) -> Optional[Path]:
+        """Resolve a repo-relative target path to an absolute Path.
+
+        Consults ``self._repo_roots`` (multi-repo map) first, then falls back
+        to ``self._repo_root``. Returns None if neither is configured.
+        """
+        if self._repo_roots and primary_repo in self._repo_roots:
+            return self._repo_roots[primary_repo] / rel_path
+        if self._repo_root:
+            return self._repo_root / rel_path
+        return None
+
+    def _compute_output_budget(
+        self,
+        context: Any,
+        *,
+        is_tool_round: bool,
+    ) -> int:
+        """Compute the per-call output token budget.
+
+        Tool rounds: small fixed budget (tool call JSON is ~1K tokens).
+        Codegen rounds: scale with target file size so full-file rewrites
+        don't truncate mid-string. Floors at :data:`_CLAUDE_OUTPUT_FLOOR`,
+        caps at ``self._output_ceiling`` (env-tunable).
+
+        Root-cause rationale: parse failures in ``.ouroboros/parse_failures/``
+        showed 1137-line targets being truncated at the legacy 8192 cap.
+        The only way to make full_content generation reliable is to
+        budget output tokens from the actual file size.
+        """
+        if is_tool_round:
+            base = getattr(self._tool_loop, "_tool_round_max_tokens", 1024) if self._tool_loop else 1024
+            return min(int(base), self._output_ceiling)
+
+        target_files = getattr(context, "target_files", ()) or ()
+        primary_repo = getattr(context, "primary_repo", "jarvis")
+        total_bytes = 0
+        resolved = 0
+        for rel in target_files:
+            path = self._resolve_target_path(rel, primary_repo)
+            if path is None:
+                continue
+            try:
+                if path.exists() and path.is_file():
+                    total_bytes += path.stat().st_size
+                    resolved += 1
+            except OSError:
+                continue
+
+        if resolved == 0:
+            # New files or unresolvable paths — fall back to starting budget
+            return min(self._max_tokens, self._output_ceiling)
+
+        # Convert bytes → tokens (roughly chars/CHARS_PER_TOKEN), apply safety
+        # margin for JSON schema overhead and rationale text, and add a
+        # fixed overhead for the schema wrapper itself.
+        raw_tokens = total_bytes / _CLAUDE_CHARS_PER_TOKEN
+        needed = int(raw_tokens * _CLAUDE_OUTPUT_SAFETY) + _CLAUDE_OUTPUT_OVERHEAD_TOKENS
+        # Always at least as generous as the starting budget (so small files
+        # don't get squeezed below the legacy behaviour).
+        needed = max(needed, self._max_tokens, _CLAUDE_OUTPUT_FLOOR)
+        return min(needed, self._output_ceiling)
 
     async def generate(
         self,
@@ -3007,15 +3262,19 @@ class ClaudeProvider:
             else:
                 user_content = p
 
-            # Smart max_tokens: during Venom tool rounds, the model only needs
-            # ~200-1024 tokens (tool call JSON). Full 8192 only for final patch.
-            _effective_max_tokens = min(self._max_tokens, 8192)
+            # Dynamic max_tokens: scale from target file sizes so large
+            # full-file rewrites don't truncate mid-string. Tool rounds
+            # get a small fixed budget (tool call JSON is ~1K tokens).
+            # See _compute_output_budget for the rationale — this replaces
+            # the legacy hardcoded min(self._max_tokens, 8192) which was
+            # causing parse failures on files > ~600 lines.
             _is_tool_round = (
                 self._tool_loop is not None
                 and getattr(self._tool_loop, "is_tool_round", False)
             )
-            if _is_tool_round:
-                _effective_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
+            _effective_max_tokens = self._compute_output_budget(
+                context, is_tool_round=_is_tool_round,
+            )
 
             # Extended thinking: enable deep reasoning for non-tool-round calls.
             # Tool rounds are fast JSON responses — no thinking needed.
@@ -3025,6 +3284,23 @@ class ClaudeProvider:
             _use_thinking = self._extended_thinking and not _is_tool_round
             _task_complexity = getattr(context, "task_complexity", "")
             if _task_complexity == "trivial":
+                _use_thinking = False
+            # Starved-budget guard: extended thinking burns ~10s of latency
+            # before the first output token. When this is a fallback call
+            # after Tier 0 DW exhausted its budget, timeout_s can be ~15-20s
+            # — leaving so little headroom that thinking guarantees a
+            # TimeoutError with zero bytes written. Below the breakeven we
+            # disable thinking so the call has a chance to actually emit
+            # the patch. Breakeven override: JARVIS_THINKING_BREAKEVEN_S.
+            _THINKING_BREAKEVEN_S = float(
+                os.environ.get("JARVIS_THINKING_BREAKEVEN_S", "25.0")
+            )
+            if _use_thinking and timeout_s < _THINKING_BREAKEVEN_S:
+                logger.info(
+                    "[ClaudeProvider] budget %.1fs < breakeven %.1fs — "
+                    "disabling extended thinking for this call",
+                    timeout_s, _THINKING_BREAKEVEN_S,
+                )
                 _use_thinking = False
             _temperature = 1.0 if _use_thinking else 0.2
             _thinking_param: Optional[Dict[str, Any]] = None
@@ -3036,10 +3312,11 @@ class ClaudeProvider:
                     "type": "enabled",
                     "budget_tokens": _thinking_tokens,
                 }
-                # max_tokens must accommodate thinking budget + output
-                _effective_max_tokens = max(
-                    _effective_max_tokens,
-                    _thinking_tokens + 4096,
+                # max_tokens must accommodate thinking budget + output,
+                # but never exceed the provider's hard ceiling.
+                _effective_max_tokens = min(
+                    max(_effective_max_tokens, _thinking_tokens + 4096),
+                    self._output_ceiling,
                 )
 
             # Prompt caching: mark the system prompt as cacheable.
@@ -3061,12 +3338,65 @@ class ClaudeProvider:
             if self._tool_loop is not None:
                 _stream_callback = getattr(self._tool_loop, "on_token", None)
 
+            # Assistant prefill: force JSON-first output. Without this, Claude
+            # routinely prefaces responses with reasoning preamble ("Looking at
+            # the task, I need to:") and wraps the JSON in a markdown ```json
+            # fence — both of which waste output tokens and, on starved budgets,
+            # cause the JSON body to truncate mid-string. By seeding the
+            # assistant turn with an opening brace, the model physically cannot
+            # emit anything before the JSON. Works for codegen schema 2b.1 and
+            # tool-call schema 2b.2 — both start with '{'. Extended thinking
+            # requires the assistant response to begin with a thinking block,
+            # so prefill is disabled when thinking is on. Env override:
+            # JARVIS_CLAUDE_JSON_PREFILL (default on).
+            _prefill_enabled = (
+                os.environ.get("JARVIS_CLAUDE_JSON_PREFILL", "true").lower()
+                not in ("false", "0", "no", "off")
+            )
+            _use_prefill = _prefill_enabled and not _use_thinking
+            _messages: List[Dict[str, Any]] = [
+                {"role": "user", "content": user_content},
+            ]
+            if _use_prefill:
+                _messages.append(
+                    {"role": "assistant", "content": "{"}
+                )
+
+            # Diagnostic log at the entry point of each Claude API call so
+            # that a silent TimeoutError can be traced back to a specific
+            # mode/budget/tool-round combination. The bare TimeoutError
+            # we were seeing in battle tests had zero context — this log
+            # line tells you exactly what was in flight.
+            _mode_label = "stream" if _stream_callback is not None else "create"
+            _prompt_chars = (
+                len(p) if isinstance(p, str)
+                else sum(
+                    len(part.get("text", "")) if isinstance(part, dict) else 0
+                    for part in (p if isinstance(p, list) else [])
+                )
+            )
+            logger.info(
+                "[ClaudeProvider] \u2192 %s model=%s timeout=%.1fs "
+                "max_tokens=%d temp=%.1f thinking=%s tool_round=%s "
+                "prompt_chars=%d",
+                _mode_label,
+                self._model,
+                timeout_s,
+                _effective_max_tokens,
+                _temperature,
+                "on" if _thinking_param is not None else "off",
+                "yes" if _is_tool_round else "no",
+                _prompt_chars,
+            )
+            _call_start = time.monotonic()
+
             if _stream_callback is not None:
                 # Streaming path: tokens appear in TUI as they're generated
                 raw_content = ""
                 input_tokens = 0
                 output_tokens = 0
                 _cached_input = 0
+                _stream_first_token_at: List[Optional[float]] = [None]
 
                 async def _do_stream() -> None:
                     nonlocal raw_content, input_tokens, output_tokens, _cached_input
@@ -3075,12 +3405,14 @@ class ClaudeProvider:
                         "max_tokens": _effective_max_tokens,
                         "temperature": _temperature,
                         "system": _system_with_cache,
-                        "messages": [{"role": "user", "content": user_content}],
+                        "messages": _messages,
                     }
                     if _thinking_param is not None:
                         _stream_kwargs["thinking"] = _thinking_param
                     async with client.messages.stream(**_stream_kwargs) as stream:
                         async for text in stream.text_stream:
+                            if _stream_first_token_at[0] is None:
+                                _stream_first_token_at[0] = time.monotonic()
                             raw_content += text
                             try:
                                 _stream_callback(text)
@@ -3098,7 +3430,26 @@ class ClaudeProvider:
                         except (TypeError, ValueError):
                             _cached_input = 0
 
-                await asyncio.wait_for(_do_stream(), timeout=timeout_s)
+                try:
+                    await asyncio.wait_for(_do_stream(), timeout=timeout_s)
+                except asyncio.TimeoutError as _te:
+                    # Re-raise with enough context that the cascade log and
+                    # postmortem can explain what actually happened. Without
+                    # this, callers see a bare `TimeoutError: ` with no
+                    # message, which is useless for debugging.
+                    _elapsed = time.monotonic() - _call_start
+                    _ttft = _stream_first_token_at[0]
+                    _ttft_str = (
+                        f"{_ttft - _call_start:.1f}s" if _ttft is not None
+                        else "NEVER"
+                    )
+                    raise asyncio.TimeoutError(
+                        f"claude stream timed out after {_elapsed:.1f}s "
+                        f"(budget={timeout_s:.1f}s, first_token={_ttft_str}, "
+                        f"bytes_received={len(raw_content)}, "
+                        f"tool_round={'yes' if _is_tool_round else 'no'}, "
+                        f"thinking={'on' if _thinking_param is not None else 'off'})"
+                    ) from _te
             else:
                 # Non-streaming fallback
                 _create_kwargs: Dict[str, Any] = {
@@ -3106,14 +3457,23 @@ class ClaudeProvider:
                     "max_tokens": _effective_max_tokens,
                     "temperature": _temperature,
                     "system": _system_with_cache,
-                    "messages": [{"role": "user", "content": user_content}],
+                    "messages": _messages,
                 }
                 if _thinking_param is not None:
                     _create_kwargs["thinking"] = _thinking_param
-                msg = await asyncio.wait_for(
-                    client.messages.create(**_create_kwargs),
-                    timeout=timeout_s,
-                )
+                try:
+                    msg = await asyncio.wait_for(
+                        client.messages.create(**_create_kwargs),
+                        timeout=timeout_s,
+                    )
+                except asyncio.TimeoutError as _te:
+                    _elapsed = time.monotonic() - _call_start
+                    raise asyncio.TimeoutError(
+                        f"claude create timed out after {_elapsed:.1f}s "
+                        f"(budget={timeout_s:.1f}s, "
+                        f"tool_round={'yes' if _is_tool_round else 'no'}, "
+                        f"thinking={'on' if _thinking_param is not None else 'off'})"
+                    ) from _te
                 _last_msg[0] = msg
                 # Extract text content only (skip thinking blocks)
                 raw_content = ""
@@ -3157,6 +3517,13 @@ class ClaudeProvider:
             _token_usage["output"] += output_tokens
             if total_cost >= self._max_cost_per_op:
                 raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
+            # Reassemble prefill: the API returns only content AFTER the
+            # seeded "{" — we must prepend it so downstream parsers receive
+            # a complete JSON object. Only do this when the returned text
+            # doesn't already start with "{" (defensive: some client
+            # versions echo the prefill).
+            if _use_prefill and raw_content and not raw_content.lstrip().startswith("{"):
+                raw_content = "{" + raw_content
             return raw_content
 
         # Complexity routing: skip Venom only for BACKGROUND/SPECULATIVE routes
@@ -3199,7 +3566,9 @@ class ClaudeProvider:
                 msg = await asyncio.wait_for(
                     client.messages.create(
                         model=self._model,
-                        max_tokens=min(self._max_tokens, 8192),
+                        max_tokens=self._compute_output_budget(
+                            context, is_tool_round=False,
+                        ),
                         temperature=0.2,
                         system=_CODEGEN_SYSTEM_PROMPT,
                         messages=messages,

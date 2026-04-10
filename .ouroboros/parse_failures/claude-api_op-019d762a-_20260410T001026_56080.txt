@@ -1,0 +1,67 @@
+# provider=claude-api
+# op_id=op-019d762a-145b-7e69-9689-010949d834ff-cau
+# exception_type=JSONDecodeError
+# exception_message=Expecting value: line 1 column 1 (char 0)
+# raw_len=3071
+# extracted_len=3071
+# ============================================================
+# RAW (pre-extraction):
+# ============================================================
+Looking at the task, I need to:
+
+1. Add docstrings to the 5/8 undocumented public symbols in `graduation_orchestrator.py`
+2. Create a test file `tests/test_graduation_orchestrator.py`
+
+Let me identify the undocumented public symbols. From the structural index, the public symbols are:
+- `AdaptiveThresholdResult` (dataclass, no docstring)
+- `compute_adaptive_threshold` (has docstring ✓)
+- `GraduationPhase` (no docstring)
+- `EphemeralUsageRecord` (no docstring)
+- `GraduationDecision` (no docstring)
+- `GraduationRecord` (no docstring)
+- `EphemeralUsageTracker` (has docstring ✓)
+- `GraduationOrchestrator` (has docstring ✓)
+
+So 5 undocumented: `AdaptiveThresholdResult`, `GraduationPhase`, `EphemeralUsageRecord`, `GraduationDecision`, `GraduationRecord`.
+
+Now I'll generate both files.
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/graduation_orchestrator.py",
+      "full_content": "\"\"\"GraduationOrchestrator — self-programming loop that converts ephemeral tools into permanent agents.\n\nThe final manifestation of the Ouroboros cycle: the snake eating its tail.\nWhen a synthesized ephemeral tool proves its value through repeated use,\nthe Graduation Orchestrator drives J-Prime to produce a permanent agent,\nvalidates it through ShadowHarness, commits it to the correct repo on an\nisolated worktree branch, and with human approval pushes a PR to GitHub.\n\nHardening requirements (baked in, not retrofitted):\n    H1: Git cleanliness check before mutation (git status --porcelain)\n    H2: Contract tests, not just pytest (BaseNeuralMeshAgent interface)\n    H3: PUSH_FAILED is an explicit phase (code preserved locally)\n    H4: Approval timeout -> discard worktree + log (30min default)\n    H5: Post-merge registration requires readiness probe\n    H6: Cost metering per J-Prime call (accumulated on GraduationRecord)\n\"\"\"\nfrom __future__ import annotations\n\nimport asyncio\nimport hashlib\nimport json\nimport logging\nimport math\nimport os\nimport re\nimport time\nimport uuid\nfrom dataclasses import asdict, dataclass, field\nfrom enum import Enum\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Optional, Tuple\n\nlogger = logging.getLogger(\"Ouroboros.GraduationOrchestrator\")\n\n# Pillar 6: Graduation threshold — count=3 defends against code bloat.\n# DEBUG_MUTATION_MODE=true overrides to count=1 for development testing.\n# NEVER enable DEBUG_MUTATION_MODE in production.\n_DEBUG_MUTATION = os.environ.get(\"DEBUG_MUTATION_MODE\", \"false\").lower() in (\"true\", \"1\", \"yes\")\n_GRADUATION_THRESHOLD = 1 if _DEBUG_MUTATION else int(os.environ.get(\"JARVIS_GRADUATION_THRESHOLD\", \"3\"))\n_APPROVAL_TIMEOUT_S = float(os.environ.get(\"JARVIS_GRADUATION_APPROVAL_TIMEOUT_S\", \"1800\"))\n_APPROVAL_POLL_S = 5.0\n_MAX_CONCURRENT = 1\n_PERSISTENCE_DIR = Path.home() / \".jarvis\" / \"ouroboros\" / \"graduations\"\n\n_STOP_WORDS = frozenset({\n    \"the\", \"a\", \"an\", \"for\", \"to\", \"and\", \"or\", \"in\", \"on\", \"
+
+# ============================================================
+# EXTRACTED (post _extract_json_block):
+# ============================================================
+Looking at the task, I need to:
+
+1. Add docstrings to the 5/8 undocumented public symbols in `graduation_orchestrator.py`
+2. Create a test file `tests/test_graduation_orchestrator.py`
+
+Let me identify the undocumented public symbols. From the structural index, the public symbols are:
+- `AdaptiveThresholdResult` (dataclass, no docstring)
+- `compute_adaptive_threshold` (has docstring ✓)
+- `GraduationPhase` (no docstring)
+- `EphemeralUsageRecord` (no docstring)
+- `GraduationDecision` (no docstring)
+- `GraduationRecord` (no docstring)
+- `EphemeralUsageTracker` (has docstring ✓)
+- `GraduationOrchestrator` (has docstring ✓)
+
+So 5 undocumented: `AdaptiveThresholdResult`, `GraduationPhase`, `EphemeralUsageRecord`, `GraduationDecision`, `GraduationRecord`.
+
+Now I'll generate both files.
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/graduation_orchestrator.py",
+      "full_content": "\"\"\"GraduationOrchestrator — self-programming loop that converts ephemeral tools into permanent agents.\n\nThe final manifestation of the Ouroboros cycle: the snake eating its tail.\nWhen a synthesized ephemeral tool proves its value through repeated use,\nthe Graduation Orchestrator drives J-Prime to produce a permanent agent,\nvalidates it through ShadowHarness, commits it to the correct repo on an\nisolated worktree branch, and with human approval pushes a PR to GitHub.\n\nHardening requirements (baked in, not retrofitted):\n    H1: Git cleanliness check before mutation (git status --porcelain)\n    H2: Contract tests, not just pytest (BaseNeuralMeshAgent interface)\n    H3: PUSH_FAILED is an explicit phase (code preserved locally)\n    H4: Approval timeout -> discard worktree + log (30min default)\n    H5: Post-merge registration requires readiness probe\n    H6: Cost metering per J-Prime call (accumulated on GraduationRecord)\n\"\"\"\nfrom __future__ import annotations\n\nimport asyncio\nimport hashlib\nimport json\nimport logging\nimport math\nimport os\nimport re\nimport time\nimport uuid\nfrom dataclasses import asdict, dataclass, field\nfrom enum import Enum\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Optional, Tuple\n\nlogger = logging.getLogger(\"Ouroboros.GraduationOrchestrator\")\n\n# Pillar 6: Graduation threshold — count=3 defends against code bloat.\n# DEBUG_MUTATION_MODE=true overrides to count=1 for development testing.\n# NEVER enable DEBUG_MUTATION_MODE in production.\n_DEBUG_MUTATION = os.environ.get(\"DEBUG_MUTATION_MODE\", \"false\").lower() in (\"true\", \"1\", \"yes\")\n_GRADUATION_THRESHOLD = 1 if _DEBUG_MUTATION else int(os.environ.get(\"JARVIS_GRADUATION_THRESHOLD\", \"3\"))\n_APPROVAL_TIMEOUT_S = float(os.environ.get(\"JARVIS_GRADUATION_APPROVAL_TIMEOUT_S\", \"1800\"))\n_APPROVAL_POLL_S = 5.0\n_MAX_CONCURRENT = 1\n_PERSISTENCE_DIR = Path.home() / \".jarvis\" / \"ouroboros\" / \"graduations\"\n\n_STOP_WORDS = frozenset({\n    \"the\", \"a\", \"an\", \"for\", \"to\", \"and\", \"or\", \"in\", \"on\", \"
