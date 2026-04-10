@@ -1,3 +1,6 @@
+# [Ouroboros] Modified by Ouroboros (op=op-019d78ce-) at 2026-04-10 19:13 UTC
+# Reason: Python 3.9.6 is PAST end-of-life (EOL: 2025-10). No security patches. Upgrade required.
+
 aiohappyeyeballs==2.6.1
 aiohttp==3.13.2
 aiohttp_cors==0.8.1
@@ -111,7 +114,7 @@ requests==2.32.5
 requests-oauthlib==2.0.0
 rich==14.2.0
 prompt_toolkit>=3.0.43  # Non-blocking async REPL for Ouroboros CLI
-# Optional TUI — required for --ui tui
+# Optional TUI -- required for --ui tui
 textual>=0.47.0  # v8.0.0 installed; TUI mode (--ui tui)
 rpds-py==0.27.1
 rsa==4.9.1
@@ -164,5 +167,8 @@ google-cloud-secret-manager>=2.20.0
 # GCP Compute Engine (for Spot VM auto-creation)
 google-cloud-compute>=1.40.0
 
-# GCP Monitoring API (for real VM CPU metrics — hypervisor-level, no agent needed)
+# GCP Monitoring API (for real VM CPU metrics -- hypervisor-level, no agent needed)
 google-cloud-monitoring>=2.0.0
+
+# Python 3.9.x is EOL (2025-10). Minimum supported version is now 3.11.
+# Upgrade your interpreter to Python 3.11 or 3.12 before installing.

@@ -1,0 +1,47 @@
+# provider=claude-api
+# op_id=op-019d78d0-27a5-72fb-a026-e3884eb98af2-cau
+# exception_type=JSONDecodeError
+# exception_message=Expecting value: line 1 column 1 (char 0)
+# raw_len=2990
+# extracted_len=2990
+# ============================================================
+# RAW (pre-extraction):
+# ============================================================
+Looking at the code, I need to:
+
+1. Fix the `# HACK/XXX are often quick fixes that can be resolved` comment at line 291 (it's a HACK marker itself that should be addressed - the comment is accurate but the logic could be improved)
+2. Create a test file for the uncovered module
+
+The HACK at line 291 is actually a comment describing the logic below it. The "fix" here is to resolve the `# HACK` comment by making the logic more robust and removing the self-referential HACK comment, replacing it with a proper docstring-style comment.
+
+Looking at the code more carefully: the comment `# HACK/XXX are often quick fixes that can be resolved` at line 291 is itself a comment explaining the logic. The actual HACK marker referenced in the op is the comment text. The fix is to clean up this comment so it doesn't read as a HACK marker (which would cause the scanner to find itself), and improve the logic.
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/intake/sensors/todo_scanner_sensor.py",
+      "full_content": "\"\"\"\nTodoScannerSensor — Finds unfinished work in the Trinity codebase.\n\nScans all Python files for TODO, FIXME, HACK, XXX, NOQA, and\nDEPRECATED markers. Classifies by priority and routes actionable\nitems through the Ouroboros pipeline.\n\nBoundary Principle:\n  Deterministic: Regex scan, file enumeration, priority classification.\n  Agentic: Resolution of the TODO (code generation) via pipeline.\n\"\"\"\nfrom __future__ import annotations\n\nimport logging\nimport os\nimport re\nfrom dataclasses import dataclass, field\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Optional, Tuple\nimport asyncio\n\nfrom backend.core.ouroboros.governance.intake.intent_envelope import make_envelope\n\nlogger = logging.getLogger(__name__)\n\n_POLL_INTERVAL_S = float(os.environ.get(\"JARVIS_TODO_SCAN_INTERVAL_S\", \"86400\"))\n\n# Markers to scan for, with priority weights\n_MARKERS: Dict[str, Tuple[str, float]] = {\n    \"FIXME\":      (\"high\", 0.9),\n    \"HACK\":       (\"high\", 0.8),\n    \"XXX\":        (\"high\", 0.7),\n    \"BUG\":        (\"high\", 0.9),\n    \"TODO\":       (\"normal\", 0.5),\n    \"DEPRECATED\": (\"normal\", 0.4),\n    \"OPTIMIZE\":   (\"low\", 0.3),\n    \"REFACTOR\":   (\"low\", 0.3),\n    \"NOTE\":       (\"low\", 0.1),  # Low priority — informational only\n}\n\n_MARKER_PATTERN = re.compile(\n    r\"#\\s*(\" + \"|\".join(_MARKERS.keys()) + r\")\\b[:\\s]*(.*)\",\n    re.IGNORECASE,\n)\n\n_SCAN_DIRS = (\n    \"backend/\",\n    \"tests/\",\n    \"scripts/\",\n)\n\n_SKIP_DIRS = frozenset({\n    \"venv\", \"__pycache__\", \"node_modules\", \".git\",\n    \"site-packages\", \".worktrees\", \"venv_py39_backup\",\n})\n\n# Keywords that indicate a HACK/XXX marker is a quick, auto-resolvable fix\n_QUICK_FIX_KEYWORDS: Tuple[str, ...] = (\n    \"temporary\", \"workaround\", \"cleanup\", \"remove\", \"replace\",\n    \"simpl
+
+# ============================================================
+# EXTRACTED (post _extract_json_block):
+# ============================================================
+Looking at the code, I need to:
+
+1. Fix the `# HACK/XXX are often quick fixes that can be resolved` comment at line 291 (it's a HACK marker itself that should be addressed - the comment is accurate but the logic could be improved)
+2. Create a test file for the uncovered module
+
+The HACK at line 291 is actually a comment describing the logic below it. The "fix" here is to resolve the `# HACK` comment by making the logic more robust and removing the self-referential HACK comment, replacing it with a proper docstring-style comment.
+
+Looking at the code more carefully: the comment `# HACK/XXX are often quick fixes that can be resolved` at line 291 is itself a comment explaining the logic. The actual HACK marker referenced in the op is the comment text. The fix is to clean up this comment so it doesn't read as a HACK marker (which would cause the scanner to find itself), and improve the logic.
+
+```json
+{
+  "schema_version": "2b.1",
+  "candidates": [
+    {
+      "candidate_id": "c1",
+      "file_path": "backend/core/ouroboros/governance/intake/sensors/todo_scanner_sensor.py",
+      "full_content": "\"\"\"\nTodoScannerSensor — Finds unfinished work in the Trinity codebase.\n\nScans all Python files for TODO, FIXME, HACK, XXX, NOQA, and\nDEPRECATED markers. Classifies by priority and routes actionable\nitems through the Ouroboros pipeline.\n\nBoundary Principle:\n  Deterministic: Regex scan, file enumeration, priority classification.\n  Agentic: Resolution of the TODO (code generation) via pipeline.\n\"\"\"\nfrom __future__ import annotations\n\nimport logging\nimport os\nimport re\nfrom dataclasses import dataclass, field\nfrom pathlib import Path\nfrom typing import Any, Dict, List, Optional, Tuple\nimport asyncio\n\nfrom backend.core.ouroboros.governance.intake.intent_envelope import make_envelope\n\nlogger = logging.getLogger(__name__)\n\n_POLL_INTERVAL_S = float(os.environ.get(\"JARVIS_TODO_SCAN_INTERVAL_S\", \"86400\"))\n\n# Markers to scan for, with priority weights\n_MARKERS: Dict[str, Tuple[str, float]] = {\n    \"FIXME\":      (\"high\", 0.9),\n    \"HACK\":       (\"high\", 0.8),\n    \"XXX\":        (\"high\", 0.7),\n    \"BUG\":        (\"high\", 0.9),\n    \"TODO\":       (\"normal\", 0.5),\n    \"DEPRECATED\": (\"normal\", 0.4),\n    \"OPTIMIZE\":   (\"low\", 0.3),\n    \"REFACTOR\":   (\"low\", 0.3),\n    \"NOTE\":       (\"low\", 0.1),  # Low priority — informational only\n}\n\n_MARKER_PATTERN = re.compile(\n    r\"#\\s*(\" + \"|\".join(_MARKERS.keys()) + r\")\\b[:\\s]*(.*)\",\n    re.IGNORECASE,\n)\n\n_SCAN_DIRS = (\n    \"backend/\",\n    \"tests/\",\n    \"scripts/\",\n)\n\n_SKIP_DIRS = frozenset({\n    \"venv\", \"__pycache__\", \"node_modules\", \".git\",\n    \"site-packages\", \".worktrees\", \"venv_py39_backup\",\n})\n\n# Keywords that indicate a HACK/XXX marker is a quick, auto-resolvable fix\n_QUICK_FIX_KEYWORDS: Tuple[str, ...] = (\n    \"temporary\", \"workaround\", \"cleanup\", \"remove\", \"replace\",\n    \"simpl
