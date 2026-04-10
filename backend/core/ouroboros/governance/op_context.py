@@ -187,6 +187,11 @@ class GenerationResult:
     is_noop: bool = False   # True when model signals change already present
     # L1: audit records from tool-use loop (empty when tools disabled)
     tool_execution_records: Tuple[Any, ...] = ()
+    # Venom edit/write/delete audit trail captured from ToolExecutor at
+    # tool_loop.run() exit. Each entry carries tool/path/action/before_hash/
+    # after_hash/timestamp (see ToolExecutor._record_edit). Empty when no
+    # mutating tool calls were issued.
+    venom_edit_history: Tuple[Dict[str, Any], ...] = ()
     # Token usage (0 = not reported by provider)
     total_input_tokens: int = 0
     total_output_tokens: int = 0
@@ -196,6 +201,15 @@ class GenerationResult:
     def with_tool_records(self, records: Tuple[Any, ...]) -> "GenerationResult":
         """Return a new GenerationResult with tool_execution_records set (called by provider after tool loop)."""
         return dataclasses.replace(self, tool_execution_records=records)
+
+    def with_venom_edits(self, edits: Tuple[Dict[str, Any], ...]) -> "GenerationResult":
+        """Return a new GenerationResult carrying Venom's edit history.
+
+        Called by providers right after ``tool_loop.run()`` completes, so
+        the orchestrator ledger and SerpentFlow can surface every autonomous
+        mutation Venom performed during generation.
+        """
+        return dataclasses.replace(self, venom_edit_history=edits)
 
 
 @dataclass(frozen=True)

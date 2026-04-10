@@ -200,3 +200,131 @@ async def test_cancelled_op_records_cancellation_event(tmp_path):
     assert cancel_count[0] == 1
     # Spec: coordinator must append ToolExecutionRecord(status=CANCELLED) before re-raising.
     assert any(r.status == ToolExecStatus.CANCELLED for r in coordinator._last_records)
+
+
+# ---------------------------------------------------------------------------
+# get_last_edit_history — Venom mutation audit surfacing
+# ---------------------------------------------------------------------------
+
+
+def _edit_tool_resp():
+    """Provider emits edit_file tool call that mutates src/foo.py."""
+    return json.dumps({
+        "schema_version": _SCHEMA,
+        "tool_call": {
+            "name": "edit_file",
+            "arguments": {
+                "path": "src/foo.py",
+                "old_text": "x = 1",
+                "new_text": "x = 2",
+            },
+        },
+    })
+
+
+def _read_foo_tool_resp():
+    return json.dumps({
+        "schema_version": _SCHEMA,
+        "tool_call": {"name": "read_file", "arguments": {"path": "src/foo.py"}},
+    })
+
+
+@pytest.mark.asyncio
+async def test_get_last_edit_history_empty_when_no_mutations(tmp_path, monkeypatch):
+    """A run that only reads files must surface an empty edit history."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.py").write_text("x = 1\n")
+
+    coordinator = _coordinator(tmp_path)
+    responses = [_read_foo_tool_resp(), _patch_resp()]
+    idx = [0]
+
+    async def generate_fn(_prompt):
+        i = min(idx[0], len(responses) - 1)
+        idx[0] += 1
+        return responses[i]
+
+    raw, _records = await coordinator.run(
+        prompt="init", generate_fn=generate_fn, parse_fn=_parse_fn,
+        repo="jarvis", op_id="op-noedit", deadline=time.monotonic() + 30,
+    )
+    assert raw  # final answer returned
+    assert coordinator.get_last_edit_history() == []
+
+
+@pytest.mark.asyncio
+async def test_get_last_edit_history_captures_edit_file(tmp_path, monkeypatch):
+    """After an edit_file tool call, get_last_edit_history() must return
+    an audit entry with the expected keys. This is the observability hook
+    providers.py uses to populate GenerationResult.venom_edit_history."""
+    monkeypatch.setenv("JARVIS_TOOL_EDIT_ALLOWED", "true")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.py").write_text("x = 1\n")
+
+    coordinator = _coordinator(tmp_path)
+    # Round 1: read_file (satisfies must-have-read), Round 2: edit_file,
+    # Round 3: final patch response.
+    responses = [_read_foo_tool_resp(), _edit_tool_resp(), _patch_resp()]
+    idx = [0]
+
+    async def generate_fn(_prompt):
+        i = min(idx[0], len(responses) - 1)
+        idx[0] += 1
+        return responses[i]
+
+    raw, _records = await coordinator.run(
+        prompt="init", generate_fn=generate_fn, parse_fn=_parse_fn,
+        repo="jarvis", op_id="op-edit", deadline=time.monotonic() + 30,
+    )
+    assert raw
+
+    history = coordinator.get_last_edit_history()
+    assert len(history) == 1, f"expected 1 edit entry, got {history!r}"
+    entry = history[0]
+    assert entry.get("tool") == "edit_file"
+    assert entry.get("path") == "src/foo.py"
+    # Mutation actually landed on disk.
+    assert (tmp_path / "src" / "foo.py").read_text() == "x = 2\n"
+
+
+@pytest.mark.asyncio
+async def test_get_last_edit_history_resets_between_runs(tmp_path, monkeypatch):
+    """A subsequent run() must not carry over edit history from the prior run."""
+    monkeypatch.setenv("JARVIS_TOOL_EDIT_ALLOWED", "true")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "foo.py").write_text("x = 1\n")
+
+    coordinator = _coordinator(tmp_path)
+
+    # First run: performs an edit.
+    responses1 = [_read_foo_tool_resp(), _edit_tool_resp(), _patch_resp()]
+    idx1 = [0]
+
+    async def gen1(_p):
+        i = min(idx1[0], len(responses1) - 1)
+        idx1[0] += 1
+        return responses1[i]
+
+    await coordinator.run(
+        prompt="x", generate_fn=gen1, parse_fn=_parse_fn,
+        repo="jarvis", op_id="op-r1", deadline=time.monotonic() + 30,
+    )
+    assert len(coordinator.get_last_edit_history()) == 1
+
+    # Second run: only reads. Must show empty history, not stale from run 1.
+    responses2 = [_read_foo_tool_resp(), _patch_resp()]
+    idx2 = [0]
+
+    async def gen2(_p):
+        i = min(idx2[0], len(responses2) - 1)
+        idx2[0] += 1
+        return responses2[i]
+
+    await coordinator.run(
+        prompt="x", generate_fn=gen2, parse_fn=_parse_fn,
+        repo="jarvis", op_id="op-r2", deadline=time.monotonic() + 30,
+    )
+    # Note: _last_edit_history is updated at _finalize_run. For a run with
+    # no mutations, the per-op executor's get_edit_history() returns [],
+    # so _last_edit_history must be [] too.
+    assert coordinator.get_last_edit_history() == []

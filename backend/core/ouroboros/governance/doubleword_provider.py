@@ -963,6 +963,7 @@ class DoublewordProvider:
             )
 
         tool_records: tuple = ()
+        venom_edits: Tuple[Dict[str, Any], ...] = ()
         raw: str = ""
 
         if self._tool_loop is not None and not _skip_tools:
@@ -981,6 +982,16 @@ class DoublewordProvider:
                 risk_tier=getattr(context, "risk_tier", None),
             )
             tool_records = tuple(tool_records_list)
+            # Venom mutation audit — captured from per-op ToolExecutor at
+            # run() exit. Empty when no edit/write/delete tools fired.
+            _hist_fn = getattr(self._tool_loop, "get_last_edit_history", None)
+            if callable(_hist_fn):
+                try:
+                    _hist_raw = _hist_fn()
+                except Exception:
+                    _hist_raw = None
+                if isinstance(_hist_raw, list):
+                    venom_edits = tuple(_hist_raw)
         else:
             raw = await _generate_raw(prompt)
 
@@ -1044,6 +1055,10 @@ class DoublewordProvider:
             len(result.candidates), elapsed, total_cost, len(tool_records),
             _token_usage["input"], _token_usage["output"],
         )
+
+        # Attach Venom mutation audit (empty when no mutating tools fired).
+        if venom_edits:
+            result = result.with_venom_edits(venom_edits)
 
         return result
 

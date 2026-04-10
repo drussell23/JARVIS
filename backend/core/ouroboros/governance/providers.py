@@ -2946,6 +2946,7 @@ class PrimeProvider:
             logger.info("[PrimeProvider] %s route — skipping Venom tool loop", _route)
 
         tool_records: tuple = ()
+        venom_edits: Tuple[Dict[str, Any], ...] = ()
         if self._tool_loop is not None and not _skip_tools:
             deadline_mono = (
                 time.monotonic()
@@ -2962,6 +2963,16 @@ class PrimeProvider:
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
+            # Venom mutation audit — captured from per-op ToolExecutor at
+            # run() exit. Empty when no edit/write/delete tools fired.
+            _hist_fn = getattr(self._tool_loop, "get_last_edit_history", None)
+            if callable(_hist_fn):
+                try:
+                    _hist_raw = _hist_fn()
+                except Exception:
+                    _hist_raw = None
+                if isinstance(_hist_raw, list):
+                    venom_edits = tuple(_hist_raw)
         elif self._tools_enabled and not _skip_tools:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             current_prompt = prompt
@@ -3061,7 +3072,7 @@ class PrimeProvider:
             getattr(response, "model", "unknown") if response else "unknown",
             getattr(response, "tokens_used", 0) if response else 0,
         )
-        return result.with_tool_records(tool_records)
+        return result.with_tool_records(tool_records).with_venom_edits(venom_edits)
 
     async def health_probe(self) -> bool:
         """Check PrimeClient health. Returns True only if AVAILABLE."""
@@ -3960,6 +3971,7 @@ class ClaudeProvider:
             logger.info("[ClaudeProvider] %s route — skipping Venom tool loop", _route)
 
         tool_records: tuple = ()
+        venom_edits: Tuple[Dict[str, Any], ...] = ()
         if self._tool_loop is not None and not _skip_tools:
             deadline_mono = (
                 time.monotonic()
@@ -3976,6 +3988,16 @@ class ClaudeProvider:
             )
             tool_records = tuple(tool_records_list)
             tool_rounds = len(tool_records_list)
+            # Venom mutation audit — captured from per-op ToolExecutor at
+            # run() exit. Empty when no edit/write/delete tools fired.
+            _hist_fn = getattr(self._tool_loop, "get_last_edit_history", None)
+            if callable(_hist_fn):
+                try:
+                    _hist_raw = _hist_fn()
+                except Exception:
+                    _hist_raw = None
+                if isinstance(_hist_raw, list):
+                    venom_edits = tuple(_hist_raw)
         elif self._tools_enabled and not _skip_tools:
             # Legacy inline loop (backward-compat with tools_enabled=True)
             raw = None
@@ -4080,7 +4102,7 @@ class ClaudeProvider:
             len(result.candidates), duration, tool_rounds, total_cost,
             _token_usage["input"], _token_usage["output"],
         )
-        return result.with_tool_records(tool_records)
+        return result.with_tool_records(tool_records).with_venom_edits(venom_edits)
 
     async def health_probe(self) -> bool:
         """Lightweight API ping. Returns True if API responds.
