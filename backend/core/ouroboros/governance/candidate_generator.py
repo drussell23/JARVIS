@@ -83,8 +83,8 @@ _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
 _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
-    "trivial": 0.0,            # Skip DW entirely — go straight to Claude (DW takes 80s+ for trivial)
-    "simple": 0.25,            # 0.65 * 0.25 ≈ 0.16 → ~19s DW, ~101s Claude
+    "trivial": 0.31,           # 0.65 * 0.31 ≈ 0.20 → ~24s DW (one-file edits, RT SSE fast enough)
+    "simple": 0.50,            # 0.65 * 0.50 ≈ 0.33 → ~39s DW, ~81s Claude
     "moderate": 1.077,         # 0.65 * 1.077 ≈ 0.70
     "standard": 1.077,         # alias for moderate
     "complex": 1.231,          # 0.65 * 1.231 ≈ 0.80

@@ -427,6 +427,20 @@ class BattleTestHarness:
                 gov_config,
                 oracle=self._oracle,
             )
+
+            # Start governance stack and promote to GOVERNED mode so
+            # can_write() allows file changes through the GATE phase.
+            # Without this, the stack stays in SANDBOX (_started=False)
+            # and all operations silently CANCEL at GATE.
+            await self._governance_stack.start()
+            await self._governance_stack.controller.mark_gates_passed()
+            await self._governance_stack.controller.enable_governed_autonomy()
+            logger.info(
+                "GovernanceStack started → %s (writes_allowed=%s)",
+                self._governance_stack.controller.mode.value,
+                self._governance_stack.controller.writes_allowed,
+            )
+
             # Inject SerpentFlow — flowing organism CLI (preferred)
             # Falls back to scrolling OuroborosTUI, then basic diff transport.
             self._serpent_flow = None
