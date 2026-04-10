@@ -344,6 +344,9 @@ class RoutingIntentTelemetry:
     estimated_prompt_tokens: int = 0
     daily_spend_usd: float = 0.0  # snapshot of daily spend at intake
     schema_capability: str = "full_content_only"  # "full_content_only" | "full_content_and_diff"
+    # Urgency-aware provider routing (Phase 5)
+    provider_route: str = ""      # "immediate" | "standard" | "complex" | "background" | "speculative"
+    provider_route_reason: str = ""  # causal code from UrgencyRouter
 
 
 @dataclass(frozen=True)
@@ -528,8 +531,17 @@ class OperationContext:
     # ---- Cumulative session intelligence (injected before GENERATE) ----
     session_lessons: str = ""  # ephemeral lessons from prior ops in this session
 
+    # ---- Signal metadata (propagated from IntentEnvelope at intake) ----
+    signal_urgency: str = ""   # "critical" | "high" | "normal" | "low"
+    signal_source: str = ""    # "test_failure" | "voice_human" | "ai_miner" | etc.
+
     # ---- Complexity classification (stamped at CLASSIFY by ComplexityClassifier) ----
     task_complexity: str = ""  # "trivial" | "simple" | "light" | "heavy_code" | "complex"
+
+    # ---- Provider routing (stamped at ROUTE by UrgencyRouter) ----
+    # Determines which provider strategy CandidateGenerator uses.
+    provider_route: str = ""   # "immediate" | "standard" | "complex" | "background" | "speculative"
+    provider_route_reason: str = ""  # human-readable reason for telemetry
 
     # ---- Dependency intelligence from Oracle graph (injected at CONTEXT_EXPANSION) ----
     # ~200-token summary: direct dependents, transitive importers, blast radius.
@@ -584,6 +596,8 @@ class OperationContext:
         schema_version: str = "3.0",
         previous_op_hash_by_scope: Tuple[Tuple[str, str], ...] = (),
         correlation_id: str = "",
+        signal_urgency: str = "",
+        signal_source: str = "",
     ) -> OperationContext:
         """Create an initial CLASSIFY-phase context.
 
@@ -657,7 +671,11 @@ class OperationContext:
             "previous_op_hash_by_scope": previous_op_hash_by_scope,
             "frozen_autonomy_tier": "governed",
             "reasoning_chain_result": None,
+            "signal_urgency": signal_urgency,
+            "signal_source": signal_source,
             "task_complexity": "",
+            "provider_route": "",
+            "provider_route_reason": "",
         }
         context_hash = _compute_hash(fields_for_hash)
 
@@ -696,6 +714,8 @@ class OperationContext:
             correlation_id=resolved_correlation_id,
             previous_op_hash_by_scope=previous_op_hash_by_scope,
             frozen_autonomy_tier="governed",
+            signal_urgency=signal_urgency,
+            signal_source=signal_source,
         )
 
     # ------------------------------------------------------------------

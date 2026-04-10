@@ -739,6 +739,46 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] TelemetryContextualizer not available", exc_info=True)
 
+        # ── Urgency-aware provider routing (Manifesto §5 Tier 0) ──
+        # Deterministic routing based on signal_urgency + signal_source +
+        # task_complexity. Stamps provider_route on context for
+        # CandidateGenerator dispatch.
+        try:
+            from backend.core.ouroboros.governance.urgency_router import (
+                UrgencyRouter,
+            )
+            _urgency_router = UrgencyRouter()
+            _provider_route, _route_reason = _urgency_router.classify(ctx)
+            object.__setattr__(ctx, "provider_route", _provider_route.value)
+            object.__setattr__(ctx, "provider_route_reason", _route_reason)
+            logger.info(
+                "[Orchestrator] \U0001f6e4\ufe0f  Route: %s (%s) [%s]",
+                _provider_route.value, _route_reason, ctx.op_id,
+            )
+            # Emit route decision to CommProtocol for observability
+            if hasattr(self._stack, "comm") and self._stack.comm is not None:
+                try:
+                    from backend.core.ouroboros.governance.urgency_router import (
+                        UrgencyRouter as _UR,
+                    )
+                    await self._stack.comm.emit_decision(
+                        op_id=ctx.op_id,
+                        outcome=_provider_route.value,
+                        reason_code=f"urgency_route:{_route_reason}",
+                        details={
+                            "route": _provider_route.value,
+                            "route_description": _UR.describe_route(_provider_route),
+                            "signal_urgency": getattr(ctx, "signal_urgency", ""),
+                            "signal_source": getattr(ctx, "signal_source", ""),
+                            "task_complexity": getattr(ctx, "task_complexity", ""),
+                            "budget_profile": _UR.route_budget_profile(_provider_route),
+                        },
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("[Orchestrator] UrgencyRouter not available", exc_info=True)
+
         if self._config.context_expansion_enabled:
             # ── PreActionNarrator: voice WHAT before CONTEXT_EXPANSION ──
             if self._pre_action_narrator is not None:
@@ -1302,8 +1342,24 @@ class GovernedOrchestrator:
                 except Exception:
                     pass
 
+                # Route-aware generation timeout (Manifesto §5):
+                #   IMMEDIATE: 45s  — fast reflex, don't burn budget on hung calls
+                #   STANDARD:  120s — DW primary with reasonable wait
+                #   COMPLEX:   180s — Claude planning takes longer
+                #   BACKGROUND/SPECULATIVE: 180s — no urgency
+                _route = getattr(ctx, "provider_route", "") or "standard"
+                _route_timeouts = {
+                    "immediate": 60.0,
+                    "standard": 120.0,
+                    "complex": 180.0,
+                    "background": 180.0,
+                    "speculative": 180.0,
+                }
+                _gen_timeout = _route_timeouts.get(
+                    _route, self._config.generation_timeout_s
+                )
                 deadline = datetime.now(tz=timezone.utc) + timedelta(
-                    seconds=self._config.generation_timeout_s
+                    seconds=_gen_timeout
                 )
                 # Emit streaming=start so SerpentFlow can render the
                 # "synthesizing" header before tokens begin flowing.
@@ -1319,7 +1375,7 @@ class GovernedOrchestrator:
                 # but asyncio.wait_for is the Iron Gate (Manifesto §6).
                 generation = await asyncio.wait_for(
                     self._generator.generate(ctx, deadline),
-                    timeout=self._config.generation_timeout_s + 5.0,
+                    timeout=_gen_timeout + 5.0,
                 )
                 # Emit streaming=end to close the streaming block
                 try:
@@ -1408,6 +1464,47 @@ class GovernedOrchestrator:
                 break
 
             except Exception as exc:
+                _err_msg = str(exc)
+
+                # ── BACKGROUND / SPECULATIVE route failures ──
+                # These routes intentionally avoid Claude. Don't retry
+                # with expensive providers — accept failure gracefully.
+                _route = getattr(ctx, "provider_route", "")
+                if _route == "speculative" and "speculative_deferred" in _err_msg:
+                    # Speculative ops are fire-and-forget — not a failure.
+                    logger.info(
+                        "[Orchestrator] SPECULATIVE op deferred (DW background) [%s]",
+                        ctx.op_id,
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="speculative_deferred",
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.COMPLETED,
+                        {"reason": "speculative_deferred", "route": "speculative"},
+                    )
+                    return ctx
+
+                if _route == "background" and "background_dw_" in _err_msg:
+                    # Background DW failure — don't cascade to Claude.
+                    # Accept failure; sensor will re-detect if still relevant.
+                    logger.info(
+                        "[Orchestrator] BACKGROUND route: DW failed (%s), "
+                        "accepting without Claude cascade [%s]",
+                        _err_msg[:100], ctx.op_id,
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code=f"background_accepted:{_err_msg[:80]}",
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.FAILED,
+                        {"reason": "background_dw_failure", "error": _err_msg[:200],
+                         "route": "background"},
+                    )
+                    return ctx
+
                 logger.warning(
                     "Generation attempt %d/%d failed for %s: %s",
                     attempt + 1,
@@ -1417,7 +1514,39 @@ class GovernedOrchestrator:
                 )
                 generate_retries_remaining -= 1
                 if generate_retries_remaining < 0:
-                    # All retries exhausted
+                    # ── IMMEDIATE → STANDARD demotion ──
+                    # If IMMEDIATE exhausted Claude retries, demote to
+                    # STANDARD (DW primary → Claude fallback) for one
+                    # last attempt.  Direct call — don't rely on the
+                    # exhausted for-loop range.
+                    if _route == "immediate":
+                        logger.info(
+                            "[Orchestrator] IMMEDIATE exhausted — demoting "
+                            "to STANDARD route for DW attempt [%s]",
+                            ctx.op_id,
+                        )
+                        object.__setattr__(ctx, "provider_route", "standard")
+                        object.__setattr__(
+                            ctx, "provider_route_reason",
+                            f"demotion:immediate_exhausted:{_err_msg[:60]}",
+                        )
+                        _route = "standard"  # update local for timeout calc
+                        try:
+                            _dem_deadline = datetime.now(tz=timezone.utc) + timedelta(seconds=120.0)
+                            generation = await asyncio.wait_for(
+                                self._generator.generate(ctx, _dem_deadline),
+                                timeout=125.0,
+                            )
+                            if generation is not None and len(generation.candidates) > 0:
+                                break  # success — continue pipeline
+                            generation = None
+                        except Exception as dem_exc:
+                            logger.warning(
+                                "[Orchestrator] STANDARD demotion also failed: %s [%s]",
+                                dem_exc, ctx.op_id,
+                            )
+
+                    # All retries truly exhausted
                     ctx = ctx.advance(
                         OperationPhase.CANCELLED,
                         terminal_reason_code="generation_failed",
@@ -2097,6 +2226,10 @@ class GovernedOrchestrator:
             {"files": list(ctx.target_files)}
         )
         if not allowed:
+            logger.warning(
+                "[Orchestrator] GATE BLOCKED: can_write=%s for op=%s files=%s",
+                reason, ctx.op_id, list(ctx.target_files)[:3],
+            )
             ctx = ctx.advance(
                 OperationPhase.CANCELLED,
                 terminal_reason_code=f"gate_blocked:{reason}",

@@ -45,13 +45,34 @@ CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GA
 | 1 | Claude (Anthropic API) | $3/$15/M | Extended thinking + prompt caching, 60s fallback cap |
 | 2 | J-Prime (GCP self-hosted) | VM cost only | When available |
 
-### Timeout Enforcement
+### Urgency-Aware Provider Routing (Manifesto §5)
 
-- **Generation**: `asyncio.wait_for(timeout=180s + 5s grace)` in orchestrator
+Deterministic routing based on signal urgency + source + task complexity. Stamped at ROUTE phase by `UrgencyRouter` (`urgency_router.py`). No LLM calls — pure code, <1ms.
+
+| Route | Strategy | Cost | When |
+|-------|----------|------|------|
+| IMMEDIATE | Claude direct, skip DW | ~$0.03/op | Critical urgency, voice commands, test failures, runtime health |
+| STANDARD | DW primary → Claude fallback | ~$0.005/op | Normal-priority moderate ops (default cascade) |
+| COMPLEX | Claude plans → DW executes | ~$0.015/op | heavy_code, multi-file architectural changes |
+| BACKGROUND | DW only, no Claude fallback | ~$0.002/op | OpportunityMiner, DocStaleness, TODOs, backlog |
+| SPECULATIVE | DW batch fire-and-forget | ~$0.001/op | IntentDiscovery, DreamEngine pre-computation |
+
+### Timeout Enforcement (Route-Aware)
+
+- **IMMEDIATE generation**: 60s + 5s grace (fast reflex — accounts for Venom tool rounds)
+- **STANDARD generation**: 120s + 5s grace
+- **COMPLEX/BACKGROUND generation**: 180s + 5s grace
 - **Fallback provider**: Hard cap at 60s (`_FALLBACK_MAX_TIMEOUT_S`)
 - **Tier 1 reserve**: 25s minimum (not 45s -- reduced to avoid starving Tier 0)
 - **DW poll interval**: 5s (not 15s)
 - **pytest (TestWatcher)**: 30s timeout
+- **IMMEDIATE → STANDARD demotion**: After Claude exhausts retries on IMMEDIATE, demotes to STANDARD (DW primary) for one more attempt
+
+### Worker Pool
+
+- **BackgroundAgentPool**: 3 workers (env: `JARVIS_BG_POOL_SIZE`), PriorityQueue (16 slots)
+- **Priority ordering**: IMMEDIATE(1) > STANDARD/COMPLEX(3) > BACKGROUND(5) > SPECULATIVE(7)
+- **Venom tool loop**: Enabled for IMMEDIATE/STANDARD/COMPLEX routes; skipped for BACKGROUND/SPECULATIVE (cost optimization)
 
 ### 16 Autonomous Sensors
 
@@ -110,7 +131,8 @@ backend/core/ouroboros/
   governance/
     governed_loop_service.py    # Main loop (Zone 6.8)
     orchestrator.py             # 11-phase FSM
-    candidate_generator.py      # 3-tier failback
+    candidate_generator.py      # 3-tier failback + route-based dispatch
+    urgency_router.py           # Deterministic provider routing (§5 Tier 0)
     providers.py                # Claude + Prime providers
     doubleword_provider.py      # DW 397B
     plan_generator.py           # Model-reasoned PLAN phase (schema plan.1)

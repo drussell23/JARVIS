@@ -445,21 +445,29 @@ class GovernanceStack:
         No alternate path can enable writes outside this gate.
         """
         if not self._started:
+            logger.warning("[GovernanceStack] can_write BLOCKED: governance_not_started")
             return False, "governance_not_started"
         if not self.controller.writes_allowed:
-            return False, f"mode_{self.controller.mode.value}"
+            _reason = f"mode_{self.controller.mode.value}"
+            logger.warning("[GovernanceStack] can_write BLOCKED: %s", _reason)
+            return False, _reason
         if self.degradation.mode.value > 1:  # REDUCED or worse
-            return False, f"degradation_{self.degradation.mode.name}"
+            _reason = f"degradation_{self.degradation.mode.name}"
+            logger.warning("[GovernanceStack] can_write BLOCKED: %s", _reason)
+            return False, _reason
         # Check canary slice
         files = op_context.get("files", [])
         for f in files:
             if not self.canary.is_file_allowed(str(f)):
-                return False, f"canary_not_promoted:{f}"
+                _reason = f"canary_not_promoted:{f}"
+                logger.warning("[GovernanceStack] can_write BLOCKED: %s", _reason)
+                return False, _reason
         # Check runtime contract
         proposed_version = op_context.get("proposed_contract_version")
         if proposed_version and not self.contract_checker.check_before_write(
             proposed_version
         ):
+            logger.warning("[GovernanceStack] can_write BLOCKED: contract_incompatible")
             return False, "contract_incompatible"
         return True, "ok"
 

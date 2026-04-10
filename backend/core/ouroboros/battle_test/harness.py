@@ -427,6 +427,20 @@ class BattleTestHarness:
                 gov_config,
                 oracle=self._oracle,
             )
+
+            # Start governance stack and promote to GOVERNED mode so
+            # can_write() allows file changes through the GATE phase.
+            # Without this, the stack stays in SANDBOX (_started=False)
+            # and all operations silently CANCEL at GATE.
+            await self._governance_stack.start()
+            await self._governance_stack.controller.mark_gates_passed()
+            await self._governance_stack.controller.enable_governed_autonomy()
+            logger.info(
+                "GovernanceStack started → %s (writes_allowed=%s)",
+                self._governance_stack.controller.mode.value,
+                self._governance_stack.controller.writes_allowed,
+            )
+
             # Inject SerpentFlow — flowing organism CLI (preferred)
             # Falls back to scrolling OuroborosTUI, then basic diff transport.
             self._serpent_flow = None
@@ -522,6 +536,11 @@ class BattleTestHarness:
             gls_config = GovernedLoopConfig.from_env(
                 project_root=self._config.repo_path,
             )
+            # Widen canary slices for battle test — allow all files.
+            # Production default is ("tests/", "docs/") which blocks
+            # autonomous writes to backend/ and root-level files.
+            import dataclasses as _dc
+            gls_config = _dc.replace(gls_config, initial_canary_slices=("",))
             self._governed_loop_service = GovernedLoopService(
                 stack=self._governance_stack,
                 config=gls_config,
@@ -656,6 +675,14 @@ class BattleTestHarness:
                 )
             except Exception as exc:
                 logger.warning("Trinity Consciousness failed to boot: %s", exc)
+
+            # --- Heap stabilization gate ---
+            # Oracle just initialized ChromaDB PersistentClient #1 (C extension).
+            # Force GC before GoalMemoryBridge creates PersistentClient #2 to
+            # prevent concurrent C-heap allocation that triggers libmalloc
+            # corruption on macOS ARM64 (Python 3.9).
+            import gc as _gc
+            _gc.collect()
 
             # --- Goal Memory Bridge (ChromaDB cross-session learning) ---
             try:

@@ -193,15 +193,19 @@ class BackgroundAgentPool:
         self._orchestrator = orchestrator
         self._pool_size: int = (
             pool_size if pool_size is not None
-            else _read_env_int("JARVIS_BG_POOL_SIZE", 2)
+            else _read_env_int("JARVIS_BG_POOL_SIZE", 3)
         )
         self._queue_size: int = (
             queue_size if queue_size is not None
-            else _read_env_int("JARVIS_BG_QUEUE_SIZE", 10)
+            else _read_env_int("JARVIS_BG_QUEUE_SIZE", 16)
         )
-        self._queue: asyncio.Queue[BackgroundOp] = asyncio.Queue(
+        # PriorityQueue: items are (priority, submission_order, op).
+        # Lower priority number = runs first.  Ensures IMMEDIATE ops
+        # don't starve BACKGROUND ops when workers free up.
+        self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue(
             maxsize=self._queue_size,
         )
+        self._submit_counter: int = 0
         self._ops: Dict[str, BackgroundOp] = {}
         self._workers: List[asyncio.Task] = []  # type: ignore[type-arg]
         self._running: bool = False
@@ -257,11 +261,12 @@ class BackgroundAgentPool:
             await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
 
-        # Drain remaining queued ops
+        # Drain remaining queued ops (handle PriorityQueue tuples)
         drained = 0
         while not self._queue.empty():
             try:
-                op = self._queue.get_nowait()
+                _item = self._queue.get_nowait()
+                op = _item[2] if isinstance(_item, tuple) else _item
                 op.status = "cancelled"
                 op.completed_at = time.monotonic()
                 self._cancelled_count += 1
@@ -314,8 +319,17 @@ class BackgroundAgentPool:
             context=op_context,
         )
 
+        # Route-based priority for PriorityQueue (lower = runs first).
+        _route = getattr(op_context, "provider_route", "") or "standard"
+        _route_priority = {
+            "immediate": 1, "standard": 3, "complex": 3,
+            "background": 5, "speculative": 7,
+        }
+        _priority = _route_priority.get(_route, 3)
+        self._submit_counter += 1
+
         try:
-            self._queue.put_nowait(op)
+            self._queue.put_nowait((_priority, self._submit_counter, op))
         except asyncio.QueueFull:
             raise QueueFullError(
                 f"Background queue is full ({self._queue_size} items). "
@@ -325,9 +339,12 @@ class BackgroundAgentPool:
 
         self._ops[op_id] = op
         logger.info(
-            "Submitted background operation %s (goal=%r, queue_depth=%d/%d)",
+            "Submitted background operation %s (goal=%r, route=%s, "
+            "priority=%d, queue_depth=%d/%d)",
             op_id,
             op.goal[:80],
+            _route,
+            _priority,
             self._queue.qsize(),
             self._queue_size,
         )
@@ -453,12 +470,18 @@ class BackgroundAgentPool:
         try:
             while self._running:
                 try:
-                    op = await asyncio.wait_for(
+                    _item = await asyncio.wait_for(
                         self._queue.get(),
                         timeout=2.0,  # Periodic check of self._running
                     )
                 except asyncio.TimeoutError:
                     continue
+
+                # Unpack PriorityQueue tuple: (priority, counter, op)
+                if isinstance(_item, tuple):
+                    _, _, op = _item
+                else:
+                    op = _item  # backward compat
 
                 # Skip already-cancelled ops (cancelled while queued)
                 if op.status == "cancelled":

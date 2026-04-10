@@ -1188,39 +1188,42 @@ class OracleSemanticIndex:
             return
 
         try:
-            from sentence_transformers import SentenceTransformer  # type: ignore[import]
+            # Use centralized EmbeddingService singleton — prevents multiple
+            # SentenceTransformer instances from spawning competing PyTorch/BLAS
+            # thread pools, which causes libmalloc heap corruption on macOS ARM64.
+            from backend.core.embedding_service import EmbeddingService
 
-            class _STEmbedder:
-                def __init__(self, model_name: str) -> None:
-                    self._model = SentenceTransformer(model_name)
+            class _SharedEmbedder:
+                """Adapter: wraps centralized EmbeddingService for Oracle."""
+
+                def __init__(self) -> None:
+                    self._service = EmbeddingService()  # singleton — no model load yet
 
                 async def embed(self, text: str) -> Any:
-                    import asyncio as _asyncio
-                    loop = _asyncio.get_event_loop()
-                    return await loop.run_in_executor(
-                        None, lambda: self._model.encode(text, normalize_embeddings=True)
+                    result = await self._service.encode(
+                        text, normalize=True,
                     )
+                    if result is not None and len(result) > 0:
+                        return result[0]
+                    return None
 
                 async def embed_batch(self, texts: List[str]) -> List[Any]:
-                    import asyncio as _asyncio
-                    loop = _asyncio.get_event_loop()
-                    results = await loop.run_in_executor(
-                        None,
-                        lambda: self._model.encode(
-                            texts, normalize_embeddings=True, show_progress_bar=False
-                        ),
+                    result = await self._service.encode(
+                        texts, normalize=True,
                     )
-                    return list(results)
+                    return list(result) if result is not None else []
 
-            self._embedder = _STEmbedder(OracleConfig.SEMANTIC_EMBED_MODEL)
+            self._embedder = _SharedEmbedder()
             self._available = True
             logger.info(
-                "[OracleSemanticIndex] Ready — collection '%s' at %s",
+                "[OracleSemanticIndex] Ready (shared EmbeddingService) — "
+                "collection '%s' at %s",
                 self._collection_name, self._persist_dir,
             )
         except Exception as exc:
             logger.warning(
-                "[OracleSemanticIndex] sentence-transformers unavailable: %s; semantic search disabled",
+                "[OracleSemanticIndex] EmbeddingService unavailable: %s; "
+                "semantic search disabled",
                 exc,
             )
 
@@ -1356,8 +1359,10 @@ class TheOracle:
         # Ensure cache directory exists
         OracleConfig.ORACLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-        # Semantic index — fault isolated, never raises in __init__
-        self._semantic_index: "OracleSemanticIndex" = OracleSemanticIndex()
+        # Semantic index — DEFERRED until after graph loading to prevent
+        # concurrent C-extension heap allocation (ChromaDB + pickle).
+        # This avoids libmalloc memory corruption on macOS ARM64.
+        self._semantic_index: "OracleSemanticIndex" = None  # type: ignore[assignment]
 
         logger.info("The Oracle initialized")
 
@@ -1365,17 +1370,19 @@ class TheOracle:
         """Initialize the Oracle, loading cached data if available."""
         logger.info("Initializing The Oracle...")
 
-        # Try to load cached graph
+        # Try to load cached graph (synchronous to avoid libmalloc crash)
         if await self._load_cache():
             logger.info(f"Loaded cached graph: {self._graph._metrics['total_nodes']} nodes, "
                        f"{self._graph._metrics['total_edges']} edges")
-            self._running = True
-            self._last_indexed_monotonic_ns = time.monotonic_ns()
-            return True
+        else:
+            # No cache, do full index
+            logger.info("No cache found, performing full index...")
+            await self.full_index()
 
-        # No cache, do full index
-        logger.info("No cache found, performing full index...")
-        await self.full_index()
+        # Initialize semantic index AFTER graph loading to prevent
+        # concurrent C-extension heap allocation (ChromaDB + pickle).
+        if self._semantic_index is None:
+            self._semantic_index = OracleSemanticIndex()
 
         self._running = True
         self._last_indexed_monotonic_ns = time.monotonic_ns()
@@ -1579,13 +1586,21 @@ class TheOracle:
                 logger.warning(f"Error scanning {file_path}: {e}")
 
     async def _load_cache(self) -> bool:
-        """Load cached graph from disk."""
+        """Load cached graph from disk.
+
+        Loads synchronously (not asyncio.to_thread) to prevent concurrent
+        C-extension heap allocation with ChromaDB/torch/numpy.  At boot
+        time nothing else needs the event loop — blocking for 2-5s is
+        acceptable to avoid libmalloc memory corruption on macOS ARM64.
+
+        Note: pickle is used here for internal cache only (never untrusted
+        data) — the cache file is written by this same process.
+        """
         try:
             if OracleConfig.GRAPH_CACHE_FILE.exists():
-                data = await asyncio.to_thread(
-                    pickle.loads,
-                    OracleConfig.GRAPH_CACHE_FILE.read_bytes(),
-                )
+                _raw = OracleConfig.GRAPH_CACHE_FILE.read_bytes()
+                data = pickle.loads(_raw)  # noqa: S301 — trusted internal cache
+                del _raw  # free the raw bytes immediately
 
                 self._graph._graph = data["graph"]
                 self._graph._node_index = data["node_index"]
@@ -1602,7 +1617,15 @@ class TheOracle:
         return False
 
     async def _save_cache(self) -> None:
-        """Save graph to cache on disk."""
+        """Save graph to cache on disk.
+
+        Serializes synchronously to avoid concurrent heap allocation
+        with C extensions (same rationale as _load_cache).
+        Uses highest available protocol for better ARM64 alignment.
+
+        Note: pickle is used here for internal cache only — the graph
+        contains only our own dataclasses, not untrusted data.
+        """
         try:
             data = {
                 "graph": self._graph._graph,
@@ -1614,9 +1637,8 @@ class TheOracle:
                 "file_hashes": self._file_hashes,
             }
 
-            await asyncio.to_thread(
-                OracleConfig.GRAPH_CACHE_FILE.write_bytes,
-                pickle.dumps(data),
+            OracleConfig.GRAPH_CACHE_FILE.write_bytes(
+                pickle.dumps(data, protocol=pickle.HIGHEST_PROTOCOL),  # noqa: S301
             )
 
             logger.info(f"Saved cache to {OracleConfig.GRAPH_CACHE_FILE}")

@@ -2581,11 +2581,11 @@ class PrimeProvider:
             )
             return raw_content
 
-        # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper)
-        _complexity = getattr(context, "task_complexity", "")
-        _skip_tools = _complexity in ("trivial",)
+        # Complexity routing: skip Venom only for BACKGROUND/SPECULATIVE routes.
+        _route = getattr(context, "provider_route", "")
+        _skip_tools = _route in ("background", "speculative")
         if _skip_tools:
-            logger.info("[PrimeProvider] \u26a1 Trivial task — skipping Venom tool loop")
+            logger.info("[PrimeProvider] %s route — skipping Venom tool loop", _route)
 
         tool_records: tuple = ()
         if self._tool_loop is not None and not _skip_tools:
@@ -2957,18 +2957,26 @@ class ClaudeProvider:
             # Extended thinking: enable deep reasoning for non-tool-round calls.
             # Tool rounds are fast JSON responses — no thinking needed.
             # Anthropic requires temperature=1.0 when thinking is enabled.
+            # Trivial tasks skip thinking entirely (saves 30-40s of 60s budget).
+            # Simple tasks use reduced budget (4K tokens instead of 10K).
             _use_thinking = self._extended_thinking and not _is_tool_round
+            _task_complexity = getattr(context, "task_complexity", "")
+            if _task_complexity == "trivial":
+                _use_thinking = False
             _temperature = 1.0 if _use_thinking else 0.2
             _thinking_param: Optional[Dict[str, Any]] = None
             if _use_thinking:
+                _thinking_tokens = self._thinking_budget
+                if _task_complexity == "simple":
+                    _thinking_tokens = min(_thinking_tokens, 4000)
                 _thinking_param = {
                     "type": "enabled",
-                    "budget_tokens": self._thinking_budget,
+                    "budget_tokens": _thinking_tokens,
                 }
                 # max_tokens must accommodate thinking budget + output
                 _effective_max_tokens = max(
                     _effective_max_tokens,
-                    self._thinking_budget + 4096,
+                    _thinking_tokens + 4096,
                 )
 
             # Prompt caching: mark the system prompt as cacheable.
@@ -3088,11 +3096,14 @@ class ClaudeProvider:
                 raise RuntimeError(f"claude_budget_exhausted_op:{total_cost:.4f}")
             return raw_content
 
-        # Complexity routing: skip Venom for TRIVIAL tasks (one-shot is cheaper)
-        _complexity = getattr(context, "task_complexity", "")
-        _skip_tools = _complexity in ("trivial",)
+        # Complexity routing: skip Venom only for BACKGROUND/SPECULATIVE routes
+        # where cost optimization trumps capability. IMMEDIATE/STANDARD/COMPLEX
+        # routes always get full Venom — Claude may need tools even for "trivial"
+        # tasks (the model decides, not us).
+        _route = getattr(context, "provider_route", "")
+        _skip_tools = _route in ("background", "speculative")
         if _skip_tools:
-            logger.info("[ClaudeProvider] \u26a1 Trivial task — skipping Venom tool loop")
+            logger.info("[ClaudeProvider] %s route — skipping Venom tool loop", _route)
 
         tool_records: tuple = ()
         if self._tool_loop is not None and not _skip_tools:
