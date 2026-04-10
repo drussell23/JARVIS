@@ -490,6 +490,84 @@ class DoublewordProvider:
             return None
 
     # ------------------------------------------------------------------
+    # Dynamic output-token budget (parallel to ClaudeProvider's
+    # _compute_output_budget). Used by both the batch path and the
+    # real-time SSE path so a "trivial" complexity task that happens
+    # to target a large file still gets enough tokens to fit the full
+    # rewrite in one response. Falls back to the complexity ceiling
+    # when target files can't be resolved (new file / bad path).
+    # ------------------------------------------------------------------
+
+    def _compute_dynamic_max_tokens(
+        self,
+        context: Any,
+        *,
+        is_tool_round: bool = False,
+    ) -> int:
+        """Compute max_tokens for a DW generation call.
+
+        Tool rounds get a small fixed budget (tool call JSON is ~1K
+        tokens). Code-gen rounds start from the complexity-derived
+        ceiling, then scale *up* by the actual target file size so
+        full-file rewrites don't truncate mid-string.
+
+        Formula:
+            raw = total_bytes / _DW_CHARS_PER_TOKEN
+            needed = int(raw * _DW_OUTPUT_SAFETY) + _DW_OUTPUT_OVERHEAD_TOKENS
+            result = max(needed, complexity_ceiling)
+            result = min(result, _DW_MAX_TOKENS)
+
+        Parameters
+        ----------
+        context:
+            The current ``OperationContext``. Expected attributes:
+            ``task_complexity`` (str) and ``target_files`` (seq of rel paths).
+        is_tool_round:
+            When True, return the tool-round cap (``_tool_round_max_tokens``
+            from the tool loop, or 1024 default).
+        """
+        # Tool round — small fixed budget (same behaviour as before).
+        if is_tool_round:
+            base = 1024
+            if self._tool_loop is not None:
+                base = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
+            return min(int(base), _DW_MAX_TOKENS)
+
+        complexity = getattr(context, "task_complexity", "") or ""
+        complexity_ceiling = _DW_COMPLEXITY_MAX_TOKENS.get(
+            complexity, self._max_tokens,
+        )
+
+        # Resolve target files → total bytes. New files (non-existent
+        # paths) contribute 0. Multi-file rewrites sum all bytes so the
+        # budget covers the whole candidate array.
+        target_files = getattr(context, "target_files", ()) or ()
+        total_bytes = 0
+        resolved = 0
+        for rel in target_files:
+            if not rel:
+                continue
+            try:
+                abs_path = (self._repo_root / str(rel)).resolve()
+                if abs_path.exists() and abs_path.is_file():
+                    total_bytes += abs_path.stat().st_size
+                    resolved += 1
+            except (OSError, ValueError):
+                continue
+
+        if resolved == 0 or total_bytes == 0:
+            # No file-size data — keep the complexity ceiling as-is.
+            return min(int(complexity_ceiling), _DW_MAX_TOKENS)
+
+        # Scale proportionally: bytes → tokens → safety margin → overhead.
+        raw_tokens = total_bytes / _DW_CHARS_PER_TOKEN
+        needed = int(raw_tokens * _DW_OUTPUT_SAFETY) + _DW_OUTPUT_OVERHEAD_TOKENS
+        # Never squeeze below the complexity ceiling — dynamic budget is
+        # strictly a floor-raiser, never a ceiling-lowerer.
+        needed = max(needed, int(complexity_ceiling))
+        return min(needed, _DW_MAX_TOKENS)
+
+    # ------------------------------------------------------------------
     # Synchronous generate() — kept for backwards compatibility.
     # Combines submit_batch + poll_and_retrieve in a single blocking call.
     # ------------------------------------------------------------------
@@ -655,14 +733,18 @@ class DoublewordProvider:
             nonlocal total_cost
             session = await self._get_session()
 
-            # Smart max_tokens: complexity-aware ceiling for initial generation,
-            # lower during Venom tool rounds (cost optimization).
-            # Trivial ops: 4096 (vs 16384 default) — DW responds ~50% faster.
-            _eff_max_tokens = _DW_COMPLEXITY_MAX_TOKENS.get(
-                getattr(context, "task_complexity", ""), self._max_tokens,
+            # Dynamic max_tokens: complexity-aware ceiling as the floor,
+            # scaled up by actual target file bytes so full-file rewrites
+            # don't truncate mid-string. Tool rounds get a small fixed
+            # budget (tool call JSON is ~1K tokens). See
+            # _compute_dynamic_max_tokens for the formula.
+            _is_tool_round = (
+                self._tool_loop is not None
+                and getattr(self._tool_loop, "is_tool_round", False)
             )
-            if self._tool_loop is not None and getattr(self._tool_loop, "is_tool_round", False):
-                _eff_max_tokens = getattr(self._tool_loop, "_tool_round_max_tokens", 1024)
+            _eff_max_tokens = self._compute_dynamic_max_tokens(
+                context, is_tool_round=_is_tool_round,
+            )
 
             # Streaming callback for token-by-token TUI output
             _stream_callback = None
