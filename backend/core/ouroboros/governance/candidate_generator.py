@@ -83,8 +83,8 @@ _TIER1_MIN_RESERVE_S = float(os.environ.get("OUROBOROS_TIER1_MIN_RESERVE_S", "25
 # Complexity-aware multipliers applied on top of _TIER0_BUDGET_FRACTION.
 # Higher complexity => more time for DW 397B code generation.
 _TIER0_COMPLEXITY_MULTIPLIER: Dict[str, float] = {
-    "trivial": 0.31,           # 0.65 * 0.31 ≈ 0.20 → ~24s DW, ~96s Claude
-    "simple": 0.62,            # 0.65 * 0.62 ≈ 0.40 → ~48s DW, ~72s Claude
+    "trivial": 0.0,            # Skip DW entirely — go straight to Claude (DW takes 80s+ for trivial)
+    "simple": 0.25,            # 0.65 * 0.25 ≈ 0.16 → ~19s DW, ~101s Claude
     "moderate": 1.077,         # 0.65 * 1.077 ≈ 0.70
     "standard": 1.077,         # alias for moderate
     "complex": 1.231,          # 0.65 * 1.231 ≈ 0.80
@@ -712,97 +712,123 @@ class CandidateGenerator:
                     getattr(self._tier0, "_model", "unknown"),
                 )
 
-                # Stream-aware timeout: use asyncio.shield so we can
-                # grant a grace extension if DW is actively streaming
-                # tokens when the base budget expires (Manifesto §3).
-                _gen_task = asyncio.ensure_future(
-                    self._tier0.generate(context, deadline),
-                )
-                try:
-                    result = await asyncio.wait_for(
-                        asyncio.shield(_gen_task), timeout=tier0_budget,
-                    )
-                    if result is not None and len(result.candidates) > 0:
-                        # RT success — record recovery if coming back from failure
-                        if self.fsm._consecutive_failures > 0:
-                            self.fsm.record_primary_success()
-                        logger.info(
-                            "[CandidateGenerator] Tier 0 RT: %d candidates in %.1fs "
-                            "(zero polling)",
-                            len(result.candidates), result.generation_duration_s,
-                        )
-                        return result
-                    # Empty result — fall through to Claude
+                if tier0_budget <= 0:
                     logger.info(
-                        "[CandidateGenerator] Tier 0 RT: no candidates — "
-                        "cascading to Tier 1 (%.1fs remaining)",
-                        self._remaining_seconds(deadline),
+                        "[CandidateGenerator] Tier 0 skipped: zero budget "
+                        "for complexity=%s. Cascading to Tier 1 (%.1fs)",
+                        _complexity, remaining,
                     )
-                except asyncio.TimeoutError:
-                    # Check if DW is actively streaming SSE tokens.
-                    # If so, grant up to 30s extension while preserving
-                    # Tier 1 reserve — don't kill a productive stream.
-                    _last_chunk = getattr(self._tier0, "_last_chunk_at", 0.0)
-                    _streaming = _last_chunk > 0 and (time.monotonic() - _last_chunk) < 10.0
-                    _ext_cap = self._remaining_seconds(deadline) - _TIER1_MIN_RESERVE_S
-                    _extension = min(30.0, _ext_cap)
+                    # Fall through to Claude cascade below
 
-                    if _streaming and _extension > 5.0:
-                        logger.info(
-                            "[CandidateGenerator] Tier 0 RT: actively streaming, "
-                            "granting +%.0fs extension (Tier 1 reserve preserved)",
-                            _extension,
+                if tier0_budget > 0:
+                    # Stream-aware timeout: use asyncio.shield so we can
+                    # grant a grace extension if DW is actively streaming
+                    # tokens when the base budget expires (Manifesto §3).
+                    _gen_task = asyncio.ensure_future(
+                        self._tier0.generate(context, deadline),
+                    )
+                    try:
+                        result = await asyncio.wait_for(
+                            asyncio.shield(_gen_task), timeout=tier0_budget,
                         )
-                        try:
-                            result = await asyncio.wait_for(
-                                _gen_task, timeout=_extension,
+                        if result is not None and len(result.candidates) > 0:
+                            # RT success — record recovery if coming back from failure
+                            if self.fsm._consecutive_failures > 0:
+                                self.fsm.record_primary_success()
+                            logger.info(
+                                "[CandidateGenerator] Tier 0 RT: %d candidates in %.1fs "
+                                "(zero polling)",
+                                len(result.candidates), result.generation_duration_s,
                             )
-                            if result is not None and len(result.candidates) > 0:
-                                if self.fsm._consecutive_failures > 0:
-                                    self.fsm.record_primary_success()
-                                logger.info(
-                                    "[CandidateGenerator] Tier 0 RT: %d candidates "
-                                    "in %.1fs (stream extension saved it)",
-                                    len(result.candidates),
-                                    result.generation_duration_s,
-                                )
-                                return result
-                        except (asyncio.TimeoutError, asyncio.CancelledError):
-                            pass
-                        except Exception as ext_exc:
-                            # DW returned content during grace period but it
-                            # failed parsing (e.g. json_parse_error).  Fall
-                            # through to Claude cascade instead of escaping.
-                            _mode = FailbackStateMachine.classify_exception(ext_exc)
-                            logger.warning(
-                                "[CandidateGenerator] Tier 0 RT: grace-period "
-                                "content failed (mode=%s, %s). Cascading.",
-                                _mode.name, ext_exc,
-                            )
-                        _gen_task.cancel()
-                    else:
-                        _gen_task.cancel()
+                            return result
+                        # Empty result — fall through to Claude
+                        logger.info(
+                            "[CandidateGenerator] Tier 0 RT: no candidates — "
+                            "cascading to Tier 1 (%.1fs remaining)",
+                            self._remaining_seconds(deadline),
+                        )
+                    except asyncio.TimeoutError:
+                        # Check if DW is actively streaming SSE tokens.
+                        # If so, grant up to 30s extension while preserving
+                        # Tier 1 reserve — don't kill a productive stream.
+                        _last_chunk = getattr(self._tier0, "_last_chunk_at", 0.0)
+                        _streaming = _last_chunk > 0 and (time.monotonic() - _last_chunk) < 10.0
+                        _ext_cap = self._remaining_seconds(deadline) - _TIER1_MIN_RESERVE_S
+                        _extension = min(30.0, _ext_cap)
 
-                    logger.warning(
-                        "[CandidateGenerator] Tier 0 RT: budget exhausted "
-                        "(%.1fs). Cascading to Tier 1 (%.1fs remaining)",
-                        tier0_budget, self._remaining_seconds(deadline),
-                    )
-                    self.fsm.record_primary_failure(mode=FailureMode.TIMEOUT)
-                except asyncio.CancelledError:
-                    _gen_task.cancel()
-                    raise
-                except Exception as rt_exc:
-                    _gen_task.cancel()
-                    mode = FailbackStateMachine.classify_exception(rt_exc)
-                    logger.warning(
-                        "[CandidateGenerator] Tier 0 RT failed (mode=%s, %s: %s). "
-                        "Cascading to Tier 1 (%.1fs remaining)",
-                        mode.name, type(rt_exc).__name__, rt_exc,
-                        self._remaining_seconds(deadline),
-                    )
-                    if mode is not FailureMode.CONTENT_FAILURE:
-                        self.fsm.record_primary_failure(mode=mode)
+                        if _streaming and _extension > 5.0:
+                            logger.info(
+                                "[CandidateGenerator] Tier 0 RT: actively streaming, "
+                                "granting +%.0fs extension (Tier 1 reserve preserved)",
+                                _extension,
+                            )
+                            # Use asyncio.wait (not wait_for) so a timeout does
+                            # NOT cancel the task — avoids the race where DW
+                            # completes between timeout fire and cancel delivery.
+                            _done, _ = await asyncio.wait(
+                                {_gen_task}, timeout=_extension,
+                            )
+                            if _gen_task in _done:
+                                try:
+                                    result = _gen_task.result()
+                                except Exception as ext_exc:
+                                    _mode = FailbackStateMachine.classify_exception(ext_exc)
+                                    logger.warning(
+                                        "[CandidateGenerator] Tier 0 RT: grace-period "
+                                        "content failed (mode=%s, %s). Cascading.",
+                                        _mode.name, ext_exc,
+                                    )
+                                    result = None
+                                if result is not None and len(result.candidates) > 0:
+                                    if self.fsm._consecutive_failures > 0:
+                                        self.fsm.record_primary_success()
+                                    logger.info(
+                                        "[CandidateGenerator] Tier 0 RT: %d candidates "
+                                        "in %.1fs (stream extension saved it)",
+                                        len(result.candidates),
+                                        result.generation_duration_s,
+                                    )
+                                    return result
+                        # Task still pending or no extension granted — cancel it.
+                        # Check done() first: task may have completed in the
+                        # instant between timeout and here (shield race window).
+                        if not _gen_task.done():
+                            _gen_task.cancel()
+                        elif not _gen_task.cancelled():
+                            try:
+                                _late = _gen_task.result()
+                                if _late is not None and len(_late.candidates) > 0:
+                                    if self.fsm._consecutive_failures > 0:
+                                        self.fsm.record_primary_success()
+                                    logger.info(
+                                        "[CandidateGenerator] Tier 0 RT: %d candidates "
+                                        "recovered from timeout race",
+                                        len(_late.candidates),
+                                    )
+                                    return _late
+                            except Exception:
+                                pass
+
+                        logger.warning(
+                            "[CandidateGenerator] Tier 0 RT: budget exhausted "
+                            "(%.1fs). Cascading to Tier 1 (%.1fs remaining)",
+                            tier0_budget, self._remaining_seconds(deadline),
+                        )
+                        self.fsm.record_primary_failure(mode=FailureMode.TIMEOUT)
+                    except asyncio.CancelledError:
+                        _gen_task.cancel()
+                        raise
+                    except Exception as rt_exc:
+                        _gen_task.cancel()
+                        mode = FailbackStateMachine.classify_exception(rt_exc)
+                        logger.warning(
+                            "[CandidateGenerator] Tier 0 RT failed (mode=%s, %s: %s). "
+                            "Cascading to Tier 1 (%.1fs remaining)",
+                            mode.name, type(rt_exc).__name__, rt_exc,
+                            self._remaining_seconds(deadline),
+                        )
+                        if mode is not FailureMode.CONTENT_FAILURE:
+                            self.fsm.record_primary_failure(mode=mode)
 
             else:
                 # ── Legacy batch path (DOUBLEWORD_REALTIME_ENABLED=false) ──
