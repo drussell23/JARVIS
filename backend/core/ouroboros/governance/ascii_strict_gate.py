@@ -246,8 +246,9 @@ def scan_candidate(
                 continue
             fp = str(entry.get("file_path", "") or "?")
             fc = entry.get("full_content", "")
-            if not isinstance(fc, str):
-                # Fallback for providers that only set raw_content.
+            # Fallback to raw_content when full_content is missing or
+            # empty — matches the single-file shape handling below.
+            if not isinstance(fc, str) or not fc:
                 fc = entry.get("raw_content", "") or ""
             if not isinstance(fc, str):
                 continue
