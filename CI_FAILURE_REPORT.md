@@ -3,13 +3,13 @@
 ## Executive Summary
 
 - **Workflow**: PR Automation & Validation
-- **Run Number**: #18318
-- **Branch**: `fix/ci/pr-automation-validation-run18314-20260410-053910`
-- **Commit**: `74bd7b3795011c7553152bd4d6f2ffdcb539aef0`
+- **Run Number**: #18323
+- **Branch**: `fix/ci/pr-automation-validation-run18318-20260410-054107`
+- **Commit**: `e41a1cbf4bc61b58b2045d6a742ea821f97d86c1`
 - **Status**: ❌ FAILED
-- **Timestamp**: 2026-04-10T05:39:38Z
+- **Timestamp**: 2026-04-10T05:41:40Z
 - **Triggered By**: @cubic-dev-ai[bot]
-- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24228318518)
+- **Workflow URL**: [View Run](https://github.com/drussell23/JARVIS/actions/runs/24228375727)
 
 ## Failure Overview
 
@@ -17,7 +17,7 @@ Total Failed Jobs: **1**
 
 | # | Job Name | Category | Severity | Duration |
 |---|----------|----------|----------|----------|
-| 1 | Validate PR Title | timeout | high | 3s |
+| 1 | Validate PR Title | timeout | high | 5s |
 
 ## Detailed Analysis
 
@@ -26,10 +26,10 @@ Total Failed Jobs: **1**
 **Status**: ❌ failure
 **Category**: Timeout
 **Severity**: HIGH
-**Started**: 2026-04-10T05:39:43Z
-**Completed**: 2026-04-10T05:39:46Z
-**Duration**: 3 seconds
-**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24228318518/job/70734192899)
+**Started**: 2026-04-10T05:41:44Z
+**Completed**: 2026-04-10T05:41:49Z
+**Duration**: 5 seconds
+**Job URL**: [View Logs](https://github.com/drussell23/JARVIS/actions/runs/24228375727/job/70734369653)
 
 #### Failed Steps
 
@@ -42,18 +42,18 @@ Total Failed Jobs: **1**
 - Pattern: `ERROR|Error|error`
   - Occurrences: 2
   - Sample matches:
-    - Line 30: `2026-04-10T05:39:44.7002757Z   subjectPatternError: The PR title must start with a capital letter.`
-    - Line 42: `2026-04-10T05:39:45.1815873Z ##[error]No release type found in pull request title "🚨 Fix CI/CD: PR A`
+    - Line 16: `2026-04-10T05:41:46.6551034Z   subjectPatternError: The PR title must start with a capital letter.`
+    - Line 28: `2026-04-10T05:41:47.0215489Z ##[error]upstream connect error or disconnect/reset before headers. res`
 
 - Pattern: `WARN|Warning|warning`
   - Occurrences: 1
   - Sample matches:
-    - Line 58: `2026-04-10T05:39:45.2263492Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
+    - Line 30: `2026-04-10T05:41:47.0725224Z ##[warning]Node.js 20 actions are deprecated. The following actions are`
 
 - Pattern: `timeout|timed out`
   - Occurrences: 1
   - Sample matches:
-    - Line 34: `- fix: Resolve database connection timeout`
+    - Line 20: `- fix: Resolve database connection timeout`
 
 #### Suggested Fixes
 
@@ -78,5 +78,5 @@ Total Failed Jobs: **1**
 
 ---
 
-📊 *Report generated on 2026-04-10T05:41:07.633024*
+📊 *Report generated on 2026-04-10T05:43:19.367974*
 🤖 *JARVIS CI/CD Auto-PR Manager*
