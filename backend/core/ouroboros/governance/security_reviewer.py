@@ -92,7 +92,29 @@ class SecurityReviewer:
     ) -> None:
         self._client = prime_client
         self._brain = brain or os.environ.get("JARVIS_SECURITY_REVIEW_BRAIN", None)
-        self._enabled = enabled and prime_client is not None
+        # Client must expose a PrimeClient-compatible prompt-based generate()
+        # (takes a `prompt` kwarg). CandidateGenerator/provider objects have
+        # `generate(context, deadline)` and would crash the review loop with
+        # "unexpected keyword argument 'prompt'". Silently disable rather than
+        # default-PASS on every review (Manifesto §7 — absolute observability).
+        self._enabled = enabled and prime_client is not None and self._client_is_compatible(prime_client)
+
+    @staticmethod
+    def _client_is_compatible(client: Any) -> bool:
+        """True iff client.generate accepts a `prompt` keyword argument."""
+        gen = getattr(client, "generate", None)
+        if gen is None or not callable(gen):
+            return False
+        try:
+            import inspect
+            sig = inspect.signature(gen)
+        except (TypeError, ValueError):
+            return False
+        params = sig.parameters
+        if "prompt" in params:
+            return True
+        # Accept **kwargs-style generate signatures too.
+        return any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
     @property
     def is_enabled(self) -> bool:

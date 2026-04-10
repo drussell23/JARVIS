@@ -1507,6 +1507,52 @@ class GovernedOrchestrator:
                             _ascii_exc._ascii_rejected_content = _rejected_content  # type: ignore[attr-defined]
                             raise _ascii_exc
 
+                # Gate 3 — Dependency file integrity. Catches hallucinated
+                # package-name renames/truncations in requirements.txt (and
+                # future: package.json, Cargo.toml, etc.). Engineered in
+                # response to bt-2026-04-10-184157, where Claude emitted a
+                # requirements.txt patch renaming ``anthropic`` →
+                # ``anthropichttp`` and ``rapidfuzz`` → ``rapidfu`` — two
+                # pure-ASCII corruptions that slipped past every other gate.
+                try:
+                    from backend.core.ouroboros.governance.dependency_file_gate import (
+                        check_candidate as _dep_check,
+                    )
+                except ImportError:
+                    _dep_check = None  # type: ignore[assignment]
+                if _dep_check is not None:
+                    for _cand in generation.candidates:
+                        _dep_result = _dep_check(_cand, self._config.project_root)
+                        if _dep_result is None:
+                            continue
+                        _dep_reason, _dep_offenders = _dep_result
+                        logger.warning(
+                            "[Orchestrator] Iron Gate — dependency_file_integrity: "
+                            "%d offender(s) [%s] op=%s",
+                            len(_dep_offenders),
+                            ", ".join(_dep_offenders[:5]),
+                            ctx.op_id[:12],
+                        )
+                        # Extract the rejected content for retry feedback.
+                        _rejected_content = ""
+                        if isinstance(_cand, dict):
+                            _rejected_content = _cand.get("full_content", "") or ""
+                            if not _rejected_content and isinstance(_cand.get("files"), list):
+                                for _entry in _cand["files"]:
+                                    if not isinstance(_entry, dict):
+                                        continue
+                                    _ep = _entry.get("file_path", "") or ""
+                                    from backend.core.ouroboros.governance.dependency_file_gate import is_dependency_file
+                                    if is_dependency_file(_ep):
+                                        _rejected_content = _entry.get("full_content", "") or ""
+                                        break
+                        generation = None
+                        _dep_exc = RuntimeError(_dep_reason)
+                        # Private attributes — retry feedback builder reads these.
+                        _dep_exc._dep_file_offenders = _dep_offenders  # type: ignore[attr-defined]
+                        _dep_exc._dep_file_rejected_content = _rejected_content  # type: ignore[attr-defined]
+                        raise _dep_exc
+
                 # Heartbeat: generation succeeded with candidates
                 try:
                     await self._stack.comm.emit_heartbeat(
@@ -1773,6 +1819,44 @@ class GovernedOrchestrator:
                         "- Sanity check: every single character in your output must\n"
                         "  be in the range 0x20–0x7E or \\n (0x0A). No exceptions.\n"
                     )
+                elif _err_str.startswith("Dependency file rename/truncation suspected"):
+                    # Gate 3 rejection — show the offender pairs and a clear
+                    # rule: you are NOT allowed to rename/shorten an existing
+                    # package name, only add new ones or bump versions.
+                    _dep_offenders = getattr(exc, "_dep_file_offenders", None) or []
+                    _dep_rejected = getattr(exc, "_dep_file_rejected_content", "") or ""
+                    _offender_block = ""
+                    if _dep_offenders:
+                        _offender_lines = "\n".join(
+                            f"  {i + 1}. {pair}" for i, pair in enumerate(_dep_offenders[:10])
+                        )
+                        _offender_block = (
+                            "\nSUSPICIOUS RENAMES DETECTED:\n"
+                            f"{_offender_lines}\n"
+                        )
+                    _error_feedback = (
+                        "## PREVIOUS GENERATION REJECTED — DEPENDENCY FILE CORRUPTION\n\n"
+                        f"{_err_str[:400]}\n"
+                        f"{_offender_block}\n"
+                        "INSTRUCTIONS FOR RETRY:\n"
+                        "- You deleted existing package(s) and added a near-identical\n"
+                        "  new name. This is almost always a typo or hallucination —\n"
+                        "  real upgrades change only the VERSION, not the package name.\n"
+                        "- If the goal is to UPGRADE a package: keep the name identical\n"
+                        "  (e.g. `anthropic==0.75.0` → `anthropic==0.80.0`). NEVER change\n"
+                        "  the letters of the package name.\n"
+                        "- If you truly need to REPLACE a package with a different one,\n"
+                        "  the new name must be clearly distinct (not a substring or\n"
+                        "  truncation of the old name) AND the reason must be in the\n"
+                        "  `rationale` field of your candidate.\n"
+                        "- Common hallucination patterns to avoid:\n"
+                        "    * truncation: `rapidfuzz` → `rapidfu` (WRONG)\n"
+                        "    * suffix append: `anthropic` → `anthropichttp` (WRONG)\n"
+                        "    * single-char typo: `requests` → `reqest` (WRONG)\n"
+                        "- Before emitting, compare each package name against the\n"
+                        "  source file character-by-character. Every name that was\n"
+                        "  there must still be there with the exact same spelling.\n"
+                    )
                 else:
                     _error_feedback = (
                         "## PREVIOUS GENERATION FAILED\n\n"
@@ -1792,6 +1876,8 @@ class GovernedOrchestrator:
                         _gen_failure_class = "exploration"
                     elif "ascii_corruption" in _err_str:
                         _gen_failure_class = "ascii"
+                    elif _err_str.startswith("Dependency file rename/truncation"):
+                        _gen_failure_class = "dep_file_rename"
                     elif "json_parse_error" in _err_str:
                         _gen_failure_class = "json_parse"
                     elif "diff_apply_failed" in _err_str:
@@ -2443,11 +2529,12 @@ class GovernedOrchestrator:
         # ---- Security Review (LLM-as-a-Judge) before APPROVE gate ----
         try:
             from backend.core.ouroboros.governance.security_reviewer import SecurityReviewer, SecurityVerdict
+            # Only wire SecurityReviewer with a genuine PrimeClient — the
+            # former fallback passed CandidateGenerator / provider objects
+            # whose generate(context, deadline) signature crashes SecurityReviewer
+            # (TypeError: generate() got an unexpected keyword argument 'prompt').
+            # See orchestrator battle test bt-2026-04-10-184157 postmortem.
             _sec_client = getattr(self._stack, "prime_client", None)
-            if _sec_client is None:
-                _sec_client = getattr(self, "_generator", None)
-                if hasattr(_sec_client, "_client"):
-                    _sec_client = _sec_client._client
             _sec_reviewer = SecurityReviewer(prime_client=_sec_client)
             if _sec_reviewer.is_enabled and best_candidate is not None:
                 _sec_result = await _sec_reviewer.review(
@@ -2506,8 +2593,24 @@ class GovernedOrchestrator:
                     _src_path = self._config.project_root / ctx.target_files[0]
                     if _src_path.exists():
                         _src_content = _src_path.read_text(encoding="utf-8", errors="replace")
-                if _src_content:
-                    _sim_reason = check_similarity(best_candidate, _src_content)
+                # Extract candidate content as a string. best_candidate is a dict with
+                # either top-level `full_content` (legacy single-file) or a `files` list
+                # (multi-file). Passing the raw dict would crash similarity_gate with
+                # AttributeError: 'dict' object has no attribute 'splitlines'.
+                _cand_content = ""
+                if isinstance(best_candidate, dict):
+                    _cand_content = best_candidate.get("full_content", "") or ""
+                    if not _cand_content and isinstance(best_candidate.get("files"), list):
+                        _target0 = ctx.target_files[0] if ctx.target_files else None
+                        for _entry in best_candidate["files"]:
+                            if not isinstance(_entry, dict):
+                                continue
+                            if _target0 is None or _entry.get("file_path") == _target0:
+                                _cand_content = _entry.get("full_content", "") or ""
+                                if _cand_content:
+                                    break
+                if _src_content and _cand_content:
+                    _sim_reason = check_similarity(_cand_content, _src_content)
                     if _sim_reason is not None:
                         logger.info(
                             "[Orchestrator] GATE similarity escalation: %s [%s]",
