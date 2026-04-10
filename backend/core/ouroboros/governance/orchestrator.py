@@ -2986,6 +2986,47 @@ class GovernedOrchestrator:
                     "stale_files": _stale_files,
                 })
 
+        # ── LiveWorkSensor: don't stomp on human-active files ──
+        # If the human is actively editing a target file, defer the autonomous
+        # apply. Green/Yellow tiers abort with `human_active`; Orange tier
+        # (APPROVAL_REQUIRED) proceeds because the human already approved.
+        try:
+            from backend.core.ouroboros.governance.live_work_sensor import (
+                LiveWorkSensor,
+                is_enabled as _lws_enabled,
+            )
+            if _lws_enabled() and ctx.risk_tier is not RiskTier.APPROVAL_REQUIRED:
+                _lws = LiveWorkSensor(self._config.project_root)
+                _active_hit: Optional[Tuple[str, str]] = None
+                _scan_targets: set[str] = set(ctx.target_files)
+                for _cf, _ in self._iter_candidate_files(best_candidate):
+                    if _cf:
+                        _scan_targets.add(_cf)
+                for _tf in sorted(_scan_targets):
+                    _is_active, _reason = _lws.is_human_active(str(_tf))
+                    if _is_active:
+                        _active_hit = (str(_tf), _reason or "human active")
+                        break
+                if _active_hit is not None:
+                    _hit_file, _hit_reason = _active_hit
+                    logger.warning(
+                        "[Orchestrator] LiveWorkSensor: human is active on %s (%s) — deferring APPLY [%s]",
+                        _hit_file, _hit_reason, ctx.op_id[:12],
+                    )
+                    await self._record_ledger(ctx, OperationState.FAILED, {
+                        "reason": "human_active_on_target",
+                        "file": _hit_file,
+                        "signal": _hit_reason,
+                    })
+                    ctx = ctx.advance(
+                        OperationPhase.POSTMORTEM,
+                        terminal_reason_code="human_active_on_target",
+                    )
+                    await self._publish_outcome(ctx, OperationState.FAILED, "human_active_on_target")
+                    return ctx
+        except Exception:
+            logger.debug("[Orchestrator] LiveWorkSensor check skipped", exc_info=True)
+
         # Capture pre-apply snapshots for complexity baseline + multi-file rollback.
         # Include ctx.target_files AND every file the candidate proposes — for a
         # multi-file candidate the secondary files may not be in ctx.target_files
