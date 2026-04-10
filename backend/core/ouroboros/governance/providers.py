@@ -2984,6 +2984,94 @@ _CLAUDE_CHARS_PER_TOKEN = 3.5
 _CLAUDE_OUTPUT_SAFETY = 1.4
 _CLAUDE_OUTPUT_OVERHEAD_TOKENS = 2048  # schema wrapper + rationale + misc
 
+# ---- Network resilience constants --------------------------------------------
+# Manifesto §3 (Disciplined Concurrency): reinforce the infrastructure to
+# handle extended-thinking cognitive load. Default httpx read timeouts sever
+# the connection while the model is still generating invisible reasoning
+# tokens. We override with a generous read budget and layer exponential
+# backoff retry on top for transient 5xx/timeout conditions.
+_CLAUDE_HTTP_CONNECT_TIMEOUT_S = float(
+    os.environ.get("JARVIS_CLAUDE_HTTP_CONNECT_TIMEOUT_S", "10.0")
+)
+_CLAUDE_HTTP_WRITE_TIMEOUT_S = float(
+    os.environ.get("JARVIS_CLAUDE_HTTP_WRITE_TIMEOUT_S", "30.0")
+)
+_CLAUDE_HTTP_POOL_TIMEOUT_S = float(
+    os.environ.get("JARVIS_CLAUDE_HTTP_POOL_TIMEOUT_S", "10.0")
+)
+# Read timeout — when extended thinking is on, the API may hold the
+# connection open for minutes before emitting the first token. 600s
+# gives ample headroom for the thinking_budget (up to 10K reasoning
+# tokens) plus generation. Non-thinking path uses 120s.
+_CLAUDE_HTTP_READ_TIMEOUT_THINKING_S = float(
+    os.environ.get("JARVIS_CLAUDE_HTTP_READ_TIMEOUT_THINKING_S", "600.0")
+)
+_CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S = float(
+    os.environ.get("JARVIS_CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S", "120.0")
+)
+# Exponential backoff retry — 2s, 4s, 8s between attempts.
+_CLAUDE_RETRY_MAX_ATTEMPTS = int(
+    os.environ.get("JARVIS_CLAUDE_RETRY_MAX_ATTEMPTS", "3")
+)
+_CLAUDE_RETRY_BASE_DELAY_S = float(
+    os.environ.get("JARVIS_CLAUDE_RETRY_BASE_DELAY_S", "2.0")
+)
+
+# Retryable HTTP status codes (transient server conditions).
+_CLAUDE_RETRYABLE_STATUSES = frozenset({502, 503, 504, 529})
+
+# Retryable exception class names. We match on class name instead of
+# importing anthropic/httpx at module load time because those imports
+# are lazy (the provider may be constructed on hosts without the SDK).
+_CLAUDE_RETRYABLE_EXC_NAMES = frozenset({
+    # Anthropic SDK
+    "APITimeoutError",
+    "APIConnectionError",
+    "APIConnectionTimeoutError",
+    # httpx low-level
+    "TimeoutException",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "WriteTimeout",
+    "PoolTimeout",
+    "ConnectError",
+    "ReadError",
+    "RemoteProtocolError",
+})
+
+
+def _is_retryable_transient_error(exc: BaseException) -> bool:
+    """Return True if *exc* is a transient network/server error worth retrying.
+
+    Matches on class name (to avoid hard SDK imports) plus HTTP status
+    code when available. Covers:
+
+    - Anthropic SDK timeout/connection errors
+    - httpx low-level timeout/connection errors
+    - HTTP 502/503/504/529 (server-side transient)
+    - ``asyncio.TimeoutError`` (from our own wait_for wrappers)
+
+    Does *not* retry on:
+    - 4xx client errors (bad request, auth, rate-limit-without-retry-hint)
+    - Schema/parse failures
+    - Budget exhaustion
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    cls_name = type(exc).__name__
+    if cls_name in _CLAUDE_RETRYABLE_EXC_NAMES:
+        return True
+    status = getattr(exc, "status_code", None)
+    if isinstance(status, int) and status in _CLAUDE_RETRYABLE_STATUSES:
+        return True
+    # Anthropic's APIStatusError subclass exposes .response.status_code
+    response = getattr(exc, "response", None)
+    if response is not None:
+        r_status = getattr(response, "status_code", None)
+        if isinstance(r_status, int) and r_status in _CLAUDE_RETRYABLE_STATUSES:
+            return True
+    return False
+
 
 class ClaudeProvider:
     """CandidateProvider adapter wrapping the Anthropic Claude API.
@@ -3061,16 +3149,140 @@ class ClaudeProvider:
         return "claude-api"
 
     def _ensure_client(self) -> Any:
-        """Lazily initialize the Anthropic client."""
+        """Lazily initialize the Anthropic client with extended-cognition timeouts.
+
+        Manifesto §3 (Disciplined Concurrency): the API may hold the HTTP
+        connection open for minutes while the model generates invisible
+        reasoning tokens (extended thinking, up to ``_thinking_budget``).
+        The default httpx read timeout (~5 min) is borderline; under heavy
+        thinking load it severs the connection mid-reasoning and the client
+        surfaces a bare ``TimeoutError`` with no message. We reinforce the
+        infrastructure here by passing a custom ``httpx.Timeout`` with a
+        generous read budget (600s when thinking is on, 120s otherwise)
+        and zero SDK-level retries — all retry decisions are made by
+        :meth:`_call_with_backoff` so they stay visible in the logs.
+        """
         if self._client is None:
             try:
                 import anthropic
-                self._client = anthropic.AsyncAnthropic(api_key=self._api_key)
-            except ImportError:
+                import httpx
+            except ImportError as _exc:
                 raise RuntimeError(
                     "claude_api_unavailable:anthropic_not_installed"
-                )
+                ) from _exc
+            _read_timeout = (
+                _CLAUDE_HTTP_READ_TIMEOUT_THINKING_S
+                if self._extended_thinking
+                else _CLAUDE_HTTP_READ_TIMEOUT_DEFAULT_S
+            )
+            _http_timeout = httpx.Timeout(
+                connect=_CLAUDE_HTTP_CONNECT_TIMEOUT_S,
+                read=_read_timeout,
+                write=_CLAUDE_HTTP_WRITE_TIMEOUT_S,
+                pool=_CLAUDE_HTTP_POOL_TIMEOUT_S,
+            )
+            self._client = anthropic.AsyncAnthropic(
+                api_key=self._api_key,
+                timeout=_http_timeout,
+                # SDK-level retries hide signal and consume our timebox
+                # silently. We do our own visible retry in _call_with_backoff.
+                max_retries=0,
+            )
+            logger.info(
+                "[ClaudeProvider] anthropic client initialized "
+                "(connect=%.0fs read=%.0fs write=%.0fs pool=%.0fs thinking=%s)",
+                _CLAUDE_HTTP_CONNECT_TIMEOUT_S,
+                _read_timeout,
+                _CLAUDE_HTTP_WRITE_TIMEOUT_S,
+                _CLAUDE_HTTP_POOL_TIMEOUT_S,
+                "on" if self._extended_thinking else "off",
+            )
         return self._client
+
+    async def _call_with_backoff(
+        self,
+        fn: Any,  # Callable[[], Awaitable[Any]]
+        *,
+        label: str,
+        max_attempts: int = _CLAUDE_RETRY_MAX_ATTEMPTS,
+        base_delay: float = _CLAUDE_RETRY_BASE_DELAY_S,
+        progress_probe: Any = None,  # Optional[Callable[[], bool]]
+    ) -> Any:
+        """Execute ``fn`` with exponential-backoff retry on transient failures.
+
+        Retries only on genuine network/server transients (see
+        :func:`_is_retryable_transient_error`). Non-retryable exceptions
+        propagate on the first occurrence.
+
+        Parameters
+        ----------
+        fn:
+            Zero-arg async callable. Invoked per attempt.
+        label:
+            Short tag used in log lines (e.g. ``"claude_stream"``).
+        max_attempts:
+            Total attempts (default 3 → 2s/4s backoff between).
+        base_delay:
+            Starting delay in seconds. Doubles per attempt.
+        progress_probe:
+            Optional zero-arg callable returning True if ``fn`` made
+            partial progress (e.g. streamed tokens already visible to
+            the caller). When it returns True, retry is aborted to
+            avoid duplicating emitted output. Only matters for the
+            streaming path.
+
+        Notes
+        -----
+        All waits use :func:`asyncio.sleep`, yielding control back to
+        the event loop so SerpentFlow, telemetry, and REPL remain
+        responsive during the cognitive wait.
+        """
+        last_exc: Optional[BaseException] = None
+        for attempt in range(max_attempts):
+            try:
+                return await fn()
+            except BaseException as exc:  # noqa: BLE001 — we rethrow below
+                if not _is_retryable_transient_error(exc):
+                    raise
+                if progress_probe is not None:
+                    _has_progress = False
+                    try:
+                        _has_progress = bool(progress_probe())
+                    except BaseException:
+                        # If the probe itself explodes, treat as "no
+                        # progress" and fall through to retry — the
+                        # original error is still the reason we're here.
+                        _has_progress = False
+                    if _has_progress:
+                        logger.warning(
+                            "[ClaudeProvider] %s transient failure after "
+                            "partial progress (%s) — aborting retry to "
+                            "avoid duplicated output",
+                            label, type(exc).__name__,
+                        )
+                        raise
+                if attempt == max_attempts - 1:
+                    logger.warning(
+                        "[ClaudeProvider] %s transient failure exhausted "
+                        "retries (%d/%d): %s",
+                        label, attempt + 1, max_attempts, type(exc).__name__,
+                    )
+                    raise
+                last_exc = exc
+                delay = base_delay * (2 ** attempt)
+                logger.warning(
+                    "[ClaudeProvider] %s transient failure (%s), "
+                    "backing off %.1fs (attempt %d/%d)",
+                    label, type(exc).__name__, delay, attempt + 1, max_attempts,
+                )
+                # asyncio.sleep — NOT time.sleep — yields to the event loop
+                # so telemetry/REPL/SerpentFlow stay live during backoff.
+                await asyncio.sleep(delay)
+        # Unreachable under normal flow (last attempt re-raises above),
+        # but defensive just in case.
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"{label}_retry_exhausted_without_exception")
 
     def _maybe_reset_daily_budget(self) -> None:
         """Reset daily spend if the day has changed."""
@@ -3470,9 +3682,20 @@ class ClaudeProvider:
                         else:
                             raise
 
+                # Reinforced transport: wrap the prefill-fallback in an
+                # exponential-backoff retry. Only retries when no tokens
+                # have streamed yet (progress_probe) — mid-stream failures
+                # are fatal because re-running would duplicate output.
+                async def _stream_with_resilience() -> None:
+                    await self._call_with_backoff(
+                        _stream_with_prefill_fallback,
+                        label="claude_stream",
+                        progress_probe=lambda: bool(raw_content),
+                    )
+
                 try:
                     await asyncio.wait_for(
-                        _stream_with_prefill_fallback(), timeout=timeout_s,
+                        _stream_with_resilience(), timeout=timeout_s,
                     )
                 except asyncio.TimeoutError as _te:
                     # Re-raise with enough context that the cascade log and
@@ -3524,9 +3747,17 @@ class ClaudeProvider:
                             return await client.messages.create(**_create_kwargs)
                         raise
 
+                # Reinforced transport: non-stream path is fully idempotent
+                # (no partial emission to callers), so we can retry freely.
+                async def _create_with_resilience() -> Any:
+                    return await self._call_with_backoff(
+                        _create_with_prefill_fallback,
+                        label="claude_create",
+                    )
+
                 try:
                     msg = await asyncio.wait_for(
-                        _create_with_prefill_fallback(),
+                        _create_with_resilience(),
                         timeout=timeout_s,
                     )
                 except asyncio.TimeoutError as _te:
@@ -3626,8 +3857,8 @@ class ClaudeProvider:
                         "(round %d)", timeout_s, tool_rounds,
                     )
                     break
-                msg = await asyncio.wait_for(
-                    client.messages.create(
+                async def _legacy_create() -> Any:
+                    return await client.messages.create(
                         model=self._model,
                         max_tokens=self._compute_output_budget(
                             context, is_tool_round=False,
@@ -3635,6 +3866,11 @@ class ClaudeProvider:
                         temperature=0.2,
                         system=_CODEGEN_SYSTEM_PROMPT,
                         messages=messages,
+                    )
+
+                msg = await asyncio.wait_for(
+                    self._call_with_backoff(
+                        _legacy_create, label="claude_legacy_tool_loop",
                     ),
                     timeout=timeout_s,
                 )
@@ -3717,7 +3953,12 @@ class ClaudeProvider:
         return result.with_tool_records(tool_records)
 
     async def health_probe(self) -> bool:
-        """Lightweight API ping. Returns True if API responds."""
+        """Lightweight API ping. Returns True if API responds.
+
+        Intentionally skips :meth:`_call_with_backoff` — health probes are
+        informational and must fail fast. Adding backoff here would mask
+        the problem the probe is meant to detect.
+        """
         try:
             client = self._ensure_client()
             await client.messages.create(
@@ -3734,24 +3975,32 @@ class ClaudeProvider:
         """Send a lightweight planning prompt; return raw string response.
 
         Used by ContextExpander for expansion rounds. Caller parses expansion.1 JSON.
-        Counts against daily budget (low token usage).
+        Counts against daily budget (low token usage). Wrapped in
+        :meth:`_call_with_backoff` so transient 5xx/timeouts don't fail
+        context expansion.
         """
         self._maybe_reset_daily_budget()
         if self._daily_spend >= self._daily_budget:
             raise RuntimeError("claude_budget_exhausted")
 
         client = self._ensure_client()
-        message = await client.messages.create(
-            model=self._model,
-            max_tokens=512,
-            system=(
-                "You are a code context analyst for the JARVIS self-programming pipeline. "
-                "Identify additional files needed for context. "
-                "Respond with valid JSON only matching schema_version expansion.1. "
-                "No markdown, no preamble."
-            ),
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
+
+        async def _plan_create() -> Any:
+            return await client.messages.create(
+                model=self._model,
+                max_tokens=512,
+                system=(
+                    "You are a code context analyst for the JARVIS self-programming pipeline. "
+                    "Identify additional files needed for context. "
+                    "Respond with valid JSON only matching schema_version expansion.1. "
+                    "No markdown, no preamble."
+                ),
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.0,
+            )
+
+        message = await self._call_with_backoff(
+            _plan_create, label="claude_plan",
         )
         input_tokens = getattr(message.usage, "input_tokens", 0)
         output_tokens = getattr(message.usage, "output_tokens", 0)
