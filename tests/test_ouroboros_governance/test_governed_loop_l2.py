@@ -14,14 +14,24 @@ _TR = "backend.core.ouroboros.governance.test_runner"
 
 
 class TestGovernedLoopConfigRepairBudget:
-    def test_default_repair_budget_is_disabled(self):
+    def test_default_repair_budget_is_enabled(self):
+        """L2 is enabled by default as of the Iron Gate push (Manifesto §6).
+
+        The self-repair loop is load-bearing for the Ouroboros cycle and
+        must engage automatically when VALIDATE exhausts retries.
+        """
         cfg = GovernedLoopConfig()
         budget = cfg.repair_budget
         assert budget is not None
-        assert budget.enabled is False
+        assert budget.enabled is True
 
-    def test_from_env_defaults_repair_budget_disabled(self, monkeypatch):
+    def test_from_env_defaults_repair_budget_enabled(self, monkeypatch):
         monkeypatch.delenv("JARVIS_L2_ENABLED", raising=False)
+        cfg = GovernedLoopConfig.from_env()
+        assert cfg.repair_budget.enabled is True
+
+    def test_from_env_explicit_false_opts_out(self, monkeypatch):
+        monkeypatch.setenv("JARVIS_L2_ENABLED", "false")
         cfg = GovernedLoopConfig.from_env()
         assert cfg.repair_budget.enabled is False
 

@@ -14,9 +14,13 @@ class TestRepairBudget:
     """Tests for RepairBudget dataclass and from_env() configuration."""
 
     def test_defaults(self):
-        """Verify RepairBudget default values."""
+        """Verify RepairBudget default values.
+
+        L2 is enabled by default as of the Iron Gate push — the self-repair
+        loop is load-bearing for the Ouroboros cycle (Manifesto §6).
+        """
         b = RepairBudget()
-        assert b.enabled is False
+        assert b.enabled is True
         assert b.max_iterations == 5
         assert b.timebox_s == 120.0
         assert b.min_deadline_remaining_s == 10.0
@@ -45,7 +49,9 @@ class TestRepairBudget:
         ):
             monkeypatch.delenv(k, raising=False)
         b = RepairBudget.from_env()
-        assert b.enabled is False
+        # Default flipped to True (Manifesto §6 — L2 closes the Ouroboros
+        # self-repair loop). Opt-out via JARVIS_L2_ENABLED=false.
+        assert b.enabled is True
         assert b.max_iterations == 5
 
     def test_from_env_reads_values(self, monkeypatch):
