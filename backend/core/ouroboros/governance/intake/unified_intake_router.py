@@ -535,6 +535,8 @@ class UnifiedIntakeRouter:
             target_files=envelope.target_files,
             description=envelope.description,
             op_id=envelope.causal_id,
+            signal_urgency=envelope.urgency,
+            signal_source=envelope.source,
         )
         try:
             _submit_fn = getattr(self._gls, "submit_background", None)

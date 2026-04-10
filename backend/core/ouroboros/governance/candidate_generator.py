@@ -660,6 +660,19 @@ class CandidateGenerator:
         asyncio.TimeoutError
             If the deadline is already past and no provider can be tried.
         """
+        # ── Route-based dispatch (Manifesto §5 Tier 0: deterministic) ──
+        _provider_route = getattr(context, "provider_route", "") or "standard"
+
+        if _provider_route == "immediate":
+            return await self._generate_immediate(context, deadline)
+        if _provider_route == "background":
+            return await self._generate_background(context, deadline)
+        if _provider_route == "speculative":
+            return await self._generate_speculative(context, deadline)
+        # "complex" and "standard" both use the full DW→Claude cascade,
+        # but "complex" gets more DW budget via route_budget_profile.
+        # Fall through to unified cascade below.
+
         # ── Tier 0: DoubleWord 397B ──────────────────────────────
         #
         # Manifesto §3: "Zero polling. Pure reflex."
@@ -702,7 +715,9 @@ class CandidateGenerator:
                 _tier0_attempted = True
                 remaining = self._remaining_seconds(deadline)
                 _complexity = getattr(context, "task_complexity", "trivial")
-                tier0_budget = self._compute_tier0_budget(remaining, _complexity)
+                tier0_budget = self._compute_tier0_budget(
+                    remaining, _complexity, _provider_route,
+                )
                 tier1_reserve = remaining - tier0_budget
 
                 logger.info(
@@ -983,6 +998,193 @@ class CandidateGenerator:
             eta_s,
         )
         return await self._call_fallback(context, deadline)
+
+    # ------------------------------------------------------------------
+    # Route-specific generation strategies (Manifesto §5)
+    # ------------------------------------------------------------------
+
+    async def _generate_immediate(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> GenerationResult:
+        """IMMEDIATE route: Claude direct, skip DW entirely.
+
+        For critical-urgency operations where every second counts:
+        test failures, voice commands, runtime health critical.
+
+        Cost: ~$0.03/op (Claude only)
+        Latency: 15-30s (no DW overhead)
+        """
+        logger.info(
+            "[CandidateGenerator] IMMEDIATE route: Claude direct "
+            "(skip DW, urgency=%s, source=%s) [%.1fs remaining]",
+            getattr(context, "signal_urgency", "?"),
+            getattr(context, "signal_source", "?"),
+            self._remaining_seconds(deadline),
+        )
+
+        # Try Claude as primary first, then fallback if available.
+        # Skip the entire Tier 0 / DW path.
+        state = self.fsm.state
+        if state is FailbackState.QUEUE_ONLY:
+            raise RuntimeError("all_providers_exhausted")
+
+        # If DW IS the primary, go straight to Claude (the fallback).
+        _dw_is_primary = (self._tier0 is not None and self._primary is self._tier0)
+        if _dw_is_primary:
+            return await self._call_fallback(context, deadline)
+
+        # Otherwise try primary (Claude/J-Prime), then fallback.
+        return await self._try_primary_then_fallback(context, deadline)
+
+    async def _generate_background(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> GenerationResult:
+        """BACKGROUND route: DW only. No Claude fallback.
+
+        For low-urgency background sensors: opportunity mining,
+        doc staleness, TODO scanning, backlog items.
+
+        Cost: ~$0.002/op (DW batch only)
+        Latency: relaxed (no deadline pressure)
+
+        Raises RuntimeError("background_dw_*") on failure — orchestrator
+        should re-queue or accept failure, NOT cascade to Claude.
+        """
+        _urgency = getattr(context, "signal_urgency", "?")
+        _source = getattr(context, "signal_source", "?")
+        remaining = self._remaining_seconds(deadline)
+
+        logger.info(
+            "[CandidateGenerator] BACKGROUND route: DW only, no Claude "
+            "(urgency=%s, source=%s) [%.1fs budget]",
+            _urgency, _source, remaining,
+        )
+
+        if self._tier0 is None or not getattr(self._tier0, "is_available", False):
+            raise RuntimeError(
+                "background_dw_unavailable:tier0_not_configured"
+            )
+
+        # DW gets the full budget — no Claude reserve needed.
+        # Use RT SSE if available, else batch.
+        if getattr(self._tier0, "_realtime_enabled", False):
+            try:
+                result = await asyncio.wait_for(
+                    self._tier0.generate(context, deadline),
+                    timeout=min(remaining, 180.0),
+                )
+                if result is not None and len(result.candidates) > 0:
+                    logger.info(
+                        "[CandidateGenerator] BACKGROUND: DW produced %d candidates "
+                        "in %.1fs ($%.4f)",
+                        len(result.candidates),
+                        result.generation_duration_s,
+                        getattr(result, "cost_usd", 0.0),
+                    )
+                    return result
+                raise RuntimeError("background_dw_empty_result")
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"background_dw_timeout:{remaining:.0f}s"
+                )
+            except RuntimeError:
+                raise  # Re-raise our own errors
+            except Exception as exc:
+                raise RuntimeError(
+                    f"background_dw_error:{type(exc).__name__}:{exc}"
+                ) from exc
+        else:
+            # Legacy batch path
+            try:
+                pending = await self._tier0.submit_batch(context)
+                if pending is None:
+                    raise RuntimeError("background_dw_batch_submit_failed")
+                result = await asyncio.wait_for(
+                    self._tier0.poll_and_retrieve(pending, context),
+                    timeout=min(remaining, 180.0),
+                )
+                if result is not None and len(result.candidates) > 0:
+                    logger.info(
+                        "[CandidateGenerator] BACKGROUND batch: DW produced %d "
+                        "candidates",
+                        len(result.candidates),
+                    )
+                    return result
+                raise RuntimeError("background_dw_batch_empty")
+            except asyncio.TimeoutError:
+                raise RuntimeError("background_dw_batch_timeout")
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                raise RuntimeError(
+                    f"background_dw_batch_error:{type(exc).__name__}"
+                ) from exc
+
+    async def _generate_speculative(
+        self,
+        context: OperationContext,
+        deadline: datetime,
+    ) -> GenerationResult:
+        """SPECULATIVE route: DW fire-and-forget pre-computation.
+
+        For intent discovery, dream engine, proactive exploration.
+        Submit to DW and don't block — store result for later use.
+
+        Cost: ~$0.001/op (DW batch, tolerate high discard)
+        Latency: N/A (async, result consumed later)
+
+        Always raises RuntimeError("speculative_deferred") — the
+        orchestrator should mark this as a deferred operation, not a failure.
+        """
+        _source = getattr(context, "signal_source", "?")
+        _op_id = getattr(context, "op_id", "unknown")
+
+        logger.info(
+            "[CandidateGenerator] SPECULATIVE route: DW fire-and-forget "
+            "(source=%s, op=%s)",
+            _source, _op_id,
+        )
+
+        if self._tier0 is not None and getattr(self._tier0, "is_available", False):
+            if getattr(self._tier0, "_realtime_enabled", False):
+                # Use RT path but don't block — create background task.
+                _gen_task = asyncio.ensure_future(
+                    self._tier0.generate(context, deadline),
+                )
+                # Store for later retrieval
+                self._background_polls[_op_id] = _gen_task
+                logger.info(
+                    "[CandidateGenerator] SPECULATIVE: DW RT task dispatched "
+                    "as background (op=%s)",
+                    _op_id,
+                )
+            else:
+                # Batch path — submit and background poll
+                try:
+                    pending = await self._tier0.submit_batch(context)
+                    if pending is not None:
+                        task = asyncio.create_task(
+                            self._background_poll_tier0(pending, context),
+                            name=f"speculative-{_op_id[:12]}",
+                        )
+                        self._background_polls[_op_id] = task
+                        logger.info(
+                            "[CandidateGenerator] SPECULATIVE: DW batch submitted "
+                            "(op=%s, batch=%s)",
+                            _op_id, getattr(pending, "batch_id", "?"),
+                        )
+                except Exception as exc:
+                    logger.debug(
+                        "[CandidateGenerator] SPECULATIVE: batch submit failed: %s",
+                        exc,
+                    )
+
+        # Always raise — speculative ops are deferred, not completed.
+        raise RuntimeError("speculative_deferred")
 
     async def _background_poll_tier0(
         self, pending: Any, context: OperationContext,
@@ -1280,7 +1482,9 @@ class CandidateGenerator:
 
     @staticmethod
     def _compute_tier0_budget(
-        total_s: float, complexity: str = "trivial",
+        total_s: float,
+        complexity: str = "trivial",
+        provider_route: str = "standard",
     ) -> float:
         """Deterministic Tier 0 (DoubleWord) budget with Tier 1 reserve.
 
@@ -1292,27 +1496,53 @@ class CandidateGenerator:
         so that complex operations receive proportionally more Tier 0 time
         (e.g. 80% instead of 65%).
 
+        *provider_route* overrides the budget profile for non-standard routes:
+          - "complex":     80% fraction, 120s max, 20s reserve (DW executes plan)
+          - "background":  100% fraction, 180s max, 0s reserve (DW only)
+          - "immediate":   0% (skip DW entirely)
+
         Invariants:
           - tier0_budget <= total_s * effective_fraction
-          - tier0_budget <= _TIER0_MAX_WAIT_S
-          - total_s - tier0_budget >= _TIER1_MIN_RESERVE_S (when possible)
+          - tier0_budget <= max_wait_s
+          - total_s - tier0_budget >= tier1_reserve (when possible)
         """
         if total_s <= 0:
             return 0.0
-        if total_s < 90.0:
+
+        # Route-aware budget profile overrides
+        if provider_route == "immediate":
+            return 0.0
+        if provider_route == "background":
+            # DW only — no Claude reserve needed
+            return min(total_s, 180.0)
+        if provider_route == "speculative":
+            return min(total_s, 300.0)
+
+        if total_s < 90.0 and provider_route == "standard":
             logger.warning(
                 "[CandidateGenerator] Generation budget tight (%.0fs < 90s). "
                 "Consider increasing JARVIS_GENERATION_TIMEOUT_S for reliable "
                 "2-tier cascade.",
                 total_s,
             )
+
         multiplier = _TIER0_COMPLEXITY_MULTIPLIER.get(complexity, 1.0)
-        effective_fraction = min(_TIER0_BUDGET_FRACTION * multiplier, 0.90)
+
+        # COMPLEX route: DW gets more budget (Claude already planned)
+        if provider_route == "complex":
+            effective_fraction = min(_TIER0_BUDGET_FRACTION * max(multiplier, 1.231), 0.90)
+            max_wait = 120.0
+            min_reserve = 20.0
+        else:
+            effective_fraction = min(_TIER0_BUDGET_FRACTION * multiplier, 0.90)
+            max_wait = _TIER0_MAX_WAIT_S
+            min_reserve = _TIER1_MIN_RESERVE_S
+
         # Reserve Tier 1 budget first (defensive — Tier 1 must always get a chance)
-        tier1_reserve = min(_TIER1_MIN_RESERVE_S, total_s * (1.0 - effective_fraction))
+        tier1_reserve = min(min_reserve, total_s * (1.0 - effective_fraction))
         budget = min(
             total_s * effective_fraction,
-            _TIER0_MAX_WAIT_S,
+            max_wait,
             total_s - tier1_reserve,
         )
         return max(budget, 0.0)

@@ -739,6 +739,46 @@ class GovernedOrchestrator:
             except Exception:
                 logger.debug("[Orchestrator] TelemetryContextualizer not available", exc_info=True)
 
+        # ── Urgency-aware provider routing (Manifesto §5 Tier 0) ──
+        # Deterministic routing based on signal_urgency + signal_source +
+        # task_complexity. Stamps provider_route on context for
+        # CandidateGenerator dispatch.
+        try:
+            from backend.core.ouroboros.governance.urgency_router import (
+                UrgencyRouter,
+            )
+            _urgency_router = UrgencyRouter()
+            _provider_route, _route_reason = _urgency_router.classify(ctx)
+            object.__setattr__(ctx, "provider_route", _provider_route.value)
+            object.__setattr__(ctx, "provider_route_reason", _route_reason)
+            logger.info(
+                "[Orchestrator] \U0001f6e4\ufe0f  Route: %s (%s) [%s]",
+                _provider_route.value, _route_reason, ctx.op_id,
+            )
+            # Emit route decision to CommProtocol for observability
+            if hasattr(self._stack, "comm") and self._stack.comm is not None:
+                try:
+                    from backend.core.ouroboros.governance.urgency_router import (
+                        UrgencyRouter as _UR,
+                    )
+                    await self._stack.comm.emit_decision(
+                        op_id=ctx.op_id,
+                        outcome=_provider_route.value,
+                        reason_code=f"urgency_route:{_route_reason}",
+                        details={
+                            "route": _provider_route.value,
+                            "route_description": _UR.describe_route(_provider_route),
+                            "signal_urgency": getattr(ctx, "signal_urgency", ""),
+                            "signal_source": getattr(ctx, "signal_source", ""),
+                            "task_complexity": getattr(ctx, "task_complexity", ""),
+                            "budget_profile": _UR.route_budget_profile(_provider_route),
+                        },
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            logger.debug("[Orchestrator] UrgencyRouter not available", exc_info=True)
+
         if self._config.context_expansion_enabled:
             # ── PreActionNarrator: voice WHAT before CONTEXT_EXPANSION ──
             if self._pre_action_narrator is not None:
@@ -1408,6 +1448,47 @@ class GovernedOrchestrator:
                 break
 
             except Exception as exc:
+                _err_msg = str(exc)
+
+                # ── BACKGROUND / SPECULATIVE route failures ──
+                # These routes intentionally avoid Claude. Don't retry
+                # with expensive providers — accept failure gracefully.
+                _route = getattr(ctx, "provider_route", "")
+                if _route == "speculative" and "speculative_deferred" in _err_msg:
+                    # Speculative ops are fire-and-forget — not a failure.
+                    logger.info(
+                        "[Orchestrator] SPECULATIVE op deferred (DW background) [%s]",
+                        ctx.op_id,
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code="speculative_deferred",
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.COMPLETED,
+                        {"reason": "speculative_deferred", "route": "speculative"},
+                    )
+                    return ctx
+
+                if _route == "background" and "background_dw_" in _err_msg:
+                    # Background DW failure — don't cascade to Claude.
+                    # Accept failure; sensor will re-detect if still relevant.
+                    logger.info(
+                        "[Orchestrator] BACKGROUND route: DW failed (%s), "
+                        "accepting without Claude cascade [%s]",
+                        _err_msg[:100], ctx.op_id,
+                    )
+                    ctx = ctx.advance(
+                        OperationPhase.CANCELLED,
+                        terminal_reason_code=f"background_accepted:{_err_msg[:80]}",
+                    )
+                    await self._record_ledger(
+                        ctx, OperationState.FAILED,
+                        {"reason": "background_dw_failure", "error": _err_msg[:200],
+                         "route": "background"},
+                    )
+                    return ctx
+
                 logger.warning(
                     "Generation attempt %d/%d failed for %s: %s",
                     attempt + 1,

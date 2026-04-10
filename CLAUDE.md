@@ -45,6 +45,18 @@ CLASSIFY -> ROUTE -> [CONTEXT_EXPANSION] -> [PLAN] -> GENERATE -> VALIDATE -> GA
 | 1 | Claude (Anthropic API) | $3/$15/M | Extended thinking + prompt caching, 60s fallback cap |
 | 2 | J-Prime (GCP self-hosted) | VM cost only | When available |
 
+### Urgency-Aware Provider Routing (Manifesto §5)
+
+Deterministic routing based on signal urgency + source + task complexity. Stamped at ROUTE phase by `UrgencyRouter` (`urgency_router.py`). No LLM calls — pure code, <1ms.
+
+| Route | Strategy | Cost | When |
+|-------|----------|------|------|
+| IMMEDIATE | Claude direct, skip DW | ~$0.03/op | Critical urgency, voice commands, test failures, runtime health |
+| STANDARD | DW primary → Claude fallback | ~$0.005/op | Normal-priority moderate ops (default cascade) |
+| COMPLEX | Claude plans → DW executes | ~$0.015/op | heavy_code, multi-file architectural changes |
+| BACKGROUND | DW only, no Claude fallback | ~$0.002/op | OpportunityMiner, DocStaleness, TODOs, backlog |
+| SPECULATIVE | DW batch fire-and-forget | ~$0.001/op | IntentDiscovery, DreamEngine pre-computation |
+
 ### Timeout Enforcement
 
 - **Generation**: `asyncio.wait_for(timeout=180s + 5s grace)` in orchestrator
@@ -110,7 +122,8 @@ backend/core/ouroboros/
   governance/
     governed_loop_service.py    # Main loop (Zone 6.8)
     orchestrator.py             # 11-phase FSM
-    candidate_generator.py      # 3-tier failback
+    candidate_generator.py      # 3-tier failback + route-based dispatch
+    urgency_router.py           # Deterministic provider routing (§5 Tier 0)
     providers.py                # Claude + Prime providers
     doubleword_provider.py      # DW 397B
     plan_generator.py           # Model-reasoned PLAN phase (schema plan.1)
