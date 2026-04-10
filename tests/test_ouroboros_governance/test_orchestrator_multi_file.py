@@ -14,7 +14,6 @@ deliberately composable on top of a mocked ``change_engine.execute``.
 """
 from __future__ import annotations
 
-import os
 import pytest
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -142,7 +141,7 @@ class TestApplyMultiFileCandidate:
             return_value=ChangeResult(
                 op_id="per-file",
                 success=True,
-                phase_reached=ChangePhase.VERIFIED,
+                phase_reached=ChangePhase.VERIFY,
             )
         )
 
@@ -194,7 +193,7 @@ class TestApplyMultiFileCandidate:
                 return ChangeResult(
                     op_id=req.op_id or "per-file",
                     success=True,
-                    phase_reached=ChangePhase.VERIFIED,
+                    phase_reached=ChangePhase.VERIFY,
                 )
             # Second file fails before any write.
             return ChangeResult(
@@ -255,7 +254,7 @@ class TestApplyMultiFileCandidate:
                 return ChangeResult(
                     op_id=req.op_id or "per-file",
                     success=True,
-                    phase_reached=ChangePhase.VERIFIED,
+                    phase_reached=ChangePhase.VERIFY,
                 )
             return ChangeResult(
                 op_id=req.op_id or "per-file",
