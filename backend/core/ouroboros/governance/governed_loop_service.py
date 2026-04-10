@@ -2357,6 +2357,10 @@ class GovernedLoopService:
             _rr = repo_roots_map if repo_roots_map else {"jarvis": Path.cwd()}
             _policy  = _GTP(repo_roots=_rr)
             _backend = _AsyncBE(semaphore=asyncio.Semaphore(self._config.max_concurrent_tools))
+            # Stash the backend on self so late-bound deps (ExplorationFleet
+            # for delegate_to_agent, MCP client, etc.) can be attached after
+            # downstream components are constructed further below.
+            self._tool_backend = _backend
             # Real-time tool call display callback (Manifesto §7: Absolute Observability)
             # Fires twice per tool: once before execution (tool name + args) and
             # once after execution (result preview + duration + status).
@@ -2913,7 +2917,18 @@ class GovernedLoopService:
             _fleet = ExplorationFleet(jarvis_root=self._config.project_root)
             self._exploration_fleet_ref = _fleet
             self._orchestrator.set_exploration_fleet(_fleet)
-            logger.info("[GLS] ExplorationFleet wired (parallel Trinity repo exploration)")
+            # Phase 2: wire the same fleet into the tool backend so
+            # Venom's delegate_to_agent tool can spawn isolated sub-agents.
+            _backend_ref = getattr(self, "_tool_backend", None)
+            if _backend_ref is not None and hasattr(_backend_ref, "set_exploration_fleet"):
+                _backend_ref.set_exploration_fleet(_fleet)
+                logger.info(
+                    "[GLS] ExplorationFleet wired (orchestrator CONTEXT_EXPANSION + Venom delegate_to_agent)"
+                )
+            else:
+                logger.info(
+                    "[GLS] ExplorationFleet wired (orchestrator CONTEXT_EXPANSION only — tool backend not present)"
+                )
         except Exception as exc:
             logger.debug("[GLS] ExplorationFleet skipped: %s", exc)
 

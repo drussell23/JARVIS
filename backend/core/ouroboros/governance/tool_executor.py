@@ -590,6 +590,57 @@ _L1_MANIFESTS: Dict[str, ToolManifest] = {
         },
         capabilities=frozenset({"subprocess"}),
     ),
+    # ---- Phase 2: Sub-Agent Delegation (architectural singularity) ----
+    "delegate_to_agent": ToolManifest(
+        name="delegate_to_agent", version="1.0",
+        description=(
+            "Spawn an isolated read-only sub-agent to explore a specific "
+            "area of the codebase in parallel. The sub-agent runs with its "
+            "OWN context budget and returns a structured findings report — "
+            "without polluting your main tool-loop context. Use this when "
+            "you need broad exploration of an unfamiliar area BEFORE "
+            "committing to an approach (e.g. 'understand the auth "
+            "middleware flow', 'map the data path from sensor X to ledger "
+            "Y', 'find every site that calls emit_heartbeat'). The "
+            "sub-agent is strictly read-only: it cannot modify files or "
+            "cascade into further delegations. The main tool loop "
+            "continues immediately after the sub-agent completes. "
+            "Prefer this over chaining many read_file/search_code calls "
+            "when the exploration would otherwise consume a large share "
+            "of your context budget."
+        ),
+        arg_schema={
+            "subtask_description": {
+                "type": "string",
+                "description": (
+                    "Clear goal for the sub-agent. Be specific — this is "
+                    "the only context the sub-agent has about what you "
+                    "want it to find."
+                ),
+            },
+            "agent_type": {
+                "type": "string",
+                "enum": ["explore"],
+                "default": "explore",
+                "description": (
+                    "Sub-agent kind. 'explore' runs a deterministic fleet "
+                    "of read-only exploration agents across the configured "
+                    "Trinity repos. (Additional agent types may be added "
+                    "in future versions.)"
+                ),
+            },
+            "timeout_s": {
+                "type": "number",
+                "default": 60.0,
+                "description": (
+                    "Max wall-clock seconds for the sub-agent before it is "
+                    "cancelled (hard cap 300s). The main tool loop's "
+                    "per-round timeout still applies."
+                ),
+            },
+        },
+        capabilities=frozenset({"delegate", "read"}),
+    ),
 }
 
 
@@ -1901,6 +1952,42 @@ class GoverningToolPolicy:
             except ImportError:
                 pass
 
+        # Rule 15: delegate_to_agent — env-gated, requires non-empty goal
+        # (Manifesto §5/§6: isolated sub-ops with distinct context budgets).
+        # The sub-agent runs in an in-process asyncio task with its own goal
+        # scope, so there are no path arguments to validate at the policy
+        # layer — the fleet's own read-only tooling enforces repo containment.
+        elif name == "delegate_to_agent":
+            allowed = (
+                os.environ.get("JARVIS_TOOL_DELEGATE_AGENT_ENABLED", "true").lower()
+                == "true"
+            )
+            if not allowed:
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.delegate_disabled",
+                    detail="JARVIS_TOOL_DELEGATE_AGENT_ENABLED is not 'true'",
+                )
+            goal = call.arguments.get("subtask_description", "")
+            if not isinstance(goal, str) or not goal.strip():
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.delegate_empty_goal",
+                    detail="subtask_description must be a non-empty string",
+                )
+            agent_type = call.arguments.get("agent_type", "explore")
+            if not isinstance(agent_type, str) or agent_type.lower().strip() not in (
+                "explore",
+            ):
+                return PolicyResult(
+                    decision=PolicyDecision.DENY,
+                    reason_code="tool.denied.delegate_bad_type",
+                    detail=(
+                        f"unsupported agent_type {agent_type!r}; "
+                        "supported: 'explore'"
+                    ),
+                )
+
         return PolicyResult(decision=PolicyDecision.ALLOW, reason_code="")
 
 
@@ -1963,11 +2050,17 @@ class AsyncProcessToolBackend:
     def __init__(self, semaphore: asyncio.Semaphore,
                  _executor_instance: Optional["ToolExecutor"] = None,
                  approval_provider: Optional[Any] = None,
-                 mcp_client: Optional[Any] = None) -> None:
+                 mcp_client: Optional[Any] = None,
+                 exploration_fleet: Optional[Any] = None) -> None:
         self._semaphore = semaphore
         self._executor_instance = _executor_instance
         self._approval_provider = approval_provider  # For ask_human tool
         self._mcp_client = mcp_client  # For MCP tool dispatch (Gap #7)
+        # Phase 2: Sub-Agent Delegation — ExplorationFleet reference for
+        # delegate_to_agent dispatch. Late-bindable via set_exploration_fleet()
+        # because GovernedLoopService constructs the fleet AFTER the tool
+        # backend (see governed_loop_service._build_components).
+        self._exploration_fleet: Optional[Any] = exploration_fleet
         # Per-op ToolExecutor cache so instance-scoped state (``_files_read``,
         # ``_edit_history``) persists across calls *within* one op. Without
         # this, every execute_async() would create a fresh executor and the
@@ -1980,6 +2073,14 @@ class AsyncProcessToolBackend:
         self._executor_cache_max: int = int(
             os.environ.get("JARVIS_TOOL_EXECUTOR_CACHE_MAX", "64")
         )
+
+    def set_exploration_fleet(self, fleet: Optional[Any]) -> None:
+        """Attach an ExplorationFleet for delegate_to_agent dispatch.
+
+        Late-bindable because the fleet is constructed after the tool
+        backend in GovernedLoopService. Pass ``None`` to detach.
+        """
+        self._exploration_fleet = fleet
 
     def _get_executor(
         self,
@@ -2043,8 +2144,15 @@ class AsyncProcessToolBackend:
             # MCP tools: forward to external MCP server (Gap #7)
             if call.name.startswith("mcp_") and self._mcp_client is not None:
                 return await self._run_mcp_tool(call, timeout, cap)
-            # Async-native tools (web search, code exploration, ask_human)
-            if call.name in ("web_search", "web_fetch", "code_explore", "ask_human"):
+            # Async-native tools (web search, code exploration, ask_human,
+            # delegate_to_agent — Phase 2 sub-agent delegation)
+            if call.name in (
+                "web_search",
+                "web_fetch",
+                "code_explore",
+                "ask_human",
+                "delegate_to_agent",
+            ):
                 return await self._run_async_native_tool(call, policy_ctx, timeout, cap)
             return await self._run_sync_tool_async(
                 call, policy_ctx.repo_root, timeout, cap, op_id=policy_ctx.op_id,
@@ -2175,6 +2283,14 @@ class AsyncProcessToolBackend:
                 else:
                     output = json.dumps({"status": "answered", "answer": answer})
 
+            elif call.name == "delegate_to_agent":
+                # Phase 2: Sub-Agent Delegation. Spawn an isolated read-only
+                # exploration sub-agent with its own goal scope and return
+                # the structured report back to the parent tool loop.
+                return await self._run_delegate_to_agent(
+                    call, policy_ctx, timeout, cap,
+                )
+
             return ToolResult(
                 tool_call=call, output=output[:cap],
                 status=ToolExecStatus.SUCCESS,
@@ -2189,6 +2305,159 @@ class AsyncProcessToolBackend:
                 tool_call=call, output="", error=str(exc),
                 status=ToolExecStatus.EXEC_ERROR,
             )
+
+    async def _run_delegate_to_agent(
+        self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
+    ) -> ToolResult:
+        """Execute a ``delegate_to_agent`` tool call — Phase 2 sub-agent delegation.
+
+        Spawns an isolated read-only exploration sub-agent via the wired
+        ``ExplorationFleet`` and returns a structured JSON report. The
+        sub-agent runs in its own asyncio task with an independent budget,
+        so its findings don't pollute the parent tool loop's context.
+
+        All failure modes produce a ``ToolResult`` — this method never raises.
+        Contract details:
+
+        * ``JARVIS_TOOL_DELEGATE_AGENT_ENABLED=false`` → policy_denied result
+          (defence-in-depth: policy rejects too, but we re-check at execution
+          time in case the env var flipped mid-loop).
+        * Missing ``ExplorationFleet`` → exec_error, tells the model the
+          sub-agent backend is unavailable so it falls back to inline reads.
+        * User-supplied ``timeout_s`` is clamped to [5, 300] and further
+          bounded by the coordinator's per-round ``timeout``.
+        * Fleet returning zero findings is NOT an error — the report still
+          lands as SUCCESS with an empty ``top_findings`` list.
+        """
+        # Defence-in-depth: re-check the env flag (policy already rejected
+        # when unset, but env vars can flip mid-session in battle tests).
+        if os.environ.get(
+            "JARVIS_TOOL_DELEGATE_AGENT_ENABLED", "true"
+        ).lower() != "true":
+            return ToolResult(
+                tool_call=call, output="",
+                error="delegate_to_agent disabled (JARVIS_TOOL_DELEGATE_AGENT_ENABLED=false)",
+                status=ToolExecStatus.POLICY_DENIED,
+            )
+
+        subtask_raw = call.arguments.get("subtask_description", "")
+        subtask = str(subtask_raw).strip() if isinstance(subtask_raw, str) else ""
+        if not subtask:
+            return ToolResult(
+                tool_call=call, output="",
+                error="delegate_to_agent: 'subtask_description' is required (non-empty string)",
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        agent_type_raw = call.arguments.get("agent_type", "explore")
+        agent_type = (
+            str(agent_type_raw).lower().strip() if isinstance(agent_type_raw, str) else ""
+        ) or "explore"
+        if agent_type != "explore":
+            return ToolResult(
+                tool_call=call, output="",
+                error=(
+                    f"delegate_to_agent: unsupported agent_type "
+                    f"{agent_type_raw!r} (supported: 'explore')"
+                ),
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        if self._exploration_fleet is None:
+            return ToolResult(
+                tool_call=call, output="",
+                error=(
+                    "delegate_to_agent: no ExplorationFleet wired to the "
+                    "tool backend — sub-agent delegation unavailable. Fall "
+                    "back to inline read_file/search_code calls."
+                ),
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        # Clamp the user-supplied timeout by both the hard cap and the
+        # coordinator's remaining per-round budget.
+        try:
+            user_timeout = float(call.arguments.get("timeout_s", 60.0))
+        except (TypeError, ValueError):
+            user_timeout = 60.0
+        eff_timeout = max(5.0, min(user_timeout, float(timeout), 300.0))
+
+        logger.info(
+            "[delegate_to_agent] op=%s spawning %s sub-agent (timeout=%.0fs): %s",
+            policy_ctx.op_id, agent_type, eff_timeout, subtask[:80],
+        )
+
+        try:
+            fleet_report = await asyncio.wait_for(
+                self._exploration_fleet.deploy(goal=subtask),
+                timeout=eff_timeout,
+            )
+        except asyncio.TimeoutError:
+            return ToolResult(
+                tool_call=call, output="",
+                error=(
+                    f"delegate_to_agent: sub-agent timed out after "
+                    f"{eff_timeout:.0f}s — narrow the subtask or increase "
+                    "timeout_s."
+                ),
+                status=ToolExecStatus.TIMEOUT,
+            )
+        except Exception as exc:  # noqa: BLE001
+            return ToolResult(
+                tool_call=call, output="",
+                error=(
+                    f"delegate_to_agent: sub-agent raised "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+                status=ToolExecStatus.EXEC_ERROR,
+            )
+
+        # Build a structured JSON payload from the FleetReport. We keep
+        # only the top N findings to stay under the tool output cap; the
+        # model can re-delegate with a narrower subtask if it needs more.
+        top_n = int(os.environ.get("JARVIS_DELEGATE_TOP_FINDINGS", "20"))
+        findings_payload: List[Dict[str, Any]] = []
+        for f in (fleet_report.findings or [])[:top_n]:
+            findings_payload.append({
+                "category": getattr(f, "category", ""),
+                "description": getattr(f, "description", ""),
+                "file": getattr(f, "file_path", ""),
+                "evidence": (getattr(f, "evidence", "") or "")[:160],
+                "relevance": round(float(getattr(f, "relevance", 0.0)), 3),
+            })
+
+        payload: Dict[str, Any] = {
+            "agent_type": agent_type,
+            "subtask": subtask,
+            "agents_deployed": int(getattr(fleet_report, "agents_deployed", 0)),
+            "agents_completed": int(getattr(fleet_report, "agents_completed", 0)),
+            "agents_failed": int(getattr(fleet_report, "agents_failed", 0)),
+            "total_files_explored": int(
+                getattr(fleet_report, "total_files_explored", 0)
+            ),
+            "total_findings": int(getattr(fleet_report, "total_findings", 0)),
+            "duration_s": round(float(getattr(fleet_report, "duration_s", 0.0)), 2),
+            "per_repo_summary": dict(
+                getattr(fleet_report, "per_repo_summary", {}) or {}
+            ),
+            "synthesis": str(getattr(fleet_report, "synthesis", "") or ""),
+            "top_findings": findings_payload,
+        }
+
+        output = json.dumps(payload, indent=2, sort_keys=False)
+        logger.info(
+            "[delegate_to_agent] op=%s sub-agent complete: %d agents, "
+            "%d files, %d findings in %.1fs",
+            policy_ctx.op_id,
+            payload["agents_completed"],
+            payload["total_files_explored"],
+            payload["total_findings"],
+            payload["duration_s"],
+        )
+        return ToolResult(
+            tool_call=call, output=output[:cap],
+            status=ToolExecStatus.SUCCESS,
+        )
 
     async def _run_tests_async(
         self, call: ToolCall, policy_ctx: PolicyContext, timeout: float, cap: int,
