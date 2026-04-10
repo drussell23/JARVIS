@@ -536,6 +536,11 @@ class BattleTestHarness:
             gls_config = GovernedLoopConfig.from_env(
                 project_root=self._config.repo_path,
             )
+            # Widen canary slices for battle test — allow all files.
+            # Production default is ("tests/", "docs/") which blocks
+            # autonomous writes to backend/ and root-level files.
+            import dataclasses as _dc
+            gls_config = _dc.replace(gls_config, initial_canary_slices=("",))
             self._governed_loop_service = GovernedLoopService(
                 stack=self._governance_stack,
                 config=gls_config,
