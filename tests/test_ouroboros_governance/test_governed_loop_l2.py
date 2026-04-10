@@ -91,8 +91,14 @@ class TestBuildComponentsRepairEngineWiring:
 
     @pytest.mark.asyncio
     async def test_repair_engine_none_when_budget_disabled(self, tmp_path):
-        """_build_components leaves repair_engine=None when repair_budget.enabled=False."""
-        cfg = GovernedLoopConfig(project_root=tmp_path)  # defaults to disabled
+        """_build_components leaves repair_engine=None when repair_budget.enabled=False.
+
+        Note: L2 is enabled by default since the Iron Gate push (Manifesto §6),
+        so this test explicitly opts out via an RepairBudget(enabled=False) to
+        exercise the "no repair engine" wiring path.
+        """
+        disabled_budget = RepairBudget(enabled=False)
+        cfg = GovernedLoopConfig(project_root=tmp_path, repair_budget=disabled_budget)
         mock_primary = MagicMock()
         mock_primary.health_probe = AsyncMock(return_value=True)
 

@@ -46,7 +46,11 @@ from backend.core.ouroboros.governance.approval_provider import (
     ApprovalResult,
     ApprovalStatus,
 )
-from backend.core.ouroboros.governance.change_engine import ChangeRequest
+from backend.core.ouroboros.governance.change_engine import (
+    ChangePhase,
+    ChangeRequest,
+    ChangeResult,
+)
 from backend.core.ouroboros.governance.ledger import LedgerEntry, OperationState
 from backend.core.ouroboros.governance.learning_bridge import OperationOutcome
 from backend.core.ouroboros.governance.op_context import (
@@ -2732,10 +2736,18 @@ class GovernedOrchestrator:
                     "stale_files": _stale_files,
                 })
 
-        # Capture pre-apply snapshots for complexity baseline
+        # Capture pre-apply snapshots for complexity baseline + multi-file rollback.
+        # Include ctx.target_files AND every file the candidate proposes — for a
+        # multi-file candidate the secondary files may not be in ctx.target_files
+        # and we need their pre-state to restore them if any file in the batch
+        # fails its apply.
         snapshots: Dict[str, str] = {}
-        for f in ctx.target_files:
-            fpath = self._config.project_root / f
+        _snapshot_targets: set[str] = {str(f) for f in ctx.target_files}
+        for _cf, _ in self._iter_candidate_files(best_candidate):
+            if _cf:
+                _snapshot_targets.add(_cf)
+        for f in _snapshot_targets:
+            fpath = Path(f) if Path(f).is_absolute() else self._config.project_root / f
             if fpath.exists():
                 try:
                     snapshots[str(f)] = fpath.read_text(errors="replace")
@@ -2744,27 +2756,55 @@ class GovernedOrchestrator:
         if snapshots:
             ctx = ctx.with_pre_apply_snapshots(snapshots)
 
-        change_request = self._build_change_request(ctx, best_candidate)
-
-        _t_apply = time.monotonic()
-        try:
-            change_result = await self._stack.change_engine.execute(change_request)
-        except Exception as exc:
-            logger.error(
-                "Change engine raised for %s: %s", ctx.op_id, exc
-            )
-            ctx = ctx.advance(
-                OperationPhase.POSTMORTEM,
-                terminal_reason_code="change_engine_error",
-            )
-            await self._record_ledger(
-                ctx,
-                OperationState.FAILED,
-                {"reason": "change_engine_error", "error": str(exc)},
-            )
-            self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
-            await self._publish_outcome(ctx, OperationState.FAILED, "change_engine_error")
-            return ctx
+        # Multi-file candidates go through a batch apply helper with
+        # all-or-nothing rollback semantics. Single-file candidates still
+        # use the legacy single ChangeRequest path (zero change for them).
+        _candidate_files = self._iter_candidate_files(best_candidate)
+        if len(_candidate_files) > 1:
+            _t_apply = time.monotonic()
+            try:
+                change_result = await self._apply_multi_file_candidate(
+                    ctx, best_candidate, _candidate_files, snapshots,
+                )
+            except Exception as exc:
+                logger.error(
+                    "Multi-file change engine raised for %s: %s", ctx.op_id, exc
+                )
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="change_engine_error",
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "change_engine_error", "error": str(exc), "multi_file": True},
+                )
+                self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
+                await self._publish_outcome(ctx, OperationState.FAILED, "change_engine_error")
+                return ctx
+            # Single-file fall-through path (change_result is already set).
+            change_request = None  # type: ignore[assignment]
+        else:
+            change_request = self._build_change_request(ctx, best_candidate)
+            _t_apply = time.monotonic()
+            try:
+                change_result = await self._stack.change_engine.execute(change_request)
+            except Exception as exc:
+                logger.error(
+                    "Change engine raised for %s: %s", ctx.op_id, exc
+                )
+                ctx = ctx.advance(
+                    OperationPhase.POSTMORTEM,
+                    terminal_reason_code="change_engine_error",
+                )
+                await self._record_ledger(
+                    ctx,
+                    OperationState.FAILED,
+                    {"reason": "change_engine_error", "error": str(exc)},
+                )
+                self._record_canary_for_ctx(ctx, False, time.monotonic() - _t_apply)
+                await self._publish_outcome(ctx, OperationState.FAILED, "change_engine_error")
+                return ctx
 
         if not change_result.success:
             ctx = ctx.advance(
@@ -3922,6 +3962,63 @@ class GovernedOrchestrator:
             return ("fatal", ctx)
 
     @staticmethod
+    def _iter_candidate_files(
+        candidate: Dict[str, Any],
+    ) -> list[Tuple[str, str]]:
+        """Return every (file_path, full_content) pair this candidate proposes.
+
+        Multi-file support (Manifesto §6 — coordinated architectural changes):
+        when a candidate has a ``files`` list, each entry represents one file
+        to apply atomically with the others. Otherwise the primary
+        ``file_path`` / ``full_content`` pair is the only one.
+
+        The feature is gated by ``JARVIS_MULTI_FILE_GEN_ENABLED`` (default
+        ``true``). When disabled, any ``files`` list is ignored and only the
+        primary file is returned — the pipeline behaves exactly as before.
+
+        Ordering:
+          • Single-file candidates yield ``[(file_path, full_content)]``.
+          • Multi-file candidates yield the entries in ``files`` in order,
+            so the first entry is the primary / authoritative file and
+            subsequent entries are its coordinated siblings.
+
+        Returns
+        -------
+        list[tuple[str, str]]
+            Non-empty list of ``(file_path, full_content)`` pairs. At minimum,
+            contains the primary file.
+        """
+        primary_path = candidate.get("file_path", "") or ""
+        primary_content = candidate.get("full_content", "") or ""
+
+        multi_enabled = (
+            os.environ.get("JARVIS_MULTI_FILE_GEN_ENABLED", "true").lower()
+            not in ("false", "0", "no", "off")
+        )
+        files_field = candidate.get("files") if multi_enabled else None
+        if isinstance(files_field, list) and files_field:
+            pairs: list[Tuple[str, str]] = []
+            seen: set[str] = set()
+            for entry in files_field:
+                if not isinstance(entry, dict):
+                    continue
+                fp = str(entry.get("file_path", "") or "")
+                fc = entry.get("full_content", "") or ""
+                if not fp or not isinstance(fc, str):
+                    continue
+                # De-duplicate — if the primary appears in the list, we
+                # don't want to process it twice.
+                if fp in seen:
+                    continue
+                seen.add(fp)
+                pairs.append((fp, fc))
+            if pairs:
+                return pairs
+
+        # Fallback: single-file candidate (legacy path).
+        return [(primary_path, primary_content)]
+
+    @staticmethod
     def _validate_config_file_format(
         file_path_str: str, content: str,
     ) -> Optional[str]:
@@ -4070,43 +4167,66 @@ class GovernedOrchestrator:
             str(ctx.target_files[0]) if ctx.target_files else "unknown.py",
         )
 
-        # Step 1: AST preflight — fast gate, no subprocess (Python files only)
-        syntax_error = self._ast_preflight(content) if target_file_str.endswith(".py") else None
-        if syntax_error:
-            return ValidationResult(
-                passed=False,
-                best_candidate=None,
-                validation_duration_s=0.0,
-                error=syntax_error,
-                failure_class="build",
-                short_summary=syntax_error[:300],
-                adapter_names_run=(),
-            )
+        # ── Multi-file expansion ────────────────────────────────────────
+        # If the candidate has a `files` list (Manifesto §6 coordinated
+        # edits), iterate the AST + duplication + config-format gates
+        # over every file, not just the primary. The primary remains the
+        # anchor for the single-file legacy runner path.
+        _all_files = self._iter_candidate_files(candidate)
+        _is_multi_file = len(_all_files) > 1
 
-        # Step 1b: Duplication guard — check for structural duplication (Python only)
-        if target_file_str.endswith(".py"):
+        # Step 1: AST preflight — fast gate, no subprocess (Python files only).
+        # Runs on EVERY file in a multi-file candidate, short-circuiting on the
+        # first failure so the retry feedback names the offending file.
+        for _fp, _fc in _all_files:
+            if not _fp.endswith(".py"):
+                continue
+            _syntax_error = self._ast_preflight(_fc)
+            if _syntax_error:
+                _scoped = (
+                    f"{_fp}: {_syntax_error}" if _is_multi_file else _syntax_error
+                )
+                return ValidationResult(
+                    passed=False,
+                    best_candidate=None,
+                    validation_duration_s=0.0,
+                    error=_scoped,
+                    failure_class="build",
+                    short_summary=_scoped[:300],
+                    adapter_names_run=(),
+                )
+
+        # Step 1b: Duplication guard — check for structural duplication (Python only).
+        # Runs on each Python file in a multi-file candidate; every file must be
+        # clean for the batch to pass.
+        for _fp, _fc in _all_files:
+            if not _fp.endswith(".py"):
+                continue
             try:
                 from backend.core.ouroboros.governance.duplication_checker import check_duplication
                 _source_content = ""
-                _src_path = Path(target_file_str)
+                _src_path = Path(_fp)
                 if not _src_path.is_absolute():
                     _src_path = self._config.project_root / _src_path
                 if _src_path.exists():
                     _source_content = _src_path.read_text(encoding="utf-8", errors="replace")
                 if _source_content:
-                    _dup_error = check_duplication(content, _source_content, target_file_str)
+                    _dup_error = check_duplication(_fc, _source_content, _fp)
                     if _dup_error is not None:
+                        _scoped = (
+                            f"{_fp}: {_dup_error}" if _is_multi_file else _dup_error
+                        )
                         return ValidationResult(
                             passed=False,
                             best_candidate=None,
                             validation_duration_s=0.0,
-                            error=_dup_error,
+                            error=_scoped,
                             failure_class="duplication",
-                            short_summary=_dup_error[:300],
+                            short_summary=_scoped[:300],
                             adapter_names_run=(),
                         )
             except Exception as exc:
-                logger.debug("[Orchestrator] Duplication check skipped: %s", exc)
+                logger.debug("[Orchestrator] Duplication check skipped for %s: %s", _fp, exc)
 
         # Non-code files (docs, configs, etc.) need no test/syntax runner,
         # but structured config files get a format sanity check so that
@@ -4114,12 +4234,18 @@ class GovernedOrchestrator:
         # caught at VALIDATE instead of blowing up post-APPLY. This is the
         # pre-APPLY deterministic gate described in Manifesto §6.
         _RUNNABLE_EXTENSIONS = {".py", ".cpp", ".cc", ".cxx", ".c", ".h", ".hpp"}
-        if Path(target_file_str).suffix not in _RUNNABLE_EXTENSIONS:
-            _cfg_err = self._validate_config_file_format(target_file_str, content)
+
+        # Config-format gate runs on every non-runnable file. In a multi-file
+        # candidate we must catch a bad requirements.txt even when the primary
+        # is a .py — otherwise the pip install would still fail post-APPLY.
+        for _fp, _fc in _all_files:
+            if Path(_fp).suffix in _RUNNABLE_EXTENSIONS:
+                continue
+            _cfg_err = self._validate_config_file_format(_fp, _fc)
             if _cfg_err is not None:
                 logger.warning(
                     "[Orchestrator] config-format gate rejected %s: %s",
-                    target_file_str, _cfg_err[:160],
+                    _fp, _cfg_err[:160],
                 )
                 return ValidationResult(
                     passed=False,
@@ -4130,6 +4256,12 @@ class GovernedOrchestrator:
                     short_summary=f"config-format: {_cfg_err[:240]}",
                     adapter_names_run=(),
                 )
+
+        # If NO file in the candidate is code (.py/.cpp/etc.), there's
+        # nothing for the runner to execute — pass through after the
+        # format gates above. For mixed candidates (some code + some
+        # config) we still run the runner on the code files below.
+        if not any(Path(_fp).suffix in _RUNNABLE_EXTENSIONS for _fp, _ in _all_files):
             return ValidationResult(
                 passed=True,
                 best_candidate=candidate,
@@ -4165,20 +4297,43 @@ class GovernedOrchestrator:
             )
 
         # Step 3: Write to temp sandbox
+        # For a multi-file candidate we write every file preserving its
+        # relative path under the sandbox root, so cross-file imports can
+        # resolve during the runner's syntax / test pass. Only code files
+        # become `changed_files` for the runner — configs are already
+        # validated by the format gate above and don't need execution.
         multi = None
         t0 = time.monotonic()
-        target_path = Path(target_file_str)
-        target_name = target_path.name
 
         with tempfile.TemporaryDirectory(prefix="ouroboros_validate_") as sandbox_str:
             sandbox = Path(sandbox_str)
-            sandbox_file = sandbox / target_name
-            sandbox_file.write_text(content, encoding="utf-8")
+            runner_changed: list[Path] = []
+            for _fp, _fc in _all_files:
+                _rel = Path(_fp)
+                if _rel.is_absolute():
+                    # Collapse absolute paths into just the basename to keep
+                    # everything under the sandbox root. This preserves the
+                    # legacy single-file behaviour for absolute inputs.
+                    _sandbox_file = sandbox / _rel.name
+                else:
+                    _sandbox_file = sandbox / _rel
+                _sandbox_file.parent.mkdir(parents=True, exist_ok=True)
+                _sandbox_file.write_text(_fc, encoding="utf-8")
+                if _sandbox_file.suffix in _RUNNABLE_EXTENSIONS:
+                    runner_changed.append(_sandbox_file)
+
+            # Safety net: if nothing qualifies for the runner (shouldn't
+            # happen — the all-non-code early return would have fired),
+            # fall back to the primary file path anchor.
+            if not runner_changed:
+                _primary_rel = Path(target_file_str)
+                _primary_file = sandbox / (_primary_rel.name if _primary_rel.is_absolute() else _primary_rel)
+                runner_changed = [_primary_file]
 
             # Step 4: Run LanguageRouter (or any duck-typed runner)
             try:
                 multi = await self._validation_runner.run(
-                    changed_files=(sandbox_file,),
+                    changed_files=tuple(runner_changed),
                     sandbox_dir=sandbox,
                     timeout_budget_s=remaining_s,
                     op_id=ctx.op_id,
@@ -4250,6 +4405,158 @@ class GovernedOrchestrator:
             proposed_content=proposed_content,
             profile=profile,
             op_id=ctx.op_id,
+        )
+
+    async def _apply_multi_file_candidate(
+        self,
+        ctx: OperationContext,
+        candidate: Dict[str, Any],
+        files: list[Tuple[str, str]],
+        snapshots: Dict[str, str],
+    ) -> ChangeResult:
+        """Apply a multi-file candidate atomically.
+
+        Manifesto §6 boundary rule: the agentic layer emits the coordinated
+        edits, the deterministic layer applies them. We iterate through the
+        files, running each through the existing single-file ChangeEngine
+        pipeline (which keeps every per-file gate: risk classification,
+        governance lock, verify hook, rollback). If any file fails, every
+        previously-applied file in the batch is restored from its pre-apply
+        snapshot so the on-disk state matches the pre-batch state.
+
+        This helper explicitly does NOT re-implement the 8-phase pipeline —
+        it composes the existing engine so the pipeline's guarantees still
+        hold for each file, and adds batch-level rollback on top.
+
+        Parameters
+        ----------
+        ctx:
+            Current operation context.
+        candidate:
+            The validated best candidate, must contain a non-empty ``files`` list.
+        files:
+            The ``(file_path, full_content)`` pairs produced by
+            ``_iter_candidate_files``. At least one entry (guaranteed by caller).
+        snapshots:
+            Pre-apply snapshots keyed by file path, used to restore files
+            if the batch fails partway through.
+
+        Returns
+        -------
+        ChangeResult
+            A single aggregated result. ``success=True`` only when every file
+            applied cleanly. ``rolled_back`` reflects whether any restoration
+            was attempted on failure.
+        """
+        profile = self._build_profile(ctx)
+        applied: list[Tuple[str, Path]] = []   # (rel_path, abs_path) of successfully applied files
+        last_phase_reached: ChangePhase = ChangePhase.PLAN
+        last_risk_tier: Optional[RiskTier] = None
+        last_error: Optional[str] = None
+
+        for idx, (fp, fc) in enumerate(files):
+            # Build an absolute target path anchored at the project root.
+            _rel = Path(fp)
+            _abs = _rel if _rel.is_absolute() else (self._config.project_root / _rel)
+
+            _per_file_request = ChangeRequest(
+                goal=f"{ctx.description} [multi-file {idx + 1}/{len(files)}: {fp}]",
+                target_file=_abs,
+                proposed_content=fc,
+                profile=profile,
+                op_id=f"{ctx.op_id}::{idx:02d}",
+            )
+
+            try:
+                per_result = await self._stack.change_engine.execute(_per_file_request)
+            except Exception as exc:
+                logger.error(
+                    "[Orchestrator] Multi-file apply: file %d/%d (%s) raised: %s",
+                    idx + 1, len(files), fp, exc,
+                )
+                per_result = ChangeResult(
+                    op_id=_per_file_request.op_id or ctx.op_id,
+                    success=False,
+                    phase_reached=last_phase_reached,
+                    rolled_back=False,
+                    error=f"change_engine_raise: {exc}",
+                )
+
+            last_phase_reached = per_result.phase_reached
+            if per_result.risk_tier is not None:
+                last_risk_tier = per_result.risk_tier
+
+            if per_result.success:
+                applied.append((fp, _abs))
+                continue
+
+            # ── Failure — roll back every previously-applied file ──
+            last_error = (
+                f"multi_file_apply failed on {fp} "
+                f"(file {idx + 1}/{len(files)}): {per_result.error or 'unknown'}"
+            )
+            logger.error("[Orchestrator] %s", last_error)
+            rolled_back_any = False
+            for done_fp, done_abs in applied:
+                if done_fp in snapshots:
+                    try:
+                        done_abs.parent.mkdir(parents=True, exist_ok=True)
+                        done_abs.write_text(snapshots[done_fp], encoding="utf-8")
+                        rolled_back_any = True
+                        logger.info(
+                            "[Orchestrator] Multi-file rollback: restored %s", done_fp,
+                        )
+                    except OSError as _restore_exc:
+                        logger.error(
+                            "[Orchestrator] Multi-file rollback FAILED for %s: %s",
+                            done_fp, _restore_exc,
+                        )
+                else:
+                    # No snapshot = file was new in this batch; unlink to undo creation.
+                    try:
+                        if done_abs.exists():
+                            done_abs.unlink()
+                            rolled_back_any = True
+                            logger.info(
+                                "[Orchestrator] Multi-file rollback: removed new file %s", done_fp,
+                            )
+                    except OSError as _unlink_exc:
+                        logger.error(
+                            "[Orchestrator] Multi-file rollback unlink FAILED for %s: %s",
+                            done_fp, _unlink_exc,
+                        )
+
+            await self._record_ledger(ctx, OperationState.APPLYING, {
+                "event": "multi_file_rollback",
+                "failed_file": fp,
+                "failed_index": idx,
+                "total_files": len(files),
+                "rolled_back_count": len(applied),
+                "rolled_back_any": rolled_back_any,
+            })
+
+            return ChangeResult(
+                op_id=ctx.op_id,
+                success=False,
+                phase_reached=last_phase_reached,
+                risk_tier=last_risk_tier,
+                rolled_back=rolled_back_any or per_result.rolled_back,
+                error=last_error,
+            )
+
+        # All files applied cleanly — return aggregated success.
+        await self._record_ledger(ctx, OperationState.APPLYING, {
+            "event": "multi_file_apply_complete",
+            "file_count": len(files),
+            "files": [fp for fp, _ in files],
+        })
+        return ChangeResult(
+            op_id=ctx.op_id,
+            success=True,
+            phase_reached=last_phase_reached,
+            risk_tier=last_risk_tier,
+            rolled_back=False,
+            error=None,
         )
 
     async def _execute_saga_apply(
